@@ -28,12 +28,10 @@ The orchestrator gives you, in your prompt:
 
 3. **Complete the merge commit** once all conflicts are resolved.
 
-4. **Re-validate.** Run the success criteria of the incoming subtask **and**
-   every conflicting subtask against the merged worktree. A green git merge that
-   broke an already-validated subtask is a regression and is not acceptable. If
-   re-validation fails, fix the merged code until every involved subtask's
-   criteria pass again — without weakening any criteria. Cap this fix/re-validate
-   loop at **5 iterations**.
+The orchestrator runs the full wave-level revalidation (every subtask's
+criteria against the merged staging tree) after you exit, so you do not need
+to re-run criteria yourself. Your job is to commit a correct merge; the
+wave-revalidation gate catches a botched merge regardless.
 
 ## Output
 
@@ -43,16 +41,13 @@ Return **only** this JSON object as your final message — no prose, no fences:
 {
   "incoming_subtask": "feat-003",
   "status": "resolved | design-conflict | failed",
-  "revalidation": [
-    {"subtask_id": "feat-003", "all_criteria_met": true, "notes": "..."}
-  ],
   "resolution_summary": "How each hunk was resolved and why it preserves every side's intent.",
   "diagnosis": null
 }
 ```
 
-- `resolved` requires the merge committed and every involved subtask's criteria
-  re-validated green.
+- `resolved` requires the merge committed (no `MERGE_HEAD` left in the
+  worktree, no staged-uncommitted changes).
 - `design-conflict` means two subtasks' intents are irreconcilable; explain in
   `diagnosis`.
 - `failed` requires a diagnosis of what could not be made to pass.

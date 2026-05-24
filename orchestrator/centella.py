@@ -14,21 +14,20 @@ Usage:
     centella "<task description>"
     centella --resume
     centella "<task>" --answers answers.json
-    centella "<task>" --no-clarify          # skip the clarification phase
+    centella "<task>" --no-clarify          # skip clarification entirely
 
 Run it from the root of the target git repository.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +45,21 @@ DEFAULT_CAPS = {
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
 }
 
+# Every key the orchestrator writes to `st.data`. Canonical alongside the
+# `state.json` field table in IMPLEMENTATION.md §8 — drift in either
+# direction is caught by tests/test_state_fields.py.
+STATE_FIELDS = (
+    "task", "started_at", "finished_at",
+    "waves", "completed_waves", "subtask_status",
+    "criteria_locks", "criteria_revisions",
+    "blocked",
+    "worker_count", "telemetry",
+    "categories", "classifier_questions", "answers",
+    "needs_source_of_truth", "source_of_truth_pref", "no_clarify",
+    "test_runner",
+    "integrator_failure", "integrator_warnings", "scope_warnings",
+)
+
 CATEGORIES = [
     "feature-implementation", "bug-fixing", "refactoring",
     "performance-optimization", "testing", "dependency-migration",
@@ -54,8 +68,28 @@ CATEGORIES = [
 
 READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch"
 ACT_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit"
+# RUN_TOOLS adds Bash to the read set so the validator can execute criteria
+# (pytest, shell checks) without gaining Write/Edit. Mechanical enforcement of
+# VALIDATOR_SYSTEM's "you do not modify code" rule, per DESIGN §12.
+RUN_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,Bash"
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
+
+# Source-of-truth preference — see DESIGN.md §11. Resolution order:
+# per-repo file (centella.toml at the repo root, committed) → env var → 'ask'.
+SOURCE_OF_TRUTH_VALUES = ("codebase", "research", "both", "ask")
+SOURCE_OF_TRUTH_ANSWERS = ("codebase", "research", "both")  # 'ask' is never an answer
+SOURCE_OF_TRUTH_ENV = "CENTELLA_SOURCE_OF_TRUTH"
+SOURCE_OF_TRUTH_FILE = "centella.toml"
+
+
+def _source_of_truth_hint() -> str:
+    """The one-line hint shown when the user is asked the source-of-truth
+    question — interactive and non-interactive paths share this string."""
+    return (f"Skip this question next time by setting "
+            f"{SOURCE_OF_TRUTH_ENV}=codebase|research|both, or by adding "
+            f"source_of_truth=... to {SOURCE_OF_TRUTH_FILE} at the repo root.")
+
 
 VALIDATOR_SYSTEM = (
     "You verify whether an integrated set of changes satisfies a list of "
@@ -99,9 +133,14 @@ SCHEMAS: dict[str, dict] = {
         "required": ["domain", "subtasks"],
         "properties": {
             "domain": {"type": "string"},
-            "source_of_truth": {"type": "string"},
-            "patterns_observed": {"type": "array", "items": {"type": "string"}},
-            "notes_for_orchestrator": {"type": "string"},
+            # Defensive: the planner echoes back what it was given; downstream
+            # code reads from answers["source_of_truth"] (validated in
+            # gather_answers), not from this field. Kept as future-proofing in
+            # case a consumer of the planner's output appears later.
+            "source_of_truth": {
+                "type": "string",
+                "enum": ["codebase", "research", "both"],
+            },
             "subtasks": {
                 "type": "array",
                 "items": {
@@ -146,6 +185,10 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            # Worker-internal: the implementer prompt uses this as a self-gate
+            # ("proceed only when both scores ≥ 9.0"). The orchestrator does
+            # not consume it. Kept in the schema so the worker still computes
+            # and surfaces it; removing it would also remove the self-gate.
             "confidence": {
                 "type": "object",
                 "properties": {
@@ -155,9 +198,21 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "checkpoint_path": {"type": ["string", "null"]},
-            "proposed_criteria_revision": {"type": ["string", "object", "null"]},
             "blocker": {"type": ["string", "null"]},
             "summary": {"type": "string"},
+            # DESIGN §9: proposal-only revision channel. An implementer
+            # that believes its criteria are wrong submits a proposal here;
+            # the orchestrator (not the implementer) decides whether to
+            # apply it. See _proposal_structurally_valid /
+            # apply_criteria_revision / record_criteria_revision below.
+            "criteria_revision_proposal": {
+                "type": ["object", "null"],
+                "properties": {
+                    "proposed_text": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["proposed_text", "evidence"],
+            },
         },
     },
     "integrator": {
@@ -168,17 +223,6 @@ SCHEMAS: dict[str, dict] = {
             "status": {
                 "type": "string",
                 "enum": ["resolved", "design-conflict", "failed"],
-            },
-            "revalidation": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "subtask_id": {"type": "string"},
-                        "all_criteria_met": {"type": "boolean"},
-                        "notes": {"type": "string"},
-                    },
-                },
             },
             "resolution_summary": {"type": "string"},
             "diagnosis": {"type": ["string", "null"]},
@@ -221,12 +265,100 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
-def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
-    """Run one of the bundled git worktree scripts in the target repo."""
-    return subprocess.run(
-        ["bash", str(SCRIPTS / name), *args],
-        cwd=os.getcwd(), capture_output=True, text=True,
+def resolve_source_of_truth(repo_root: Path) -> str:
+    """Resolve the source-of-truth preference. Order: per-repo file →
+    env var → default 'ask'. Unknown values are rejected via die() so
+    a bad config is caught at startup, not during a planner run."""
+    cfg = repo_root / SOURCE_OF_TRUTH_FILE
+    if cfg.exists():
+        for raw in cfg.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k == "source_of_truth":
+                if v not in SOURCE_OF_TRUTH_VALUES:
+                    die(f"{cfg}: source_of_truth={v!r} is not one of "
+                        f"{SOURCE_OF_TRUTH_VALUES}")
+                return v
+    env = os.environ.get(SOURCE_OF_TRUTH_ENV, "").strip()
+    if env:
+        if env not in SOURCE_OF_TRUTH_VALUES:
+            die(f"{SOURCE_OF_TRUTH_ENV}={env!r} is not one of "
+                f"{SOURCE_OF_TRUTH_VALUES}")
+        return env
+    return "ask"
+
+
+async def run_proc(cmd: list[str], *, cwd: str | None = None,
+                   timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
+    On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
+    semantics callers already handle. One helper everywhere keeps the asyncio
+    boilerplate out of the call sites."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    try:
+        if timeout is None:
+            stdout, stderr = await proc.communicate()
+        else:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    except BaseException:
+        # Any other exception (CancelledError from a parent abort, an unexpected
+        # OSError/BrokenPipeError from the PIPE, etc.) must still leave no
+        # orphan child. Reap then re-raise the original exception.
+        proc.kill()
+        try:
+            await proc.wait()
+        except BaseException:
+            pass
+        raise
+    return subprocess.CompletedProcess(
+        cmd,
+        proc.returncode if proc.returncode is not None else 0,
+        stdout.decode(errors="replace") if stdout else "",
+        stderr.decode(errors="replace") if stderr else "",
+    )
+
+
+async def gather_or_cancel(*aws):
+    """Like asyncio.gather, but on the first exception cancel every other
+    in-flight task and await its finalization before re-raising. Paired with
+    run_proc's child-killing exception handler, this terminates in-flight
+    `claude -p` subprocesses immediately on a failed-run abort instead of
+    letting them burn the worker budget for up to worker_timeout_sec."""
+    tasks = [asyncio.ensure_future(a) for a in aws]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            # If the cleanup itself is cancelled or errors, drop that
+            # secondary exception so the bare `raise` below re-raises the
+            # original — the user wants the real failure cause, not noise
+            # from the cleanup phase.
+            pass
+        raise
+
+
+async def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one of the bundled git worktree scripts in the target repo."""
+    return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd())
 
 
 # =========================================================================
@@ -239,28 +371,25 @@ def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
 # test suites, enforcing structural rules.
 # =========================================================================
 
-def preflight(centella_dir: Path, skip_smoke: bool = False) -> None:
+async def preflight(centella_dir: Path, skip_smoke: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
 
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
-        r = subprocess.run(["git", "config", key],
-                           capture_output=True, text=True)
+        r = await run_proc(["git", "config", key])
         if r.returncode != 0 or not r.stdout.strip():
             die(f"git {key} is not configured. "
                 f"Run: git config --global {key} \"<value>\"")
 
     # 2. working tree must be clean — a dirty tree produces ambiguous diffs
-    r = subprocess.run(["git", "status", "--porcelain"],
-                       capture_output=True, text=True)
+    r = await run_proc(["git", "status", "--porcelain"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
         die(f"working tree has {len(dirty)} modified/staged file(s). "
             "Commit or stash before running centella.")
 
     # 3. no stale centella/* branches — they collide with this run's names
-    r = subprocess.run(["git", "branch", "--list", "centella/*"],
-                       capture_output=True, text=True)
+    r = await run_proc(["git", "branch", "--list", "centella/*"])
     stale_branches = [b.strip() for b in r.stdout.strip().splitlines() if b.strip()]
     if stale_branches:
         die(f"stale centella/* branches exist: {', '.join(stale_branches)}\n"
@@ -277,12 +406,12 @@ def preflight(centella_dir: Path, skip_smoke: bool = False) -> None:
     if not skip_smoke:
         log("preflight: smoke-testing claude -p…")
         try:
-            proc = subprocess.run(
+            proc = await run_proc(
                 ["claude", "-p", "respond with the single word ok",
                  "--output-format", "json",
                  "--json-schema", '{"type":"object"}',
                  "--max-turns", "1"],
-                capture_output=True, text=True, timeout=90,
+                timeout=90,
             )
             if proc.returncode != 0:
                 die(f"claude -p smoke test failed (exit {proc.returncode}):\n"
@@ -308,13 +437,6 @@ _ID_PREFIXES = frozenset({
 def validate_plan(subtasks: dict) -> None:
     """Structural validation of the merged plan — pure Python set operations."""
     errors: list[str] = []
-
-    # duplicate ids cause silent filesystem collisions
-    seen: set[str] = set()
-    for sid in subtasks:
-        if sid in seen:
-            errors.append(f"duplicate subtask id: {sid!r}")
-        seen.add(sid)
 
     # all provides tags across every subtask — used for requires resolution
     all_provides: set[str] = set()
@@ -399,11 +521,10 @@ def lock_criteria(sid: str, centella_dir: Path, st: State) -> None:
     path = centella_dir / "criteria" / f"{sid}.md"
     if not path.exists():
         return
-    with st._lock:
-        locks = st.data.setdefault("criteria_locks", {})
-        if sid not in locks:
-            locks[sid] = _hash_file(path)
-            st.save()
+    locks = st.data.setdefault("criteria_locks", {})
+    if sid not in locks:
+        locks[sid] = _hash_file(path)
+        st.save()
 
 
 def verify_criteria_lock(sid: str, centella_dir: Path, st: State) -> None:
@@ -419,6 +540,92 @@ def verify_criteria_lock(sid: str, centella_dir: Path, st: State) -> None:
             f"{sid}: criteria file was modified after being locked "
             f"(stored={locks[sid][:8]}, current={current[:8]}). "
             "Implementer may have lowered its own bar — escalating.")
+
+
+# --- proposal-only criteria revision (DESIGN §9) -----------------------------
+# The implementer cannot apply its own revision — the lock prevents it.
+# Instead it returns a `criteria_revision_proposal` and the orchestrator
+# decides. The decision is a structural-minimum check: code can verify a
+# proposal is well-formed and points at real artifacts, but cannot judge
+# its semantic merit (per DESIGN §12 — orchestrator does only what can be
+# checked mechanically). Every proposal, approved or rejected, is logged.
+
+def _proposal_structurally_valid(proposal: dict, worktree: str) -> str | None:
+    """Return None if the proposal passes the structural minimum, else an
+    error string. The minimum: both fields non-empty after strip, and the
+    evidence references at least one path that actually exists in the
+    worktree (file:line citations, test names that map to a real file).
+    Cannot judge the proposal's semantic merit — see module-level comment."""
+    proposed_text = (proposal.get("proposed_text") or "").strip()
+    if not proposed_text:
+        return "proposed_text is empty"
+    evidence = (proposal.get("evidence") or "").strip()
+    if not evidence:
+        return "evidence is empty"
+    # The evidence must reference at least one real artifact in the worktree.
+    # Scan tokens that look like paths (contain "/") or look like file:line
+    # citations, and require at least one to resolve to an existing path.
+    candidates: list[str] = []
+    for tok in evidence.replace(",", " ").split():
+        # strip common surrounding punctuation
+        cleaned = tok.strip("`'\"()[]{}.,;:")
+        if not cleaned:
+            continue
+        # file:line → take the file part
+        if ":" in cleaned:
+            cleaned = cleaned.split(":", 1)[0]
+        if "/" in cleaned or cleaned.endswith((".py", ".md", ".sh",
+                                                ".js", ".ts", ".go",
+                                                ".rs", ".java", ".rb",
+                                                ".cpp", ".c", ".h",
+                                                ".json", ".yaml", ".yml",
+                                                ".toml")):
+            candidates.append(cleaned)
+    wt = Path(worktree)
+    for c in candidates:
+        # try both absolute and relative-to-worktree
+        if Path(c).exists() or (wt / c).exists():
+            return None
+    return ("evidence cites no path that exists in the worktree — "
+            f"checked candidates: {candidates[:5] or '(none found)'}")
+
+
+def record_criteria_revision(sid: str, st: State, evidence: str, status: str,
+                              old_hash: str | None, new_hash: str | None,
+                              rejection_reason: str | None = None) -> None:
+    """Append one entry to state.data['criteria_revisions']. Append-only;
+    every proposal (approved or rejected) is logged for audit per DESIGN §9
+    'every approved revision is logged with its justification' — extended to
+    also log rejections so a reader can see what was tried."""
+    entry = {
+        "sid": sid, "timestamp": now(), "status": status,
+        "evidence": evidence,
+    }
+    if old_hash is not None:
+        entry["old_hash"] = old_hash
+    if new_hash is not None:
+        entry["new_hash"] = new_hash
+    if rejection_reason is not None:
+        entry["rejection_reason"] = rejection_reason
+    st.data.setdefault("criteria_revisions", []).append(entry)
+    st.save()
+
+
+def apply_criteria_revision(sid: str, centella_dir: Path, st: State,
+                             proposed_text: str) -> tuple[str, str]:
+    """Write the new criteria file and update the lock hash to match.
+    Returns (old_hash, new_hash). Caller must have already validated the
+    proposal — this function does not re-check; it just commits the change."""
+    path = centella_dir / "criteria" / f"{sid}.md"
+    old_hash = _hash_file(path) if path.exists() else ""
+    path.write_text(proposed_text)
+    new_hash = _hash_file(path)
+    # Update the lock to the new hash so verify_criteria_lock does not fire
+    # on the next loop. Without this the orchestrator would immediately
+    # reject the file *it just wrote*.
+    st.data.setdefault("criteria_locks", {})[sid] = new_hash
+    st.save()
+    return old_hash, new_hash
 
 
 # --- checkpoint validation ---------------------------------------------------
@@ -485,19 +692,27 @@ def validate_result(result: dict,
     elif status == "blocked":
         if not (result.get("blocker") or "").strip():
             return "status='blocked' but blocker field is empty"
+    elif status == "failed":
+        # A `failed` result without a summary is a worker contract violation:
+        # the prompt requires a diagnosis, and `_retryable_failure` needs real
+        # text to classify against. Without it the run drops a canned string
+        # ("worker reported failure") into the retry classifier — terminal,
+        # but with no actionable record of what went wrong.
+        if not (result.get("summary") or "").strip():
+            return "status='failed' but summary is empty — no diagnosis provided"
     return None
 
 
 # --- post-implementation diff scope check ------------------------------------
 
-def check_diff_scope(sid: str, worktree: str, subtask: dict,
-                     st: State) -> str | None:
+async def check_diff_scope(sid: str, worktree: str, subtask: dict,
+                           st: State) -> str | None:
     """Check the implementer's diff for violations.
     Returns a fatal error string if protected paths were touched.
     Logs a non-fatal warning for unexpected scope. Returns None when clean."""
-    r = subprocess.run(
+    r = await run_proc(
         ["git", "diff", "--name-only", "centella/staging..HEAD"],
-        cwd=worktree, capture_output=True, text=True,
+        cwd=worktree,
     )
     if r.returncode != 0:
         return None
@@ -520,18 +735,17 @@ def check_diff_scope(sid: str, worktree: str, subtask: dict,
     if over_ratio or over_volume:
         reason = f"touched {len(touched)} files, expected ~{len(expected)}"
         log(f"  ⚠  scope warning {sid}: {reason}")
-        with st._lock:
-            st.data.setdefault("scope_warnings", {})[sid] = {
-                "touched": touched, "expected": expected, "reason": reason,
-            }
-            st.save()
+        st.data.setdefault("scope_warnings", {})[sid] = {
+            "touched": touched, "expected": expected, "reason": reason,
+        }
+        st.save()
 
     return None
 
 
 # --- post-integrator commit check --------------------------------------------
 
-def check_merge_committed(staging: Path) -> str | None:
+async def check_merge_committed(staging: Path) -> str | None:
     """Return an error if the staging worktree is still mid-merge.
 
     An integrator that returns status 'resolved' must have completed the merge
@@ -539,17 +753,17 @@ def check_merge_committed(staging: Path) -> str | None:
     worker claimed success while leaving the worktree in a broken mid-merge
     state. This is the integrator-side analogue of `check_branch_has_commits`:
     it catches a worker lying about having finished."""
-    r = subprocess.run(
+    r = await run_proc(
         ["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-        cwd=str(staging), capture_output=True, text=True,
+        cwd=str(staging),
     )
     if r.returncode == 0:
         return ("the staging worktree is still mid-merge (MERGE_HEAD exists) — "
                 "the integrator did not complete the merge commit")
     # also reject a worktree left with staged-but-uncommitted conflict edits
-    s = subprocess.run(
+    s = await run_proc(
         ["git", "diff", "--cached", "--name-only"],
-        cwd=str(staging), capture_output=True, text=True,
+        cwd=str(staging),
     )
     if s.returncode == 0 and s.stdout.strip():
         return ("the staging worktree has staged but uncommitted changes — "
@@ -557,12 +771,12 @@ def check_merge_committed(staging: Path) -> str | None:
     return None
 
 
-def check_integrator_commit(staging: Path) -> str | None:
+async def check_integrator_commit(staging: Path) -> str | None:
     """Return an error if the integrator's merge commit touched .centella/ files.
     The integrator should only touch project files, never coordination artifacts."""
-    r = subprocess.run(
+    r = await run_proc(
         ["git", "show", "--name-only", "--format=", "HEAD"],
-        cwd=str(staging), capture_output=True, text=True,
+        cwd=str(staging),
     )
     if r.returncode != 0:
         return None
@@ -575,16 +789,16 @@ def check_integrator_commit(staging: Path) -> str | None:
 
 # --- branch-has-commits verification -----------------------------------------
 
-def check_branch_has_commits(sid: str, worktree: str) -> str | None:
+async def check_branch_has_commits(sid: str, worktree: str) -> str | None:
     """Return error if the implementer's branch has no commits ahead of staging.
     An empty diff means the worker produced schema-valid JSON claiming success
     while doing nothing — a silent no-op that wastes an integration attempt."""
     if not Path(worktree).exists():
         return None  # worktree gone — can't determine, don't block
     try:
-        r = subprocess.run(
+        r = await run_proc(
             ["git", "log", "centella/staging..HEAD", "--oneline"],
-            cwd=worktree, capture_output=True, text=True,
+            cwd=worktree,
         )
     except OSError:
         return None
@@ -598,15 +812,15 @@ def check_branch_has_commits(sid: str, worktree: str) -> str | None:
 
 # --- conflict marker scan post-integration -----------------------------------
 
-def scan_conflict_markers(staging: Path) -> str | None:
+async def scan_conflict_markers(staging: Path) -> str | None:
     """Return error if unresolved conflict markers remain in the staging tree.
     git grep exit 0 = matches found (bad); exit 1 = clean (good)."""
     if not staging.exists():
         return None
     try:
-        r = subprocess.run(
+        r = await run_proc(
             ["git", "grep", "-l", "^<<<<<<< ", "HEAD"],
-            cwd=str(staging), capture_output=True, text=True,
+            cwd=str(staging),
         )
     except OSError:
         return None
@@ -670,11 +884,10 @@ class WorkerError(RuntimeError):
     pass
 
 
-def _invoke(cmd: list[str], cwd: str, timeout: int) -> dict:
+async def _invoke(cmd: list[str], cwd: str, timeout: int) -> dict:
     """Run a `claude -p` command once; return the parsed JSON envelope."""
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True,
-                              text=True, timeout=timeout)
+        proc = await run_proc(cmd, cwd=cwd, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise WorkerError(f"worker timed out after {timeout}s")
     if proc.returncode != 0:
@@ -685,9 +898,9 @@ def _invoke(cmd: list[str], cwd: str, timeout: int) -> dict:
         raise WorkerError("claude -p did not return a valid JSON envelope")
 
 
-def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
-             cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
-             caps: dict, st: "State", model: str | None = None) -> dict:
+async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
+                   cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
+                   caps: dict, st: "State") -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
 
@@ -715,8 +928,6 @@ def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # acting workers run inside an isolated worktree; skipping prompts
             # is what makes the run unattended. Blast radius is the worktree.
             cmd.append("--dangerously-skip-permissions")
-        if model:
-            cmd += ["--model", model]
         return cmd
 
     timeout = caps["worker_timeout_sec"]
@@ -725,7 +936,7 @@ def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         retry_note = ("" if attempt == 1 else
                       f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
                       "Return output that conforms exactly to the required schema.")
-        envelope = _invoke(build(retry_note), cwd, timeout)
+        envelope = await _invoke(build(retry_note), cwd, timeout)
 
         # record run-weight telemetry
         st.add_telemetry(envelope)
@@ -756,12 +967,16 @@ def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 # run state — persisted so a run is observable and resumable
 # =========================================================================
 class State:
+    """In-memory run state with atomic on-disk persistence.
+
+    No lock: every mutator runs on the single asyncio event loop, so reads and
+    writes are not preempted mid-statement. Concurrent `claude -p` workers
+    spawned via `asyncio.gather` interleave only at `await` points, which never
+    fall inside a `st.data[k] = v; st.save()` pair."""
+
     def __init__(self, centella_dir: Path):
         self.path = centella_dir / "state.json"
         self.data: dict = {}
-        # RLock (reentrant) so callers that already hold the lock can call
-        # save() without deadlocking.
-        self._lock = __import__("threading").RLock()
 
     def load(self) -> bool:
         if self.path.exists():
@@ -770,23 +985,15 @@ class State:
         return False
 
     def save(self) -> None:
-        """Atomic write via temp-file rename — safe to call from any thread."""
-        with self._lock:
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, indent=2))
-            tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
-
-    def update(self, key: str, value) -> None:
-        """Thread-safe single-key update + save."""
-        with self._lock:
-            self.data[key] = value
-            self.save()
+        """Atomic write via temp-file rename."""
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2))
+        tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
 
     def bump_workers(self, caps: dict) -> None:
-        with self._lock:
-            self.data["worker_count"] = self.data.get("worker_count", 0) + 1
-            count = self.data["worker_count"]
-            self.save()
+        self.data["worker_count"] = self.data.get("worker_count", 0) + 1
+        count = self.data["worker_count"]
+        self.save()
         if count > caps["max_total_workers"]:
             raise WorkerError(
                 f"worker budget exhausted ({caps['max_total_workers']}). "
@@ -797,29 +1004,28 @@ class State:
         """Accumulate run-weight signals from a worker envelope. On a
         subscription the dollar figure is not billed, but it and the token
         counts are a useful proxy for how heavy the run is."""
-        with self._lock:
-            t = self.data.setdefault("telemetry", {"calls": 0, "cost_usd": 0.0,
-                                                   "input_tokens": 0,
-                                                   "output_tokens": 0})
-            t["calls"] += 1
-            t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
-            usage = envelope.get("usage") or {}
-            t["input_tokens"] += int(usage.get("input_tokens") or 0)
-            t["output_tokens"] += int(usage.get("output_tokens") or 0)
-            self.save()
+        t = self.data.setdefault("telemetry", {"calls": 0, "cost_usd": 0.0,
+                                               "input_tokens": 0,
+                                               "output_tokens": 0})
+        t["calls"] += 1
+        t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
+        usage = envelope.get("usage") or {}
+        t["input_tokens"] += int(usage.get("input_tokens") or 0)
+        t["output_tokens"] += int(usage.get("output_tokens") or 0)
+        self.save()
 
 
 # =========================================================================
 # phases
 # =========================================================================
-def phase_classify(task: str, st: State, caps: dict, no_clarify: bool) -> dict:
+async def phase_classify(task: str, st: State, caps: dict, no_clarify: bool) -> dict:
     """Phase 1 (classify), which also produces the Phase 0 clarification
     questions: classify the task and surface only genuinely underivable
     (intent-level) questions."""
     log("phase 1: classifying task")
     sys_prompt = (PROMPTS / "classifier.md").read_text()
     st.bump_workers(caps)
-    result = claude_p(
+    result = await claude_p(
         user_prompt=f"TASK:\n{task}\n\nClassify it and apply the clarification filter.",
         system_prompt=sys_prompt, schema_key="classifier", cwd=os.getcwd(),
         allowed_tools=READ_TOOLS, max_turns=20, autonomous=False,
@@ -838,11 +1044,37 @@ def phase_classify(task: str, st: State, caps: dict, no_clarify: bool) -> dict:
 
 
 def gather_answers(st: State, supplied: dict | None) -> dict:
-    """Collect clarification answers — from --answers, from a TTY prompt, or
-    (no TTY, no answers) defer by writing pending-questions.json and exiting."""
+    """Collect clarification answers — from --answers, from the resolved
+    source-of-truth preference, from a TTY prompt, or (no TTY, no answers)
+    defer by writing pending-questions.json and exiting."""
     questions = st.data.get("classifier_questions", [])
     need_sot = st.data.get("needs_source_of_truth", False)
+    sot_pref = st.data.get("source_of_truth_pref", "ask")
     answers: dict = dict(supplied or {})
+
+    provided_sot = answers.get("source_of_truth")
+    if provided_sot is not None and provided_sot not in SOURCE_OF_TRUTH_ANSWERS:
+        die(f"source_of_truth={provided_sot!r} is not one of "
+            f"{SOURCE_OF_TRUTH_ANSWERS}")
+
+    # If the preference is preset (not 'ask') and the classifier flagged a
+    # feature task, satisfy source_of_truth from the preference without
+    # asking. See DESIGN.md §11.
+    if need_sot and "source_of_truth" not in answers and sot_pref != "ask":
+        answers["source_of_truth"] = sot_pref
+
+    # --no-clarify means "skip clarification entirely" per DESIGN §11. If
+    # the source-of-truth is still missing at this point — preference is
+    # 'ask' and no answer was pre-supplied — default to 'codebase' and warn
+    # rather than block. DESIGN's rationale: the caller invoked --no-clarify
+    # to guarantee the task is fully specified, so any remaining question
+    # must be resolved by the orchestrator without user interaction.
+    if (st.data.get("no_clarify") and need_sot
+            and "source_of_truth" not in answers):
+        answers["source_of_truth"] = "codebase"
+        log("--no-clarify with no source-of-truth preference set; defaulting "
+            f"to 'codebase' (set {SOURCE_OF_TRUTH_ENV} or {SOURCE_OF_TRUTH_FILE} "
+            "to choose a different default)")
 
     pending = [q for q in questions if q.get("id") not in answers]
     sot_missing = need_sot and "source_of_truth" not in answers
@@ -858,6 +1090,7 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
         (centella_dir / "pending-questions.json").write_text(json.dumps({
             "questions": pending,
             "source_of_truth": sot_missing,
+            "source_of_truth_hint": _source_of_truth_hint() if sot_missing else None,
         }, indent=2))
         log("clarification needed; wrote .centella/pending-questions.json")
         sys.exit(EXIT_NEEDS_ANSWERS)
@@ -868,45 +1101,53 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
             print(f"  (underivable: {q['why_underivable']})")
         answers[q["id"]] = input("  > ").strip()
     if sot_missing:
-        print("\n? Build feature work from existing codebase patterns, "
-              "or from researched best-practice standards?")
-        choice = input("  [patterns/research] > ").strip().lower()
-        answers["source_of_truth"] = (
-            "researched-standards" if choice.startswith("r") else "existing-patterns")
+        print("\n? Build feature work from the existing codebase's patterns, "
+              "from researched best-practice standards, or both?")
+        print(f"  ({_source_of_truth_hint()})")
+        choice = input("  [codebase/research/both] > ").strip().lower()
+        if choice.startswith("c"):
+            answers["source_of_truth"] = "codebase"
+        elif choice.startswith("r"):
+            answers["source_of_truth"] = "research"
+        elif choice.startswith("b"):
+            answers["source_of_truth"] = "both"
+        else:
+            die("source-of-truth answer must be codebase, research, or both")
 
     st.data["answers"] = answers
     st.save()
     return answers
 
 
-def phase_plan(task: str, st: State, caps: dict) -> list[dict]:
-    """Phase 2: one planner per category, run in parallel. Each returns a
-    JSON plan of granular subtasks."""
+async def phase_plan(task: str, st: State, caps: dict) -> list[dict]:
+    """Phase 2: one planner per category, run in parallel (bounded by
+    max_parallel). Each returns a JSON plan of granular subtasks."""
     log("phase 2: planning")
     cats = st.data["categories"]
     answers = st.data.get("answers", {})
-    sot = answers.get("source_of_truth", "existing-patterns")
+    sot = answers.get("source_of_truth", "codebase")
     sys_prompt = (PROMPTS / "planner.md").read_text()
     ctx = json.dumps({"task": task, "source_of_truth": sot,
                       "clarification_answers": answers}, indent=2)
 
-    def plan_one(category: str) -> dict:
-        st.bump_workers(caps)
-        up = (f"DOMAIN: {category}\n\nCONTEXT:\n{ctx}\n\n"
-              f"Decompose the {category} aspect of this task into a JSON plan "
-              "per your instructions.")
-        return claude_p(user_prompt=up, system_prompt=sys_prompt,
-                        schema_key="planner", cwd=os.getcwd(),
-                        allowed_tools=READ_TOOLS, max_turns=40,
-                        autonomous=False, caps=caps, st=st)
+    sem = asyncio.Semaphore(caps["max_parallel"])
 
-    plans = []
-    with ThreadPoolExecutor(max_workers=caps["max_parallel"]) as ex:
-        for category, plan in zip(cats, ex.map(plan_one, cats)):
-            n = len(plan.get("subtasks", []))
-            log(f"  {category}: {n} subtask(s)")
-            plans.append(plan)
-    return plans
+    async def plan_one(category: str) -> dict:
+        async with sem:
+            st.bump_workers(caps)
+            up = (f"DOMAIN: {category}\n\nCONTEXT:\n{ctx}\n\n"
+                  f"Decompose the {category} aspect of this task into a JSON plan "
+                  "per your instructions.")
+            return await claude_p(user_prompt=up, system_prompt=sys_prompt,
+                                  schema_key="planner", cwd=os.getcwd(),
+                                  allowed_tools=READ_TOOLS, max_turns=40,
+                                  autonomous=False, caps=caps, st=st)
+
+    plans = await gather_or_cancel(*(plan_one(c) for c in cats))
+    for category, plan in zip(cats, plans):
+        n = len(plan.get("subtasks", []))
+        log(f"  {category}: {n} subtask(s)")
+    return list(plans)
 
 
 def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
@@ -958,7 +1199,7 @@ def write_plan(centella_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
     answers = st.data.get("answers", {})
-    sot = answers.get("source_of_truth", "existing-patterns")
+    sot = answers.get("source_of_truth", "codebase")
     (centella_dir / "plan.json").write_text(json.dumps(
         {"task": task, "waves": waves, "subtasks": subtasks}, indent=2))
     sub_dir = centella_dir / "subtasks"
@@ -974,12 +1215,12 @@ def write_plan(centella_dir: Path, task: str, st: State,
     st.save()
 
 
-def run_implementer(sid: str, centella_dir: Path, caps: dict, st: State,
-                    continuation: bool = False, note: str = "") -> dict:
+async def run_implementer(sid: str, centella_dir: Path, caps: dict, st: State,
+                          continuation: bool = False, note: str = "") -> dict:
     """Spawn one implementer for one subtask in its own worktree. Handles
     handoff continuations up to the cap."""
     sys_prompt = (PROMPTS / "implementer.md").read_text()
-    proc = run_script("new-worktree.sh", sid)
+    proc = await run_script("new-worktree.sh", sid)
     if proc.returncode != 0:
         raise WorkerError(f"worktree creation failed for {sid}: {proc.stderr.strip()}")
     worktree = proc.stdout.strip().splitlines()[-1]
@@ -998,10 +1239,10 @@ def run_implementer(sid: str, centella_dir: Path, caps: dict, st: State,
 
     st.bump_workers(caps)
     try:
-        return claude_p(user_prompt="\n".join(up), system_prompt=sys_prompt,
-                        schema_key="implementer", cwd=worktree,
-                        allowed_tools=ACT_TOOLS, max_turns=120,
-                        autonomous=True, caps=caps, st=st)
+        return await claude_p(user_prompt="\n".join(up), system_prompt=sys_prompt,
+                              schema_key="implementer", cwd=worktree,
+                              allowed_tools=ACT_TOOLS, max_turns=120,
+                              autonomous=True, caps=caps, st=st)
     except WorkerError as e:
         # worker could not return schema-valid output even after a retry
         # (e.g. it hit --max-turns mid-task) -> treat as a handoff so a fresh
@@ -1035,7 +1276,7 @@ def _retryable_failure(reason: str) -> bool:
     return any(m in reason for m in retryable_markers)
 
 
-def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
+async def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
     """Drive one subtask to a terminal state.
 
     Two bounded escalation paths, both code-enforced:
@@ -1047,6 +1288,7 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
     result."""
     continuations = 0
     retries = 0
+    revision_retries = 0   # DESIGN §9: at most one revision-driven retry per subtask
     note = ""
     continuation = False
     worktree = str(centella_dir / "worktrees" / sid)
@@ -1059,9 +1301,8 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
         caller should loop for one more corrective attempt."""
         nonlocal retries, continuation, note
         res = {"subtask_id": sid, "status": "failed", "summary": reason}
-        with st._lock:
-            st.data.setdefault("subtask_status", {})[sid] = "failed"
-            st.save()
+        st.data.setdefault("subtask_status", {})[sid] = "failed"
+        st.save()
         lock_criteria(sid, centella_dir, st)
         if not _retryable_failure(reason):
             log(f"  {sid}: non-retryable failure — terminating: {reason}")
@@ -1082,8 +1323,8 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
         # iteration, when no lock exists yet.
         verify_criteria_lock(sid, centella_dir, st)
 
-        res = run_implementer(sid, centella_dir, caps, st,
-                              continuation=continuation, note=note)
+        res = await run_implementer(sid, centella_dir, caps, st,
+                                    continuation=continuation, note=note)
 
         # cross-field invariant check — catches a worker that lied about
         # status. A self-contradictory result means the worker is malfunctioning
@@ -1097,14 +1338,42 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
             continue
 
         status = res.get("status")
-        with st._lock:
-            st.data.setdefault("subtask_status", {})[sid] = status
-            st.save()
+        st.data.setdefault("subtask_status", {})[sid] = status
+        st.save()
+
+        # DESIGN §9: proposal-only criteria revision. If the implementer
+        # included a proposal alongside its result, the orchestrator decides
+        # whether to apply it (structural-minimum check) and logs every
+        # decision. Approved proposals overwrite the criteria file and the
+        # lock; if the implementer originally returned `failed` against the
+        # old criteria, it gets one retry against the new ones.
+        proposal = res.get("criteria_revision_proposal")
+        if proposal:
+            err = _proposal_structurally_valid(proposal, worktree)
+            if err:
+                record_criteria_revision(sid, st, proposal.get("evidence", ""),
+                                         "rejected", None, None,
+                                         rejection_reason=err)
+                log(f"  {sid}: criteria revision rejected: {err}")
+            else:
+                old_hash, new_hash = apply_criteria_revision(
+                    sid, centella_dir, st, proposal["proposed_text"])
+                record_criteria_revision(sid, st, proposal["evidence"],
+                                         "approved", old_hash, new_hash)
+                log(f"  {sid}: criteria revision approved "
+                    f"(old={old_hash[:8] or '(new file)'}, new={new_hash[:8]})")
+                if status == "failed" and revision_retries == 0:
+                    revision_retries += 1
+                    log(f"  {sid}: retrying once against revised criteria")
+                    continuation = False
+                    note = ("Criteria were revised based on your proposal — "
+                            "retry against the new criteria.")
+                    continue
 
         if status == "complete":
             # a 'complete' claim with no commits is a retryable mistake —
             # the worker may genuinely have work to commit and just forgot
-            commit_err = check_branch_has_commits(sid, worktree)
+            commit_err = await check_branch_has_commits(sid, worktree)
             if commit_err:
                 log(f"  branch check failed for {sid}: {commit_err}")
                 done = fail(commit_err)
@@ -1112,10 +1381,8 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
                     return done
                 continue
             # uncommitted changes — retryable, same reasoning
-            wt_status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=worktree, capture_output=True, text=True,
-            )
+            wt_status = await run_proc(
+                ["git", "status", "--porcelain"], cwd=worktree)
             dirty = [l for l in wt_status.stdout.splitlines()
                      if l and not l.startswith("??")]
             if dirty:
@@ -1127,7 +1394,7 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
             lock_criteria(sid, centella_dir, st)
             # protected-path violation — the worker wrote to .git/ etc.: it is
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
-            scope_err = check_diff_scope(sid, worktree, subtask, st)
+            scope_err = await check_diff_scope(sid, worktree, subtask, st)
             if scope_err:
                 done = fail(scope_err)
                 if done is not None:
@@ -1164,8 +1431,8 @@ def settle_subtask(sid: str, centella_dir: Path, caps: dict, st: State) -> dict:
         return res
 
 
-def integrate_wave(wave: list[str], results: dict[str, dict],
-                   centella_dir: Path, caps: dict, st: State) -> list[str]:
+async def integrate_wave(wave: list[str], results: dict[str, dict],
+                         centella_dir: Path, caps: dict, st: State) -> list[str]:
     """Merge each completed subtask branch into staging (git merge, not
     cherry-pick); resolve conflicts with an integrator worker. Returns the
     list of integrated ids.
@@ -1179,12 +1446,25 @@ def integrate_wave(wave: list[str], results: dict[str, dict],
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
             continue
-        proc = run_script("integrate.sh", sid)
+        proc = await run_script("integrate.sh", sid)
         if proc.returncode == 0:
             integrated.append(sid)
             integrated_so_far.append(sid)
             continue
-        # conflict: staging worktree is mid-merge — hand to an integrator
+        if proc.returncode == 2:
+            # exit 2 from integrate.sh is a precondition failure (staging
+            # worktree or subtask branch missing) — not a merge conflict.
+            # Spawning an integrator against a missing worktree fails in
+            # confusing ways, so abort here with the script's own message.
+            # Save state first (local convention — see the two neighboring
+            # die() sites below) so `--resume` can pick up what was done.
+            reason = (f"integrate.sh precondition failure: "
+                      f"{proc.stderr.strip() or proc.stdout.strip() or 'no message'}")
+            st.data.setdefault("blocked", {})[sid] = reason
+            st.save()
+            die(f"integrate.sh precondition failure for {sid}: "
+                f"{proc.stderr.strip() or proc.stdout.strip() or 'no message'}")
+        # exit 1 (conflict): staging worktree is mid-merge — hand to an integrator
         log(f"  conflict integrating {sid}; spawning integrator")
         sys_prompt = (PROMPTS / "integrator.md").read_text()
         up = (f"Resolve the in-progress merge conflict in this worktree.\n"
@@ -1193,33 +1473,30 @@ def integrate_wave(wave: list[str], results: dict[str, dict],
               f"Already-integrated subtasks it may conflict with: "
               f"{', '.join(integrated_so_far) or 'none'}")
         st.bump_workers(caps)
-        ires = claude_p(user_prompt=up, system_prompt=sys_prompt,
-                        schema_key="integrator", cwd=str(staging),
-                        allowed_tools=ACT_TOOLS, max_turns=60,
-                        autonomous=True, caps=caps, st=st)
+        ires = await claude_p(user_prompt=up, system_prompt=sys_prompt,
+                              schema_key="integrator", cwd=str(staging),
+                              allowed_tools=ACT_TOOLS, max_turns=60,
+                              autonomous=True, caps=caps, st=st)
         if ires.get("status") == "resolved":
             # the integrator must have actually committed the merge — a
             # 'resolved' claim with the worktree still mid-merge is a lie,
             # the integrator-side analogue of check_branch_has_commits.
-            merge_err = check_merge_committed(staging)
+            merge_err = await check_merge_committed(staging)
             if merge_err:
-                subprocess.run(["git", "merge", "--abort"],
-                               cwd=str(staging), capture_output=True)
-                with st._lock:
-                    st.data["integrator_failure"] = {
-                        "subtask": sid,
-                        "reason": f"integrator claimed 'resolved' but {merge_err}"}
-                    st.save()
+                await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+                st.data["integrator_failure"] = {
+                    "subtask": sid,
+                    "reason": f"integrator claimed 'resolved' but {merge_err}"}
+                st.save()
                 die(f"integrator for {sid} returned 'resolved' but {merge_err}. "
                     f"The merge was aborted; centella/staging is clean. "
                     f"State saved — resolve and re-run with --resume.")
-            commit_err = check_integrator_commit(staging)
+            commit_err = await check_integrator_commit(staging)
             if commit_err:
                 # non-fatal: log and record, but don't undo the integration
                 log(f"  ⚠  integrator commit warning for {sid}: {commit_err}")
-                with st._lock:
-                    st.data.setdefault("integrator_warnings", {})[sid] = commit_err
-                    st.save()
+                st.data.setdefault("integrator_warnings", {})[sid] = commit_err
+                st.save()
             integrated.append(sid)
             integrated_so_far.append(sid)
         else:
@@ -1231,13 +1508,11 @@ def integrate_wave(wave: list[str], results: dict[str, dict],
                          or "no diagnosis provided")
             log(f"  integrator could not resolve {sid}: "
                 f"{ires.get('status')} — {diagnosis}")
-            subprocess.run(["git", "merge", "--abort"],
-                           cwd=str(staging), capture_output=True)
-            with st._lock:
-                st.data["integrator_failure"] = {
-                    "subtask": sid, "status": ires.get("status"),
-                    "diagnosis": diagnosis}
-                st.save()
+            await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+            st.data["integrator_failure"] = {
+                "subtask": sid, "status": ires.get("status"),
+                "diagnosis": diagnosis}
+            st.save()
             die(f"integrator could not integrate {sid} "
                 f"({ires.get('status')}): {diagnosis}\n"
                 f"The in-progress merge was aborted; centella/staging is intact "
@@ -1247,8 +1522,8 @@ def integrate_wave(wave: list[str], results: dict[str, dict],
     return integrated
 
 
-def validate_wave(wave: list[str], centella_dir: Path, caps: dict,
-                  st: State) -> dict:
+async def validate_wave(wave: list[str], centella_dir: Path, caps: dict,
+                        st: State) -> dict:
     """Re-run every wave subtask's frozen criteria against integrated staging.
     Tries the deterministic test runner first; falls back to LLM only on
     failure or when no runner was detected."""
@@ -1263,16 +1538,20 @@ def validate_wave(wave: list[str], centella_dir: Path, caps: dict,
     runner = st.data.get("test_runner")
     if runner:
         log(f"  running deterministic test suite: {' '.join(runner)}")
-        r = subprocess.run(runner, cwd=str(staging), capture_output=True,
-                           text=True, timeout=600)
-        if r.returncode == 0:
-            log("  staging tests pass — skipping LLM validator")
-            return {"results": [
-                {"subtask_id": sid, "all_criteria_met": True, "failing": []}
-                for sid in wave
-            ]}
-        log(f"  tests failed (exit {r.returncode}) — "
-            "falling through to LLM validator for diagnosis")
+        try:
+            r = await run_proc(runner, cwd=str(staging), timeout=600)
+        except subprocess.TimeoutExpired:
+            log("  deterministic test suite exceeded 600s — "
+                "falling through to LLM validator for diagnosis")
+        else:
+            if r.returncode == 0:
+                log("  staging tests pass — skipping LLM validator")
+                return {"results": [
+                    {"subtask_id": sid, "all_criteria_met": True, "failing": []}
+                    for sid in wave
+                ]}
+            log(f"  tests failed (exit {r.returncode}) — "
+                "falling through to LLM validator for diagnosis")
 
     # LLM validator: runs criteria that aren't captured by the test suite,
     # or diagnoses why the test suite failed
@@ -1282,18 +1561,27 @@ def validate_wave(wave: list[str], centella_dir: Path, caps: dict,
           "\n".join(f"- subtask {sid}: {path}"
                     for sid, path in zip(wave, criteria)))
     st.bump_workers(caps)
-    return claude_p(user_prompt=up, system_prompt=VALIDATOR_SYSTEM,
-                    schema_key="validator", cwd=str(staging),
-                    allowed_tools=ACT_TOOLS, max_turns=40,
-                    autonomous=True, caps=caps, st=st)
+    return await claude_p(user_prompt=up, system_prompt=VALIDATOR_SYSTEM,
+                          schema_key="validator", cwd=str(staging),
+                          allowed_tools=RUN_TOOLS, max_turns=40,
+                          autonomous=True, caps=caps, st=st)
 
 
-def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
-    """Phase 5: run waves sequentially; within a wave, subtasks in parallel."""
+async def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
+    """Phases 4-5: create staging, then run waves sequentially; within a wave,
+    subtasks in parallel (bounded by max_parallel)."""
     log("phase 4: creating staging worktree")
-    proc = run_script("setup-staging.sh")
+    proc = await run_script("setup-staging.sh")
     if proc.returncode != 0:
         die(f"staging setup failed: {proc.stderr.strip()}")
+
+    sem = asyncio.Semaphore(caps["max_parallel"])
+
+    async def settle_one(sid: str) -> tuple[str, dict]:
+        async with sem:
+            r = await settle_subtask(sid, centella_dir, caps, st)
+            log(f"  {sid}: {r.get('status')}")
+            return sid, r
 
     waves = st.data["waves"]
     start = st.data.get("completed_waves", 0)
@@ -1301,14 +1589,8 @@ def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
         wave = waves[wi]
         log(f"phase 5: wave {wi + 1}/{len(waves)} — {len(wave)} subtask(s)")
 
-        results: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=caps["max_parallel"]) as ex:
-            futs = {ex.submit(settle_subtask, sid, centella_dir, caps, st): sid
-                    for sid in wave}
-            for fut in futs:
-                sid = futs[fut]
-                results[sid] = fut.result()
-                log(f"  {sid}: {results[sid].get('status')}")
+        pairs = await gather_or_cancel(*(settle_one(sid) for sid in wave))
+        results: dict[str, dict] = dict(pairs)
 
         blocked = [s for s, r in results.items()
                    if r.get("status") in ("blocked", "failed")]
@@ -1319,12 +1601,12 @@ def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
                 f"See .centella/state.json; resolve and re-run with --resume.")
 
-        integrate_wave(wave, results, centella_dir, caps, st)
+        await integrate_wave(wave, results, centella_dir, caps, st)
 
         # deterministic: scan staging for unresolved conflict markers before
         # spending any validation workers — a marker means integration is broken
         staging_path = centella_dir / "worktrees" / "staging"
-        marker_err = scan_conflict_markers(staging_path)
+        marker_err = await scan_conflict_markers(staging_path)
         if marker_err:
             die(f"wave {wi + 1}: {marker_err}\n"
                 "Resolve manually in .centella/worktrees/staging, commit, "
@@ -1332,7 +1614,7 @@ def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
 
         # re-validate integrated staging; re-spawn failing implementers
         for attempt in range(caps["wave_revalidation_rounds"]):
-            v = validate_wave(wave, centella_dir, caps, st)
+            v = await validate_wave(wave, centella_dir, caps, st)
             failing = [r["subtask_id"] for r in v.get("results", [])
                        if not r.get("all_criteria_met", False)]
             if not failing:
@@ -1343,24 +1625,23 @@ def phase_execute(centella_dir: Path, st: State, caps: dict) -> None:
                 die(f"wave {wi + 1} fails staging validation after "
                     f"{caps['wave_revalidation_rounds']} rounds: {failing}")
             for sid in failing:
-                settle_subtask(sid, centella_dir, caps, st)  # add fixing commits
-                run_script("integrate.sh", sid)             # re-merge the delta
+                await settle_subtask(sid, centella_dir, caps, st)  # add fixing commits
+                await run_script("integrate.sh", sid)              # re-merge the delta
 
         st.data["completed_waves"] = wi + 1
         st.save()
 
 
-def phase_finalize(centella_dir: Path, st: State) -> None:
+async def phase_finalize(centella_dir: Path, st: State) -> None:
     log("phase 6: finalizing")
-    proc = run_script("finalize.sh")
+    proc = await run_script("finalize.sh")
     if proc.returncode != 0:
         die(f"finalize failed (staging is intact): {proc.stderr.strip()}")
-    run_script("cleanup.sh")
+    await run_script("cleanup.sh")
 
     # verify the merge commit actually landed on the working branch
-    r = subprocess.run(
+    r = await run_proc(
         ["git", "log", "--merges", "-1", "--format=%s", "HEAD"],
-        capture_output=True, text=True,
     )
     if r.returncode == 0 and "centella:" not in r.stdout:
         log("  ⚠  finalize warning: centella merge commit not found at HEAD — "
@@ -1368,9 +1649,8 @@ def phase_finalize(centella_dir: Path, st: State) -> None:
 
     # verify staging and the working branch are now identical — a non-empty
     # diff here means the merge silently dropped changes (data loss)
-    r = subprocess.run(
+    r = await run_proc(
         ["git", "diff", "--stat", "centella/staging..HEAD"],
-        capture_output=True, text=True,
     )
     if r.returncode == 0 and r.stdout.strip():
         log(f"  ⚠  finalize warning: working branch diverges from staging after merge:\n"
@@ -1393,6 +1673,52 @@ def phase_finalize(centella_dir: Path, st: State) -> None:
 # =========================================================================
 # entry point
 # =========================================================================
+async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
+                      sot_pref: str) -> None:
+    """The async portion of a run: every phase that spawns a `claude -p`
+    worker. main() handles sync setup, then drives this with `asyncio.run`."""
+    if args.resume:
+        if not st.load():
+            die("nothing to resume — no .centella/state.json")
+        validate_resume_state(st.data)
+        task = st.data["task"]
+        log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
+        if "waves" not in st.data:
+            die("cannot resume — run did not reach the scheduling phase")
+        # Refresh the preference in case the env var or centella.toml
+        # changed since the original run started.
+        st.data["source_of_truth_pref"] = sot_pref
+        st.save()
+    else:
+        if not args.task:
+            die("a task description is required (or use --resume)")
+        task = args.task
+        st.data = {"task": task, "started_at": now(), "worker_count": 0,
+                   "source_of_truth_pref": sot_pref,
+                   "no_clarify": bool(args.no_clarify)}
+        st.save()
+        await preflight(centella_dir, skip_smoke=args.skip_smoke)
+        supplied = (json.loads(Path(args.answers).read_text())
+                    if args.answers else None)
+        await phase_classify(task, st, caps, args.no_clarify)
+        # gather_answers blocks on input(). That's fine here: no concurrent
+        # tasks are scheduled yet, so blocking the loop blocks nothing. Kept
+        # on the event loop deliberately — every State mutation runs on the
+        # loop, which is why the lock-free State works.
+        gather_answers(st, supplied)
+        plans = await phase_plan(task, st, caps)
+        subtasks, waves = schedule(plans)
+        validate_plan(subtasks)
+        runner = detect_test_runner()
+        if runner:
+            log(f"detected test runner: {' '.join(runner)}")
+        st.data["test_runner"] = runner
+        write_plan(centella_dir, task, st, subtasks, waves)
+
+    await phase_execute(centella_dir, st, caps)
+    await phase_finalize(centella_dir, st)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="centella", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1402,7 +1728,10 @@ def main() -> None:
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--no-clarify", action="store_true",
-                    help="skip clarification; derive everything autonomously")
+                    help="skip clarification entirely (DESIGN §11): drop "
+                         "intent questions and satisfy the source-of-truth "
+                         "from CENTELLA_SOURCE_OF_TRUTH / centella.toml if "
+                         "set, otherwise default to 'codebase'")
     ap.add_argument("--max-workers", type=int,
                     help="override the total worker-invocation budget")
     ap.add_argument("--max-parallel", type=int,
@@ -1428,41 +1757,19 @@ def main() -> None:
         (centella_dir / sub).mkdir(parents=True, exist_ok=True)
     st = State(centella_dir)
 
-    try:
-        if args.resume:
-            if not st.load():
-                die("nothing to resume — no .centella/state.json")
-            validate_resume_state(st.data)
-            task = st.data["task"]
-            log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
-            if "waves" not in st.data:
-                die("cannot resume — run did not reach the scheduling phase")
-        else:
-            if not args.task:
-                die("a task description is required (or use --resume)")
-            task = args.task
-            st.data = {"task": task, "started_at": now(), "worker_count": 0}
-            st.save()
-            preflight(centella_dir, skip_smoke=args.skip_smoke)
-            supplied = (json.loads(Path(args.answers).read_text())
-                        if args.answers else None)
-            phase_classify(task, st, caps, args.no_clarify)
-            gather_answers(st, supplied)
-            plans = phase_plan(task, st, caps)
-            subtasks, waves = schedule(plans)
-            validate_plan(subtasks)
-            runner = detect_test_runner()
-            if runner:
-                log(f"detected test runner: {' '.join(runner)}")
-            st.data["test_runner"] = runner
-            write_plan(centella_dir, task, st, subtasks, waves)
+    # Resolve source-of-truth preference once per run. die()s on a bad value
+    # so a typo in centella.toml or the env var is caught at startup, not
+    # mid-planner.
+    sot_pref = resolve_source_of_truth(Path(os.getcwd()))
 
-        phase_execute(centella_dir, st, caps)
-        phase_finalize(centella_dir, st)
+    try:
+        asyncio.run(orchestrate(args, caps, centella_dir, st, sot_pref))
     except WorkerError as e:
         st.save()
         die(str(e))
     except KeyboardInterrupt:
+        # asyncio.run cancels pending tasks on KeyboardInterrupt; run_proc's
+        # CancelledError handler kills any in-flight child processes.
         st.save()
         die("interrupted — state saved; re-run with --resume", code=130)
 

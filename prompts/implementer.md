@@ -29,18 +29,36 @@ observable, documented check. Cover both the **explicit success condition** and
 **regression guards** — adjacent behavior that must not change.
 
 Write the criteria to `CENTELLA_DIR/criteria/<id>.md`. **Once you begin step 4,
-these criteria are frozen.** You may not rewrite them to make a failing result
-pass. If you find strong evidence the criteria were wrong, record a
-`proposed_criteria_revision` in your final result with the evidence — you do not
-apply it yourself. A self-revising checker lowers its own bar; that is the
-failure mode this rule prevents.
+these criteria are frozen.** You may not rewrite the file yourself — the
+orchestrator hashes it and will reject your result if it changes. A
+self-revising checker lowers its own bar; that is the failure mode this rule
+prevents.
+
+If you find strong evidence the criteria were genuinely wrong, return a
+`criteria_revision_proposal` object alongside your normal result:
+`{"proposed_text": "<full new criteria file body>", "evidence": "<why the
+current criteria are wrong, with file:line citations to real artifacts>"}`.
+The orchestrator will approve proposals that meet a structural minimum
+(non-empty fields; evidence cites at least one real path in the worktree) —
+writing the new criteria file and re-locking it — and reject the rest.
+Every decision is logged to `state.json["criteria_revisions"]`. If your
+result was `failed` and the proposal is approved, you get one retry against
+the new criteria.
 
 ### 2. Investigate and plan
 
 Read the relevant code. Trace the path from symptom to cause (bugs) or from
-requirement to integration points (everything else). Research online if the
-codebase lacks precedent and `source_of_truth` calls for it. Write a plan: the
-root cause / chosen approach, and the specific changes you will make.
+requirement to integration points (everything else). Run online research
+according to `source_of_truth`:
+
+- `codebase` — do not research online.
+- `research` — read online sources for current best-practice guidance,
+  preferring primary sources.
+- `both` — research only where the codebase lacks precedent. If the codebase
+  covers what you need, do not research.
+
+Write a plan: the root cause / chosen approach, and the specific changes you
+will make.
 
 ### 3. Evidence gate — pass it before you implement
 
@@ -144,9 +162,9 @@ Return **only** this JSON object as your final message — no prose, no fences:
   ],
   "confidence": {"root_cause": 9.5, "solution": 9.2, "basis": "which gates carry the evidence"},
   "checkpoint_path": null,
-  "proposed_criteria_revision": null,
   "blocker": null,
-  "summary": "What changed and how it was verified, in two or three sentences."
+  "summary": "What changed and how it was verified, in two or three sentences.",
+  "criteria_revision_proposal": null
 }
 ```
 
@@ -154,5 +172,3 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `incomplete-handoff` requires `checkpoint_path` set.
 - `blocked` requires `blocker` set with the precise missing evidence/input.
 - `failed` requires a diagnosis in `summary`.
-- `proposed_criteria_revision`, when non-null, must contain the proposed
-  criteria and the hard evidence that the original criteria were wrong.

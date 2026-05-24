@@ -178,10 +178,10 @@ topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable and aborts the run rather than being silently broken.
 
-This global graph is what makes category-first decomposition safe. The original
-worry — that decomposing by category fragments work that is actually coupled —
-is answered here: the coupling is not lost, it is recovered by the scheduler
-from the capability tags and enforced as wave ordering.
+Cross-domain dependencies are reconciled by the orchestrator from capability
+tags and enforced as wave ordering. Planners can therefore run in parallel
+without coordination: the coupling between their outputs is recovered globally
+by the scheduler.
 
 ### Why waves are sequential
 
@@ -250,11 +250,20 @@ the behavior one of the subtasks was validated against.
 So conflict resolution is defined behaviorally. The integrator reads the intent
 and the frozen success criteria of *every* subtask whose work is part of the
 conflicting merge — the incoming subtask and every already-integrated subtask
-it collides with — and resolves the conflict so that each side's intent is
-preserved. It then re-runs the frozen criteria of all of them against the
-merged result. A merge that satisfied git but broke an already-validated
-subtask is a regression and is rejected. This behavioral re-check is the point
-of having an integrator at all; a purely textual merge needs no LLM.
+it collides with — and resolves the merge so that each side's intent is
+preserved. Resolving a *semantic* conflict is what the integrator is for;
+a purely textual merge can satisfy git while silently breaking the behavior
+one side was validated against, and only a worker that understands intent
+can avoid that.
+
+The behavioral re-check that *catches* a merge gone wrong happens immediately
+after, at the wave level: once the integrator commits the merge, the
+orchestrator re-runs every wave subtask's frozen criteria against integrated
+staging (the same validator pass that runs at the end of every wave, whether
+an integrator was needed or not). A merge that satisfied git but broke an
+already-validated subtask is caught there, not in the integrator itself.
+Keeping the re-check in one place — the wave-level validator — means there
+is no double-validation and no place to forget.
 
 ### When integration cannot succeed
 
@@ -428,11 +437,19 @@ codebase and research answer *how* to build something; they cannot answer
 *what* to build when that has genuinely not been decided. A fully-specified
 request leaves nothing for the filter to catch, so it runs with zero questions.
 
-One question is in scope for any feature work: build from the existing
-codebase's patterns, or from researched best-practice standards? This is itself
-an intent question — the codebase cannot tell you which of the two the user
-prefers — and its answer becomes a setting carried to every planner and
-implementer, so the whole run draws from one consistent source of truth.
+When a feature task's request leaves the source of truth ambiguous, centella
+resolves it from a preference: `codebase` (build from existing patterns only),
+`research` (build from researched best-practice standards), `both` (codebase
+first; research only where the codebase is insufficient), or `ask` (surface
+the question to the user). The preference is read
+from a per-repo config file if present, otherwise from an environment
+variable, otherwise defaults to `ask`. When `ask` fires, the question is
+presented with a hint that setting the env var or the per-repo file will skip
+it next time. A request that already names its own source of truth, or a
+non-feature task where the question does not apply, runs without it.
+Whichever path resolved the preference, its value becomes a setting carried
+to every planner and implementer, so the whole run draws from one consistent
+source of truth.
 
 When Centella runs in a context where it cannot block for an answer, the
 clarification step is non-blocking: it records the questions, exits with a
@@ -502,11 +519,11 @@ owns the counter, the cap is a genuine guarantee.
 ### Worker-internal caps
 
 Other limits — how many times an implementer re-runs its evidence gate or its
-validation loop, how many times an integrator retries a resolution — live
-*inside* a single worker. The orchestrator never sees these iterations; it sees
-only the worker's final result. These limits are therefore *prompt-governed*:
-the worker is instructed to bound itself, and the genuine hard backstop is the
-worker's overall turn limit, which the orchestrator does control.
+validation loop — live *inside* a single worker. The orchestrator never sees
+these iterations; it sees only the worker's final result. These limits are
+therefore *prompt-governed*: the worker is instructed to bound itself, and the
+genuine hard backstop is the worker's overall turn limit, which the
+orchestrator does control.
 
 This distinction matters and must not be blurred. Presenting a worker-internal,
 prompt-governed limit as if it were a code-enforced guarantee would mislead

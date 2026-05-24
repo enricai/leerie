@@ -24,6 +24,9 @@ centella/
 │   ├── planner.md                 Phase 2 worker system prompt
 │   ├── implementer.md             Phase 5 implementer worker system prompt
 │   └── integrator.md              conflict-resolution worker system prompt
+│   (the validator's system prompt is the `VALIDATOR_SYSTEM` constant in
+│    `orchestrator/centella.py`, not a file — it is short and has no
+│    behavioral tuning that would benefit from out-of-tree editing)
 ├── scripts/
 │   ├── setup-staging.sh           create staging branch + worktree (idempotent)
 │   ├── new-worktree.sh            create/reuse a per-subtask worktree
@@ -32,7 +35,10 @@ centella/
 │   └── cleanup.sh                 remove worktrees (and optionally branches)
 ├── commands/centella.md            thin plugin skill — launches the orchestrator
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
-└── docs/IMPLEMENTATION.md         this document
+├── docs/IMPLEMENTATION.md         this document
+├── tests/                         pytest suite (see §10)
+├── pytest.ini                     pytest configuration
+└── README.md                      top-level user-facing readme
 ```
 
 The share-sheet flattens directories; the tree above must be reassembled
@@ -52,7 +58,10 @@ Maps to `DESIGN.md`: §3 (architecture / phases), §2 (why a program, not a skil
 # Resume an interrupted run:
 /path/to/centella/centella --resume
 
-# Skip clarification (caller guarantees the task is fully specified):
+# Skip clarification entirely (DESIGN §11). Intent questions from the
+# classifier are dropped; the source-of-truth question is satisfied from
+# CENTELLA_SOURCE_OF_TRUTH / centella.toml if set, and otherwise defaults
+# to `codebase` with a logged warning.
 /path/to/centella/centella "task" --no-clarify
 
 # Pre-supply clarification answers:
@@ -60,6 +69,9 @@ Maps to `DESIGN.md`: §3 (architecture / phases), §2 (why a program, not a skil
 
 # Override caps:
 /path/to/centella/centella "task" --max-workers 60 --max-parallel 6
+
+# Set the source-of-truth preference globally so centella does not ask:
+export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both, ask
 
 # Recommended backstop for worker auto-compaction
 # (Claude Code CLI variable — not consumed by centella itself):
@@ -77,12 +89,37 @@ claude --plugin-dir /path/to/centella
 /centella <task>
 ```
 
-The `--answers` file is a JSON object keyed by classifier-assigned question
-`id`, plus `source_of_truth` set to `"existing-patterns"` or
-`"researched-standards"` when a feature source-of-truth question was asked:
+### Source-of-truth preference
+
+For feature work, centella needs to know whether to draw conventions from the
+codebase, from online research, from both (codebase first; research as
+fallback), or to ask the user. Resolution order (highest priority first):
+
+1. **`centella.toml` at the repo root** (committed, so the preference travels
+   with the repo). Plain `key=value` syntax:
+
+   ```
+   source_of_truth = codebase
+   ```
+
+2. **`CENTELLA_SOURCE_OF_TRUTH`** environment variable, values
+   `codebase` | `research` | `both` | `ask`.
+
+3. **Default `ask`.** When unset, centella surfaces the question on a feature
+   task and prints a hint that setting the env var or the per-repo file
+   will skip it next time.
+
+An invalid value in either source is rejected at startup via `die()` — bad
+config is caught before any worker spawns.
+
+### The `--answers` file
+
+A JSON object keyed by classifier-assigned question `id`, plus
+`source_of_truth` set to `"codebase"`, `"research"`, or `"both"` when the
+source-of-truth question was asked:
 
 ```json
-{ "q1": "answer text", "source_of_truth": "existing-patterns" }
+{ "q1": "answer text", "source_of_truth": "codebase" }
 ```
 
 Maps to `DESIGN.md`: §11 (clarification procedure).
@@ -98,16 +135,23 @@ Each worker is one `claude -p` headless process. Flags used:
 | `-p` | non-interactive single-shot |
 | `--output-format json` | returns an envelope object (cost, usage, `terminal_reason`, `structured_output`) |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
-| `--append-system-prompt` | injects the worker's role prompt from `prompts/*.md` |
-| `--allowedTools` | tool allowlist; acting workers get the act-tool set, read-only workers a narrower set |
+| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/implementer/integrator, or the `VALIDATOR_SYSTEM` constant in `centella.py` for the validator |
+| `--allowedTools` | tool allowlist; three buckets — **read-only** (`READ_TOOLS`: Read/Grep/Glob/WebSearch/WebFetch) for classifier and planner; **acting** (`ACT_TOOLS`: read-set + Bash/Write/Edit) for implementer and integrator; **run-and-read** (`RUN_TOOLS`: read-set + Bash) for the validator — Bash to execute criteria, no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
-| `--dangerously-skip-permissions` | acting workers only — suppresses all permission prompts for unattended file writes |
+| `--dangerously-skip-permissions` | acting *and* run-and-read workers (implementer, integrator, validator) — suppresses all permission prompts for unattended Bash and file writes |
+
+`claude_p()` is `async`; every caller awaits it. Internally it awaits
+`_invoke()`, which spawns the worker via the `run_proc` helper
+(`asyncio.create_subprocess_exec` + `communicate()` with an optional timeout).
+Shell scripts in `scripts/*.sh` are invoked via `run_script()`, a thin async
+wrapper that resolves the script path and forwards to `run_proc`.
 
 The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
 
-`WorkerError` handling by worker type:
+`WorkerError` handling by worker type — per DESIGN §7's salvage rule
+("salvage if there is something to salvage; abort cleanly otherwise"):
 - **implementer** — `run_implementer()` catches it, converts to an
   `incomplete-handoff` result; a fresh implementer continues from the checkpoint.
 - **classifier, planner, integrator, validator** — not caught locally;
@@ -124,16 +168,23 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 
 | Phase | Function(s) | What it does |
 |-------|-------------|--------------|
-| 1 Classify | `phase_classify` | one classifier worker → categories + questions |
-| 0 Clarify | `gather_answers` | if questions and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` skips |
-| 2 Plan | `phase_plan` | one planner worker per category, in a `ThreadPoolExecutor`; a worker exception surfaces when results are consumed and propagates to `main()` |
+| Preflight | `preflight` | git identity, clean working tree, no stale `centella/*` branches or worktrees, live `claude -p` smoke test. Bypassed by `--skip-smoke`; skipped entirely on `--resume` |
+| 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 8-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
+| 0 Clarify | `gather_answers` | if questions and interactive: collect; non-interactive: write `pending-questions.json`, exit code 10; `--no-clarify` skips clarification entirely per DESIGN §11 — intent questions dropped, source-of-truth resolved from preference or defaulted to `codebase` with a warning |
+| 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `centella.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
 | 3 Schedule | `schedule`, `validate_plan` | merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
 | 4 Setup | `phase_execute` head → `setup-staging.sh` | create staging branch + worktree |
-| 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers in parallel, integrate, re-validate |
+| 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `validate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then re-validate. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume` |
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh` | merge staging into working branch; post-merge sanity checks |
 
 `phase_classify` runs before `gather_answers` because the question set depends
 on the classification.
+
+Between Phase 3 and Phase 4, `write_plan()` persists the merged plan
+(`.centella/plan.json`) and per-subtask spec files
+(`.centella/subtasks/<id>.json`), and `detect_test_runner()` scans for a
+deterministic test harness (pytest, npm, go, cargo, make) — stored in
+`state['test_runner']` for `validate_wave`'s fast path.
 
 Maps to `DESIGN.md`: §3.
 
@@ -147,6 +198,7 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 ### Preflight (before any LLM work)
 | Check | Catches |
 |-------|---------|
+| `resolve_source_of_truth()` at startup | invalid value in `centella.toml` or `CENTELLA_SOURCE_OF_TRUTH` — caught before any worker spawns, not mid-planner |
 | `git user.email` / `user.name` set | commits would fail silently without identity |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
 | no stale `centella/*` branches | name collisions with this run |
@@ -155,10 +207,15 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 
 `--skip-smoke` bypasses the last check (used by the test harness).
 
-### Plan validation — `validate_plan` (after planners, before scheduling)
+### Phase 1 checks — `phase_classify`
 | Check | Catches |
 |-------|---------|
-| no duplicate subtask ids | filesystem collisions in `.centella/subtasks/` |
+| classifier-returned categories filtered against the 8-name whitelist `CATEGORIES` (mirrors DESIGN §4) | classifier hallucinating a category outside the eight |
+| `die()` if no category survives the filter | a run with no valid domain for any planner |
+
+### Plan validation — `validate_plan` (after scheduling, before persisting the plan)
+| Check | Catches |
+|-------|---------|
 | ids match domain prefix (`bugfix-`, `feat-`, `refactor-`, `perf-`, `test-`, `deps-`, `config-`, `docs-`) | cross-domain collisions, audit ambiguity |
 | no `size: large` subtasks | planner violated the sizing constraint |
 | no empty `success_criteria_seed` | implementer has no criteria starting point |
@@ -168,14 +225,29 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 ### Per-subtask checks — in `settle_subtask`, every worker result
 | Check | Catches | On failure |
 |-------|---------|-----------|
-| `validate_result()` cross-field invariants | `complete` with empty/failing criteria; `handoff` with no checkpoint file; `blocked` with no blocker | **Terminal** |
+| `validate_result()` cross-field invariants | `complete` with empty/failing criteria; `handoff` with no checkpoint file; `blocked` with no blocker; `failed` with no summary | **Terminal** |
 | `validate_result()` criteria file exists | fabricated `criteria_results`, no real criteria file | **Terminal** |
 | `check_branch_has_commits()` | `complete` claim, nothing committed | **Retryable** |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `verify_criteria_lock()` — before every re-invocation | criteria file changed after the hash was stored | raises `WorkerError`, run aborts |
 | `lock_criteria()` | stores the sha256 of the criteria file on first settled result | — |
-| `check_diff_scope()` | `.centella/` `.git/` `.claude/` in the diff | **Terminal** (protected path); scope-volume warning is non-fatal |
+
+**Proposal-only criteria revision (DESIGN §9, both halves):**
+
+| Check | Catches | On failure |
+|-------|---------|-----------|
+| `_proposal_structurally_valid()` — when implementer result includes `criteria_revision_proposal` | empty fields; evidence that cites no real path in the worktree | **Rejected**: criteria file unchanged, lock unchanged, rejection logged to `state.json["criteria_revisions"]` |
+| `apply_criteria_revision()` + `record_criteria_revision()` — when proposal passes | (n/a: this is the approval path) | **Approved**: new criteria file written, lock re-hashed to match, approval logged; if the implementer's status was `failed`, one retry against the revised criteria is granted (`revision_retries`, hardcoded cap 1) |
+
+The orchestrator approves only on the **structural minimum** — non-empty
+proposed text + evidence that references at least one path which actually
+exists in the worktree — per DESIGN §12: code judges only what can be
+checked mechanically, never semantic merit. A reviewer wanting stronger
+judgment reads `state.json["criteria_revisions"]` after the run.
+
+| `check_diff_scope()` | `.centella/` `.git/` `.claude/` in the diff | **Terminal** (protected path); scope-volume warning is non-fatal (triggered when `files_likely_touched` is non-empty *and* touched > max(3× expected, 5), or when touched > 15 regardless of the planner's estimate) |
 | `validate_checkpoint()` — on `incomplete-handoff` | required checkpoint sections missing | returns `blocked` |
+| `_retryable_failure(summary)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy using the worker's `summary` as the reason; because `summary` is freeform text it almost never matches a retryable marker, so in practice a self-reported `failed` is **terminal** on first occurrence |
 
 ### Wave-level checks (after integration, before validation)
 | Check | Catches |
@@ -184,7 +256,20 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 | test-runner short-circuit | a passing deterministic runner (pytest/npm/go/cargo/make) skips the LLM validator |
 | `scan_conflict_markers()` | unresolved `<<<<<<<` markers in staging after integration |
 
+On a re-validation failure round, the orchestrator re-runs `settle_subtask`
+for each failing subtask (which may produce additional fixing commits) and
+then `integrate.sh` to re-merge the delta into staging, before the next
+round of validation. The cap on this loop is `wave_revalidation_rounds`
+(5) — exceeding it aborts the run with the failing subtask ids.
+
 ### Post-integrator checks (after an integrator handles a conflict)
+These verify the integrator honored DESIGN §6's *behavioral* conflict-
+resolution contract — the integrator prompt itself
+(`prompts/integrator.md`) carries the behavioral spec (read every
+involved subtask's intent and frozen criteria, preserve each side's
+intent, call irreconcilable cases a `design-conflict`); the
+orchestrator only checks the outcome.
+
 | Check | Catches |
 |-------|---------|
 | `check_merge_committed()` | integrator returned `resolved` but left the worktree mid-merge (`MERGE_HEAD` present) or with staged-uncommitted changes — **terminal**: merge aborted, run stops |
@@ -192,23 +277,45 @@ All in `centella.py`, in execution order. This is the concrete catalogue behind
 | integrator status `design-conflict` / `failed` | unresolvable conflict — **terminal**: in-progress merge aborted, staging left clean at last good wave, diagnosis saved, run stops |
 
 ### Post-finalize checks
-| Check | Catches |
-|-------|---------|
-| merge commit present in `git log --merges` | finalize merged to the wrong branch |
-| `git diff centella/staging..HEAD` empty | merge silently dropped changes |
+Both are **non-fatal warnings** (logged, not `die()`) — the user is told to
+verify manually; the run does not abort.
+
+| Check | Catches | On failure |
+|-------|---------|-----------|
+| most-recent merge subject contains `'centella:'` (read from `git log --merges -1 --format=%s HEAD`) | finalize merged to the wrong branch | non-fatal warning |
+| `git diff --stat centella/staging..HEAD` empty | merge silently dropped changes | non-fatal warning |
 
 ### Resume integrity — `validate_resume_state()`
+Enforces (one half of) DESIGN §6's "staging is the resume contract"
+invariant — state.json's `waves`/`completed_waves` say *which* wave to
+resume; the never-reset `centella/staging` branch holds *the work* every
+prior wave produced. Both must be coherent for resume to be safe.
+
 On `--resume`: asserts `task` is present and non-empty; asserts `waves`,
 `completed_waves`, `subtask_status` are well-formed *if present*. `waves` is
 intentionally optional — a run interrupted before scheduling has none, and
 `main()` handles that case with a clearer message. Rejects corrupt or
 hand-edited state without rejecting a legitimately-early interruption.
 
-### Concurrency safety
-`State` uses a `threading.RLock` (reentrant — a caller holding the lock can
-still call `save()`); `save()` writes to a temp file then `os.replace()` for
-atomicity. Prevents partial-write corruption when parallel workers in a wave
-update shared state.
+`orchestrate()` also re-resolves the source-of-truth preference on every
+`--resume` and overwrites `state.json`'s `source_of_truth_pref` with the
+fresh value, so a change to `centella.toml` or `CENTELLA_SOURCE_OF_TRUTH`
+between runs takes effect on resume.
+
+### Concurrency model
+The orchestrator runs on a single `asyncio` event loop. Each `claude -p`
+worker is spawned via `asyncio.create_subprocess_exec` (wrapped by the
+`run_proc` helper) and awaited; parallel workers within a wave run
+concurrently via `gather_or_cancel` — a small `asyncio.gather` wrapper that,
+on the first exception, cancels every other in-flight task and awaits its
+finalization before re-raising — under an `asyncio.Semaphore` bounded by
+`max_parallel`. Because every mutator runs on the single loop, `State` carries
+no lock — coroutines only interleave at `await` points, which never fall inside
+a `st.data[k] = v; st.save()` pair. `State.save()` still writes to a temp file
+then `os.replace()` for atomicity against process crash. On `KeyboardInterrupt`,
+`asyncio.run` cancels pending tasks; `run_proc`'s catch-all `BaseException`
+handler kills any in-flight child process before re-raising, so no `claude`
+or `git` subprocesses are orphaned.
 
 ---
 
@@ -220,16 +327,27 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | Loop | Cap | On cap |
 |------|-----|--------|
 | handoff continuations per subtask | 3 | return `blocked`; fatal at wave boundary |
-| corrective retries of a *retryable* failure per subtask | 1 | return `failed` |
+| corrective retries of a *retryable* failure per subtask (`failed_retries`) | 1 | return `failed` |
 | wave staging re-validation rounds | 5 | abort run, name failing subtasks |
 | total worker invocations per run | 40 (`--max-workers`) | abort, state saved for `--resume` |
 | concurrent workers within a wave | 4 (`--max-parallel`) | throughput throttle |
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
-| per-worker wall-clock | 90 min | worker killed; implementer → `incomplete-handoff` |
+| per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 
 `--max-turns` by worker: classifier 20, planner 40, validator 40, integrator
 60, implementer 120. For the implementer, 120 turns and 90 minutes both apply —
 whichever trips first.
+
+A seventh cap, `revision_retries`, is hardcoded to **1** (not in
+`DEFAULT_CAPS`): an implementer that returns `failed` and proposes an
+approved criteria revision gets at most one retry against the new
+criteria. The literal is intentional — DESIGN §9's lock discipline
+exists to prevent a stuck model from weakening its own bar, and a
+tunable that allowed repeated revisions would re-open exactly that
+loophole. The cap is 1 because DESIGN §9's burden of proof ("hard
+evidence") is hard to meet once and harder to meet twice, not because
+the architecture forbids >1; promoting it to `DEFAULT_CAPS` would
+invite values that defeat the lock.
 
 ### Worker-internal caps (prompt-governed — NOT counted by the orchestrator)
 These iterate inside one worker; the orchestrator sees only the final result.
@@ -239,7 +357,11 @@ The real backstop is the worker's `--max-turns` above.
 |------|------------------|--------------------|
 | evidence gate iterations (implementer) | 5 | return `blocked` |
 | validate-against-criteria iterations (implementer) | 5 | return `failed` |
-| fix / re-validate iterations (integrator) | 5 | return `failed` |
+
+Per DESIGN §10 #1, **granular sizing is the primary defense** against
+context exhaustion — these caps are a safety net, not the main path.
+If they fire often, the planner is under-decomposing (DESIGN §5); look
+there first when handoffs become routine.
 
 Maps to `DESIGN.md`: §13. The code-enforced / prompt-governed split there is
 *the* point — do not present the second table as a code guarantee.
@@ -247,9 +369,11 @@ Maps to `DESIGN.md`: §13. The code-enforced / prompt-governed split there is
 ### The two-tier retry policy — `_retryable_failure(reason)`
 One classifier function decides retryable vs. terminal. It substring-matches
 the failure reason; the markers must stay in sync with the strings the check
-functions actually emit — there is no test enforcing this, so the coupling is
-a discipline that has to be held by hand. When adding a new retryable failure
-mode, edit `_retryable_failure` and the check function in the same change.
+functions actually emit. The coupling test in
+`tests/test_retryable_failure.py` enforces this — if you change a marker
+in `_retryable_failure` without updating the matching check string (or
+vice versa), the test fails. When adding a new retryable failure mode,
+edit `_retryable_failure` and the check function in the same change.
 
 | Failure | Tier | Marker / source |
 |---------|------|-----------------|
@@ -271,7 +395,7 @@ first occurrence.
 |--------|----------|
 | `setup-staging.sh` | Creates `centella/staging` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch to `.centella/working-branch` on first run only. Adds the staging worktree if missing. Idempotent — safe on `--resume`. |
 | `new-worktree.sh <id>` | Creates `centella/<id>` worktree branched off the current `centella/staging` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. |
-| `integrate.sh <id>` | From repo root, inside the staging worktree: `git merge --no-ff centella/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator. |
+| `integrate.sh <id>` | From repo root, inside the staging worktree: `git merge --no-ff centella/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (staging worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh` | Checks out the working branch (recorded by `setup-staging.sh`), merges `centella/staging` into it. On conflict: `git merge --abort`, restore the working branch clean, exit non-zero with manual-merge instructions; staging left intact. |
 | `cleanup.sh [--branches]` | Removes all `.centella/worktrees/*`, prunes worktree metadata. Keeps `centella/*` branches as an audit trail unless `--branches` is passed. |
 
@@ -285,21 +409,13 @@ Maps to `DESIGN.md`: §6.
 ## 8. Coordination directory layout (`.centella/`)
 
 Created in the main repository (not in any worktree — worktrees are disposable).
-Git-excluded via the repo's `info/exclude`.
+`setup-staging.sh` git-excludes `.centella/` by appending it to the target
+repo's `.git/info/exclude` rather than to the user's tracked `.gitignore`
+(we deliberately do not modify files the user has committed).
 
 ```
 .centella/
-├── state.json              run state. Fields:
-│                             task, started_at, finished_at
-│                             waves, completed_waves, subtask_status
-│                             criteria_locks, blocked
-│                             worker_count, telemetry (calls, cost_usd,
-│                               input/output tokens — printed at run end)
-│                             categories, classifier_questions, answers,
-│                               needs_source_of_truth (phase-0/1 persistence)
-│                             test_runner (detected short-circuit command)
-│                             integrator_failure, integrator_warnings,
-│                               scope_warnings (non-fatal signal log)
+├── state.json              run state — see field table below
 ├── working-branch          the branch finalize.sh returns to
 ├── plan.json               merged planner output
 ├── subtasks/<id>.json      per-subtask spec handed to each implementer
@@ -311,6 +427,53 @@ Git-excluded via the repo's `info/exclude`.
 └── answers.json            written by the plugin skill when relaying
                             clarification answers; passed back via --answers
 ```
+
+`state.json` fields. This table is canonical: every field the orchestrator
+writes to `st.data` must appear here, and every field listed here must be
+written somewhere in `orchestrator/centella.py`. The coupling test in
+`tests/test_state_fields.py` enforces parity in both directions against the
+`STATE_FIELDS` tuple in `centella.py`.
+
+| Field | Shape | Purpose |
+|-------|-------|---------|
+| `task` | str | the task description passed on the command line |
+| `started_at` | ISO-8601 str | wall-clock time at run start |
+| `finished_at` | ISO-8601 str | wall-clock time at successful finalize |
+| `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
+| `completed_waves` | int | index of the next wave to run (resume cursor) |
+| `subtask_status` | dict[str, str] | per-subtask terminal status |
+| `criteria_locks` | dict[str, str] | sha256 per subtask — structural enforcement of DESIGN §9 |
+| `criteria_revisions` | list[dict] | append-only audit log of every proposed revision (approved and rejected, DESIGN §9 proposal channel) |
+| `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
+| `worker_count` | int | running total of `claude -p` invocations against `max_total_workers` |
+| `telemetry` | dict | calls, cost_usd, input_tokens, output_tokens — printed at run end |
+| `categories` | list[str] | classifier output, post-whitelist filtering |
+| `classifier_questions` | list[dict] | intent questions the classifier surfaced |
+| `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
+| `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation |
+| `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both` / `ask`) |
+| `no_clarify` | bool | whether `--no-clarify` was passed |
+| `test_runner` | list[str] | detected short-circuit test command |
+| `integrator_failure` | dict | unresolvable conflict from `integrate_wave` (non-fatal signal log) |
+| `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
+| `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
+
+`pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
+the plugin skill in `commands/centella.md`):
+
+| Field | Shape | Notes |
+|-------|-------|-------|
+| `questions` | array of `{id, question, why_underivable?}` | the classifier-surfaced intent questions not already in `--answers` |
+| `source_of_truth` | bool | true if the user still needs to answer the source-of-truth question |
+| `source_of_truth_hint` | string \| null | the env-var/`centella.toml` hint to show the user when `source_of_truth` is true |
+
+`answers.json` (written by the plugin skill, passed back via
+`--answers .centella/answers.json`):
+
+| Field | Shape | Notes |
+|-------|-------|-------|
+| `<question id>` | string | one entry per question id from `pending-questions.json.questions[].id` |
+| `source_of_truth` | `"codebase"` / `"research"` / `"both"` | required only when `pending-questions.json.source_of_truth` was true |
 
 The checkpoint schema — seven required sections, enforced by
 `validate_checkpoint()`: *Frozen success criteria*, *Current status*, *Files
@@ -327,23 +490,37 @@ locking).
 `claude_p()` validates each worker's payload against a schema keyed by worker
 type. Required fields, current shape:
 
-- **classifier** — `categories` (array), `questions` (array of
-  `{id, question, why_underivable}`), `source_of_truth_question` (bool).
-- **planner** — `domain`, `subtasks` (array of `{id, title, intent,
-  scope_note, files_likely_touched, depends_on, requires, provides,
-  success_criteria_seed, size, investigation_notes}`), `notes_for_orchestrator`.
-  `size` is `small` or `medium` — `large` is rejected by `validate_plan`.
-- **implementer** — `subtask_id`, `status` (`complete` / `incomplete-handoff` /
-  `blocked` / `failed`), `branch`, `criteria_results` (array of
-  `{criterion, met, evidence}`), `confidence` (`{root_cause, solution, basis}`
-  — keys fixed; `root_cause` is read as problem-understanding for non-bug
-  domains), `checkpoint_path`, `proposed_criteria_revision`, `blocker`,
-  `summary`.
-- **integrator** — `incoming_subtask`, `status` (`resolved` / `design-conflict`
-  / `failed`), `revalidation` (array of
-  `{subtask_id, all_criteria_met, notes}`), `resolution_summary`, `diagnosis`.
-- **validator** — `results` (array of `{subtask_id, all_criteria_met,
-  failing}`).
+- **classifier** — required: `categories` (array). Optional: `questions`
+  (array of `{id, question, why_underivable?}` — only `id` and `question`
+  are required on each question), `source_of_truth_question` (bool). The
+  classifier only flags whether the source-of-truth question is relevant;
+  the orchestrator's preference resolution (see §2) decides whether to
+  actually ask.
+- **planner** — required: `domain`, `subtasks`. Optional: `source_of_truth`
+  (enum `codebase` / `research` / `both`). The `source_of_truth` enum is
+  *defensive*: the orchestrator does not currently consume the planner's
+  echoed value (it reads `answers["source_of_truth"]` instead); the enum
+  future-proofs against a future consumer reading a garbled value. Each
+  subtask is `{id, title, success_criteria_seed (all required), intent,
+  scope_note, files_likely_touched, depends_on, requires, provides, size,
+  investigation_notes}`. `size` is `small` or `medium` — `large` is
+  rejected by `validate_plan`.
+- **implementer** — required: `subtask_id`, `status` (`complete` /
+  `incomplete-handoff` / `blocked` / `failed`). Optional: `branch`,
+  `criteria_results` (array of `{criterion, met, evidence}`), `confidence`
+  (`{root_cause, solution, basis}` — keys fixed; *worker-internal*, used by
+  the implementer as a self-gate, not consumed by the orchestrator),
+  `checkpoint_path`, `blocker`, `summary`, `criteria_revision_proposal`
+  (DESIGN §9 proposal channel: `{proposed_text, evidence}` — both required
+  when the object is present; orchestrator decides via the structural-minimum
+  check described in §5).
+- **integrator** — required: `incoming_subtask`, `status` (`resolved` /
+  `design-conflict` / `failed`). Optional: `resolution_summary`,
+  `diagnosis` (read as a fallback for `resolution_summary` when
+  diagnosing a non-`resolved` outcome).
+- **validator** — required: `results` (array of `{subtask_id,
+  all_criteria_met (both required), failing?}`). `failing` is optional in the
+  schema; when omitted, the orchestrator treats it as an empty list.
 
 Schemas are embedded as Python dicts in `centella.py` and serialized inline.
 
@@ -355,20 +532,29 @@ Maps to `DESIGN.md`: §7.
 
 Mirrors `DESIGN.md` §15, at the code level.
 
-**No test suite exists in the repository.** The deterministic surface is
-*constructed* — every cap, check, and state transition lives in real Python
-control flow, not in a worker prompt — but it has not been exercised by
-automated tests. Manual end-to-end runs against a stub `claude` binary were
-used during development; the shell scripts were exercised against real
-repositories the same way. None of that is captured as a re-runnable test,
-so a future change to the orchestrator has no regression net.
+**Tested.** A pytest suite under `tests/` exercises the deterministic
+enforcement functions:
 
-The worker behavior is also unverified against a live `claude -p`. The flag
-contract in §3 is from CLI documentation, not from observed runs.
+| Test file | Function under test |
+|-----------|----------------------|
+| `test_resolve_source_of_truth.py` | `resolve_source_of_truth()` |
+| `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
+| `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that the retryable markers actually appear in the strings emitted by `check_branch_has_commits` and the inline dirty-worktree check |
+| `test_state_fields.py` | `STATE_FIELDS` tuple parity, in both directions: against the §8 field table, and against every `st.data[...] = …` / `setdefault(...)` write in `centella.py`. This is the mechanism §8's "this table is canonical" claim relies on |
+| `test_validate_plan.py` | `validate_plan()` (every rule in §5) |
+| `test_validate_result.py` | `validate_result()` (every status-branch invariant) |
+| `test_check_merge_committed.py` | `check_merge_committed()` (real-git fixtures) |
+| `test_criteria_revision.py` | `_proposal_structurally_valid()`, `apply_criteria_revision()`, `record_criteria_revision()` (DESIGN §9 proposal channel) |
+| `test_validator_tools.py` | `RUN_TOOLS` composition and `validate_wave`'s wiring — pins that the validator gets `Bash` but never `Write`/`Edit`, enforcing the DESIGN §12 "you do not modify code" rule mechanically (per §3 of this document) |
+
+Run with `pytest tests/` from the repo root. The suite completes in
+under two seconds end to end.
+
+**Not tested.** No worker has run against a live `claude -p`. The flag
+contract in §3 is from CLI documentation, not from observed runs. The
+worker invocation function (`claude_p`) is not unit-tested because
+meaningful testing requires a stub or live `claude` binary — that's a
+separate end-to-end tier.
 
 First real step: one run on a throwaway repo with a small, fully-specified
-task. If a regression net is wanted before that, the place to start is a
-pytest suite covering `_retryable_failure` (the marker / check-string
-coupling), `check_merge_committed`, `validate_result`, and `validate_plan` —
-these are the deterministic enforcement points with the smallest input set
-and the highest cost if they silently break.
+task.
