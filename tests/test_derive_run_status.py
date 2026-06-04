@@ -177,6 +177,7 @@ def test_status_table_lists_every_value_used(leerie):
     """RUN_STATUSES tuple must contain every value _derive_run_status
     can return — drift guard."""
     expected = {
+        "seed-failed",
         "corrupt-sidecar", "in-progress", "done",
         "done-pushed-no-pr", "done-pushed-pr",
         "push-failed", "pr-failed",
@@ -184,6 +185,28 @@ def test_status_table_lists_every_value_used(leerie):
         "sync-failed",
     }
     assert set(leerie.RUN_STATUSES) == expected
+
+
+def test_orphan_marker_returns_seed_failed(leerie):
+    """state_json with _orphan=True → seed-failed, fires before any
+    run.json check. Synthesized for run dirs that have fly-machine.json
+    but no state.json (pre-classify failure during seed_auth)."""
+    assert leerie._derive_run_status(None, {"_orphan": True}) == "seed-failed"
+    # Even with a corrupted run.json present, _orphan wins because the
+    # orphan signal is the earliest precedence and orphans by definition
+    # have no run.json at all.
+    assert (
+        leerie._derive_run_status({"corrupted": "trash"},
+                                  {"_orphan": True})
+        == "seed-failed"
+    )
+
+
+def test_non_orphan_state_does_not_trigger_seed_failed(leerie):
+    """Absence of `_orphan` marker means normal flow; in-progress when
+    run.json is None and state has no other signals."""
+    assert leerie._derive_run_status(None, {}) == "in-progress"
+    assert leerie._derive_run_status(None, {"_orphan": False}) == "in-progress"
 
 
 def test_push_error_priority_over_pr_url(leerie):

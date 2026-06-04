@@ -154,6 +154,59 @@ def test_resolve_bootstrap_id_does_not_match_wrong_name(leerie, tmp_path):
         leerie.resolve_run_id(tmp_path, "_bootstrap-fake999")
 
 
+# --- Change 4: orphan run dirs (seed_auth failed before state.json) -----
+# When seed_auth aborts before phase_classify completes, the launcher
+# wrote .leerie/runs/<run-id>/fly-machine.json but the orchestrator
+# never wrote state.json. Pre-Change-4, resolve_run_id rejected
+# --run-id <orphan> with "does not match any known run" because
+# discover_runs filtered the dir out, leaving users with no way to
+# recover three of the four hung runs from the 2026-06-04 incident
+# (the fourth had progressed far enough to write state.json).
+
+def _make_orphan(leerie_root: Path, run_id: str, fly: dict) -> None:
+    run_dir = leerie_root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "fly-machine.json").write_text(json.dumps(fly))
+
+
+def test_resolve_explicit_orphan_id_accepted(leerie, tmp_path):
+    """Orphan dirs (fly-machine.json without state.json) must resolve
+    so the user can `--resume --run-id <orphan-id>` after seed_auth
+    aborted before phase_classify. This is the live regression test for
+    the stackpulse/finalmemoriam hangs."""
+    _make_orphan(tmp_path, "feat-seed-died-abc123", {
+        "fly_machine_id": "287061da360d78",
+        "started_at": "2026-06-04T19:20:58+00:00",
+    })
+    assert leerie.resolve_run_id(
+        tmp_path, "feat-seed-died-abc123"
+    ) == "feat-seed-died-abc123"
+
+
+def test_resolve_orphan_single_auto_picks(leerie, tmp_path):
+    """An orphan is a real run — exactly one of them in the repo means
+    `--resume` (no --run-id) auto-picks it. Same UX as a single healthy
+    run."""
+    _make_orphan(tmp_path, "feat-seed-died-abc123", {
+        "fly_machine_id": "287061da360d78",
+        "started_at": "2026-06-04T19:20:58+00:00",
+    })
+    assert leerie.resolve_run_id(tmp_path, None) == "feat-seed-died-abc123"
+
+
+def test_resolve_orphan_with_healthy_runs_disambiguates(leerie, tmp_path):
+    """When orphans and healthy runs coexist, ambiguity rules apply —
+    `--resume` without `--run-id` dies and the error message lists both."""
+    _make_orphan(tmp_path, "feat-died-aaa111", {
+        "fly_machine_id": "machine-aaa",
+        "started_at": "2026-06-04T19:00:00+00:00",
+    })
+    _make_run(tmp_path, "feat-live-bbb222",
+              {"task": "y", "started_at": "2026-06-04T20:00:00+00:00"})
+    with pytest.raises(SystemExit):
+        leerie.resolve_run_id(tmp_path, None)
+
+
 # --- disambiguation hint: status + last-activity per row -----------------
 
 def test_resolve_multiple_runs_message_includes_status(leerie, tmp_path,

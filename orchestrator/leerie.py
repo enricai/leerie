@@ -2112,11 +2112,24 @@ def discover_runs(leerie_root: Path) -> list[dict]:
     (those are pre-classify, not real runs). Malformed state.json files
     are skipped with a logged warning, never raising.
 
+    Also enumerate **orphan** run dirs: directories that have a
+    `fly-machine.json` (written by the launcher the moment Fly machine
+    provision succeeds, before any orchestrator code runs) but no
+    `state.json` (the orchestrator never wrote one — typically because
+    `seed_auth` failed before `phase_classify` completed). These are
+    returned with `_orphan=True` and `started_at` synthesized from
+    `fly-machine.json`, so `--list` shows them and `resolve_run_id`
+    accepts them for `--resume`. Without this, runs that died during
+    the initial seed are invisible to both commands and the user has no
+    way to recover them other than `ls .leerie/runs/` + manual machine
+    cleanup. (See plan file 2026-06-04 incident: 3 of 4 hung runs hid
+    here.)
+
     Returned dicts have at least: `run_id` (directory name), `path` (the
-    state.json path), `task`, `started_at`, `finished_at`, `categories`.
-    Other state.json fields are passed through unchanged. Sorted by
-    `started_at` descending (newest first) for stable display in
-    `leerie --list`.
+    state.json path, or fly-machine.json for orphans), `task`,
+    `started_at`, `finished_at`, `categories`. Other state.json fields
+    are passed through unchanged. Sorted by `started_at` descending
+    (newest first) for stable display in `leerie --list`.
 
     Pure read; no writes. Returns [] if `leerie_root/runs` doesn't
     exist."""
@@ -2131,6 +2144,31 @@ def discover_runs(leerie_root: Path) -> list[dict]:
             continue
         state_path = entry / "state.json"
         if not state_path.is_file():
+            # Orphan check: dir with fly-machine.json but no state.json
+            # is a pre-classify failure (seed_auth aborted before the
+            # orchestrator wrote state.json). Surface it so `--list`
+            # and `--resume` can reach it. Skip if neither sidecar
+            # exists — empty dirs are not runs.
+            fly_path = entry / "fly-machine.json"
+            if not fly_path.is_file():
+                continue
+            try:
+                fly_data = json.loads(fly_path.read_text())
+            except (OSError, ValueError) as e:
+                log(f"warning: skipping malformed fly-machine.json at "
+                    f"{fly_path}: {e}")
+                continue
+            if not isinstance(fly_data, dict):
+                log(f"warning: fly-machine.json at {fly_path} is not a "
+                    f"JSON object")
+                continue
+            summary = {
+                "run_id": entry.name,
+                "path": str(fly_path),
+                "started_at": fly_data.get("started_at") or "",
+                "_orphan": True,
+            }
+            out.append(summary)
             continue
         try:
             data = json.loads(state_path.read_text())
@@ -2271,10 +2309,19 @@ def _format_age(seconds: float) -> str:
 
 # --- run status (consumed by `leerie --list`) -------------------------
 
-# The nine derived statuses returned by `_derive_run_status`. Status is
+# The derived statuses returned by `_derive_run_status`. Status is
 # *derived* from run.json + state.json fields, not stored, so the value
 # rendered by --list is always consistent with the actual on-disk state.
+#
+# `seed-failed` is special: it covers run dirs that have a
+# fly-machine.json (machine was provisioned) but no state.json (the
+# orchestrator never wrote one — typically seed_auth aborted before
+# phase_classify). Surfaced by `discover_runs` as `_orphan=True`,
+# matched by the earliest check in `_derive_run_status`. See plan file
+# for the 2026-06-04 incident where this status would have rescued
+# three runs that hid behind the prior "no state.json → skip" rule.
 RUN_STATUSES = (
+    "seed-failed",
     "corrupt-sidecar",
     "in-progress",
     "done",
@@ -2296,6 +2343,11 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     `--list --runtime <local|fly>`.
 
     Order of checks matters — earlier checks fire first:
+      0. state_json["_orphan"] set → `seed-failed` (synthesized by
+                                     `discover_runs` for run dirs that
+                                     have fly-machine.json but no
+                                     state.json; seed_auth aborted
+                                     before phase_classify).
       1. run.json invariant-invalid → `corrupt-sidecar`.
       2. push_error set            → `push-failed`.
       3. pr_error set              → `pr-failed`.
@@ -2315,10 +2367,16 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     user must address the failed sync before treating the run as locally
     complete. killed_at fires before paused_at because the kill verb
     supersedes any prior pause state (the machine was destroyed).
+    seed-failed fires earliest because orphan dirs have no run.json at
+    all; running the corrupt-sidecar check on an empty dict would
+    misclassify them.
 
-    state_json is currently unused in the derivation but accepted for
-    forward-compat: future statuses (e.g., 'blocked') may consult
-    state.json["blocked"]."""
+    state_json is consulted for the `_orphan` marker (synthesized by
+    `discover_runs`); other state.json fields remain reserved for
+    forward-compat (future statuses like 'blocked' may consult
+    state.json["blocked"])."""
+    if (state_json or {}).get("_orphan"):
+        return "seed-failed"
     rj = run_json or {}
     if rj:
         try:
@@ -2348,7 +2406,12 @@ def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, str]]
     """Build (run_id, started_at, status, machine, branch) rows for every
     run under `leerie_root/runs/`. Pure data-gathering; rendering is the
     caller's concern. `machine` is the Fly Machine ID for remote runs and
-    empty string for local runs."""
+    empty string for local runs.
+
+    For orphan rows (status `seed-failed`), `machine` is read from
+    `fly-machine.json` since run.json doesn't exist yet — this is what
+    lets `--list` show the user the ID of the Fly machine they need to
+    stop or resume after a pre-classify failure."""
     runs = discover_runs(leerie_root)
     rows: list[tuple[str, str, str, str, str]] = []
     for state in runs:
@@ -2367,6 +2430,18 @@ def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, str]]
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or compute_run_branch(run_id)
         machine = (run_json or {}).get("fly_machine_id") or ""
+        # Orphan fallback: pre-classify runs have no run.json yet, so
+        # pull the machine id from fly-machine.json instead. Same file
+        # the launcher reads for `./leerie --resume`.
+        if not machine and state.get("_orphan"):
+            fly_sidecar = run_dir / "fly-machine.json"
+            if fly_sidecar.is_file():
+                try:
+                    fly_parsed = json.loads(fly_sidecar.read_text())
+                    if isinstance(fly_parsed, dict):
+                        machine = fly_parsed.get("fly_machine_id") or ""
+                except (OSError, ValueError):
+                    machine = ""
         rows.append((run_id[:50], started_at, status, machine, branch))
     return rows
 

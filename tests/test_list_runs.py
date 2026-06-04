@@ -262,3 +262,45 @@ def test_list_runs_status_filter_empty_match_message(leerie, tmp_path, capsys):
     leerie.list_runs(tmp_path, status_filter="killed")
     out = capsys.readouterr().out
     assert "no runs" in out and "killed" in out
+
+
+# --- Change 4: orphan dirs (seed_auth failure before state.json) --------
+
+def _make_orphan(root: Path, run_id: str, fly: dict) -> None:
+    rd = root / "runs" / run_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "fly-machine.json").write_text(json.dumps(fly))
+
+
+def test_list_runs_shows_orphan_with_seed_failed_status(leerie, tmp_path, capsys):
+    """A run dir with only fly-machine.json must appear in --list with
+    status `seed-failed` and a populated `machine` column. This is the
+    discoverability fix for the 2026-06-04 incident hangs."""
+    _make_orphan(tmp_path, "feat-died-aaa111", {
+        "fly_machine_id": "287061da360d78",
+        "started_at": "2026-06-04T19:20:58+00:00",
+    })
+    leerie.list_runs(tmp_path)
+    out = capsys.readouterr().out
+    assert "feat-died-aaa111" in out
+    assert "seed-failed" in out
+    # Machine column appears (because the orphan has fly_machine_id).
+    assert "287061da360d78" in out
+    # started_at from fly-machine.json renders.
+    assert "2026-06-04T19:20:58" in out
+
+
+def test_list_runs_status_filter_seed_failed(leerie, tmp_path, capsys):
+    """--list --status seed-failed isolates orphan runs. This is the
+    final piece of the discoverability fix: users with a mix of healthy
+    and seed-failed runs can list just the broken ones."""
+    _make_orphan(tmp_path, "feat-died-aaa111", {
+        "fly_machine_id": "287061da360d78",
+        "started_at": "2026-06-04T19:20:58+00:00",
+    })
+    _make_run(tmp_path, "feat-live-bbb222",
+              {"started_at": "2026-06-04T20:00:00+00:00", "task": "y"})
+    leerie.list_runs(tmp_path, status_filter="seed-failed")
+    out = capsys.readouterr().out
+    assert "feat-died-aaa111" in out
+    assert "feat-live-bbb222" not in out
