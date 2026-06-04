@@ -171,10 +171,21 @@ seed_repo_clone() {
   #    The receiver MUST be wrapped in `sh -c '...'`; without it, the
   #    remote treats `>` as an argument to `cat` rather than a shell
   #    redirect and fails with `cat: invalid option -- 'c'`.
-  if ! git -C "$USER_REPO" bundle create - --all 2>/dev/null \
-        | flyctl ssh console --quiet --app "$FLY_APP" \
+  local _hb_pid_parent _seed_to="" _parent_rc=0
+  _seed_to="$(_seed_timeout_prefix)"
+  _seed_progress_bg "seed_repo (parent bundle)" &
+  _hb_pid_parent=$!
+  git -C "$USER_REPO" bundle create - --all 2>/dev/null \
+        | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
             --machine "$LEERIE_MACHINE_ID" --pty=false \
-            -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1; then
+            -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1
+  _parent_rc=${PIPESTATUS[1]}
+  kill "$_hb_pid_parent" 2>/dev/null || true
+  wait "$_hb_pid_parent" 2>/dev/null || true
+  if [ "$_parent_rc" -ne 0 ]; then
+    if [ "$_parent_rc" -eq 124 ] || [ "$_parent_rc" -eq 137 ]; then
+      remote_log "seed_repo: parent-bundle pipe did not return within ${LEERIE_SEED_TIMEOUT_S:-600}s (rc=$_parent_rc) — flyctl ssh console likely stalled"
+    fi
     remote_log "seed_repo: failed to pipe parent bundle to machine"
     return 1
   fi
@@ -189,6 +200,9 @@ seed_repo_clone() {
   #    Inside the foreach, $displaypath is git's superproject-relative
   #    path. We export host-side env vars the foreach body needs.
   if [ -f "$USER_REPO/.gitmodules" ]; then
+    local _hb_pid_subs
+    _seed_progress_bg "seed_repo (submodule bundles)" &
+    _hb_pid_subs=$!
     if ! (
       cd "$USER_REPO" && \
       LEERIE_FLY_APP="$FLY_APP" LEERIE_MACHINE_ID="$LEERIE_MACHINE_ID" \
@@ -204,9 +218,13 @@ seed_repo_clone() {
           || { echo "leerie: seed_repo: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
       '
     ); then
+      kill "$_hb_pid_subs" 2>/dev/null || true
+      wait "$_hb_pid_subs" 2>/dev/null || true
       remote_log "seed_repo: submodule bundling failed"
       return 1
     fi
+    kill "$_hb_pid_subs" 2>/dev/null || true
+    wait "$_hb_pid_subs" 2>/dev/null || true
   fi
 
   # 3. Machine-side: clone from /tmp/leerie-seed.bundle into /work, wire

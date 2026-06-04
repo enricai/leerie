@@ -121,9 +121,19 @@ seed_auth() {
   # Single attempt + one retry after `flyctl agent restart` if the
   # failure matches the transient "tunnel unavailable" pattern
   # observed on cold-start probes. Same retry shape as seed-repo.sh.
-  local tar_rc=0 attempt err_log
+  # Build the timeout prefix once (empty string on hosts w/o GNU
+  # `timeout`). The prefix bounds the `flyctl ssh console` invocation so
+  # a stalled WireGuard tunnel produces a clean rc 124/137 instead of
+  # hanging the launcher indefinitely.
+  local _seed_to=""
+  if command -v _seed_timeout_prefix >/dev/null 2>&1; then
+    _seed_to="$(_seed_timeout_prefix)"
+  fi
+  local tar_rc=0 attempt err_log _hb_pid
   for attempt in 1 2; do
     err_log="$(mktemp)"
+    _seed_progress_bg "seed_auth" &
+    _hb_pid=$!
     COPYFILE_DISABLE=1 tar -cC "$STAGE" \
          --exclude='.gitconfig' \
          --exclude='.gitconfig.local' \
@@ -135,13 +145,36 @@ seed_auth() {
          --exclude='.gnupg' \
          --exclude='.config' \
          . \
-         | flyctl ssh console \
+         | $_seed_to flyctl ssh console \
              --app "$FLY_APP" \
              --machine "$machine_id" \
              --pty=false \
              -C "sh -c 'tar -xC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log"
     tar_rc=${PIPESTATUS[1]}
+    kill "$_hb_pid" 2>/dev/null || true
+    wait "$_hb_pid" 2>/dev/null || true
     if [ "$tar_rc" -eq 0 ]; then
+      rm -f "$err_log"
+      break
+    fi
+    # rc 124 = `timeout` sent SIGTERM after $LEERIE_SEED_TIMEOUT_S;
+    # rc 137 = `timeout --kill-after` escalated to SIGKILL. Both mean
+    # the flyctl ssh console session stalled (the failure mode that
+    # used to manifest as a multi-hour hang). Emit a diagnosis hint
+    # and treat as a retryable failure: the existing first-attempt
+    # retry path will run; on second-attempt timeout we fall through
+    # to the failure-return at the end of the function, which the
+    # orchestrator then converts to a PAUSED run via the existing
+    # rc≠0 path (DESIGN §6 *Pause on failure*).
+    if [ "$tar_rc" -eq 124 ] || [ "$tar_rc" -eq 137 ]; then
+      remote_log "seed_auth: flyctl ssh console did not return within ${LEERIE_SEED_TIMEOUT_S:-600}s (rc=$tar_rc) — the remote tar may have completed; verify with 'flyctl ssh console --app $FLY_APP --machine $machine_id -C \"ls -la /home/leerie\"' before resuming"
+      if [ "$attempt" -eq 1 ]; then
+        remote_log "remote: restarting flyctl agent and retrying once..."
+        flyctl agent restart >/dev/null 2>&1 || true
+        sleep 2
+        rm -f "$err_log"
+        continue
+      fi
       rm -f "$err_log"
       break
     fi
