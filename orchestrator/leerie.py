@@ -2125,11 +2125,23 @@ def discover_runs(leerie_root: Path) -> list[dict]:
     cleanup. (See plan file 2026-06-04 incident: 3 of 4 hung runs hid
     here.)
 
-    Returned dicts have at least: `run_id` (directory name), `path` (the
-    state.json path, or fly-machine.json for orphans), `task`,
-    `started_at`, `finished_at`, `categories`. Other state.json fields
-    are passed through unchanged. Sorted by `started_at` descending
-    (newest first) for stable display in `leerie --list`.
+    Returned dicts have one of two shapes:
+
+    - **Normal (state.json present):** at least `run_id` (directory
+      name), `path` (state.json path), `task`, `started_at`,
+      `finished_at`, `categories`. Other state.json fields are passed
+      through unchanged.
+    - **Orphan (`fly-machine.json` only, `_orphan=True`):** exactly
+      `run_id` (directory name), `path` (fly-machine.json path),
+      `started_at` (copied from fly-machine.json; may be the empty
+      string), `_orphan: True`. Fields like `task`, `finished_at`,
+      `categories` are NOT present — they were never written. Callers
+      that consume both shapes must branch on `state.get("_orphan")`
+      before accessing state-only fields, or use `state.get(<key>)`
+      with a default.
+
+    Both shapes sort together by `started_at` descending (newest
+    first) for stable display in `leerie --list`.
 
     Pure read; no writes. Returns [] if `leerie_root/runs` doesn't
     exist."""

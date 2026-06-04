@@ -259,8 +259,10 @@ export LEERIE_VERBOSITY=normal  # sticky default
 export LEERIE_SEED_TIMEOUT_S=900
 
 # Heartbeat cadence (default 10 s) for the "still streaming (Ns
-# elapsed)" line emitted during seed_auth/seed_repo bulk transfers and
-# the wait-for-hallpass loop. Set to 0 to suppress entirely:
+# elapsed)" line emitted during seed_auth/seed_repo bulk transfers. Set
+# to 0 to suppress entirely. The separate hallpass-wait heartbeat in
+# wait_for_fly_ssh_ready fires on a fixed every-3rd-probe cadence and
+# does not consult this variable:
 export LEERIE_PROGRESS_INTERVAL_S=15
 
 # Pre-classify failures (seed_auth aborted before phase_classify) now
