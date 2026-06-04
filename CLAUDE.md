@@ -249,6 +249,25 @@ export LEERIE_MAX_WORKERS=80
 ./leerie "task" -qq      # quiet (errors + phase boundaries only)
 ./leerie "task" -vv      # debug (raw event payloads + tool I/O)
 export LEERIE_VERBOSITY=normal  # sticky default
+
+# Bound the seed_auth tar pipe over `flyctl ssh console` against the
+# known flyctl-stalls-without-exiting failure mode. Default 600 s
+# (10 min) per bulk transfer. On rc 124/137 (timeout fired), seed_auth
+# runs its existing one-shot `flyctl agent restart` retry; if that also
+# stalls, the function returns 1 and leerie's existing PAUSED-on-failure
+# path takes over — `./leerie --resume` recovers the run normally:
+export LEERIE_SEED_TIMEOUT_S=900
+
+# Heartbeat cadence (default 10 s) for the "still streaming (Ns
+# elapsed)" line emitted during seed_auth/seed_repo bulk transfers and
+# the wait-for-hallpass loop. Set to 0 to suppress entirely:
+export LEERIE_PROGRESS_INTERVAL_S=15
+
+# Pre-classify failures (seed_auth aborted before phase_classify) now
+# appear in `--list` with status `seed-failed` and are resumable via
+# `--resume --run-id <id>`. Previously these runs were invisible:
+./leerie --list --status seed-failed
+./leerie --resume --run-id <seed-failed-id> --runtime fly
 ```
 
 ## Testing
