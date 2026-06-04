@@ -447,7 +447,14 @@ wait_for_fly_ssh_ready() {
       return 0
     fi
     attempts=$((attempts + 1))
+    # Heartbeat every 3rd probe (~15 s) so a slow hallpass startup is
+    # visible to the user instead of looking like a silent wait. Today
+    # the function was silent until success or the full 60 s budget;
+    # users couldn't distinguish "waiting normally" from "hung."
     if [ "$attempts" -lt "$max_attempts" ]; then
+      if [ $((attempts % 3)) -eq 0 ]; then
+        remote_log "remote: still waiting for hallpass on $machine_id (attempt $attempts of $max_attempts)..."
+      fi
       sleep 5
     fi
   done
