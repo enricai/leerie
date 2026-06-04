@@ -172,7 +172,13 @@ seed_repo_clone() {
   #    remote treats `>` as an argument to `cat` rather than a shell
   #    redirect and fails with `cat: invalid option -- 'c'`.
   local _hb_pid_parent _seed_to="" _parent_rc=0
-  _seed_to="$(_seed_timeout_prefix)"
+  # Symmetry with seed-auth.sh: defensive `command -v` so a standalone
+  # sourcing path that hasn't loaded lib.sh still works (today
+  # seed-repo.sh always sources lib.sh, but the guard keeps the two
+  # bulk-pipe call sites uniform).
+  if command -v _seed_timeout_prefix >/dev/null 2>&1; then
+    _seed_to="$(_seed_timeout_prefix)"
+  fi
   _seed_progress_bg "seed_repo (parent bundle)" &
   _hb_pid_parent=$!
   git -C "$USER_REPO" bundle create - --all 2>/dev/null \
