@@ -384,8 +384,9 @@ surface (flags, timeouts, schema enforcement).
 
 ## Walkthrough
 
-For a worked end-to-end example — from invocation through clarification,
-wave execution, run-branch review, and merge — see
+For worked end-to-end examples — from invocation through clarification,
+wave execution, run-branch review, and merge; and for chain orchestration
+(submitting, monitoring, and cancelling a multi-run chain) — see
 [`docs/USAGE.md`](docs/USAGE.md).
 
 ## Documentation
@@ -482,7 +483,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `docs/DESIGN.md` | Full design document and rationale (theory) |
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
-| `docs/USAGE.md` | End-to-end walkthrough of one Leerie run |
+| `docs/USAGE.md` | End-to-end walkthrough of one Leerie run + chain orchestration example |
 
 ## Safety
 

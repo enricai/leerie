@@ -468,5 +468,5 @@ leerie --chain-submit --runs prompts/a.md,prompts/b.md --target ~/src/myrepo
 
 For the `leerie-chain` setup steps (deploying the Fly app, setting
 `GH_DISPATCH_PAT`, `FLY_API_TOKEN`, and `FLY_WEBHOOK_SIGNING_SECRET`),
-see [`docs/IMPLEMENTATION.md`](IMPLEMENTATION.md) §2 "Chain launcher
+see [`docs/IMPLEMENTATION.md`](IMPLEMENTATION.md) §7 "Chain launcher
 verbs" and the `chain/` subdirectory's own `README`.
