@@ -3,9 +3,11 @@
 #
 # Each leerie invocation has a unique run_id; this script sets up the
 # directory and branch for that run. Records the current working branch,
-# creates `leerie/runs/<run-id>` off the current HEAD, adds a worktree
-# at `.leerie/runs/<run-id>/worktrees/staging`, and ensures `.leerie/`
-# is git-excluded.
+# creates `leerie/runs/<run-id>` off the current HEAD, and adds a worktree
+# at `<state-root>/runs/<run-id>/worktrees/staging`.
+#
+# State root: $LEERIE_STATE_DIR when set (centralized, outside the repo);
+# falls back to `.leerie` (repo-relative, legacy behavior).
 #
 # GENUINELY idempotent: if `leerie/runs/<run-id>` already exists (a run
 # is in progress, or this is a --resume), the branch is LEFT WHERE IT IS.
@@ -20,7 +22,8 @@
 set -euo pipefail
 
 RUN_ID="${1:?usage: setup-run.sh <run-id>}"
-RUN_DIR=".leerie/runs/${RUN_ID}"
+LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
+RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 BRANCH="leerie/runs/${RUN_ID}"
 STAGING_WT="${RUN_DIR}/worktrees/staging"
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
@@ -52,10 +55,6 @@ fi
 if ! git worktree list --porcelain | grep -q "worktree .*/${STAGING_WT}$"; then
   git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 fi
-
-# Keep leerie artifacts out of git without touching the user's tracked .gitignore.
-EXCLUDE_FILE="$(git rev-parse --git-dir)/info/exclude"
-grep -qxF '.leerie/' "${EXCLUDE_FILE}" 2>/dev/null || echo '.leerie/' >> "${EXCLUDE_FILE}"
 
 echo "working-branch: ${WORKING_BRANCH}"
 echo "staging-worktree: $(cd "${STAGING_WT}" && pwd)"

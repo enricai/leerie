@@ -51,9 +51,10 @@ def test_setup_run_takes_run_id_arg():
 
 
 def test_setup_run_uses_per_run_paths():
-    """The script writes everything under .leerie/runs/$RUN_ID/."""
+    """The script derives RUN_DIR from LEERIE_STATE_DIR (or .leerie fallback)."""
     src = _script("setup-run.sh")
-    assert '.leerie/runs/${RUN_ID}' in src
+    assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
+    assert 'RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"' in src
     # And it doesn't write to top-level paths.
     assert '.leerie/worktrees/staging' not in src
     assert '.leerie/state.json' not in src
@@ -66,6 +67,15 @@ def test_setup_run_branch_is_per_run():
     assert 'leerie/staging' not in src
 
 
+def test_setup_run_no_git_exclude():
+    """setup-run.sh must not write .leerie/ into .git/info/exclude.
+    State now lives outside the repo; no per-repo git-exclude is needed."""
+    src = _script("setup-run.sh")
+    assert 'info/exclude' not in src
+    assert "'.leerie/'" not in src
+    assert '".leerie/"' not in src
+
+
 # --- new-worktree.sh ------------------------------------------------------
 
 def test_new_worktree_takes_run_id_arg():
@@ -75,7 +85,8 @@ def test_new_worktree_takes_run_id_arg():
 
 def test_new_worktree_uses_per_run_paths():
     src = _script("new-worktree.sh")
-    assert '.leerie/runs/${RUN_ID}/worktrees/${ID}' in src
+    assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
+    assert 'WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"' in src
 
 
 def test_new_worktree_branch_uses_subtasks_namespace():
@@ -103,7 +114,8 @@ def test_integrate_takes_run_id_arg():
 
 def test_integrate_merges_into_per_run_staging():
     src = _script("integrate.sh")
-    assert 'STAGING=".leerie/runs/${RUN_ID}/worktrees/staging"' in src
+    assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
+    assert 'STAGING="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/staging"' in src
 
 
 def test_integrate_branch_uses_subtasks_namespace():
