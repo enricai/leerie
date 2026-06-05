@@ -30,7 +30,7 @@ _seed_timeout_prefix() {
 # Atomically merge key/value pairs into a run.json sidecar on the host.
 #
 # Usage:
-#   update_run_json "$USER_REPO/.leerie/runs/<run-id>/run.json" \
+#   update_run_json "$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json" \
 #                   key1 value1 [key2 value2 ...]
 #
 # Values are treated as strings and JSON-encoded. The merge is read →
