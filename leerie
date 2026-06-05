@@ -149,6 +149,89 @@ with open(sidecar, "w") as f:
 ' "$fmj" "$sidecar"
 }
 
+# --- host-side per-repo state directory ----------------------------------
+# Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
+# state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
+# it; keyed by repo identity so each repo gets its own subtree, mirroring
+# how ~/.claude/projects/ separates per-repo state.
+#
+# Precedence (lowest → highest):
+#   default ($HOME/.leerie/state/<sha16>-<basename>)
+#   → leerie.toml `state_dir = ...`
+#   → LEERIE_STATE_DIR env var
+#   → --state-dir CLI flag
+#
+# The default key is SHA-256(abs_path)[:16] + "-" + basename, giving a
+# stable, collision-resistant, human-legible directory name with no
+# slashes. This mirrors the abs-path-sha approach noted in the
+# investigation notes (DESIGN §TBD), but keeps the basename visible so
+# the directory is browsable without a lookup table.
+#
+# Resolved early (before the verb dispatch) so --stop/--kill/--finalize
+# and other fast-path verbs can use it without the full launcher startup.
+_state_dir_default() {
+  local key
+  key="$(python3 -c \
+    "import hashlib,sys,os; p=sys.argv[1]; print(hashlib.sha256(p.encode()).hexdigest()[:16]+'-'+os.path.basename(p.rstrip('/')))" \
+    "$USER_REPO")"
+  echo "$HOME/.leerie/state/$key"
+}
+
+LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
+
+# TOML override: state_dir = /some/path
+if [ -f "$USER_REPO/leerie.toml" ]; then
+  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
+                            "$USER_REPO/leerie.toml" 2>/dev/null \
+                        || true; } \
+                      | head -1 \
+                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
+                                s/[[:space:]]*$//;
+                                s/^"(.*)"$/\1/;
+                                s/^'"'"'(.*)'"'"'$/\1/')"
+  if [ -n "$_toml_state_dir" ]; then
+    # Expand leading ~ so relative-home paths work as TOML values.
+    case "$_toml_state_dir" in
+      "~")   _toml_state_dir="$HOME" ;;
+      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
+    esac
+    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
+  fi
+  unset _toml_state_dir
+fi
+
+# Env override: LEERIE_STATE_DIR
+if [ -n "${LEERIE_STATE_DIR:-}" ]; then
+  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
+fi
+
+# CLI override: --state-dir /path or --state-dir=/path
+_cli_state_dir=""
+_prev_was_state_dir=false
+for arg in "$@"; do
+  if $_prev_was_state_dir; then
+    _cli_state_dir="$arg"
+    _prev_was_state_dir=false
+    continue
+  fi
+  case "$arg" in
+    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
+    --state-dir)   _prev_was_state_dir=true ;;
+  esac
+done
+if [ -n "$_cli_state_dir" ]; then
+  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
+fi
+unset _cli_state_dir _prev_was_state_dir
+
+# Expand leading ~ in the final resolved value.
+case "$LEERIE_STATE_HOST_DIR" in
+  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
+  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
+esac
+
+export LEERIE_STATE_HOST_DIR
+
 case "${1:-}" in
   --version)
     echo "leerie $LEERIE_VERSION"
@@ -183,12 +266,13 @@ case "${1:-}" in
         echo "  Falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
       else
-        LEERIE_LIST_FLY_JSON="$_list_json" python3 - "$USER_REPO" "$FLY_APP" <<'PY'
+        LEERIE_LIST_FLY_JSON="$_list_json" python3 - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
 from pathlib import Path
 
 repo = Path(sys.argv[1])
 app = sys.argv[2]
+state_dir = Path(sys.argv[3])
 raw = os.environ.get("LEERIE_LIST_FLY_JSON", "")
 try:
     machines = json.loads(raw) if raw.strip() else []
@@ -197,7 +281,7 @@ except ValueError as e:
     sys.exit(1)
 
 m2r: dict[str, str] = {}
-runs_dir = repo / ".leerie" / "runs"
+runs_dir = state_dir / "runs"
 if runs_dir.is_dir():
     for run_dir in runs_dir.iterdir():
         if not run_dir.is_dir():
@@ -238,7 +322,7 @@ print(fmt.format(*("-" * w for w in widths)))
 for r in rows:
     print(fmt.format(*r))
 print()
-print(f"app: {app}   (run_id '?' = sidecar not in {repo}/.leerie/runs/)")
+print(f"app: {app}   (run_id '?' = sidecar not in {state_dir}/runs/)")
 PY
         exit 0
       fi
@@ -326,7 +410,7 @@ PY
       echo "  Usage: leerie --stop <run-id> [--runtime fly]" >&2
       exit 1
     fi
-    _stop_run_dir="$USER_REPO/.leerie/runs/$_stop_run_id"
+    _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
       remote_log "--stop: no run dir at $_stop_run_dir"
       echo "  Check 'leerie --list' for active runs." >&2
@@ -405,7 +489,7 @@ PY
     _kill_run_dir=""
     _kill_sidecar=""
     if [ -n "$_kill_run_id" ]; then
-      _kill_run_dir="$USER_REPO/.leerie/runs/$_kill_run_id"
+      _kill_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_kill_run_id"
       if [ ! -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
         remote_log "--kill: no run dir at $_kill_run_dir"
         echo "  Pass --machine-id <id> to destroy an orphan machine without a sidecar." >&2
@@ -520,7 +604,7 @@ PY
       echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
-    _fin_run_dir="$USER_REPO/.leerie/runs/$_fin_run_id"
+    _fin_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
       # Final-id fallback: when the user passes the final run-id but
       # only the bootstrap dir exists locally (the orchestrator died
@@ -532,9 +616,9 @@ PY
       # bootstrap→final-id promotion `--resume` already does at lines
       # 1684–1700.
       _bootstrap_candidates=()
-      if [ -d "$USER_REPO/.leerie/runs" ]; then
+      if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]; then
         # shellcheck disable=SC2231
-        for _d in "$USER_REPO"/.leerie/runs/_bootstrap-*; do
+        for _d in "$LEERIE_STATE_HOST_DIR"/runs/_bootstrap-*; do
           [ -d "$_d" ] || continue
           [ -f "$_d/fly-machine.json" ] || continue
           _bootstrap_candidates+=("$_d")
@@ -544,7 +628,7 @@ PY
         _fin_run_dir="${_bootstrap_candidates[0]}"
         remote_log "--finalize: $_fin_run_id not local; using bootstrap dir $(basename "$_fin_run_dir") (fetch_branch will discover the final id on the machine)"
       elif [ "${#_bootstrap_candidates[@]}" -gt 1 ]; then
-        remote_log "--finalize: no local run dir at .leerie/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
+        remote_log "--finalize: no local run dir at $LEERIE_STATE_HOST_DIR/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
         for _d in "${_bootstrap_candidates[@]}"; do
           remote_log "  $(basename "$_d")"
         done
@@ -682,7 +766,7 @@ except Exception:
       # (which may differ from $_fin_run_id if the user passed a bootstrap
       # id). Use the discovered id to locate the run dir host-side.
       _fetched_run_id="${LEERIE_REMOTE_RUN_ID:-$_fin_run_id}"
-      _fetched_run_dir="$USER_REPO/.leerie/runs/$_fetched_run_id"
+      _fetched_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fetched_run_id"
       if [ ! -d "$_fetched_run_dir" ]; then
         remote_log "error: fetch_branch succeeded but $_fetched_run_dir missing"
         exit 1
@@ -716,7 +800,7 @@ except Exception:
       # the bootstrap-id dir (if --finalize was called with a bootstrap
       # id) or the final-id dir (post-rename).
       _host_intent=""
-      for _candidate in "$USER_REPO/.leerie/runs/$_fin_run_id" "$_fetched_run_dir"; do
+      for _candidate in "$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id" "$_fetched_run_dir"; do
         if [ -f "$_candidate/fly-machine.json" ]; then
           _host_intent="$(python3 -c '
 import json, sys
@@ -1109,86 +1193,6 @@ if [ -n "${FLY_VM_DISK_GB:-}" ]; then
   esac
   export FLY_VM_DISK_GB
 fi
-
-# --- host-side per-repo state directory ----------------------------------
-# Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
-# state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
-# it; keyed by repo identity so each repo gets its own subtree, mirroring
-# how ~/.claude/projects/ separates per-repo state.
-#
-# Precedence (lowest → highest):
-#   default ($HOME/.leerie/state/<sha16>-<basename>)
-#   → leerie.toml `state_dir = ...`
-#   → LEERIE_STATE_DIR env var
-#   → --state-dir CLI flag
-#
-# The default key is SHA-256(abs_path)[:16] + "-" + basename, giving a
-# stable, collision-resistant, human-legible directory name with no
-# slashes. This mirrors the abs-path-sha approach noted in the
-# investigation notes (DESIGN §TBD), but keeps the basename visible so
-# the directory is browsable without a lookup table.
-_state_dir_default() {
-  local key
-  key="$(python3 -c \
-    "import hashlib,sys,os; p=sys.argv[1]; print(hashlib.sha256(p.encode()).hexdigest()[:16]+'-'+os.path.basename(p.rstrip('/')))" \
-    "$USER_REPO")"
-  echo "$HOME/.leerie/state/$key"
-}
-
-LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
-
-# TOML override: state_dir = /some/path
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | head -1 \
-                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_state_dir" ]; then
-    # Expand leading ~ so relative-home paths work as TOML values.
-    case "$_toml_state_dir" in
-      "~")   _toml_state_dir="$HOME" ;;
-      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
-    esac
-    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
-  fi
-  unset _toml_state_dir
-fi
-
-# Env override: LEERIE_STATE_DIR
-if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
-fi
-
-# CLI override: --state-dir /path or --state-dir=/path
-_cli_state_dir=""
-_prev_was_state_dir=false
-for arg in "$@"; do
-  if $_prev_was_state_dir; then
-    _cli_state_dir="$arg"
-    _prev_was_state_dir=false
-    continue
-  fi
-  case "$arg" in
-    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
-    --state-dir)   _prev_was_state_dir=true ;;
-  esac
-done
-if [ -n "$_cli_state_dir" ]; then
-  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
-fi
-unset _cli_state_dir _prev_was_state_dir
-
-# Expand leading ~ in the final resolved value.
-case "$LEERIE_STATE_HOST_DIR" in
-  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
-  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
-esac
-
-export LEERIE_STATE_HOST_DIR
 
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
@@ -2059,7 +2063,7 @@ if [ "$RUNTIME" = "fly" ]; then
     _paused_mid=""
     if [ -n "$LEERIE_RUN_ID" ]; then
       _paused_mid="$(_resolve_fly_machine_id_from_run_dir \
-                       "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID")"
+                       "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"
     fi
 
     _provisioned=false
@@ -2082,8 +2086,8 @@ if [ "$RUNTIME" = "fly" ]; then
       # loudly instead of silently provisioning a brand-new machine —
       # the user typed "resume", not "start a new run".
       remote_log "--resume: no Fly machine pointer found for run-id $LEERIE_RUN_ID"
-      echo "  Looked for: $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
-      echo "             $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
+      echo "  Looked for: $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
+      echo "             $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
       echo "  Neither exists with a usable machine id." >&2
       echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
       echo "  start a fresh run." >&2
@@ -2114,8 +2118,8 @@ if [ "$RUNTIME" = "fly" ]; then
       if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
         remote_log "remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting LEERIE_RUN_ID"
         # Migrate host-side run dir if needed.
-        _host_boot_dir="$USER_REPO/.leerie/runs/${_bootstrap_pid}"
-        _host_final_dir="$USER_REPO/.leerie/runs/${_final_id}"
+        _host_boot_dir="$LEERIE_STATE_HOST_DIR/runs/${_bootstrap_pid}"
+        _host_final_dir="$LEERIE_STATE_HOST_DIR/runs/${_final_id}"
         if [ -d "$_host_boot_dir" ] && [ ! -d "$_host_final_dir" ]; then
           mv "$_host_boot_dir" "$_host_final_dir" 2>/dev/null || true
         fi
@@ -2149,9 +2153,9 @@ if [ "$RUNTIME" = "fly" ]; then
     # but the run-keyed pointer survives from the original provision, so the
     # `[ ! -f "$_run_record" ]` guard makes this a no-op on resume).
     if [ "$_provisioned" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      _pid_record="$USER_REPO/.leerie/remote/$$.json"
-      mkdir -p "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID" 2>/dev/null || true
-      _run_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json"
+      _pid_record="$LEERIE_STATE_HOST_DIR/remote/$$.json"
+      mkdir -p "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID" 2>/dev/null || true
+      _run_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
       if [ -f "$_pid_record" ] && [ ! -f "$_run_record" ]; then
         cp "$_pid_record" "$_run_record" 2>/dev/null || true
       fi
@@ -2161,7 +2165,7 @@ if [ "$RUNTIME" = "fly" ]; then
       # strips --resume on bootstrap-stage resumes (routing to the fresh-
       # launch branch), but that branch needs a task argument. Without
       # this file the user has to retype the task on every retry.
-      _task_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt"
+      _task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
       if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_record" ]; then
         printf '%s' "$LEERIE_TASK_ARG" > "$_task_record" 2>/dev/null || true
       fi
@@ -2266,7 +2270,7 @@ if [ "$RUNTIME" = "fly" ]; then
           # from the persisted task.txt written at first-launch. The
           # orchestrator's fresh-launch branch (which we routed to by
           # stripping --resume) requires a task argument.
-          _task_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt"
+          _task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
           if [ -z "$LEERIE_TASK_ARG" ] && [ -f "$_task_record" ]; then
             _restored_task="$(cat "$_task_record" 2>/dev/null || true)"
             if [ -n "$_restored_task" ]; then
@@ -2536,8 +2540,8 @@ if [ "$RUNTIME" != "fly" ]; then
   # `find` + sort isn't portable with -printf; iterate and pick newest.
   LATEST_RUN_DIR=""
   LATEST_RUN_MTIME=0
-  if [ -d "$USER_REPO/.leerie/runs" ]; then
-    for run_json in "$USER_REPO"/.leerie/runs/*/run.json; do
+  if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]; then
+    for run_json in "$LEERIE_STATE_HOST_DIR"/runs/*/run.json; do
       [ -f "$run_json" ] || continue
       # finished_at must be present and non-null.
       if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then

@@ -476,8 +476,7 @@ before relying on the result.** Push + PR at finalize is the natural
 review surface; you can also pass `--no-push` to keep finalize fully
 local.
 
-The run writes only to `.leerie/runs/<run-id>/` (auto-excluded from git
-via `.git/info/exclude`) and to `leerie/runs/<run-id>` plus
+The run writes only to `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` (outside the repo by default — see `LEERIE_STATE_DIR`) and to `leerie/runs/<run-id>` plus
 `leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
 `--no-push`) pushes the run branch to `origin` and opens a PR against
 your working branch — your working branch itself is never modified
@@ -537,7 +536,7 @@ for an audit cleanup across every past run).
 
 - **Push or PR failed at finalize** — the run completed locally. Check
   `leerie --list` for the run's status (`push-failed` / `pr-failed`)
-  and read `.leerie/runs/<run-id>/run.json` for the captured stderr.
+  and read `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` for the captured stderr.
   The error message at finalize names the exact retry command. Local
   commits are intact on the run branch.
 
@@ -550,7 +549,7 @@ key is read or sent.
 
 **Can I run multiple Leerie instances in the same repository?**
 Yes. Each invocation derives a unique `run_id` and namespaces all of its
-state under `.leerie/runs/<run-id>/` and its branches under
+state under `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` and its branches under
 `leerie/runs/<run-id>` (run branch) and `leerie/subtasks/<run-id>/<sid>`
 (subtask branches) — so parallel runs in the same clone never collide.
 Use `--list` to see what's in flight and `--resume --run-id <id>` to

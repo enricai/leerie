@@ -148,7 +148,9 @@ destroy_machine() {
   fi
   # Drop the PID-keyed attach pointer (Phase 3) — the machine no longer
   # exists, so attach should report "no active remote machine" next time.
-  if [ -n "${USER_REPO:-}" ]; then
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    rm -f "$LEERIE_STATE_HOST_DIR/remote/$$.json"
+  elif [ -n "${USER_REPO:-}" ]; then
     rm -f "$USER_REPO/.leerie/remote/$$.json"
   fi
   LEERIE_MACHINE_ID=""
@@ -269,8 +271,12 @@ decide_teardown() {
         # host_finalize already printed. Matches `leerie --finalize`'s
         # existing behavior — work is preserved on origin.
         local run_dir=""
-        if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ] && [ -n "${USER_REPO:-}" ]; then
-          run_dir="$USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID"
+        if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
+          if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+            run_dir="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_REMOTE_RUN_ID"
+          elif [ -n "${USER_REPO:-}" ]; then
+            run_dir="$USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID"
+          fi
         fi
         # Skip auto-finalize when the run exited cleanly (rc=0|10|75)
         # but didn't reach phase_finalize — most commonly
@@ -350,8 +356,12 @@ decide_teardown() {
       else
         local sync_reason="sync-failed-on-clean-exit"
         local sidecar=""
-        if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
-          sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+        if [ -n "${LEERIE_RUN_ID:-}" ]; then
+          if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+            sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"
+          elif [ -n "${USER_REPO:-}" ]; then
+            sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+          fi
         fi
         if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
           update_run_json "$sidecar" \
@@ -425,8 +435,12 @@ decide_teardown() {
       # sidecar.
       local reason="${LEERIE_PAUSE_REASON:-worker-error}"
       local sidecar=""
-      if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
-        sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+      if [ -n "${LEERIE_RUN_ID:-}" ]; then
+        if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+          sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"
+        elif [ -n "${USER_REPO:-}" ]; then
+          sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+        fi
       fi
       if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
         update_run_json "$sidecar" \
@@ -617,9 +631,14 @@ provision_machine() {
   # DESIGN §6 Remote pause-on-failure: the sidecar is the source of truth
   # for what's recoverable; the env-var-only path of older revisions
   # leaks machines on launcher crash.
-  if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
-    local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
-    if [ -f "$sidecar" ]; then
+  if [ -n "${LEERIE_RUN_ID:-}" ]; then
+    local sidecar=""
+    if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+      sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"
+    elif [ -n "${USER_REPO:-}" ]; then
+      sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+    fi
+    if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
       if [ -n "$LEERIE_VOLUME_ID" ]; then
         update_run_json "$sidecar" \
           fly_machine_id "$machine_id" \
@@ -632,12 +651,18 @@ provision_machine() {
 
   # PID-keyed pointer for `leerie --attach` (no run-id available yet on
   # fresh runs because the orchestrator hasn't minted one). The file is
-  # under $USER_REPO/.leerie/remote/<launcher-pid>.json and is removed by
-  # destroy_machine on teardown. The launcher renames it to
-  # .leerie/runs/<run-id>/fly-machine.json after fetch-branch.sh runs.
+  # under $LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json and is removed
+  # by destroy_machine on teardown. The launcher renames it to
+  # runs/<run-id>/fly-machine.json after fetch-branch.sh runs.
   # (Phase 3: PTY-over-SSH attach.)
-  if [ -n "${USER_REPO:-}" ]; then
-    local remote_dir="$USER_REPO/.leerie/remote"
+  local _state_base=""
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    _state_base="$LEERIE_STATE_HOST_DIR"
+  elif [ -n "${USER_REPO:-}" ]; then
+    _state_base="$USER_REPO/.leerie"
+  fi
+  if [ -n "$_state_base" ]; then
+    local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir"
     local pid_record="$remote_dir/$$.json"
     # Record the USER's launch-time --no-push intent here so the host's

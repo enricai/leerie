@@ -35,11 +35,17 @@ def _stub_flyctl(tmp_path: Path) -> None:
     p.chmod(0o755)
 
 
+def _state_dir(tmp_path: Path) -> Path:
+    """Return the canonical state dir for these tests: a fixed subdir of
+    tmp_path that LEERIE_STATE_DIR is set to so all leerie verbs agree
+    on where to look for run dirs."""
+    return tmp_path / "leerie-state"
+
+
 def _bootstrap_run(tmp_path: Path, run_id: str, machine_id: str) -> Path:
-    """Set up `.leerie/runs/<run_id>/fly-machine.json` with no run.json.
+    """Set up `<state_dir>/runs/<run_id>/fly-machine.json` with no run.json.
     This is the in-flight bootstrap state on the host."""
-    user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".leerie" / "runs" / run_id
+    run_dir = _state_dir(tmp_path) / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": machine_id,
@@ -52,14 +58,18 @@ def _run_leerie(tmp_path: Path, *args: str,
               stdin: str = "") -> subprocess.CompletedProcess:
     """Run leerie with stubbed flyctl on PATH. cwd is the fake user-repo
     so leerie's USER_REPO=$(pwd -P) resolves there (the launcher hard-
-    overrides USER_REPO from $PWD at line 39, ignoring the env var)."""
+    overrides USER_REPO from $PWD at line 39, ignoring the env var).
+    LEERIE_STATE_DIR is set to the test's canonical state dir so sidecar
+    lookups find the fixtures created by _bootstrap_run."""
     user_repo = tmp_path / "user-repo"
+    user_repo.mkdir(exist_ok=True)
     return subprocess.run(
         [str(LEERIE), *args],
         cwd=str(user_repo),
         env={
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
             "HOME": str(tmp_path),
+            "LEERIE_STATE_DIR": str(_state_dir(tmp_path)),
             "LEERIE_NO_RUNTIME_INSTALL": "1",  # don't trigger install path
         },
         input=stdin,

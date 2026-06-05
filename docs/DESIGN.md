@@ -687,7 +687,7 @@ push + PR sit between them on the host:
      pipes it to the host, where `git fetch` materialises the branch in the
      host's local repo;
    - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
-     `$USER_REPO/.leerie/runs/` on the host.
+     `$LEERIE_STATE_HOST_DIR/runs/` on the host.
 3. With the run dir now on the host, the trap sources
    `scripts/host-finalize.sh` and calls `host_finalize` directly — push
    + `gh pr create` happen inline, with the host's own auth, before
@@ -1313,9 +1313,9 @@ concern"). The same mechanism serves four roles:
    never noticed; only the local view paused.
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
-record at `$USER_REPO/.leerie/remote/$$.json` immediately after
+record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after
 provisioning, removes it in `destroy_machine`, and lets the launcher
-rename it to `$USER_REPO/.leerie/runs/<run-id>/fly-machine.json` after
+rename it to `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` after
 the run-id becomes known (via fetch-branch.sh). `leerie --attach`
 resolves the machine via either path. Multiple concurrent remote
 runs in the same repo are disambiguated by passing a run-id.
