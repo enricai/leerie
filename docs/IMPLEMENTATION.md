@@ -747,6 +747,15 @@ export LEERIE_VERBOSITY=stream
 export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
 
+# Override the host-side per-repo state directory (default:
+# $HOME/.leerie/state/<sha16>-<basename>/). Each repo gets its own
+# subtree under $HOME so Colima auto-shares it. Precedence:
+# default < leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
+export LEERIE_STATE_DIR=~/.leerie/state/myproject
+leerie "task" --state-dir ~/.leerie/state/myproject
+# Or commit a per-repo default in leerie.toml:
+#   state_dir = ~/.leerie/state/myproject
+
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers.
 export LEERIE_RUNTIME=local               # or: fly
@@ -982,6 +991,52 @@ because a budget-infeasible run has no work to finalize and `--resume`
 would die at the resume guard (no `waves` field in `state.json`).
 This routing keeps the user from paying for a Fly volume indefinitely
 on a structurally-unrecoverable run.
+
+### Host-side per-repo state directory
+
+Resolves `LEERIE_STATE_HOST_DIR`: the host path where this repo's leerie run
+state (`runs/`, `worktrees/`, etc.) is stored. Lives under `$HOME` so Colima
+auto-shares it without an explicit `--mount` entry; keyed by repo identity so
+each repo gets an isolated subtree, mirroring how `~/.claude/projects/`
+separates per-repo state from the shared install at `~/.claude/`.
+
+Default path: `$HOME/.leerie/state/<key>/` where `<key>` is
+`sha256(abs_path)[:16]-<basename>` — stable, collision-resistant, and
+human-legible without a lookup table. The default must NOT reuse
+`$LEERIE_HOME` (`~/.leerie`) verbatim, because that is the install/clone
+directory (DESIGN §TBD); state lives in a distinct `state/` subtree.
+
+Resolution order (lowest → highest priority):
+
+1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. The key is computed
+   by the `_state_dir_default` helper in the launcher via
+   `hashlib.sha256(abs_path.encode()).hexdigest()[:16] + "-" + basename`.
+
+2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
+   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
+   `$HOME`:
+
+   ```
+   state_dir = ~/.leerie/state/myproject
+   ```
+
+3. **`LEERIE_STATE_DIR`** environment variable. Overrides the default and
+   any toml value; bare `~` and `~/`-prefixed values are expanded.
+
+4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
+   Bare `~` and `~/`-prefixed values are expanded.
+
+The resolved directory is `mkdir -p`'d by the launcher on every invocation
+(alongside the other `~/.cache/leerie/*` dirs at `leerie:1827`). This
+ensures the directory exists before the container is launched and before any
+mount in a later subtask adds the host-side path.
+
+Resolution lives entirely in the launcher (bash); no Python counterpart —
+the path is passed to `nerdctl run` as a bind-mount volume argument once
+resolved. Tested by `tests/test_resolve_state_dir.py`.
+
+> The CLI/env > file order follows the same session-scoped vs.
+> committed-default split as `--source-of-truth` and `--runtime`.
 
 ### Runtime mode
 
