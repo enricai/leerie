@@ -433,7 +433,7 @@ deliverable through a declared contract.
 The contract for cross-subtask deliverables is therefore separate from
 the contract for code changes. A producing subtask returns an
 `artifacts` field on its implementer result; the orchestrator persists
-the artifacts to `.leerie/runs/<run-id>/artifacts/<sid>.json` and injects
+the artifacts to `<state-root>/runs/<run-id>/artifacts/<sid>.json` and injects
 them into the prompts of subtasks whose predecessor graph names the
 producer. Code-implementation subtasks emit an absent or empty
 `artifacts` field — the deliverable mechanism does not change for them.
@@ -549,7 +549,7 @@ depends on.
 When more than one run is in flight in the same repository, `--resume`
 needs to know *which* run to resume. The orchestrator auto-picks when
 exactly one run exists, and requires an explicit `--run-id` otherwise; the
-discovery scans `.leerie/runs/*/state.json`. Resume never guesses across
+discovery scans `<state-root>/runs/*/state.json`. Resume never guesses across
 multiple runs.
 
 ### Why merge, not cherry-pick
@@ -849,13 +849,13 @@ resumable via `--resume --run-id <id>` after any abnormal exit.
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
-- Worktrees under `.leerie/runs/<run-id>/worktrees/` are removed and
+- Worktrees under `<state-root>/runs/<run-id>/worktrees/` are removed and
   `git worktree prune` clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
   on `--resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
   branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
-  checkpoints under `.leerie/runs/<run-id>/checkpoints/` survive too,
+  checkpoints under `<state-root>/runs/<run-id>/checkpoints/` survive too,
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container
@@ -1472,8 +1472,8 @@ classification and planning, layered top-to-bottom by determinism:
    install: (a) the host's checked-out source tree and tracked
    dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are
    never written to by leerie's install path — `.leerie-setup.sh`
-   (user-opt-in) and the `.leerie/` coordination directory are the
-   only paths leerie ever modifies under the host repo; (b) no work
+   (user-opt-in) is the only path leerie ever modifies under the host
+   repo (run state lives outside the repo at `<state-root>`); (b) no work
    is wasted on worktrees whose subtasks don't need built deps;
    (c) the same `claude -p` event-streaming the workers use for
    everything else makes install progress visible to the user,
@@ -2212,7 +2212,7 @@ worker in the system (§7).
 Each run's telemetry lives at:
 
 ```
-.leerie/runs/<run-id>/calls.ndjson
+<state-root>/runs/<run-id>/calls.ndjson
 ```
 
 One file per run. The file is opened for append at run start and written to

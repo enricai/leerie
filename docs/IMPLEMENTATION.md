@@ -315,9 +315,9 @@ Note the two `.leerie*` paths inside the container:
   `/opt/leerie-image/{scripts,orchestrator}/`.
 
 The container's PID 1 (the entry script) reads from `.leerie-image/`
-and writes to `.leerie/`. Confusing the two would either break runs
-(writing to the read-only mount) or corrupt the install (writing to
-the source tree).
+and writes to `/leerie-state/` (the state bind mount). Confusing the
+two would either break runs (writing to the read-only mount) or
+corrupt the install (writing to the source tree).
 
 ### Entrypoint and source mounting
 
@@ -532,13 +532,14 @@ handling) is identical.
 - Inside the container, `sys.stdin.isatty()` returns False. The
   orchestrator's `gather_answers()` and the mid-execution
   clarification path (`surface_clarification()`) both detect this and trigger
-  the canonical no-TTY signal: write `.leerie/pending-questions.json`
+  the canonical no-TTY signal: write `<state-root>/runs/<run-id>/pending-questions.json`
   to disk and `sys.exit(EXIT_NEEDS_ANSWERS)` (= 10).
-- `.leerie/pending-questions.json` is visible on the host because
-  `/work` is bind-mounted from the user's repo. The plugin agent at
-  `commands/leerie.md` reads it directly, asks the user via the chat
-  UI, writes the matching `.leerie/answers.json`, and re-runs the
-  container with `--answers .leerie/answers.json` and `--resume`.
+- `<state-root>/runs/<run-id>/pending-questions.json` is visible on the
+  host because `/leerie-state` is bind-mounted from `LEERIE_STATE_HOST_DIR`.
+  The plugin agent at `commands/leerie.md` reads it directly, asks the
+  user via the chat UI, writes the matching `<state-root>/answers.json`,
+  and re-runs the container with `--answers <state-root>/answers.json`
+  and `--resume`.
 - Stdout/stderr stream back through the Bash tool to the agent's
   chat session — possibly in 30s-ish chunks per the harness's
   buffering, which is acceptable for the streaming UX.
@@ -556,7 +557,7 @@ Common to both modes:
 
 The plugin mode flow above is exactly what `commands/leerie.md` already
 documents — it works through the container with zero new mechanism
-because `.leerie/` lives on the bind-mounted host filesystem.
+because the state dir lives on the bind-mounted `/leerie-state` host filesystem.
 
 ### What does NOT change in the orchestrator
 
@@ -733,7 +734,7 @@ export LEERIE_CONFIDENCE_ROUNDS=12
 # Verbosity controls how much per-worker activity surfaces inline.
 # Default is `stream`: one-line summary per worker event. -q drops to
 # leerie's pre-streaming terse output; -qq is fully quiet (errors
-# still emit). -vv adds raw payloads. Per-worker .leerie/logs/<sid>.log
+# still emit). -vv adds raw payloads. Per-worker <state-root>/logs/<sid>.log
 # files are always written regardless of level.
 leerie "task"        # default: stream
 leerie "task" -q      # normal (pre-streaming)
@@ -1149,7 +1150,7 @@ each planner / implementer's user prompt — the cap is prompt-governed (see
 ### Verbosity
 
 Controls how much of the per-worker activity surfaces to the
-orchestrator log. Per-worker `.leerie/logs/<sid>.log` files are
+orchestrator log. Per-worker `<state-root>/logs/<sid>.log` files are
 always written with the full raw event stream — verbosity governs
 only the *inline* summary lines. Four named levels with stackable
 `-v`/`-q` shortcuts, following the clig.dev / cargo / kubectl
@@ -1267,8 +1268,8 @@ unneeded.
 ### Telemetry
 
 Controls whether leerie writes NDJSON telemetry events for LLM calls. Events
-land in `<run-dir>/<telemetry_subdir>/` — already under `.leerie/` and thus
-covered by the existing `.gitignore` exclusion. Telemetry is on by default.
+land in `<run-dir>/<telemetry_subdir>/` — already under `<state-root>/` and
+outside the repo, so no `.gitignore` entry is needed. Telemetry is on by default.
 
 Resolution order (highest priority first):
 

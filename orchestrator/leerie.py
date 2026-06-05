@@ -6181,10 +6181,8 @@ class State:
     ):
         self.leerie_root = leerie_root
         self.run_id = run_id
-        # When leerie_root is inside the repo (current layout: <repo>/.leerie),
-        # this defaults to leerie_root.parent.  The param exists so a later
-        # refactor can point leerie_root at ~/.leerie/<repo-key> while repo_root
-        # still points at the real repo.
+        # leerie_root may now live outside the repo (LEERIE_STATE_DIR), so
+        # repo_root cannot be derived from it as leerie_root.parent in general.
         self.repo_root: Path = repo_root if repo_root is not None else leerie_root.parent
         self.run_dir = leerie_root / "runs" / run_id
         self.path = self.run_dir / "state.json"
