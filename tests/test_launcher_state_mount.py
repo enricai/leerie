@@ -1,4 +1,4 @@
-"""Tests for the local nerdctl run state-dir bind-mount (config-002).
+"""Tests for the local nerdctl run state-dir bind-mount.
 
 The local container path verifies that:
   - `nerdctl run` includes `-v "<host-state-dir>:/leerie-state"`
