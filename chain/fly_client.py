@@ -1,11 +1,3 @@
-"""chain.fly_client — thin Fly Machines API client for leerie-chain.
-
-Launches, queries, and destroys Fly Machines for per-run leerie workers.
-Auth: FLY_API_TOKEN environment variable (required).
-App:  FLY_APP_NAME environment variable (default: "leerie").
-
-Uses stdlib urllib.request only — no third-party HTTP libraries.
-"""
 from __future__ import annotations
 
 import json
@@ -18,7 +10,7 @@ _MACHINES_API = "https://api.machines.dev/v1"
 
 
 class FlyClientError(Exception):
-    """Raised when the Fly Machines API returns an error or token is missing."""
+    pass
 
 
 def _token() -> str:
@@ -64,11 +56,6 @@ def launch_machine(
     vm_cpus: int = 4,
     vm_memory_mb: int = 8192,
 ) -> str:
-    """Launch a Fly Machine and return its machine_id.
-
-    Sends POST /v1/apps/{app}/machines with the leerie image, env vars, and
-    region. Returns the machine id string from the response.
-    """
     payload: dict[str, Any] = {
         "config": {
             "image": image,
@@ -89,10 +76,6 @@ def launch_machine(
 
 
 def get_machine_state(machine_id: str) -> str:
-    """Return the current state of a Fly Machine (e.g. 'started', 'stopped').
-
-    Sends GET /v1/apps/{app}/machines/{machine_id}.
-    """
     result = _request("GET", f"/apps/{_app()}/machines/{machine_id}")
     if not isinstance(result, dict) or "state" not in result:
         raise FlyClientError(
@@ -102,11 +85,6 @@ def get_machine_state(machine_id: str) -> str:
 
 
 def destroy_machine(machine_id: str) -> None:
-    """Destroy a Fly Machine (best-effort, force=true).
-
-    Sends DELETE /v1/apps/{app}/machines/{machine_id}?force=true.
-    Does not raise on 404 (machine already gone is success).
-    """
     try:
         _request("DELETE", f"/apps/{_app()}/machines/{machine_id}?force=true")
     except FlyClientError as exc:

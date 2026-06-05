@@ -3717,6 +3717,21 @@ model for `leerie-chain`. Key public surface:
 
 Single-writer semantics mirror the orchestrator's `State` class: `leerie-chain` is one process on one Fly machine; all HTTP handler coroutines serialise on a single asyncio event loop and never interleave inside a SQLite transaction. WAL mode is enabled for defence-in-depth (concurrent readers are possible; the writer-exclusive lock prevents concurrent writes regardless). Covered by `tests/test_chain_state.py`.
 
+`chain/fly_client.py` is a thin stdlib-only HTTP client for the Fly Machines
+API. It exports `FlyClientError` (raised on API errors or missing token) and
+three functions:
+
+| Function | Endpoint | Returns |
+|----------|----------|---------|
+| `launch_machine(image, env, region, vm_cpus=4, vm_memory_mb=8192) -> str` | `POST /v1/apps/{app}/machines` | machine id string |
+| `get_machine_state(machine_id) -> str` | `GET /v1/apps/{app}/machines/{machine_id}` | state string (e.g. `"started"`) |
+| `destroy_machine(machine_id) -> None` | `DELETE /v1/apps/{app}/machines/{machine_id}?force=true` | None; 404 is silently ignored |
+
+Auth reads `FLY_API_TOKEN` from the environment; raises `FlyClientError` if
+absent or empty. App name reads `FLY_APP_NAME` (default: `"leerie"`). Uses
+`urllib.request` only — no third-party HTTP libraries. Covered by
+`tests/test_chain_fly_client.py`.
+
 ---
 
 ## 8. Coordination directory layout
