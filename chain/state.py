@@ -43,10 +43,10 @@ multiple times (e.g. after a machine restart) is a no-op.
 """
 from __future__ import annotations
 
-import sqlite3
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
+import uuid
 
 
 _DDL = """\

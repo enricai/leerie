@@ -3697,6 +3697,26 @@ time, so tests can monkeypatch before calling):
 any required var is absent or empty — mirrors leerie.py's `die()` pattern.
 `Settings` is a frozen dataclass. Covered by `tests/test_chain_config.py`.
 
+`chain/state.py` exports the `ChainState` class — the SQLite-backed state
+model for `leerie-chain`. Key public surface:
+
+| Symbol | Description |
+|--------|-------------|
+| `ChainState.init_db(path)` | Open (or create) the SQLite DB at `path`, apply schema (idempotent — uses `CREATE TABLE IF NOT EXISTS`), enable WAL mode. Returns a `ChainState` instance. |
+| `ChainState.create_chain(target, run_prompts)` | Insert a new chain row and its `run_prompts` as `chain_runs` rows. `run_prompts` is a list of `(prompt_text, wave)` tuples where `wave` is `'a'` or `'b'`. Returns the new chain's `id`. |
+| `ChainState.load_chain(chain_id)` | Return a full chain snapshot dict (chain fields + `"runs"` list), or `None` if not found. |
+| `ChainState.list_chains()` | Return all chain rows (no run sub-rows). |
+| `ChainState.transition_run(run_id, new_status, machine_id=None)` | Advance a run's status; optionally records the Fly machine ID. Raises `ValueError` on invalid status, `KeyError` if not found. |
+| `ChainState.transition_chain(chain_id, new_status)` | Set the chain's top-level status. Raises `ValueError`/`KeyError`. |
+| `ChainState.advance_wave(chain_id, new_wave_state)` | Advance the chain's wave state (`wave_a` → `wave_b` → `done`). Raises `ValueError`/`KeyError`. |
+| `ChainState.set_machine_id(run_id, machine_id)` | Record a Fly machine ID on a run row without changing status. Raises `KeyError` if not found. |
+| `ChainState.close()` | Close the underlying SQLite connection. |
+| `CHAIN_STATUSES` | `frozenset` of valid chain status values: `running`, `paused`, `done`, `failed`, `cancelled`. |
+| `RUN_STATUSES` | `frozenset` of valid run status values: `queued`, `running`, `done`, `failed`. |
+| `WAVE_STATES` | `frozenset` of valid wave state values: `wave_a`, `wave_b`, `done`. |
+
+Single-writer semantics mirror the orchestrator's `State` class: `leerie-chain` is one process on one Fly machine; all HTTP handler coroutines serialise on a single asyncio event loop and never interleave inside a SQLite transaction. WAL mode is enabled for defence-in-depth (concurrent readers are possible; the writer-exclusive lock prevents concurrent writes regardless). Covered by `tests/test_chain_state.py`.
+
 ---
 
 ## 8. Coordination directory layout
