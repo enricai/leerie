@@ -295,6 +295,14 @@ class ChainState:
         if result.rowcount == 0:
             raise KeyError(f"chain {chain_id!r} not found")
 
+    def find_chain_id_by_machine_id(self, machine_id: str) -> str | None:
+        """Return the chain_id for the run with the given Fly machine ID, or None."""
+        row = self._conn.execute(
+            "SELECT chain_id FROM chain_runs WHERE machine_id = ?",
+            (machine_id,),
+        ).fetchone()
+        return row["chain_id"] if row is not None else None
+
     def set_machine_id(self, run_id: str, machine_id: str) -> None:
         """Record the Fly machine ID for a run (separate from status transition)."""
         now = _now()

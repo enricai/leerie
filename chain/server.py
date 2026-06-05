@@ -271,14 +271,11 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
         if not machine_id:
             return
 
-        # Find the chain_run with this machine_id.
-        row = self._cs._conn.execute(
-            "SELECT chain_id FROM chain_runs WHERE machine_id = ?",
-            (machine_id,),
-        ).fetchone()
-        if row is None:
+        # Find the chain that owns this machine_id.
+        chain_id_or_none = self._cs.find_chain_id_by_machine_id(machine_id)
+        if chain_id_or_none is None:
             return
-        chain_id: str = row["chain_id"]
+        chain_id: str = chain_id_or_none
 
         snap = self._cs.load_chain(chain_id)
         if snap is None:
