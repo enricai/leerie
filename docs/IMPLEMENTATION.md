@@ -3796,7 +3796,7 @@ Endpoints:
 
 Covered by `tests/test_chain_server.py` (server spun in-process on an
 ephemeral port; `fly_client.launch_machine` and `git_ops` stubbed via
-`unittest.mock.patch` and `monkeypatch.setattr`; 20 tests).
+`unittest.mock.patch` and `monkeypatch.setattr`; 22 tests).
 
 `chain/__main__.py` is the `python3 -m chain` entry point. It reads three
 env vars at startup (`CHAIN_DB_PATH` default `/data/chain.db`, `CHAIN_HOST`
