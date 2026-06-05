@@ -254,11 +254,17 @@ print(best[3])
   fi
 
   # --- Step 3: stream the .leerie run state directory back -------------------
-  # The host-side finalize reads .leerie/runs/<run-id>/run.json (for finished_at,
+  # The host-side finalize reads runs/<run-id>/run.json (for finished_at,
   # branch, working_branch) and state.json (for PR body composition).
-  # Tar the whole run directory from the machine and extract it under $USER_REPO.
+  # Tar the whole run directory from the machine and extract it under the
+  # host state dir (LEERIE_STATE_HOST_DIR if set, else USER_REPO/.leerie).
   local run_state_dir="/work/.leerie/runs/$run_id"
-  local host_leerie_runs="$USER_REPO/.leerie/runs"
+  local host_leerie_runs
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    host_leerie_runs="$LEERIE_STATE_HOST_DIR/runs"
+  else
+    host_leerie_runs="$USER_REPO/.leerie/runs"
+  fi
   mkdir -p "$host_leerie_runs"
 
   remote_log "remote: streaming .leerie/runs/$run_id state directory ..."

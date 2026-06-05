@@ -52,14 +52,15 @@ def _make_user_repo(tmp_path: Path) -> Path:
     return user_repo
 
 
-def _make_no_work_run_dir(user_repo: Path, run_id: str) -> Path:
+def _make_no_work_run_dir(state_dir: Path, run_id: str) -> Path:
     """Synthesize the host-side artifacts of a cleared-but-empty
     terminal-state run that has been auto-synced back to the host:
       - run.json with finished_at, no_push=true, branch, working_branch
       - state.json with no_work_required=true
       - NO local `leerie/runs/<id>` branch (the run never created one)
+    Creates under state_dir/runs/ (LEERIE_STATE_HOST_DIR layout).
     """
-    run_dir = user_repo / ".leerie" / "runs" / run_id
+    run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": run_id,
@@ -93,15 +94,17 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
     non-existent branch, and the run would fail with `src refspec ...
     does not match any`."""
     user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
     run_id = "bugfix-already-done-test-c838cc"
-    _make_no_work_run_dir(user_repo, run_id)
+    _make_no_work_run_dir(state_dir, run_id)
 
     # Run from inside the user repo, as the user does.
     result = subprocess.run(
         ["bash", str(LEERIE), "--finalize", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
     )
 
     assert result.returncode == 0, (
@@ -127,7 +130,7 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
     # stripper at lines 499-533 must have been skipped because the
     # branch is absent locally).
     after = json.loads(
-        (user_repo / ".leerie" / "runs" / run_id / "run.json").read_text()
+        (state_dir / "runs" / run_id / "run.json").read_text()
     )
     assert after.get("no_push") is True, (
         "Fix B2: no_push=true must be preserved when the run branch "
@@ -144,8 +147,9 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
     the branch state. Confirms Fix B didn't disturb the earlier
     short-circuit at leerie:348-360."""
     user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
     run_id = "feat-already-pushed-abc123"
-    run_dir = user_repo / ".leerie" / "runs" / run_id
+    run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "branch": f"leerie/runs/{run_id}",
@@ -159,7 +163,8 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
         ["bash", str(LEERIE), "--finalize", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
-        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
     )
     assert result.returncode == 0, result.stderr
     assert "already pushed" in result.stderr or "already pushed" in result.stdout

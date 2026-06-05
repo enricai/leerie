@@ -77,7 +77,7 @@ container_rc=0
 _paused_mid=""
 if [ -n "$LEERIE_RUN_ID" ]; then
   _paused_mid="$(_resolve_fly_machine_id_from_run_dir \\
-                   "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID")"
+                   "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"
 fi
 
 _provisioned=false
@@ -91,8 +91,8 @@ if [ -n "$_paused_mid" ]; then
   fi
 elif [ "$IS_RESUME" = "true" ]; then
   remote_log "--resume: no Fly machine pointer found for run-id $LEERIE_RUN_ID"
-  echo "  Looked for: $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
-  echo "             $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
+  echo "  Looked for: $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
+  echo "             $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
   echo "  Neither exists with a usable machine id." >&2
   echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
   echo "  start a fresh run." >&2
@@ -138,14 +138,14 @@ def _make_flyctl_stub(tmp_path: Path, *, state: str = "started",
     return fake
 
 
-def _make_run_dir_with_fly_machine_json(user_repo: Path, run_id: str,
+def _make_run_dir_with_fly_machine_json(state_dir: Path, run_id: str,
                                          machine_id: str) -> Path:
     """Synthesize a host-side run dir in the bootstrap-pre-classify
-    shape: only fly-machine.json exists (the launcher writes it at
-    `leerie:1842-1847`), no run.json (the orchestrator inside the
-    machine hasn't synced state back yet). This is the shape the
+    shape: only fly-machine.json exists (the launcher writes it at the
+    LEERIE_STATE_HOST_DIR/runs path), no run.json (the orchestrator inside
+    the machine hasn't synced state back yet). This is the shape the
     dispatch must tolerate."""
-    run_dir = user_repo / ".leerie" / "runs" / run_id
+    run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(
         '{"fly_app": "leerie", "fly_machine_id": "' + machine_id + '",'
@@ -158,11 +158,13 @@ def _make_run_dir_with_fly_machine_json(user_repo: Path, run_id: str,
 
 def _run_harness(tmp_path: Path, run_id: str, is_resume: str) -> subprocess.CompletedProcess:
     user_repo = tmp_path / "user-repo"
+    state_dir = tmp_path / "leerie-state"
     return subprocess.run(
         ["bash", "-c", _HARNESS, "_", run_id, is_resume],
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
             "LEERIE_FLY_APP": "leerie",
             # Provision-side env that provision_machine reads — only
             # consulted on the provision path (Case A and Case C should
@@ -185,8 +187,9 @@ def test_resume_finds_machine_id_in_fly_machine_json(tmp_path: Path):
     _make_flyctl_stub(tmp_path, state="started")
     user_repo = tmp_path / "user-repo"
     user_repo.mkdir()
+    state_dir = tmp_path / "leerie-state"
     _make_run_dir_with_fly_machine_json(
-        user_repo, "_bootstrap-abc123", "mach-LIVE-001"
+        state_dir, "_bootstrap-abc123", "mach-LIVE-001"
     )
     r = _run_harness(tmp_path, "_bootstrap-abc123", "true")
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
@@ -235,8 +238,9 @@ def test_resume_against_destroyed_machine_does_not_provision(tmp_path: Path):
     _make_flyctl_stub(tmp_path, state="destroyed")
     user_repo = tmp_path / "user-repo"
     user_repo.mkdir()
+    state_dir = tmp_path / "leerie-state"
     _make_run_dir_with_fly_machine_json(
-        user_repo, "_bootstrap-gone", "mach-DEAD-001"
+        state_dir, "_bootstrap-gone", "mach-DEAD-001"
     )
     r = _run_harness(tmp_path, "_bootstrap-gone", "true")
     assert r.returncode == 0, r.stderr
@@ -280,6 +284,11 @@ def test_launcher_resume_dispatch_pinned():
         "Resume dispatch must use the dual-file resolver, not an inline "
         "single-file reader."
     )
+    # The resolver must use LEERIE_STATE_HOST_DIR, not USER_REPO/.leerie.
+    assert '$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"' in launcher, (
+        "Resume dispatch resolver must reference LEERIE_STATE_HOST_DIR, "
+        "not USER_REPO/.leerie (fly path must target the centralized state dir)."
+    )
     # An inline reader that gates on paused_at would skip bootstrap runs
     # (which never write run.json on the host). Reject that shape.
     assert "if d.get('paused_at') and d.get('fly_machine_id'):" not in launcher, (
@@ -290,6 +299,10 @@ def test_launcher_resume_dispatch_pinned():
     assert "no Fly machine pointer found for run-id" in launcher, (
         "Resume dispatch must emit a diagnostic on missing pointer, not "
         "fall through to provision."
+    )
+    # Diagnostic paths must reference LEERIE_STATE_HOST_DIR, not USER_REPO/.leerie.
+    assert "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" in launcher, (
+        "Resume dispatch diagnostic must report LEERIE_STATE_HOST_DIR-based path."
     )
     # IS_RESUME must be initialized and set from --resume in argv so the
     # strict-fail policy can gate on explicit user intent.

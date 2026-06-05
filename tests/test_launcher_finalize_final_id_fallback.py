@@ -44,10 +44,11 @@ def _make_user_repo(tmp_path: Path) -> Path:
     return user_repo
 
 
-def _make_bootstrap_dir(user_repo: Path, bootstrap_id: str,
+def _make_bootstrap_dir(state_dir: Path, bootstrap_id: str,
                         machine_id: str = "7812445c537208") -> Path:
-    """Synthesize a bootstrap dir with fly-machine.json, no run.json."""
-    bs_dir = user_repo / ".leerie" / "runs" / bootstrap_id
+    """Synthesize a bootstrap dir with fly-machine.json, no run.json.
+    Creates the dir under state_dir/runs/ (LEERIE_STATE_HOST_DIR layout)."""
+    bs_dir = state_dir / "runs" / bootstrap_id
     bs_dir.mkdir(parents=True)
     (bs_dir / "fly-machine.json").write_text(json.dumps({
         "fly_app": "leerie",
@@ -89,13 +90,15 @@ def test_falls_back_to_bootstrap_when_only_bootstrap_exists(tmp_path):
     error out with 'no run dir' — we got far enough to attempt
     fetch_branch."""
     user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
     bs_id = "_bootstrap-5de324"
-    _make_bootstrap_dir(user_repo, bs_id)
+    _make_bootstrap_dir(state_dir, bs_id)
     stub = _make_fake_flyctl_that_fails(tmp_path)
     final_id = "feat-cool-redesign-abc123"
     env = {
         **os.environ,
         "PATH": f"{stub.parent}:{os.environ.get('PATH', '')}",
+        "LEERIE_STATE_DIR": str(state_dir),
     }
     result = subprocess.run(
         ["bash", str(LEERIE), "--finalize", final_id],
@@ -125,12 +128,14 @@ def test_errors_when_no_bootstrap_and_no_final(tmp_path):
     --finalize errors with the original 'no run dir' message plus the
     new `leerie --list` hint."""
     user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
     # No bootstrap dir, no final-id dir.
     final_id = "feat-cool-redesign-abc123"
     result = subprocess.run(
         ["bash", str(LEERIE), "--finalize", final_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
+        env={**os.environ, "LEERIE_STATE_DIR": str(state_dir)},
     )
     combined = result.stdout + result.stderr
     assert result.returncode != 0, combined
@@ -144,13 +149,15 @@ def test_errors_on_multiple_bootstrap_dirs(tmp_path):
     """When the final-id dir is missing but multiple bootstrap dirs
     exist, the resolver should refuse to guess and fail clearly."""
     user_repo = _make_user_repo(tmp_path)
-    _make_bootstrap_dir(user_repo, "_bootstrap-aaaaaa", "machine-aaa")
-    _make_bootstrap_dir(user_repo, "_bootstrap-bbbbbb", "machine-bbb")
+    state_dir = tmp_path / "leerie-state"
+    _make_bootstrap_dir(state_dir, "_bootstrap-aaaaaa", "machine-aaa")
+    _make_bootstrap_dir(state_dir, "_bootstrap-bbbbbb", "machine-bbb")
     final_id = "feat-ambiguous-cccccc"
     result = subprocess.run(
         ["bash", str(LEERIE), "--finalize", final_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
+        env={**os.environ, "LEERIE_STATE_DIR": str(state_dir)},
     )
     combined = result.stdout + result.stderr
     assert result.returncode != 0, combined
@@ -166,12 +173,13 @@ def test_final_id_passes_through_when_final_dir_exists(tmp_path):
     auto-sync path completed), the fallback path is skipped entirely
     and the legacy resolver consumes the final-id dir directly."""
     user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
     final_id = "feat-normal-flow-ddd111"
-    final_dir = user_repo / ".leerie" / "runs" / final_id
+    final_dir = state_dir / "runs" / final_id
     final_dir.mkdir(parents=True)
-    # Provide a complete sidecar so the short-circuit at leerie:348-360
-    # (pushed_at set → already-pushed) fires and we don't fall into the
-    # SSH path. This isolates the new resolver from network behavior.
+    # Provide a complete sidecar so the short-circuit (pushed_at set →
+    # already-pushed) fires and we don't fall into the SSH path. This
+    # isolates the new resolver from network behavior.
     (final_dir / "run.json").write_text(json.dumps({
         "branch": f"leerie/runs/{final_id}",
         "working_branch": "main",
@@ -183,6 +191,7 @@ def test_final_id_passes_through_when_final_dir_exists(tmp_path):
         ["bash", str(LEERIE), "--finalize", final_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
+        env={**os.environ, "LEERIE_STATE_DIR": str(state_dir)},
     )
     assert result.returncode == 0, result.stderr
     combined = result.stdout + result.stderr
