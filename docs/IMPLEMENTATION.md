@@ -638,8 +638,8 @@ leerie/
 │       │                           pause-on-failure*); resume_machine() flyctl machine start
 │       │                           + wait_for_started + clear paused_at sentinels
 │       ├── attach.sh               PTY-over-SSH attach for `leerie --attach`; resolves
-│       │                           machine id from .leerie/remote/<pid>.json or
-│       │                           .leerie/runs/<run-id>/fly-machine.json and execs
+│       │                           machine id from <state-root>/remote/<pid>.json or
+│       │                           <state-root>/runs/<run-id>/fly-machine.json and execs
 │       │                           `flyctl ssh console` over Fly WireGuard (no sshd
 │       │                           in the image; hallpass is platform-injected)
 │       ├── re-seed.sh               Mid-run re-rsync (Phase 4) — wakes paused machine,
@@ -1533,7 +1533,7 @@ wants the old all-Sonnet behavior sets `LEERIE_MODEL=sonnet` (or
 `--model sonnet`). Per-worker overrides (`--model-planner sonnet`) let
 users selectively de-escalate individual workers.
 
-Models are not persisted in `.leerie/state.json`. On `--resume`, models are
+Models are not persisted in `<state-root>/state.json`. On `--resume`, models are
 re-resolved from the current environment, so changing `LEERIE_MODEL` between
 the original run and the resume is intentional and takes effect.
 
@@ -1607,7 +1607,7 @@ values are validated by argparse `choices=`. A worker that resolves to `None`
 (no override and no per-worker default) produces the exact same CLI as
 before this feature landed — zero behavior change for unconfigured workers.
 
-Efforts are not persisted in `.leerie/state.json`. Like models, on `--resume`
+Efforts are not persisted in `<state-root>/state.json`. Like models, on `--resume`
 they are re-resolved from the current environment.
 
 ### The `--answers` file
@@ -1768,10 +1768,10 @@ Run-id collisions are detected outside preflight because the final `run_id` is o
 
 | Check | Where | Catches |
 |-------|-------|---------|
-| `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `.leerie/runs/<run-id>/` already exists on disk |
+| `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `<state-root>/runs/<run-id>/` already exists on disk |
 | `setup-run.sh` preserves an existing `leerie/runs/<run-id>` branch instead of creating it | wave-execute phase | A pre-existing branch with the same name (treated as a resume; the run picks up wherever the branch was left) |
 
-The bootstrap directory `.leerie/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
+The bootstrap directory `<state-root>/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
 
 `--skip-smoke` bypasses only the live smoke test (used by the test harness); the CLI version check and the `gh` check still run because they are local and read-only, and skipping them would defer a confusing failure to mid-run.
 
@@ -2378,7 +2378,7 @@ branch, after the `_write_run_json(...)` block and before
    record `kind: none` and return.
 2. **Setup hook.** `run_setup_hook(repo_root, log_dir, st)` execs
    `<repo>/.leerie-setup.sh` if present (10-min timeout, streams to
-   `.leerie/runs/<id>/logs/setup-hook.log`). Idempotent via
+   `<state-root>/runs/<id>/logs/setup-hook.log`). Idempotent via
    `st.data["provision"]["sh_hook_ran"]`. Nonzero exit → `die()`.
    **Runs as the non-root `leerie` container user; no sudo.** The hook
    can install user-space tooling (`mise install <lang>@<version>`,
@@ -2426,7 +2426,7 @@ branch, after the `_write_run_json(...)` block and before
    `.python-version` / `.ruby-version` / `rust-toolchain.toml` /
    `.go-version` because the image sets
    `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust`.
-   Streams to `.leerie/runs/<id>/logs/provision.log`. Nonzero exit
+   Streams to `<state-root>/runs/<id>/logs/provision.log`. Nonzero exit
    surfaces the failing tool+version to `die()`.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
@@ -2559,7 +2559,7 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 | `new-worktree.sh <id> <run-id>` | Creates `leerie/subtasks/<run-id>/<id>` worktree at `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/<id>` branched off the current `leerie/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`leerie/runs/…`) and subtask-branch (`leerie/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
 | `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/staging`): `git merge --no-ff leerie/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/leerie/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — leerie does not merge into it locally; the PR is the proposed integration. The push and PR step lives in the **host launcher** (`leerie` bash script), not in the container — it runs after `nerdctl run` exits cleanly, using the host's own `git push` + `gh pr create` against the host's auth state. See "Host-side finalize" below. |
-| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `.leerie/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.leerie/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
+| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `<state-root>/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `<state-root>/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
 
 A run branch `leerie/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
@@ -3737,7 +3737,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
 | `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
-| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `.leerie/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
+| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/leerie.md`):

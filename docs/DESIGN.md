@@ -495,7 +495,7 @@ three inputs known by the end of Phase 1:
 
 The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
 string in three places: the run branch name (`leerie/runs/<run-id>`), the
-per-run state directory (`.leerie/runs/<run-id>/`), and the title of the
+per-run state directory (`<state-root>/runs/<run-id>/`), and the title of the
 PR opened at finalize. A user looking at any of the three can grep for the
 others.
 
@@ -916,10 +916,11 @@ The container boundary holds across both invocation modes:
   launcher passes `-i` only. Inside the container,
   `sys.stdin.isatty()` returns False, so the orchestrator's existing
   no-TTY clarification path activates: it writes
-  `.leerie/pending-questions.json` (visible on the host via the
-  `/work` bind mount) and exits with `EXIT_NEEDS_ANSWERS=10`. The
-  plugin agent reads the file, asks the user in chat, writes
-  `.leerie/answers.json`, and re-runs the container with `--answers`.
+  `<state-root>/runs/<run-id>/pending-questions.json` (visible on the
+  host via the `/leerie-state` bind mount) and exits with
+  `EXIT_NEEDS_ANSWERS=10`. The plugin agent reads the file, asks the
+  user in chat, writes `<state-root>/answers.json`, and re-runs the
+  container with `--answers`.
   Same exit codes, same file passing, same kernel teardown
   guarantee. The container is transparent to the plugin's existing
   exit-10 dance.
@@ -1078,7 +1079,7 @@ explicit value and skips auto-generation.
 **Remote pause-on-failure (Fly.io).** Local mode reaps the container's
 PID namespace on every exit (success or failure) because the host
 filesystem holds the durable record. Remote mode has the same durable
-record (the run branch and `.leerie/runs/<run-id>/`, both of which the
+record (the run branch and `<state-root>/runs/<run-id>/`, both of which the
 stream-back finalize already understands) but the Fly Machine is *not*
 free — keeping it alive after failure has a real per-second cost, and
 destroying it after failure throws away the in-machine filesystem state
@@ -1122,13 +1123,13 @@ exit codes through the runtime-appropriate teardown.
 
 `flyctl machine stop` (not destroy) on the pause branch preserves the
 machine's filesystem; the orchestrator's own state is already in
-`.leerie/runs/<run-id>/run.json` and the run branch holds the committed
-work, and `flyctl machine start` brings the machine back from disk
-without losing anything. Memory state is not preserved across a pause —
-the contract this section relies on is that the run branch (the
-committed work) plus `.leerie/runs/<run-id>/` (the orchestrator's own
-state) are the only durable record of a run, and both already live on
-the machine's filesystem by the time a pause fires.
+`<state-root>/runs/<run-id>/run.json` and the run branch holds the
+committed work, and `flyctl machine start` brings the machine back from
+disk without losing anything. Memory state is not preserved across a
+pause — the contract this section relies on is that the run branch (the
+committed work) plus `<state-root>/runs/<run-id>/` (the orchestrator's
+own state) are the only durable record of a run, and both already live
+on the machine's filesystem by the time a pause fires.
 
 ### Remote disk policy
 
@@ -1190,8 +1191,8 @@ has minted a final run-id and synced state back. Before that — i.e.,
 during the bootstrap window when the run dir is still
 `_bootstrap-<hex>` and `run.json` has not yet been written on the
 host — the `fly_machine_id` pointer lives on
-`.leerie/runs/<run-id>/fly-machine.json` instead. `provision.sh`
-writes a PID-keyed pointer at `.leerie/remote/$$.json` immediately
+`<state-root>/runs/<run-id>/fly-machine.json` instead. `provision.sh`
+writes a PID-keyed pointer at `<state-root>/remote/$$.json` immediately
 after `flyctl machine run` succeeds and the launcher promotes it to
 the run-keyed `fly-machine.json` once the run-id is known, so a
 crash before classify still leaves a recoverable pointer. Every
@@ -1830,14 +1831,18 @@ worktree. A worktree is disposable — it is removed at cleanup — so a checkpo
 stored inside it would vanish exactly when a successor worker needs to read it.
 Coordination state must outlive the worktree that produced it.
 
-Coordination state is **per-run**, rooted at `.leerie/runs/<run-id>/`.
-State, plan, criteria, checkpoints, logs, the worktrees themselves, the
-PR-result sidecar, and the per-subtask `artifacts/` directory (§5
-*Artifact passing between subtasks*) all live under that directory. Two
-runs in the same repository share no coordination state — each has its
-own subtree, and neither can clobber the other's `state.json`, log
-files, or worktrees by collision. The parent `.leerie/` is otherwise
-empty of run data; it only hosts the `runs/` directory.
+Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
+(where `<state-root>` is the resolved state directory — default
+`$HOME/.leerie/state/<sha16>-<basename>/`, overridable via
+`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`; always
+outside the target repo). State, plan, criteria, checkpoints, logs, the
+worktrees themselves, the PR-result sidecar, and the per-subtask
+`artifacts/` directory (§5 *Artifact passing between subtasks*) all live
+under that directory. Two runs in the same repository share no
+coordination state — each has its own subtree, and neither can clobber
+the other's `state.json`, log files, or worktrees by collision. The
+state root is otherwise empty of run data; it only hosts the `runs/`
+directory.
 
 ---
 
