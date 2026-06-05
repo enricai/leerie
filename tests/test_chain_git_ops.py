@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import stat
 import subprocess
 import textwrap
-from pathlib import Path
 
 import pytest
 
