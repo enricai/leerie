@@ -188,8 +188,8 @@ Base layers (top-down):
   `claude` CLI workers invoke; leerie enforces ≥ 2.1.22 at runtime).
 - Non-root `leerie` user created with `--build-arg HOST_UID/HOST_GID`
   matching the host user. This is what makes files the container
-  writes into `/work/.leerie/` and the worktrees keep the host user's
-  ownership.
+  writes into `/work` (worktrees) and `/leerie-state` (run state) keep
+  the host user's ownership.
 - `git config --system --add safe.directory '*'` is set in the image
   (writes to `/etc/gitconfig`). The container is single-tenant (one
   user) and `/work` is its only repo, so blanket-allow is the standard
@@ -301,12 +301,13 @@ Flags:
 The flag is consumed by the launcher and not forwarded to the
 orchestrator (same convention as `--no-runtime-install` and `--remote`).
 
-Note the two `.leerie*` paths inside the container:
+Note the key paths inside the container:
 
-- **`/work/.leerie/`** is the run-state directory inside the user's
-  repo (state.json, logs, worktrees, telemetry). It lives on the
-  host filesystem via the `/work` bind mount and persists across
-  container runs.
+- **`/leerie-state/`** is the run-state directory (state.json, logs,
+  worktrees, telemetry). It lives on the host filesystem via the
+  `/leerie-state` bind mount (`LEERIE_STATE_HOST_DIR`) and persists
+  across container runs. In *local mode*, worktrees land under
+  `/leerie-state/runs/<run-id>/worktrees/` — outside `/work`.
 - **`/opt/leerie-image/`** is the orchestrator source tree. On local
   runs it is a read-only bind mount of `$LEERIE_HOME` on the host; on
   Fly Machines it is the baked copy from the Dockerfile's `COPY`
@@ -1632,7 +1633,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | Flag | Purpose |
 |------|---------|
 | `-p` | non-interactive single-shot |
-| `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.leerie/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
+| `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `<state-root>/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
 | `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/plan_overlap_judge/provision/implementer/integrator/conformer, plus the post-run / finalize workers pr_writer, judge, and patch_generator |
 | `--allowedTools` | tool allowlist; two buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, plan_overlap_judge, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer. The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
@@ -1731,9 +1732,10 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 on the classification.
 
 Between Phase 3 and Phase 4, `write_plan()` persists the merged plan
-(`.leerie/plan.json`) and per-subtask spec files
-(`.leerie/subtasks/<id>.json`). The conformance phase derives its
-advisory test command separately via `_infer_build_lint_test()`.
+(`<state-root>/runs/<run-id>/plan.json`) and per-subtask spec files
+(`<state-root>/runs/<run-id>/subtasks/<id>.json`). The conformance
+phase derives its advisory test command separately via
+`_infer_build_lint_test()`.
 
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`

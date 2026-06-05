@@ -101,8 +101,8 @@ orchestrator and not used anywhere in this repo.
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
 - **All run state goes through the `State` class.** Never write to
-  `.leerie/state.json` directly — `State.save()` writes a temp file then
-  `os.replace()`s it for atomicity. The orchestrator runs on a single asyncio
+  `state.json` (under `<state-root>/runs/<run-id>/`) directly —
+  `State.save()` writes a temp file then `os.replace()`s it for atomicity. The orchestrator runs on a single asyncio
   event loop, so no lock is needed: coroutines only interleave at `await`
   points and never inside a `st.data[k] = v; st.save()` pair.
 - **Source-of-truth answers go through the validation gate in

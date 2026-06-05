@@ -10802,7 +10802,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             "disputed surface (name which API survives, or split it into "
             "two distinct artifacts), and re-run.\n"
             "  • Or manually delete one of the colliding subtask specs "
-            "in .leerie/runs/<run-id>/subtasks/ and `--resume`."
+            "in <state-root>/runs/<run-id>/subtasks/ and `--resume`."
         )
 
     # Apply merges and drops in input order via the pure helper.
