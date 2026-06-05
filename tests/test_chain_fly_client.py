@@ -127,6 +127,31 @@ class TestLaunchMachine:
         assert body["config"]["env"] == env
         assert body["region"] == "lhr"
 
+    def test_sends_guest_config_in_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FLY_API_TOKEN", "test-token")
+        monkeypatch.setenv("FLY_APP_NAME", "leerie")
+
+        captured_body: list[dict[str, Any]] = []
+
+        def fake_urlopen(req: Any) -> Any:
+            captured_body.append(json.loads(req.data))
+            return _fake_response({"id": "m1", "state": "created"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            launch_machine(
+                "registry.fly.io/leerie:1.0.0",
+                {},
+                "iad",
+                vm_cpus=2,
+                vm_memory_mb=4096,
+            )
+
+        guest = captured_body[0]["config"]["guest"]
+        assert guest["cpus"] == 2
+        assert guest["memory_mb"] == 4096
+
     def test_sends_auth_header(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
