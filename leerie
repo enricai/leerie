@@ -2444,8 +2444,9 @@ $_tail_script"
   fi
 else
   # --- local container execution path ----------------------------------
-  # --rm: container is removed on exit. Worktrees + .leerie/ state persist on
-  #       the host filesystem via the /work bind mount, so --resume still works.
+  # --rm: container is removed on exit. Worktrees persist on the host via
+  #       the /work bind mount; run state persists via the /leerie-state
+  #       bind mount (LEERIE_STATE_HOST_DIR), so --resume still works.
   # Mount-table rationale lives in docs/IMPLEMENTATION.md §0.5.
   #
   # TTY flags adapt to whether the launcher itself has a controlling terminal:
@@ -2491,9 +2492,11 @@ else
     --rm $TTY_FLAGS \
     --name "leerie-$(date +%s)-$$" \
     -e LEERIE_INSPECT_DIRS= \
+    -e LEERIE_STATE_DIR=/leerie-state \
     --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
     -v "$USER_REPO:/work" \
     -v "$LEERIE_REPO:/opt/leerie-image:ro" \
+    -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
