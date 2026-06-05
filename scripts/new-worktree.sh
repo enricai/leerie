@@ -15,7 +15,8 @@ set -euo pipefail
 
 ID="${1:?usage: new-worktree.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: new-worktree.sh <subtask-id> <run-id>}"
-WT=".leerie/runs/${RUN_ID}/worktrees/${ID}"
+LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
+WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 PARENT_BRANCH="leerie/runs/${RUN_ID}"
 

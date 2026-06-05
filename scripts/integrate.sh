@@ -11,7 +11,8 @@ set -euo pipefail
 
 ID="${1:?usage: integrate.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: integrate.sh <subtask-id> <run-id>}"
-STAGING=".leerie/runs/${RUN_ID}/worktrees/staging"
+LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
+STAGING="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/staging"
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 
 if [ ! -d "$STAGING" ]; then
