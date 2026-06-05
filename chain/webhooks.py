@@ -165,11 +165,10 @@ def handle_machine_exit(
 
     result = parse_machine_event(payload)
     if result is None:
-        return  # non-exit event — nothing to do
+        return
 
     machine_id, exit_code, _event_type = result
 
-    # Find the chain_run whose machine_id matches.
     run_row = cs._conn.execute(
         "SELECT id FROM chain_runs WHERE machine_id = ?",
         (machine_id,),
