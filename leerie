@@ -628,7 +628,7 @@ PY
         _fin_run_dir="${_bootstrap_candidates[0]}"
         remote_log "--finalize: $_fin_run_id not local; using bootstrap dir $(basename "$_fin_run_dir") (fetch_branch will discover the final id on the machine)"
       elif [ "${#_bootstrap_candidates[@]}" -gt 1 ]; then
-        remote_log "--finalize: no local run dir at .leerie/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
+        remote_log "--finalize: no local run dir at $LEERIE_STATE_HOST_DIR/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
         for _d in "${_bootstrap_candidates[@]}"; do
           remote_log "  $(basename "$_d")"
         done
