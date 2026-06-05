@@ -3575,7 +3575,7 @@ root is otherwise empty of run data; it only hosts the `runs/` directory.
 Two concurrent runs in the same repository share no coordination state.
 
 ```
-.leerie/
+<state-root>/          (default: $HOME/.leerie/state/<sha16>-<basename>/)
 └── runs/
     └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
         ├── state.json               run state — see field table below
