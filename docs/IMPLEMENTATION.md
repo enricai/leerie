@@ -3709,6 +3709,7 @@ model for `leerie-chain`. Key public surface:
 | `ChainState.transition_run(run_id, new_status, machine_id=None)` | Advance a run's status; optionally records the Fly machine ID. Raises `ValueError` on invalid status, `KeyError` if not found. |
 | `ChainState.transition_chain(chain_id, new_status)` | Set the chain's top-level status. Raises `ValueError`/`KeyError`. |
 | `ChainState.advance_wave(chain_id, new_wave_state)` | Advance the chain's wave state (`wave_a` → `wave_b` → `done`). Raises `ValueError`/`KeyError`. |
+| `ChainState.find_chain_id_by_machine_id(machine_id)` | Return the `chain_id` for the run with the given Fly machine ID, or `None` if not found. |
 | `ChainState.set_machine_id(run_id, machine_id)` | Record a Fly machine ID on a run row without changing status. Raises `KeyError` if not found. |
 | `ChainState.close()` | Close the underlying SQLite connection. |
 | `CHAIN_STATUSES` | `frozenset` of valid chain status values: `running`, `paused`, `done`, `failed`, `cancelled`. |
