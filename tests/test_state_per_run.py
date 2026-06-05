@@ -140,9 +140,7 @@ def test_state_repo_root_explicit_override(leerie, tmp_path):
     repo_root = tmp_path / "my-repo"
     st = leerie.State(leerie_root, "feat-foo-abc123", repo_root=repo_root)
     assert st.repo_root == repo_root
-    # leerie_root is unchanged
     assert st.leerie_root == leerie_root
-    # repo_root is NOT leerie_root.parent
     assert st.repo_root != st.leerie_root.parent
 
 
