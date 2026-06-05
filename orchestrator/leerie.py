@@ -564,6 +564,14 @@ HEAL_SUCCESS_THRESHOLD_ENV = "LEERIE_HEAL_SUCCESS_THRESHOLD"
 HEAL_MAX_ROUNDS_FILE = "leerie.toml"
 HEAL_SUCCESS_THRESHOLD_FILE = "leerie.toml"
 
+# State directory override — see IMPLEMENTATION.md §2 "State directory".
+# When set, leerie writes all run state (state.json, runs/, logs/) under
+# this path instead of the default repo-relative `.leerie/`. This decouples
+# the persisted state location from the repo mount so users can keep a single
+# ~/.leerie-style directory across all repos rather than one per repo.
+# Unset → falls back to `<repo_root>/.leerie` (today's behavior preserved).
+STATE_DIR_ENV = "LEERIE_STATE_DIR"
+
 
 
 
@@ -2607,6 +2615,21 @@ def resolve_task_argument(raw: str) -> str:
             die(f"task file {raw!r} is empty")
         return contents
     return raw
+
+
+def resolve_leerie_root(repo_root: Path) -> Path:
+    """Resolve the leerie state root directory.
+
+    Resolution order: LEERIE_STATE_DIR env var → repo_root / '.leerie'.
+
+    When LEERIE_STATE_DIR is set, all run state (state.json, runs/, logs/)
+    is written there instead of inside the repo. Unset preserves today's
+    repo-relative '.leerie/' behavior.
+    """
+    env = os.environ.get(STATE_DIR_ENV, "").strip()
+    if env:
+        return Path(env).resolve()
+    return (repo_root / ".leerie").resolve()
 
 
 def resolve_source_of_truth(repo_root: Path,
@@ -13356,7 +13379,7 @@ def main() -> None:
     # .leerie/runs/* and exit. No git/CLI checks needed; the user might
     # be inspecting runs from outside a git repo.
     if args.list_runs:
-        leerie_root = Path(".leerie").resolve()
+        leerie_root = resolve_leerie_root(Path(os.getcwd()))
         list_runs(
             leerie_root,
             status_filter=args.status_filter,
@@ -13364,7 +13387,7 @@ def main() -> None:
         )
         return
     if args.list_paused:
-        leerie_root = Path(".leerie").resolve()
+        leerie_root = resolve_leerie_root(Path(os.getcwd()))
         list_paused_runs(leerie_root)
         return
 
@@ -13407,7 +13430,7 @@ def main() -> None:
     # run we don't know the final run_id until phase_classify has chosen
     # a category, so state lives in `_bootstrap-<6hex>/` until then; the
     # rename to the final run_id happens in orchestrate() after classify.
-    leerie_root = Path(".leerie").resolve()
+    leerie_root = resolve_leerie_root(Path(os.getcwd()))
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:

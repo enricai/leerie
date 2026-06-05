@@ -284,6 +284,7 @@ Complete reference for every CLI flag, environment variable, and
 
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
+| `LEERIE_STATE_DIR` | — | Redirect all run state (state.json, runs/, logs/) to a path outside the repo. Unset → default `<cwd>/.leerie` (repo-relative). No TOML key: this is a deployment-level setting, not a per-repo setting. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |

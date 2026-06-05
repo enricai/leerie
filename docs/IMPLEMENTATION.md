@@ -1038,6 +1038,31 @@ resolved. Tested by `tests/test_resolve_state_dir.py`.
 > The CLI/env > file order follows the same session-scoped vs.
 > committed-default split as `--source-of-truth` and `--runtime`.
 
+### State directory
+
+Controls where leerie writes all run state (state.json, runs/, logs/, etc.).
+By default, state is written to `.leerie/` inside the current repo. Setting
+`LEERIE_STATE_DIR` redirects state to a path outside the repo, so users can
+keep a single shared state directory (e.g. `~/.leerie`) across all repos
+rather than scattering `.leerie/` directories into every project.
+
+Resolution order (highest priority first):
+
+1. **`LEERIE_STATE_DIR`** environment variable — any non-empty, non-whitespace
+   value is resolved to an absolute path via `Path(value).resolve()`.
+
+2. **Default `<repo_root>/.leerie`** — preserves today's behavior exactly
+   when the env var is unset or empty.
+
+No TOML key and no CLI flag: the state directory is a deployment-level
+concern (where on the filesystem to persist runs), not a per-task or
+per-repo setting. A user who wants a global state directory sets
+`LEERIE_STATE_DIR` once in their shell profile.
+
+Code counterpart: `resolve_leerie_root(repo_root)` in `leerie.py`;
+constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`. All three `leerie_root`
+assignments in `main()` call `resolve_leerie_root(Path(os.getcwd()))`.
+
 ### Runtime mode
 
 Controls which execution backend runs the per-subtask worker containers.
@@ -3983,6 +4008,7 @@ enforcement functions:
 
 | Test file | Function under test |
 |-----------|----------------------|
+| `test_resolve_leerie_root.py` | `resolve_leerie_root()` — `LEERIE_STATE_DIR` set → custom path; unset/empty/whitespace → `<repo_root>/.leerie`; always absolute |
 | `test_resolve_source_of_truth.py` | `resolve_source_of_truth()` |
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |

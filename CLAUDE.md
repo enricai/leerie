@@ -172,6 +172,11 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./leerie --resume
 
+# Redirect all run state to a path outside the repo (e.g. a single shared
+# directory across all repos, like ~/.leerie). Default: <cwd>/.leerie.
+# No TOML key and no CLI flag — set once in your shell profile.
+export LEERIE_STATE_DIR=~/.leerie
+
 # Override the default source-of-truth preference (`both`) with an env
 # var, the CLI flag, or a per-repo file:
 export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
@@ -275,8 +280,8 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ## Testing
 
 `pytest tests/` from the repo root. Tests cover the deterministic
-enforcement functions (`resolve_source_of_truth`, `resolve_runtime`,
-`gather_answers` validation gate, `_retryable_failure`,
+enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
+`resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `list_paused_runs`)
 including a coupling test that the
