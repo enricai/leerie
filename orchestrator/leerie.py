@@ -11654,7 +11654,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
     is recorded as a warning by the caller — DESIGN §9: the phase is
     advisory)."""
     sys_prompt = load_prompt("conformer")
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_paths_str = ", ".join(
         str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
         else str(p)
@@ -11749,7 +11749,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     violations on conformer commits, exhausted rounds — surface as
     entries in `warnings`. The subtask still returns `complete`."""
     warnings: list[str] = []
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
     blt = _infer_build_lint_test(repo_root)
     run_branch = compute_run_branch(st.run_id)
@@ -11854,7 +11854,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     st.data["current_phase"] = "phase 5: final conformance"
     st.save()
 
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
     blt = _infer_build_lint_test(repo_root)
 
