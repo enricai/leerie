@@ -268,6 +268,36 @@ class TestPostChains:
         )
         assert status == 400
 
+    def test_malformed_body_does_not_create_chain(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        """A 400 response must not persist a chain row in the DB."""
+        status, _ = _post(
+            f"{server_url}/chains",
+            {"runs": [{"prompt": "p", "wave": "a"}]},  # missing target
+        )
+        assert status == 400
+        assert cs.list_chains() == []
+
+    def test_invalid_json_body_returns_400(self, server_url: str) -> None:
+        """Non-JSON content in the request body returns 400."""
+        payload = b"not-json"
+        req = urllib.request.Request(
+            f"{server_url}/chains",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
 
 # ---------------------------------------------------------------------------
 # GET /chains/<id>
