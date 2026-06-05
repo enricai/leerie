@@ -3732,6 +3732,21 @@ absent or empty. App name reads `FLY_APP_NAME` (default: `"leerie"`). Uses
 `urllib.request` only — no third-party HTTP libraries. Covered by
 `tests/test_chain_fly_client.py`.
 
+`chain/git_ops.py` exports the four git/PR operations the chain app uses
+inside its container (distinct from the host-side `scripts/host-finalize.sh`):
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `clone_target` | `(repo_url, pat, clone_dir) -> Path` | Clone via HTTPS PAT-embedded URL (`https://<pat>@...`); dies on failure |
+| `create_stage_branch` | `(repo_path, chain_id, base_branch="main") -> str` | Create `stage-<chain_id>` off `base_branch`; idempotent — checks out existing branch instead of erroring |
+| `push_branch` | `(repo_path, branch_name) -> None` | `git push -u origin <branch>`; dies on failure |
+| `open_pr` | `(repo_path, head, base, title, body) -> str` | `gh pr create --base … --head … --title … --body-file -`; returns PR URL; dies on failure |
+
+All functions use `subprocess.run` directly (no third-party git library).
+`push_branch` and `open_pr` match the arg shape of `host-finalize.sh:105`
+and `host-finalize.sh:182-186` respectively. Covered by
+`tests/test_chain_git_ops.py` (local tmp git repo; gh stubbed via PATH).
+
 ---
 
 ## 8. Coordination directory layout
