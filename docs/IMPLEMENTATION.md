@@ -3732,6 +3732,17 @@ absent or empty. App name reads `FLY_APP_NAME` (default: `"leerie"`). Uses
 `urllib.request` only — no third-party HTTP libraries. Covered by
 `tests/test_chain_fly_client.py`.
 
+`chain/webhooks.py` implements Fly webhook signature verification and machine-exit event parsing. It is stdlib-only (`hashlib`, `hmac`). Public surface:
+
+| Symbol | Description |
+|--------|-------------|
+| `WebhookError` | Raised when a webhook cannot be processed (bad signature, unknown run, missing fields). |
+| `verify_signature(secret, body, sig_header) -> bool` | Returns `True` iff the `fly-signature-256` header value (`hmac-sha256=<hex>`) matches the HMAC-SHA256 of `body` under `secret`. Uses `hmac.compare_digest` for constant-time comparison. Returns `False` (not raise) on malformed or absent headers. |
+| `parse_machine_event(payload) -> tuple[str, int, str] \| None` | Extracts `(machine_id, exit_code, event_type)` from an `io.fly.machine.exited` payload dict. Returns `None` for all other event types (callers ignore silently). Tolerates field-name variants: machine identity tried as `machine_id` → `id` → `instance_id`; exit code tried as `exit_code` → `exit_status`. Raises `WebhookError` if the event is an exit event but required fields are absent. |
+| `handle_machine_exit(cs, payload, secret, raw_body, sig_header) -> None` | Verifies signature, parses the event, finds the matching `chain_runs` row by `machine_id`, and transitions the run to `done` (exit code 0) or `failed` (non-zero). Non-exit events are silently ignored. Raises `WebhookError` on bad signature or if no run matches the machine_id. |
+
+The `fly-signature-256` header format is `hmac-sha256=<lowercase-hex-digest>`, matching the convention used by Fly.io webhook delivery. Covered by `tests/test_chain_webhooks.py` (in-memory SQLite, no network access).
+
 `chain/git_ops.py` exports the four git/PR operations the chain app uses
 inside its container (distinct from the host-side `scripts/host-finalize.sh`):
 
