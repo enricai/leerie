@@ -666,6 +666,25 @@ leerie/
 │   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that
 │                                  proposes and measures prompt patches for failing
 │                                  call_types; uses judge verdicts as the signal
+├── chain/                         leerie-chain Fly app — persistent chain-orchestration
+│   │                              service (DESIGN §19). Deploy once per user via
+│   │                              `fly launch` from this subdirectory.
+│   ├── Dockerfile                 leerie-chain container image (Debian 13-slim +
+│   │                              git/gh/flyctl/python3; no mise/claude-code/
+│   │                              build-essential). Entrypoint: `python3 -m chain`.
+│   ├── fly.toml                   Fly app config: persistent HTTP service,
+│   │                              min_machines_running=1, [http_service] port 8080,
+│   │                              [mounts] SQLite volume at /data.
+│   ├── __init__.py                exports __version__ = "0.1.0"
+│   ├── __main__.py                `python3 -m chain` entry point — reads CHAIN_DB_PATH
+│   │                              / CHAIN_HOST / CHAIN_PORT env vars, calls
+│   │                              ChainState.init_db, make_server, serve_forever
+│   ├── config.py                  load_settings() → Settings frozen dataclass
+│   ├── state.py                   ChainState — SQLite-backed chain/run state model
+│   ├── fly_client.py              stdlib Fly Machines API client
+│   ├── webhooks.py                Fly webhook signature verification + event parsing
+│   ├── git_ops.py                 clone_target / create_stage_branch / push_branch / open_pr
+│   └── server.py                  make_server() — stdlib HTTPServer + ChainHTTPHandler
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
@@ -3778,6 +3797,42 @@ Endpoints:
 Covered by `tests/test_chain_server.py` (server spun in-process on an
 ephemeral port; `fly_client.launch_machine` and `git_ops` stubbed via
 `unittest.mock.patch` and `monkeypatch.setattr`; 20 tests).
+
+`chain/__main__.py` is the `python3 -m chain` entry point. It reads three
+env vars at startup (`CHAIN_DB_PATH` default `/data/chain.db`, `CHAIN_HOST`
+default `0.0.0.0`, `CHAIN_PORT` default `8080`), calls `ChainState.init_db`,
+`load_settings`, and `make_server`, then calls `httpd.serve_forever()`. This
+is the `CMD` target in `chain/Dockerfile`. Not separately unit-tested
+(integration-level via the server tests); the env-var defaults match the
+`[mounts]` destination (`/data`) and `[http_service].internal_port` (`8080`)
+declared in `chain/fly.toml`.
+
+`chain/Dockerfile` builds the leerie-chain container image. Base:
+`debian:13-slim`. Installed packages: `ca-certificates`, `curl`, `git`,
+`openssh-client`, `python3`, `python3-pip`, `gnupg`, `gh` (from
+`cli.github.com` apt repo), and `flyctl` (from `fly.io/install.sh`). Omits
+mise, claude-code, build-essential, and the `/inspect/` cache layers present
+in the repo-root `Dockerfile` — the chain app is not a worker. Non-root user
+created with `ARG HOST_UID=501 / HOST_GID=20` (same pattern as root
+Dockerfile). Volume mount point `/data` created and owned by the leerie user.
+The chain package is baked to `/app/chain/`; `WORKDIR /app`. Final `CMD`:
+`["python3", "-m", "chain"]`. Tests: `tests/test_chain_fly_toml.py`
+(structural checks — asserts entrypoint references chain, omits
+mise/claude-code, installs git+gh).
+
+`chain/fly.toml` configures the leerie-chain Fly app. Key fields:
+`app = "leerie-chain"`, `primary_region = "iad"`, `[build] dockerfile =
+"chain/Dockerfile"`. VM: 1 shared CPU, 512 MB. `[deploy]
+min_machines_running = 1`, `auto_stop_machines = "off"` — persistent,
+unlike the root fly.toml's ephemeral machines. `[http_service]
+internal_port = 8080`, `force_https = true`, `min_machines_running = 1`.
+`[mounts] source = "chain_data"`, `destination = "/data"` — SQLite
+persistent volume. Health check: `GET /chains` every 30 s. Provision once
+per user with `fly launch --config chain/fly.toml --dockerfile
+chain/Dockerfile --name leerie-chain --region iad --no-deploy` then
+`fly volumes create chain_data --region iad --size 1 --app leerie-chain`.
+Tests: `tests/test_chain_fly_toml.py` (validates TOML, asserts [http_service],
+[mounts], [build], internal_port=8080, min_machines_running≥1).
 
 ---
 
