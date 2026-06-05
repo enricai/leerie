@@ -17,12 +17,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LEERIE_BASH = REPO_ROOT / "leerie"
 
-# Minimal bash harness: resolves LEERIE_STATE_HOST_DIR (same block as the
-# launcher), then stubs nerdctl to print its argv separated by newlines,
-# and executes only the nerdctl run command (no Fly branch, no finalize).
-# USER_REPO=$1, HOME=$2, LEERIE_REPO=$3, IMAGE_TAG=$4; remaining args unused.
 _HARNESS = r"""
 #!/usr/bin/env bash
 set -euo pipefail
