@@ -1,18 +1,4 @@
-"""chain.config — shared settings for the leerie-chain orchestrator app.
-
-Reads required env vars at call time (not import time) so tests can
-monkeypatch os.environ before calling load_settings(). All values come
-from os.environ; no file-based precedence layer is needed for the
-chain app (it runs on Fly with secrets injected as env vars).
-
-Required env vars:
-  GH_DISPATCH_PAT       GitHub PAT with repo + workflow scopes, used to
-                        clone target repos and open PRs via gh.
-  FLY_API_TOKEN         Fly.io API token used by fly_client to launch and
-                        destroy per-run worker machines via the Machines API.
-  CHAIN_WEBHOOK_SECRET  HMAC-SHA256 signing secret shared with Fly to verify
-                        incoming machine-exit webhook payloads.
-"""
+"""chain.config — shared settings for the leerie-chain orchestrator app."""
 from __future__ import annotations
 
 import os
@@ -40,12 +26,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    """Read required env vars and return a frozen Settings object.
-
-    Exits with a clear error message if any required variable is absent or
-    empty — mirrors leerie.py's die() pattern so misconfiguration is caught
-    at startup rather than surfacing as an obscure AttributeError later.
-    """
+    """Read required env vars and return a frozen Settings object."""
     missing = [k for k in _REQUIRED if not os.environ.get(k, "").strip()]
     if missing:
         _die(

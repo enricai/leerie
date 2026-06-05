@@ -3678,6 +3678,25 @@ skip value tokens when forwarding to the orchestrator's argparse). Chain
 verbs consume these flags inline and never reach the forwarding path;
 `tests/test_launcher_value_flags_coupling.py` guards this invariant.
 
+#### `chain/` Python package
+
+The `chain/` directory at the repo root is the Python package for the
+leerie-chain orchestrator app (the HTTP server that coordinates multi-run
+chains). It is stdlib-only (no third-party imports). `chain/__init__.py`
+exports `__version__ = "0.1.0"`. `chain/config.py` exports `load_settings()
+-> Settings` which reads the three required env vars at call time (not import
+time, so tests can monkeypatch before calling):
+
+| Env var | `Settings` field | Purpose |
+|---------|-----------------|---------|
+| `GH_DISPATCH_PAT` | `gh_dispatch_pat` | GitHub PAT for repo access and PR creation |
+| `FLY_API_TOKEN` | `fly_api_token` | Fly.io API token for Machines API |
+| `CHAIN_WEBHOOK_SECRET` | `chain_webhook_secret` | HMAC-SHA256 signing secret for webhook verification |
+
+`load_settings()` exits via `_die()` with a `leerie-chain: error:` prefix if
+any required var is absent or empty — mirrors leerie.py's `die()` pattern.
+`Settings` is a frozen dataclass. Covered by `tests/test_chain_config.py`.
+
 ---
 
 ## 8. Coordination directory layout
