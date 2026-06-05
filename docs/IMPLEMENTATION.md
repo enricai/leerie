@@ -1041,28 +1041,38 @@ resolved. Tested by `tests/test_resolve_state_dir.py`.
 
 ### State directory
 
-Controls where leerie writes all run state (state.json, runs/, logs/, etc.).
-By default, state is written to `.leerie/` inside the current repo. Setting
-`LEERIE_STATE_DIR` redirects state to a path outside the repo, so users can
-keep a single shared state directory (e.g. `~/.leerie`) across all repos
-rather than scattering `.leerie/` directories into every project.
+Controls where leerie writes all run state (`state.json`, `runs/`, `logs/`,
+etc.). By default, state is written to a per-repo subtree under `$HOME` —
+never inside the repo itself — so target projects do not accumulate a
+`.leerie/` directory and do not need to add anything to their `.gitignore`.
+The default path is `$HOME/.leerie/state/<sha16>-<basename>/`, giving each
+repo an isolated, human-legible subtree that mirrors how `~/.claude/projects/`
+separates per-repo state from the shared install at `~/.claude/`.
 
-Resolution order (highest priority first):
+Resolution order (lowest → highest priority):
 
-1. **`LEERIE_STATE_DIR`** environment variable — any non-empty, non-whitespace
-   value is resolved to an absolute path via `Path(value).resolve()`.
+1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. Computed from the
+   absolute path of the repo root; stable and collision-resistant.
 
-2. **Default `<repo_root>/.leerie`** — preserves today's behavior exactly
-   when the env var is unset or empty.
+2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
+   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
+   `$HOME`.
 
-No TOML key and no CLI flag: the state directory is a deployment-level
-concern (where on the filesystem to persist runs), not a per-task or
-per-repo setting. A user who wants a global state directory sets
-`LEERIE_STATE_DIR` once in their shell profile.
+3. **`LEERIE_STATE_DIR`** environment variable — any non-empty value is
+   expanded (`~/` → `$HOME/`) and used verbatim. Set once in your shell
+   profile to keep all repos under a common directory.
+
+4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
+   Bare `~` and `~/`-prefixed values are expanded.
 
 Code counterpart: `resolve_leerie_root(repo_root)` in `leerie.py`;
 constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`. All three `leerie_root`
 assignments in `main()` call `resolve_leerie_root(Path(os.getcwd()))`.
+The launcher resolves `LEERIE_STATE_HOST_DIR` (the same value, before
+container launch) via `_state_dir_default()` and passes it as the
+`/leerie-state` bind-mount argument and via `-e LEERIE_STATE_DIR=/leerie-state`
+so the orchestrator inside the container always writes to the mounted state
+dir. See §0.5 *Bind-mount table* for the full mount specification.
 
 ### Runtime mode
 
@@ -3550,19 +3560,22 @@ Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 
 ---
 
-## 8. Coordination directory layout (`.leerie/`)
+## 8. Coordination directory layout
 
-State lives under `$LEERIE_STATE_DIR` when set (centralized, outside the
-repo) or falls back to `.leerie/` at the repo root. Worktrees are
+State lives under the resolved state root — by default
+`$HOME/.leerie/state/<sha16>-<basename>/`, or the path set via
+`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir` (see §2
+*State directory* for the full resolution order). The state root is always
+outside the target repo, so no `.leerie/` directory accumulates in project
+checkouts and no `.gitignore` entry is needed. Worktrees are
 disposable; the coordination directory outlives them.
 
-Every run's artifacts live under `<state-root>/runs/<run-id>/`. The parent
-`.leerie/` directory is otherwise empty of run data; it only hosts the
-`runs/` directory. Two concurrent runs in the same repository share no
-coordination state.
+Every run's artifacts live under `<state-root>/runs/<run-id>/`. The state
+root is otherwise empty of run data; it only hosts the `runs/` directory.
+Two concurrent runs in the same repository share no coordination state.
 
 ```
-.leerie/
+<state-root>/          (default: $HOME/.leerie/state/<sha16>-<basename>/)
 └── runs/
     └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
         ├── state.json               run state — see field table below

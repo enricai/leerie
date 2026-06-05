@@ -17,7 +17,7 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 - **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar.
 - **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
 - **Resumable by design.** A reboot, network blip, budget cap, the Claude Code subscription rate-limit, Ctrl-C, or an external kill (SIGTERM from CI / systemd / a closed terminal) all lose nothing — the run branch is the durable record, worktrees are torn down, and `--resume` picks up from the last completed wave. When the subscription rate-limit hits and the reset time is unambiguously parseable, leerie even auto-resumes after the reset window without manual intervention. The explicit "throw this away" gesture is `scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
-- **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and `.leerie/` state never collide. Launch a fix and a feature in parallel without coordination.
+- **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and per-run state directories never collide. Launch a fix and a feature in parallel without coordination.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -271,7 +271,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
 | `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
 | `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `LEERIE_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `leerie.toml`. |
-| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.leerie/logs/<sid>.log`. |
+| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`). |
 | `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
 | `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
 | `--telemetry` / `--no-telemetry` | on | Enable / disable telemetry NDJSON event writing. Also `LEERIE_TELEMETRY=1`/`0` or `telemetry=true`/`false` in `leerie.toml`. |
@@ -284,7 +284,7 @@ Complete reference for every CLI flag, environment variable, and
 
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
-| `LEERIE_STATE_DIR` | — | Redirect all run state (state.json, runs/, logs/) to a path outside the repo. Unset → default `<cwd>/.leerie` (repo-relative). No TOML key: this is a deployment-level setting, not a per-repo setting. |
+| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/state/<sha16>-<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
@@ -444,7 +444,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Provides `update_run_json()` (atomic merge into the run sidecar) and `wait_for_started()` (poll Fly Machine status until ready). |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs. Reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7. |
 | `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which tar-pipes `~/.claude.json` + `~/.claude/` (with `.claude/local` excluded — duplicates the Dockerfile-installed claude CLI) to `/home/leerie/` via `flyctl ssh console -C "tar -xC ..."`, writes git identity to `/home/leerie/.gitconfig`, and pre-warms `claude --version` once so the orchestrator's preflight call hits warm caches. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Worker auth + config seeding*. |
-| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` always (host-side run state) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
+| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` (defensively excluded; run state lives outside the repo at `$LEERIE_STATE_HOST_DIR`, not in-repo) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie --re-seed <run-id>` and the auto-re-seed step on `--resume --runtime fly`. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
 | `scripts/remote/attach.sh` | PTY-over-SSH attach for `leerie --attach`. Resolves the Fly Machine ID for a run and execs `flyctl ssh console` (no sshd in the image; hallpass is platform-injected). `--tail` mode replaces the shell with `tail -F` of the orchestrator log. |
@@ -477,7 +477,9 @@ review surface; you can also pass `--no-push` to keep finalize fully
 local.
 
 The run writes only to `<state-root>/runs/<run-id>/` (where `<state-root>`
-is `$LEERIE_STATE_DIR` when set, or `.leerie` at the repo root) and to `leerie/runs/<run-id>` plus
+is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`,
+overridable via `LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`;
+never inside the repo itself) and to `leerie/runs/<run-id>` plus
 `leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
 `--no-push`) pushes the run branch to `origin` and opens a PR against
 your working branch — your working branch itself is never modified
@@ -497,8 +499,9 @@ for an audit cleanup across every past run).
 
 - **Exits with code 10** — not an error. Leerie needs clarification
   answers and you are running non-interactively. Read
-  `.leerie/pending-questions.json`, write the answers to
-  `.leerie/answers.json`, then `./leerie --resume --answers .leerie/answers.json`.
+  `<state-root>/pending-questions.json`, write the answers to
+  `<state-root>/answers.json`, then `./leerie --resume --answers <state-root>/answers.json`
+  (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`).
   The plugin skill at `commands/leerie.md` handles this relay
   automatically when invoked as `/leerie`.
 
@@ -526,7 +529,7 @@ for an audit cleanup across every past run).
 
 - **A subtask reports `blocked`** — the implementer hit something it
   cannot resolve and bailed before integration. Read the blocker reason in
-  `.leerie/state.json` under `blocked[<subtask-id>]`, address the
+  `<state-root>/runs/<run-id>/state.json` under `blocked[<subtask-id>]`, address the
   upstream cause, then resume. See [`docs/DESIGN.md`](docs/DESIGN.md) §8
   for the evidence-gated loop.
 

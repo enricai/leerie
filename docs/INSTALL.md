@@ -332,7 +332,8 @@ When the container starts, the launcher mounts the following:
 
 | Host path | Container path | Mode | Purpose |
 |---|---|---|---|
-| `$(pwd)` (your repo) | `/work` | rw | Leerie operates here. Worktrees and `.leerie/` state are written to your host filesystem; `--resume` works across runs. |
+| `$(pwd)` (your repo) | `/work` | rw | Leerie operates on the repo here. Worktrees are written under the repo; the repo itself stays clean — no `.leerie/` directory accumulates inside it. |
+| `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | Per-repo run state (`state.json`, `runs/`, `logs/`, worktrees). Defaults to `$HOME/.leerie/state/<sha16>-<basename>/`; overridable via `LEERIE_STATE_DIR` env var, `state_dir =` in `leerie.toml`, or `--state-dir`. Lives outside the repo so target projects need no `.gitignore` entry. `--resume` works across container runs because state persists on the host at this path. |
 | `$LEERIE_HOME` (leerie install) | `/opt/leerie-image` | ro | Leerie's source and Dockerfile. Edit `orchestrator/leerie.py` on the host; next run picks it up without rebuilding the image. |
 | Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude.json`) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with `projects[]` stripped. The shared host file is never directly mounted — it's a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop. Each container writes only its private copy. |
 | Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude/`) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/`, `settings.json`, `mcp-needs-auth-cache.json`, `local/`, `statsig/`, `cache/`) ride along. |
@@ -346,8 +347,9 @@ paths the CLI and git already look at, so nothing inside the container
 knows or cares that the files are private rather than the shared host
 originals. Container-side writes (incremented startup counters, new
 session transcripts, refreshed auth state) are intentionally lost when
-the container exits — leerie's own telemetry (`.leerie/runs/<id>/`) is the
-source of truth for run cost and structure. The host scratch dir is
+the container exits — leerie's own telemetry (`<state-root>/runs/<id>/`,
+mounted at `/leerie-state`) is the source of truth for run cost and
+structure. The host scratch dir is
 reaped on container exit; your host `~/.claude.json` and `~/.claude/`
 are never modified by a worker.
 

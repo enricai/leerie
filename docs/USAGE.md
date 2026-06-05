@@ -64,9 +64,9 @@ source-of-truth preference for this run — useful when the default
 
 Within the first few seconds you will see preflight output on stdout — git
 identity check, working-tree-clean check, a live `claude -p` smoke test —
-and a fresh `.leerie/` directory appears in the repo root. It is
-git-excluded automatically (via `.git/info/exclude`, not your tracked
-`.gitignore`).
+and leerie creates its run state directory outside the repo (default:
+`$HOME/.leerie/state/<sha16>-<basename>/`). No `.leerie/` directory appears
+inside your repo, so there is nothing to add to `.gitignore`.
 
 ## Step 2 — Classification and clarification
 
@@ -188,9 +188,11 @@ merged on GitHub):
 ```
 
 deletes the run branch and any remaining subtask branches. The per-run
-state directory `.leerie/runs/<run-id>/` is kept as a smaller audit
-trail; `rm -rf` it manually when you no longer need that either. For an
-audit cleanup across every past run, use `--all-runs --branches`.
+state directory (`<state-root>/runs/<run-id>/`, where `<state-root>` is
+the resolved state directory — default `$HOME/.leerie/state/<key>/`) is
+kept as a smaller audit trail; `rm -rf` it manually when you no longer
+need that either. For an audit cleanup across every past run, use
+`--all-runs --branches`.
 
 ## What happens when something goes wrong
 
