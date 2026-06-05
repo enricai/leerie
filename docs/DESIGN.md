@@ -2385,6 +2385,13 @@ end-to-end requires the local-mode finalize to be exercised first;
 stacking new features on an unproven foundation is the failure mode
 this section is meant to surface.
 
+Chain orchestration (§19) is also not demonstrated. The launcher verbs
+(`--chain-submit`, `--chain-status`, `--list-chains`, `--chain-kill`,
+`--chain-attach`) are implemented and documented, but the `leerie-chain`
+Fly app — the persistent HTTP server, its SQLite state machine, Wave A/B
+sequencing, and machine-exit webhook handling — has not been exercised
+in a live run. The chain subsystem's behavior is reasoned, not observed.
+
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
 
@@ -2434,6 +2441,10 @@ design:
 - **Per-domain implementer specialization.** One generic implementer serves all
   nine domains today. Nine domain-specialized implementers would allow richer
   per-domain guidance, at the cost of more to maintain.
+- **Richer chain dependency DAG.** The chain subsystem (§19) uses a two-wave
+  (Wave A / Wave B) model — the minimum shape that is not flat. A general
+  task-dependency DAG would allow arbitrary inter-run ordering for workloads
+  that do not fit the single-level producer/consumer pattern.
 
 ---
 
