@@ -819,6 +819,31 @@ leerie --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
 # Recommended backstop for worker auto-compaction
 # (Claude Code CLI variable — not consumed by leerie itself):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+
+# Chain verbs: submit, inspect, and cancel multi-run chains via the
+# leerie-chain HTTP API. These are launcher fast-paths (like --kill) —
+# they never start a container and do not forward to the Python orchestrator.
+# LEERIE_CHAIN_URL sets the API base URL (default: http://localhost:8080).
+
+# Submit a new chain. --runs is a comma-separated list of prompt-file paths;
+# --target is the repo path (defaults to $USER_REPO or $PWD).
+leerie --chain-submit --runs prompts/run-1.txt,prompts/run-2.txt --target ~/src/myrepo
+
+# Check status of a chain. Prints the JSON response from GET /chains/<id>.
+leerie --chain-status <chain-id>
+
+# List all chains from the leerie-chain API (GET /chains).
+leerie --list-chains
+
+# Cancel a chain. Mirrors --kill semantics (DELETE /chains/<id>).
+leerie --chain-kill <chain-id>
+
+# Stream the chain orchestrator's log (GET /chains/<id>/log, streaming).
+# Mirrors --attach for runs.
+leerie --chain-attach <chain-id>
+
+# Override the leerie-chain API base URL:
+export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 ```
 
 Requirements: the `claude` CLI on `PATH` and logged in interactively (no API
@@ -1623,6 +1648,63 @@ includes a `source_of_truth` key set to `"codebase"`, `"research"`, or
 ```
 
 Maps to `DESIGN.md`: §11 (clarification procedure).
+
+### Chain verbs
+
+Five launcher fast-path verbs that talk to the leerie-chain HTTP API. They are
+handled entirely inside the `leerie` bash launcher (alongside `--kill` /
+`--stop`), never forwarded to the Python orchestrator, and never start a
+container.
+
+| Verb | Flags | API call |
+|------|-------|----------|
+| `leerie --chain-submit` | `--runs <files>` (required), `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [...], "target": "..."}` built with `python3 -c '...'` |
+| `leerie --chain-status <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>` |
+| `leerie --list-chains` | none | `GET /chains` |
+| `leerie --chain-kill <chain-id>` | positional `<chain-id>` | `DELETE /chains/<chain-id>` |
+| `leerie --chain-attach <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>/log` (streaming) |
+
+All five verbs exit non-zero on missing required args or when a positional
+argument looks like a flag (starts with `--`). `--chain-submit` exits non-zero
+when `--runs` is omitted or an unrecognised flag is passed.
+
+#### `LEERIE_CHAIN_URL`
+
+All five chain verbs read `LEERIE_CHAIN_URL` to determine the leerie-chain API
+base URL. Resolution:
+
+1. **`LEERIE_CHAIN_URL`** environment variable. Set this to the URL of a
+   deployed leerie-chain Fly app:
+
+   ```bash
+   export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+   ```
+
+2. **Default `http://localhost:8080`.** When unset, verbs target a locally
+   running leerie-chain instance — useful for development and testing.
+
+There is no CLI flag override and no `leerie.toml` key for this value; the
+env var is the only resolution point (the API endpoint is infrastructure, not
+a per-run or per-repo preference).
+
+#### leerie-chain Fly secrets
+
+`leerie-chain` is a separate Fly app deployed once per user (see `DESIGN.md`
+§19). It requires three secrets set via `flyctl secrets set` in the `chain/`
+directory:
+
+| Secret | Purpose |
+|--------|---------|
+| `GH_DISPATCH_PAT` | GitHub Personal Access Token scoped to the target repository. Used by leerie-chain to clone the repo, create branches, and open PRs via `gh`. |
+| `FLY_API_TOKEN` | Fly API token scoped to the user's org. Used by leerie-chain to launch per-run Fly machines via the Machines API. |
+| `FLY_WEBHOOK_SIGNING_SECRET` | Signing secret registered with Fly's webhook delivery. leerie-chain verifies every incoming `POST /webhooks/fly` request against this secret before acting on the payload. |
+
+These are not `LEERIE_*` environment variables consumed by the launcher or
+the core orchestrator — they are Fly app secrets consumed by `leerie-chain`
+itself. The launcher's chain verbs (`--chain-submit`, etc.) communicate with
+leerie-chain over HTTP and are unaware of these secrets.
+
+Maps to `DESIGN.md`: §19 *Chain orchestration*.
 
 ---
 
