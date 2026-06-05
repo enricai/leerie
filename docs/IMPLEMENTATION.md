@@ -3760,8 +3760,7 @@ and `host-finalize.sh:182-186` respectively. Covered by
 `tests/test_chain_git_ops.py` (local tmp git repo; gh stubbed via PATH).
 
 `chain/server.py` is the stdlib HTTP server that ties the chain subsystem
-together. It is stdlib-only (`http.server`, `json`, `os`, `tempfile`,
-`threading`). Public surface:
+together. It is stdlib-only (`http.server`, `json`, `os`, `tempfile`). Public surface:
 
 | Symbol | Description |
 |--------|-------------|

@@ -45,7 +45,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
