@@ -26,7 +26,6 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    """Read required env vars and return a frozen Settings object."""
     missing = [k for k in _REQUIRED if not os.environ.get(k, "").strip()]
     if missing:
         _die(
