@@ -44,6 +44,10 @@ def _run_launcher(tmp_path: Path, args: list[str],
         "USER_REPO": str(tmp_path),
         # Prevent the launcher from entering Keychain / runtime preflight:
         "LEERIE_REPO": str(REPO_ROOT),
+        # state-dir resolution at the top of the launcher dereferences $HOME
+        # under `set -u` before verb dispatch (PR #8 / config-001); chain
+        # verbs are fast-paths after that point, not before it.
+        "HOME": str(tmp_path),
     }
     if env_extra:
         env.update(env_extra)
@@ -181,6 +185,7 @@ def test_list_chains_uses_chain_url_env(tmp_path: Path):
         "LEERIE_CHAIN_URL": "http://my-chain-app.fly.dev",
         "USER_REPO": str(tmp_path),
         "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(tmp_path),
     }
     result = subprocess.run(
         ["bash", str(LAUNCHER), "--list-chains"],
