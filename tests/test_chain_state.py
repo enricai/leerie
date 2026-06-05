@@ -415,6 +415,46 @@ def test_chain_pause_on_failure() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Disjoint storage — two distinct chain IDs
+# (mirrors test_two_states_disjoint_paths / test_two_states_save_independently
+#  from tests/test_state_per_run.py)
+# ---------------------------------------------------------------------------
+
+def test_two_chains_disjoint_state() -> None:
+    """Transitioning one chain's state must not affect the other chain."""
+    cs = _make_db()
+    chain_a = cs.create_chain("repo-a", [("Task A1", "a"), ("Task A2", "b")])
+    chain_b = cs.create_chain("repo-b", [("Task B1", "a")])
+
+    snap_a = cs.load_chain(chain_a)
+    snap_b = cs.load_chain(chain_b)
+    assert snap_a is not None and snap_b is not None
+    run_a_id = snap_a["runs"][0]["id"]
+
+    # Advance chain A's state; chain B must remain unchanged.
+    cs.transition_run(run_a_id, "running", machine_id="m-a")
+    cs.advance_wave(chain_a, "wave_b")
+    cs.transition_chain(chain_a, "paused")
+
+    snap_a2 = cs.load_chain(chain_a)
+    snap_b2 = cs.load_chain(chain_b)
+    assert snap_a2 is not None and snap_b2 is not None
+
+    # Chain A reflects changes.
+    assert snap_a2["status"] == "paused"
+    assert snap_a2["wave_state"] == "wave_b"
+    assert snap_a2["runs"][0]["status"] == "running"
+
+    # Chain B is entirely unaffected.
+    assert snap_b2["status"] == "running"
+    assert snap_b2["wave_state"] == "wave_a"
+    assert snap_b2["runs"][0]["status"] == "queued"
+    assert snap_b2["runs"][0]["machine_id"] is None
+
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
 # Persistence: data survives close + reopen
 # ---------------------------------------------------------------------------
 
