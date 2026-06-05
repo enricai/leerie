@@ -284,7 +284,7 @@ Complete reference for every CLI flag, environment variable, and
 
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
-| `LEERIE_STATE_DIR` | — | Redirect all run state (state.json, runs/, logs/) to a path outside the repo. Unset → default `<cwd>/.leerie` (repo-relative). No TOML key: this is a deployment-level setting, not a per-repo setting. |
+| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/state/<sha16>-<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
@@ -444,7 +444,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Provides `update_run_json()` (atomic merge into the run sidecar) and `wait_for_started()` (poll Fly Machine status until ready). |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs. Reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7. |
 | `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which tar-pipes `~/.claude.json` + `~/.claude/` (with `.claude/local` excluded — duplicates the Dockerfile-installed claude CLI) to `/home/leerie/` via `flyctl ssh console -C "tar -xC ..."`, writes git identity to `/home/leerie/.gitconfig`, and pre-warms `claude --version` once so the orchestrator's preflight call hits warm caches. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Worker auth + config seeding*. |
-| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` always (host-side run state) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
+| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` (defensively excluded; run state lives outside the repo at `$LEERIE_STATE_HOST_DIR`, not in-repo) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie --re-seed <run-id>` and the auto-re-seed step on `--resume --runtime fly`. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
 | `scripts/remote/attach.sh` | PTY-over-SSH attach for `leerie --attach`. Resolves the Fly Machine ID for a run and execs `flyctl ssh console` (no sshd in the image; hallpass is platform-injected). `--tail` mode replaces the shell with `tail -F` of the orchestrator log. |
@@ -477,7 +477,9 @@ review surface; you can also pass `--no-push` to keep finalize fully
 local.
 
 The run writes only to `<state-root>/runs/<run-id>/` (where `<state-root>`
-is `$LEERIE_STATE_DIR` when set, or `.leerie` at the repo root) and to `leerie/runs/<run-id>` plus
+is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`,
+overridable via `LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`;
+never inside the repo itself) and to `leerie/runs/<run-id>` plus
 `leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
 `--no-push`) pushes the run branch to `origin` and opens a PR against
 your working branch — your working branch itself is never modified

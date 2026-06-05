@@ -172,10 +172,10 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./leerie --resume
 
-# Redirect all run state to a path outside the repo (e.g. a single shared
-# directory across all repos, like ~/.leerie). Default: <cwd>/.leerie.
-# No TOML key and no CLI flag — set once in your shell profile.
-export LEERIE_STATE_DIR=~/.leerie
+# Override the default per-repo state directory. Default is
+# $HOME/.leerie/state/<sha16>-<basename>/ (outside the repo, no
+# .gitignore entry needed). Set in your shell profile to pin it globally.
+export LEERIE_STATE_DIR=~/.leerie/state/myproject
 
 # Override the default source-of-truth preference (`both`) with an env
 # var, the CLI flag, or a per-repo file:

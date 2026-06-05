@@ -15,7 +15,9 @@ venv/
 *.swp
 *.swo
 
-# Leerie run artifacts — created per-run in target repos, never tracked.
+# Leerie run artifacts — only present when leerie is run directly in this
+# repo (dogfooding). Target repos no longer accumulate .leerie/ directories;
+# state lives in $HOME/.leerie/state/ by default.
 .leerie/
 # Top-level log when the CLI is teed (`./leerie "..." | tee leerie.log`).
 leerie.log
