@@ -109,9 +109,10 @@ orchestrator and not used anywhere in this repo.
   `gather_answers`.** Anything reading `answers["source_of_truth"]` can
   trust the value is in `SOURCE_OF_TRUTH_VALUES` (`codebase` /
   `research` / `both`).
-- **Don't write to `.leerie/` from inside a subtask worktree.** The
+- **Don't write to the coordination state directory from inside a subtask worktree.** The
   worktree is disposable; coordination state must outlive it. The
-  orchestrator writes to `.leerie/`; workers commit code to their
+  orchestrator writes to the state root (default: `$HOME/.leerie/state/<sha16>-<basename>/`,
+  at `/leerie-state` inside the container); workers commit code to their
   worktree branch only.
 
 ## Code style
@@ -249,7 +250,7 @@ export LEERIE_MAX_WORKERS=80
 ./leerie "task" --dangerously-skip-permissions
 
 # Verbosity: default is `stream` (one-line summary per worker event).
-# Per-worker .leerie/logs/<sid>.log files are always written.
+# Per-worker logs are always written to <state-root>/logs/<sid>.log.
 ./leerie "task" -q       # normal (pre-streaming terse output)
 ./leerie "task" -qq      # quiet (errors + phase boundaries only)
 ./leerie "task" -vv      # debug (raw event payloads + tool I/O)
@@ -315,8 +316,9 @@ Before marking a change complete:
       are valid JSON and all referenced skill/command paths still exist.
       The `version` field is duplicated across the two manifests;
       `tests/test_version_flag.py` guards them from drifting.
-- [ ] `python3 -c 'import json; [json.loads(l) for l in open(".leerie/runs/<run>/calls.ndjson")]'`
+- [ ] `python3 -c 'import json; [json.loads(l) for l in open("<state-root>/runs/<run>/calls.ndjson")]'`
       — if the telemetry writer (`_capture_call`) was touched, confirm a
       representative run produces a well-formed `calls.ndjson` (each line
       valid JSON with at least `call_type`, `system_prompt`, and
-      `response_content` keys).
+      `response_content` keys). Replace `<state-root>` with the resolved
+      state directory (default: `$HOME/.leerie/state/<sha16>-<basename>/`).

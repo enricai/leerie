@@ -17,7 +17,7 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 - **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar.
 - **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
 - **Resumable by design.** A reboot, network blip, budget cap, the Claude Code subscription rate-limit, Ctrl-C, or an external kill (SIGTERM from CI / systemd / a closed terminal) all lose nothing — the run branch is the durable record, worktrees are torn down, and `--resume` picks up from the last completed wave. When the subscription rate-limit hits and the reset time is unambiguously parseable, leerie even auto-resumes after the reset window without manual intervention. The explicit "throw this away" gesture is `scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
-- **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and `.leerie/` state never collide. Launch a fix and a feature in parallel without coordination.
+- **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and per-run state directories never collide. Launch a fix and a feature in parallel without coordination.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -271,7 +271,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
 | `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
 | `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `LEERIE_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `leerie.toml`. |
-| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.leerie/logs/<sid>.log`. |
+| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`). |
 | `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
 | `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
 | `--telemetry` / `--no-telemetry` | on | Enable / disable telemetry NDJSON event writing. Also `LEERIE_TELEMETRY=1`/`0` or `telemetry=true`/`false` in `leerie.toml`. |
@@ -499,8 +499,9 @@ for an audit cleanup across every past run).
 
 - **Exits with code 10** — not an error. Leerie needs clarification
   answers and you are running non-interactively. Read
-  `.leerie/pending-questions.json`, write the answers to
-  `.leerie/answers.json`, then `./leerie --resume --answers .leerie/answers.json`.
+  `<state-root>/pending-questions.json`, write the answers to
+  `<state-root>/answers.json`, then `./leerie --resume --answers <state-root>/answers.json`
+  (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`).
   The plugin skill at `commands/leerie.md` handles this relay
   automatically when invoked as `/leerie`.
 
@@ -528,7 +529,7 @@ for an audit cleanup across every past run).
 
 - **A subtask reports `blocked`** — the implementer hit something it
   cannot resolve and bailed before integration. Read the blocker reason in
-  `.leerie/state.json` under `blocked[<subtask-id>]`, address the
+  `<state-root>/runs/<run-id>/state.json` under `blocked[<subtask-id>]`, address the
   upstream cause, then resume. See [`docs/DESIGN.md`](docs/DESIGN.md) §8
   for the evidence-gated loop.
 
