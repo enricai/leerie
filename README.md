@@ -229,6 +229,29 @@ leerie "task" --model-implementer opus --model-classifier haiku
 # Optional but recommended — lower the auto-compaction threshold
 # for worker processes (default is 95%):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+
+# Chain orchestration: submit and track multi-run chains via the
+# leerie-chain HTTP API (LEERIE_CHAIN_URL sets the endpoint;
+# default: http://localhost:8080).
+
+# Submit a new chain. --runs is a comma-separated list of prompt files;
+# --target is the local repo path (defaults to $PWD).
+leerie --chain-submit --runs prompts/run-a.md,prompts/run-b.md --target ~/src/myrepo
+
+# Check status of a running or completed chain:
+leerie --chain-status <chain-id>
+
+# List all chains known to the leerie-chain app:
+leerie --list-chains
+
+# Stream the chain orchestrator's log (follows until interrupted):
+leerie --chain-attach <chain-id>
+
+# Cancel an in-progress chain:
+leerie --chain-kill <chain-id>
+
+# Point at a deployed leerie-chain app instead of localhost:
+export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 ```
 
 Inside Claude Code (after `/plugin install leerie@enricai-leerie`):

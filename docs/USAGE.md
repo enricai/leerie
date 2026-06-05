@@ -351,3 +351,122 @@ local setup) because nerdctl can't reach Keychain. See
 
 The full inventory of CLI flags and environment variables is in the
 [README "Configuration" section](../README.md#configuration).
+
+## Submitting and tracking a chain
+
+A *chain* is a sequence of Leerie runs coordinated by a separate
+`leerie-chain` service (DESIGN §19). Each run in the chain executes
+one task on the same target repository; `leerie-chain` launches them
+in order, waits for each to complete cleanly, and moves on to the
+next. This is the right shape for a series of tasks with a strict
+ordering — for example: refactor the data model, then write the
+migration, then update the API layer.
+
+The chain verbs (`--chain-submit`, `--chain-status`, `--list-chains`,
+`--chain-kill`, `--chain-attach`) are launcher fast-paths — they talk
+to the `leerie-chain` HTTP API and never start a container. They read
+`LEERIE_CHAIN_URL` to find the API endpoint (default:
+`http://localhost:8080`).
+
+### Step 1 — Write your prompt files
+
+Prepare one prompt file per task. Plain text or Markdown, exactly as
+you would pass to `leerie "..."`:
+
+```
+prompts/
+  01-refactor-data-model.md
+  02-write-migration.md
+  03-update-api-layer.md
+```
+
+### Step 2 — Submit the chain
+
+```bash
+export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev  # point at your deployed app
+
+leerie --chain-submit \
+  --runs prompts/01-refactor-data-model.md,prompts/02-write-migration.md,prompts/03-update-api-layer.md \
+  --target ~/src/myrepo
+```
+
+`--runs` is a comma-separated list of prompt-file paths (resolved on
+the host). `--target` is the local path of the repository to run
+against; it defaults to `$PWD` when omitted. `leerie-chain` receives
+a `POST /chains` request, inserts a chain record, and immediately
+launches the first run. The command prints the new `chain-id`:
+
+```
+{"chain_id": "chain-abc123", "status": "running", "current_run": 0}
+```
+
+Copy the `chain_id` — you'll use it for the other verbs.
+
+### Step 3 — Monitor progress
+
+```bash
+# One-shot status check (JSON response):
+leerie --chain-status chain-abc123
+
+# Stream the leerie-chain log (follows until interrupted):
+leerie --chain-attach chain-abc123
+```
+
+`--chain-status` calls `GET /chains/<chain-id>` and prints the JSON
+response, which includes the chain status (`running`, `paused`,
+`completed`, `failed`), the index and run-id of the current run, and
+the completion state of earlier runs.
+
+`--chain-attach` streams `GET /chains/<chain-id>/log`. Press Ctrl-C to
+detach from the stream; the chain keeps running. Re-attach whenever
+you like.
+
+### Step 4 — Review each run branch
+
+While the chain is running, each completed run produces a run branch
+(`leerie/runs/<run-id>`) and opens a PR just like a single run. Review
+and merge those PRs as they appear — the chain continues regardless,
+and you pull in each change when you're satisfied.
+
+### Step 5 — List all chains
+
+```bash
+leerie --list-chains
+```
+
+Calls `GET /chains` and prints all chains the `leerie-chain` app knows
+about. Filter in your terminal (e.g. `| jq '.[] | select(.status ==
+"running")'`) to find a chain you submitted earlier.
+
+### Step 6 — Cancel a chain
+
+If you want to stop a chain in progress (for example, you spotted a
+mistake in run two before it starts):
+
+```bash
+leerie --chain-kill chain-abc123
+```
+
+Sends `DELETE /chains/<chain-id>`. Any run that is already in flight
+continues to its natural conclusion (running its own `--resume`
+recovery path if interrupted); the chain moves to `cancelled` status
+and no new runs are started.
+
+### Pointing at a different leerie-chain app
+
+`LEERIE_CHAIN_URL` selects the API endpoint for all five verbs:
+
+```bash
+# Deployed Fly app (production):
+export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+
+# Local development instance:
+export LEERIE_CHAIN_URL=http://localhost:8080
+
+leerie --chain-submit --runs prompts/a.md,prompts/b.md --target ~/src/myrepo
+```
+
+For the `leerie-chain` setup steps (deploying the Fly app, setting
+`GH_DISPATCH_PAT`, `FLY_API_TOKEN`, and `FLY_WEBHOOK_SIGNING_SECRET`),
+see [`docs/IMPLEMENTATION.md`](IMPLEMENTATION.md) §2 "Chain launcher
+verbs" and the `chain/` subdirectory's own `README`.
