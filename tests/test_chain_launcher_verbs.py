@@ -111,6 +111,17 @@ def test_chain_submit_requires_runs(tmp_path: Path):
     assert "--runs" in result.stderr
 
 
+def test_chain_submit_target_optional(tmp_path: Path):
+    """--chain-submit without --target succeeds (target defaults to USER_REPO)."""
+    result = _run_launcher(tmp_path, [
+        "--chain-submit", "--runs", "run.txt",
+    ])
+    assert result.returncode == 0, result.stderr
+    invoc = _curl_invocations(tmp_path)
+    assert "-X POST" in invoc
+    assert "/chains" in invoc
+
+
 def test_chain_submit_rejects_unknown_flags(tmp_path: Path):
     """--chain-submit rejects unknown flags."""
     result = _run_launcher(tmp_path, [
