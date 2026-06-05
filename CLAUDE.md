@@ -148,6 +148,9 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
+chain/                      leerie-chain Fly app — persistent chain-orchestration service
+                            (see DESIGN.md §19). fly launch once from this subdirectory
+                            to provision the app; subsequent --chain-submit calls reuse it.
 tests/                      pytest suite
 ```
 
@@ -334,3 +337,8 @@ Before marking a change complete:
       valid JSON with at least `call_type`, `system_prompt`, and
       `response_content` keys). Replace `<state-root>` with the resolved
       state directory (default: `$HOME/.leerie/state/<sha16>-<basename>/`).
+- [ ] `grep -q -- '--chain-submit)\|--chain-status)\|--list-chains)\|--chain-kill)\|--chain-attach)' leerie`
+      — if chain launcher verbs were touched, confirm all five verb case-arms
+      are still present in the launcher (see DESIGN.md §19 and
+      IMPLEMENTATION.md "Chain launcher verbs"; `pytest tests/test_chain_launcher_verbs.py`
+      for full coverage).
