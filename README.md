@@ -476,8 +476,8 @@ before relying on the result.** Push + PR at finalize is the natural
 review surface; you can also pass `--no-push` to keep finalize fully
 local.
 
-The run writes only to `.leerie/runs/<run-id>/` (auto-excluded from git
-via `.git/info/exclude`) and to `leerie/runs/<run-id>` plus
+The run writes only to `<state-root>/runs/<run-id>/` (where `<state-root>`
+is `$LEERIE_STATE_DIR` when set, or `.leerie` at the repo root) and to `leerie/runs/<run-id>` plus
 `leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
 `--no-push`) pushes the run branch to `origin` and opens a PR against
 your working branch — your working branch itself is never modified
