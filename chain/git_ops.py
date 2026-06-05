@@ -11,9 +11,9 @@ is the same — clone via HTTPS PAT URL, push, gh pr create.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
 
 def _die(msg: str, code: int = 1) -> None:
