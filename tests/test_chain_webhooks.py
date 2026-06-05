@@ -280,3 +280,21 @@ def test_handle_machine_exit_instance_id_variant() -> None:
     assert snap is not None
     assert snap["runs"][0]["status"] == "done"
     cs.close()
+
+
+# ---------------------------------------------------------------------------
+# Malformed body — verify_signature must not crash on non-JSON bytes
+# ---------------------------------------------------------------------------
+
+def test_verify_signature_malformed_body_correct_sig() -> None:
+    """verify_signature returns True for any correctly-signed bytes, including non-JSON."""
+    body = b"not json at all {{"
+    sig = _sign(_SECRET, body)
+    assert verify_signature(_SECRET, body, sig) is True
+
+
+def test_verify_signature_malformed_body_bad_sig() -> None:
+    """verify_signature returns False (not raises) when signature does not match non-JSON body."""
+    body = b"not json at all {{"
+    bad_sig = "hmac-sha256=deadbeef"
+    assert verify_signature(_SECRET, body, bad_sig) is False
