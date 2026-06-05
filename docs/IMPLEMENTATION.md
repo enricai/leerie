@@ -3758,6 +3758,27 @@ All functions use `subprocess.run` directly (no third-party git library).
 and `host-finalize.sh:182-186` respectively. Covered by
 `tests/test_chain_git_ops.py` (local tmp git repo; gh stubbed via PATH).
 
+`chain/server.py` is the stdlib HTTP server that ties the chain subsystem
+together. It is stdlib-only (`http.server`, `json`, `os`, `tempfile`,
+`threading`). Public surface:
+
+| Symbol | Description |
+|--------|-------------|
+| `make_server(cs, settings, host="0.0.0.0", port=8080) -> HTTPServer` | Factory that returns a configured `http.server.HTTPServer`. Captures `ChainState` and `Settings` in an inner `ChainHTTPHandler` subclass so the stdlib handler constructor interface is unchanged. |
+| `ChainHTTPHandler` | `BaseHTTPRequestHandler` subclass with three routes (see below). Subclasses must set `_cs` and `_settings` as class attributes — `make_server` does this via an inner class. |
+
+Endpoints:
+
+| Method | Path | Behaviour |
+|--------|------|-----------|
+| `POST` | `/chains` | Body: `{"target": str, "runs": [{"prompt": str, "wave": "a"\|"b"}, ...]}`. Creates a chain row in SQLite, clones the target repo via `git_ops.clone_target`, creates the stage branch via `git_ops.create_stage_branch`, launches all Wave A runs via `fly_client.launch_machine`, marks them `running`, and returns 201 with the full chain snapshot. Returns 400 on missing/invalid fields; 500 on git or Fly errors. |
+| `GET` | `/chains/<id>` | Returns 200 with the full chain snapshot (`ChainState.load_chain`), or 404 if not found. |
+| `POST` | `/webhooks/fly` | Reads `fly-signature-256` header; rejects with 400 on bad/absent signature. Dispatches to `handle_machine_exit`; after a successful Wave A completion, calls `_maybe_advance_to_wave_b` which advances `wave_state` to `wave_b` and launches Wave B machines. If any Wave A run failed, pauses the chain. If Wave A completes with no Wave B runs, marks the chain `done`. Returns 200 `{"ok": true}` on success. |
+
+Covered by `tests/test_chain_server.py` (server spun in-process on an
+ephemeral port; `fly_client.launch_machine` and `git_ops` stubbed via
+`unittest.mock.patch` and `monkeypatch.setattr`; 20 tests).
+
 ---
 
 ## 8. Coordination directory layout
