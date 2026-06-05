@@ -1110,6 +1110,86 @@ if [ -n "${FLY_VM_DISK_GB:-}" ]; then
   export FLY_VM_DISK_GB
 fi
 
+# --- host-side per-repo state directory ----------------------------------
+# Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
+# state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
+# it; keyed by repo identity so each repo gets its own subtree, mirroring
+# how ~/.claude/projects/ separates per-repo state.
+#
+# Precedence (lowest → highest):
+#   default ($HOME/.leerie/state/<sha16>-<basename>)
+#   → leerie.toml `state_dir = ...`
+#   → LEERIE_STATE_DIR env var
+#   → --state-dir CLI flag
+#
+# The default key is SHA-256(abs_path)[:16] + "-" + basename, giving a
+# stable, collision-resistant, human-legible directory name with no
+# slashes. This mirrors the abs-path-sha approach noted in the
+# investigation notes (DESIGN §TBD), but keeps the basename visible so
+# the directory is browsable without a lookup table.
+_state_dir_default() {
+  local key
+  key="$(python3 -c \
+    "import hashlib,sys,os; p=sys.argv[1]; print(hashlib.sha256(p.encode()).hexdigest()[:16]+'-'+os.path.basename(p.rstrip('/')))" \
+    "$USER_REPO")"
+  echo "$HOME/.leerie/state/$key"
+}
+
+LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
+
+# TOML override: state_dir = /some/path
+if [ -f "$USER_REPO/leerie.toml" ]; then
+  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
+                            "$USER_REPO/leerie.toml" 2>/dev/null \
+                        || true; } \
+                      | head -1 \
+                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
+                                s/[[:space:]]*$//;
+                                s/^"(.*)"$/\1/;
+                                s/^'"'"'(.*)'"'"'$/\1/')"
+  if [ -n "$_toml_state_dir" ]; then
+    # Expand leading ~ so relative-home paths work as TOML values.
+    case "$_toml_state_dir" in
+      "~")   _toml_state_dir="$HOME" ;;
+      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
+    esac
+    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
+  fi
+  unset _toml_state_dir
+fi
+
+# Env override: LEERIE_STATE_DIR
+if [ -n "${LEERIE_STATE_DIR:-}" ]; then
+  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
+fi
+
+# CLI override: --state-dir /path or --state-dir=/path
+_cli_state_dir=""
+_prev_was_state_dir=false
+for arg in "$@"; do
+  if $_prev_was_state_dir; then
+    _cli_state_dir="$arg"
+    _prev_was_state_dir=false
+    continue
+  fi
+  case "$arg" in
+    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
+    --state-dir)   _prev_was_state_dir=true ;;
+  esac
+done
+if [ -n "$_cli_state_dir" ]; then
+  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
+fi
+unset _cli_state_dir _prev_was_state_dir
+
+# Expand leading ~ in the final resolved value.
+case "$LEERIE_STATE_HOST_DIR" in
+  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
+  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
+esac
+
+export LEERIE_STATE_HOST_DIR
+
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
 DRY_RUN=false
@@ -1747,7 +1827,8 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/pnpm-store" \
          "$HOME/.cache/leerie/pip" \
          "$HOME/.cache/leerie/go-mod" \
-         "$HOME/.cache/leerie/cargo"
+         "$HOME/.cache/leerie/cargo" \
+         "$LEERIE_STATE_HOST_DIR"
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
