@@ -260,3 +260,32 @@ def test_open_pr_failure_calls_die(
     with pytest.raises(SystemExit) as exc_info:
         git_ops.open_pr(local_clone, "h", "b", "t", "body")
     assert exc_info.value.code == 1
+
+
+def test_open_pr_body_piped_via_stdin(
+    local_clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """open_pr pipes the body string to gh's stdin (--body-file -)."""
+    bin_dir = tmp_path / "stdin-bin"
+    bin_dir.mkdir()
+    stdin_log = tmp_path / "gh-stdin.log"
+    gh_script = bin_dir / "gh"
+    gh_script.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/bin/sh
+            # Capture whatever arrives on stdin.
+            cat >> {stdin_log}
+            echo "https://github.com/owner/repo/pull/99"
+            exit 0
+            """
+        )
+    )
+    gh_script.chmod(gh_script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    body = "## Summary\n\nThis body must arrive via stdin."
+    git_ops.open_pr(local_clone, "my-head", "main", "my title", body)
+
+    received = stdin_log.read_text()
+    assert received == body
