@@ -6173,9 +6173,19 @@ class State:
     `leerie_root / "runs" / run_id / state.json`. Two State instances with
     different run_ids share no on-disk state. See DESIGN.md §6 and §10."""
 
-    def __init__(self, leerie_root: Path, run_id: str):
+    def __init__(
+        self,
+        leerie_root: Path,
+        run_id: str,
+        repo_root: Path | None = None,
+    ):
         self.leerie_root = leerie_root
         self.run_id = run_id
+        # When leerie_root is inside the repo (current layout: <repo>/.leerie),
+        # this defaults to leerie_root.parent.  The param exists so a later
+        # refactor can point leerie_root at ~/.leerie/<repo-key> while repo_root
+        # still points at the real repo.
+        self.repo_root: Path = repo_root if repo_root is not None else leerie_root.parent
         self.run_dir = leerie_root / "runs" / run_id
         self.path = self.run_dir / "state.json"
         self.data: dict = {}

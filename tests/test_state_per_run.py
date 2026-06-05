@@ -126,6 +126,34 @@ def test_rename_to_dies_on_collision(leerie, tmp_path):
         st.rename_to("feat-existing-xyz999")
 
 
+# --- repo_root ---------------------------------------------------------------
+
+def test_state_repo_root_defaults_to_leerie_root_parent(leerie, tmp_path):
+    """When no repo_root is passed, st.repo_root == st.leerie_root.parent."""
+    st = leerie.State(tmp_path / ".leerie", "feat-foo-abc123")
+    assert st.repo_root == tmp_path
+
+
+def test_state_repo_root_explicit_override(leerie, tmp_path):
+    """An explicit repo_root is stored independently of leerie_root."""
+    leerie_root = tmp_path / "dot-leerie"
+    repo_root = tmp_path / "my-repo"
+    st = leerie.State(leerie_root, "feat-foo-abc123", repo_root=repo_root)
+    assert st.repo_root == repo_root
+    assert st.leerie_root == leerie_root
+    assert st.repo_root != st.leerie_root.parent
+
+
+def test_state_repo_root_explicit_does_not_affect_run_dir(leerie, tmp_path):
+    """run_dir derivation is always under leerie_root, not repo_root."""
+    leerie_root = tmp_path / "dot-leerie"
+    repo_root = tmp_path / "my-repo"
+    st = leerie.State(leerie_root, "feat-foo-abc123", repo_root=repo_root)
+    assert st.run_dir == leerie_root / "runs" / "feat-foo-abc123"
+
+
+# --- rename_to ---------------------------------------------------------------
+
 def test_rename_to_preserves_sub_directories(leerie, tmp_path):
     """Subdirectories under the run dir (criteria/, logs/, etc.) move
     with the rename — they're inside the dir being renamed."""
