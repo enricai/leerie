@@ -475,6 +475,8 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
 | `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
+| `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |
+| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch --config chain/fly.toml`. |
 | `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
