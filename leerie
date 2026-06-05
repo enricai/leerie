@@ -858,6 +858,100 @@ PY
     host_finalize "$_fetched_run_dir"
     exit $?
     ;;
+  --chain-submit)
+    # Fast-path: submit a new chain to the leerie-chain HTTP API.
+    # POST /chains with runs (comma-separated prompt files) and target.
+    # LEERIE_CHAIN_URL sets the base URL (default: http://localhost:8080).
+    shift
+    _cs_runs=""
+    _cs_target="${USER_REPO:-$PWD}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runs) _cs_runs="${2:-}"; shift 2 ;;
+        --runs=*) _cs_runs="${1#--runs=}"; shift ;;
+        --target) _cs_target="${2:-}"; shift 2 ;;
+        --target=*) _cs_target="${1#--target=}"; shift ;;
+        --*) remote_log "--chain-submit: unknown flag: $1"; exit 1 ;;
+        *) remote_log "--chain-submit: unexpected argument: $1"; exit 1 ;;
+      esac
+    done
+    if [ -z "$_cs_runs" ]; then
+      remote_log "--chain-submit: --runs is required"
+      echo "  Usage: leerie --chain-submit --runs <file1,file2,...> [--target <repo-path>]" >&2
+      exit 1
+    fi
+    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    _cs_payload="$(python3 -c '
+import json, sys
+runs_raw, target = sys.argv[1], sys.argv[2]
+runs = [r.strip() for r in runs_raw.split(",") if r.strip()]
+print(json.dumps({"runs": runs, "target": target}))
+' "$_cs_runs" "$_cs_target")"
+    curl -fsSL -X POST \
+      -H "Content-Type: application/json" \
+      -d "$_cs_payload" \
+      "$_chain_url/chains"
+    exit $?
+    ;;
+  --chain-status)
+    # Fast-path: get status of a chain from the leerie-chain HTTP API.
+    # GET /chains/<chain-id>.
+    shift
+    _chain_id="${1:-}"
+    if [ -z "$_chain_id" ]; then
+      remote_log "--chain-status: <chain-id> is required"
+      echo "  Usage: leerie --chain-status <chain-id>" >&2
+      exit 1
+    fi
+    case "$_chain_id" in
+      --*) remote_log "--chain-status: expected <chain-id>, got flag '$_chain_id'"; exit 1 ;;
+    esac
+    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    curl -fsSL "$_chain_url/chains/$_chain_id"
+    exit $?
+    ;;
+  --list-chains)
+    # Fast-path: list all chains from the leerie-chain HTTP API.
+    # GET /chains.
+    shift
+    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    curl -fsSL "$_chain_url/chains"
+    exit $?
+    ;;
+  --chain-kill)
+    # Fast-path: cancel a chain via the leerie-chain HTTP API.
+    # DELETE /chains/<chain-id>.
+    shift
+    _ck_chain_id="${1:-}"
+    if [ -z "$_ck_chain_id" ]; then
+      remote_log "--chain-kill: <chain-id> is required"
+      echo "  Usage: leerie --chain-kill <chain-id>" >&2
+      exit 1
+    fi
+    case "$_ck_chain_id" in
+      --*) remote_log "--chain-kill: expected <chain-id>, got flag '$_ck_chain_id'"; exit 1 ;;
+    esac
+    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    curl -fsSL -X DELETE "$_chain_url/chains/$_ck_chain_id"
+    exit $?
+    ;;
+  --chain-attach)
+    # Fast-path: stream logs for a chain from the leerie-chain HTTP API.
+    # GET /chains/<chain-id>/log.
+    shift
+    _ca_chain_id="${1:-}"
+    if [ -z "$_ca_chain_id" ]; then
+      remote_log "--chain-attach: <chain-id> is required"
+      echo "  Usage: leerie --chain-attach <chain-id>" >&2
+      exit 1
+    fi
+    case "$_ca_chain_id" in
+      --*) remote_log "--chain-attach: expected <chain-id>, got flag '$_ca_chain_id'"; exit 1 ;;
+    esac
+    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    curl -fsSL "$_chain_url/chains/$_ca_chain_id/log"
+    exit $?
+    ;;
 esac
 
 # --- platform preflight --------------------------------------------------
