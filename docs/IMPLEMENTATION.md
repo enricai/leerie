@@ -2544,7 +2544,7 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 
 | Script | Behavior |
 |--------|----------|
-| `setup-run.sh <run-id>` | Creates `leerie/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.leerie/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.leerie/runs/<run-id>/worktrees/staging` if missing. Appends `.leerie/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
+| `setup-run.sh <run-id>` | Creates `leerie/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/staging` if missing. Safe on `--resume`. |
 | `new-worktree.sh <id> <run-id>` | Creates `leerie/subtasks/<run-id>/<id>` worktree at `.leerie/runs/<run-id>/worktrees/<id>` branched off the current `leerie/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`leerie/runs/…`) and subtask-branch (`leerie/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
 | `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.leerie/runs/<run-id>/worktrees/staging`): `git merge --no-ff leerie/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/leerie/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — leerie does not merge into it locally; the PR is the proposed integration. The push and PR step lives in the **host launcher** (`leerie` bash script), not in the container — it runs after `nerdctl run` exits cleanly, using the host's own `git push` + `gh pr create` against the host's auth state. See "Host-side finalize" below. |
@@ -3551,12 +3551,11 @@ Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 
 ## 8. Coordination directory layout (`.leerie/`)
 
-Created in the main repository (not in any worktree — worktrees are disposable).
-`setup-run.sh` git-excludes `.leerie/` by appending it to the target
-repo's `.git/info/exclude` rather than to the user's tracked `.gitignore`
-(we deliberately do not modify files the user has committed).
+State lives under `$LEERIE_STATE_DIR` when set (centralized, outside the
+repo) or falls back to `.leerie/` at the repo root. Worktrees are
+disposable; the coordination directory outlives them.
 
-Every run's artifacts live under `.leerie/runs/<run-id>/`. The parent
+Every run's artifacts live under `<state-root>/runs/<run-id>/`. The parent
 `.leerie/` directory is otherwise empty of run data; it only hosts the
 `runs/` directory. Two concurrent runs in the same repository share no
 coordination state.
