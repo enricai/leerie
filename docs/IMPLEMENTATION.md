@@ -3562,6 +3562,40 @@ watching.
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 *Finalization* (recovery sub-paragraph).
 
+#### Chain launcher verbs (`leerie --chain-*`)
+
+Five fast-path verbs that talk to the leerie-chain HTTP API. They are
+handled entirely inside the `leerie` bash launcher (before the runtime
+preflight, alongside `--kill` / `--stop`), never forwarded to the Python
+orchestrator, and never start a container. `LEERIE_CHAIN_URL` sets the
+base URL (default: `http://localhost:8080`).
+
+- **`leerie --chain-submit --runs <files> [--target <repo>]`** — POST
+  `/chains`. `--runs` accepts a comma-separated list of prompt-file paths;
+  `--target` is the repo path (defaults to `$USER_REPO` or `$PWD`). The
+  launcher converts the values to a JSON body via `python3 -c '...'` and
+  passes it to `curl -X POST`. Exits non-zero when `--runs` is omitted or
+  an unknown flag is passed.
+
+- **`leerie --chain-status <chain-id>`** — GET `/chains/<chain-id>` and
+  print the JSON response. Exits non-zero when `<chain-id>` is missing or
+  looks like a flag.
+
+- **`leerie --list-chains`** — GET `/chains` and print the JSON response.
+
+- **`leerie --chain-kill <chain-id>`** — DELETE `/chains/<chain-id>`.
+  Exits non-zero when `<chain-id>` is missing or looks like a flag.
+
+- **`leerie --chain-attach <chain-id>`** — GET `/chains/<chain-id>/log`
+  (streaming endpoint). Exits non-zero when `<chain-id>` is missing or
+  looks like a flag.
+
+`--runs` and `--target` are intentionally absent from `_value_flags` in the
+launcher (the table at `leerie:942-947` that tells the main dispatch how to
+skip value tokens when forwarding to the orchestrator's argparse). Chain
+verbs consume these flags inline and never reach the forwarding path;
+`tests/test_launcher_value_flags_coupling.py` guards this invariant.
+
 ---
 
 ## 8. Coordination directory layout
