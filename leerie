@@ -408,42 +408,73 @@ case "${1:-}" in
       esac
     done
 
-    # --list --chains: query Fly Machines API for coordinator machines.
-    # This is a fast-path that bypasses the orchestrator's --list.
+    # --list --chains: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # group by chain_id, render one row per chain with run counts +
+    # earliest-started + status breakdown. Under v5 Shape A there is no
+    # Fly coordinator machine to query; the chain identity lives only
+    # in each run's run.json (set by --chain's wave loop post-finalize).
     if [ "$_list_chains_only" = "1" ]; then
-      _lc_app="${LEERIE_FLY_APP:-leerie}"
-      if [ -z "${FLY_API_TOKEN:-}" ]; then
-        remote_log "--list --chains: FLY_API_TOKEN must be set"; exit 1
-      fi
-      _chains_json="$(curl -sS \
-        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-        "https://api.machines.dev/v1/apps/${_lc_app}/machines?metadata.leerie_role=coordinator")" || {
-          remote_log "--list --chains: Fly Machines API list failed"; exit 1
-      }
-      echo "$_chains_json" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-if not isinstance(data, list) or not data:
-    print("(no active chains)")
+      python3 - "$LEERIE_STATE_HOST_DIR" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+state_dir = Path(sys.argv[1])
+runs_dir = state_dir / "runs"
+if not runs_dir.is_dir():
+    print("(no chains found)")
     sys.exit(0)
-rows = []
-for m in data:
-    if not isinstance(m, dict):
+
+# Group runs by chain_id.
+chains = {}  # chain_id -> {"runs": [...], "started_at": min, "waves": set}
+for run_dir in runs_dir.iterdir():
+    if not run_dir.is_dir():
         continue
-    md = m.get("metadata") or {}
-    chain_id = md.get("leerie_chain_id", "")
-    mid = m.get("id", "")
-    state = m.get("state", "")
-    created = m.get("created_at", "")
-    rows.append((chain_id, mid, state, created))
-headers = ("chain_id", "coordinator_machine_id", "state", "created_at")
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    cid = data.get("chain_id")
+    if not cid:
+        continue
+    bucket = chains.setdefault(cid, {"runs": [], "waves": set()})
+    bucket["runs"].append(data)
+    widx = data.get("wave_idx")
+    if widx is not None:
+        bucket["waves"].add(widx)
+
+if not chains:
+    print("(no chains found)")
+    sys.exit(0)
+
+rows = []
+for cid, info in chains.items():
+    n_runs = len(info["runs"])
+    n_waves = len(info["waves"])
+    started = min((r.get("started_at", "") for r in info["runs"] if r.get("started_at")), default="")
+    n_pushed = sum(1 for r in info["runs"] if r.get("pushed_at"))
+    n_paused = sum(1 for r in info["runs"] if r.get("paused_at"))
+    n_killed = sum(1 for r in info["runs"] if r.get("killed_at"))
+    if n_killed:
+        status = "killed"
+    elif n_paused:
+        status = "paused"
+    elif n_pushed == n_runs:
+        status = "done"
+    else:
+        status = "in-progress"
+    rows.append((cid, status, f"{n_pushed}/{n_runs}", str(n_waves), started))
+
+headers = ("chain_id", "status", "pushed", "waves", "started_at")
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
 print(fmt.format(*("-" * w for w in widths)))
-for r in rows:
+for r in sorted(rows, key=lambda x: x[4], reverse=True):
     print(fmt.format(*r))
-'
+PY
       exit 0
     fi
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
@@ -571,29 +602,43 @@ PY
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     # Peek at the first positional arg for UUID dispatch.
+    # Chain-id stop: iterate runs with matching chain_id, stop each.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
       _sp_chain="$1"; shift
-      _sp_app="${LEERIE_FLY_APP:-leerie}"
-      if [ -z "${FLY_API_TOKEN:-}" ]; then
-        remote_log "--stop: FLY_API_TOKEN must be set to pause a chain"; exit 1
+      _sp_pass_args=("$@")
+      _sp_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_sp_chain" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    # Only stop runs whose machines are still running.
+    if (not data.get("pushed_at") and not data.get("killed_at")
+        and not data.get("paused_at") and data.get("fly_machine_id")):
+        print(run_dir.name)
+PY
+)"
+      if [ -z "$_sp_run_ids" ]; then
+        remote_log "--stop: no running runs found for chain $_sp_chain"
+        exit 0
       fi
-      _coord_mid="$(curl -sS \
-        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-        "https://api.machines.dev/v1/apps/${_sp_app}/machines?metadata.leerie_chain_id=${_sp_chain}&metadata.leerie_role=coordinator" \
-        | python3 -c 'import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list) and data:
-    print(data[0].get("id",""))
-' 2>/dev/null || true)"
-      if [ -z "$_coord_mid" ]; then
-        remote_log "--stop: no live coordinator for chain $_sp_chain"; exit 1
-      fi
-      _coord_host="${_coord_mid}.vm.${_sp_app}.internal:8080"
-      remote_log "--stop: POST /pause to coordinator for chain $_sp_chain"
-      curl -fsSL -X POST -H 'Content-Type: application/json' \
-        -d '{"reason":"user-requested"}' \
-        "http://${_coord_host}/pause"
-      exit $?
+      echo "$_sp_run_ids" | while read -r _rid; do
+        [ -z "$_rid" ] && continue
+        remote_log "--stop: pausing run $_rid (chain $_sp_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" --stop "$_rid" "${_sp_pass_args[@]}" || remote_log "--stop: $_rid failed (continuing)"
+      done
+      remote_log "--stop: chain $_sp_chain pause pass complete"
+      exit 0
     fi
     _stop_run_id=""
     _stop_runtime=""
@@ -665,38 +710,40 @@ if isinstance(data, list) and data:
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
     # Peek for UUID-formatted chain-id as the first positional arg.
+    # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # find runs with matching chain_id, invoke single-run kill on each.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
       _kc_chain="$1"; shift
-      _kc_app="${LEERIE_FLY_APP:-leerie}"
-      if [ -z "${FLY_API_TOKEN:-}" ]; then
-        remote_log "--kill: FLY_API_TOKEN must be set to destroy a chain"; exit 1
-      fi
-      # Find every machine tagged with this chain_id (coordinator + workers).
-      _machines_json="$(curl -sS \
-        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-        "https://api.machines.dev/v1/apps/${_kc_app}/machines?metadata.leerie_chain_id=${_kc_chain}")" || {
-          remote_log "--kill: Fly Machines API list failed"; exit 1
-      }
-      _ids="$(echo "$_machines_json" | python3 -c '
+      # Pass through --force / --runtime / etc. flags to per-run kill.
+      _kc_pass_args=("$@")
+      _kc_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_kc_chain" <<'PY'
 import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list):
-    for m in data:
-        mid = m.get("id","")
-        if mid:
-            print(mid)
-' 2>/dev/null || true)"
-      if [ -z "$_ids" ]; then
-        remote_log "--kill: no machines found for chain $_kc_chain (already destroyed?)"
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") == chain_id:
+        # Only kill runs whose machines aren't already gone.
+        if data.get("killed_at") is None and data.get("fly_machine_id"):
+            print(run_dir.name)
+PY
+)"
+      if [ -z "$_kc_run_ids" ]; then
+        remote_log "--kill: no live runs found for chain $_kc_chain (already destroyed or never ran)"
         exit 0
       fi
-      echo "$_ids" | while read -r _mid; do
-        [ -z "$_mid" ] && continue
-        remote_log "--kill: destroying $_mid"
-        curl -sS -X DELETE \
-          -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-          "https://api.machines.dev/v1/apps/${_kc_app}/machines/${_mid}?force=true" \
-          >/dev/null || remote_log "--kill: destroy failed for $_mid (continuing)"
+      echo "$_kc_run_ids" | while read -r _rid; do
+        [ -z "$_rid" ] && continue
+        remote_log "--kill: destroying run $_rid (chain $_kc_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" --kill "$_rid" "${_kc_pass_args[@]}" || remote_log "--kill: destroy failed for $_rid (continuing)"
       done
       remote_log "--kill: chain $_kc_chain destroyed"
       exit 0
@@ -816,6 +863,47 @@ if isinstance(data, list):
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
+    # Chain-id dispatch: `--finalize <uuid>` finalizes every run-id
+    # belonging to a chain that hasn't already been pushed.
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _fc_chain="$1"; shift
+      _fc_pass_args=("$@")
+      _fc_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_fc_chain" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    # Skip already-pushed runs (idempotency).
+    if data.get("pushed_at"):
+        continue
+    if data.get("killed_at"):
+        continue
+    print(run_dir.name)
+PY
+)"
+      if [ -z "$_fc_run_ids" ]; then
+        remote_log "--finalize: no pending runs found for chain $_fc_chain"
+        exit 0
+      fi
+      echo "$_fc_run_ids" | while read -r _rid; do
+        [ -z "$_rid" ] && continue
+        remote_log "--finalize: finalizing run $_rid (chain $_fc_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" --finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "--finalize: $_rid failed (continuing)"
+      done
+      remote_log "--finalize: chain $_fc_chain finalize pass complete"
+      exit 0
+    fi
     # Pull the run-id (first positional). Then scan remaining args for
     # `--force` so we know whether to attempt the stuck-run recovery
     # path before SSHing. --no-verify / --no-push are scanned later in
@@ -1089,278 +1177,401 @@ PY
     exit $?
     ;;
   --status)
-    # NEW: ID-dispatched status verb.
-    # UUID-pattern id (8-4-4-4-12) → query the chain coordinator's /state.
+    # ID-dispatched status verb.
+    # UUID-pattern id (8-4-4-4-12) → enumerate runs with matching
+    # chain_id and render per-run states.
     # Other ids fall through to the existing --list mechanism (run-level).
     shift
     _st_id="${1:-}"
     if [ -z "$_st_id" ]; then
       remote_log "--status: <id> is required (chain-id or run-id)"; exit 1
     fi
-    # Detect UUID format. If yes, query the coordinator for this chain.
     if echo "$_st_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-      _st_app="${LEERIE_FLY_APP:-leerie}"
-      if [ -z "${FLY_API_TOKEN:-}" ]; then
-        remote_log "--status: FLY_API_TOKEN must be set to query a chain"; exit 1
-      fi
-      _coord_mid="$(curl -sS \
-        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-        "https://api.machines.dev/v1/apps/${_st_app}/machines?metadata.leerie_chain_id=${_st_id}&metadata.leerie_role=coordinator" \
-        | python3 -c 'import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list) and data:
-    print(data[0].get("id",""))
-' 2>/dev/null || true)"
-      if [ -z "$_coord_mid" ]; then
-        remote_log "--status: no live coordinator for chain $_st_id (chain may be complete; check audit at _leerie-chains/$_st_id/chain.json in target repo)"
-        exit 1
-      fi
-      _coord_host="${_coord_mid}.vm.${_st_app}.internal:8080"
-      curl -fsSL "http://${_coord_host}/state"
+      python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY'
+import json, sys
+from pathlib import Path
+
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+matched = []
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    matched.append((run_dir.name, data))
+
+if not matched:
+    print(f"chain {chain_id}: no runs found", file=sys.stderr)
+    sys.exit(1)
+
+def status_of(d):
+    if d.get("killed_at"): return "killed"
+    if d.get("paused_at"): return "paused"
+    if d.get("sync_failed_at"): return "sync-failed"
+    if d.get("pr_url"): return "done-pr"
+    if d.get("pushed_at"): return "done-pushed"
+    if d.get("finished_at"): return "done-local"
+    return "in-progress"
+
+rows = []
+for rid, d in matched:
+    rows.append((
+        d.get("wave_idx", "?"),
+        rid,
+        status_of(d),
+        d.get("branch", ""),
+        d.get("pr_url", "") or d.get("push_error", "") or d.get("pause_reason", ""),
+    ))
+rows.sort(key=lambda r: (str(r[0]), r[1]))
+
+print(f"chain {chain_id}: {len(rows)} run(s)")
+print()
+headers = ("wave", "run_id", "status", "branch", "notes")
+widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*("-" * w for w in widths)))
+for r in rows:
+    print(fmt.format(*(str(c) for c in r)))
+PY
       exit $?
     fi
-    # Fall through: non-UUID id. The orchestrator's --list verb doesn't
-    # accept a positional run-id (it lists all runs and only filters by
-    # --status <state>), so route the user to the right command rather
-    # than exec'ing a path that would silently misbehave.
+    # Non-UUID: route to single-run inspection.
     remote_log "--status: non-UUID id '$_st_id' looks like a run-id"
     remote_log "  For a single run, inspect with: leerie --list --runtime fly"
-    remote_log "  Then filter by run-id with grep, or reattach with: leerie --resume $_st_id"
+    remote_log "  Then reattach with: leerie --resume $_st_id"
     exit 1
     ;;
   --attach)
-    # NEW: ID-dispatched attach verb.
-    # UUID → poll the coordinator's /state.
-    # Other ids → not yet implemented (run attach goes through the
-    # existing tail-orchestrator-log flow, which is handled below).
+    # ID-dispatched attach verb.
+    # UUID → poll run.json files until all chain runs reach terminal status.
+    # Non-UUID → not yet implemented for single runs.
     shift
     _at_id="${1:-}"
     if [ -z "$_at_id" ]; then
       remote_log "--attach: <id> is required (chain-id or run-id)"; exit 1
     fi
     if echo "$_at_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-      _at_app="${LEERIE_FLY_APP:-leerie}"
-      if [ -z "${FLY_API_TOKEN:-}" ]; then
-        remote_log "--attach: FLY_API_TOKEN must be set to attach to a chain"; exit 1
-      fi
-      # Poll loop: every 5s, dump /state. Stop when chain status is terminal.
-      _coord_mid="$(curl -sS \
-        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-        "https://api.machines.dev/v1/apps/${_at_app}/machines?metadata.leerie_chain_id=${_at_id}&metadata.leerie_role=coordinator" \
-        | python3 -c 'import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list) and data:
-    print(data[0].get("id",""))
-' 2>/dev/null || true)"
-      if [ -z "$_coord_mid" ]; then
-        remote_log "--attach: no live coordinator for chain $_at_id"; exit 1
-      fi
-      _coord_host="${_coord_mid}.vm.${_at_app}.internal:8080"
-      remote_log "--attach: polling http://${_coord_host}/state every 5s (Ctrl-C to detach)"
+      remote_log "--attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
       while :; do
-        _state="$(curl -sS "http://${_coord_host}/state" 2>/dev/null || true)"
-        if [ -z "$_state" ]; then
-          remote_log "--attach: coordinator unreachable (likely self-destructed); chain may be complete"
+        _at_done="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+matched = 0
+terminal = 0
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    matched += 1
+    if (data.get("pushed_at") or data.get("paused_at") or
+        data.get("killed_at") or data.get("sync_failed_at")):
+        terminal += 1
+print(f"{matched} {terminal}")
+PY
+)"
+        _at_matched="$(echo "$_at_done" | awk '{print $1}')"
+        _at_terminal="$(echo "$_at_done" | awk '{print $2}')"
+        echo "  chain $_at_id: $_at_terminal/$_at_matched run(s) in terminal state"
+        if [ "$_at_matched" -gt 0 ] && [ "$_at_terminal" = "$_at_matched" ]; then
+          remote_log "--attach: chain $_at_id reached terminal state"
           exit 0
         fi
-        echo "$_state"
-        # Check for terminal status and exit if reached.
-        _status="$(echo "$_state" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("status",""))' 2>/dev/null || true)"
-        case "$_status" in
-          done|failed|cancelled)
-            remote_log "--attach: chain reached terminal status: $_status"
-            exit 0
-            ;;
-        esac
         sleep 5
       done
     fi
-    remote_log "--attach: run-id attach not yet implemented for chain mode; use 'leerie --resume $_at_id' to reattach to a single run"
+    remote_log "--attach: run-id attach not yet implemented; use 'leerie --resume $_at_id' to reattach"
     exit 1
     ;;
+  --resume)
+    # ID-dispatch fast-path: `--resume <uuid>` resumes all paused runs
+    # belonging to a chain. Non-UUID args fall through to the existing
+    # run-id resume path below.
+    if [ "$#" -ge 2 ] && echo "$2" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _rs_chain="$2"
+      shift 2
+      _rs_pass_args=("$@")
+      _rs_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_rs_chain" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    # Only resume paused runs; pushed/killed ones are done.
+    if data.get("paused_at") and not data.get("killed_at"):
+        print(run_dir.name)
+PY
+)"
+      if [ -z "$_rs_run_ids" ]; then
+        remote_log "--resume: no paused runs found for chain $_rs_chain"
+        exit 0
+      fi
+      echo "$_rs_run_ids" | while read -r _rid; do
+        [ -z "$_rid" ] && continue
+        remote_log "--resume: resuming run $_rid (chain $_rs_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+      done
+      remote_log "--resume: chain $_rs_chain resume pass complete"
+      echo ""
+      echo "Re-run 'leerie --chain --wave ...' to resume the wave loop from where it paused."
+      exit 0
+    fi
+    # Non-UUID: fall through to the existing run-id resume.
+    ;;
   --chain|--chain-submit)
-    # Fast-path: submit a new chain by launching a per-chain ephemeral
-    # coordinator Fly machine, which then bootstraps the chain state
-    # from LEERIE_QUEUE_JSON and launches wave-0 workers.
+    # Laptop-side wave sequencer. A chain is N parallel copies of today's
+    # single-run --runtime fly flow per wave, with synth-merge between
+    # waves to build wave N+1's base branch. The laptop drives everything;
+    # no Fly coordinator machine, no per-chain SQLite, no 6PN HTTP. GitHub
+    # is touched only by the laptop, through each per-job host_finalize
+    # (push + PR) just like a single run today, plus the laptop's own
+    # synth-merge stage-branch pushes between waves.
     #
-    # Each --wave flag defines one sequential wave; waves execute in
-    # the order specified. Each value is a comma-separated list of
-    # prompt *file paths*; the launcher reads each file and sends its
-    # contents as the prompt. N waves are supported (wave 0, 1, 2, …).
+    # Each --wave flag defines one sequential wave; waves execute in the
+    # order specified. Each value is a comma-separated list of prompt
+    # *file paths*; the launcher reads each file and sends its contents
+    # as the prompt to a backgrounded ./leerie --runtime fly invocation.
+    # N waves are supported (wave 0, 1, 2, …).
     #
-    # --chain-submit is a deprecated alias for --chain. Both behave
-    # identically; existing scripts continue to work.
+    # --chain-submit is a deprecated alias for --chain.
     #
-    # Required env (set by the user before invocation):
-    #   FLY_API_TOKEN          — for the Fly Machines API.
-    #   GH_DISPATCH_PAT        — for the coordinator's push + PR ops.
-    #   LEERIE_CHAIN_IMAGE     — coordinator image (registry.fly.io/leerie-coordinator:N).
-    #   LEERIE_WORKER_IMAGE    — worker image  (registry.fly.io/leerie:N).
-    # Optional env:
-    #   LEERIE_FLY_APP         — Fly app name (default 'leerie').
-    #   LEERIE_REGION          — Fly region    (default 'iad').
+    # Required env: none chain-specific. The single-run --runtime fly
+    # flow that each wave job invokes has its own requirements (gh auth,
+    # the user's ~/.git-credentials for push, etc.) which are unchanged.
     shift
     _ch_waves=()
-    _ch_target="${USER_REPO:-$PWD}"
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --wave) _ch_waves+=("${2:-}"); shift 2 ;;
         --wave=*) _ch_waves+=("${1#--wave=}"); shift ;;
-        --target) _ch_target="${2:-}"; shift 2 ;;
-        --target=*) _ch_target="${1#--target=}"; shift ;;
+        # --target is accepted but ignored (kept for CLI compatibility);
+        # the wave loop always operates against $USER_REPO directly.
+        --target) shift 2 ;;
+        --target=*) shift ;;
         --*) remote_log "--chain: unknown flag: $1"; exit 1 ;;
         *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
       esac
     done
     if [ "${#_ch_waves[@]}" -eq 0 ]; then
       remote_log "--chain: at least one --wave is required"
-      echo "  Usage: leerie --chain --wave <f1,f2,...> [--wave <f3,...>] [--target <repo>]" >&2
+      echo "  Usage: leerie --chain --wave <f1,f2,...> [--wave <f3,...>]" >&2
       exit 1
     fi
-    # Required: FLY_API_TOKEN, GH_DISPATCH_PAT, LEERIE_CHAIN_IMAGE.
-    if [ -z "${FLY_API_TOKEN:-}" ]; then
-      remote_log "--chain: FLY_API_TOKEN must be set in env"; exit 1
-    fi
-    if [ -z "${GH_DISPATCH_PAT:-}" ]; then
-      remote_log "--chain: GH_DISPATCH_PAT must be set (coordinator needs it for push + PR)"; exit 1
-    fi
-    if [ -z "${LEERIE_CHAIN_IMAGE:-}" ]; then
-      remote_log "--chain: LEERIE_CHAIN_IMAGE must be set (e.g. registry.fly.io/leerie-coordinator:N)"; exit 1
-    fi
-    if [ -z "${LEERIE_WORKER_IMAGE:-}" ]; then
-      remote_log "--chain: LEERIE_WORKER_IMAGE must be set (e.g. registry.fly.io/leerie:N)"; exit 1
-    fi
-    _ch_app="${LEERIE_FLY_APP:-leerie}"
-    _ch_region="${LEERIE_REGION:-iad}"
-
-    # Build queue spec JSON: {target, runs: [{prompt, wave}, ...]}.
-    # python3 reads each prompt-file path and emits the structure.
-    _queue_spec="$(printf '%s\n' "${_ch_waves[@]}" | python3 -c '
-import json, sys, os
-target = sys.argv[1]
-runs = []
-for idx, line in enumerate(sys.stdin):
-    raw = line.strip()
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        try:
-            with open(entry, "r", encoding="utf-8") as fh:
-                text = fh.read().strip()
-        except OSError as exc:
-            sys.stderr.write(f"--chain: cannot read prompt file {entry!r}: {exc}\n")
-            sys.exit(1)
-        if not text:
-            sys.stderr.write(f"--chain: prompt file {entry!r} is empty\n")
-            sys.exit(1)
-        runs.append({"prompt": text, "wave": str(idx)})
-if not runs:
-    sys.stderr.write("--chain: no runs found in --wave args\n")
-    sys.exit(1)
-print(json.dumps({"target": target, "runs": runs}))
-' "$_ch_target")" || exit 1
-
-    # Mint a chain_id locally (UUID) so we have an ID to print to the user
-    # immediately, even before the coordinator has finished booting.
+    # Sanity-check every prompt file before fan-out so we fail fast on
+    # typos instead of mid-chain. Also collect the prompt contents into
+    # arrays so the wave loop below can pass them to each ./leerie child.
     _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-    # Base64-encode the queue spec so it survives env transport intact
-    # (Fly env values are strings; JSON with embedded newlines is fragile).
-    _ch_queue_b64="$(printf '%s' "$_queue_spec" | _b64_stdin)"
+    _ch_jobs_per_wave=()   # one entry per wave: "n_jobs"
+    _ch_prompts=()         # flat list of prompts (length = total jobs)
+    _ch_prompt_files=()    # flat list of prompt file paths (same length)
+    for _w in "${_ch_waves[@]}"; do
+      _w_count=0
+      IFS=',' read -ra _w_jobs <<< "$_w"
+      for _job_file in "${_w_jobs[@]}"; do
+        _job_file="$(echo "$_job_file" | sed 's/^ *//;s/ *$//')"
+        [ -z "$_job_file" ] && continue
+        if [ ! -f "$_job_file" ]; then
+          remote_log "--chain: prompt file not found: $_job_file"; exit 1
+        fi
+        if [ ! -s "$_job_file" ]; then
+          remote_log "--chain: prompt file is empty: $_job_file"; exit 1
+        fi
+        _ch_prompts+=("$(cat "$_job_file")")
+        _ch_prompt_files+=("$_job_file")
+        _w_count=$((_w_count + 1))
+      done
+      if [ "$_w_count" -eq 0 ]; then
+        remote_log "--chain: wave is empty (no prompt files)"; exit 1
+      fi
+      _ch_jobs_per_wave+=("$_w_count")
+    done
 
-    # Collect host Claude OAuth credentials and pack them into a
-    # base64-encoded JSON envelope keyed by the canonical env var the
-    # worker's container-entry.sh chain-mode prelude reads. The
-    # coordinator forwards _ch_worker_env_b64 verbatim as
-    # LEERIE_WORKER_ENV_JSON; its existing merge logic injects each
-    # key/value into every worker's launch env. Without this, workers
-    # boot without ~/.claude/.credentials.json and the orchestrator's
-    # preflight `claude --version` smoke test fails with 401.
-    if ! _ch_claude_creds_json="$(_extract_claude_credentials_json)"; then
-      remote_log "--chain: could not extract Claude credentials from Keychain / disk / CLAUDE_CODE_OAUTH_TOKEN"
-      echo "  Workers cannot authenticate without credentials. On macOS, grant the" >&2
-      echo "  launcher Keychain access (the prompt that pops up). On Linux, export" >&2
-      echo "  CLAUDE_CODE_OAUTH_TOKEN in your shell before running leerie --chain." >&2
-      exit 1
-    fi
-    _ch_claude_creds_b64="$(printf '%s' "$_ch_claude_creds_json" | _b64_stdin)"
-    unset _ch_claude_creds_json
-    _ch_worker_env_b64="$(python3 -c '
-import json, sys
-print(json.dumps({"LEERIE_CLAUDE_CREDS_B64": sys.argv[1]}))
-' "$_ch_claude_creds_b64")"
-    unset _ch_claude_creds_b64
+    # Source the existing remote-helper lib for `update_run_json` (used
+    # to tag each finalized run with chain_id + wave_idx) and
+    # `remote_log` (already in scope).
+    _ch_leerie_dir="$(cd "$(dirname "$0")" && pwd)"
+    # shellcheck disable=SC1091
+    . "$_ch_leerie_dir/scripts/remote/lib.sh"
 
-    # Build the coordinator machine create payload. Smallest tier:
-    # shared-cpu-1x, 256MB RAM. 1GB volume at /data for crash recovery.
-    _coord_payload="$(python3 -c '
-import json, os, sys
-chain_id = sys.argv[1]
-queue_b64 = sys.argv[2]
-image = sys.argv[3]
-region = sys.argv[4]
-worker_image = sys.argv[5]
-gh_pat = sys.argv[6]
-fly_token = sys.argv[7]
-app = sys.argv[8]
-worker_env_json = sys.argv[9]
-spec = {
-    "config": {
-        "image": image,
-        "env": {
-            "LEERIE_CHAIN_ID": chain_id,
-            "LEERIE_QUEUE_JSON": queue_b64,
-            "LEERIE_IMAGE": worker_image,
-            "FLY_APP_NAME": app,
-            "FLY_API_TOKEN": fly_token,
-            "GH_DISPATCH_PAT": gh_pat,
-            "LEERIE_WORKER_ENV_JSON": worker_env_json,
-        },
-        "guest": {
-            "cpu_kind": "shared",
-            "cpus": 1,
-            "memory_mb": 256,
-        },
-        "metadata": {
-            "leerie_chain_id": chain_id,
-            "leerie_role": "coordinator",
-        },
-    },
-    "name": f"chain-{chain_id[:8]}-coord",
-    "region": region,
-}
-print(json.dumps(spec))
-' "$_ch_id" "$_ch_queue_b64" "$LEERIE_CHAIN_IMAGE" "$_ch_region" "$LEERIE_WORKER_IMAGE" "$GH_DISPATCH_PAT" "$FLY_API_TOKEN" "$_ch_app" "$_ch_worker_env_b64")" || exit 1
-    unset _ch_worker_env_b64
+    # Resolve starting base branch from the current $USER_REPO HEAD.
+    _ch_current_base="$(git -C "$USER_REPO" symbolic-ref --short HEAD 2>/dev/null || echo "main")"
 
-    remote_log "--chain: launching coordinator for chain $_ch_id"
-    _coord_resp="$(curl -sS -X POST \
-      -H "Authorization: Bearer ${FLY_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -d "$_coord_payload" \
-      "https://api.machines.dev/v1/apps/${_ch_app}/machines")" || {
-      remote_log "--chain: Fly Machines API call failed"
-      exit 1
+    # Trap SIGINT/SIGTERM: kill all in-flight wave children + propagate.
+    _ch_wave_pids=()
+    _ch_cleanup_done=0
+    _ch_kill_wave() {
+      [ "$_ch_cleanup_done" -eq 1 ] && return 0
+      _ch_cleanup_done=1
+      for _p in "${_ch_wave_pids[@]:-}"; do
+        kill -TERM "$_p" 2>/dev/null || true
+      done
+      # Grace then SIGKILL.
+      _ch_deadline=$(( $(date +%s) + 2 ))
+      while [ "$(date +%s)" -lt "$_ch_deadline" ]; do
+        _ch_remaining=()
+        for _p in "${_ch_wave_pids[@]:-}"; do
+          kill -0 "$_p" 2>/dev/null && _ch_remaining+=("$_p")
+        done
+        _ch_wave_pids=("${_ch_remaining[@]}")
+        [ "${#_ch_wave_pids[@]}" -eq 0 ] && break
+        sleep 0.1
+      done
+      for _p in "${_ch_wave_pids[@]:-}"; do
+        kill -KILL "$_p" 2>/dev/null || true
+      done
+      wait 2>/dev/null || true
     }
-    _coord_mid="$(echo "$_coord_resp" | python3 -c 'import json, sys; d=json.load(sys.stdin); print(d.get("id", ""))' 2>/dev/null || true)"
-    if [ -z "$_coord_mid" ]; then
-      remote_log "--chain: failed to parse coordinator machine id from Fly response"
-      echo "$_coord_resp" >&2
-      exit 1
-    fi
+    trap '_ch_kill_wave; exit 130' INT
+    trap '_ch_kill_wave; exit 143' TERM
 
-    cat <<EOF
-chain submitted:
-  chain_id:   $_ch_id
-  coordinator: $_coord_mid (chain-${_ch_id:0:8}-coord on $_ch_app)
-  waves:       ${#_ch_waves[@]}
+    echo ""
+    echo "chain submitted:"
+    echo "  chain_id:    $_ch_id"
+    echo "  waves:       ${#_ch_waves[@]} (jobs per wave: ${_ch_jobs_per_wave[*]})"
+    echo "  base branch: $_ch_current_base"
+    echo ""
 
-The coordinator will boot, self-bootstrap the chain state, and launch
-wave-0 workers within ~30s. Inspect with:
+    # Wave loop. Each wave: ensure $USER_REPO HEAD = current_base,
+    # fan out N background ./leerie --runtime fly --chain-id <id>,
+    # wait for all, tag each run.json with chain_id + wave_idx,
+    # synth-merge into stage branch (if next wave exists), push,
+    # advance current_base.
+    _ch_offset=0
+    for _wave_idx in "${!_ch_waves[@]}"; do
+      _n="${_ch_jobs_per_wave[$_wave_idx]}"
+      remote_log "wave $_wave_idx: launching $_n job(s) from base $_ch_current_base"
 
-  leerie --status $_ch_id
-  leerie --kill   $_ch_id   # destroy coordinator + workers
-EOF
+      # Ensure laptop HEAD = current_base so seed-repo.sh ships the
+      # right starting state to each worker.
+      git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
+        || { remote_log "--chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
+
+      # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so we
+      # can identify which fly-machine.json files belong to this wave.
+      # remote/<pid>.json is written by provision.sh post-provision; the
+      # pid is the per-job ./leerie's own $$, captured here via $! of
+      # the bash background process — same value.
+      _ch_wave_pids=()
+      _ch_wave_child_pids=()
+      for _k in $(seq 0 $((_n - 1))); do
+        _prompt="${_ch_prompts[$((_ch_offset + _k))]}"
+        # Background-launch single-run leerie. Each child runs its own
+        # full provision → seed → orchestrator → fetch_branch →
+        # host_finalize → destroy_machine pipeline on the laptop, and
+        # writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
+        "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly --chain-id "$_ch_id" &
+        _ch_wave_pids+=($!)
+        _ch_wave_child_pids+=($!)
+      done
+
+      # Wait for ALL wave-N jobs, capture per-child rc.
+      _ch_failed=0
+      for _p in "${_ch_wave_pids[@]}"; do
+        if ! wait "$_p"; then
+          _ch_failed=$((_ch_failed + 1))
+        fi
+      done
+
+      if [ "$_ch_failed" -gt 0 ]; then
+        remote_log "wave $_wave_idx: $_ch_failed/$_n job(s) failed; chain paused"
+        echo ""
+        echo "Some wave-$_wave_idx jobs paused on failure. Recover with:"
+        echo "    leerie --resume $_ch_id"
+        echo "After paused runs complete, re-run:"
+        echo "    leerie --chain --wave ... (the wave loop will skip already-done waves)"
+        exit 1
+      fi
+
+      # Tag each just-finalized run with chain_id + wave_idx via the
+      # remote/<child-pid>.json → fly-machine.json → run.json chain.
+      _ch_wave_branches=()
+      for _cp in "${_ch_wave_child_pids[@]}"; do
+        _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
+        [ -f "$_ch_remote_pointer" ] || continue
+        _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
+        [ -z "$_ch_mid" ] && continue
+        _ch_run_json="$LEERIE_STATE_HOST_DIR/runs/$_ch_mid/run.json"
+        [ -f "$_ch_run_json" ] || continue
+        update_run_json "$_ch_run_json" chain_id "$_ch_id" wave_idx "$_wave_idx" || true
+        # Collect this run's branch name for synth-merge.
+        _ch_branch="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("branch",""))' "$_ch_run_json" 2>/dev/null)"
+        [ -n "$_ch_branch" ] && _ch_wave_branches+=("$_ch_branch")
+      done
+
+      # Synth-merge between waves: build the next wave's base branch.
+      if [ "$((_wave_idx + 1))" -lt "${#_ch_waves[@]}" ]; then
+        _ch_next_stage="leerie/stage/${_ch_id}-wave-$((_wave_idx + 1))"
+        remote_log "wave $_wave_idx → $((_wave_idx + 1)): synth-merging ${#_ch_wave_branches[@]} branch(es) into $_ch_next_stage"
+
+        # Reuse chain.git_ops.synth_merge_branches via python3 -c.
+        # Each wave-N branch is already on origin (each host_finalize
+        # pushed it), so the function's git fetch origin + git merge
+        # origin/<branch> works as-is.
+        # Preserve any caller PYTHONPATH (e.g. test seam that shadows
+        # chain.git_ops with a stub) by prepending our leerie dir.
+        _ch_branches_repr="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${_ch_wave_branches[@]}")"
+        if ! PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$_ch_leerie_dir" python3 -c "
+import json, sys
+from chain.git_ops import synth_merge_branches, SynthMergeConflict
+branches = json.loads('$_ch_branches_repr')
+try:
+    synth_merge_branches('$USER_REPO', '$_ch_current_base', branches, '$_ch_next_stage')
+except SynthMergeConflict as exc:
+    sys.stderr.write(f'synth-merge conflict on {exc.branch}: {exc.output}\n')
+    sys.exit(1)
+"; then
+          remote_log "wave $_wave_idx: synth-merge conflict; chain paused"
+          echo ""
+          echo "Resolve the conflict in $USER_REPO, then re-run:"
+          echo "    leerie --chain --wave ... (the wave loop will resume from wave $((_wave_idx + 1)))"
+          exit 1
+        fi
+        # Push the staged base branch to origin so subsequent wave's
+        # workers can use it as their starting point (via seed-repo.sh
+        # in their own ./leerie invocation).
+        if ! git -C "$USER_REPO" push origin "$_ch_next_stage" >/dev/null 2>&1; then
+          remote_log "--chain: failed to push $_ch_next_stage to origin"
+          exit 1
+        fi
+        _ch_current_base="$_ch_next_stage"
+      fi
+
+      _ch_offset=$((_ch_offset + _n))
+    done
+
+    # Clear the wave-kill trap; chain completed cleanly.
+    trap - INT TERM
+
+    echo ""
+    remote_log "chain $_ch_id: all ${#_ch_waves[@]} wave(s) complete"
+    echo "  All wave PRs are open. Final staging branch: $_ch_current_base"
+    echo "  Inspect: leerie --status $_ch_id  |  leerie --list --chains"
     exit 0
     ;;
   --chain-status)
@@ -1599,7 +1810,7 @@ _value_flags=" --run-id --answers --pr-template --max-workers \
 --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \
---heal-dir --phase --host-no-push --status "
+--heal-dir --phase --host-no-push --status --chain-id "
 for arg in "$@"; do
   # Skip if this arg is the value of a previous value-taking flag.
   if [ -n "$_prev" ]; then
@@ -2148,10 +2359,19 @@ fi
 # intercept exactly that one form and let everything else flow through.
 prev_was_inspect=false
 _prev_was_resume=false
+_prev_was_chain_id=false
 for arg in "$@"; do
   if $prev_was_inspect; then
     collect_inspect_path "$arg"
     prev_was_inspect=false
+    continue
+  fi
+  # Consume the value of --chain-id (next arg after --chain-id <val>).
+  # The chain_id is a launcher-side tag written to run.json post-
+  # finalize by the wave loop; the orchestrator doesn't need to know it.
+  if $_prev_was_chain_id; then
+    _prev_was_chain_id=false
+    export LEERIE_CHAIN_ID="$arg"
     continue
   fi
   # Consume positional run-id after --resume: rewrite to --run-id <val>
@@ -2168,6 +2388,12 @@ for arg in "$@"; do
       ;;
     --inspect-dir=*)
       collect_inspect_path "${arg#--inspect-dir=}"
+      ;;
+    --chain-id)
+      _prev_was_chain_id=true
+      ;;
+    --chain-id=*)
+      export LEERIE_CHAIN_ID="${arg#--chain-id=}"
       ;;
     --no-runtime-install)
       # Launcher-only flag; consumed by the runtime preflight above.

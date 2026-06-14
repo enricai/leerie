@@ -152,10 +152,11 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
-chain/                      Per-chain ephemeral coordinator subpackage (see DESIGN.md §19).
-                            Each `leerie --chain` submission launches one tiny Fly machine
-                            from `chain/Dockerfile` that holds chain state and self-destructs
-                            at chain end. No persistent app; no `fly.toml`.
+chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
+                            N parallel `leerie --runtime fly` invocations per wave,
+                            sequenced by the launcher's `--chain` arm. `chain/git_ops.py`
+                            provides `synth_merge_branches` (used between waves).
+                            No Fly coordinator machine.
 tests/                      pytest suite
 ```
 
@@ -303,31 +304,28 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie --list --status seed-failed
 ./leerie --resume <seed-failed-id>
 
-# Chain verbs: submit, inspect, pause, and destroy multi-run chains. Each
-# `leerie --chain` launches a tiny ephemeral coordinator Fly machine that
-# owns chain state and self-destructs at chain end (DESIGN §19). These verbs
-# are launcher fast-paths (like --kill) — they never start a local container
-# and do not forward to the Python orchestrator. Each --wave flag defines
-# one sequential wave (N waves supported); waves execute in order, all jobs
-# inside a wave run in parallel:
-export FLY_API_TOKEN=...            # for the Fly Machines API
-export GH_DISPATCH_PAT=...          # for the coordinator's push + PR ops
-export LEERIE_CHAIN_IMAGE=registry.fly.io/leerie-coordinator:0.7.2
-export LEERIE_WORKER_IMAGE=registry.fly.io/leerie:0.7.2
+# Chain verbs: submit + manage multi-run chains. A chain is N parallel
+# `./leerie --runtime fly` invocations per wave, with synth-merge between
+# waves to build the next wave's base branch. The laptop is the sequencer;
+# no Fly coordinator machine. Each --wave flag defines one sequential wave
+# (N waves supported); waves execute in order, jobs inside a wave run in
+# parallel. No chain-specific env vars required — the per-job
+# `--runtime fly` invocations have their own env requirements unchanged.
 ./leerie --chain \
   --wave "prompts/fetch.md,prompts/lint.md" \
-  --wave "prompts/publish.md" \
-  --target https://github.com/me/myrepo
+  --wave "prompts/publish.md"
 
-# ID-dispatched single-run verbs: pass a UUID → chain scope; pass a Fly
-# machine id → existing single-run behavior. Deprecated chain-prefixed
-# aliases (--chain-submit, --chain-status, --chain-kill, --chain-attach,
-# --list-chains) are kept for backwards compatibility.
-./leerie --status <chain-id>          # GET /state on the coordinator
-./leerie --attach <chain-id>          # poll /state every 5s until terminal
-./leerie --stop <chain-id>            # POST /pause to the coordinator
-./leerie --kill <chain-id>            # destroy coordinator + every worker
-./leerie --list --chains              # list live coordinators in the Fly app
+# ID-dispatched verbs: UUID → chain scope (iterates run.json filtered by
+# chain_id); Fly machine id → existing single-run behavior. Deprecated
+# chain-prefixed aliases (--chain-submit, --chain-status, --chain-kill,
+# --chain-attach, --list-chains) shim to the new verbs.
+./leerie --status   <chain-id>        # render per-run states from run.json
+./leerie --attach   <chain-id>        # poll run.json files every 5s
+./leerie --stop     <chain-id>        # pause every running chain run
+./leerie --kill     <chain-id>        # destroy every chain run's machine
+./leerie --resume   <chain-id>        # resume every paused chain run
+./leerie --finalize <chain-id>        # push + open PR for every unpushed run
+./leerie --list --chains              # group runs by chain_id
 ```
 
 ## Testing

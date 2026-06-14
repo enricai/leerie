@@ -46,17 +46,6 @@ _PROVISION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$_PROVISION_DIR/lib.sh"
 
-# --- chain-mode worker exit hook ----------------------------------------
-# Optional: only sourced when present so non-chain installs keep working.
-# Exposes leerie_chain_report() which decide_teardown calls when
-# LEERIE_CHAIN_ID is set in the env. See scripts/leerie-chain-exit-hook.sh
-# for the full contract.
-_CHAIN_HOOK="$_PROVISION_DIR/../leerie-chain-exit-hook.sh"
-if [ -f "$_CHAIN_HOOK" ]; then
-  # shellcheck disable=SC1091,SC1090
-  . "$_CHAIN_HOOK"
-fi
-
 # --- configuration with defaults -----------------------------------------
 FLY_APP="${LEERIE_FLY_APP:-leerie}"
 FLY_REGION="${FLY_REGION:-iad}"
@@ -235,28 +224,6 @@ decide_teardown() {
     export LEERIE_TEARDOWN_DONE
     return 0
   fi
-  # Chain mode: when LEERIE_CHAIN_ID is set, the run is part of a chain
-  # managed by an ephemeral per-chain coordinator. Workers have no GitHub
-  # push creds (seed-auth.sh:149-158 excludes them by design) so host-side
-  # push + PR is replaced by a /report POST to the coordinator over 6PN.
-  # The coordinator handles push + PR + synth-merge for next-wave launch.
-  #
-  # The hook (sourced at the top of this file) exposes leerie_chain_report.
-  # It sets LEERIE_CHAIN_HANDLED=1 on success so the non-chain rc-arms
-  # below know to skip host_finalize. Machine destruction (or pause for
-  # detach codes) still happens per the normal rc routing.
-  if [ -n "${LEERIE_CHAIN_ID:-}" ] && command -v leerie_chain_report >/dev/null 2>&1; then
-    local _chain_run_dir=""
-    if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-      if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
-        _chain_run_dir="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_REMOTE_RUN_ID"
-      elif [ -n "${USER_REPO:-}" ]; then
-        _chain_run_dir="$USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID"
-      fi
-    fi
-    leerie_chain_report "$rc" "$_chain_run_dir" || true
-  fi
-
   case "$rc" in
     0|10|11|75)
       # Genuine terminal exits of the *run*:
@@ -342,12 +309,6 @@ decide_teardown() {
               remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
             fi
           fi
-          destroy_machine
-        elif [ -n "${LEERIE_CHAIN_HANDLED:-}" ]; then
-          # Chain mode: the coordinator handles push + PR (workers have
-          # no GitHub creds). The chain hook already POSTed /report;
-          # just destroy the machine to free the run's compute.
-          remote_log "chain mode: skipping host_finalize (coordinator handles push + PR)"
           destroy_machine
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
@@ -476,10 +437,10 @@ decide_teardown() {
       if [ -n "${LEERIE_CHAIN_ID:-}" ]; then
         echo "" >&2
         echo "  This run is part of chain ${LEERIE_CHAIN_ID}. Chain-scoped:" >&2
-        echo "    leerie --status ${LEERIE_CHAIN_ID}      # full chain state" >&2
+        echo "    leerie --status ${LEERIE_CHAIN_ID}      # status of all chain runs" >&2
         echo "    leerie --attach ${LEERIE_CHAIN_ID}      # poll until chain done" >&2
-        echo "    leerie --stop   ${LEERIE_CHAIN_ID}      # pause whole chain" >&2
-        echo "    leerie --kill   ${LEERIE_CHAIN_ID}      # destroy coordinator + all workers" >&2
+        echo "    leerie --stop   ${LEERIE_CHAIN_ID}      # pause all chain runs" >&2
+        echo "    leerie --kill   ${LEERIE_CHAIN_ID}      # destroy all chain workers" >&2
       fi
       echo "  Machine: $mid (still running on Fly)" >&2
       echo "================================================================" >&2
@@ -489,21 +450,6 @@ decide_teardown() {
       # Unknown non-zero: pause. Stop the machine (preserves filesystem if
       # a volume is attached) and surface the failure to the user via the run
       # sidecar.
-      #
-      # Chain mode short-circuit: the coordinator was already notified by
-      # the chain hook at the top of decide_teardown; it pauses the chain
-      # (per the failure-classification rules in chain.coordinator). The
-      # worker machine itself should be destroyed — the run's "state" is
-      # whatever the coordinator now knows about it, and there's no
-      # filesystem-preservation benefit to a paused worker machine.
-      if [ -n "${LEERIE_CHAIN_HANDLED:-}" ]; then
-        remote_log "chain mode: coordinator notified of failure (rc=$rc); destroying worker"
-        destroy_machine
-        LEERIE_TEARDOWN_DONE=1
-        export LEERIE_TEARDOWN_DONE
-        return 0
-      fi
-
       local reason="${LEERIE_PAUSE_REASON:-worker-error}"
       local sidecar=""
       if [ -n "${LEERIE_RUN_ID:-}" ]; then

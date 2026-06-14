@@ -679,24 +679,17 @@ leerie/
 │   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that
 │                                  proposes and measures prompt patches for failing
 │                                  call_types; uses judge verdicts as the signal
-├── chain/                         Per-chain ephemeral coordinator subpackage (DESIGN §19).
-│   │                              Each `leerie --chain` submission launches one tiny
-│   │                              Fly machine from chain/Dockerfile that owns chain
-│   │                              state and self-destructs at chain end. No
-│   │                              persistent app; no fly.toml.
-│   ├── Dockerfile                 Per-chain coordinator container image (Debian 13-slim +
-│   │                              git/gh/python3). Entrypoint: `python3 -m chain`.
+├── chain/                         Laptop-side chain helpers (DESIGN §19).
+│   │                              A chain is N parallel single-run `--runtime fly`
+│   │                              invocations per wave, sequenced by the launcher's
+│   │                              `--chain` arm. The laptop drives everything; no Fly
+│   │                              coordinator machine.
 │   ├── __init__.py                exports __version__ = "0.1.0"
-│   ├── __main__.py                `python3 -m chain` entry point — delegates to
-│   │                              chain.coordinator.main.
-│   ├── coordinator.py             Per-chain HTTP server + decision logic + watchdog +
-│   │                              self-destruct. The Coordinator class owns chain-state
-│   │                              decisions; _CoordinatorHandler delegates HTTP routes.
-│   ├── state.py                   ChainState — SQLite-backed chain/run state model.
-│   ├── fly_client.py              stdlib Fly Machines API client.
-│   └── git_ops.py                 clone_target / create_stage_branch / synth_merge_branches /
-│                                  fetch_branch / push_branch / open_pr / finalize_run /
-│                                  write_audit_artifact.
+│   ├── _log.py                    log()/die() helpers — shared with git_ops.
+│   └── git_ops.py                 synth_merge_branches (used between waves) +
+│                                  clone_target / fetch_branch / push_branch / open_pr /
+│                                  finalize_run / write_audit_artifact (kept for tests
+│                                  and future automated paths).
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
@@ -853,30 +846,31 @@ leerie --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 
 # Chain verbs: submit, inspect, pause, and destroy multi-run chains.
-# Each `leerie --chain` launches a per-chain ephemeral coordinator Fly
-# machine that owns chain state and self-destructs at chain end
-# (DESIGN §19). These are launcher fast-paths — they never start a local
-# container and do not forward to the Python orchestrator.
-export FLY_API_TOKEN=...                  # Fly Machines API access
-export GH_DISPATCH_PAT=...                # coordinator's push + PR ops
-export LEERIE_CHAIN_IMAGE=registry.fly.io/leerie-coordinator:0.7.2
-export LEERIE_WORKER_IMAGE=registry.fly.io/leerie:0.7.2
+# A chain is N parallel single-run `--runtime fly` invocations per wave,
+# with synth-merge between waves (DESIGN §19). The laptop is the
+# sequencer; no Fly coordinator machine. No chain-specific env vars are
+# required — the underlying `./leerie --runtime fly` invocations have
+# their own env requirements unchanged.
 
 # Submit a new chain. Each --wave flag defines one sequential wave
 # (comma-separated prompt-file paths). Waves execute in order; runs
-# within a wave execute in parallel. N waves are supported.
-# --target is the target-repo URL (defaults to $USER_REPO or $PWD).
+# within a wave execute in parallel. N waves are supported. The chain
+# operates against $USER_REPO directly (the laptop's current repo).
 leerie --chain \
   --wave prompts/fetch.txt,prompts/lint.txt \
-  --wave prompts/publish.txt \
-  --target https://github.com/me/myrepo
+  --wave prompts/publish.txt
 
 # ID-dispatched verbs (UUID → chain scope; Fly machine id → run scope).
-leerie --status <chain-id>          # GET /state on the coordinator
-leerie --attach <chain-id>          # poll /state every 5s until terminal
-leerie --stop   <chain-id>          # POST /pause to the coordinator
-leerie --kill   <chain-id>          # destroy coordinator + every worker
-leerie --list --chains              # list live chains via Fly metadata
+# Chain-scope verbs iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json
+# filtered by chain_id, dispatching the existing single-run verb per
+# discovered run.
+leerie --status   <chain-id>        # render per-run states from run.json
+leerie --attach   <chain-id>        # poll run.json files every 5s
+leerie --stop     <chain-id>        # pause every running chain run
+leerie --kill     <chain-id>        # destroy every chain run's machine
+leerie --resume   <chain-id>        # resume every paused chain run
+leerie --finalize <chain-id>        # push + open PR for every unpushed run
+leerie --list --chains              # group runs by chain_id
 
 # Deprecated chain-prefixed aliases shim to the new verbs:
 #   --chain-submit → --chain
@@ -1776,190 +1770,141 @@ Maps to `DESIGN.md`: §11 (clarification procedure).
 
 ### Chain verbs
 
-Chain orchestration is implemented as a per-chain **ephemeral
-coordinator** Fly machine (DESIGN.md §19). The launcher creates the
-coordinator at chain submit; the coordinator owns wave-advance
-decisions and self-destructs at chain end.
+Chain orchestration is implemented as a **laptop-side wave
+sequencer** in the `leerie` launcher (DESIGN.md §19). A chain is N
+parallel copies of today's single-run `--runtime fly` flow per
+wave, with synth-merge between waves to build the next wave's base
+branch. The laptop is the sequencer; there is no Fly coordinator
+machine, no per-chain SQLite, no 6PN HTTP.
 
-The primary verb is `leerie --chain`. ID-dispatched single-run verbs
-(`--status`, `--stop`, `--kill`, `--attach`) detect UUID-formatted
-positional arguments and route to chain operations.
+The primary verb is `leerie --chain`. Chain-scoped verbs
+(`--status`, `--stop`, `--kill`, `--resume`, `--finalize`,
+`--attach`) detect UUID-formatted positional arguments and dispatch
+by iterating `$LEERIE_STATE_HOST_DIR/runs/*/run.json` for runs with
+matching `chain_id`.
 
-| Verb | Flags | Behavior |
-|------|-------|----------|
-| `leerie --chain` (alias: `--chain-submit`) | one or more `--wave <files>` (repeatable); `--target <repo>` (optional, defaults to `$USER_REPO`) | Mints a chain_id (UUID), base64-encodes the queue spec (`{target, runs: [{prompt, wave}]}`) into `LEERIE_QUEUE_JSON`, POSTs to `https://api.machines.dev/v1/apps/<app>/machines` to create the coordinator (shared-cpu-1x, 256MB, with `LEERIE_CHAIN_ID` + queue spec + worker creds in env). Coordinator self-bootstraps + launches wave 0. |
-| `leerie --status <chain-id>` (alias: `--chain-status`) | positional UUID | Looks up the coordinator via `GET /machines?metadata.leerie_chain_id=<id>&metadata.leerie_role=coordinator`, then `GET http://<coord>.vm.<app>.internal:8080/state`. |
-| `leerie --attach <chain-id>` (alias: `--chain-attach`) | positional UUID | Same discovery, then polls `/state` every 5s. Exits 0 when chain reaches a terminal status (done/failed/cancelled) or when the coordinator becomes unreachable. |
-| `leerie --kill <chain-id>` (alias: `--chain-kill`) | positional UUID | Lists every machine tagged `metadata.leerie_chain_id=<id>` (coordinator + workers) and DELETEs each one with `?force=true`. Idempotent. |
-| `leerie --stop <chain-id>` | positional UUID | Discovers coordinator, POSTs `{"reason":"user-requested"}` to `/pause`. Chain holds at current wave_state. |
-| `leerie --list --chains` (alias: `--list-chains`) | none | `GET /machines?metadata.leerie_role=coordinator` and renders one row per chain (chain_id, machine_id, state, created_at). |
+| Verb | Behavior |
+|------|----------|
+| `leerie --chain --wave <files> [--wave <files>] ...` (alias: `--chain-submit`) | Wave-sequencer loop. For each wave N: checks out `current_base` in `$USER_REPO`, fans out N background `./leerie "$prompt" --runtime fly --chain-id <id>` per prompt file, waits for all to finalize on the laptop (existing single-run path: `provision_machine` → `seed-auth.sh` → `seed-repo.sh` → orchestrator → `decide_teardown` trap → `fetch_branch` → `host_finalize` → `destroy_machine`), tags each finalized `run.json` with `chain_id` + `wave_idx` via `update_run_json`, then synth-merges all wave-N branches into `leerie/stage/<chain-id>-wave-<N+1>` via `chain.git_ops.synth_merge_branches` and pushes the stage branch to origin. Advances `current_base` to the stage branch and repeats. Trap handler `_ch_kill_wave` propagates SIGINT/SIGTERM to all in-flight wave children. |
+| `leerie --status <chain-id>` (alias: `--chain-status`) | Iterates run.json files, filters by `chain_id`, renders one row per matched run (wave, run_id, status, branch, notes). Status derived from run.json fields (`pushed_at` / `paused_at` / `killed_at` / `finished_at`). |
+| `leerie --attach <chain-id>` (alias: `--chain-attach`) | Polls run.json files every 5s; exits 0 when every chain run is in a terminal state (`pushed_at` / `paused_at` / `killed_at` / `sync_failed_at`). |
+| `leerie --kill <chain-id>` (alias: `--chain-kill`) | Enumerates run.json files with matching `chain_id` whose machines aren't already destroyed (`killed_at` is null), invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
+| `leerie --stop <chain-id>` | Enumerates runs that are actively running (have `fly_machine_id`, no terminal state), invokes `leerie --stop <run-id>` per discovered run. |
+| `leerie --resume <chain-id>` | Enumerates paused runs (`paused_at` set, not `killed_at`), invokes `leerie --resume <run-id>` per discovered run. After paused runs resume, the user re-invokes `leerie --chain --wave ...` to continue the wave loop from where it stopped. |
+| `leerie --finalize <chain-id>` | Enumerates runs that haven't been pushed yet (`pushed_at` null, not `killed_at`), invokes `leerie --finalize <run-id>` per discovered run. |
+| `leerie --list --chains` (alias: `--list-chains`) | Iterates run.json files, groups by `chain_id`, renders one row per chain (chain_id, status, pushed/total, wave count, started_at). |
 
-Non-UUID positional ids for `--status`/`--stop`/`--kill`/`--attach`
-fall through unchanged to the existing single-run code path. UUID
-detection uses the `8-4-4-4-12` hyphen pattern.
+Non-UUID positional ids fall through unchanged to the existing
+single-run code paths. UUID detection uses the `8-4-4-4-12` hyphen
+pattern.
 
-The chain verbs require `FLY_API_TOKEN` in env (for Fly Machines
-API access). `--chain` additionally requires `GH_DISPATCH_PAT` (for
-the coordinator's push + PR ops), `LEERIE_CHAIN_IMAGE` (coordinator
-image path), and `LEERIE_WORKER_IMAGE` (worker image path).
+**Test seam**: chain-scoped verbs use `${LEERIE_SELF_CMD:-"$0"}` for
+the per-run recursive invocation, so tests can substitute a stub
+binary via the `LEERIE_SELF_CMD` env var without faking `$0`. See
+`tests/test_chain_launcher_id_dispatch.py`.
 
-#### Coordinator implementation
+Chain verbs do NOT require `FLY_API_TOKEN`, `GH_DISPATCH_PAT`,
+`LEERIE_CHAIN_IMAGE`, or `LEERIE_WORKER_IMAGE` — there is no
+coordinator to provision. The per-job `./leerie --runtime fly`
+invocations have their own env requirements unchanged.
 
-The coordinator process is `python3 -m chain` (delegates to
-`chain.coordinator.main`). On boot:
+#### Per-job lifecycle
 
-1. Opens `/data/chain.db` (SQLite on the persistent 1GB Fly volume).
-2. If the chain row doesn't exist (first boot), decodes
-   `LEERIE_QUEUE_JSON` (base64 → JSON) and INSERTs the chain + run
-   rows reusing the caller-supplied `LEERIE_CHAIN_ID` so the UUID
-   the launcher generated survives end-to-end.
-3. Eagerly launches wave 0 via `chain.fly_client.launch_machine`.
-4. Starts the watchdog thread (60s tick — stale-heartbeat + abandon
-   timeout checks).
-5. `make_server` binds a stdlib `HTTPServer` on `0.0.0.0:8080`.
+Each wave job is a normal single-run `--runtime fly` invocation:
 
-`Coordinator` (in `chain/coordinator.py`) is the decision-logic
-class; the `_CoordinatorHandler` subclass of `BaseHTTPRequestHandler`
-delegates to it. Endpoints:
+1. **Provision.** `scripts/remote/provision.sh::provision_machine` creates a
+   Fly machine, writes `fly-machine.json` + `$LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json`
+   immediately after `flyctl machine run` succeeds.
+2. **Seed.** `scripts/remote/seed-auth.sh` + `seed-repo.sh` ship the
+   laptop's Claude credentials + git identity + working tree to the
+   worker via `flyctl ssh console` tar pipe. `seed-auth.sh:149-158`
+   excludes git-push credentials by design — workers never see them.
+3. **Orchestrate.** The orchestrator runs the standard
+   classify → plan → execute → finalize phases on the worker.
+4. **Decide teardown.** When the orchestrator exits, the launcher's
+   `decide_teardown` trap fires on the LAPTOP (it's a trap on the
+   bash process that sourced provision.sh; the worker's exit
+   propagates via the SSH session's tail wrapper). The trap calls
+   `fetch_branch` (pulls bundle + run-state), `host_finalize`
+   (pushes branch + opens PR), `destroy_machine` (Fly DELETE).
 
-| Endpoint | Method | Caller | Behavior |
-|----------|--------|--------|----------|
-| `/report` | POST | worker chain-exit-hook | Records terminal status (done/failed/stale_creds/merge_failed); if wave complete, either pauses or advances + launches next wave. |
-| `/heartbeat` | POST | worker background heartbeat | Stamps `last_heartbeat_at` so the watchdog doesn't mark the worker stale. |
-| `/pause` | POST | launcher (chain-scoped `--stop`) | Sets `chains.status = 'paused'` with a reason string. |
-| `/unpause` | POST | (future chain-scoped `--resume`) | Clears `paused` and returns `running`. |
-| `/state` | GET | launcher (chain-scoped `--status`/`--attach`) | Returns full `ChainState.load_chain(chain_id)` snapshot. |
-| `/health` | GET | launcher (`leerie --chain` startup wait) | Liveness probe (always 200). |
+The chain wave loop catches each per-job exit via `wait` and
+captures the rc. The launcher_pid recorded in
+`$LEERIE_STATE_HOST_DIR/remote/<pid>.json` is `$!` from the parent's
+background spawn, which lets the wave loop discover each child's
+`fly_machine_id` (= run_id) and tag the run with `chain_id` /
+`wave_idx`.
 
-On chain quiescence (status in `{done, failed, cancelled}`), the
-watchdog runs the self-destruct sequence: push
-`_leerie-chains/<chain-id>/chain.json` audit artifact to the
-target repo via `chain.git_ops.write_audit_artifact`, then call
-`fly_client.destroy_machine(self_machine_id)`.
+#### chain_id discovery for chain-scoped verbs
 
-#### Worker boot path (`scripts/container-entry.sh` chain-mode branch)
+The `chain_id` (UUID minted by `--chain`) is written into each
+chain run's `run.json` by the wave loop AFTER `host_finalize`
+completes for that run. The launcher's `update_run_json` bash
+helper (`scripts/remote/lib.sh:42`) merges the field atomically into
+the existing JSON.
 
-Chain workers are launched by the coordinator via the bare Fly
-Machines API (`chain.fly_client.launch_machine`) with no `init.cmd`
-or `init.exec`, so they boot with the worker image's `ENTRYPOINT`
-(`container-entry.sh`) and no argv. The chain-mode branch is gated
-on `LEERIE_CHAIN_ID` being set in env AND `$# == 0`. It runs
-entirely on the worker — there is no launcher process and no host
-involvement during the run.
+All chain-scoped verbs operate by iterating
+`$LEERIE_STATE_HOST_DIR/runs/*/run.json`, parsing each with
+`json.load`, and filtering by the `chain_id` field. The standard
+`for run_json in "$LEERIE_STATE_HOST_DIR"/runs/*/run.json` glob
+(established in `leerie:3330-3347` for auto-finalize) is the shared
+discovery pattern.
 
-Required env (set by the coordinator's `_build_worker_env`):
+#### Synth-merge between waves
 
-| Var | Source | Purpose |
-|-----|--------|---------|
-| `LEERIE_CHAIN_ID` | coordinator (chain identity) | Primary key into `chains`. |
-| `LEERIE_CHAIN_RUN_UUID` | coordinator (per-run identity) | Primary key into `chain_runs`. Distinct from the orchestrator's own `run_id`, which under `--runtime fly` is the Fly machine id (derived at orchestrator boot). |
-| `LEERIE_COORDINATOR_HOST` | coordinator | `<coord-id>.vm.<app>.internal:8080`. |
-| `LEERIE_TASK` | coordinator | The worker's prompt. Used as the positional argument to the orchestrator. |
-| `LEERIE_TARGET_REPO` | coordinator | The target repo URL. |
-| `LEERIE_CLAUDE_CREDS_B64` | launcher → coordinator's `LEERIE_WORKER_ENV_JSON` → worker env | Base64-encoded `~/.claude/.credentials.json` content. |
+After every wave-N job's `host_finalize` has pushed its branch to
+origin, the wave loop runs synth-merge to build the next wave's
+base branch:
 
-Boot sequence:
-
-1. **Materialize Claude credentials.** Decode `LEERIE_CLAUDE_CREDS_B64`
-   and write `/home/leerie/.claude/.credentials.json` with mode 600.
-   The path matches what `scripts/remote/seed-auth.sh` produces for
-   non-chain Fly runs, so the orchestrator's auth path is identical
-   in both runtimes.
-2. **Background-start the heartbeat.** `runuser -u leerie -- env ... bash
-   /opt/leerie-image/scripts/leerie-chain-heartbeat.sh &` plus a trap
-   that kills the background pid on EXIT/INT/TERM.
-3. **Run (not exec) the orchestrator** with `python3
-   /opt/leerie-image/orchestrator/leerie.py "$LEERIE_TASK"`. The
-   chain-mode branch does NOT pass `--run-id`: the orchestrator
-   derives its own run_id from the Fly machine id, as on every other
-   Fly run. `_orch_rc=$?` (via `... || _orch_rc=$?` so `set -e`
-   doesn't abort the script on non-zero) captures the rc.
-4. **Invoke the chain-exit-hook.** A bash subshell sources
-   `/opt/leerie-image/scripts/remote/_log.sh` (for `remote_log`)
-   and `/opt/leerie-image/scripts/leerie-chain-exit-hook.sh`, then
-   calls `leerie_chain_report "$_orch_rc" "$_run_dir"`. The bash
-   subshell is necessary because `container-entry.sh` is `/bin/sh`
-   (dash on Debian) and the hook uses bash-only `local`.
-5. **Exit with the orchestrator's rc.**
-
-Chain workers do **not** run `decide_teardown` (the trap defined in
-`scripts/remote/provision.sh`). That path is for non-chain Fly runs
-managed by a launcher on the user's host, which has `flyctl` and
-GitHub push creds. Chain workers have neither.
-
-#### Worker-side hooks (bash scripts under `scripts/`)
-
-Both scripts are delivered by the existing
-`COPY scripts/ /opt/leerie-image/scripts/` in `Dockerfile`.
-
-| Script | Called by | Purpose |
-|--------|-----------|---------|
-| `scripts/leerie-chain-exit-hook.sh` | container-entry.sh chain-mode branch (above) | Exposes `leerie_chain_report rc run_dir` which classifies the orchestrator exit code, reads `fly_machine_id` and `branch` from `run.json`, POSTs `/report` to the coordinator with `{chain_run_uuid, machine_id, status, exit_code, branch}` (retry-with-backoff via curl), and sets `LEERIE_CHAIN_HANDLED=1`. |
-| `scripts/leerie-chain-heartbeat.sh` | container-entry.sh chain-mode branch (background-started before the orchestrator runs) | Loops every `LEERIE_CHAIN_HEARTBEAT_INTERVAL_S` (default 60s), POSTs `{"chain_run_uuid":"..."}` to `/heartbeat`. Tolerates transient errors; exits cleanly on SIGTERM. |
-
-Note: `scripts/remote/provision.sh` also sources the chain-exit-hook
-near the top and calls `leerie_chain_report` from its
-`decide_teardown` trap when `LEERIE_CHAIN_ID` is in env. That code
-path is reachable from the non-chain launcher when a future
-operator extends `--runtime fly` runs into chains; in the current
-design only the container-entry path fires the hook for chain
-workers.
-
-#### State schema
-
-`chain/state.py` defines two tables (DESIGN.md §19 *State model*):
-
-```sql
-CREATE TABLE chains (
-    id           TEXT PRIMARY KEY,
-    target       TEXT NOT NULL,
-    queue_json   TEXT NOT NULL DEFAULT '{}',
-    wave_state   TEXT NOT NULL DEFAULT 'wave_0',
-    status       TEXT NOT NULL DEFAULT 'running',
-    paused       TEXT,                                -- 'stale_creds' | 'merge_failed' | ...
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL,
-    completed_at TEXT
-);
-CREATE TABLE chain_runs (
-    id                TEXT PRIMARY KEY,
-    chain_id          TEXT NOT NULL,
-    prompt            TEXT NOT NULL,
-    wave              TEXT NOT NULL,
-    machine_id        TEXT,
-    status            TEXT NOT NULL DEFAULT 'queued',
-    exit_code         INTEGER,
-    branch            TEXT,
-    started_at        TEXT,
-    finished_at       TEXT,
-    last_heartbeat_at TEXT,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
-    FOREIGN KEY (chain_id) REFERENCES chains(id)
-);
+```bash
+python3 -c "
+from chain.git_ops import synth_merge_branches, SynthMergeConflict
+synth_merge_branches('$USER_REPO', '$current_base',
+                     ['leerie/runs/...', ...],
+                     'leerie/stage/<chain-id>-wave-<N+1>')
+"
 ```
 
-`RUN_STATUSES = {queued, running, done, failed, stale_creds, merge_failed}`.
-`CHAIN_STATUSES = {running, paused, done, failed, cancelled}`.
+`synth_merge_branches` runs in `$USER_REPO`, does `git fetch
+origin` + `git checkout -B <stage> origin/<base>` + sequential
+`git merge --no-ff --no-edit origin/<branch>`. Conflicts raise
+`SynthMergeConflict`; the wave loop catches and pauses the chain
+with a clear message for manual resolution. The function works
+unchanged from its v3 form — branches are on origin (each wave-N
+job's `host_finalize` pushed it), so the `origin/<branch>`
+references resolve.
 
-`ChainState.init_db` opens with `PRAGMA journal_mode=WAL` for
-read-while-write concurrency on the single-writer server.
+After synth-merge, the wave loop pushes the stage branch to origin
+so wave-N+1 workers can see it as their starting base.
 
-#### Git operations
+#### Idempotent resume
 
-`chain/git_ops.py` provides the coordinator's git/gh side-effects
-(coordinator's equivalent of host-side `scripts/host-finalize.sh`):
+If the user Ctrl-Cs mid-chain or any job fails, the wave loop
+exits non-zero with a resume hint. To resume:
+
+1. `leerie --resume <chain-id>` resumes every paused run (existing
+   single-run resume per discovered run).
+2. After paused runs complete, the user re-invokes
+   `leerie --chain --wave ...`. The wave loop's idempotency check
+   (waves whose runs are all already `pushed_at` are skipped) lets
+   the chain pick up from where it stopped.
+
+The canonical "this run is done, don't re-spawn" sentinel is
+`pushed_at` being set on the run.json — written by `host_finalize`
+after `git push -u origin <branch>` succeeds. This is the same
+sentinel `host_finalize` itself uses for push idempotency.
+
+#### chain.git_ops surface (laptop-side)
+
+`chain/git_ops.py` provides the git operations invoked by the wave
+loop. Workers never invoke this module; all GitHub credential
+touches happen on the laptop using its existing `gh auth` and
+`~/.git-credentials`.
 
 | Function | Purpose |
 |----------|---------|
-| `clone_target(url, pat, dest)` | Clone target repo into `dest` using `https://<pat>@github.com/...` rewrite. |
-| `create_stage_branch(repo, chain_id, base_branch="main")` | Create or check out `stage-<chain-id>` off `base_branch`. |
-| `synth_merge_branches(repo, base_branch, dep_branches, stage_name)` | Build stage branch by merging each dep branch in turn; raises `SynthMergeConflict` on conflict. |
-| `fetch_branch(repo, branch)` | `git fetch origin <branch>:<branch>` into the coordinator's workspace. |
-| `push_branch(repo, branch)` | `git push -u origin <branch>`. |
-| `open_pr(repo, head, base, title, body)` | Shells out to `gh pr create`; returns PR URL. |
-| `finalize_run(repo, head, base, title, body)` | `push_branch` + `open_pr` in one call. |
-| `write_audit_artifact(snapshot, repo_url=, pat=)` | Clones target into tempdir, writes `_leerie-chains/<chain-id>/chain.json`, commits + pushes to main. Called on coordinator self-destruct. |
+| `synth_merge_branches(repo, base_branch, dep_branches, stage_name)` | Build a stage branch by merging each dep branch into a fresh checkout of `base_branch`; raises `SynthMergeConflict` on any conflict. Used by the wave loop between waves. |
+| `clone_target(url, pat, dest)`, `fetch_branch`, `push_branch`, `open_pr`, `finalize_run`, `write_audit_artifact` | Kept for compatibility with existing tests and any future automated paths; the wave loop MVP uses only `synth_merge_branches`. |
 
 Maps to `DESIGN.md`: §19 *Chain orchestration*.
 
@@ -4241,6 +4186,8 @@ discovery without parsing the full `state.json`):
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
+| `chain_id` | str \| null | UUID of the chain this run is part of (set by `leerie --chain` wave-sequencer via `update_run_json` after each wave job's `host_finalize` completes). Null for runs not spawned as part of a chain. Purely advisory — no state-machine coupling — used only by chain-scoped verbs (`leerie --list --chains`, `--status <chain-id>`, `--kill <chain-id>`, `--attach <chain-id>`, `--resume <chain-id>`) to discover the runs that belong to a chain. |
+| `wave_idx` | int \| null | Zero-based wave index within the chain (set alongside `chain_id`). Used by the chain wave-sequencer to group runs by wave for synth-merge between waves. Null when `chain_id` is null. |
 
 `_validate_run_json(data)` enforces these invariants on read:
 - `pushed_at` and `push_error` are mutually exclusive (at most one is non-null).

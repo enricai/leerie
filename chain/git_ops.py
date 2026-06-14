@@ -1,22 +1,22 @@
-"""chain.git_ops — git and gh PR operations for the leerie-chain coordinator.
+"""chain.git_ops — laptop-side git/gh operations for chain wave transitions.
 
-The coordinator runs inside a container that holds the GH_DISPATCH_PAT.
-Functions here clone the target repo, manage the stage-<chain-id>
-branch used for N-wave sequencing, and push branches / open PRs via gh.
+Imported by the leerie launcher's ``--chain`` wave-sequencer (laptop
+side) to synth-merge each wave's branches into a staged base before
+launching the next wave. Wave-N branches are pushed to origin by each
+per-job ``host_finalize`` invocation (single-run flow); this module
+fetches them locally and produces the stage branch for wave N+1.
 
-This is the coordinator's counterpart to the host-side scripts/host-finalize.sh.
-The actor is different (coordinator, not user's shell) but the git/gh mechanic
-is the same — clone via HTTPS PAT URL, push, gh pr create.
-
-Additions for the per-chain ephemeral coordinator design:
+Functions:
   - synth_merge_branches: build a stage branch by merging several
-    completed dep branches into a fresh base — used to launch
-    the next wave with its predecessors' work already in tree.
-  - finalize_run: fetch + push + open_pr for one completed worker
-    in a single shell-friendly call.
-  - write_audit_artifact: push `_leerie-chains/<chain-id>/chain.json`
-    on coordinator self-destruct so post-mortem inspection survives
-    the coordinator's death.
+    completed dep branches into a fresh base — used to seed the next
+    wave with its predecessors' work already in tree.
+  - clone_target / finalize_run / write_audit_artifact / open_pr: kept
+    for compatibility with the existing test suite and any future
+    automated paths; the laptop-side sequencer uses only
+    synth_merge_branches in the MVP.
+
+Workers never invoke this module. All GitHub credential touches happen
+on the laptop using its existing gh auth + ~/.git-credentials.
 """
 from __future__ import annotations
 

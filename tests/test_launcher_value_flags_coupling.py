@@ -117,6 +117,11 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     "--local-build",
     "--no-re-seed",
     "--force",
+    # --chain-id is value-taking but launcher-only: the wave sequencer
+    # passes it through to each per-job ./leerie invocation, which
+    # records it via update_run_json after host_finalize. The
+    # orchestrator never reads it.
+    "--chain-id",
 })
 
 

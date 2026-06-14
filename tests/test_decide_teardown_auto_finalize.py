@@ -185,128 +185,58 @@ def test_clean_exit_missing_host_finalize_sh_falls_back(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Chain mode
+# Chain-aware detach banner
 # ---------------------------------------------------------------------------
+#
+# Per-job runs that are part of a chain still pause / detach individually
+# under the v5 Shape A model — there is no longer a special chain-mode
+# short-circuit in decide_teardown. What survives is the rc=130 detach
+# banner's chain-scoped command hints, which fire purely on
+# LEERIE_CHAIN_ID being present in env.
 
 
-def _run_decide_teardown_chain(
-    *,
-    rc: int,
-    chain_id: str = "test-chain-uuid-001",
-    run_id: str = "rid-001",
-    coord_host: str = "coord-mach.vm.leerie.internal:8080",
-    tmp_path: Path,
-) -> subprocess.CompletedProcess:
-    """Invoke decide_teardown with LEERIE_CHAIN_ID set + leerie_chain_report stubbed.
-
-    Verifies that:
-      - leerie_chain_report() is called once on entry.
-      - host_finalize is SKIPPED for clean exits.
-      - destroy_machine is called for both clean (rc=0|10|11|75) and
-        failure (rc=*) exits in chain mode.
-      - The non-chain pause-on-failure path is NOT taken in chain mode.
+def test_chain_id_detach_banner_includes_chain_scoped_commands(tmp_path):
+    """When LEERIE_CHAIN_ID is set, the rc=130 detach banner lists
+    chain-scoped recovery commands in addition to the run-scoped ones.
+    The per-job decide_teardown otherwise behaves identically to a
+    single-run detach (no destroy, no stop).
     """
+    chain_id = "test-chain-uuid-001"
+    run_id = "rid-001"
     user_repo = tmp_path / "user_repo"
     run_dir = user_repo / ".leerie" / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(
         '{"finished_at": "2026-06-14T00:00:00Z", "branch": "leerie/runs/test"}'
     )
-
-    leerie_repo = tmp_path / "leerie_repo"
-    scripts_dir = leerie_repo / "scripts"
-    scripts_dir.mkdir(parents=True)
-    (scripts_dir / "host-finalize.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        "host_finalize() { echo '[stub-host-finalize] CALLED'; return 0; }\n"
-    )
-
     script = f"""
 source {PROVISION_SH}
 _try_fetch_branch_for_teardown() {{ return 0; }}
 destroy_machine() {{ echo "[stub] destroy_machine called"; LEERIE_MACHINE_ID=''; }}
 stop_machine() {{ echo "[stub] stop_machine called"; LEERIE_MACHINE_ID=''; }}
 update_run_json() {{ :; }}
-# Stub the chain hook function (decide_teardown checks for it via
-# `command -v`). Setting LEERIE_CHAIN_HANDLED=1 tells the rc-arms
-# to take the chain-mode short-circuit.
-leerie_chain_report() {{
-  echo "[stub] leerie_chain_report rc=$1 run_dir=$2"
-  export LEERIE_CHAIN_HANDLED=1
-}}
 export LEERIE_MACHINE_ID=test-mid-chain-001
-export LEERIE_REMOTE_EXIT_RC={rc}
+export LEERIE_REMOTE_EXIT_RC=130
 export LEERIE_REMOTE_RUN_ID={run_id}
 export LEERIE_RUN_ID={run_id}
 export LEERIE_CHAIN_ID={chain_id}
-export LEERIE_COORDINATOR_HOST={coord_host}
 export USER_REPO={user_repo}
-export LEERIE_REPO={leerie_repo}
 decide_teardown
 """
-    return subprocess.run(
+    result = subprocess.run(
         ["bash", "-c", script],
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", "")},
     )
-
-
-def test_chain_mode_clean_exit_skips_host_finalize_destroys_machine(tmp_path):
-    """Clean rc=0 in chain mode: report → destroy (no host_finalize)."""
-    result = _run_decide_teardown_chain(rc=0, tmp_path=tmp_path)
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert "[stub] leerie_chain_report rc=0" in combined
-    # host_finalize MUST NOT be called for chain runs.
-    assert "[stub-host-finalize] CALLED" not in combined
-    assert "auto-finalize: pushing + opening PR" not in combined
-    # And the chain-mode skip banner appears.
-    assert "chain mode: skipping host_finalize" in combined
-    assert "[stub] destroy_machine called" in combined
-
-
-def test_chain_mode_failure_destroys_worker_no_pause(tmp_path):
-    """Non-zero rc in chain mode: coordinator notified, worker destroyed
-    (NOT paused). The chain itself is paused at the coordinator level."""
-    result = _run_decide_teardown_chain(rc=1, tmp_path=tmp_path)
-    combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
-    assert "[stub] leerie_chain_report rc=1" in combined
-    # The pause-on-failure path must NOT run in chain mode.
-    assert "[stub] stop_machine called" not in combined
-    assert "PAUSED:" not in combined
-    # The chain-mode short-circuit DOES destroy the worker machine.
-    assert "[stub] destroy_machine called" in combined
-    assert "chain mode: coordinator notified" in combined
-
-
-def test_chain_mode_detach_rc_130_unchanged(tmp_path):
-    """rc=130 (detach) in chain mode: the chain hook reports failed, but
-    the 130|143 case-arm prints reattach hints and does NOT destroy.
-
-    The orchestrator is still running on the machine; the user just
-    detached from tailing.
-    """
-    result = _run_decide_teardown_chain(rc=130, tmp_path=tmp_path)
-    combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
-    assert "[stub] leerie_chain_report rc=130" in combined
-    # 130|143 specifically does NOT destroy or stop.
+    # rc=130 specifically does NOT destroy or stop.
     assert "[stub] destroy_machine called" not in combined
     assert "[stub] stop_machine called" not in combined
-    assert "still running on Fly" in combined
-
-
-def test_chain_mode_detach_banner_includes_chain_scoped_commands(tmp_path):
-    """When LEERIE_CHAIN_ID is set, the rc=130 detach banner lists
-    chain-scoped recovery commands in addition to the run-scoped ones.
-    """
-    result = _run_decide_teardown_chain(rc=130, tmp_path=tmp_path)
-    combined = result.stdout + result.stderr
     # Run-scoped (existing) commands still shown.
-    assert "leerie --resume rid-001" in combined
+    assert f"leerie --resume {run_id}" in combined
     # Chain-scoped commands surfaced.
-    assert "leerie --status test-chain-uuid-001" in combined
-    assert "leerie --attach test-chain-uuid-001" in combined
-    assert "leerie --stop   test-chain-uuid-001" in combined
-    assert "leerie --kill   test-chain-uuid-001" in combined
+    assert f"leerie --status {chain_id}" in combined
+    assert f"leerie --attach {chain_id}" in combined
+    assert f"leerie --stop   {chain_id}" in combined
+    assert f"leerie --kill   {chain_id}" in combined
