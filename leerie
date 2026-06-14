@@ -110,6 +110,15 @@ _b64_stdin() {
   python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
 }
 
+# UUID format pattern (8-4-4-4-12 hex). Used by all chain-scoped verb
+# arms (--stop / --kill / --finalize / --resume / --status / --attach
+# / --chain --chain-id) to distinguish a chain_id from a single-run
+# Fly machine id. Case-insensitive grep at the call sites; chain code
+# normalizes to lowercase before string comparison against run.json
+# fields (uuid.uuid4() emits lowercase, so the canonical form is
+# lowercase).
+UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
 # Read a single top-level key from a JSON file. Prints the value
 # (empty string if absent/null/error). Used by --finalize to avoid
 # repeating the same python3 one-liner.
@@ -751,7 +760,7 @@ PY
     export USER_REPO
     # Peek at the first positional arg for UUID dispatch.
     # Chain-id stop: iterate runs with matching chain_id, stop each.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _sp_chain="$1"; shift
       _sp_pass_args=("$@")
       _sp_run_ids="$(_chain_runs_filter "$_sp_chain" stop)"
@@ -841,7 +850,7 @@ PY
     # Peek for UUID-formatted chain-id as the first positional arg.
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # find runs with matching chain_id, invoke single-run kill on each.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _kc_chain="$1"; shift
       # Pass through --force / --runtime / etc. flags to per-run kill.
       _kc_pass_args=("$@")
@@ -975,7 +984,7 @@ PY
     export USER_REPO
     # Chain-id dispatch: `--finalize <uuid>` finalizes every run-id
     # belonging to a chain that hasn't already been pushed.
-    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _fc_chain="$1"; shift
       _fc_pass_args=("$@")
       _fc_run_ids="$(_chain_runs_filter "$_fc_chain" finalize)"
@@ -1273,7 +1282,7 @@ PY
     if [ -z "$_st_id" ]; then
       remote_log "--status: <id> is required (chain-id or run-id)"; exit 1
     fi
-    if echo "$_st_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if echo "$_st_id" | grep -qiE "$UUID_PATTERN"; then
       python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY'
 import json, sys
 from pathlib import Path
@@ -1345,7 +1354,7 @@ PY
     if [ -z "$_at_id" ]; then
       remote_log "--attach: <id> is required (chain-id or run-id)"; exit 1
     fi
-    if echo "$_at_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if echo "$_at_id" | grep -qiE "$UUID_PATTERN"; then
       remote_log "--attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
       while :; do
         _at_done="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
@@ -1390,7 +1399,7 @@ PY
     # ID-dispatch fast-path: `--resume <uuid>` resumes all paused runs
     # belonging to a chain. Non-UUID args fall through to the existing
     # run-id resume path below.
-    if [ "$#" -ge 2 ] && echo "$2" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if [ "$#" -ge 2 ] && echo "$2" | grep -qiE "$UUID_PATTERN"; then
       _rs_chain="$2"
       shift 2
       _rs_pass_args=("$@")
@@ -1465,12 +1474,20 @@ PY
     # typos instead of mid-chain. Also collect the prompt contents into
     # arrays so the wave loop below can pass them to each ./leerie child.
     if [ -n "$_ch_id_override" ]; then
-      # Validate UUID format (8-4-4-4-12 hex) before trusting it.
-      if ! echo "$_ch_id_override" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      # Validate UUID format (8-4-4-4-12 hex) before trusting it. The
+      # regex is case-insensitive (grep -qiE), but `uuid.uuid4()` and
+      # therefore run.json's `chain_id` field are always lowercase, and
+      # the wave-loop helpers (_wave_already_done, _wave_branches,
+      # _chain_runs_filter) compare case-sensitively. Normalize to
+      # lowercase here so uppercase user input matches the prior
+      # chain's lowercase tag — without this, --chain-id with any
+      # uppercase letter silently bypasses idempotency and forks the
+      # chain into a second chain_id (v8 audit finding S1).
+      if ! echo "$_ch_id_override" | grep -qiE "$UUID_PATTERN"; then
         remote_log "--chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
-      _ch_id="$_ch_id_override"
+      _ch_id="$(echo "$_ch_id_override" | tr '[:upper:]' '[:lower:]')"
       remote_log "--chain: pinning chain_id to $_ch_id (resuming prior chain)"
     else
       _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -1543,6 +1560,10 @@ PY
     echo "  chain_id:    $_ch_id"
     echo "  waves:       ${#_ch_waves[@]} (jobs per wave: ${_ch_jobs_per_wave[*]})"
     echo "  base branch: $_ch_current_base"
+    echo ""
+    echo "If a wave fails, resume with:"
+    echo "    leerie --resume $_ch_id"
+    echo "    leerie --chain --chain-id $_ch_id --wave ..."
     echo ""
 
     # Wave loop. Each wave:
@@ -1640,6 +1661,26 @@ PY
       # Synth-merge between waves: build the next wave's base branch.
       if [ "$((_wave_idx + 1))" -lt "${#_ch_waves[@]}" ]; then
         _ch_next_stage="leerie/stage/${_ch_id}-wave-$((_wave_idx + 1))"
+
+        # Idempotency probe (v8 audit S2.1): if the stage branch
+        # already exists on origin, the synth-merge for this transition
+        # ran successfully in a prior submission (or the user manually
+        # resolved a conflict + pushed). Don't re-run synth-merge,
+        # which would force-recreate the branch from $_ch_current_base
+        # via `git checkout -B` and clobber the resolved state, then
+        # re-conflict. Instead fetch + checkout the existing stage
+        # branch and advance current_base.
+        if git -C "$USER_REPO" ls-remote --exit-code origin "$_ch_next_stage" >/dev/null 2>&1; then
+          remote_log "wave $_wave_idx → $((_wave_idx + 1)): stage branch $_ch_next_stage already on origin; skipping synth-merge"
+          git -C "$USER_REPO" fetch origin "$_ch_next_stage" >/dev/null 2>&1 \
+            || { remote_log "--chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
+          git -C "$USER_REPO" checkout -B "$_ch_next_stage" "origin/$_ch_next_stage" >/dev/null 2>&1 \
+            || { remote_log "--chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
+          _ch_current_base="$_ch_next_stage"
+          _ch_offset=$((_ch_offset + _n))
+          continue
+        fi
+
         remote_log "wave $_wave_idx → $((_wave_idx + 1)): synth-merging ${#_ch_wave_branches[@]} branch(es) into $_ch_next_stage"
 
         # Reuse chain.git_ops.synth_merge_branches via python3 -c.
@@ -1672,9 +1713,10 @@ except SynthMergeConflict as exc:
           echo "  2. Resolve the conflict (the workspace is on a half-merged"
           echo "     staging branch named leerie/stage/${_ch_id}-wave-$((_wave_idx + 1)))."
           echo "  3. git commit + git push origin leerie/stage/${_ch_id}-wave-$((_wave_idx + 1))"
-          echo "  4. Re-submit the chain pinning the same chain_id so the"
-          echo "     wave loop skips the now-pushed wave-$_wave_idx and resumes"
-          echo "     at wave-$((_wave_idx + 1)):"
+          echo "  4. Re-submit the chain pinning the same chain_id; the wave"
+          echo "     loop will detect the now-pushed staging branch and skip"
+          echo "     synth-merge for wave-$_wave_idx → $((_wave_idx + 1)),"
+          echo "     resuming at wave-$((_wave_idx + 1)):"
           echo "       leerie --chain --chain-id $_ch_id --wave ..."
           exit 1
         fi

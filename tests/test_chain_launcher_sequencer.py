@@ -684,3 +684,158 @@ except SynthMergeConflict as exc:
     log_content = synth_log.read_text()
     assert apostrophed_branch in log_content
     assert "stage'with-apostrophe" in log_content
+
+
+# ---------------------------------------------------------------------------
+# v8 audit additions
+# ---------------------------------------------------------------------------
+
+
+def test_chain_id_uppercase_input_normalized_to_lowercase(tmp_path: Path) -> None:
+    """v8 audit S1 fix: --chain-id accepts uppercase UUIDs but normalizes
+    to lowercase before matching against run.json's chain_id field
+    (which is always lowercase since uuid.uuid4() emits lowercase).
+
+    Without normalization, uppercase --chain-id would silently fork
+    the chain into a second chain_id and re-fan-out every wave.
+
+    Test path:
+    1. Run a 2-wave chain end-to-end; both stubs fire (2 invocations).
+    2. Capture the minted lowercase chain_id.
+    3. Re-run with --chain-id <UPPERCASE-version> --wave (same args).
+    4. Verify: ZERO new fan-outs, "already complete; skipping fan-out"
+       fires for both waves, AND the launcher logs the normalized
+       (lowercase) chain_id.
+    """
+    p0 = _write_prompt(tmp_path, "wave0.md", "p0")
+    p1 = _write_prompt(tmp_path, "wave1.md", "p1")
+
+    result1 = _run_chain(tmp_path, [[p0], [p1]])
+    assert result1.returncode == 0, result1.stderr
+    invocations_run1 = result1.self_log.count("--runtime fly")
+    assert invocations_run1 == 2
+
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    run_jsons = list((state_dir / "runs").glob("*/run.json"))
+    chain_ids = {json.loads(rj.read_text()).get("chain_id") for rj in run_jsons}
+    chain_ids.discard(None)
+    assert len(chain_ids) == 1
+    prior_chain_id_lower = next(iter(chain_ids))
+    assert prior_chain_id_lower == prior_chain_id_lower.lower(), \
+        "uuid.uuid4() should have emitted lowercase"
+    prior_chain_id_upper = prior_chain_id_lower.upper()
+    assert prior_chain_id_upper != prior_chain_id_lower, \
+        "upper-case version must differ from lower-case"
+
+    # Re-run with UPPERCASE --chain-id. Without normalization, this
+    # would fork the chain. With v8's tr-to-lower fix, the idempotency
+    # check still matches and skips fan-out.
+    result2 = _run_chain(
+        tmp_path, [[p0], [p1]],
+        extra_args=["--chain-id", prior_chain_id_upper],
+    )
+    assert result2.returncode == 0, result2.stderr
+    invocations_run2_new = result2.self_log.count("--runtime fly") - invocations_run1
+    assert invocations_run2_new == 0, (
+        f"uppercase --chain-id forked the chain: {invocations_run2_new} "
+        f"new fan-outs (should be 0)"
+    )
+    combined = result2.stdout + result2.stderr
+    # Both waves skipped via the lowercase-normalized match.
+    assert combined.count("already complete") >= 2
+    # The launcher logs the LOWERCASE form, not the uppercase input.
+    assert f"pinning chain_id to {prior_chain_id_lower}" in combined
+    # The uppercase input itself should NOT appear as a "fresh" chain id
+    # in the pinning message.
+    assert f"pinning chain_id to {prior_chain_id_upper}" not in combined
+
+
+def test_synth_merge_skipped_when_stage_branch_exists_on_origin(tmp_path: Path) -> None:
+    """v8 audit S2.1 fix: when the stage branch for wave N→N+1 already
+    exists on origin (e.g., user manually resolved a prior synth-merge
+    conflict + pushed), the wave loop probes `git ls-remote
+    --exit-code origin <stage-branch>` and skips synth-merge for that
+    transition. Without this, synth_merge_branches's `git checkout -B`
+    would force-recreate the branch and discard the user's resolved
+    state.
+
+    Test path:
+    1. Pre-create a stage branch in the userrepo that has been pushed
+       to a fake "origin" — actually, the test stub's git wrapper
+       returns success on `ls-remote --exit-code` for any branch, so
+       we control the probe outcome via LEERIE_TEST_STAGE_EXISTS env.
+    2. Run a 2-wave chain. The git stub reports the wave-1 stage
+       branch as already existing on origin.
+    3. Verify: synth_merge stub is NOT invoked for the wave 0 → 1
+       transition.
+    """
+    # Build a custom git stub that returns 0 on `ls-remote --exit-code
+    # origin leerie/stage/...` (simulating the branch existing).
+    git_log = tmp_path / "git-v8.log"
+    bin_dir = tmp_path / "stub-bin-v8"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "git"
+    real_git = shutil.which("git") or "/usr/bin/git"
+    stub.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        echo "$@" >> "{git_log}"
+        # Scan for ls-remote --exit-code: claim every leerie/stage/...
+        # branch EXISTS on origin (rc 0).
+        _saw_ls_remote=0
+        for _arg in "$@"; do
+          case "$_arg" in
+            ls-remote) _saw_ls_remote=1 ;;
+            leerie/stage/*) [ "$_saw_ls_remote" = 1 ] && exit 0 ;;
+          esac
+        done
+        # Otherwise: pass-through for checkout/fetch (succeed quietly),
+        # or delegate to real git for symbolic-ref / init / status / etc.
+        for _arg in "$@"; do
+          case "$_arg" in
+            checkout|push|fetch) exit 0 ;;
+          esac
+        done
+        exec "{real_git}" "$@"
+        """))
+    stub.chmod(0o755)
+
+    user_repo = tmp_path / "userrepo"
+    user_repo.mkdir()
+    _init_git_repo(user_repo)
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    self_stub, self_log = _build_self_stub(tmp_path)
+    fake_chain_dir, synth_log = _build_synth_merge_stub(tmp_path)
+
+    p0 = _write_prompt(tmp_path, "wave0.md", "p0")
+    p1 = _write_prompt(tmp_path, "wave1.md", "p1")
+
+    real_path = os.environ.get("PATH", "/usr/bin:/bin")
+    env = {
+        "PATH": f"{bin_dir}:{real_path}",
+        "USER_REPO": str(user_repo),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(tmp_path),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "LEERIE_STATE_DIR": str(state_dir),
+        "LEERIE_SELF_CMD": str(self_stub),
+        "PYTHONPATH": str(fake_chain_dir),
+    }
+    result = subprocess.run(
+        ["bash", str(LAUNCHER), "--chain",
+         "--wave", str(p0), "--wave", str(p1)],
+        env=env, capture_output=True, text=True, timeout=30,
+        cwd=str(user_repo),
+    )
+    assert result.returncode == 0, result.stderr
+    # Per-wave fan-out still happened (we didn't skip waves, just the
+    # synth-merge step between them).
+    assert self_log.read_text().count("--runtime fly") == 2
+    # Synth-merge stub was NOT invoked (because git ls-remote --exit-code
+    # claimed the staging branch already exists on origin).
+    assert not synth_log.exists() or synth_log.read_text() == ""
+    # The launcher should log the skip-message.
+    combined = result.stdout + result.stderr
+    assert "stage branch" in combined
+    assert "already on origin" in combined
+    assert "skipping synth-merge" in combined

@@ -59,6 +59,32 @@ the user wants to detach, they can Ctrl-C (the trap propagates SIGTERM
 to all in-flight wave children, each of which runs its own
 `decide_teardown` to clean up its Fly machine).
 
+#### Resuming a chain (after wave failure or Ctrl-C)
+
+When a wave fails or the user Ctrl-Cs mid-chain, the chain pauses.
+To resume:
+
+1. `leerie --resume <chain-id>` — resumes every paused single-run
+   in the chain. After each paused run completes, the wave it
+   belongs to has all runs `pushed_at`.
+2. Re-submit the chain with `--chain-id` pinned to the prior UUID.
+   The wave loop's idempotency check detects waves whose runs are
+   all already pushed and skips fan-out, advancing directly to the
+   first incomplete wave:
+
+```
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain \
+  --chain-id <prior-uuid> \
+  --wave <same --wave args as the original submission>
+```
+
+The `--chain-id` value is the UUID printed by the original submit
+banner. If a synth-merge between waves conflicted, the user resolves
+the conflict in `$USER_REPO` + pushes the staging branch, then re-
+submits with `--chain-id`. The wave loop detects the now-existing
+staging branch on origin (via `git ls-remote`) and skips synth-merge
+for that wave transition, resuming at the next wave.
+
 ### `status` — print a chain snapshot
 
 ```

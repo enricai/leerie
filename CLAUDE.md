@@ -318,6 +318,17 @@ export LEERIE_PROGRESS_INTERVAL_S=15
   --wave "prompts/fetch.md,prompts/lint.md" \
   --wave "prompts/publish.md"
 
+# Resume after a wave failure or synth-merge conflict: re-submit
+# with --chain-id pinned to the prior chain's UUID. The wave loop
+# skips already-pushed waves AND skips synth-merge for transitions
+# whose staging branch is already on origin (idempotency probe via
+# `git ls-remote --exit-code`). Run `./leerie --resume <chain-id>`
+# first to unpause any per-run paused machines.
+./leerie --resume <chain-id>
+./leerie --chain --chain-id <chain-id> \
+  --wave "prompts/fetch.md,prompts/lint.md" \
+  --wave "prompts/publish.md"
+
 # ID-dispatched verbs: UUID → chain scope (iterates run.json filtered by
 # chain_id); Fly machine id → existing single-run behavior. Deprecated
 # chain-prefixed aliases (--chain-submit, --chain-status, --chain-kill,

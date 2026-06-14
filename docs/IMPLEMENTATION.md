@@ -1886,6 +1886,30 @@ unpauses every paused run: the user re-submits with `--chain-id
 <prior-uuid>` and the chain picks up at the first not-yet-done
 wave.
 
+The launcher normalizes the user-supplied chain_id to lowercase via
+`tr '[:upper:]' '[:lower:]'` after UUID format validation. The
+validation regex (`UUID_PATTERN`, defined near the top of the
+launcher) is case-insensitive (`grep -qiE`) so uppercase input
+passes; but the wave-loop helpers compare against `run.json`'s
+`chain_id` field case-sensitively, and `uuid.uuid4()` always emits
+lowercase. Without normalization, uppercase `--chain-id` input
+would silently bypass idempotency and fork the chain into two
+chain_ids — the v8 audit's S1 finding.
+
+##### Synth-merge idempotency probe
+
+Before invoking `chain.git_ops.synth_merge_branches` for wave
+N → N+1, the wave loop probes origin via `git ls-remote
+--exit-code origin leerie/stage/<chain-id>-wave-<N+1>`. If the
+stage branch already exists (e.g., the user manually resolved a
+prior synth-merge conflict and pushed), the wave loop fetches +
+checks out the existing branch and skips synth-merge entirely.
+Without this probe, `synth_merge_branches`'s `git checkout -B`
+would force-recreate the stage branch from `$current_base`,
+discarding the user's resolved state, and then re-merge the same
+wave-N branches — re-conflicting in exactly the same way that
+prompted the resume.
+
 #### Synth-merge between waves
 
 After every wave-N job's `host_finalize` has pushed its branch to
