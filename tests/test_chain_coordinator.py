@@ -445,3 +445,94 @@ def test_should_not_self_destruct_while_paused() -> None:
     coord, cs, fly, chain_id, _ = _make_coord()
     cs.transition_chain(chain_id, "paused", paused="stale_creds")
     assert coord._should_self_destruct() is False
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: SQLite-on-volume preserves state across restarts
+# ---------------------------------------------------------------------------
+
+def test_crash_recovery_preserves_state(tmp_path) -> None:
+    """A new coordinator process opens the same DB and sees prior state.
+
+    Simulates the case where the coordinator's Fly machine crashed (OOM,
+    host failure) and Fly restarted it. Because SQLite lives on the
+    persistent 1GB volume at /data, the new coordinator instance picks
+    up exactly where the prior one left off.
+    """
+    db_path = tmp_path / "chain.db"
+    # First coordinator: create chain, run wave-0 to completion (but don't
+    # report wave-0 done yet), then "crash" (close the connection).
+    cs1 = ChainState.init_db(db_path)
+    chain_id = cs1.create_chain(
+        target="https://github.com/x/y",
+        run_prompts=[("R0a", "0"), ("R0b", "0"), ("R1", "1")],
+    )
+    snap = cs1.load_chain(chain_id)
+    assert snap is not None
+    run_ids = [r["id"] for r in snap["runs"]]
+    cs1.transition_run(run_ids[0], "running", machine_id="m-0")
+    cs1.transition_run(run_ids[1], "running", machine_id="m-1")
+    fly1 = _StubFly()
+    coord1 = Coordinator(
+        cs=cs1, chain_id=chain_id, self_machine_id="coord-x",
+        worker_image="img", fly_module=fly1,
+    )
+    coord1.handle_report({"run_id": run_ids[0], "status": "done", "exit_code": 0})
+    # Coordinator "crashes" before the second run reports.
+    cs1.close()
+
+    # Second coordinator: re-open the SAME DB, construct a fresh Coordinator,
+    # confirm it sees R0 as done and the chain still in wave_0.
+    cs2 = ChainState.init_db(db_path)
+    snap2 = cs2.load_chain(chain_id)
+    assert snap2 is not None
+    assert snap2["runs"][0]["status"] == "done"
+    assert snap2["runs"][1]["status"] == "running"
+    assert snap2["wave_state"] == "wave_0"
+
+    fly2 = _StubFly()
+    coord2 = Coordinator(
+        cs=cs2, chain_id=chain_id, self_machine_id="coord-x",
+        worker_image="img", fly_module=fly2,
+    )
+    # When R1 (the still-running wave-0 sibling) reports done, the new
+    # coordinator advances the wave and launches R2.
+    coord2.handle_report({"run_id": run_ids[1], "status": "done", "exit_code": 0})
+    snap3 = cs2.load_chain(chain_id)
+    assert snap3 is not None
+    assert snap3["wave_state"] == "wave_1"
+    # Worker #1 — only wave-1's run was launched after restart.
+    assert len(fly2.launched) == 1
+    assert fly2.launched[0]["env"]["LEERIE_RUN_ID"] == run_ids[2]
+    cs2.close()
+
+
+def test_crash_recovery_paused_chain_stays_paused(tmp_path) -> None:
+    """Paused state survives a restart; the new coordinator respects it."""
+    db_path = tmp_path / "chain.db"
+    cs1 = ChainState.init_db(db_path)
+    chain_id = cs1.create_chain(
+        target="repo", run_prompts=[("R0", "0"), ("R1", "1")]
+    )
+    snap = cs1.load_chain(chain_id)
+    assert snap is not None
+    run_ids = [r["id"] for r in snap["runs"]]
+    cs1.transition_run(run_ids[0], "running")
+    cs1.transition_chain(chain_id, "paused", paused="stale_creds")
+    cs1.close()
+
+    cs2 = ChainState.init_db(db_path)
+    fly2 = _StubFly()
+    coord2 = Coordinator(
+        cs=cs2, chain_id=chain_id, self_machine_id="coord-x",
+        worker_image="img", fly_module=fly2,
+    )
+    # Any report while paused returns "pause" and does NOT advance.
+    action = coord2.handle_report({"run_id": run_ids[0], "status": "done"})
+    assert action == {"action": "pause"}
+    snap2 = cs2.load_chain(chain_id)
+    assert snap2 is not None
+    assert snap2["status"] == "paused"
+    assert snap2["paused"] == "stale_creds"
+    assert fly2.launched == []
+    cs2.close()
