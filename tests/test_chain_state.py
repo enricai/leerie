@@ -5,9 +5,17 @@ is required and tests are fully isolated.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from chain.state import ChainState, CHAIN_STATUSES, RUN_STATUSES, _valid_wave_state
+from chain.state import (
+    CHAIN_STATUSES,
+    RUN_STATUSES,
+    RUN_TERMINAL_STATUSES,
+    ChainState,
+    _valid_wave_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +502,282 @@ def test_persistence_across_reopen(tmp_path) -> None:
     assert snap["runs"][0]["status"] == "running"
     assert snap["runs"][0]["machine_id"] == "fly-persisted"
     cs2.close()
+
+
+# ---------------------------------------------------------------------------
+# New schema: queue_json blob
+# ---------------------------------------------------------------------------
+
+def test_create_chain_stores_queue_json() -> None:
+    cs = _make_db()
+    qj = '{"jobs": {"r0": {"deps": []}, "r1": {"deps": ["r0"]}}}'
+    chain_id = cs.create_chain("repo", [("T", "0")], queue_json=qj)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["queue_json"] == qj
+    cs.close()
+
+
+def test_create_chain_default_queue_json_is_empty_object() -> None:
+    cs = _make_db()
+    chain_id = cs.create_chain("repo", [("T", "0")])
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["queue_json"] == "{}"
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# New schema: exit_code, branch, and timestamps on transition_run
+# ---------------------------------------------------------------------------
+
+def test_transition_run_records_exit_code_and_branch() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(
+        run_ids[0],
+        "done",
+        exit_code=0,
+        branch="leerie/runs/abc123",
+    )
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    run = snap["runs"][0]
+    assert run["status"] == "done"
+    assert run["exit_code"] == 0
+    assert run["branch"] == "leerie/runs/abc123"
+    cs.close()
+
+
+def test_transition_run_running_sets_started_at() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["started_at"] is None
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["started_at"] is not None
+    cs.close()
+
+
+def test_transition_run_terminal_sets_finished_at() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(run_ids[0], "done", exit_code=0)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["finished_at"] is not None
+    cs.close()
+
+
+def test_transition_run_failed_records_exit_code() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(run_ids[0], "failed", exit_code=1)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["exit_code"] == 1
+    cs.close()
+
+
+def test_started_at_idempotent_across_re_runs() -> None:
+    """Calling transition_run('running') twice keeps the first started_at."""
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    first_started = snap["runs"][0]["started_at"]
+    assert first_started is not None
+    # Pause briefly so any new timestamp would clearly differ.
+    time.sleep(0.01)
+    cs.transition_run(run_ids[0], "running")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["started_at"] == first_started
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# New schema: stale_creds and merge_failed statuses
+# ---------------------------------------------------------------------------
+
+def test_stale_creds_status_accepted() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(run_ids[0], "stale_creds", exit_code=2)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["status"] == "stale_creds"
+    cs.close()
+
+
+def test_merge_failed_status_accepted() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(run_ids[0], "merge_failed")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["status"] == "merge_failed"
+    cs.close()
+
+
+def test_stale_creds_is_terminal() -> None:
+    """stale_creds counts as a terminal status (sets finished_at)."""
+    assert "stale_creds" in RUN_TERMINAL_STATUSES
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running", machine_id="m-1")
+    cs.transition_run(run_ids[0], "stale_creds")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["finished_at"] is not None
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# Heartbeats
+# ---------------------------------------------------------------------------
+
+def test_record_heartbeat_sets_timestamp() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running")
+    cs.record_heartbeat(run_ids[0])
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["last_heartbeat_at"] is not None
+    cs.close()
+
+
+def test_record_heartbeat_missing_run_raises() -> None:
+    cs = _make_db()
+    with pytest.raises(KeyError):
+        cs.record_heartbeat("nonexistent-run")
+    cs.close()
+
+
+def test_record_heartbeat_advances_timestamp() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.record_heartbeat(run_ids[0])
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    first_hb = snap["runs"][0]["last_heartbeat_at"]
+    time.sleep(0.01)
+    cs.record_heartbeat(run_ids[0])
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["runs"][0]["last_heartbeat_at"] != first_hb
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# Stale-running-runs detection
+# ---------------------------------------------------------------------------
+
+def test_stale_running_runs_empty_when_no_runs() -> None:
+    cs = _make_db()
+    chain_id, _ = _simple_chain(cs)
+    assert cs.stale_running_runs(chain_id, 60) == []
+    cs.close()
+
+
+def test_stale_running_runs_excludes_non_running() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    # No running runs at all; both are 'queued'.
+    assert cs.stale_running_runs(chain_id, 0) == []
+    cs.close()
+
+
+def test_stale_running_runs_detects_stale() -> None:
+    """A run whose heartbeat is older than the threshold appears as stale."""
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running")
+    cs.record_heartbeat(run_ids[0])
+    # Threshold of 0s: every running run with any heartbeat already
+    # "older than 0 seconds" qualifies, after a brief sleep.
+    time.sleep(0.05)
+    stale = cs.stale_running_runs(chain_id, 0)
+    assert len(stale) == 1
+    assert stale[0]["id"] == run_ids[0]
+    cs.close()
+
+
+def test_stale_running_runs_fresh_heartbeat_not_stale() -> None:
+    """A run whose heartbeat is very recent is NOT stale."""
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    cs.transition_run(run_ids[0], "running")
+    cs.record_heartbeat(run_ids[0])
+    # 60-second threshold; heartbeat just happened.
+    assert cs.stale_running_runs(chain_id, 60) == []
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# Chain-level paused reason
+# ---------------------------------------------------------------------------
+
+def test_transition_chain_paused_records_reason() -> None:
+    cs = _make_db()
+    chain_id, _ = _simple_chain(cs)
+    cs.transition_chain(chain_id, "paused", paused="stale_creds")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["status"] == "paused"
+    assert snap["paused"] == "stale_creds"
+    cs.close()
+
+
+def test_transition_chain_running_clears_paused() -> None:
+    cs = _make_db()
+    chain_id, _ = _simple_chain(cs)
+    cs.transition_chain(chain_id, "paused", paused="stale_creds")
+    cs.transition_chain(chain_id, "running")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["status"] == "running"
+    assert snap["paused"] is None
+    cs.close()
+
+
+def test_transition_chain_terminal_sets_completed_at() -> None:
+    cs = _make_db()
+    chain_id, _ = _simple_chain(cs)
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["completed_at"] is None
+    cs.transition_chain(chain_id, "done")
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["completed_at"] is not None
+    cs.close()
+
+
+# ---------------------------------------------------------------------------
+# get_run
+# ---------------------------------------------------------------------------
+
+def test_get_run_returns_row() -> None:
+    cs = _make_db()
+    chain_id, run_ids = _simple_chain(cs)
+    row = cs.get_run(run_ids[0])
+    assert row is not None
+    assert row["id"] == run_ids[0]
+    cs.close()
+
+
+def test_get_run_missing_returns_none() -> None:
+    cs = _make_db()
+    assert cs.get_run("nonexistent") is None
+    cs.close()
