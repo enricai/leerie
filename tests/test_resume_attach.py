@@ -417,12 +417,28 @@ def test_launcher_strips_submode_flags_from_rewritten_args():
     )
 
 
-def test_attach_case_arm_removed():
-    """The old --attach) case-arm must be gone. The launcher's default
-    unknown-flag error takes over for muscle-memory invocations."""
+def test_attach_case_arm_is_id_dispatched():
+    """The --attach case-arm exists and dispatches by ID type.
+
+    Previously (pre-chain-coordinator refactor) --attach was an
+    out-of-band launcher verb that just SSH'd into a Fly machine. That
+    one was removed. The chain-coordinator refactor reintroduced
+    --attach as an ID-dispatched verb: UUID → coordinator /state poll;
+    non-UUID → not-yet-implemented for run-mode (the existing
+    --resume reattaches single runs).
+
+    This test pins the new behavior so a future regression doesn't
+    silently bring back the old attach.sh-driven SSH path.
+    """
     launcher = LEERIE.read_text()
-    assert "--attach)" not in launcher, (
-        "--attach) case-arm still present in launcher."
+    assert "--attach)" in launcher, (
+        "--attach) case-arm missing from launcher (expected the new "
+        "ID-dispatched chain attach verb)"
+    )
+    assert "ID-dispatched attach verb" in launcher, (
+        "--attach case-arm exists but is not the new chain-mode "
+        "implementation — check whether the old SSH-style attach has "
+        "been reintroduced."
     )
 
 
