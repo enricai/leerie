@@ -1,29 +1,34 @@
-# chain/Dockerfile — leerie-chain orchestrator app image.
+# chain/Dockerfile — per-chain ephemeral coordinator image.
 #
-# Intentionally leaner than the repo-root Dockerfile: this image runs
-# chain/server.py (the persistent HTTP API), which only needs git, gh,
-# flyctl, and stdlib Python3 to clone repos, open PRs, and launch
-# worker Fly Machines. It does NOT run `claude -p` worker tasks, so
-# mise, claude-code, build-essential, and the /inspect/ cache mounts
-# are all omitted.
+# Each `leerie --chain` submission launches one of these as a tiny Fly
+# Machine (shared-cpu-1x, 256MB, persistent 1GB volume at /data).
+# It runs chain.coordinator — a stdlib HTTP server that holds the chain's
+# SQLite state and decides wave advancement. Workers POST /report,
+# /heartbeat, /pause, /unpause to this machine over Fly's private 6PN
+# network (no public exposure, no authentication).
 #
-# Build:  docker build -f chain/Dockerfile -t leerie-chain:dev .
-#   (from the repo root so the COPY instructions below resolve)
-# Or from the chain/ subdirectory:
-#   docker build -f Dockerfile -t leerie-chain:dev ..
+# When the chain reaches a terminal state (done / failed / cancelled),
+# the coordinator pushes an audit artifact to the target repo and POSTs
+# its own destroy via the Fly Machines API. There is no `fly.toml` —
+# the launcher (leerie --chain) constructs the machine spec inline.
+#
+# Build:  docker build -f chain/Dockerfile -t leerie-coordinator:dev .
+#         (from the repo root so the COPY instructions below resolve)
 
 FROM debian:13-slim
 
-# Base tools: git + openssh for clone/branch/push ops, python3 for the
-# HTTP server, ca-certificates + curl for HTTPS and package-list fetches.
+# Base tools:
+#   - git for clone + push of worker branches and the audit artifact
+#   - gh CLI for opening PRs (target-repo push creds + PAT come in via env)
+#   - python3 for the coordinator HTTP server
+#   - ca-certificates + curl for HTTPS and installing gh below
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git openssh-client \
+      ca-certificates curl git \
       python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# GitHub CLI — chain/git_ops.py calls `gh pr create` to open PRs after
-# integrating Wave A/B branches. Installed from the official Debian apt
-# repo to stay on a current release without pinning a URL.
+# GitHub CLI — chain/git_ops.py shells out to `gh pr create` to open PRs
+# for each completed worker's branch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
     && mkdir -p /etc/apt/keyrings \
@@ -34,12 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
-
-# flyctl — used by chain/fly_client.py to launch and stop Fly Machines
-# for each leerie run. Installed from Fly's official install script.
-RUN curl -fsSL https://fly.io/install.sh | sh \
-    && mv /root/.fly/bin/flyctl /usr/local/bin/flyctl \
-    && rm -rf /root/.fly
 
 # Relax git's safe.directory check so `git -C <clone-dir> ...` ops in
 # git_ops.py work regardless of UID/GID mismatches inside the container.
@@ -54,18 +53,34 @@ RUN if ! getent group "${HOST_GID}" >/dev/null 2>&1; then \
     useradd -u "${HOST_UID}" -g "${HOST_GID}" -m -s /bin/bash leerie
 
 # Persistent volume mount point for the SQLite chain state DB.
-# The fly.toml [mounts] section attaches a Fly volume here at runtime.
+# The launcher (leerie --chain) attaches a Fly volume here at machine
+# creation time.
 RUN mkdir -p /data && chown leerie:"${HOST_GID}" /data
 
-# Bake the chain package and its dependencies into the image.
-# The server is started as `python3 -m chain.server` from /app, so the
-# package must be importable from there.
+# Bake the chain package into the image. The coordinator is started as
+# `python3 -m chain` from /app, so the package must be importable from there.
 COPY chain/ /app/chain/
 RUN chown -R leerie:"${HOST_GID}" /app
 
 WORKDIR /app
 USER leerie
 
-# chain.__main__ is the entry point: reads env vars for port/host,
-# initialises ChainState at /data/chain.db, then serves forever.
+# Runtime env (set by the launcher when creating the machine):
+#   LEERIE_CHAIN_ID       — chain row this coordinator owns (required)
+#   FLY_MACHINE_ID        — coordinator's own machine id, used for self-destruct
+#                           (set automatically by Fly; required)
+#   LEERIE_IMAGE          — worker image to launch for next-wave workers
+#   FLY_APP_NAME          — Fly app name (defaults to "leerie")
+#   FLY_API_TOKEN         — Fly Machines API token for launching/destroying
+#   GH_DISPATCH_PAT       — GitHub PAT for push + PR + audit-artifact commits
+#   LEERIE_REGION         — default 'iad'
+#   LEERIE_DB_PATH        — default '/data/chain.db'
+#   LEERIE_HEARTBEAT_STALENESS_S — default 900 (15 min)
+#   LEERIE_ABANDON_TIMEOUT_S     — default 1800 (30 min)
+#   LEERIE_WORKER_ENV_JSON       — base env merged into every worker's env
+#                                  (Claude OAuth creds, etc.)
+#
+# chain.__main__ delegates to chain.coordinator.main, which reads all of
+# the above and either initialises a fresh chain.db (first boot) or
+# resumes from the persistent volume (after a Fly restart).
 CMD ["python3", "-m", "chain"]
