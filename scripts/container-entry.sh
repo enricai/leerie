@@ -70,6 +70,61 @@ if getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
 fi
 
+# Chain-mode path: a chain worker is launched by the per-chain coordinator
+# via the Fly Machines API (chain/fly_client.py::launch_machine) which
+# POSTs a bare {image, env, guest} spec — no init.cmd, no init.exec, no
+# argv. We detect this by LEERIE_CHAIN_ID being set in env and run the
+# orchestrator inline as PID 1 rather than idling. (Non-chain Fly runs
+# fall through to the `sleep infinity` branch and the launcher's
+# `flyctl ssh console -C "python3 -"` wrapper invokes the orchestrator
+# out-of-band; see leerie launcher around lines 2541-2611.)
+#
+# Before exec'ing the orchestrator we background-start the
+# leerie-chain-heartbeat.sh loop and trap EXIT to clean it up. The
+# heartbeat POSTs /heartbeat to the coordinator every
+# LEERIE_CHAIN_HEARTBEAT_INTERVAL_S seconds (default 60); without it
+# the coordinator's watchdog would mark this worker presumed-failed
+# after 15 minutes.
+#
+# Required env (set by the coordinator at launch_machine time):
+#   LEERIE_CHAIN_ID, LEERIE_RUN_ID, LEERIE_COORDINATOR_HOST, LEERIE_TASK
+if [ -n "${LEERIE_CHAIN_ID:-}" ] && [ "$#" -eq 0 ]; then
+  if [ -z "${LEERIE_TASK:-}" ]; then
+    echo "container-entry: chain-mode requires LEERIE_TASK to be set" >&2
+    exit 64
+  fi
+  if [ -z "${LEERIE_RUN_ID:-}" ]; then
+    echo "container-entry: chain-mode requires LEERIE_RUN_ID to be set" >&2
+    exit 64
+  fi
+  # Background-start the heartbeat as the leerie user (matches
+  # orchestrator's identity so /proc inspection is consistent). The
+  # script tolerates LEERIE_COORDINATOR_HOST being absent (exits cleanly).
+  runuser -u leerie -- \
+    env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+        LEERIE_CHAIN_ID="$LEERIE_CHAIN_ID" \
+        LEERIE_RUN_ID="$LEERIE_RUN_ID" \
+        LEERIE_COORDINATOR_HOST="${LEERIE_COORDINATOR_HOST:-}" \
+        LEERIE_CHAIN_HEARTBEAT_INTERVAL_S="${LEERIE_CHAIN_HEARTBEAT_INTERVAL_S:-60}" \
+    /bin/bash /opt/leerie-image/scripts/leerie-chain-heartbeat.sh &
+  _heartbeat_pid=$!
+  # Reap the heartbeat on any orchestrator exit path — clean exit,
+  # signal, or crash — so the worker doesn't linger as a zombie waiting
+  # on a dead background process when the Fly machine teardown trap
+  # runs.
+  trap 'kill "${_heartbeat_pid}" 2>/dev/null || true' EXIT INT TERM
+
+  # Forward the chain run-id as --run-id so the orchestrator writes its
+  # state dir under the chain-assigned UUID (so the coordinator can
+  # correlate branch names like leerie/runs/<run-id> back to the
+  # chain_runs row). The task is the positional final arg.
+  exec runuser -u leerie -- \
+    env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+    python3 /opt/leerie-image/orchestrator/leerie.py \
+      --run-id "$LEERIE_RUN_ID" \
+      "$LEERIE_TASK"
+fi
+
 # Fly path: idle as PID 1 so the machine stays up. The orchestrator is
 # invoked out-of-band by the launcher's `flyctl ssh console -C
 # "python3 -"` wrapper, which itself runs as root (ssh-console always

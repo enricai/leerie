@@ -781,3 +781,93 @@ def test_get_run_missing_returns_none() -> None:
     cs = _make_db()
     assert cs.get_run("nonexistent") is None
     cs.close()
+
+
+# ---------------------------------------------------------------------------
+# create_chain_with_id
+# (used by chain.coordinator's first-boot bootstrap to honor the
+# launcher-minted chain UUID rather than minting a new one)
+# ---------------------------------------------------------------------------
+
+def test_create_chain_with_id_round_trips_caller_id() -> None:
+    """load_chain returns the same id the caller passed in."""
+    cs = _make_db()
+    explicit_id = "abcdef01-2345-4789-89ab-0123456789ab"
+    returned = cs.create_chain_with_id(
+        chain_id=explicit_id,
+        target="repo",
+        run_prompts=[("Run A", "0")],
+    )
+    assert returned == explicit_id
+    snap = cs.load_chain(explicit_id)
+    assert snap is not None
+    assert snap["id"] == explicit_id
+    cs.close()
+
+
+def test_create_chain_with_id_duplicate_raises_integrity_error() -> None:
+    """Two inserts with the same chain_id raise sqlite3.IntegrityError.
+
+    Important because the coordinator's bootstrap path runs once per Fly
+    boot — a duplicate call (e.g. coordinator restarted mid-bootstrap
+    after committing the chain row) must be caught explicitly rather
+    than silently double-inserting.
+    """
+    import sqlite3
+    cs = _make_db()
+    chain_id = "11111111-1111-4111-8111-111111111111"
+    cs.create_chain_with_id(chain_id=chain_id, target="r", run_prompts=[("T", "0")])
+    with pytest.raises(sqlite3.IntegrityError):
+        cs.create_chain_with_id(
+            chain_id=chain_id, target="r2", run_prompts=[("T2", "0")]
+        )
+    cs.close()
+
+
+def test_create_chain_with_id_invalid_wave_raises_value_error() -> None:
+    """Same wave validation as create_chain — caller-supplied id doesn't
+    bypass the integrity check."""
+    cs = _make_db()
+    with pytest.raises(ValueError, match="non-negative integer"):
+        cs.create_chain_with_id(
+            chain_id="22222222-2222-4222-8222-222222222222",
+            target="r",
+            run_prompts=[("T", "not-an-int")],
+        )
+    cs.close()
+
+
+def test_create_chain_with_id_inserts_all_runs() -> None:
+    """Multi-run insert preserves both the caller's chain_id and every run."""
+    cs = _make_db()
+    chain_id = "33333333-3333-4333-8333-333333333333"
+    cs.create_chain_with_id(
+        chain_id=chain_id,
+        target="repo",
+        run_prompts=[("Wave-0 A", "0"), ("Wave-0 B", "0"), ("Wave-1", "1")],
+        queue_json='{"jobs": {}}',
+    )
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    assert snap["queue_json"] == '{"jobs": {}}'
+    assert len(snap["runs"]) == 3
+    waves = sorted(r["wave"] for r in snap["runs"])
+    assert waves == ["0", "0", "1"]
+
+
+def test_create_chain_delegates_to_create_chain_with_id() -> None:
+    """create_chain(target, run_prompts) is equivalent to
+    create_chain_with_id(<fresh-uuid>, target, run_prompts) — the
+    only difference is who mints the UUID. This pins the contract so
+    a future refactor that diverges the two paths is caught."""
+    cs = _make_db()
+    minted = cs.create_chain("repo", [("Task", "0")])
+    # The returned id must be a UUID (8-4-4-4-12).
+    import re
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        minted,
+    ), f"create_chain returned non-UUID id: {minted!r}"
+    snap = cs.load_chain(minted)
+    assert snap is not None
+    cs.close()
