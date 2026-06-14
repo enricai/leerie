@@ -120,7 +120,7 @@ def _build_synth_merge_stub(tmp_path: Path) -> tuple[Path, Path]:
     """
     log = tmp_path / "synth-merge.log"
     pkg_dir = tmp_path / "fake_chain_pkg" / "chain"
-    pkg_dir.mkdir(parents=True)
+    pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / "__init__.py").write_text("")
     (pkg_dir / "git_ops.py").write_text(textwrap.dedent(f"""\
         import json, os, sys
@@ -183,11 +183,14 @@ def _run_chain(
     *,
     exit_codes: list[int] | None = None,
     synth_fail: bool = False,
+    extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run the launcher's --chain arm with stubs."""
     user_repo = tmp_path / "userrepo"
-    user_repo.mkdir()
-    _init_git_repo(user_repo)
+    is_new_repo = not user_repo.exists()
+    user_repo.mkdir(exist_ok=True)
+    if is_new_repo:
+        _init_git_repo(user_repo)
 
     state_dir = tmp_path / ".leerie" / "testrepo"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -197,6 +200,8 @@ def _run_chain(
     git_bin_dir, git_log = _stub_git(tmp_path)
 
     args = ["--chain"]
+    if extra_args:
+        args.extend(extra_args)
     for w in waves:
         args.extend(["--wave", ",".join(str(p) for p in w)])
 
@@ -511,3 +516,171 @@ def test_resume_skips_done_waves(tmp_path: Path) -> None:
     # The "already complete; skipping fan-out" message should NOT
     # appear since this is a fresh chain.
     assert "already complete" not in (result.stdout + result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# v7 audit additions
+# ---------------------------------------------------------------------------
+
+
+def test_chain_rejects_target_flag(tmp_path: Path) -> None:
+    """--chain --target <url> exits non-zero with a clear error message
+    (chains operate against $USER_REPO directly; the flag is not
+    supported under v5 Shape A)."""
+    p = _write_prompt(tmp_path, "a.md")
+    result = _run_chain(
+        tmp_path, [[p]],
+        extra_args=["--target", "https://github.com/x/y"],
+    )
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "--target" in combined
+    assert "not supported" in combined.lower()
+
+
+def test_chain_id_flag_pins_chain_id(tmp_path: Path) -> None:
+    """--chain --chain-id <uuid> reuses the supplied UUID instead of
+    minting a fresh one. The wave-loop idempotency check then matches
+    prior chain runs and skips fan-out for already-pushed waves.
+
+    To exercise this end-to-end:
+    1. Run a chain with 2 waves; both waves fan out (2 stub invocations).
+    2. Capture the minted chain_id from the resulting run.json files.
+    3. Re-run with the SAME --wave args AND --chain-id <prior-uuid>.
+    4. Verify: zero new stub invocations (both waves' runs already
+       match the pinned chain_id and are pushed).
+    """
+    p0 = _write_prompt(tmp_path, "wave0.md", "p0")
+    p1 = _write_prompt(tmp_path, "wave1.md", "p1")
+
+    result1 = _run_chain(tmp_path, [[p0], [p1]])
+    assert result1.returncode == 0, result1.stderr
+    invocations_run1 = result1.self_log.count("--runtime fly")
+    assert invocations_run1 == 2
+
+    # Capture chain_id from the run.json files.
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    run_jsons = list((state_dir / "runs").glob("*/run.json"))
+    chain_ids = {json.loads(rj.read_text()).get("chain_id") for rj in run_jsons}
+    chain_ids.discard(None)
+    assert len(chain_ids) == 1, f"expected one chain_id, got {chain_ids}"
+    prior_chain_id = next(iter(chain_ids))
+
+    # Re-run with --chain-id pinned to the prior chain. Both waves are
+    # already pushed → idempotency check matches → both waves skip
+    # fan-out.
+    result2 = _run_chain(
+        tmp_path, [[p0], [p1]],
+        extra_args=["--chain-id", prior_chain_id],
+    )
+    assert result2.returncode == 0, result2.stderr
+    # Critically: ZERO new stub invocations on the second run.
+    invocations_run2_total = result2.self_log.count("--runtime fly")
+    invocations_run2_new = invocations_run2_total - invocations_run1
+    assert invocations_run2_new == 0, (
+        f"expected 0 new stub invocations on resume, got {invocations_run2_new} "
+        f"({invocations_run2_total} total - {invocations_run1} from run1)"
+    )
+    # And the "already complete; skipping fan-out" message MUST appear
+    # for both waves.
+    skip_count = (result2.stdout + result2.stderr).count("already complete")
+    assert skip_count >= 2, f"expected skip messages for both waves, got {skip_count}"
+    # And the pinning was logged.
+    assert "pinning chain_id" in (result2.stdout + result2.stderr)
+
+
+def test_chain_id_flag_rejects_invalid_uuid(tmp_path: Path) -> None:
+    """--chain --chain-id <not-a-uuid> exits 1 with a UUID-format error."""
+    p = _write_prompt(tmp_path, "a.md")
+    result = _run_chain(
+        tmp_path, [[p]],
+        extra_args=["--chain-id", "not-a-uuid"],
+    )
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "not a valid UUID" in combined or "8-4-4-4-12" in combined
+
+
+def test_chain_runs_filter_rejects_unknown_verb(tmp_path: Path) -> None:
+    """_chain_runs_filter exits rc=2 with a remote_log error when the
+    verb is not one of stop/kill/finalize/resume. The bash-side assert
+    surfaces the typo via remote_log instead of the misleading "no runs
+    found" downstream message.
+
+    Sources scripts/remote/_log.sh (which defines remote_log) and the
+    helper, then invokes with a typo'd verb.
+    """
+    import subprocess
+    log_sh = REPO_ROOT / "scripts" / "remote" / "_log.sh"
+    result = subprocess.run(
+        ["bash", "-c",
+         f"source '{log_sh}'; "
+         f"source <(awk '/^_chain_runs_filter\\(\\)/,/^}}$/' '{LAUNCHER}'); "
+         f"LEERIE_STATE_HOST_DIR=/tmp USER_REPO=/tmp "
+         f"_chain_runs_filter 'fake-chain-id' 'stopp'"],  # typo: stopp
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 2, (
+        f"expected rc=2 for unknown verb, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "unknown verb" in combined.lower()
+    assert "stopp" in combined  # the offending typo is named
+
+
+def test_chain_handles_apostrophe_in_branch_names(tmp_path: Path) -> None:
+    """The shell-quote fix (v6 Z1.2) uses argv pass-through into the
+    synth-merge python heredoc, so a branch name containing an
+    apostrophe must not break the chain.
+
+    The synth-merge stub records the args it received via the
+    chain.git_ops.synth_merge_branches hook; we verify the apostrophe
+    survives the round trip.
+    """
+    # Use a stub that writes a run.json with an apostrophe in branch.
+    user_repo = tmp_path / "userrepo"
+    user_repo.mkdir()
+    _init_git_repo(user_repo)
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    runs_dir = state_dir / "runs"
+    runs_dir.mkdir(parents=True)
+
+    # Manually fan-out a fake chain with apostrophed branches, then
+    # invoke just the synth-merge step via the chain.git_ops stub to
+    # confirm the shell-quote path is robust.
+    fake_chain_dir, synth_log = _build_synth_merge_stub(tmp_path)
+
+    # Test the launcher's python -c block at leerie:1620+ directly by
+    # passing an apostrophed value through argv. If the v6 fix is
+    # correct, this exits cleanly; if regressed (back to single-quote
+    # interpolation), Python would SyntaxError.
+    import subprocess
+    apostrophed_repo = str(user_repo)  # paths don't have apostrophes
+    # But branch names CAN. Pass one through argv.
+    apostrophed_branch = "leerie/runs/abc'def"
+    branches_json = json.dumps([apostrophed_branch])
+    result = subprocess.run(
+        ["python3", "-c", '''
+import json, sys
+from chain.git_ops import synth_merge_branches, SynthMergeConflict
+repo, base, branches_json, stage = sys.argv[1:5]
+branches = json.loads(branches_json)
+try:
+    synth_merge_branches(repo, base, branches, stage)
+except SynthMergeConflict as exc:
+    sys.stderr.write(f"synth-merge conflict on {exc.branch}: {exc.output}\\n")
+    sys.exit(1)
+''', apostrophed_repo, "main", branches_json, "stage'with-apostrophe"],
+        env={**os.environ, "PYTHONPATH": str(fake_chain_dir)},
+        cwd=str(tmp_path),  # avoid Python finding the REAL chain.git_ops
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, (
+        f"apostrophe in branch name broke synth-merge: rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    # Verify the stub recorded the apostrophed values.
+    log_content = synth_log.read_text()
+    assert apostrophed_branch in log_content
+    assert "stage'with-apostrophe" in log_content

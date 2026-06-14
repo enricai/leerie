@@ -2724,15 +2724,25 @@ tar). The earlier v3/v4 design that placed a coordinator on Fly
 with `GH_DISPATCH_PAT` has been removed in favor of this
 laptop-only model.
 
-Smoke-test scripts at `scripts/smoke/chain-trivial.sh` and
-`scripts/smoke/chain-failure-modes.sh` exercise the full flow
-end-to-end (chain submit → wave 0 → wave 1 → audit artifact
-landed) and the three primary failure modes (worker crash via
-heartbeat staleness, coordinator crash + restart from volume,
-stale-creds resume). They have not yet been run against a real Fly
-account; until that happens, the chain subsystem's behavior is
-mechanically verified (151 unit tests across `tests/test_chain_*`)
-but not observed in production.
+Verification today is purely unit-level: the chain subsystem's
+behavior is mechanically tested across `tests/test_chain_*` (about
+50 tests covering credential transport, git operations, ID-
+dispatched verb routing, and the wave-sequencer wave loop with
+stubs for the per-job `./leerie --runtime fly` invocation, git
+operations, and `chain.git_ops.synth_merge_branches`). Live-deploy
+verification — running an end-to-end chain against real Fly with
+real worker machines — has not been done. Under v7 Shape A there
+are no longer Fly coordinator failure modes (heartbeat staleness,
+coordinator-volume restart, stale-creds resume) to test; the
+relevant failure modes are now those of the underlying single-run
+`--runtime fly` path applied N times per wave (which the existing
+single-run tests + production usage already cover) plus two
+chain-specific ones: a wave-job failure (handled by the wave loop's
+`wait`-rc detection + paused-on-failure semantics inherited from
+`decide_teardown`) and a synth-merge conflict at a wave boundary
+(handled by `chain.git_ops.SynthMergeConflict` + the wave-loop
+chain-paused exit). Both chain-specific paths are unit-tested with
+stubs; neither has been observed in production.
 
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.

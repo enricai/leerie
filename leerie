@@ -181,6 +181,18 @@ PY
 #   resume   — paused runs (paused_at set, not killed).
 _chain_runs_filter() {
   local chain_id="$1" verb="$2"
+  # Bash-side verb assert (defense in depth — the Python heredoc
+  # below also rejects unknown verbs via sys.exit(2), but that error
+  # is invisible to the bash subshell-assignment pattern callers
+  # use; this assert surfaces typos via remote_log instead of the
+  # misleading "no runs found" downstream).
+  case "$verb" in
+    stop|kill|finalize|resume) ;;
+    *)
+      remote_log "_chain_runs_filter: unknown verb '$verb' (expected one of: stop kill finalize resume)"
+      return 2
+      ;;
+  esac
   python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$verb" <<'PY'
 import json, sys
 from pathlib import Path
@@ -1421,10 +1433,17 @@ PY
     # the user's ~/.git-credentials for push, etc.) which are unchanged.
     shift
     _ch_waves=()
+    _ch_id_override=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --wave) _ch_waves+=("${2:-}"); shift 2 ;;
         --wave=*) _ch_waves+=("${1#--wave=}"); shift ;;
+        # --chain-id <uuid>: pin chain_id to a prior chain's UUID so
+        # the wave-loop idempotency check can skip already-pushed
+        # waves (cross-submission resume). When absent, the chain_id
+        # is freshly minted below.
+        --chain-id) _ch_id_override="${2:-}"; shift 2 ;;
+        --chain-id=*) _ch_id_override="${1#--chain-id=}"; shift ;;
         # --target is not supported under v5 Shape A. The wave loop
         # always operates against $USER_REPO directly (the laptop's
         # cwd). cd into the target repo and re-run.
@@ -1445,7 +1464,17 @@ PY
     # Sanity-check every prompt file before fan-out so we fail fast on
     # typos instead of mid-chain. Also collect the prompt contents into
     # arrays so the wave loop below can pass them to each ./leerie child.
-    _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    if [ -n "$_ch_id_override" ]; then
+      # Validate UUID format (8-4-4-4-12 hex) before trusting it.
+      if ! echo "$_ch_id_override" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        remote_log "--chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        exit 1
+      fi
+      _ch_id="$_ch_id_override"
+      remote_log "--chain: pinning chain_id to $_ch_id (resuming prior chain)"
+    else
+      _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    fi
     _ch_jobs_per_wave=()   # one entry per wave: "n_jobs"
     _ch_prompts=()         # flat list of prompts (length = total jobs)
     _ch_prompt_files=()    # flat list of prompt file paths (same length)
@@ -1530,6 +1559,13 @@ PY
     for _wave_idx in "${!_ch_waves[@]}"; do
       _n="${_ch_jobs_per_wave[$_wave_idx]}"
 
+      # Reset wave-scoped pid arrays at the top of each iteration so
+      # the trap handler (_ch_kill_wave) never sees stale entries
+      # from a prior wave — regardless of whether this wave fans out
+      # or skips via the idempotency check below.
+      _ch_wave_pids=()
+      _ch_wave_child_pids=()
+
       if _wave_already_done "$_ch_id" "$_wave_idx" "$_n"; then
         remote_log "wave $_wave_idx: already complete ($_n runs pushed); skipping fan-out"
       else
@@ -1545,8 +1581,6 @@ PY
         # wave. remote/<pid>.json is written by provision.sh post-
         # provision; the pid is the per-job ./leerie's own $$,
         # captured here via $! of the bash background process.
-        _ch_wave_pids=()
-        _ch_wave_child_pids=()
         for _k in $(seq 0 $((_n - 1))); do
           _prompt="${_ch_prompts[$((_ch_offset + _k))]}"
           # Background-launch single-run leerie. Each child runs its
@@ -1584,12 +1618,13 @@ PY
         if [ "$_ch_failed" -gt 0 ]; then
           remote_log "wave $_wave_idx: $_ch_failed/$_n job(s) failed; chain paused"
           echo ""
-          echo "Some wave-$_wave_idx jobs paused on failure. Recover with:"
-          echo "    leerie --resume $_ch_id"
-          echo "After paused runs complete, the chain state is recoverable"
-          echo "via single-run verbs; re-running 'leerie --chain --wave ...'"
-          echo "mints a new chain_id and starts from wave 0 (intentional —"
-          echo "cross-submission resume is not supported in MVP)."
+          echo "Some wave-$_wave_idx jobs paused on failure. To recover:"
+          echo "  1. Resume paused runs in this chain:"
+          echo "       leerie --resume $_ch_id"
+          echo "  2. After every paused run is pushed, re-submit the chain"
+          echo "     with --chain-id pinning to this chain so the wave loop"
+          echo "     skips the already-pushed waves and continues:"
+          echo "       leerie --chain --chain-id $_ch_id --wave ..."
           exit 1
         fi
       fi
@@ -1637,8 +1672,10 @@ except SynthMergeConflict as exc:
           echo "  2. Resolve the conflict (the workspace is on a half-merged"
           echo "     staging branch named leerie/stage/${_ch_id}-wave-$((_wave_idx + 1)))."
           echo "  3. git commit + git push origin leerie/stage/${_ch_id}-wave-$((_wave_idx + 1))"
-          echo "  4. Submit a fresh chain for wave-$((_wave_idx + 1))+ work,"
-          echo "     or open the wave-$((_wave_idx + 1))+ PRs manually."
+          echo "  4. Re-submit the chain pinning the same chain_id so the"
+          echo "     wave loop skips the now-pushed wave-$_wave_idx and resumes"
+          echo "     at wave-$((_wave_idx + 1)):"
+          echo "       leerie --chain --chain-id $_ch_id --wave ..."
           exit 1
         fi
         # Push the staged base branch to origin so subsequent wave's

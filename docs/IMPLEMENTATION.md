@@ -1785,12 +1785,12 @@ matching `chain_id`.
 
 | Verb | Behavior |
 |------|----------|
-| `leerie --chain --wave <files> [--wave <files>] ...` (alias: `--chain-submit`) | Wave-sequencer loop. For each wave N: checks out `current_base` in `$USER_REPO`, fans out N background `./leerie "$prompt" --runtime fly --chain-id <id>` per prompt file, waits for all to finalize on the laptop (existing single-run path: `provision_machine` → `seed-auth.sh` → `seed-repo.sh` → orchestrator → `decide_teardown` trap → `fetch_branch` → `host_finalize` → `destroy_machine`), tags each finalized `run.json` with `chain_id` + `wave_idx` via `update_run_json`, then synth-merges all wave-N branches into `leerie/stage/<chain-id>-wave-<N+1>` via `chain.git_ops.synth_merge_branches` and pushes the stage branch to origin. Advances `current_base` to the stage branch and repeats. Trap handler `_ch_kill_wave` propagates SIGINT/SIGTERM to all in-flight wave children. |
+| `leerie --chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` (alias: `--chain-submit`) | Wave-sequencer loop. Mints a fresh `chain_id` (UUID) unless `--chain-id <prior-uuid>` is supplied (in which case the prior chain's `chain_id` is reused so the wave-loop idempotency check skips already-pushed waves — see "Chain helpers" subsection below). For each wave N: if every wave-N run is already pushed (`_wave_already_done`), skip fan-out; else checks out `current_base` in `$USER_REPO` and fans out N background `./leerie "$prompt" --runtime fly --chain-id <id>` per prompt file, waits for all to finalize on the laptop (existing single-run path: `provision_machine` → `seed-auth.sh` → `seed-repo.sh` → orchestrator → `decide_teardown` trap → `fetch_branch` → `host_finalize` → `destroy_machine`), tags each finalized `run.json` with `chain_id` + `wave_idx` via `update_run_json`. Either way, gathers wave-N branches via `_wave_branches`, synth-merges into `leerie/stage/<chain-id>-wave-<N+1>` via `chain.git_ops.synth_merge_branches`, pushes the stage branch to origin, advances `current_base`. Trap handler `_ch_kill_wave` propagates SIGINT/SIGTERM to all in-flight wave children. |
 | `leerie --status <chain-id>` (alias: `--chain-status`) | Iterates run.json files, filters by `chain_id`, renders one row per matched run (wave, run_id, status, branch, notes). Status derived from run.json fields (`pushed_at` / `paused_at` / `killed_at` / `finished_at`). |
 | `leerie --attach <chain-id>` (alias: `--chain-attach`) | Polls run.json files every 5s; exits 0 when every chain run is in a terminal state (`pushed_at` / `paused_at` / `killed_at` / `sync_failed_at`). |
 | `leerie --kill <chain-id>` (alias: `--chain-kill`) | Enumerates run.json files with matching `chain_id` whose machines aren't already destroyed (`killed_at` is null), invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
 | `leerie --stop <chain-id>` | Enumerates runs that are actively running (have `fly_machine_id`, no terminal state), invokes `leerie --stop <run-id>` per discovered run. |
-| `leerie --resume <chain-id>` | Enumerates paused runs (`paused_at` set, not `killed_at`), invokes `leerie --resume <run-id>` per discovered run. After paused runs resume, the user re-invokes `leerie --chain --wave ...` to continue the wave loop from where it stopped. |
+| `leerie --resume <chain-id>` | Enumerates paused runs (`paused_at` set, not `killed_at`), invokes `leerie --resume <run-id>` per discovered run. After paused runs complete, the user re-invokes `leerie --chain --chain-id <chain-id> --wave ...` to continue the wave loop from where it stopped — the `--chain-id` pin makes the wave-loop idempotency check skip the already-pushed wave(s) and resume at the first incomplete wave. |
 | `leerie --finalize <chain-id>` | Enumerates runs that haven't been pushed yet (`pushed_at` null, not `killed_at`), invokes `leerie --finalize <run-id>` per discovered run. |
 | `leerie --list --chains` (alias: `--list-chains`) | Iterates run.json files, groups by `chain_id`, renders one row per chain (chain_id, status, pushed/total, wave count, started_at). |
 
@@ -1849,6 +1849,42 @@ All chain-scoped verbs operate by iterating
 `for run_json in "$LEERIE_STATE_HOST_DIR"/runs/*/run.json` glob
 (established in `leerie:3330-3347` for auto-finalize) is the shared
 discovery pattern.
+
+#### Chain helpers (launcher bash)
+
+Three private launcher helpers near `_json_get` implement the
+discovery + idempotency primitives the wave loop and chain-scoped
+verbs build on. Each runs a self-contained `python3 - … <<'PY'`
+heredoc against `$LEERIE_STATE_HOST_DIR`; none access global bash
+state besides `$LEERIE_STATE_HOST_DIR`. Args come through positional
+parameters (no env interpolation into Python source).
+
+| Helper | Args | Contract |
+|--------|------|----------|
+| `_wave_already_done <chain_id> <wave_idx> <n_expected>` | UUID, integer, integer | Exits 0 iff `n_expected` runs are tagged with `chain_id` + `wave_idx` AND every matching run has `pushed_at` set. Used by the `--chain` wave loop to skip fan-out on a resume submission. |
+| `_wave_branches <chain_id> <wave_idx>` | UUID, integer | Emits one branch-name per line for every matching run. Used by the wave loop to gather wave-N branches for synth-merge (works for both the just-fanned path and the resume path). |
+| `_chain_runs_filter <chain_id> <verb>` | UUID, one of `stop`/`kill`/`finalize`/`resume` | Emits matching run-ids one per line. The `verb` parameter selects a hardcoded filter inside the heredoc (`stop`: machine running; `kill`: not yet destroyed; `finalize`: not yet pushed; `resume`: paused). Used by the chain-scoped verb arms (`--stop`/`--kill`/`--finalize`/`--resume`) to enumerate runs for per-run dispatch. Returns rc=2 + `remote_log` error on unknown verb (bash-side assert; Python heredoc has its own `sys.exit(2)` backstop). |
+
+The wave loop's tag-write step (`update_run_json … chain_id "$_ch_id"
+wave_idx "$_wave_idx"`) fires BEFORE the failure-pause check so
+runs that paused on failure still get tagged and are therefore
+discoverable by `leerie --resume <chain-id>` / `--kill <chain-id>` /
+etc. The `_ch_wave_pids` / `_ch_wave_child_pids` arrays reset at
+the top of every wave iteration (above the `_wave_already_done`
+check) so the SIGINT trap handler never sees stale entries from a
+prior wave.
+
+##### Resuming a chain via `--chain --chain-id <uuid>`
+
+`leerie --chain --chain-id <prior-uuid> --wave …` pins the chain_id
+to a prior chain's UUID instead of minting fresh. The wave loop's
+`_wave_already_done` check then matches the prior chain's runs and
+skips fan-out for already-pushed waves, advancing `current_base`
+through any wave-staging branches already pushed to origin. This is
+the load-bearing recovery path after `leerie --resume <chain-id>`
+unpauses every paused run: the user re-submits with `--chain-id
+<prior-uuid>` and the chain picks up at the first not-yet-done
+wave.
 
 #### Synth-merge between waves
 
