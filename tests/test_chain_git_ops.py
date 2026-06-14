@@ -289,3 +289,291 @@ def test_open_pr_body_piped_via_stdin(
 
     received = stdin_log.read_text()
     assert received == body
+
+
+# ---------------------------------------------------------------------------
+# synth_merge_branches — combine dep branches into stage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def seeded_origin_with_dep_branches(
+    seeded_origin: Path, tmp_path: Path
+) -> tuple[Path, list[str]]:
+    """Seeded origin + two disjoint feature branches pushed to it.
+
+    Returns (origin_path, [branch_names]).
+    """
+    work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(seeded_origin), str(work)],
+        check=True, capture_output=True,
+    )
+    branches = []
+    for i, fname in enumerate(["alpha.txt", "beta.txt"]):
+        branch = f"feat-{i}"
+        subprocess.run(["git", "checkout", "main"], cwd=work, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            cwd=work, check=True, capture_output=True,
+        )
+        (work / fname).write_text(f"content {i}\n")
+        subprocess.run(["git", "add", fname], cwd=work, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+             "commit", "-m", f"add {fname}"],
+            cwd=work, check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.com",
+                 "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@t.com"},
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=work, check=True, capture_output=True,
+        )
+        branches.append(branch)
+    return seeded_origin, branches
+
+
+def test_synth_merge_branches_combines_disjoint_branches(
+    seeded_origin_with_dep_branches: tuple[Path, list[str]], tmp_path: Path
+) -> None:
+    origin, branches = seeded_origin_with_dep_branches
+    clone = tmp_path / "merge-clone"
+    subprocess.run(["git", "clone", str(origin), str(clone)], check=True, capture_output=True)
+
+    stage = git_ops.synth_merge_branches(
+        repo_path=clone,
+        base_branch="main",
+        dep_branches=branches,
+        stage_branch_name="stage-merge-test",
+    )
+    assert stage == "stage-merge-test"
+
+    # Both feature files should now be in tree.
+    assert (clone / "alpha.txt").read_text() == "content 0\n"
+    assert (clone / "beta.txt").read_text() == "content 1\n"
+
+    # And HEAD is on the stage branch.
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=clone, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "stage-merge-test"
+
+
+def test_synth_merge_branches_raises_on_conflict(
+    seeded_origin: Path, tmp_path: Path
+) -> None:
+    """Two branches that both modify the same file → SynthMergeConflict."""
+    work = tmp_path / "conflict-work"
+    subprocess.run(["git", "clone", str(seeded_origin), str(work)], check=True, capture_output=True)
+
+    # Create two branches that both write to README.md → guaranteed conflict.
+    for i, content in enumerate(["A side\n", "B side\n"]):
+        branch = f"conflict-{i}"
+        subprocess.run(["git", "checkout", "main"], cwd=work, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            cwd=work, check=True, capture_output=True,
+        )
+        (work / "README.md").write_text(content)
+        subprocess.run(["git", "add", "README.md"], cwd=work, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+             "commit", "-m", f"conflict-{i}"],
+            cwd=work, check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.com",
+                 "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@t.com"},
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=work, check=True, capture_output=True,
+        )
+
+    clone = tmp_path / "merge-clone"
+    subprocess.run(["git", "clone", str(seeded_origin), str(clone)], check=True, capture_output=True)
+
+    with pytest.raises(git_ops.SynthMergeConflict) as exc_info:
+        git_ops.synth_merge_branches(
+            repo_path=clone,
+            base_branch="main",
+            dep_branches=["conflict-0", "conflict-1"],
+            stage_branch_name="stage-conflict",
+        )
+    # Conflict is reported on the second branch (the first merge succeeds).
+    assert exc_info.value.branch == "conflict-1"
+
+
+def test_synth_merge_branches_force_recreates_stage(
+    seeded_origin_with_dep_branches: tuple[Path, list[str]], tmp_path: Path
+) -> None:
+    """Re-running synth_merge with the same stage name starts fresh (no stale commits)."""
+    origin, branches = seeded_origin_with_dep_branches
+    clone = tmp_path / "force-clone"
+    subprocess.run(["git", "clone", str(origin), str(clone)], check=True, capture_output=True)
+
+    # First run.
+    git_ops.synth_merge_branches(
+        repo_path=clone,
+        base_branch="main",
+        dep_branches=[branches[0]],
+        stage_branch_name="stage-retry",
+    )
+    # Add a junk commit on stage branch.
+    (clone / "junk.txt").write_text("junk\n")
+    subprocess.run(["git", "add", "junk.txt"], cwd=clone, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T",
+         "commit", "-m", "junk"],
+        cwd=clone, check=True, capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.com",
+             "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@t.com"},
+    )
+
+    # Re-run from main — junk commit should be gone, stage branch reset.
+    git_ops.synth_merge_branches(
+        repo_path=clone,
+        base_branch="main",
+        dep_branches=branches,
+        stage_branch_name="stage-retry",
+    )
+    assert not (clone / "junk.txt").exists()
+    assert (clone / "alpha.txt").exists()
+    assert (clone / "beta.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# fetch_branch
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_branch_pulls_remote_branch(
+    seeded_origin_with_dep_branches: tuple[Path, list[str]], tmp_path: Path
+) -> None:
+    origin, branches = seeded_origin_with_dep_branches
+    clone = tmp_path / "fetch-clone"
+    subprocess.run(["git", "clone", str(origin), str(clone)], check=True, capture_output=True)
+    # Before fetch, the remote branch isn't a local ref.
+    rev = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branches[0]}"],
+        cwd=clone, capture_output=True,
+    )
+    assert rev.returncode != 0
+
+    git_ops.fetch_branch(clone, branches[0])
+
+    # After fetch, the branch is a local ref.
+    rev2 = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branches[0]}"],
+        cwd=clone, capture_output=True,
+    )
+    assert rev2.returncode == 0
+
+
+def test_fetch_branch_failure_calls_die(
+    local_clone: Path
+) -> None:
+    """Fetching a non-existent branch → SystemExit."""
+    with pytest.raises(SystemExit):
+        git_ops.fetch_branch(local_clone, "nonexistent-branch")
+
+
+# ---------------------------------------------------------------------------
+# finalize_run — push + open_pr in one call
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_run_pushes_and_opens_pr(
+    seeded_origin: Path, tmp_path: Path, gh_stub: Path
+) -> None:
+    work = tmp_path / "finalize-work"
+    subprocess.run(["git", "clone", str(seeded_origin), str(work)], check=True, capture_output=True)
+    # Make a feature branch with a commit.
+    subprocess.run(
+        ["git", "checkout", "-b", "leerie/runs/abc-001"],
+        cwd=work, check=True, capture_output=True,
+    )
+    (work / "result.txt").write_text("done\n")
+    subprocess.run(["git", "add", "result.txt"], cwd=work, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=T", "commit", "-m", "result"],
+        cwd=work, check=True, capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.com",
+             "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@t.com"},
+    )
+
+    url = git_ops.finalize_run(
+        repo_path=work,
+        head_branch="leerie/runs/abc-001",
+        base_branch="main",
+        pr_title="leerie: run abc-001",
+        pr_body="## Summary\n\nbody body",
+    )
+    assert url.startswith("https://")
+
+    # Confirm the branch landed in the bare origin.
+    out = subprocess.run(
+        ["git", "branch"], cwd=seeded_origin, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "leerie/runs/abc-001" in out
+
+    # Confirm gh was called with the right args.
+    calls = gh_stub.read_text()
+    assert "--head leerie/runs/abc-001" in calls
+    assert "--base main" in calls
+
+
+# ---------------------------------------------------------------------------
+# write_audit_artifact
+# ---------------------------------------------------------------------------
+
+
+def test_write_audit_artifact_commits_chain_json(
+    seeded_origin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit artifact lands at _leerie-chains/<id>/chain.json on main."""
+    # Bypass the PAT-URL rewrite so we can use a file:// origin.
+    monkeypatch.setattr(
+        git_ops, "_pat_url",
+        lambda repo_url, pat: f"file://{seeded_origin}",
+    )
+    monkeypatch.setenv("GH_DISPATCH_PAT", "fake-pat")
+
+    chain_snapshot = {
+        "id": "abc-chain-123",
+        "target": "https://github.com/x/y",
+        "queue_json": '{"jobs": {}}',
+        "wave_state": "done",
+        "status": "done",
+        "paused": None,
+        "created_at": "2026-06-14T00:00:00+00:00",
+        "updated_at": "2026-06-14T00:01:00+00:00",
+        "completed_at": "2026-06-14T00:01:00+00:00",
+        "runs": [
+            {"id": "r0", "status": "done", "wave": "0", "branch": "leerie/runs/r0"},
+        ],
+    }
+    git_ops.write_audit_artifact(chain_snapshot)
+
+    # Now clone the origin somewhere else and verify the artifact is on main.
+    verify = tmp_path / "verify"
+    subprocess.run(
+        ["git", "clone", f"file://{seeded_origin}", str(verify)],
+        check=True, capture_output=True,
+    )
+    artifact = verify / "_leerie-chains" / "abc-chain-123" / "chain.json"
+    assert artifact.exists()
+    text = artifact.read_text()
+    import json
+    parsed = json.loads(text)
+    assert parsed["id"] == "abc-chain-123"
+    assert parsed["status"] == "done"
+    assert parsed["runs"][0]["id"] == "r0"
+
+
+def test_write_audit_artifact_missing_pat_raises() -> None:
+    with pytest.raises(ValueError, match="PAT"):
+        git_ops.write_audit_artifact(
+            {"id": "x", "target": "https://x/y"},
+            pat="",
+        )
