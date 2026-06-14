@@ -116,8 +116,8 @@ _b64_stdin() {
 # Fly machine id. Case-insensitive grep at the call sites; chain code
 # normalizes to lowercase before string comparison against run.json
 # fields (uuid.uuid4() emits lowercase, so the canonical form is
-# lowercase).
-UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# lowercase). Exported so sourced hook scripts can reuse the pattern.
+export UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 # Read a single top-level key from a JSON file. Prints the value
 # (empty string if absent/null/error). Used by --finalize to avoid
@@ -1474,6 +1474,18 @@ PY
     # typos instead of mid-chain. Also collect the prompt contents into
     # arrays so the wave loop below can pass them to each ./leerie child.
     if [ -n "$_ch_id_override" ]; then
+      # Strip surrounding whitespace first (copy-paste from terminals
+      # / chat platforms sometimes adds leading or trailing spaces;
+      # the UUID regex anchors at ^...$ so unstripped whitespace
+      # would silently fail validation with a confusing "not a valid
+      # UUID" error pointing at the visibly-correct hex value).
+      _ch_id_stripped="$(echo "$_ch_id_override" | tr -d '[:space:]')"
+      if [ "$_ch_id_stripped" != "$_ch_id_override" ]; then
+        remote_log "--chain: --chain-id value had surrounding whitespace; stripped to '$_ch_id_stripped'"
+        _ch_id_override="$_ch_id_stripped"
+      fi
+      unset _ch_id_stripped
+
       # Validate UUID format (8-4-4-4-12 hex) before trusting it. The
       # regex is case-insensitive (grep -qiE), but `uuid.uuid4()` and
       # therefore run.json's `chain_id` field are always lowercase, and
@@ -1561,7 +1573,7 @@ PY
     echo "  waves:       ${#_ch_waves[@]} (jobs per wave: ${_ch_jobs_per_wave[*]})"
     echo "  base branch: $_ch_current_base"
     echo ""
-    echo "If a wave fails, resume with:"
+    echo "  Recovery (if a wave pauses on failure):"
     echo "    leerie --resume $_ch_id"
     echo "    leerie --chain --chain-id $_ch_id --wave ..."
     echo ""

@@ -839,3 +839,61 @@ def test_synth_merge_skipped_when_stage_branch_exists_on_origin(tmp_path: Path) 
     assert "stage branch" in combined
     assert "already on origin" in combined
     assert "skipping synth-merge" in combined
+
+
+# ---------------------------------------------------------------------------
+# v9 polish additions
+# ---------------------------------------------------------------------------
+
+
+def test_chain_id_strips_surrounding_whitespace(tmp_path: Path) -> None:
+    """v9 polish P3: surrounding whitespace on a `--chain-id` value
+    (copy-paste from terminals or chat platforms sometimes adds
+    leading/trailing spaces) is stripped before UUID format
+    validation. The user sees a `stripped to ...` notice in the log
+    and the chain proceeds as if the value had been clean to begin
+    with.
+
+    Test path:
+    1. Run a 1-wave chain end-to-end; mint a fresh chain_id.
+    2. Capture the chain_id from the resulting run.json.
+    3. Re-run with `--chain-id "  <chain_id>  "` (leading + trailing
+       spaces).
+    4. Verify: rc=0 (validation passed after strip), idempotency
+       fires (0 new fan-outs), and the log mentions the strip.
+    """
+    p = _write_prompt(tmp_path, "wave0.md", "p")
+
+    result1 = _run_chain(tmp_path, [[p]])
+    assert result1.returncode == 0, result1.stderr
+    invocations_run1 = result1.self_log.count("--runtime fly")
+    assert invocations_run1 == 1
+
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    run_jsons = list((state_dir / "runs").glob("*/run.json"))
+    chain_ids = {json.loads(rj.read_text()).get("chain_id") for rj in run_jsons}
+    chain_ids.discard(None)
+    assert len(chain_ids) == 1
+    prior_chain_id = next(iter(chain_ids))
+
+    # Wrap the chain_id in surrounding whitespace. The strip should
+    # clean it up; the regex would otherwise fail against the padded
+    # value.
+    padded = f"  {prior_chain_id}\t"
+    result2 = _run_chain(
+        tmp_path, [[p]],
+        extra_args=["--chain-id", padded],
+    )
+    assert result2.returncode == 0, (
+        f"whitespace-padded --chain-id failed validation:\n"
+        f"stdout: {result2.stdout}\nstderr: {result2.stderr}"
+    )
+    combined = result2.stdout + result2.stderr
+    # The launcher should have logged the whitespace strip.
+    assert "surrounding whitespace" in combined.lower()
+    # And idempotency should have fired (no new fan-outs).
+    invocations_run2_new = result2.self_log.count("--runtime fly") - invocations_run1
+    assert invocations_run2_new == 0, (
+        f"whitespace-padded --chain-id failed idempotency match: "
+        f"{invocations_run2_new} new fan-outs (should be 0)"
+    )
