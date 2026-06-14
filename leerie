@@ -472,9 +472,39 @@ PY
     # Fast-path: explicit pause of a remote run (DESIGN §6 *The user-
     # visible verb surface*). Reads fly_machine_id from the run sidecar
     # and calls stop_machine. Resumable via --resume.
+    #
+    # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
+    # POST /pause to the chain coordinator instead. The coordinator
+    # holds the chain at its current wave_state and stops advancing
+    # until --resume reaches it.
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
+    # Peek at the first positional arg for UUID dispatch.
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _sp_chain="$1"; shift
+      _sp_app="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${FLY_API_TOKEN:-}" ]; then
+        remote_log "--stop: FLY_API_TOKEN must be set to pause a chain"; exit 1
+      fi
+      _coord_mid="$(curl -sS \
+        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+        "https://api.machines.dev/v1/apps/${_sp_app}/machines?metadata.leerie_chain_id=${_sp_chain}&metadata.leerie_role=coordinator" \
+        | python3 -c 'import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list) and data:
+    print(data[0].get("id",""))
+' 2>/dev/null || true)"
+      if [ -z "$_coord_mid" ]; then
+        remote_log "--stop: no live coordinator for chain $_sp_chain"; exit 1
+      fi
+      _coord_host="${_coord_mid}.vm.${_sp_app}.internal:8080"
+      remote_log "--stop: POST /pause to coordinator for chain $_sp_chain"
+      curl -fsSL -X POST -H 'Content-Type: application/json' \
+        -d '{"reason":"user-requested"}' \
+        "http://${_coord_host}/pause"
+      exit $?
+    fi
     _stop_run_id=""
     _stop_runtime=""
     while [ "$#" -gt 0 ]; do
@@ -538,9 +568,49 @@ PY
     # Fast-path: explicit destroy of a remote run's machine (DESIGN §6
     # *The user-visible verb surface*). Confirmation prompt unless --force.
     # NOT resumable afterwards — sets killed_at on the sidecar.
+    #
+    # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
+    # destroy the coordinator AND every worker tagged with that chain_id.
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
+    # Peek for UUID-formatted chain-id as the first positional arg.
+    if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _kc_chain="$1"; shift
+      _kc_app="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${FLY_API_TOKEN:-}" ]; then
+        remote_log "--kill: FLY_API_TOKEN must be set to destroy a chain"; exit 1
+      fi
+      # Find every machine tagged with this chain_id (coordinator + workers).
+      _machines_json="$(curl -sS \
+        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+        "https://api.machines.dev/v1/apps/${_kc_app}/machines?metadata.leerie_chain_id=${_kc_chain}")" || {
+          remote_log "--kill: Fly Machines API list failed"; exit 1
+      }
+      _ids="$(echo "$_machines_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    for m in data:
+        mid = m.get("id","")
+        if mid:
+            print(mid)
+' 2>/dev/null || true)"
+      if [ -z "$_ids" ]; then
+        remote_log "--kill: no machines found for chain $_kc_chain (already destroyed?)"
+        exit 0
+      fi
+      echo "$_ids" | while read -r _mid; do
+        [ -z "$_mid" ] && continue
+        remote_log "--kill: destroying $_mid"
+        curl -sS -X DELETE \
+          -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+          "https://api.machines.dev/v1/apps/${_kc_app}/machines/${_mid}?force=true" \
+          >/dev/null || remote_log "--kill: destroy failed for $_mid (continuing)"
+      done
+      remote_log "--kill: chain $_kc_chain destroyed"
+      exit 0
+    fi
     _kill_run_id=""
     _kill_machine_id=""
     _kill_force=0
@@ -927,6 +997,90 @@ PY
     . "$LEERIE_REPO/scripts/host-finalize.sh"
     host_finalize "$_fetched_run_dir"
     exit $?
+    ;;
+  --status)
+    # NEW: ID-dispatched status verb.
+    # UUID-pattern id (8-4-4-4-12) → query the chain coordinator's /state.
+    # Other ids fall through to the existing --list mechanism (run-level).
+    shift
+    _st_id="${1:-}"
+    if [ -z "$_st_id" ]; then
+      remote_log "--status: <id> is required (chain-id or run-id)"; exit 1
+    fi
+    # Detect UUID format. If yes, query the coordinator for this chain.
+    if echo "$_st_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _st_app="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${FLY_API_TOKEN:-}" ]; then
+        remote_log "--status: FLY_API_TOKEN must be set to query a chain"; exit 1
+      fi
+      _coord_mid="$(curl -sS \
+        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+        "https://api.machines.dev/v1/apps/${_st_app}/machines?metadata.leerie_chain_id=${_st_id}&metadata.leerie_role=coordinator" \
+        | python3 -c 'import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list) and data:
+    print(data[0].get("id",""))
+' 2>/dev/null || true)"
+      if [ -z "$_coord_mid" ]; then
+        remote_log "--status: no live coordinator for chain $_st_id (chain may be complete; check audit at _leerie-chains/$_st_id/chain.json in target repo)"
+        exit 1
+      fi
+      _coord_host="${_coord_mid}.vm.${_st_app}.internal:8080"
+      curl -fsSL "http://${_coord_host}/state"
+      exit $?
+    fi
+    # Fall through: treat as a run-id and re-exec --list with status filter.
+    exec "$0" --list --runs --run-id "$_st_id"
+    ;;
+  --attach)
+    # NEW: ID-dispatched attach verb.
+    # UUID → poll the coordinator's /state.
+    # Other ids → not yet implemented (run attach goes through the
+    # existing tail-orchestrator-log flow, which is handled below).
+    shift
+    _at_id="${1:-}"
+    if [ -z "$_at_id" ]; then
+      remote_log "--attach: <id> is required (chain-id or run-id)"; exit 1
+    fi
+    if echo "$_at_id" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      _at_app="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${FLY_API_TOKEN:-}" ]; then
+        remote_log "--attach: FLY_API_TOKEN must be set to attach to a chain"; exit 1
+      fi
+      # Poll loop: every 5s, dump /state. Stop when chain status is terminal.
+      _coord_mid="$(curl -sS \
+        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+        "https://api.machines.dev/v1/apps/${_at_app}/machines?metadata.leerie_chain_id=${_at_id}&metadata.leerie_role=coordinator" \
+        | python3 -c 'import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list) and data:
+    print(data[0].get("id",""))
+' 2>/dev/null || true)"
+      if [ -z "$_coord_mid" ]; then
+        remote_log "--attach: no live coordinator for chain $_at_id"; exit 1
+      fi
+      _coord_host="${_coord_mid}.vm.${_at_app}.internal:8080"
+      remote_log "--attach: polling http://${_coord_host}/state every 5s (Ctrl-C to detach)"
+      while :; do
+        _state="$(curl -sS "http://${_coord_host}/state" 2>/dev/null || true)"
+        if [ -z "$_state" ]; then
+          remote_log "--attach: coordinator unreachable (likely self-destructed); chain may be complete"
+          exit 0
+        fi
+        echo "$_state"
+        # Check for terminal status and exit if reached.
+        _status="$(echo "$_state" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("status",""))' 2>/dev/null || true)"
+        case "$_status" in
+          done|failed|cancelled)
+            remote_log "--attach: chain reached terminal status: $_status"
+            exit 0
+            ;;
+        esac
+        sleep 5
+      done
+    fi
+    remote_log "--attach: run-id attach not yet implemented for chain mode; use 'leerie --resume $_at_id' to reattach to a single run"
+    exit 1
     ;;
   --chain|--chain-submit)
     # Fast-path: submit a new chain by launching a per-chain ephemeral
