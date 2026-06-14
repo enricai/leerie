@@ -638,6 +638,11 @@ def main() -> None:
     Reads required env vars, opens (or restores) /data/chain.db, constructs
     the Coordinator, starts the watchdog, then serves HTTP forever.
 
+    On first boot (chain row does not yet exist in the DB), self-bootstraps
+    from LEERIE_QUEUE_JSON + LEERIE_TARGET_REPO. On subsequent boots
+    (e.g. after a Fly machine restart), the chain row is already on the
+    volume and main() just attaches to it.
+
     Required env:
       LEERIE_CHAIN_ID    — chain row this coordinator owns.
       FLY_MACHINE_ID     — set by Fly automatically; this is the coordinator's
@@ -645,6 +650,9 @@ def main() -> None:
       LEERIE_IMAGE       — worker image to launch for next-wave workers.
       FLY_APP_NAME       — Fly app (consumed by chain.fly_client).
       FLY_API_TOKEN      — Fly Machines API token (consumed by chain.fly_client).
+    First-boot only (used to bootstrap the chain row):
+      LEERIE_QUEUE_JSON  — base64-encoded JSON: {target, runs: [{prompt, wave}, ...]}.
+                           Set by `leerie --chain` at coordinator launch.
     Optional env:
       LEERIE_REGION                       — default 'iad'.
       LEERIE_DB_PATH                      — default '/data/chain.db'.
@@ -687,6 +695,69 @@ def main() -> None:
             _log("LEERIE_WORKER_ENV_JSON failed to parse; ignoring")
 
     cs = ChainState.init_db(db_path)
+
+    # First-boot bootstrap: if the chain row doesn't exist yet, create it
+    # from LEERIE_QUEUE_JSON. The launcher (`leerie --chain`) sets the
+    # env var to a base64-encoded JSON: {target, runs}. On a Fly restart
+    # the chain row already exists on the persistent volume and this
+    # block is a no-op.
+    existing = cs.load_chain(chain_id)
+    if existing is None:
+        raw_queue_b64 = os.environ.get("LEERIE_QUEUE_JSON", "").strip()
+        if not raw_queue_b64:
+            print(
+                "[coordinator] error: chain not in DB and LEERIE_QUEUE_JSON is empty",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        try:
+            import base64
+            raw = base64.b64decode(raw_queue_b64)
+            queue_spec = json.loads(raw)
+        except Exception as exc:
+            print(
+                f"[coordinator] error: failed to decode LEERIE_QUEUE_JSON: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        target = queue_spec.get("target")
+        runs_spec = queue_spec.get("runs") or []
+        if not target or not isinstance(target, str):
+            print("[coordinator] error: queue spec missing 'target'", file=sys.stderr)
+            sys.exit(2)
+        run_prompts: list[tuple[str, str]] = []
+        for r in runs_spec:
+            prompt = r.get("prompt", "")
+            wave = str(r.get("wave", ""))
+            if not prompt or not wave.isdigit():
+                print(
+                    f"[coordinator] error: queue spec run missing prompt/wave: {r!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            run_prompts.append((prompt, wave))
+        # Re-use the caller-supplied chain_id (the launcher pre-generated
+        # it and baked it into both the coordinator env and the wave-0
+        # worker envs — so we MUST honor it rather than calling
+        # bootstrap_chain which mints a new UUID).
+        from chain.state import _new_id, _now
+        ts = _now()
+        with cs._conn:
+            cs._conn.execute(
+                "INSERT INTO chains"
+                " (id, target, queue_json, wave_state, status, created_at, updated_at)"
+                " VALUES (?, ?, ?, 'wave_0', 'running', ?, ?)",
+                (chain_id, target, json.dumps(queue_spec), ts, ts),
+            )
+            for prompt, wave in run_prompts:
+                cs._conn.execute(
+                    "INSERT INTO chain_runs"
+                    " (id, chain_id, prompt, wave, status, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+                    (_new_id(), chain_id, prompt, wave, ts, ts),
+                )
+        _log(f"first-boot bootstrap complete (chain={chain_id}, runs={len(run_prompts)})")
+
     coord = Coordinator(
         cs=cs,
         chain_id=chain_id,
@@ -697,6 +768,17 @@ def main() -> None:
         abandon_timeout_s=abandon_s,
         worker_env_base=worker_env_base,
     )
+
+    # First-boot: launch wave 0 immediately. On subsequent boots (Fly
+    # restart), wave-0 runs are already in 'running' or terminal state
+    # and the coordinator just picks up where it left off.
+    snap = cs.load_chain(chain_id)
+    if snap is not None and snap["wave_state"] == "wave_0":
+        wave_0 = [r for r in snap["runs"] if r["wave"] == "0"]
+        all_queued = all(r["status"] == "queued" for r in wave_0)
+        if all_queued and wave_0:
+            _log(f"launching wave 0 ({len(wave_0)} runs)")
+            coord._launch_wave(snap, wave_0)
 
     coord.start_watchdog()
     httpd = make_server(coord)

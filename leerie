@@ -928,39 +928,66 @@ PY
     host_finalize "$_fetched_run_dir"
     exit $?
     ;;
-  --chain-submit)
-    # Fast-path: submit a new chain to the leerie-chain HTTP API.
-    # POST /chains with runs (each {prompt, wave}) and target.
+  --chain|--chain-submit)
+    # Fast-path: submit a new chain by launching a per-chain ephemeral
+    # coordinator Fly machine, which then bootstraps the chain state
+    # from LEERIE_QUEUE_JSON and launches wave-0 workers.
+    #
     # Each --wave flag defines one sequential wave; waves execute in
     # the order specified. Each value is a comma-separated list of
     # prompt *file paths*; the launcher reads each file and sends its
     # contents as the prompt. N waves are supported (wave 0, 1, 2, …).
-    # LEERIE_CHAIN_URL sets the base URL (default: http://localhost:8080).
+    #
+    # --chain-submit is a deprecated alias for --chain. Both behave
+    # identically; existing scripts continue to work.
+    #
+    # Required env (set by the user before invocation):
+    #   FLY_API_TOKEN          — for the Fly Machines API.
+    #   GH_DISPATCH_PAT        — for the coordinator's push + PR ops.
+    #   LEERIE_CHAIN_IMAGE     — coordinator image (registry.fly.io/leerie-coordinator:N).
+    #   LEERIE_WORKER_IMAGE    — worker image  (registry.fly.io/leerie:N).
+    # Optional env:
+    #   LEERIE_FLY_APP         — Fly app name (default 'leerie').
+    #   LEERIE_REGION          — Fly region    (default 'iad').
     shift
-    _cs_waves=()
-    _cs_target="${USER_REPO:-$PWD}"
+    _ch_waves=()
+    _ch_target="${USER_REPO:-$PWD}"
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --wave) _cs_waves+=("${2:-}"); shift 2 ;;
-        --wave=*) _cs_waves+=("${1#--wave=}"); shift ;;
-        --target) _cs_target="${2:-}"; shift 2 ;;
-        --target=*) _cs_target="${1#--target=}"; shift ;;
-        --*) remote_log "--chain-submit: unknown flag: $1"; exit 1 ;;
-        *) remote_log "--chain-submit: unexpected argument: $1"; exit 1 ;;
+        --wave) _ch_waves+=("${2:-}"); shift 2 ;;
+        --wave=*) _ch_waves+=("${1#--wave=}"); shift ;;
+        --target) _ch_target="${2:-}"; shift 2 ;;
+        --target=*) _ch_target="${1#--target=}"; shift ;;
+        --*) remote_log "--chain: unknown flag: $1"; exit 1 ;;
+        *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
       esac
     done
-    if [ "${#_cs_waves[@]}" -eq 0 ]; then
-      remote_log "--chain-submit: at least one --wave is required"
-      echo "  Usage: leerie --chain-submit --wave <f1,f2,...> [--wave <f3,...>] [--target <repo>]" >&2
+    if [ "${#_ch_waves[@]}" -eq 0 ]; then
+      remote_log "--chain: at least one --wave is required"
+      echo "  Usage: leerie --chain --wave <f1,f2,...> [--wave <f3,...>] [--target <repo>]" >&2
       exit 1
     fi
-    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
-    # Build the JSON payload. python3 reads each prompt-file path and
-    # emits {prompt, wave} objects. Wave index is assigned by position
-    # of the --wave flag (0, 1, 2, …). A missing file is a hard error.
-    _cs_waves_json="$(printf '%s\n' "${_cs_waves[@]}" | python3 -c '
-import json, sys
+    # Required: FLY_API_TOKEN, GH_DISPATCH_PAT, LEERIE_CHAIN_IMAGE.
+    if [ -z "${FLY_API_TOKEN:-}" ]; then
+      remote_log "--chain: FLY_API_TOKEN must be set in env"; exit 1
+    fi
+    if [ -z "${GH_DISPATCH_PAT:-}" ]; then
+      remote_log "--chain: GH_DISPATCH_PAT must be set (coordinator needs it for push + PR)"; exit 1
+    fi
+    if [ -z "${LEERIE_CHAIN_IMAGE:-}" ]; then
+      remote_log "--chain: LEERIE_CHAIN_IMAGE must be set (e.g. registry.fly.io/leerie-coordinator:N)"; exit 1
+    fi
+    if [ -z "${LEERIE_WORKER_IMAGE:-}" ]; then
+      remote_log "--chain: LEERIE_WORKER_IMAGE must be set (e.g. registry.fly.io/leerie:N)"; exit 1
+    fi
+    _ch_app="${LEERIE_FLY_APP:-leerie}"
+    _ch_region="${LEERIE_REGION:-iad}"
 
+    # Build queue spec JSON: {target, runs: [{prompt, wave}, ...]}.
+    # python3 reads each prompt-file path and emits the structure.
+    _queue_spec="$(printf '%s\n' "${_ch_waves[@]}" | python3 -c '
+import json, sys, os
+target = sys.argv[1]
 runs = []
 for idx, line in enumerate(sys.stdin):
     raw = line.strip()
@@ -972,87 +999,138 @@ for idx, line in enumerate(sys.stdin):
             with open(entry, "r", encoding="utf-8") as fh:
                 text = fh.read().strip()
         except OSError as exc:
-            sys.stderr.write(f"--chain-submit: cannot read prompt file {entry!r}: {exc}\n")
+            sys.stderr.write(f"--chain: cannot read prompt file {entry!r}: {exc}\n")
             sys.exit(1)
         if not text:
-            sys.stderr.write(f"--chain-submit: prompt file {entry!r} is empty\n")
+            sys.stderr.write(f"--chain: prompt file {entry!r} is empty\n")
             sys.exit(1)
         runs.append({"prompt": text, "wave": str(idx)})
 if not runs:
-    sys.stderr.write("--chain-submit: no runs to submit\n")
+    sys.stderr.write("--chain: no runs found in --wave args\n")
     sys.exit(1)
-print(json.dumps(runs))
-')" || exit 1
-    _cs_payload="$(python3 -c '
-import json, sys
-runs = json.loads(sys.argv[1])
-target = sys.argv[2]
-print(json.dumps({"runs": runs, "target": target}))
-' "$_cs_waves_json" "$_cs_target")" || exit 1
-    curl -fsSL -X POST \
+print(json.dumps({"target": target, "runs": runs}))
+' "$_ch_target")" || exit 1
+
+    # Mint a chain_id locally (UUID) so we have an ID to print to the user
+    # immediately, even before the coordinator has finished booting.
+    _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    # Base64-encode the queue spec so it survives env transport intact
+    # (Fly env values are strings; JSON with embedded newlines is fragile).
+    _ch_queue_b64="$(printf '%s' "$_queue_spec" | python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+
+    # Build the coordinator machine create payload. Smallest tier:
+    # shared-cpu-1x, 256MB RAM. 1GB volume at /data for crash recovery.
+    _coord_payload="$(python3 -c '
+import json, os, sys
+chain_id = sys.argv[1]
+queue_b64 = sys.argv[2]
+image = sys.argv[3]
+region = sys.argv[4]
+worker_image = sys.argv[5]
+gh_pat = sys.argv[6]
+fly_token = sys.argv[7]
+app = sys.argv[8]
+spec = {
+    "config": {
+        "image": image,
+        "env": {
+            "LEERIE_CHAIN_ID": chain_id,
+            "LEERIE_QUEUE_JSON": queue_b64,
+            "LEERIE_IMAGE": worker_image,
+            "FLY_APP_NAME": app,
+            "FLY_API_TOKEN": fly_token,
+            "GH_DISPATCH_PAT": gh_pat,
+        },
+        "guest": {
+            "cpu_kind": "shared",
+            "cpus": 1,
+            "memory_mb": 256,
+        },
+        "metadata": {
+            "leerie_chain_id": chain_id,
+            "leerie_role": "coordinator",
+        },
+    },
+    "name": f"chain-{chain_id[:8]}-coord",
+    "region": region,
+}
+print(json.dumps(spec))
+' "$_ch_id" "$_ch_queue_b64" "$LEERIE_CHAIN_IMAGE" "$_ch_region" "$LEERIE_WORKER_IMAGE" "$GH_DISPATCH_PAT" "$FLY_API_TOKEN" "$_ch_app")" || exit 1
+
+    remote_log "--chain: launching coordinator for chain $_ch_id"
+    _coord_resp="$(curl -sS -X POST \
+      -H "Authorization: Bearer ${FLY_API_TOKEN}" \
       -H "Content-Type: application/json" \
-      -d "$_cs_payload" \
-      "$_chain_url/chains"
-    exit $?
+      -d "$_coord_payload" \
+      "https://api.machines.dev/v1/apps/${_ch_app}/machines")" || {
+      remote_log "--chain: Fly Machines API call failed"
+      exit 1
+    }
+    _coord_mid="$(echo "$_coord_resp" | python3 -c 'import json, sys; d=json.load(sys.stdin); print(d.get("id", ""))' 2>/dev/null || true)"
+    if [ -z "$_coord_mid" ]; then
+      remote_log "--chain: failed to parse coordinator machine id from Fly response"
+      echo "$_coord_resp" >&2
+      exit 1
+    fi
+
+    cat <<EOF
+chain submitted:
+  chain_id:   $_ch_id
+  coordinator: $_coord_mid (chain-${_ch_id:0:8}-coord on $_ch_app)
+  waves:       ${#_ch_waves[@]}
+
+The coordinator will boot, self-bootstrap the chain state, and launch
+wave-0 workers within ~30s. Inspect with:
+
+  leerie --status $_ch_id
+  leerie --kill   $_ch_id   # destroy coordinator + workers
+EOF
+    exit 0
     ;;
   --chain-status)
-    # Fast-path: get status of a chain from the leerie-chain HTTP API.
-    # GET /chains/<chain-id>.
+    # Deprecated alias for `leerie --status <chain-id>`.
+    # Kept for backward compat with scripts that used the old verb.
     shift
     _chain_id="${1:-}"
     if [ -z "$_chain_id" ]; then
-      remote_log "--chain-status: <chain-id> is required"
-      echo "  Usage: leerie --chain-status <chain-id>" >&2
+      remote_log "--chain-status: <chain-id> is required (use 'leerie --status <chain-id>' going forward)"
       exit 1
     fi
     case "$_chain_id" in
       --*) remote_log "--chain-status: expected <chain-id>, got flag '$_chain_id'"; exit 1 ;;
     esac
-    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
-    curl -fsSL "$_chain_url/chains/$_chain_id"
-    exit $?
+    exec "$0" --status "$_chain_id"
     ;;
   --list-chains)
-    # Fast-path: list all chains from the leerie-chain HTTP API.
-    # GET /chains.
+    # Deprecated alias for `leerie --list --chains`.
     shift
-    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
-    curl -fsSL "$_chain_url/chains"
-    exit $?
+    exec "$0" --list --chains "$@"
     ;;
   --chain-kill)
-    # Fast-path: cancel a chain via the leerie-chain HTTP API.
-    # DELETE /chains/<chain-id>.
+    # Deprecated alias for `leerie --kill <chain-id>`.
     shift
     _ck_chain_id="${1:-}"
     if [ -z "$_ck_chain_id" ]; then
-      remote_log "--chain-kill: <chain-id> is required"
-      echo "  Usage: leerie --chain-kill <chain-id>" >&2
+      remote_log "--chain-kill: <chain-id> is required (use 'leerie --kill <chain-id>' going forward)"
       exit 1
     fi
     case "$_ck_chain_id" in
       --*) remote_log "--chain-kill: expected <chain-id>, got flag '$_ck_chain_id'"; exit 1 ;;
     esac
-    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
-    curl -fsSL -X DELETE "$_chain_url/chains/$_ck_chain_id"
-    exit $?
+    exec "$0" --kill "$_ck_chain_id"
     ;;
   --chain-attach)
-    # Fast-path: stream logs for a chain from the leerie-chain HTTP API.
-    # GET /chains/<chain-id>/log.
+    # Deprecated alias for `leerie --attach <chain-id>`.
     shift
     _ca_chain_id="${1:-}"
     if [ -z "$_ca_chain_id" ]; then
-      remote_log "--chain-attach: <chain-id> is required"
-      echo "  Usage: leerie --chain-attach <chain-id>" >&2
+      remote_log "--chain-attach: <chain-id> is required (use 'leerie --attach <chain-id>' going forward)"
       exit 1
     fi
     case "$_ca_chain_id" in
       --*) remote_log "--chain-attach: expected <chain-id>, got flag '$_ca_chain_id'"; exit 1 ;;
     esac
-    _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
-    curl -fsSL "$_chain_url/chains/$_ca_chain_id/log"
-    exit $?
+    exec "$0" --attach "$_ca_chain_id"
     ;;
 esac
 
