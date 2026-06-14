@@ -2769,284 +2769,224 @@ design:
 
 ---
 
+
 ## 19. Chain orchestration
 
 A single leerie run takes one task and drives it to a merged PR — one
 classification, one plan, one wave sequence, one finalized branch. Many
 real workloads are *sequences of tasks* that must run in a fixed order
-across one repository: run the fetch job, then run the summarize job on
-the results, then run the publish job on those summaries. None of those
-runs can start until the prior one has merged its PR and the target
-branch has advanced. That sequencing problem is outside the scope of the
-core orchestrator, which is scoped to one run. Chain orchestration is
-the subsystem that manages it.
+across one repository: run job A and job B in parallel, then run job C
+after both complete. That sequencing problem is outside the scope of
+the core orchestrator, which is scoped to one run. **Chain
+orchestration** is the subsystem that manages it.
 
-### Pre-build verification (Q1–Q4)
+### Architecture: per-chain ephemeral coordinator
 
-The chain orchestration build was gated on four pre-build questions
-(QUEUE_JOBS.md lines 90–154). The answers below were derived from the
-existing single-run code before any chain-orchestration code was
-written, and they justify the shape of the chain subsystem as
-implemented.
+Each `leerie --chain` submission launches **one tiny ephemeral Fly
+machine** — the coordinator — that lives only as long as the chain
+itself. The coordinator:
 
-**Q1 — Does the in-Fly orchestrator push to origin itself?**
-No. The host launcher pushes. On a clean exit, the launcher's
-`decide_teardown` trap fetches the run branch back from the machine
-(`scripts/remote/fetch-branch.sh`), then sources `scripts/host-finalize.sh`
-to run `git push` and `gh pr create` inline on the host (DESIGN §6
-*Finalization*; `scripts/host-finalize.sh:105–127`). **Implication for
-the chain case**: the chain orchestrator launches per-run Fly machines
-via the Machines API directly (`chain/fly_client.py`), bypassing the
-launcher and its trap. There is no `host_finalize` in the chain-launched
-path, so the run branch is *not* on origin when the machine-exit webhook
-fires. The chain orchestrator must therefore push the branch and open
-the PR itself: `chain/git_ops.py` exposes `push_branch` and `open_pr`
-helpers for this purpose. **Open item**: those helpers exist but are not
-yet wired into `chain/server.py`'s webhook handler — wave
-finalization is currently a no-op. See §16 *Verification status*
-for the open work.
+1. Holds chain state in SQLite at `/data/chain.db` on a small (1GB)
+   persistent volume.
+2. Listens on Fly's private 6PN network at port 8080 with no public
+   port and no authentication. Workers in the same Fly app reach it
+   at `<coord-id>.vm.<app>.internal:8080`.
+3. Decides wave advancement and launches next-wave workers via the
+   Fly Machines API.
+4. When the chain reaches a terminal state (done/failed/cancelled),
+   pushes an audit artifact to the target repo and POSTs its own
+   `DELETE /machines/<self>` to destroy itself.
 
-**Q2 — Fly webhook payload shape.**
-Event type lives in `type` or `event_type`; the value of interest is
-`io.fly.machine.exited`. Machine identity comes from `machine_id` |
-`id` | `instance_id` (tried in that order). Exit code comes from
-`exit_code` | `exit_status`. Non-exit event types are silently ignored.
-The defensive field-order tolerance is in `chain/webhooks.py:74–132`
-and is exercised by `tests/test_chain_webhooks.py:127–152`.
+The coordinator runs on a `shared-cpu-1x` VM with 256MB of RAM. Cost
+per chain: pennies, even for hour-long chains.
 
-**Q3 — leerie launcher on Linux (no Keychain).**
-The launcher's Keychain extraction is macOS-only (`leerie:1862–1877`,
-guarded by `if [ "$OS" = "Darwin" ]`). On Linux it relies solely on
-`CLAUDE_CODE_OAUTH_TOKEN`. The chain orchestrator's Fly machines run
-a Debian-based image (per `chain/Dockerfile`), so they take the Linux
-env-var path cleanly with no Keychain fallback errors.
+**Why ephemeral, not always-on.** The earlier always-on
+`leerie-chain` app was rejected because it added an additional Fly
+app the operator had to deploy, secure, and pay for indefinitely. The
+per-chain coordinator self-provisions at chain submit and
+self-destructs at chain end. No persistent infrastructure beyond the
+coordinator image itself (which is published to
+`registry.fly.io/leerie-coordinator:<tag>` and pulled fresh on each
+chain).
 
-**Q4 — How does leerie know what branch to base on?**
-Whatever the host working tree's HEAD points to at invocation time.
-`scripts/remote/seed-repo.sh:133–272` bundles and rsyncs the working
-tree as-is — no `git checkout` and no `git rev-parse HEAD` in the
-seeding path. The chain orchestrator establishes the stage branch in
-its own clone via `chain/git_ops.create_stage_branch`, then launches
-each subsequent-wave machine with the stage branch already checked out
-in the clone the seeder reads from. The seeding mechanism does not
-change; the chain app manages branch state, not the seeder.
+**Why 6PN-only, no auth.** The coordinator's endpoints are
+internal-only — only other machines in the same Fly app can reach
+them. Fly's private network is the auth boundary. This eliminates the
+HMAC signature verification of the prior design (Fly outbound
+webhooks → coordinator) since workers POST directly over a network
+that is already trusted.
 
+### Worker → coordinator protocol
 
+Each worker is a normal leerie Fly machine launched by the coordinator
+with three additional env vars:
 
-The core orchestrator runs as a subprocess on the user's development
-machine (or inside a short-lived Fly machine for `--runtime fly` runs).
-Either way it is a **single-run process**: it starts, drives one run to
-completion, and exits. There is no persistent process that could hold
-state between runs, receive webhooks from Fly, or react to a prior run's
-PR merging.
+  * `LEERIE_CHAIN_ID` — the chain UUID.
+  * `LEERIE_RUN_ID` — the worker's chain-run id (NOT the Fly machine id).
+  * `LEERIE_COORDINATOR_HOST` — `<coord-id>.vm.<app>.internal:8080`.
 
-The alternative — giving the orchestrator a "chain mode" that spawns
-run N+1 when run N completes — would require the orchestrator to keep
-running across run boundaries, accumulate state across multiple
-invocations, and expose an HTTP endpoint for Fly's webhook delivery. That
-is a fundamentally different process lifecycle from the current single-run
-shape, and imposing it on the existing orchestrator would break the
-single-run invariant that the rest of the design depends on (worktree
-isolation, state namespacing, resume semantics, the six-phase control
-flow).
+While the worker runs, a background heartbeat process POSTs `/heartbeat`
+every 60 seconds with `{"run_id": "..."}`. The coordinator stamps
+`last_heartbeat_at` and uses it to detect crashed workers (default
+threshold: 15 minutes, ~15× the interval; suspended while the chain is
+paused so `--resume` operations don't trip it).
 
-A dedicated `leerie-chain` Fly app is the clean separation. It is a
-persistent process with a long lifetime (the chain's duration, not a
-single run's duration). It owns inter-run sequencing, holds chain state,
-and reacts to events from Fly. The core orchestrator is not modified — it
-still runs as a single-run process, launched by `leerie-chain` instead of
-by the user's shell.
+On worker exit (via `scripts/remote/provision.sh`'s `decide_teardown`
+trap, sourced inside the Fly machine), the chain-exit-hook
+(`scripts/leerie-chain-exit-hook.sh`) classifies the orchestrator's
+exit code and POSTs `/report` to the coordinator with status,
+exit_code, run_id, and branch. The coordinator's response tells the
+worker what to do:
 
-**Why Fly specifically.** The core leerie architecture already uses Fly
-machines for `--runtime fly` runs — the Fly Machines API, the image
-registry, the SSH-based seeding, and the webhook infrastructure are
-already part of the operator's provisioning. Using the same platform for
-the chain app avoids introducing a new vendor and lets `leerie-chain`
-launch per-run machines using the same `registry.fly.io/leerie:<tag>`
-image the user already pushes.
+  * `{"action": "exit"}` — worker's work is recorded; coordinator is
+    either waiting on other workers or has paused.
+  * `{"action": "pause"}` — chain is paused; worker should exit.
+  * `{"action": "launch", ...}` — reserved for a future "worker
+    launches next" mode; currently the coordinator does the launch
+    itself.
 
-### Why Fly machine-exit webhooks, not polling
+The worker is then destroyed by `decide_teardown`'s machine-destroy
+step. There is no host-side `host_finalize` for chain runs:
+**workers have no GitHub push credentials** (verified in
+`scripts/remote/seed-auth.sh:149-158`), so push + PR are handled by
+the coordinator, which holds the PAT in env.
 
-After `leerie-chain` launches a Fly machine for a run, it must be
-notified when that run completes. Two designs are possible:
+### Coordinator endpoints
 
-- **Polling.** `leerie-chain` checks the machine's state on a timer,
-  calling the Fly Machines API to ask whether the machine has exited.
-- **Webhooks.** Fly delivers a machine-exit event to a registered HTTP
-  endpoint the moment the machine transitions to the exit state.
+Internal-only HTTP API on port 8080:
 
-Polling trades simplicity for two costs. First, it introduces response
-latency: a run that completes between polls is not acted on until the
-next poll fires. For a chain where each run may take 10–30 minutes,
-inter-run idle time should be at most seconds, not a poll interval.
-Second, polling means `leerie-chain` must manage a timer loop and hold
-open connections to the Fly API throughout the run — complexity that
-grows with chain length (N concurrent polls for N-run chains).
+  * `POST /report` — worker terminal status; coordinator decides next action.
+  * `POST /heartbeat` — worker liveness ping.
+  * `POST /pause` — chain-level pause flag (used by chain-scoped `--stop`).
+  * `POST /unpause` — clear pause (used by chain-scoped `--resume`).
+  * `GET /state` — full chain snapshot for `leerie --status <chain-id>`.
+  * `GET /health` — liveness probe used by the launcher's submit-time wait.
 
-Webhooks are event-driven. The machine-exit event arrives at
-`leerie-chain`'s `/webhooks/fly` endpoint at the moment the machine
-exits; `leerie-chain` reacts immediately. No timer, no polling loop, no
-idle wait. The only cost is that `leerie-chain` must be reachable over
-HTTPS, which it is by virtue of being a Fly app with a public endpoint.
-Fly's webhook delivery includes a signing secret that `leerie-chain`
-verifies before acting, so the endpoint is authenticated.
+### State model
 
-The event-driven model also keeps `leerie-chain`'s concurrency model
-simple: it is a request handler, not a polling scheduler. It handles an
-incoming webhook, advances chain state, and optionally launches the next
-machine. No timer threads, no background loops.
+SQLite at `/data/chain.db`. Two tables:
 
-### The SQLite state model
+  * `chains(id, target, queue_json, wave_state, status, paused,
+    created_at, updated_at, completed_at)` — one row per chain.
+  * `chain_runs(id, chain_id, prompt, wave, machine_id, status,
+    exit_code, branch, started_at, finished_at, last_heartbeat_at,
+    created_at, updated_at)` — one row per chain run.
 
-`leerie-chain` manages state for chains that span multiple runs and
-persist across HTTP requests. The existing `State` class in
-`orchestrator/leerie.py` is a JSON file written atomically with
-`os.replace()` — a per-run object, not a server object. It does not
-support concurrent access from an HTTP handler and is scoped to a
-single run's directory.
+`RUN_STATUSES = {queued, running, done, failed, stale_creds,
+merge_failed}` — the last two are chain-specific. `stale_creds` means
+the worker's Claude OAuth token rotated mid-run; the chain pauses
+with `paused="stale_creds"` and `--resume <chain-id>` re-launches
+the affected worker with fresh creds. `merge_failed` means the
+coordinator's synth-merge of dep branches conflicted; the chain
+pauses with `paused="merge_failed"`.
 
-SQLite fits the requirements exactly:
+`CHAIN_STATUSES = {running, paused, done, failed, cancelled}`.
 
-- **Persistence without a separate server process.** A SQLite file on
-  a Fly persistent volume survives machine restarts and is directly
-  readable without a database daemon.
-- **Single-writer serializability.** `leerie-chain` is a single process
-  (one Fly machine, one Python process). SQLite's writer-exclusive lock
-  is sufficient; there is no multi-writer contention to manage.
-- **Relational structure mirrors the chain model.** A chain has a
-  `chains` row; each run in the chain has a `chain_runs` row with a
-  foreign key. Per-run status, error fields, and timestamps are natural
-  column types — more structured than a nested JSON blob and more
-  queryable for status endpoints.
-- **Semantic alignment with the `State` class.** The existing `State`
-  class holds per-run data in a JSON dict with atomic writes. The SQLite
-  model extends the same concept to multi-run scope: each `chain_runs`
-  row is conceptually what `State` holds for one run, with the `chains`
-  row holding the cross-run envelope. Both use transaction-style atomicity
-  (`os.replace()` for `State`; `BEGIN`/`COMMIT` for SQLite writes).
+### Wave sequencing
 
-A full server-side database (PostgreSQL, etc.) would require a separate
-process, a connection string, and credentials — operational overhead that
-is out of proportion for a single-tenant Fly app processing at most a
-handful of simultaneous chains.
+The chain DAG is encoded in `queue_json` (the queue spec injected at
+coordinator launch). Currently the DAG is wave-based: jobs in wave N
+run in parallel; wave N+1 starts only when every job in wave N is in
+a non-`paused` terminal status. Failures (any of `failed`,
+`stale_creds`, `merge_failed`) pause the chain rather than
+auto-advancing.
 
-### The leerie-chain app and per-run machine topology
+When all wave-N runs are `done`, the coordinator:
 
-```
-leerie-chain Fly app (one persistent machine, per-user deployment)
-│
-│  State: SQLite on persistent volume
-│  HTTP API:
-│    POST /chains              — start a new chain
-│    GET  /chains/<id>         — chain status
-│    POST /webhooks/fly        — receive machine-exit events
-│
-│  On chain start:
-│    1. Insert chain + run_0 row into SQLite
-│    2. Clone target repo using GH PAT
-│    3. Launch run_0 Fly machine via Machines API
-│       (same registry.fly.io/leerie:<tag> image)
-│       with run_0's task + branch as machine env
-│
-│  On webhook (machine exits):
-│    1. Verify Fly signing secret
-│    2. Look up chain_run by machine_id
-│    3. If run exited 0: fetch run branch, merge into stage branch,
-│       open PR (if final wave); mark run complete
-│    4. If run exited nonzero: mark run failed; pause chain
-│    5. If more runs remain: launch next machine
-│
-└─ Per-run Fly machines (one per leerie run, ephemeral)
-     - same registry.fly.io/leerie:<tag> image
-     - run the leerie orchestrator end-to-end
-     - commit + exit when done (host-side push is done by leerie-chain,
-       which holds the GH PAT; the machine itself holds no push credentials,
-       matching the existing DESIGN §6 *Finalization* no-credentials guarantee)
-```
+1. Reads `queue_json` for any `synth_merge_from` directives on
+   wave N+1 jobs.
+2. For each such job, performs `git fetch origin` for the dep
+   branches, creates `leerie/stage/<chain-id>` from main, merges
+   each dep branch, pushes the stage branch.
+3. Launches each wave-N+1 worker via the Fly Machines API with
+   `LEERIE_BASE_BRANCH=leerie/stage/<chain-id>` in env when
+   synth-merge applies.
 
-**Why the machine holds no push credentials.** The existing remote
-architecture keeps long-lived push tokens off Fly machines by design
-(§6 *Finalization*): workers commit on the machine; the host pushes via
-`leerie --finalize`. In the chain topology, `leerie-chain` takes the host
-role: it holds the GH PAT, fetches the completed branch from the machine,
-and pushes to origin. The constraint is preserved without modification —
-only the actor that performs the push changes from the user's shell to the
-`leerie-chain` process.
+`chain/git_ops.py` exposes `synth_merge_branches`, `fetch_branch`,
+`finalize_run` (push + PR for one worker), and `write_audit_artifact`
+(self-destruct artifact at `_leerie-chains/<chain-id>/chain.json`).
 
-**Why one persistent machine for the app.** `leerie-chain` is an HTTP
-server with a SQLite file. A persistent Fly machine (auto-start/stop
-disabled) keeps the SQLite file on a persistent volume and avoids cold-
-start latency on webhook delivery. The machine is small — the app is a
-lightweight Python HTTP server with no worker processes of its own — and
-costs significantly less than the ephemeral per-run machines it launches.
+### Watchdog and self-destruct
 
-### N-wave sequential execution
+The coordinator runs a background watchdog thread (60s tick) that:
 
-The chain model organizes runs into N sequential waves (wave 0, wave 1,
-…, wave N−1). Each `--wave` flag on `--chain-submit` defines one wave;
-runs within a wave may execute in parallel; waves execute in strict
-order. Wave K+1 does not begin until every run in wave K has completed
-successfully.
+  * Detects stale running workers (no heartbeat for > 15min) and
+    marks them failed; pauses the chain with `paused="heartbeat_stale"`.
+  * Times out abandoned chains (no worker activity for > 30min) by
+    marking the chain failed.
+  * On terminal chain status, executes the self-destruct sequence
+    (push audit artifact → `DELETE /machines/<self>?force=true`).
 
-`leerie-chain` creates a `stage-<chain-id>` branch and merges each
-completed wave's results into it before seeding the next wave's
-machines. The existing `seed-repo.sh` seeds whatever the host's working
-tree contains — a `git checkout stage-<chain-id>` on the chain app's
-clone before seeding delivers the accumulated prior-wave results to the
-next wave's workers. No change to the seeding mechanism is required; the
-chain app manages the branch state, not the seeder.
+Both checks are suspended while the chain is paused, so `--resume`
+operations have a generous grace window.
 
-**Failure handling.** A run that exits nonzero (implementation failed,
-confidence gate not cleared, blocked) pauses the chain and records the
-failure in SQLite. Subsequent runs that depend on the failed run do not
-launch. The chain is resumable: once the failure is resolved (by manually
-merging a fix, or by re-running the failed subtask and re-triggering via
-`--chain-submit`), the chain resumes from the point it paused. This
-mirrors the existing `--resume` semantics for individual runs.
+### Crash recovery
+
+The coordinator's SQLite DB lives on a 1GB Fly volume mounted at
+`/data`. On Fly machine restart (rare — small, stable process), the
+new coordinator instance opens the same DB and resumes operation;
+`ChainState.init_db` is idempotent (CREATE TABLE IF NOT EXISTS).
+The watchdog's in-memory `_last_worker_activity` resets to "now" on
+restart, intentionally giving the chain a fresh abandon-timer window
+after a crash.
 
 ### User-facing CLI surface
 
-The chain feature is surfaced as new `--flag` verbs on the existing
-`leerie` launcher, following Option 1 of the CLI design analysis (the
-`--flag` pattern is the existing leerie convention; see §2 for the
-rationale behind the CLI-subprocess shape that makes this natural):
+Submit a new chain:
 
 ```
-leerie --chain-submit \
-       --wave prompts/fetch.txt,prompts/lint.txt \
-       --wave prompts/summarize.txt \
-       --wave prompts/publish.txt \
-       --target ~/src/enric/summarizer
-
-leerie --chain-status <chain-id>
-leerie --list-chains
-leerie --chain-kill <chain-id>
-leerie --chain-attach <chain-id>
+leerie --chain --wave a.md,b.md --wave c.md
 ```
 
-The `--chain-submit` verb contacts the user's deployed `leerie-chain`
-Fly app, which handles run sequencing from there. The user provisions the
-`leerie-chain` app once (one `fly launch` in the `chain/` subdirectory);
-subsequent `--chain-submit` calls reuse the same persistent app.
+The launcher mints a chain_id (UUID), base64-encodes the queue spec
+into `LEERIE_QUEUE_JSON`, and POSTs to the Fly Machines API to
+create the coordinator. The coordinator self-bootstraps from the
+queue spec on first boot and launches wave 0.
+
+ID-dispatched verbs: each of `--status`, `--stop`, `--kill`,
+`--attach` detects whether its positional argument is a UUID (chain
+scope) or not (existing single-run scope):
+
+```
+leerie --status <chain-id>   # GET /state on the coordinator
+leerie --attach <chain-id>   # poll /state every 5s until terminal
+leerie --stop   <chain-id>   # POST /pause on the coordinator
+leerie --kill   <chain-id>   # destroy coordinator + every worker
+```
+
+Non-UUID ids fall through to the historical run-level behavior.
+Deprecated aliases (`--chain-submit`, `--chain-status`,
+`--chain-kill`, `--chain-attach`, `--list-chains`) shim to the new
+verbs so existing scripts continue to work.
+
+Active chains can be listed: `leerie --list --chains` queries Fly
+machines filtered by `metadata.leerie_role=coordinator`.
+
+When a worker stops or fails, its detach banner surfaces both
+single-run and chain-scoped recovery commands if `LEERIE_CHAIN_ID` is
+set in the worker's env.
 
 ### The §12 application
 
-§12's principle — prompts are advisory, code enforces — applies to the
-chain subsystem the same way it applies everywhere else:
+Chain orchestration is **all** §12 enforcement:
 
-- The **chain state machine** — valid transitions between `pending`,
-  `running`, `paused`, and `complete` — is a Python conditional in
-  `leerie-chain`, not a worker prompt. A webhook handler that receives
-  a machine-exit event transitions state mechanically; no model judges
-  whether the transition is valid.
-- The **run sequencing** — which run in the chain launches next, whether
-  wave K is fully complete before wave K+1 begins — is a Python query over
-  the SQLite `chain_runs` table. The prompt that describes wave sequencing to
-  a user does not govern the sequencing; the code does.
-- The **webhook signature verification** — confirming that a received
-  webhook was signed with the Fly signing secret — is a HMAC check in
-  code, not a prompt instruction to the handler to "verify the source."
-- The **task content** passed to each run — what the leerie run should
-  do — is a user-authored prompt file, and the run's behavior is
-  model-governed as in any single leerie run. That is the right scope
-  for model judgment; the sequencing envelope around it is not.
+- **Wave advancement** is a coordinator decision in
+  `chain/coordinator.py`, not a prompt instruction. Whether or not
+  wave N has completed is a SQL query (`all runs in wave N are in a
+  terminal status`), not a model judgment.
+- **Race-safety on "who launches the next wave"** is single-writer
+  state (the coordinator's SQLite), not a leader-election protocol or
+  a CAS dance — the coordinator decides exactly once.
+- **Stale-heartbeat detection** is a timestamp comparison, not a
+  prompt instruction to the worker to "report periodically."
+- **Push + PR + synth-merge** are deterministic git operations in
+  `chain/git_ops.py`, not model judgments. A merge conflict is a
+  bash exit code, not a prompt instruction to "resolve conflicts
+  carefully."
+- **Self-destruct** is a coordinator decision when the chain status
+  is terminal — a SQL query, not a model judgment.
+
+The task content passed to each worker — what the leerie run should
+do — is a user-authored prompt file, and the worker's behavior is
+model-governed as in any single leerie run. That is the right scope
+for model judgment; the sequencing envelope around it is not.
