@@ -184,6 +184,14 @@ COPY scripts/ /opt/leerie-image/scripts/
 COPY prompts/ /opt/leerie-image/prompts/
 COPY .claude-plugin/ /opt/leerie-image/.claude-plugin/
 RUN chown -R leerie:"${HOST_GID}" /opt/leerie-image
+# Chain-mode scripts must be executable. The COPY above preserves the
+# host's perm bits on Linux/macOS, but a sloppy `git checkout` on
+# Windows or an oddly-configured filesystem can drop the +x bit, so be
+# explicit. Other scripts in /opt/leerie-image/scripts/ already have
+# +x baked into their git index entries (verified by git ls-files
+# --stage); the two below are new and we want belt-and-suspenders.
+RUN chmod +x /opt/leerie-image/scripts/leerie-chain-exit-hook.sh \
+              /opt/leerie-image/scripts/leerie-chain-heartbeat.sh
 # /work must be writable by leerie for the orchestrator to create
 # /work/.leerie on remote (Fly Machine) runs. Local runs bind-mount
 # $(pwd):/work which masks the image's /work permission; remote runs
