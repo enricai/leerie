@@ -152,6 +152,58 @@ class TestLaunchMachine:
         assert guest["cpus"] == 2
         assert guest["memory_mb"] == 4096
 
+    def test_sends_metadata_in_body_when_provided(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When `metadata` kwarg is set, it lands at `config.metadata` in
+        the POSTed payload. The coordinator passes this to tag workers
+        with leerie_chain_id/leerie_role/leerie_run_id so the launcher's
+        --kill <chain-id> can discover them via the Fly metadata filter."""
+        monkeypatch.setenv("FLY_API_TOKEN", "test-token")
+        monkeypatch.setenv("FLY_APP_NAME", "leerie")
+
+        captured_body: list[dict[str, Any]] = []
+
+        def fake_urlopen(req: Any) -> Any:
+            captured_body.append(json.loads(req.data))
+            return _fake_response({"id": "m1", "state": "created"})
+
+        metadata = {
+            "leerie_chain_id": "abc-uuid",
+            "leerie_role": "worker",
+            "leerie_run_id": "r0",
+        }
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            launch_machine(
+                "registry.fly.io/leerie:1.0.0",
+                {},
+                "iad",
+                metadata=metadata,
+            )
+
+        assert captured_body[0]["config"]["metadata"] == metadata
+
+    def test_omits_metadata_field_when_not_provided(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When `metadata` is None/omitted (e.g. coordinator launched by
+        the laptop CLI, which sets metadata via a different path), the
+        config.metadata key is absent from the payload — not present as
+        an empty dict, which Fly's API may reject."""
+        monkeypatch.setenv("FLY_API_TOKEN", "test-token")
+        monkeypatch.setenv("FLY_APP_NAME", "leerie")
+
+        captured_body: list[dict[str, Any]] = []
+
+        def fake_urlopen(req: Any) -> Any:
+            captured_body.append(json.loads(req.data))
+            return _fake_response({"id": "m1", "state": "created"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            launch_machine("registry.fly.io/leerie:1.0.0", {}, "iad")
+
+        assert "metadata" not in captured_body[0]["config"]
+
     def test_sends_auth_header(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

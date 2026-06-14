@@ -66,7 +66,23 @@ def launch_machine(
     region: str,
     vm_cpus: int = 4,
     vm_memory_mb: int = 8192,
+    metadata: dict[str, str] | None = None,
 ) -> str:
+    """Create a Fly machine via the Machines API and return its id.
+
+    Args:
+        image: Container image tag (e.g. ``registry.fly.io/leerie:0.7.3``).
+        env: Environment variables to inject into the machine.
+        region: Fly region (e.g. ``"iad"``).
+        vm_cpus: Guest CPU count.
+        vm_memory_mb: Guest memory in MB.
+        metadata: Optional ``config.metadata`` dict — string keys + string
+            values queryable via ``GET /machines?metadata.<key>=<value>``.
+            The coordinator tags worker machines with
+            ``{"leerie_chain_id": ..., "leerie_role": "worker",
+            "leerie_run_id": ...}`` so ``leerie --kill <chain-id>``
+            discovers them alongside the coordinator.
+    """
     payload: dict[str, Any] = {
         "config": {
             "image": image,
@@ -78,6 +94,8 @@ def launch_machine(
         },
         "region": region,
     }
+    if metadata:
+        payload["config"]["metadata"] = metadata
     result = _request("POST", f"/apps/{_app()}/machines", body=payload)
     if not isinstance(result, dict) or "id" not in result:
         raise FlyClientError(

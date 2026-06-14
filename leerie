@@ -65,6 +65,48 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # image and starts in ~2s.
 
 
+# Extract the host's Claude OAuth credentials JSON for forwarding to
+# a worker. Single source of truth for "where do creds live on this
+# host": macOS Keychain (service "Claude Code-credentials") first;
+# Linux / Keychain-miss fall back to ~/.claude/.credentials.json on
+# disk; final fall back is the $CLAUDE_CODE_OAUTH_TOKEN env var, in
+# which case we synthesize the minimal {claudeAiOauth.accessToken}
+# JSON shape that the CLI reads on Linux (same shape seed-auth.sh
+# constructs in its fallback path).
+#
+# Used by:
+#   - the STAGE-assembly block (sources $STAGE/.claude/.credentials.json
+#     for the Fly seed-auth tar pipe);
+#   - the --chain fast-path, which packs the result into
+#     LEERIE_WORKER_ENV_JSON for the coordinator → worker env.
+#
+# Prints the JSON to stdout. Returns 0 if creds were found, 1 otherwise.
+_extract_claude_credentials_json() {
+  local creds=""
+  if [ "$(uname -s)" = "Darwin" ]; then
+    creds="$(security find-generic-password -s "Claude Code-credentials" \
+                -w 2>/dev/null || true)"
+  fi
+  if [ -z "$creds" ] && [ -s "$HOME/.claude/.credentials.json" ]; then
+    creds="$(cat "$HOME/.claude/.credentials.json")"
+  fi
+  if [ -z "$creds" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    creds="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
+                    "$CLAUDE_CODE_OAUTH_TOKEN")"
+  fi
+  if [ -z "$creds" ]; then
+    return 1
+  fi
+  printf '%s' "$creds"
+}
+
+# Read stdin and emit a base64-encoded string (no newlines). Used by
+# --chain to pack the queue spec and Claude creds into env-safe values
+# without duplicating the same python one-liner per call site.
+_b64_stdin() {
+  python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
+}
+
 # Read a single top-level key from a JSON file. Prints the value
 # (empty string if absent/null/error). Used by --finalize to avoid
 # repeating the same python3 one-liner.
@@ -1224,7 +1266,30 @@ print(json.dumps({"target": target, "runs": runs}))
     _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     # Base64-encode the queue spec so it survives env transport intact
     # (Fly env values are strings; JSON with embedded newlines is fragile).
-    _ch_queue_b64="$(printf '%s' "$_queue_spec" | python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+    _ch_queue_b64="$(printf '%s' "$_queue_spec" | _b64_stdin)"
+
+    # Collect host Claude OAuth credentials and pack them into a
+    # base64-encoded JSON envelope keyed by the canonical env var the
+    # worker's container-entry.sh chain-mode prelude reads. The
+    # coordinator forwards _ch_worker_env_b64 verbatim as
+    # LEERIE_WORKER_ENV_JSON; its existing merge logic injects each
+    # key/value into every worker's launch env. Without this, workers
+    # boot without ~/.claude/.credentials.json and the orchestrator's
+    # preflight `claude --version` smoke test fails with 401.
+    if ! _ch_claude_creds_json="$(_extract_claude_credentials_json)"; then
+      remote_log "--chain: could not extract Claude credentials from Keychain / disk / CLAUDE_CODE_OAUTH_TOKEN"
+      echo "  Workers cannot authenticate without credentials. On macOS, grant the" >&2
+      echo "  launcher Keychain access (the prompt that pops up). On Linux, export" >&2
+      echo "  CLAUDE_CODE_OAUTH_TOKEN in your shell before running leerie --chain." >&2
+      exit 1
+    fi
+    _ch_claude_creds_b64="$(printf '%s' "$_ch_claude_creds_json" | _b64_stdin)"
+    unset _ch_claude_creds_json
+    _ch_worker_env_b64="$(python3 -c '
+import json, sys
+print(json.dumps({"LEERIE_CLAUDE_CREDS_B64": sys.argv[1]}))
+' "$_ch_claude_creds_b64")"
+    unset _ch_claude_creds_b64
 
     # Build the coordinator machine create payload. Smallest tier:
     # shared-cpu-1x, 256MB RAM. 1GB volume at /data for crash recovery.
@@ -1238,6 +1303,7 @@ worker_image = sys.argv[5]
 gh_pat = sys.argv[6]
 fly_token = sys.argv[7]
 app = sys.argv[8]
+worker_env_json = sys.argv[9]
 spec = {
     "config": {
         "image": image,
@@ -1248,6 +1314,7 @@ spec = {
             "FLY_APP_NAME": app,
             "FLY_API_TOKEN": fly_token,
             "GH_DISPATCH_PAT": gh_pat,
+            "LEERIE_WORKER_ENV_JSON": worker_env_json,
         },
         "guest": {
             "cpu_kind": "shared",
@@ -1263,7 +1330,8 @@ spec = {
     "region": region,
 }
 print(json.dumps(spec))
-' "$_ch_id" "$_ch_queue_b64" "$LEERIE_CHAIN_IMAGE" "$_ch_region" "$LEERIE_WORKER_IMAGE" "$GH_DISPATCH_PAT" "$FLY_API_TOKEN" "$_ch_app")" || exit 1
+' "$_ch_id" "$_ch_queue_b64" "$LEERIE_CHAIN_IMAGE" "$_ch_region" "$LEERIE_WORKER_IMAGE" "$GH_DISPATCH_PAT" "$FLY_API_TOKEN" "$_ch_app" "$_ch_worker_env_b64")" || exit 1
+    unset _ch_worker_env_b64
 
     remote_log "--chain: launching coordinator for chain $_ch_id"
     _coord_resp="$(curl -sS -X POST \
@@ -2306,12 +2374,14 @@ else
   rm -f "$STAGE"/.claude/settings.json.*
 fi
 
-# -- macOS-only: extract OAuth credentials from Keychain. --
+# -- Extract OAuth credentials for the staged $STAGE/.claude/. --
 # On macOS the CLI stores its OAuth token in the Keychain (service
 # `Claude Code-credentials`), not in a file. The Linux CLI reads the
-# same JSON from ~/.claude/.credentials.json, so writing the Keychain
-# blob to that path inside the container's staged .claude/ makes the
-# Linux file-based code path work transparently on both platforms.
+# same JSON from ~/.claude/.credentials.json, so writing whatever the
+# host has (Keychain blob, on-disk file, or $CLAUDE_CODE_OAUTH_TOKEN
+# bridged to the same JSON shape) to that path inside the container's
+# staged .claude/ makes the Linux file-based code path work
+# transparently on both platforms.
 #
 # MUST run AFTER the .claude/ copy above, otherwise the rsync would
 # overwrite the credentials file.
@@ -2321,20 +2391,19 @@ fi
 # outside that (SSH-without-tty, daemons) it would prompt or fail.
 # Best-effort: if extraction fails, fall back to the legacy
 # CLAUDE_CODE_OAUTH_TOKEN env-var bridge so workers still authenticate.
-if [ "$OS" = "Darwin" ]; then
-  if security find-generic-password -s "Claude Code-credentials" \
-       -w >"$STAGE/.claude/.credentials.json" 2>/dev/null && \
-     [ -s "$STAGE/.claude/.credentials.json" ]; then
-    chmod 600 "$STAGE/.claude/.credentials.json"
-  else
-    rm -f "$STAGE/.claude/.credentials.json"
-    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-      AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-    else
-      remote_log "note — could not extract Claude credentials from Keychain."
-      echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
-      echo "  Keychain access (the prompt that pops up the first time)." >&2
-    fi
+if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
+   && [ -n "$_CLAUDE_CREDS_JSON" ]; then
+  printf '%s' "$_CLAUDE_CREDS_JSON" >"$STAGE/.claude/.credentials.json"
+  chmod 600 "$STAGE/.claude/.credentials.json"
+  unset _CLAUDE_CREDS_JSON
+else
+  rm -f "$STAGE/.claude/.credentials.json"
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+  elif [ "$OS" = "Darwin" ]; then
+    remote_log "note — could not extract Claude credentials from Keychain."
+    echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
+    echo "  Keychain access (the prompt that pops up the first time)." >&2
   fi
 fi
 

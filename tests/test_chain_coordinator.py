@@ -43,6 +43,7 @@ class _StubFly:
         region: str,
         vm_cpus: int = 4,
         vm_memory_mb: int = 8192,
+        metadata: dict[str, str] | None = None,
     ) -> str:
         if self.launch_should_fail:
             raise self.FlyClientError("stubbed launch failure")
@@ -51,6 +52,7 @@ class _StubFly:
         self.launched.append({
             "image": image,
             "env": env,
+            "metadata": metadata,
             "region": region,
             "machine_id": mid,
         })
@@ -127,7 +129,7 @@ def test_report_done_partial_wave_returns_exit() -> None:
     cs.transition_run(run_ids[1], "running", machine_id="mid-1")
 
     action = coord.handle_report({
-        "run_id": run_ids[0],
+        "chain_run_uuid": run_ids[0],
         "status": "done",
         "exit_code": 0,
         "branch": "leerie/runs/mid-0",
@@ -145,14 +147,14 @@ def test_report_done_completes_wave_advances_and_launches() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running", machine_id="mid-0")
     cs.transition_run(run_ids[1], "running", machine_id="mid-1")
-    coord.handle_report({"run_id": run_ids[0], "status": "done", "exit_code": 0})
-    coord.handle_report({"run_id": run_ids[1], "status": "done", "exit_code": 0})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done", "exit_code": 0})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "done", "exit_code": 0})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["wave_state"] == "wave_1"
     # Exactly one new launch — the wave-1 run.
     assert len(fly.launched) == 1
-    assert fly.launched[0]["env"]["LEERIE_RUN_ID"] == run_ids[2]
+    assert fly.launched[0]["env"]["LEERIE_CHAIN_RUN_UUID"] == run_ids[2]
     # The launched run transitioned to 'running'.
     snap = cs.load_chain(chain_id)
     assert snap is not None
@@ -164,8 +166,8 @@ def test_report_failed_pauses_chain() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
     cs.transition_run(run_ids[1], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
-    coord.handle_report({"run_id": run_ids[1], "status": "failed", "exit_code": 1})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "failed", "exit_code": 1})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["status"] == "paused"
@@ -178,8 +180,8 @@ def test_report_stale_creds_pauses_with_stale_creds_reason() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
     cs.transition_run(run_ids[1], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
-    coord.handle_report({"run_id": run_ids[1], "status": "stale_creds"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "stale_creds"})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["status"] == "paused"
@@ -190,8 +192,8 @@ def test_report_merge_failed_pauses_with_merge_failed_reason() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
     cs.transition_run(run_ids[1], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
-    coord.handle_report({"run_id": run_ids[1], "status": "merge_failed"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "merge_failed"})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["status"] == "paused"
@@ -204,7 +206,7 @@ def test_report_last_wave_marks_chain_done() -> None:
         run_prompts=[("only", "0")]
     )
     cs.transition_run(run_ids[0], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["status"] == "done"
@@ -214,21 +216,21 @@ def test_report_last_wave_marks_chain_done() -> None:
 
 def test_report_missing_run_id_raises() -> None:
     coord, *_ = _make_coord()
-    with pytest.raises(ValueError, match="missing run_id"):
+    with pytest.raises(ValueError, match="missing chain_run_uuid"):
         coord.handle_report({"status": "done"})
 
 
 def test_report_invalid_status_raises() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     with pytest.raises(ValueError, match="not a terminal status"):
-        coord.handle_report({"run_id": run_ids[0], "status": "running"})
+        coord.handle_report({"chain_run_uuid": run_ids[0], "status": "running"})
 
 
 def test_report_while_paused_returns_pause() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
     cs.transition_chain(chain_id, "paused", paused="user-requested")
-    action = coord.handle_report({"run_id": run_ids[0], "status": "done"})
+    action = coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
     assert action == {"action": "pause"}
 
 
@@ -241,8 +243,8 @@ def test_wave_launch_failure_marks_chain_failed() -> None:
     fly.launch_should_fail = True
     cs.transition_run(run_ids[0], "running")
     cs.transition_run(run_ids[1], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
-    coord.handle_report({"run_id": run_ids[1], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "done"})
     snap = cs.load_chain(chain_id)
     assert snap is not None
     assert snap["status"] == "failed"
@@ -256,15 +258,34 @@ def test_launch_env_includes_chain_id_run_id_and_coordinator_host() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
     cs.transition_run(run_ids[1], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
-    coord.handle_report({"run_id": run_ids[1], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "done"})
     assert len(fly.launched) == 1
     env = fly.launched[0]["env"]
     assert env["LEERIE_CHAIN_ID"] == chain_id
-    assert env["LEERIE_RUN_ID"] == run_ids[2]
+    assert env["LEERIE_CHAIN_RUN_UUID"] == run_ids[2]
     assert "LEERIE_COORDINATOR_HOST" in env
     assert env["LEERIE_COORDINATOR_HOST"].startswith("stub-coordinator-001.vm.")
     assert env["LEERIE_TARGET_REPO"] == "https://github.com/test/repo"
+
+
+def test_launch_tags_worker_with_metadata() -> None:
+    """Worker machines must be tagged with leerie_chain_id + leerie_role +
+    leerie_run_id so that ``leerie --kill <chain-id>`` discovers them via
+    the Fly Machines API metadata filter. Without this, the launcher's
+    --kill verb destroys the coordinator but leaves workers running
+    (silent Fly $ leak)."""
+    coord, cs, fly, chain_id, run_ids = _make_coord()
+    cs.transition_run(run_ids[0], "running")
+    cs.transition_run(run_ids[1], "running")
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[1], "status": "done"})
+    assert len(fly.launched) == 1
+    md = fly.launched[0]["metadata"]
+    assert md is not None, "worker metadata is required for --kill discovery"
+    assert md["leerie_chain_id"] == chain_id
+    assert md["leerie_role"] == "worker"
+    assert md["leerie_run_id"] == run_ids[2]
 
 
 def test_worker_env_base_is_forwarded() -> None:
@@ -286,7 +307,7 @@ def test_worker_env_base_is_forwarded() -> None:
         fly_module=fly,
     )
     cs.transition_run(run_ids[0], "running")
-    coord.handle_report({"run_id": run_ids[0], "status": "done"})
+    coord.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
     env = fly.launched[0]["env"]
     assert env["CLAUDE_API_KEY"] == "sk-stub"
     assert env["FOO"] == "bar"
@@ -301,7 +322,7 @@ def test_worker_env_base_is_forwarded() -> None:
 def test_heartbeat_stamps_run_row() -> None:
     coord, cs, fly, chain_id, run_ids = _make_coord()
     cs.transition_run(run_ids[0], "running")
-    result = coord.handle_heartbeat({"run_id": run_ids[0]})
+    result = coord.handle_heartbeat({"chain_run_uuid": run_ids[0]})
     assert result == {"ok": True}
     snap = cs.load_chain(chain_id)
     assert snap is not None
@@ -310,13 +331,13 @@ def test_heartbeat_stamps_run_row() -> None:
 
 def test_heartbeat_unknown_run_returns_not_ok() -> None:
     coord, *_ = _make_coord()
-    result = coord.handle_heartbeat({"run_id": "nonexistent"})
-    assert result == {"ok": False, "reason": "unknown run_id"}
+    result = coord.handle_heartbeat({"chain_run_uuid": "nonexistent"})
+    assert result == {"ok": False, "reason": "unknown chain_run_uuid"}
 
 
 def test_heartbeat_missing_run_id_raises() -> None:
     coord, *_ = _make_coord()
-    with pytest.raises(ValueError, match="missing run_id"):
+    with pytest.raises(ValueError, match="missing chain_run_uuid"):
         coord.handle_heartbeat({})
 
 
@@ -477,7 +498,7 @@ def test_crash_recovery_preserves_state(tmp_path) -> None:
         cs=cs1, chain_id=chain_id, self_machine_id="coord-x",
         worker_image="img", fly_module=fly1,
     )
-    coord1.handle_report({"run_id": run_ids[0], "status": "done", "exit_code": 0})
+    coord1.handle_report({"chain_run_uuid": run_ids[0], "status": "done", "exit_code": 0})
     # Coordinator "crashes" before the second run reports.
     cs1.close()
 
@@ -497,13 +518,13 @@ def test_crash_recovery_preserves_state(tmp_path) -> None:
     )
     # When R1 (the still-running wave-0 sibling) reports done, the new
     # coordinator advances the wave and launches R2.
-    coord2.handle_report({"run_id": run_ids[1], "status": "done", "exit_code": 0})
+    coord2.handle_report({"chain_run_uuid": run_ids[1], "status": "done", "exit_code": 0})
     snap3 = cs2.load_chain(chain_id)
     assert snap3 is not None
     assert snap3["wave_state"] == "wave_1"
     # Worker #1 — only wave-1's run was launched after restart.
     assert len(fly2.launched) == 1
-    assert fly2.launched[0]["env"]["LEERIE_RUN_ID"] == run_ids[2]
+    assert fly2.launched[0]["env"]["LEERIE_CHAIN_RUN_UUID"] == run_ids[2]
     cs2.close()
 
 
@@ -528,7 +549,7 @@ def test_crash_recovery_paused_chain_stays_paused(tmp_path) -> None:
         worker_image="img", fly_module=fly2,
     )
     # Any report while paused returns "pause" and does NOT advance.
-    action = coord2.handle_report({"run_id": run_ids[0], "status": "done"})
+    action = coord2.handle_report({"chain_run_uuid": run_ids[0], "status": "done"})
     assert action == {"action": "pause"}
     snap2 = cs2.load_chain(chain_id)
     assert snap2 is not None

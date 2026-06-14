@@ -7,10 +7,12 @@
 # at scripts/remote/seed-auth.sh:149-158), so push + PR happen on the
 # coordinator. This hook just notifies the coordinator and exits.
 #
-# Inputs (read from env, set by the launcher at chain submit):
+# Inputs (read from env, set by the coordinator at worker launch):
 #   LEERIE_CHAIN_ID         — chain UUID this worker belongs to
-#   LEERIE_RUN_ID           — chain-run id within that chain (NOT the
-#                             Fly machine id; see plan §"CLI surface")
+#   LEERIE_CHAIN_RUN_UUID   — chain-run UUID within that chain
+#                             (coordinator-internal scope; this is the
+#                             primary key into chain_runs, distinct from
+#                             the orchestrator's Fly-machine-id run_id)
 #   LEERIE_COORDINATOR_HOST — <coord-id>.vm.<app>.internal:8080
 #
 # Inputs from decide_teardown's locals:
@@ -50,19 +52,35 @@ _leerie_chain_classify_status() {
   esac
 }
 
-# Read the run branch from run.json, falling back to the default name.
+# Read a string field from run.json. jq -r emits "null" for missing
+# keys; coerce that to empty. Returns 0 with the value on stdout (empty
+# if absent); never errors.
+_leerie_chain_runjson_field() {
+  local run_dir="$1"
+  local field="$2"
+  if [ ! -f "$run_dir/run.json" ]; then
+    return 0
+  fi
+  local v
+  v="$(jq -r --arg f "$field" '.[$f] // ""' "$run_dir/run.json" 2>/dev/null || true)"
+  if [ "$v" = "null" ]; then
+    v=""
+  fi
+  printf '%s' "$v"
+}
+
+# Read the run branch from run.json, falling back to the default
+# leerie/runs/<machine-id> shape the orchestrator produces.
 _leerie_chain_branch() {
   local run_dir="$1"
-  local run_id="$2"
-  if [ -f "$run_dir/run.json" ]; then
-    local b
-    b="$(jq -r '.branch // ""' "$run_dir/run.json" 2>/dev/null || true)"
-    if [ -n "$b" ] && [ "$b" != "null" ]; then
-      echo "$b"
-      return 0
-    fi
+  local machine_id="$2"
+  local b
+  b="$(_leerie_chain_runjson_field "$run_dir" branch)"
+  if [ -n "$b" ]; then
+    echo "$b"
+    return 0
   fi
-  echo "leerie/runs/$run_id"
+  echo "leerie/runs/$machine_id"
 }
 
 # POST a JSON report to the coordinator with retries.
@@ -98,7 +116,7 @@ leerie_chain_report() {
   local run_dir="$2"
 
   # Defensive: only run in chain mode.
-  if [ -z "${LEERIE_CHAIN_ID:-}" ] || [ -z "${LEERIE_RUN_ID:-}" ]; then
+  if [ -z "${LEERIE_CHAIN_ID:-}" ] || [ -z "${LEERIE_CHAIN_RUN_UUID:-}" ]; then
     return 0
   fi
   if [ -z "${LEERIE_COORDINATOR_HOST:-}" ]; then
@@ -106,22 +124,34 @@ leerie_chain_report() {
     return 1
   fi
 
+  # The orchestrator's run_id (= Fly machine id under --runtime fly)
+  # was persisted to run.json by provision.sh; use it to derive the
+  # branch and report it as machine_id alongside the chain-run UUID.
+  local machine_id
+  machine_id="$(_leerie_chain_runjson_field "$run_dir" fly_machine_id)"
   local status
   status="$(_leerie_chain_classify_status "$rc")"
   local branch
-  branch="$(_leerie_chain_branch "$run_dir" "$LEERIE_RUN_ID")"
+  branch="$(_leerie_chain_branch "$run_dir" "$machine_id")"
 
   local payload
   payload="$(jq -nc \
-    --arg run_id "$LEERIE_RUN_ID" \
+    --arg chain_run_uuid "$LEERIE_CHAIN_RUN_UUID" \
+    --arg machine_id "$machine_id" \
     --arg status "$status" \
     --arg branch "$branch" \
     --argjson exit_code "$rc" \
-    '{run_id: $run_id, status: $status, exit_code: $exit_code, branch: $branch}'
+    '{
+      chain_run_uuid: $chain_run_uuid,
+      machine_id: $machine_id,
+      status: $status,
+      exit_code: $exit_code,
+      branch: $branch
+    }'
   )"
 
   local url="http://${LEERIE_COORDINATOR_HOST}/report"
-  remote_log "chain-exit-hook: POST /report rc=$rc status=$status branch=$branch"
+  remote_log "chain-exit-hook: POST /report rc=$rc status=$status branch=$branch machine_id=$machine_id"
 
   local response
   if response="$(_leerie_chain_post_report "$url" "$payload")"; then

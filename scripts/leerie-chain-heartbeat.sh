@@ -15,7 +15,10 @@
 #
 # Inputs (env):
 #   LEERIE_CHAIN_ID                    — chain UUID (required)
-#   LEERIE_RUN_ID                      — chain-run id within that chain (required)
+#   LEERIE_CHAIN_RUN_UUID              — chain-run UUID within that chain
+#                                        (required; coordinator-internal scope,
+#                                        distinct from the orchestrator's
+#                                        Fly-machine-id run_id)
 #   LEERIE_COORDINATOR_HOST            — <coord-id>.vm.<app>.internal:8080 (required)
 #   LEERIE_CHAIN_HEARTBEAT_INTERVAL_S  — beat interval, default 60s
 #
@@ -32,8 +35,8 @@ _log() {
   fi
 }
 
-if [ -z "${LEERIE_CHAIN_ID:-}" ] || [ -z "${LEERIE_RUN_ID:-}" ]; then
-  _log "chain-heartbeat: LEERIE_CHAIN_ID/RUN_ID not set; exiting"
+if [ -z "${LEERIE_CHAIN_ID:-}" ] || [ -z "${LEERIE_CHAIN_RUN_UUID:-}" ]; then
+  _log "chain-heartbeat: LEERIE_CHAIN_ID/LEERIE_CHAIN_RUN_UUID not set; exiting"
   exit 0
 fi
 if [ -z "${LEERIE_COORDINATOR_HOST:-}" ]; then
@@ -43,7 +46,9 @@ fi
 
 interval="${LEERIE_CHAIN_HEARTBEAT_INTERVAL_S:-60}"
 url="http://${LEERIE_COORDINATOR_HOST}/heartbeat"
-payload="$(printf '{"run_id":"%s"}' "$LEERIE_RUN_ID")"
+# The /heartbeat handler keys by the chain-run UUID (coordinator-internal
+# scope), not the Fly machine id — same shape as the /report payload.
+payload="$(printf '{"chain_run_uuid":"%s"}' "$LEERIE_CHAIN_RUN_UUID")"
 
 # Exit cleanly on SIGTERM so the chain-exit-hook can stop us deterministically.
 trap 'exit 0' TERM INT

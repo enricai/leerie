@@ -2833,24 +2833,63 @@ that is already trusted.
 ### Worker → coordinator protocol
 
 Each worker is a normal leerie Fly machine launched by the coordinator
-with three additional env vars:
+with the following additional env vars (set by the coordinator's
+`_build_worker_env` plus the launcher-provided `worker_env_base`):
 
   * `LEERIE_CHAIN_ID` — the chain UUID.
-  * `LEERIE_RUN_ID` — the worker's chain-run id (NOT the Fly machine id).
+  * `LEERIE_CHAIN_RUN_UUID` — the worker's chain-run UUID.
+    Coordinator-internal scope: this is the primary key into
+    `chain_runs`, distinct from the orchestrator's own `run_id`
+    (which under `--runtime fly` is the Fly machine id, derived by
+    the orchestrator at boot).
   * `LEERIE_COORDINATOR_HOST` — `<coord-id>.vm.<app>.internal:8080`.
+  * `LEERIE_TASK` / `LEERIE_TARGET_REPO` — the worker's prompt and
+    target repo.
+  * `LEERIE_CLAUDE_CREDS_B64` — base64-encoded
+    `~/.claude/.credentials.json` content. The launcher's
+    `_extract_claude_credentials_json` helper acquires it (Keychain
+    on macOS / on-disk file / `$CLAUDE_CODE_OAUTH_TOKEN` fallback —
+    same DRY source the host-side STAGE-assembly uses for non-chain
+    Fly runs), packs it into a JSON envelope as
+    `LEERIE_WORKER_ENV_JSON` on the coordinator's env, and the
+    coordinator merges it into every worker's launch env. Chain
+    workers cannot use the non-chain `seed-auth.sh` tar-pipe path
+    because the coordinator has no `flyctl` binary and the worker
+    boots immediately upon Fly machine create.
 
-While the worker runs, a background heartbeat process POSTs `/heartbeat`
-every 60 seconds with `{"run_id": "..."}`. The coordinator stamps
-`last_heartbeat_at` and uses it to detect crashed workers (default
-threshold: 15 minutes, ~15× the interval; suspended while the chain is
-paused so `--resume` operations don't trip it).
+The worker's boot sequence (`scripts/container-entry.sh` chain-mode
+branch):
 
-On worker exit (via `scripts/remote/provision.sh`'s `decide_teardown`
-trap, sourced inside the Fly machine), the chain-exit-hook
-(`scripts/leerie-chain-exit-hook.sh`) classifies the orchestrator's
-exit code and POSTs `/report` to the coordinator with status,
-exit_code, run_id, and branch. The coordinator's response tells the
-worker what to do:
+1. Decode `LEERIE_CLAUDE_CREDS_B64` and write
+   `~/.claude/.credentials.json` with mode 600 — matches the file
+   path the non-chain `seed-auth.sh` produces, so the orchestrator's
+   auth path is identical in both runtimes.
+2. Background-start `scripts/leerie-chain-heartbeat.sh`, which POSTs
+   `/heartbeat` every 60s with `{"chain_run_uuid": "..."}`. The
+   coordinator stamps `last_heartbeat_at` and uses it to detect
+   crashed workers (default threshold: 15 minutes, ~15× the
+   interval; suspended while the chain is paused so `--resume`
+   operations don't trip it).
+3. Run (not exec) the orchestrator with no `--run-id` flag — the
+   orchestrator derives its own run_id from the Fly machine id, as
+   on every non-chain Fly run.
+4. After the orchestrator exits, source
+   `scripts/leerie-chain-exit-hook.sh` (via a bash subshell, since
+   container-entry.sh is `/bin/sh`) and call `leerie_chain_report`
+   with the orchestrator's exit rc and the run directory. The hook
+   POSTs `/report` to the coordinator with:
+
+   * `chain_run_uuid` — primary key into `chain_runs`.
+   * `machine_id` — the Fly machine id (= orchestrator's run_id),
+     read from `run.json`'s `fly_machine_id` field. The coordinator
+     persists it so wave-transition synth-merge can derive the
+     branch name from it.
+   * `status`, `exit_code`, `branch` — terminal status, exit code,
+     and branch name (from `run.json` or
+     `leerie/runs/<fly-machine-id>` fallback).
+5. Exit with the orchestrator's exit rc.
+
+The coordinator's response to `/report` tells the worker what to do:
 
   * `{"action": "exit"}` — worker's work is recorded; coordinator is
     either waiting on other workers or has paused.
@@ -2859,11 +2898,16 @@ worker what to do:
     launches next" mode; currently the coordinator does the launch
     itself.
 
-The worker is then destroyed by `decide_teardown`'s machine-destroy
-step. There is no host-side `host_finalize` for chain runs:
-**workers have no GitHub push credentials** (verified in
-`scripts/remote/seed-auth.sh:149-158`), so push + PR are handled by
-the coordinator, which holds the PAT in env.
+In all cases the worker process exits and the Fly machine is
+destroyed by the coordinator's housekeeping. There is no host-side
+`host_finalize` for chain runs: **workers have no GitHub push
+credentials** (verified in `scripts/remote/seed-auth.sh:149-158`),
+so push + PR are handled by the coordinator, which holds the PAT in
+env. Chain workers also do **not** run `decide_teardown` — that path
+exists in `scripts/remote/provision.sh` for non-chain Fly runs
+managed by a launcher on the user's host. Chain workers have no
+launcher and no `flyctl`; the chain-exit-hook fires from
+container-entry.sh on the worker itself.
 
 ### Coordinator endpoints
 

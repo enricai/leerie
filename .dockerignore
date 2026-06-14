@@ -34,6 +34,15 @@
 !orchestrator/
 !orchestrator/leerie.py
 
+# Chain subsystem — baked into /app/chain/ in the coordinator image
+# (see chain/Dockerfile). Not used by the worker image. Both this
+# directory entry and chain/Dockerfile itself must be allow-listed:
+# the coordinator build context is the repo root (per chain/Dockerfile
+# docstring) and the dockerignore default `*` would otherwise exclude
+# everything.
+!chain/
+!chain/Dockerfile
+
 # Shell scripts — baked into /work/.leerie-image/scripts/.
 !scripts/
 !scripts/container-entry.sh
@@ -44,6 +53,20 @@
 !scripts/cleanup.sh
 !scripts/install.sh
 !scripts/runtime-install.sh
+# Chain-mode worker scripts — exit hook is sourced by
+# scripts/remote/provision.sh's decide_teardown trap; heartbeat is
+# background-started by scripts/container-entry.sh when LEERIE_CHAIN_ID
+# is set. The recursive `!scripts/` line above already includes them;
+# the individual entries here match the convention so the manifest
+# stays in sync with /opt/leerie-image/scripts/ contents.
+!scripts/leerie-chain-exit-hook.sh
+!scripts/leerie-chain-heartbeat.sh
+# Smoke scripts — not baked into the image (not under /opt/leerie-image/
+# at runtime), but kept in the build context so a future change that
+# does include them doesn't silently miss the files.
+!scripts/smoke/
+!scripts/smoke/chain-trivial.sh
+!scripts/smoke/chain-failure-modes.sh
 
 # Worker prompts — baked into /work/.leerie-image/prompts/.
 !prompts/

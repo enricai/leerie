@@ -368,7 +368,7 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$LEERIE_HOME` (leerie install dir) | `/opt/leerie-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
 | `$STAGE/.claude.json` (per-run host scratch) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with the `projects[]` block stripped. The host file is never directly mounted into a container: the shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226 — all open) that hangs workers in a recovery loop with no backoff. Each container writes only its private copy. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + sibling JSON, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/` and `plugins/marketplaces/` are rebuilt on the remote in the fly runtime; see `scripts/remote/seed-auth.sh` step 4 (`# --- 4. Rebuild plugin cache`). |
-| Keychain → `$STAGE/.claude/.credentials.json` (macOS only) | `/home/leerie/.claude/.credentials.json` | rw | On macOS the launcher extracts the OAuth token JSON from Keychain (service `Claude Code-credentials`) and writes it to the staged `.claude/.credentials.json`. The Linux CLI reads exactly that path, so both platforms use the same file-based auth flow inside the container. Extraction uses `security find-generic-password -w`; succeeds silently in the user's login session. |
+| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher's `_extract_claude_credentials_json` helper resolves "where do Claude OAuth credentials live on this host" via a single fallback chain — Keychain (service `Claude Code-credentials`, via `security find-generic-password -w`, macOS only), then `$HOME/.claude/.credentials.json` on disk, then `$CLAUDE_CODE_OAUTH_TOKEN` synthesized into the same JSON shape — and writes it to the staged path with mode 600. The Linux CLI reads exactly that path, so both platforms use the same file-based auth flow inside the container. Single source of truth: the same helper is called from the `--chain` arm to populate `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` key (base64-encoded), so chain workers receive identical credentials without a separate Keychain probe. |
 | `$STAGE/.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc` (per-run host scratch) | `/home/leerie/.<same>` | rw | Per-container copies of each present host `~/.git*` sibling and `~/.netrc`. Worker can `git config --local` / mutate freely without affecting host state. |
 | `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` | rw | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
 | `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` | rw | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
@@ -1837,25 +1837,73 @@ watchdog runs the self-destruct sequence: push
 target repo via `chain.git_ops.write_audit_artifact`, then call
 `fly_client.destroy_machine(self_machine_id)`.
 
-#### Worker-side hooks
+#### Worker boot path (`scripts/container-entry.sh` chain-mode branch)
 
-Two new bash scripts the worker Fly machine runs (delivered by the
-existing `COPY scripts/ /opt/leerie-image/scripts/` in `Dockerfile`):
+Chain workers are launched by the coordinator via the bare Fly
+Machines API (`chain.fly_client.launch_machine`) with no `init.cmd`
+or `init.exec`, so they boot with the worker image's `ENTRYPOINT`
+(`container-entry.sh`) and no argv. The chain-mode branch is gated
+on `LEERIE_CHAIN_ID` being set in env AND `$# == 0`. It runs
+entirely on the worker — there is no launcher process and no host
+involvement during the run.
 
-| Script | Source | Purpose |
-|--------|--------|---------|
-| `scripts/leerie-chain-exit-hook.sh` | sourced at the top of `scripts/remote/provision.sh` via `_PROVISION_DIR/../leerie-chain-exit-hook.sh` | Exposes `leerie_chain_report rc run_dir` which classifies the orchestrator exit code, reads the run branch from `run.json`, POSTs `/report` with retry-with-backoff, and sets `LEERIE_CHAIN_HANDLED=1`. Called by `decide_teardown` when `LEERIE_CHAIN_ID` is in env. |
-| `scripts/leerie-chain-heartbeat.sh` | started in background by the launcher's worker entrypoint when `LEERIE_CHAIN_ID` is set | Loops every `LEERIE_CHAIN_HEARTBEAT_INTERVAL_S` (default 60s), POSTs `{"run_id":"..."}` to `/heartbeat`. Tolerates transient errors; exits cleanly on SIGTERM. |
+Required env (set by the coordinator's `_build_worker_env`):
 
-`scripts/remote/provision.sh::decide_teardown` short-circuits for
-chain runs: when `LEERIE_CHAIN_HANDLED=1`, both the clean-exit
-(`rc=0|10|11|75`) and failure (`*`) arms skip `host_finalize`
-(workers have no GitHub push creds per `seed-auth.sh:149-158`) and
-go directly to `destroy_machine`. The `130|143` detach arm is
-preserved unchanged — the orchestrator is still running and the
-user wants reattach hints; the chain hook still POSTs a `failed`
-report to the coordinator for bookkeeping, but the banner adds
-chain-scoped recovery commands when `LEERIE_CHAIN_ID` is set.
+| Var | Source | Purpose |
+|-----|--------|---------|
+| `LEERIE_CHAIN_ID` | coordinator (chain identity) | Primary key into `chains`. |
+| `LEERIE_CHAIN_RUN_UUID` | coordinator (per-run identity) | Primary key into `chain_runs`. Distinct from the orchestrator's own `run_id`, which under `--runtime fly` is the Fly machine id (derived at orchestrator boot). |
+| `LEERIE_COORDINATOR_HOST` | coordinator | `<coord-id>.vm.<app>.internal:8080`. |
+| `LEERIE_TASK` | coordinator | The worker's prompt. Used as the positional argument to the orchestrator. |
+| `LEERIE_TARGET_REPO` | coordinator | The target repo URL. |
+| `LEERIE_CLAUDE_CREDS_B64` | launcher → coordinator's `LEERIE_WORKER_ENV_JSON` → worker env | Base64-encoded `~/.claude/.credentials.json` content. |
+
+Boot sequence:
+
+1. **Materialize Claude credentials.** Decode `LEERIE_CLAUDE_CREDS_B64`
+   and write `/home/leerie/.claude/.credentials.json` with mode 600.
+   The path matches what `scripts/remote/seed-auth.sh` produces for
+   non-chain Fly runs, so the orchestrator's auth path is identical
+   in both runtimes.
+2. **Background-start the heartbeat.** `runuser -u leerie -- env ... bash
+   /opt/leerie-image/scripts/leerie-chain-heartbeat.sh &` plus a trap
+   that kills the background pid on EXIT/INT/TERM.
+3. **Run (not exec) the orchestrator** with `python3
+   /opt/leerie-image/orchestrator/leerie.py "$LEERIE_TASK"`. The
+   chain-mode branch does NOT pass `--run-id`: the orchestrator
+   derives its own run_id from the Fly machine id, as on every other
+   Fly run. `_orch_rc=$?` (via `... || _orch_rc=$?` so `set -e`
+   doesn't abort the script on non-zero) captures the rc.
+4. **Invoke the chain-exit-hook.** A bash subshell sources
+   `/opt/leerie-image/scripts/remote/_log.sh` (for `remote_log`)
+   and `/opt/leerie-image/scripts/leerie-chain-exit-hook.sh`, then
+   calls `leerie_chain_report "$_orch_rc" "$_run_dir"`. The bash
+   subshell is necessary because `container-entry.sh` is `/bin/sh`
+   (dash on Debian) and the hook uses bash-only `local`.
+5. **Exit with the orchestrator's rc.**
+
+Chain workers do **not** run `decide_teardown` (the trap defined in
+`scripts/remote/provision.sh`). That path is for non-chain Fly runs
+managed by a launcher on the user's host, which has `flyctl` and
+GitHub push creds. Chain workers have neither.
+
+#### Worker-side hooks (bash scripts under `scripts/`)
+
+Both scripts are delivered by the existing
+`COPY scripts/ /opt/leerie-image/scripts/` in `Dockerfile`.
+
+| Script | Called by | Purpose |
+|--------|-----------|---------|
+| `scripts/leerie-chain-exit-hook.sh` | container-entry.sh chain-mode branch (above) | Exposes `leerie_chain_report rc run_dir` which classifies the orchestrator exit code, reads `fly_machine_id` and `branch` from `run.json`, POSTs `/report` to the coordinator with `{chain_run_uuid, machine_id, status, exit_code, branch}` (retry-with-backoff via curl), and sets `LEERIE_CHAIN_HANDLED=1`. |
+| `scripts/leerie-chain-heartbeat.sh` | container-entry.sh chain-mode branch (background-started before the orchestrator runs) | Loops every `LEERIE_CHAIN_HEARTBEAT_INTERVAL_S` (default 60s), POSTs `{"chain_run_uuid":"..."}` to `/heartbeat`. Tolerates transient errors; exits cleanly on SIGTERM. |
+
+Note: `scripts/remote/provision.sh` also sources the chain-exit-hook
+near the top and calls `leerie_chain_report` from its
+`decide_teardown` trap when `LEERIE_CHAIN_ID` is in env. That code
+path is reachable from the non-chain launcher when a future
+operator extends `--runtime fly` runs into chains; in the current
+design only the container-entry path fires the hook for chain
+workers.
 
 #### State schema
 

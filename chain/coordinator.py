@@ -68,7 +68,6 @@ from typing import Any
 from chain import fly_client, git_ops
 from chain._log import die, log
 from chain.state import (
-    CHAIN_STATUSES,
     RUN_TERMINAL_STATUSES,
     ChainState,
 )
@@ -188,7 +187,8 @@ class Coordinator:
         Request body shape::
 
             {
-              "run_id": "...",
+              "chain_run_uuid": "...",      # primary key into chain_runs
+              "machine_id": "...",          # Fly machine id (worker's orchestrator run_id)
               "status": "done" | "failed" | "stale_creds" | "merge_failed",
               "exit_code": <int> | null,
               "branch": "leerie/runs/..." | null,
@@ -210,22 +210,24 @@ class Coordinator:
               — chain is paused; worker should exit and let the
                 coordinator handle restart on --resume.
         """
-        run_id = body.get("run_id")
+        chain_run_uuid = body.get("chain_run_uuid")
+        machine_id = body.get("machine_id")
         new_status = body.get("status")
         exit_code = body.get("exit_code")
         branch = body.get("branch")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("report missing run_id")
+        if not isinstance(chain_run_uuid, str) or not chain_run_uuid:
+            raise ValueError("report missing chain_run_uuid")
         if new_status not in RUN_TERMINAL_STATUSES:
             raise ValueError(
                 f"report status {new_status!r} is not a terminal status"
             )
 
         self._cs.transition_run(
-            run_id,
+            chain_run_uuid,
             new_status,
             exit_code=exit_code if isinstance(exit_code, int) else None,
             branch=branch if isinstance(branch, str) else None,
+            machine_id=machine_id if isinstance(machine_id, str) and machine_id else None,
         )
         self._last_worker_activity = _now()
 
@@ -304,15 +306,34 @@ class Coordinator:
         self._launch_wave(chain, next_runs)
 
     def _launch_wave(self, chain: dict, runs: list[dict]) -> None:
-        """Launch every run in *runs* as a worker Fly machine."""
+        """Launch every run in *runs* as a worker Fly machine.
+
+        Each worker is tagged with metadata so the launcher's
+        chain-scoped verbs can discover it. Specifically:
+
+          * ``--kill <chain-id>`` queries
+            ``?metadata.leerie_chain_id=<id>`` (no role filter) and
+            destroys every match — without this tag, workers would be
+            invisible to that query and would continue running after
+            the coordinator is destroyed.
+          * ``--list --chains`` filters on
+            ``metadata.leerie_role=coordinator`` and skips workers
+            cleanly.
+        """
         target = chain["target"]
         for run in runs:
             env = self._build_worker_env(chain_id=self._chain_id, run=run, target=target)
+            metadata = {
+                "leerie_chain_id": self._chain_id,
+                "leerie_role": "worker",
+                "leerie_run_id": run["id"],
+            }
             try:
                 mid = self._fly.launch_machine(
                     image=self._worker_image,
                     env=env,
                     region=self._region,
+                    metadata=metadata,
                 )
             except self._fly.FlyClientError as exc:
                 _log(
@@ -332,17 +353,21 @@ class Coordinator:
         """Compose the env dict injected into a worker machine on launch.
 
         Includes:
-        - LEERIE_CHAIN_ID, LEERIE_RUN_ID — so the worker knows its scope.
+        - LEERIE_CHAIN_ID, LEERIE_CHAIN_RUN_UUID — so the worker knows its
+          scope. The chain-run UUID is coordinator-internal (it keys the
+          chain_runs row); the orchestrator's own run_id is derived from
+          the Fly machine id elsewhere, per the --runtime fly contract.
         - LEERIE_COORDINATOR_HOST — where to POST /report and /heartbeat.
         - LEERIE_TASK, LEERIE_TARGET_REPO — same fields the existing
           orchestrator already consumes.
         - Anything in self._worker_env_base — forwarded creds (Claude
-          OAuth, target-repo PAT) propagated by the CLI at chain submit.
+          OAuth via LEERIE_CLAUDE_CREDS_B64, target-repo PAT) propagated
+          by the CLI at chain submit.
         """
         env = dict(self._worker_env_base)
         env.update({
             "LEERIE_CHAIN_ID": chain_id,
-            "LEERIE_RUN_ID": run["id"],
+            "LEERIE_CHAIN_RUN_UUID": run["id"],
             "LEERIE_TASK": run["prompt"],
             "LEERIE_TARGET_REPO": target,
             "LEERIE_COORDINATOR_HOST": f"{self._self_machine_id}.vm.{fly_client.app_name()}.internal:8080",
@@ -356,20 +381,24 @@ class Coordinator:
     def handle_heartbeat(self, body: dict[str, Any]) -> dict[str, Any]:
         """Stamp the run's last_heartbeat_at; return optional action.
 
+        Request body shape::
+
+            {"chain_run_uuid": "..."}
+
         Future extension point: if chain is in a `paused: stale_creds`
         state, the response can carry a `{action: "reseed", creds: ...}`
         instruction for the worker. Initial implementation just stamps
         the heartbeat and returns OK.
         """
-        run_id = body.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("heartbeat missing run_id")
+        chain_run_uuid = body.get("chain_run_uuid")
+        if not isinstance(chain_run_uuid, str) or not chain_run_uuid:
+            raise ValueError("heartbeat missing chain_run_uuid")
         try:
-            self._cs.record_heartbeat(run_id)
+            self._cs.record_heartbeat(chain_run_uuid)
         except KeyError:
             # Worker reporting for an unknown run — discard. Likely a stale
             # machine that survived a coordinator wipe.
-            return {"ok": False, "reason": "unknown run_id"}
+            return {"ok": False, "reason": "unknown chain_run_uuid"}
         self._last_worker_activity = _now()
         return {"ok": True}
 
