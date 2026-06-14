@@ -25,6 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Chain orchestration: laptop-side wave sequencer (`leerie --chain`,
+  DESIGN §19).** Submit a multi-wave chain of leerie runs with
+  `--wave <prompt-file[,prompt-file,...]>` (repeatable per wave). Each
+  wave fans out N parallel `./leerie --runtime fly` invocations on the
+  laptop; the wave loop waits for all to finalize via the existing
+  single-run path (provision → seed-auth + seed-repo → orchestrator →
+  decide_teardown trap → fetch_branch → host_finalize →
+  destroy_machine), then runs `chain.git_ops.synth_merge_branches` in
+  `$USER_REPO` to build `leerie/stage/<chain-id>-wave-<N+1>` and
+  pushes it to origin before advancing to the next wave. The laptop is
+  the sequencer; **no Fly coordinator machine, no per-chain SQLite,
+  no 6PN HTTP, and zero Fly machines hold GitHub credentials at any
+  point** — each wave job's `host_finalize` runs on the laptop using
+  the user's existing `gh auth`. Chain-scoped verbs (`--status`,
+  `--stop`, `--kill`, `--resume`, `--finalize`, `--attach`,
+  `--list --chains`) operate by iterating
+  `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by the new
+  `chain_id` field. Resume after a wave failure via
+  `leerie --resume <chain-id>` then
+  `leerie --chain --chain-id <prior-uuid> --wave …`; the wave loop's
+  idempotency check (against `pushed_at` + the synth-merge probe via
+  `git ls-remote --exit-code origin <stage>`) skips already-completed
+  waves and synth-merge transitions whose stage branch is already on
+  origin.
+
 ### Changed
 
 - **`--attach` folded into `--resume`.** The two verbs collapsed into a
