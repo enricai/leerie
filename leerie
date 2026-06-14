@@ -346,16 +346,63 @@ case "${1:-}" in
     # current repo to fill in run-id columns. Without --runtime fly, this arm restores
     # the original argv and lets execution continue past the case block;
     # the orchestrator's argparse handles plain `--list`.
+    #
+    # --list --chains lists active chains (coordinator machines tagged
+    # with metadata.leerie_role=coordinator). Used by users (and by
+    # the deprecated --list-chains alias) to see what chains exist.
     _list_runtime=""
+    _list_chains_only=0
+    _list_runs_only=0
     _list_rest=("$@")
     shift
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --runtime) _list_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _list_runtime="${1#--runtime=}"; shift ;;
+        --chains) _list_chains_only=1; shift ;;
+        --runs)   _list_runs_only=1;   shift ;;
         *) shift ;;
       esac
     done
+
+    # --list --chains: query Fly Machines API for coordinator machines.
+    # This is a fast-path that bypasses the orchestrator's --list.
+    if [ "$_list_chains_only" = "1" ]; then
+      _lc_app="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${FLY_API_TOKEN:-}" ]; then
+        remote_log "--list --chains: FLY_API_TOKEN must be set"; exit 1
+      fi
+      _chains_json="$(curl -sS \
+        -H "Authorization: Bearer ${FLY_API_TOKEN}" \
+        "https://api.machines.dev/v1/apps/${_lc_app}/machines?metadata.leerie_role=coordinator")" || {
+          remote_log "--list --chains: Fly Machines API list failed"; exit 1
+      }
+      echo "$_chains_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if not isinstance(data, list) or not data:
+    print("(no active chains)")
+    sys.exit(0)
+rows = []
+for m in data:
+    if not isinstance(m, dict):
+        continue
+    md = m.get("metadata") or {}
+    chain_id = md.get("leerie_chain_id", "")
+    mid = m.get("id", "")
+    state = m.get("state", "")
+    created = m.get("created_at", "")
+    rows.append((chain_id, mid, state, created))
+headers = ("chain_id", "coordinator_machine_id", "state", "created_at")
+widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*("-" * w for w in widths)))
+for r in rows:
+    print(fmt.format(*r))
+'
+      exit 0
+    fi
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
       FLY_APP="${LEERIE_FLY_APP:-leerie}"
       USER_REPO="${USER_REPO:-$PWD}"

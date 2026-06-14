@@ -225,3 +225,42 @@ def test_kill_non_uuid_falls_through(tmp_path: Path) -> None:
     result = _run(tmp_path, ["--kill", RUN_ID, "--force"], curl_body="[]")
     log = result.curl_log
     assert f"metadata.leerie_chain_id={RUN_ID}" not in log
+
+
+# ---------------------------------------------------------------------------
+# --list --chains
+# ---------------------------------------------------------------------------
+
+
+def test_list_chains_renders_active_chains(tmp_path: Path) -> None:
+    body = (
+        '[{"id":"coord-a","state":"started","created_at":"2026-06-14T00:00:00Z",'
+        ' "metadata":{"leerie_role":"coordinator","leerie_chain_id":"abc-111"}},'
+        ' {"id":"coord-b","state":"started","created_at":"2026-06-14T01:00:00Z",'
+        ' "metadata":{"leerie_role":"coordinator","leerie_chain_id":"def-222"}}]'
+    )
+    result = _run(tmp_path, ["--list", "--chains"], curl_body=body)
+    assert result.returncode == 0, result.stderr + result.stdout
+    out = result.stdout
+    assert "chain_id" in out
+    assert "coord-a" in out
+    assert "coord-b" in out
+    assert "abc-111" in out
+    assert "def-222" in out
+
+
+def test_list_chains_empty_response(tmp_path: Path) -> None:
+    result = _run(tmp_path, ["--list", "--chains"], curl_body="[]")
+    assert result.returncode == 0
+    assert "no active chains" in (result.stdout + result.stderr).lower()
+
+
+def test_list_chains_via_deprecated_alias(tmp_path: Path) -> None:
+    """`leerie --list-chains` is shim'd to `leerie --list --chains`."""
+    body = (
+        '[{"id":"coord-x","state":"started","created_at":"2026-06-14T00:00:00Z",'
+        ' "metadata":{"leerie_role":"coordinator","leerie_chain_id":"deadbeef"}}]'
+    )
+    result = _run(tmp_path, ["--list-chains"], curl_body=body)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "deadbeef" in result.stdout
