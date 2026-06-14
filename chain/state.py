@@ -175,7 +175,7 @@ class ChainState:
         run_prompts: list[tuple[str, str]],
         queue_json: str = "{}",
     ) -> str:
-        """Insert a new chain and its associated run rows.
+        """Insert a new chain (with a freshly minted ``id``) and its run rows.
 
         Args:
             target: Target repo URL or local path.
@@ -190,7 +190,44 @@ class ChainState:
         Returns:
             The new chain's ``id``.
         """
-        chain_id = _new_id()
+        return self.create_chain_with_id(
+            chain_id=_new_id(),
+            target=target,
+            run_prompts=run_prompts,
+            queue_json=queue_json,
+        )
+
+    def create_chain_with_id(
+        self,
+        chain_id: str,
+        target: str,
+        run_prompts: list[tuple[str, str]],
+        queue_json: str = "{}",
+    ) -> str:
+        """Insert a new chain row with a *caller-supplied* ``chain_id``.
+
+        Used by the coordinator's first-boot bootstrap path: the launcher
+        (``leerie --chain``) generates a UUID host-side and bakes it into
+        both the coordinator's ``LEERIE_CHAIN_ID`` env var and into the
+        deterministic worker machine names. The coordinator must honor
+        that id when it self-bootstraps the chain row, rather than calling
+        :meth:`create_chain` (which would mint a fresh, unrelated UUID).
+
+        Args:
+            chain_id: The id to assign to the new row. Caller must
+                      guarantee uniqueness (it becomes the table's
+                      PRIMARY KEY).
+            target: Target repo URL or local path.
+            run_prompts: Ordered list of ``(prompt_text, wave)`` tuples.
+            queue_json: JSON-encoded DAG.
+
+        Returns:
+            ``chain_id`` (the same value the caller passed in).
+
+        Raises:
+            ValueError: If any wave is not a non-negative integer string.
+            sqlite3.IntegrityError: If *chain_id* already exists.
+        """
         now = _now()
         with self._conn:
             self._conn.execute(

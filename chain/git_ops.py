@@ -24,13 +24,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 
-
-def _die(msg: str, code: int = 1) -> None:
-    print(f"leerie-chain: error: {msg}", file=sys.stderr, flush=True)
-    sys.exit(code)
+from chain._log import die as _die
 
 
 def _run(args: list[str], cwd: str | Path | None = None, check: bool = True) -> subprocess.CompletedProcess:

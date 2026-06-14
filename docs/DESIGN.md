@@ -2693,25 +2693,39 @@ end-to-end requires the local-mode finalize to be exercised first;
 stacking new features on an unproven foundation is the failure mode
 this section is meant to surface.
 
-Chain orchestration (§19) is also not demonstrated. The launcher verbs
-(`--chain-submit`, `--chain-status`, `--list-chains`, `--chain-kill`,
-`--chain-attach`) are implemented and documented, but the `leerie-chain`
-Fly app — the persistent HTTP server, its SQLite state machine, N-wave
-sequencing, and machine-exit webhook handling — has not been exercised
-in a live run. The chain subsystem's behavior is reasoned, not observed.
+Chain orchestration (§19) is implemented but **not yet observed in a
+live deploy**. The architecture is the per-chain ephemeral coordinator
+described in §19: each `leerie --chain` submission spawns a
+shared-cpu-1x Fly machine running `chain/coordinator.py` with a 1GB
+volume for `/data/chain.db`; workers report to it directly over 6PN
+HTTP; the coordinator self-destructs on chain quiescence. The
+launcher's `--chain` verb (and the deprecated `--chain-submit` alias)
+is wired end-to-end, the ID-dispatched single-run verbs
+(`--status`, `--stop`, `--kill`, `--attach`) route UUID arguments to
+the coordinator, and the deprecated chain-prefixed aliases continue
+to shim to the new verbs.
 
-**Chain wave finalization is an explicit open item.** The webhook
-handler in `chain/server.py` transitions runs to `done`/`failed` and
-advances the chain's wave state, but it does *not* push the run branch
-to origin or open the PR. The helpers exist (`chain/git_ops.push_branch`,
-`chain/git_ops.open_pr`) but are unwired. A clean wave exit today
-therefore advances the chain to the next wave without producing a PR for the
-finished run. Wiring the push + PR into the webhook path is non-trivial
-because the per-run Fly machine has already exited (and is typically
-destroyed) by the time the webhook fires — the chain orchestrator must
-either fetch the branch from the machine before destruction or persist
-the branch tip into its own clone before the run is teardown'd. Both
-are real design work that belongs in §19 once chosen.
+**Wave finalization is wired**, replacing the prior unwired state.
+The coordinator now owns push + PR + synth-merge for chain runs:
+`chain/git_ops.finalize_run` (push + PR for one worker), and
+`chain/git_ops.write_audit_artifact` (post-mortem JSON pushed at
+self-destruct). This is the design correction discovered during
+the build: worker Fly machines have no GitHub push credentials by
+construction (`scripts/remote/seed-auth.sh:149-158` excludes them
+from the seed tar), so the host-side `host_finalize.sh` step is
+bypassed for chain runs and the coordinator takes its place. The
+coordinator receives the target-repo PAT in env (`GH_DISPATCH_PAT`)
+at chain submit.
+
+Smoke-test scripts at `scripts/smoke/chain-trivial.sh` and
+`scripts/smoke/chain-failure-modes.sh` exercise the full flow
+end-to-end (chain submit → wave 0 → wave 1 → audit artifact
+landed) and the three primary failure modes (worker crash via
+heartbeat staleness, coordinator crash + restart from volume,
+stale-creds resume). They have not yet been run against a real Fly
+account; until that happens, the chain subsystem's behavior is
+mechanically verified (151 unit tests across `tests/test_chain_*`)
+but not observed in production.
 
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.

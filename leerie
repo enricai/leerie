@@ -352,7 +352,6 @@ case "${1:-}" in
     # the deprecated --list-chains alias) to see what chains exist.
     _list_runtime=""
     _list_chains_only=0
-    _list_runs_only=0
     _list_rest=("$@")
     shift
     while [ "$#" -gt 0 ]; do
@@ -360,7 +359,9 @@ case "${1:-}" in
         --runtime) _list_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _list_runtime="${1#--runtime=}"; shift ;;
         --chains) _list_chains_only=1; shift ;;
-        --runs)   _list_runs_only=1;   shift ;;
+        # --runs is the historical default; accept it as a no-op so the
+        # documented `leerie --list --runs` form keeps working.
+        --runs)   shift ;;
         *) shift ;;
       esac
     done
@@ -1076,8 +1077,14 @@ if isinstance(data, list) and data:
       curl -fsSL "http://${_coord_host}/state"
       exit $?
     fi
-    # Fall through: treat as a run-id and re-exec --list with status filter.
-    exec "$0" --list --runs --run-id "$_st_id"
+    # Fall through: non-UUID id. The orchestrator's --list verb doesn't
+    # accept a positional run-id (it lists all runs and only filters by
+    # --status <state>), so route the user to the right command rather
+    # than exec'ing a path that would silently misbehave.
+    remote_log "--status: non-UUID id '$_st_id' looks like a run-id"
+    remote_log "  For a single run, inspect with: leerie --list --runtime fly"
+    remote_log "  Then filter by run-id with grep, or reattach with: leerie --resume $_st_id"
+    exit 1
     ;;
   --attach)
     # NEW: ID-dispatched attach verb.

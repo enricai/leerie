@@ -56,16 +56,17 @@ no Cloudflare/Vercel forwarder.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
-import sys
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
-from chain import fly_client
+from chain import fly_client, git_ops
+from chain._log import die, log
 from chain.state import (
     CHAIN_STATUSES,
     RUN_TERMINAL_STATUSES,
@@ -94,9 +95,10 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _log(msg: str) -> None:
-    """Stdout log line; Fly captures stdout into the machine's log stream."""
-    print(f"[coordinator] {msg}", flush=True)
+# Internal alias kept so the rest of this module reads as before.
+# `log` itself comes from chain._log; the body of every former `_log()`
+# call is unchanged.
+_log = log
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +345,7 @@ class Coordinator:
             "LEERIE_RUN_ID": run["id"],
             "LEERIE_TASK": run["prompt"],
             "LEERIE_TARGET_REPO": target,
-            "LEERIE_COORDINATOR_HOST": f"{self._self_machine_id}.vm.{fly_client._app()}.internal:8080",
+            "LEERIE_COORDINATOR_HOST": f"{self._self_machine_id}.vm.{fly_client.app_name()}.internal:8080",
         })
         return env
 
@@ -505,10 +507,6 @@ class Coordinator:
         chain = self._cs.load_chain(self._chain_id)
         if chain is None:
             return
-        # Import locally so chain.git_ops's git/gh shell-outs only get
-        # imported in environments where they make sense (not in unit
-        # tests that mock the coordinator).
-        from chain import git_ops
         git_ops.write_audit_artifact(chain)
 
 
@@ -663,13 +661,11 @@ def main() -> None:
     """
     chain_id = os.environ.get("LEERIE_CHAIN_ID", "").strip()
     if not chain_id:
-        print("[coordinator] error: LEERIE_CHAIN_ID is required", file=sys.stderr)
-        sys.exit(2)
+        die("LEERIE_CHAIN_ID is required", code=2)
 
     self_machine_id = os.environ.get("FLY_MACHINE_ID", "").strip()
     if not self_machine_id:
-        print("[coordinator] error: FLY_MACHINE_ID is required", file=sys.stderr)
-        sys.exit(2)
+        die("FLY_MACHINE_ID is required", code=2)
 
     worker_image = os.environ.get("LEERIE_IMAGE", "registry.fly.io/leerie:latest")
     region = os.environ.get("LEERIE_REGION", "iad").strip() or "iad"
@@ -705,58 +701,39 @@ def main() -> None:
     if existing is None:
         raw_queue_b64 = os.environ.get("LEERIE_QUEUE_JSON", "").strip()
         if not raw_queue_b64:
-            print(
-                "[coordinator] error: chain not in DB and LEERIE_QUEUE_JSON is empty",
-                file=sys.stderr,
+            die(
+                "chain row missing from /data/chain.db and "
+                "LEERIE_QUEUE_JSON is empty — coordinator cannot bootstrap",
+                code=2,
             )
-            sys.exit(2)
         try:
-            import base64
             raw = base64.b64decode(raw_queue_b64)
             queue_spec = json.loads(raw)
-        except Exception as exc:
-            print(
-                f"[coordinator] error: failed to decode LEERIE_QUEUE_JSON: {exc}",
-                file=sys.stderr,
-            )
-            sys.exit(2)
+        except (ValueError, json.JSONDecodeError) as exc:
+            die(f"failed to decode LEERIE_QUEUE_JSON: {exc}", code=2)
         target = queue_spec.get("target")
         runs_spec = queue_spec.get("runs") or []
         if not target or not isinstance(target, str):
-            print("[coordinator] error: queue spec missing 'target'", file=sys.stderr)
-            sys.exit(2)
+            die("queue spec missing 'target' (must be string)", code=2)
         run_prompts: list[tuple[str, str]] = []
         for r in runs_spec:
             prompt = r.get("prompt", "")
             wave = str(r.get("wave", ""))
             if not prompt or not wave.isdigit():
-                print(
-                    f"[coordinator] error: queue spec run missing prompt/wave: {r!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
+                die(f"queue spec run missing prompt/wave: {r!r}", code=2)
             run_prompts.append((prompt, wave))
         # Re-use the caller-supplied chain_id (the launcher pre-generated
         # it and baked it into both the coordinator env and the wave-0
-        # worker envs — so we MUST honor it rather than calling
-        # bootstrap_chain which mints a new UUID).
-        from chain.state import _new_id, _now
-        ts = _now()
-        with cs._conn:
-            cs._conn.execute(
-                "INSERT INTO chains"
-                " (id, target, queue_json, wave_state, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, 'wave_0', 'running', ?, ?)",
-                (chain_id, target, json.dumps(queue_spec), ts, ts),
-            )
-            for prompt, wave in run_prompts:
-                cs._conn.execute(
-                    "INSERT INTO chain_runs"
-                    " (id, chain_id, prompt, wave, status, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-                    (_new_id(), chain_id, prompt, wave, ts, ts),
-                )
-        _log(f"first-boot bootstrap complete (chain={chain_id}, runs={len(run_prompts)})")
+        # worker envs) by going through the public
+        # ChainState.create_chain_with_id rather than INSERTing into the
+        # private cs._conn handle.
+        cs.create_chain_with_id(
+            chain_id=chain_id,
+            target=target,
+            run_prompts=run_prompts,
+            queue_json=json.dumps(queue_spec),
+        )
+        log(f"first-boot bootstrap complete (chain={chain_id}, runs={len(run_prompts)})")
 
     coord = Coordinator(
         cs=cs,

@@ -22,8 +22,19 @@ def _token() -> str:
     return tok
 
 
-def _app() -> str:
+def app_name() -> str:
+    """Return the Fly app name from ``FLY_APP_NAME`` env (default ``'leerie'``).
+
+    Public so callers outside this module (e.g. ``chain.coordinator``)
+    can compose machine-internal DNS names without poking at module
+    internals.
+    """
     return os.environ.get("FLY_APP_NAME", "leerie").strip()
+
+
+# Backwards-compat alias. Used by older call sites; do not introduce
+# new uses. New code should call ``app_name`` directly.
+_app = app_name
 
 
 def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:

@@ -679,25 +679,24 @@ leerie/
 │   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that
 │                                  proposes and measures prompt patches for failing
 │                                  call_types; uses judge verdicts as the signal
-├── chain/                         leerie-chain Fly app — persistent chain-orchestration
-│   │                              service (DESIGN §19). Deploy once per user via
-│   │                              `fly launch` from this subdirectory.
-│   ├── Dockerfile                 leerie-chain container image (Debian 13-slim +
-│   │                              git/gh/flyctl/python3; no mise/claude-code/
-│   │                              build-essential). Entrypoint: `python3 -m chain`.
-│   ├── fly.toml                   Fly app config: persistent HTTP service,
-│   │                              min_machines_running=1, [http_service] port 8080,
-│   │                              [mounts] SQLite volume at /data.
+├── chain/                         Per-chain ephemeral coordinator subpackage (DESIGN §19).
+│   │                              Each `leerie --chain` submission launches one tiny
+│   │                              Fly machine from chain/Dockerfile that owns chain
+│   │                              state and self-destructs at chain end. No
+│   │                              persistent app; no fly.toml.
+│   ├── Dockerfile                 Per-chain coordinator container image (Debian 13-slim +
+│   │                              git/gh/python3). Entrypoint: `python3 -m chain`.
 │   ├── __init__.py                exports __version__ = "0.1.0"
-│   ├── __main__.py                `python3 -m chain` entry point — reads CHAIN_DB_PATH
-│   │                              / CHAIN_HOST / CHAIN_PORT env vars, calls
-│   │                              ChainState.init_db, make_server, serve_forever
-│   ├── config.py                  load_settings() → Settings frozen dataclass
-│   ├── state.py                   ChainState — SQLite-backed chain/run state model
-│   ├── fly_client.py              stdlib Fly Machines API client
-│   ├── webhooks.py                Fly webhook signature verification + event parsing
-│   ├── git_ops.py                 clone_target / create_stage_branch / push_branch / open_pr
-│   └── server.py                  make_server() — stdlib HTTPServer + ChainHTTPHandler
+│   ├── __main__.py                `python3 -m chain` entry point — delegates to
+│   │                              chain.coordinator.main.
+│   ├── coordinator.py             Per-chain HTTP server + decision logic + watchdog +
+│   │                              self-destruct. The Coordinator class owns chain-state
+│   │                              decisions; _CoordinatorHandler delegates HTTP routes.
+│   ├── state.py                   ChainState — SQLite-backed chain/run state model.
+│   ├── fly_client.py              stdlib Fly Machines API client.
+│   └── git_ops.py                 clone_target / create_stage_branch / synth_merge_branches /
+│                                  fetch_branch / push_branch / open_pr / finalize_run /
+│                                  write_audit_artifact.
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
@@ -853,35 +852,38 @@ leerie --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
 # (Claude Code CLI variable — not consumed by leerie itself):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 
-# Chain verbs: submit, inspect, and cancel multi-run chains via the
-# leerie-chain HTTP API. These are launcher fast-paths (like --kill) —
-# they never start a container and do not forward to the Python orchestrator.
-# LEERIE_CHAIN_URL sets the API base URL (default: http://localhost:8080).
+# Chain verbs: submit, inspect, pause, and destroy multi-run chains.
+# Each `leerie --chain` launches a per-chain ephemeral coordinator Fly
+# machine that owns chain state and self-destructs at chain end
+# (DESIGN §19). These are launcher fast-paths — they never start a local
+# container and do not forward to the Python orchestrator.
+export FLY_API_TOKEN=...                  # Fly Machines API access
+export GH_DISPATCH_PAT=...                # coordinator's push + PR ops
+export LEERIE_CHAIN_IMAGE=registry.fly.io/leerie-coordinator:0.7.2
+export LEERIE_WORKER_IMAGE=registry.fly.io/leerie:0.7.2
 
 # Submit a new chain. Each --wave flag defines one sequential wave
 # (comma-separated prompt-file paths). Waves execute in order; runs
 # within a wave execute in parallel. N waves are supported.
-# --target is the repo path (defaults to $USER_REPO or $PWD).
-leerie --chain-submit \
+# --target is the target-repo URL (defaults to $USER_REPO or $PWD).
+leerie --chain \
   --wave prompts/fetch.txt,prompts/lint.txt \
   --wave prompts/publish.txt \
-  --target ~/src/myrepo
+  --target https://github.com/me/myrepo
 
-# Check status of a chain. Prints the JSON response from GET /chains/<id>.
-leerie --chain-status <chain-id>
+# ID-dispatched verbs (UUID → chain scope; Fly machine id → run scope).
+leerie --status <chain-id>          # GET /state on the coordinator
+leerie --attach <chain-id>          # poll /state every 5s until terminal
+leerie --stop   <chain-id>          # POST /pause to the coordinator
+leerie --kill   <chain-id>          # destroy coordinator + every worker
+leerie --list --chains              # list live chains via Fly metadata
 
-# List all chains from the leerie-chain API (GET /chains).
-leerie --list-chains
-
-# Cancel a chain. Mirrors --kill semantics (DELETE /chains/<id>).
-leerie --chain-kill <chain-id>
-
-# Stream the chain orchestrator's log (GET /chains/<id>/log, streaming).
-# Mirrors --resume's default tail behavior for runs.
-leerie --chain-attach <chain-id>
-
-# Override the leerie-chain API base URL:
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+# Deprecated chain-prefixed aliases shim to the new verbs:
+#   --chain-submit → --chain
+#   --chain-status → --status
+#   --chain-kill   → --kill
+#   --chain-attach → --attach
+#   --list-chains  → --list --chains
 ```
 
 Requirements: the `claude` CLI on `PATH` and logged in interactively (no API
@@ -1827,7 +1829,7 @@ delegates to it. Endpoints:
 | `/pause` | POST | launcher (chain-scoped `--stop`) | Sets `chains.status = 'paused'` with a reason string. |
 | `/unpause` | POST | (future chain-scoped `--resume`) | Clears `paused` and returns `running`. |
 | `/state` | GET | launcher (chain-scoped `--status`/`--attach`) | Returns full `ChainState.load_chain(chain_id)` snapshot. |
-| `/health` | GET | launcher (chain-submit startup wait) | Liveness probe (always 200). |
+| `/health` | GET | launcher (`leerie --chain` startup wait) | Liveness probe (always 200). |
 
 On chain quiescence (status in `{done, failed, cancelled}`), the
 watchdog runs the self-destruct sequence: push
@@ -4074,244 +4076,13 @@ fresh-launch tail (`leerie "task" --runtime fly --auto-finalize`).
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 *Finalization* (recovery sub-paragraph).
 
-#### Chain launcher verbs (`leerie --chain-*`)
+#### Chain orchestration (cross-reference)
 
-Five fast-path verbs that talk to the leerie-chain HTTP API. They are
-handled entirely inside the `leerie` bash launcher (before the runtime
-preflight, alongside `--kill` / `--stop`), never forwarded to the Python
-orchestrator, and never start a container. `LEERIE_CHAIN_URL` sets the
-base URL (default: `http://localhost:8080`).
+The chain orchestration code surface is documented in
+[**§7 *Chain verbs***](#chain-verbs) earlier in this file (the launcher
+verbs, coordinator endpoints, state schema, and worker-side hooks).
+DESIGN.md §19 holds the architecture rationale.
 
-- **`leerie --chain-submit --wave <files> [--wave <files> ...] [--target <repo>]`**
-  — POST `/chains`. Each `--wave` value is a comma-separated list of
-  prompt-file paths; the launcher reads each file and emits one
-  `{"prompt": <file contents>, "wave": "<index>"}` object per file, where
-  the index is assigned by `--wave` flag order (0, 1, 2, …). N waves are
-  supported. `--target` is the repo path (defaults to `$USER_REPO` or
-  `$PWD`). The launcher converts the values to a JSON body via
-  `python3 -c '...'` and passes it to `curl -X POST`. Exits non-zero when
-  no `--wave` flags are passed, when a referenced prompt file does not
-  exist or is empty, or when an unknown flag is passed.
-
-- **`leerie --chain-status <chain-id>`** — GET `/chains/<chain-id>` and
-  print the JSON response. Exits non-zero when `<chain-id>` is missing or
-  looks like a flag.
-
-- **`leerie --list-chains`** — GET `/chains` and print the JSON response.
-
-- **`leerie --chain-kill <chain-id>`** — DELETE `/chains/<chain-id>`.
-  Exits non-zero when `<chain-id>` is missing or looks like a flag.
-
-- **`leerie --chain-attach <chain-id>`** — GET `/chains/<chain-id>/log`
-  (streaming endpoint). Exits non-zero when `<chain-id>` is missing or
-  looks like a flag.
-
-`--target` is intentionally absent from `_value_flags` in the
-launcher (the table at `leerie:942-947` that tells the main dispatch how to
-skip value tokens when forwarding to the orchestrator's argparse). Chain
-verbs consume these flags inline and never reach the forwarding path;
-`tests/test_launcher_value_flags_coupling.py` guards this invariant.
-
-#### Live deploy and smoke test
-
-Closes DESIGN.md §16's "reasoned, not observed" caveat for the chain
-subsystem. Until these steps have been run end-to-end against a real
-Fly deployment, the contract between launcher, server, and Fly webhook
-delivery is verified mechanically but not observed in production.
-
-**Prerequisites.**
-
-1. Fly org account with billing attached (the user's `personal` org).
-2. `flyctl` installed locally and authenticated (`flyctl auth status`).
-3. GitHub PAT with `repo` + `workflow` scopes for a throwaway target repo.
-4. A signing secret: `openssl rand -hex 32`.
-5. A Fly API token: `flyctl tokens create deploy --name leerie-chain`.
-
-**Deploy.**
-
-```bash
-cd chain
-fly launch --config fly.toml --dockerfile Dockerfile \
-  --name leerie-chain --region iad --no-deploy
-fly volumes create chain_data --region iad --size 1 --app leerie-chain
-fly secrets set \
-  GH_DISPATCH_PAT="<github-pat>" \
-  FLY_API_TOKEN="<fly-token>" \
-  CHAIN_WEBHOOK_SECRET="<openssl-rand-hex-32>" \
-  --app leerie-chain
-fly deploy --config fly.toml --app leerie-chain
-```
-
-After deploy, register the machine-exit webhook with Fly so events
-fire at `POST $LEERIE_CHAIN_URL/webhooks/fly`. The exact `flyctl`
-subcommand depends on the current Fly webhook surface — confirm at
-deploy time via `flyctl --help | grep -i webhook` (this step is the
-known unknown that the live test will pin down).
-
-**Smoke test.**
-
-```bash
-export LEERIE_CHAIN_URL=https://leerie-chain.fly.dev
-echo "Add a blank line to README.md" > /tmp/a.txt
-echo "Add a comment to that line"    > /tmp/b.txt
-leerie --chain-submit \
-  --wave /tmp/a.txt \
-  --wave /tmp/b.txt \
-  --target git@github.com:<user>/<throwaway>.git
-# capture CHAIN_ID from the response JSON
-leerie --chain-status "$CHAIN_ID"   # poll
-leerie --list-chains                # confirm the chain shows up
-leerie --chain-attach "$CHAIN_ID"   # event history
-leerie --chain-kill "$CHAIN_ID"     # idempotent on done chains
-```
-
-**Pass criteria.**
-
-- Wave 0 machine launches, exits cleanly, Fly fires the webhook.
-- `wave_state` advances `wave_0` → `wave_1`.
-- Wave 1 machine launches against the `stage-<chain-id>` branch.
-- Both runs land PRs against the target repo.
-
-After the test passes, DESIGN.md §16's chain-orchestration caveat
-should be updated to record the date and the validation artifact
-(chain id + Fly machine logs URL).
-
-#### `chain/` Python package
-
-The `chain/` directory at the repo root is the Python package for the
-leerie-chain orchestrator app (the HTTP server that coordinates multi-run
-chains). It is stdlib-only (no third-party imports). `chain/__init__.py`
-exports `__version__ = "0.1.0"`. `chain/config.py` exports `load_settings()
--> Settings` which reads the three required env vars at call time (not import
-time, so tests can monkeypatch before calling):
-
-| Env var | `Settings` field | Purpose |
-|---------|-----------------|---------|
-| `GH_DISPATCH_PAT` | `gh_dispatch_pat` | GitHub PAT for repo access and PR creation |
-| `FLY_API_TOKEN` | `fly_api_token` | Fly.io API token for Machines API |
-| `CHAIN_WEBHOOK_SECRET` | `chain_webhook_secret` | HMAC-SHA256 signing secret for webhook verification |
-
-`load_settings()` exits via `_die()` with a `leerie-chain: error:` prefix if
-any required var is absent or empty — mirrors leerie.py's `die()` pattern.
-`Settings` is a frozen dataclass. Covered by `tests/test_chain_config.py`.
-
-`chain/state.py` exports the `ChainState` class — the SQLite-backed state
-model for `leerie-chain`. Key public surface:
-
-| Symbol | Description |
-|--------|-------------|
-| `ChainState.init_db(path)` | Open (or create) the SQLite DB at `path`, apply schema (idempotent — uses `CREATE TABLE IF NOT EXISTS`), enable WAL mode. Returns a `ChainState` instance. |
-| `ChainState.create_chain(target, run_prompts)` | Insert a new chain row and its `run_prompts` as `chain_runs` rows. `run_prompts` is a list of `(prompt_text, wave)` tuples where `wave` is `'a'` or `'b'`. Returns the new chain's `id`. |
-| `ChainState.load_chain(chain_id)` | Return a full chain snapshot dict (chain fields + `"runs"` list), or `None` if not found. |
-| `ChainState.list_chains()` | Return all chain rows (no run sub-rows). |
-| `ChainState.transition_run(run_id, new_status, machine_id=None)` | Advance a run's status; optionally records the Fly machine ID. Raises `ValueError` on invalid status, `KeyError` if not found. |
-| `ChainState.transition_chain(chain_id, new_status)` | Set the chain's top-level status. Raises `ValueError`/`KeyError`. |
-| `ChainState.advance_wave(chain_id, new_wave_state)` | Advance the chain's wave state (`wave_0` → `wave_1` → … → `done`). Raises `ValueError`/`KeyError`. |
-| `ChainState.find_chain_id_by_machine_id(machine_id)` | Return the `chain_id` for the run with the given Fly machine ID, or `None` if not found. |
-| `ChainState.set_machine_id(run_id, machine_id)` | Record a Fly machine ID on a run row without changing status. Raises `KeyError` if not found. |
-| `ChainState.close()` | Close the underlying SQLite connection. |
-| `CHAIN_STATUSES` | `frozenset` of valid chain status values: `running`, `paused`, `done`, `failed`, `cancelled`. |
-| `RUN_STATUSES` | `frozenset` of valid run status values: `queued`, `running`, `done`, `failed`. |
-| `_valid_wave_state(s)` | Returns `True` if *s* is `'done'` or `'wave_N'` for non-negative integer N. Replaces the former `WAVE_STATES` frozenset. |
-
-Single-writer semantics mirror the orchestrator's `State` class: `leerie-chain` is one process on one Fly machine; all HTTP handler coroutines serialise on a single asyncio event loop and never interleave inside a SQLite transaction. WAL mode is enabled for defence-in-depth (concurrent readers are possible; the writer-exclusive lock prevents concurrent writes regardless). Covered by `tests/test_chain_state.py`.
-
-`chain/fly_client.py` is a thin stdlib-only HTTP client for the Fly Machines
-API. It exports `FlyClientError` (raised on API errors or missing token) and
-three functions:
-
-| Function | Endpoint | Returns |
-|----------|----------|---------|
-| `launch_machine(image, env, region, vm_cpus=4, vm_memory_mb=8192) -> str` | `POST /v1/apps/{app}/machines` | machine id string |
-| `get_machine_state(machine_id) -> str` | `GET /v1/apps/{app}/machines/{machine_id}` | state string (e.g. `"started"`) |
-| `destroy_machine(machine_id) -> None` | `DELETE /v1/apps/{app}/machines/{machine_id}?force=true` | None; 404 is silently ignored |
-
-Auth reads `FLY_API_TOKEN` from the environment; raises `FlyClientError` if
-absent or empty. App name reads `FLY_APP_NAME` (default: `"leerie"`). Uses
-`urllib.request` only — no third-party HTTP libraries. Covered by
-`tests/test_chain_fly_client.py`.
-
-`chain/webhooks.py` implements Fly webhook signature verification and machine-exit event parsing. It is stdlib-only (`hashlib`, `hmac`). Public surface:
-
-| Symbol | Description |
-|--------|-------------|
-| `WebhookError` | Raised when a webhook cannot be processed (bad signature, unknown run, missing fields). |
-| `verify_signature(secret, body, sig_header) -> bool` | Returns `True` iff the `fly-signature-256` header value (`hmac-sha256=<hex>`) matches the HMAC-SHA256 of `body` under `secret`. Uses `hmac.compare_digest` for constant-time comparison. Returns `False` (not raise) on malformed or absent headers. |
-| `parse_machine_event(payload) -> tuple[str, int, str] \| None` | Extracts `(machine_id, exit_code, event_type)` from an `io.fly.machine.exited` payload dict. Returns `None` for all other event types (callers ignore silently). Tolerates field-name variants: machine identity tried as `machine_id` → `id` → `instance_id`; exit code tried as `exit_code` → `exit_status`. Raises `WebhookError` if the event is an exit event but required fields are absent. |
-| `handle_machine_exit(cs, payload, secret, raw_body, sig_header) -> None` | Verifies signature, parses the event, finds the matching `chain_runs` row by `machine_id`, and transitions the run to `done` (exit code 0) or `failed` (non-zero). Non-exit events are silently ignored. Raises `WebhookError` on bad signature or if no run matches the machine_id. |
-
-The `fly-signature-256` header format is `hmac-sha256=<lowercase-hex-digest>`, matching the convention used by Fly.io webhook delivery. Covered by `tests/test_chain_webhooks.py` (in-memory SQLite, no network access).
-
-`chain/git_ops.py` exports the four git/PR operations the chain app uses
-inside its container (distinct from the host-side `scripts/host-finalize.sh`):
-
-| Function | Signature | Purpose |
-|----------|-----------|---------|
-| `clone_target` | `(repo_url, pat, clone_dir) -> Path` | Clone via HTTPS PAT-embedded URL (`https://<pat>@...`); dies on failure |
-| `create_stage_branch` | `(repo_path, chain_id, base_branch="main") -> str` | Create `stage-<chain_id>` off `base_branch`; idempotent — checks out existing branch instead of erroring |
-| `push_branch` | `(repo_path, branch_name) -> None` | `git push -u origin <branch>`; dies on failure |
-| `open_pr` | `(repo_path, head, base, title, body) -> str` | `gh pr create --base … --head … --title … --body-file -`; returns PR URL; dies on failure |
-
-All functions use `subprocess.run` directly (no third-party git library).
-`push_branch` and `open_pr` match the arg shape of `host-finalize.sh:105`
-and `host-finalize.sh:182-186` respectively. Covered by
-`tests/test_chain_git_ops.py` (local tmp git repo; gh stubbed via PATH).
-
-`chain/server.py` is the stdlib HTTP server that ties the chain subsystem
-together. It is stdlib-only (`http.server`, `json`, `os`, `tempfile`). Public surface:
-
-| Symbol | Description |
-|--------|-------------|
-| `make_server(cs, settings, host="0.0.0.0", port=8080) -> HTTPServer` | Factory that returns a configured `http.server.HTTPServer`. Captures `ChainState` and `Settings` in an inner `ChainHTTPHandler` subclass so the stdlib handler constructor interface is unchanged. |
-| `ChainHTTPHandler` | `BaseHTTPRequestHandler` subclass with three routes (see below). Subclasses must set `_cs` and `_settings` as class attributes — `make_server` does this via an inner class. |
-
-Endpoints:
-
-| Method | Path | Behaviour |
-|--------|------|-----------|
-| `POST` | `/chains` | Body: `{"target": str, "runs": [{"prompt": str, "wave": "0"\|"1"\|…}, ...]}`. Creates a chain row in SQLite, clones the target repo via `git_ops.clone_target`, creates the stage branch via `git_ops.create_stage_branch`, launches all wave 0 runs via `fly_client.launch_machine`, marks them `running`, and returns 201 with the full chain snapshot. Returns 400 on missing/invalid fields; 500 on git or Fly errors. |
-| `GET` | `/chains/<id>` | Returns 200 with the full chain snapshot (`ChainState.load_chain`), or 404 if not found. |
-| `POST` | `/webhooks/fly` | Reads `fly-signature-256` header; rejects with 400 on bad/absent signature. Dispatches to `handle_machine_exit`; after a successful current-wave completion, calls `_maybe_advance_wave` which advances `wave_state` to the next wave and launches its machines. If any current-wave run failed, pauses the chain. If the current wave completes with no subsequent waves, marks the chain `done`. Returns 200 `{"ok": true}` on success. |
-
-Covered by `tests/test_chain_server.py` (server spun in-process on an
-ephemeral port; `fly_client.launch_machine` and `git_ops` stubbed via
-`unittest.mock.patch` and `monkeypatch.setattr`; 22 tests).
-
-`chain/__main__.py` is the `python3 -m chain` entry point. It reads three
-env vars at startup (`CHAIN_DB_PATH` default `/data/chain.db`, `CHAIN_HOST`
-default `0.0.0.0`, `CHAIN_PORT` default `8080`), calls `ChainState.init_db`,
-`load_settings`, and `make_server`, then calls `httpd.serve_forever()`. This
-is the `CMD` target in `chain/Dockerfile`. Not separately unit-tested
-(integration-level via the server tests); the env-var defaults match the
-`[mounts]` destination (`/data`) and `[http_service].internal_port` (`8080`)
-declared in `chain/fly.toml`.
-
-`chain/Dockerfile` builds the leerie-chain container image. Base:
-`debian:13-slim`. Installed packages: `ca-certificates`, `curl`, `git`,
-`openssh-client`, `python3`, `python3-pip`, `gnupg`, `gh` (from
-`cli.github.com` apt repo), and `flyctl` (from `fly.io/install.sh`). Omits
-mise, claude-code, build-essential, and the `/inspect/` cache layers present
-in the repo-root `Dockerfile` — the chain app is not a worker. Non-root user
-created with `ARG HOST_UID=501 / HOST_GID=20` (same pattern as root
-Dockerfile). Volume mount point `/data` created and owned by the leerie user.
-The chain package is baked to `/app/chain/`; `WORKDIR /app`. Final `CMD`:
-`["python3", "-m", "chain"]`. Tests: `tests/test_chain_fly_toml.py`
-(structural checks — asserts entrypoint references chain, omits
-mise/claude-code, installs git+gh).
-
-`chain/fly.toml` configures the leerie-chain Fly app. Key fields:
-`app = "leerie-chain"`, `primary_region = "iad"`, `[build] dockerfile =
-"chain/Dockerfile"`. VM: 1 shared CPU, 512 MB. `[deploy]
-min_machines_running = 1`, `auto_stop_machines = "off"` — persistent,
-unlike the root fly.toml's ephemeral machines. `[http_service]
-internal_port = 8080`, `force_https = true`, `min_machines_running = 1`.
-`[mounts] source = "chain_data"`, `destination = "/data"` — SQLite
-persistent volume. Health check: `GET /chains` every 30 s. Provision once
-per user with `fly launch --config chain/fly.toml --dockerfile
-chain/Dockerfile --name leerie-chain --region iad --no-deploy` then
-`fly volumes create chain_data --region iad --size 1 --app leerie-chain`.
-Tests: `tests/test_chain_fly_toml.py` (validates TOML, asserts [http_service],
-[mounts], [build], internal_port=8080, min_machines_running≥1).
 
 ---
 

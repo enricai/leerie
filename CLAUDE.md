@@ -152,9 +152,10 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
-chain/                      leerie-chain Fly app — persistent chain-orchestration service
-                            (see DESIGN.md §19). fly launch once from this subdirectory
-                            to provision the app; subsequent --chain-submit calls reuse it.
+chain/                      Per-chain ephemeral coordinator subpackage (see DESIGN.md §19).
+                            Each `leerie --chain` submission launches one tiny Fly machine
+                            from `chain/Dockerfile` that holds chain state and self-destructs
+                            at chain end. No persistent app; no `fly.toml`.
 tests/                      pytest suite
 ```
 
@@ -302,21 +303,31 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie --list --status seed-failed
 ./leerie --resume <seed-failed-id>
 
-# Chain verbs: submit, inspect, and cancel multi-run chains via the
-# leerie-chain HTTP API. LEERIE_CHAIN_URL sets the endpoint
-# (default: http://localhost:8080). These verbs are launcher fast-paths
-# (like --kill) — they never start a container and do not forward to the
-# Python orchestrator. Each --wave flag defines one sequential wave
-# (N waves supported); waves execute in order:
-./leerie --chain-submit \
+# Chain verbs: submit, inspect, pause, and destroy multi-run chains. Each
+# `leerie --chain` launches a tiny ephemeral coordinator Fly machine that
+# owns chain state and self-destructs at chain end (DESIGN §19). These verbs
+# are launcher fast-paths (like --kill) — they never start a local container
+# and do not forward to the Python orchestrator. Each --wave flag defines
+# one sequential wave (N waves supported); waves execute in order, all jobs
+# inside a wave run in parallel:
+export FLY_API_TOKEN=...            # for the Fly Machines API
+export GH_DISPATCH_PAT=...          # for the coordinator's push + PR ops
+export LEERIE_CHAIN_IMAGE=registry.fly.io/leerie-coordinator:0.7.2
+export LEERIE_WORKER_IMAGE=registry.fly.io/leerie:0.7.2
+./leerie --chain \
   --wave "prompts/fetch.md,prompts/lint.md" \
   --wave "prompts/publish.md" \
-  --target /my/repo
-./leerie --chain-status <chain-id>
-./leerie --list-chains
-./leerie --chain-kill <chain-id>
-./leerie --chain-attach <chain-id>
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+  --target https://github.com/me/myrepo
+
+# ID-dispatched single-run verbs: pass a UUID → chain scope; pass a Fly
+# machine id → existing single-run behavior. Deprecated chain-prefixed
+# aliases (--chain-submit, --chain-status, --chain-kill, --chain-attach,
+# --list-chains) are kept for backwards compatibility.
+./leerie --status <chain-id>          # GET /state on the coordinator
+./leerie --attach <chain-id>          # poll /state every 5s until terminal
+./leerie --stop <chain-id>            # POST /pause to the coordinator
+./leerie --kill <chain-id>            # destroy coordinator + every worker
+./leerie --list --chains              # list live coordinators in the Fly app
 ```
 
 ## Testing
@@ -364,7 +375,8 @@ Before marking a change complete:
       `response_content` keys). Replace `<state-root>` with the resolved
       state directory (default: `$HOME/.leerie/<basename>/`).
 - [ ] `grep -q -- '--chain-submit)\|--chain-status)\|--list-chains)\|--chain-kill)\|--chain-attach)' leerie`
-      — if chain launcher verbs were touched, confirm all five verb case-arms
-      are still present in the launcher (see DESIGN.md §19 and
-      IMPLEMENTATION.md "Chain launcher verbs"; `pytest tests/test_chain_launcher_verbs.py`
-      for full coverage).
+      — if chain launcher verbs were touched, confirm all five deprecated-alias
+      case-arms are still present in the launcher (the aliases shim to the new
+      ID-dispatched verbs; see DESIGN.md §19 and IMPLEMENTATION.md "Chain
+      verbs"; `pytest tests/test_chain_launcher_id_dispatch.py` for the
+      ID-dispatch contract test).
