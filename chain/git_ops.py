@@ -148,8 +148,8 @@ class SynthMergeConflict(Exception):
     """A merge during synth_merge_branches conflicted.
 
     Carries the failing branch name and the git output for diagnostics
-    so the coordinator can surface it to the user via state file +
-    `leerie --status <chain-id>`.
+    so the laptop's --chain wave loop can surface it to the user and
+    pause the chain (DESIGN §19).
     """
 
     def __init__(self, branch: str, output: str) -> None:
@@ -218,8 +218,9 @@ def synth_merge_branches(
 def fetch_branch(repo_path: str | Path, branch: str) -> None:
     """``git fetch origin <branch>:<branch>`` into the local repo.
 
-    Used by the coordinator to pull a worker's just-pushed branch into
-    its own workspace before push + PR steps.
+    Kept for the existing test suite; not on the v5 Shape A active
+    chain code path (the laptop wave loop fetches branches via
+    ``synth_merge_branches``'s internal ``git fetch origin`` call).
     """
     repo_path = Path(repo_path)
     result = _run(
@@ -247,13 +248,13 @@ def finalize_run(
 ) -> str:
     """Push *head_branch* to origin and open a PR against *base_branch*.
 
-    Coordinator's equivalent of scripts/host-finalize.sh (which the
-    launcher runs host-side for non-chain runs). For chain runs the
-    launcher does not host-finalize — the coordinator does.
+    Kept for the existing test suite; not on the v5 Shape A active
+    chain code path. Chain runs use ``scripts/host-finalize.sh`` per
+    job (same as single-run ``--runtime fly``); the wave loop only
+    calls ``synth_merge_branches`` from this module.
 
-    Returns the PR URL on success. Raises SystemExit on push or PR-create
-    failure (the wrapper catches SystemExit and routes to a coordinator
-    pause/fail decision).
+    Returns the PR URL on success. Raises SystemExit on push or
+    PR-create failure.
     """
     push_branch(repo_path, head_branch)
     return open_pr(
@@ -281,13 +282,15 @@ def write_audit_artifact(
 ) -> None:
     """Push `_leerie-chains/<chain-id>/chain.json` to the target repo.
 
-    Called by the coordinator on self-destruct. The artifact is a single
-    file containing the chain snapshot (queue.json + per-run timing,
-    status, branch, exit_code, wave transitions) so post-mortem
-    inspection survives the coordinator's death.
+    Kept for the existing test suite; not on the v5 Shape A active
+    chain code path. The single-run flow each wave job invokes
+    already records run history under ``$LEERIE_STATE_HOST_DIR/runs/``,
+    so a separate audit artifact in the target repo is no longer
+    needed for the laptop-side wave loop.
 
     Args:
-        chain_snapshot: ``ChainState.load_chain`` output for the chain.
+        chain_snapshot: dict containing at minimum ``id`` and
+                        ``target`` (the target repo URL).
         repo_url: Override of the target repo URL. Defaults to
                   ``chain_snapshot["target"]``.
         pat: GitHub PAT for the push. Defaults to ``GH_DISPATCH_PAT`` env.
@@ -298,10 +301,6 @@ def write_audit_artifact(
       2. Check out *base_branch*.
       3. Write the artifact at ``_leerie-chains/<chain-id>/chain.json``.
       4. Commit and ``git push origin <base_branch>``.
-
-    Failures are NOT fatal — the coordinator catches any exception
-    and proceeds to self-destruct regardless. We don't want a flaky
-    push to keep the coordinator alive burning compute.
     """
     target = repo_url or chain_snapshot.get("target")
     if not target:
@@ -314,8 +313,8 @@ def write_audit_artifact(
 
     chain_id = chain_snapshot["id"]
 
-    # Use a tempdir as the clone — coordinator's /data volume is for
-    # SQLite, not for repo working trees.
+    # Use a tempdir as the clone — keep the audit-artifact work
+    # ephemeral.
     with tempfile.TemporaryDirectory(prefix=f"leerie-audit-{chain_id}-") as tmpdir:
         clone_root = Path(tmpdir) / "clone"
         clone_target(target, pat, clone_root)
@@ -328,7 +327,9 @@ def write_audit_artifact(
             json.dumps(chain_snapshot, indent=2, default=str) + "\n"
         )
 
-        # Configure identity for the commit (coordinator runs as a bot).
+        # Configure identity for the commit (bot identity matching
+        # how the artifact would be authored under any future
+        # automated path).
         _run(["git", "config", "user.email", "leerie-chain@bot.invalid"], cwd=clone_root)
         _run(["git", "config", "user.name", "leerie-chain"], cwd=clone_root)
         _run(["git", "add", str(artifact_path.relative_to(clone_root))], cwd=clone_root)

@@ -76,9 +76,12 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 #
 # Used by:
 #   - the STAGE-assembly block (sources $STAGE/.claude/.credentials.json
-#     for the Fly seed-auth tar pipe);
-#   - the --chain fast-path, which packs the result into
-#     LEERIE_WORKER_ENV_JSON for the coordinator → worker env.
+#     for the Fly seed-auth tar pipe) — this is the active path.
+#
+# (The function is also called by chain-aware tests; nothing in the
+# laptop-side --chain wave loop currently invokes it directly, since
+# each per-job ./leerie --runtime fly invocation runs its own
+# STAGE-assembly + seed-auth pipeline.)
 #
 # Prints the JSON to stdout. Returns 0 if creds were found, 1 otherwise.
 _extract_claude_credentials_json() {
@@ -121,6 +124,138 @@ try:
 except Exception:
     pass
 ' "$file" "$key"
+}
+
+# Idempotency probe for the --chain wave loop. Returns 0 (success) when
+# every run with chain_id=<id> AND wave_idx=<idx> has pushed_at set,
+# AND the count of such runs equals the expected wave size <n_expected>
+# (so a wave that partially completed in a prior session does not
+# pretend to be done). Returns non-zero otherwise.
+#
+# Reads $LEERIE_STATE_HOST_DIR/runs/*/run.json. Quiet on stdout/stderr.
+_wave_already_done() {
+  local chain_id="$1" wave_idx="$2" n_expected="$3"
+  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" "$n_expected" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+wave_idx_target = sys.argv[3]
+n_expected = int(sys.argv[4])
+runs_dir = state_dir / "runs"
+matched = 0
+pushed = 0
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    if str(data.get("wave_idx", "")) != wave_idx_target:
+        continue
+    matched += 1
+    if data.get("pushed_at"):
+        pushed += 1
+sys.exit(0 if (matched == n_expected and pushed == n_expected) else 1)
+PY
+}
+
+# Emit (one per line) every run-id in $LEERIE_STATE_HOST_DIR/runs/
+# that belongs to <chain_id> AND matches the per-verb filter <verb>.
+# Used by the chain-scoped verb arms (--stop, --kill, --finalize,
+# --resume) to enumerate runs for per-run dispatch. The verb name
+# selects a hardcoded filter inside the heredoc (no eval, no
+# injection surface — only known verb names are accepted).
+#
+# Supported verbs:
+#   stop     — runs whose machines are still actively running
+#              (have fly_machine_id, no terminal state).
+#   kill     — runs whose machines are not already destroyed
+#              (killed_at is null) and have fly_machine_id.
+#   finalize — runs whose work hasn't been pushed yet
+#              (pushed_at is null, not killed).
+#   resume   — paused runs (paused_at set, not killed).
+_chain_runs_filter() {
+  local chain_id="$1" verb="$2"
+  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$verb" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+verb = sys.argv[3]
+
+
+def matches(data: dict, verb: str) -> bool:
+    if verb == "stop":
+        # Running (has machine, no terminal state).
+        return (
+            not data.get("pushed_at")
+            and not data.get("killed_at")
+            and not data.get("paused_at")
+            and bool(data.get("fly_machine_id"))
+        )
+    if verb == "kill":
+        # Machine not already gone.
+        return data.get("killed_at") is None and bool(data.get("fly_machine_id"))
+    if verb == "finalize":
+        # Not pushed yet, not killed.
+        return not data.get("pushed_at") and not data.get("killed_at")
+    if verb == "resume":
+        # Paused, not killed.
+        return bool(data.get("paused_at")) and not data.get("killed_at")
+    sys.stderr.write(f"_chain_runs_filter: unknown verb {verb!r}\n")
+    sys.exit(2)
+
+
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    if matches(data, verb):
+        print(run_dir.name)
+PY
+}
+
+# Emit (one per line) the branch field of every run with chain_id=<id>
+# AND wave_idx=<idx>. Used by the --chain wave loop to gather wave-N
+# branch names for synth-merge. Works for both the just-fanned path
+# and the resume path (single discovery surface).
+_wave_branches() {
+  local chain_id="$1" wave_idx="$2"
+  python3 - "$LEERIE_STATE_HOST_DIR" "$chain_id" "$wave_idx" <<'PY'
+import json, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+chain_id = sys.argv[2]
+wave_idx_target = sys.argv[3]
+runs_dir = state_dir / "runs"
+for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if data.get("chain_id") != chain_id:
+        continue
+    if str(data.get("wave_idx", "")) != wave_idx_target:
+        continue
+    branch = data.get("branch") or ""
+    if branch:
+        print(branch)
+PY
 }
 
 # Read volume_id from a run's host-side sidecar. provision.sh persists
@@ -389,9 +524,10 @@ case "${1:-}" in
     # the original argv and lets execution continue past the case block;
     # the orchestrator's argparse handles plain `--list`.
     #
-    # --list --chains lists active chains (coordinator machines tagged
-    # with metadata.leerie_role=coordinator). Used by users (and by
-    # the deprecated --list-chains alias) to see what chains exist.
+    # --list --chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # groups by chain_id, and prints one row per chain. Used by users
+    # (and by the deprecated --list-chains alias) to see what chains
+    # exist in the local state dir.
     _list_runtime=""
     _list_chains_only=0
     _list_rest=("$@")
@@ -595,9 +731,9 @@ PY
     # and calls stop_machine. Resumable via --resume.
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
-    # POST /pause to the chain coordinator instead. The coordinator
-    # holds the chain at its current wave_state and stops advancing
-    # until --resume reaches it.
+    # iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by
+    # chain_id and invoke `leerie --stop <run-id>` per matching
+    # running run (pause the machine; preserve state for --resume).
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
@@ -606,28 +742,7 @@ PY
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
       _sp_chain="$1"; shift
       _sp_pass_args=("$@")
-      _sp_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_sp_chain" <<'PY'
-import json, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-chain_id = sys.argv[2]
-runs_dir = state_dir / "runs"
-for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
-    rj = run_dir / "run.json"
-    if not rj.is_file():
-        continue
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if data.get("chain_id") != chain_id:
-        continue
-    # Only stop runs whose machines are still running.
-    if (not data.get("pushed_at") and not data.get("killed_at")
-        and not data.get("paused_at") and data.get("fly_machine_id")):
-        print(run_dir.name)
-PY
-)"
+      _sp_run_ids="$(_chain_runs_filter "$_sp_chain" stop)"
       if [ -z "$_sp_run_ids" ]; then
         remote_log "--stop: no running runs found for chain $_sp_chain"
         exit 0
@@ -705,7 +820,9 @@ PY
     # NOT resumable afterwards — sets killed_at on the sidecar.
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
-    # destroy the coordinator AND every worker tagged with that chain_id.
+    # iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by
+    # chain_id and invoke `leerie --kill <run-id>` per matching live
+    # run (idempotent — already-killed runs are skipped).
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
@@ -716,26 +833,7 @@ PY
       _kc_chain="$1"; shift
       # Pass through --force / --runtime / etc. flags to per-run kill.
       _kc_pass_args=("$@")
-      _kc_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_kc_chain" <<'PY'
-import json, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-chain_id = sys.argv[2]
-runs_dir = state_dir / "runs"
-for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
-    rj = run_dir / "run.json"
-    if not rj.is_file():
-        continue
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if data.get("chain_id") == chain_id:
-        # Only kill runs whose machines aren't already gone.
-        if data.get("killed_at") is None and data.get("fly_machine_id"):
-            print(run_dir.name)
-PY
-)"
+      _kc_run_ids="$(_chain_runs_filter "$_kc_chain" kill)"
       if [ -z "$_kc_run_ids" ]; then
         remote_log "--kill: no live runs found for chain $_kc_chain (already destroyed or never ran)"
         exit 0
@@ -868,30 +966,7 @@ PY
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
       _fc_chain="$1"; shift
       _fc_pass_args=("$@")
-      _fc_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_fc_chain" <<'PY'
-import json, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-chain_id = sys.argv[2]
-runs_dir = state_dir / "runs"
-for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
-    rj = run_dir / "run.json"
-    if not rj.is_file():
-        continue
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if data.get("chain_id") != chain_id:
-        continue
-    # Skip already-pushed runs (idempotency).
-    if data.get("pushed_at"):
-        continue
-    if data.get("killed_at"):
-        continue
-    print(run_dir.name)
-PY
-)"
+      _fc_run_ids="$(_chain_runs_filter "$_fc_chain" finalize)"
       if [ -z "$_fc_run_ids" ]; then
         remote_log "--finalize: no pending runs found for chain $_fc_chain"
         exit 0
@@ -1307,27 +1382,7 @@ PY
       _rs_chain="$2"
       shift 2
       _rs_pass_args=("$@")
-      _rs_run_ids="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_rs_chain" <<'PY'
-import json, sys
-from pathlib import Path
-state_dir = Path(sys.argv[1])
-chain_id = sys.argv[2]
-runs_dir = state_dir / "runs"
-for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
-    rj = run_dir / "run.json"
-    if not rj.is_file():
-        continue
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    if data.get("chain_id") != chain_id:
-        continue
-    # Only resume paused runs; pushed/killed ones are done.
-    if data.get("paused_at") and not data.get("killed_at"):
-        print(run_dir.name)
-PY
-)"
+      _rs_run_ids="$(_chain_runs_filter "$_rs_chain" resume)"
       if [ -z "$_rs_run_ids" ]; then
         remote_log "--resume: no paused runs found for chain $_rs_chain"
         exit 0
@@ -1370,10 +1425,14 @@ PY
       case "$1" in
         --wave) _ch_waves+=("${2:-}"); shift 2 ;;
         --wave=*) _ch_waves+=("${1#--wave=}"); shift ;;
-        # --target is accepted but ignored (kept for CLI compatibility);
-        # the wave loop always operates against $USER_REPO directly.
-        --target) shift 2 ;;
-        --target=*) shift ;;
+        # --target is not supported under v5 Shape A. The wave loop
+        # always operates against $USER_REPO directly (the laptop's
+        # cwd). cd into the target repo and re-run.
+        --target|--target=*)
+          remote_log "--chain: --target is not supported; chains operate on \$USER_REPO directly."
+          echo "  Cd into the target repo and re-run leerie --chain --wave ..." >&2
+          exit 1
+          ;;
         --*) remote_log "--chain: unknown flag: $1"; exit 1 ;;
         *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
       esac
@@ -1457,72 +1516,91 @@ PY
     echo "  base branch: $_ch_current_base"
     echo ""
 
-    # Wave loop. Each wave: ensure $USER_REPO HEAD = current_base,
-    # fan out N background ./leerie --runtime fly --chain-id <id>,
-    # wait for all, tag each run.json with chain_id + wave_idx,
-    # synth-merge into stage branch (if next wave exists), push,
-    # advance current_base.
+    # Wave loop. Each wave:
+    #   - Idempotency: if every wave-N run (filtered by chain_id +
+    #     wave_idx) is already pushed_at, skip fan-out (resume from
+    #     a prior --chain invocation that completed this wave).
+    #   - Else: checkout current_base, fan out N background
+    #     ./leerie --runtime fly --chain-id <id>, wait, tag each
+    #     run.json with chain_id + wave_idx.
+    #   - Either way: gather wave-N branches from run.json, synth-
+    #     merge into next stage branch (if next wave exists), push,
+    #     advance current_base.
     _ch_offset=0
     for _wave_idx in "${!_ch_waves[@]}"; do
       _n="${_ch_jobs_per_wave[$_wave_idx]}"
-      remote_log "wave $_wave_idx: launching $_n job(s) from base $_ch_current_base"
 
-      # Ensure laptop HEAD = current_base so seed-repo.sh ships the
-      # right starting state to each worker.
-      git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
-        || { remote_log "--chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
+      if _wave_already_done "$_ch_id" "$_wave_idx" "$_n"; then
+        remote_log "wave $_wave_idx: already complete ($_n runs pushed); skipping fan-out"
+      else
+        remote_log "wave $_wave_idx: launching $_n job(s) from base $_ch_current_base"
 
-      # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so we
-      # can identify which fly-machine.json files belong to this wave.
-      # remote/<pid>.json is written by provision.sh post-provision; the
-      # pid is the per-job ./leerie's own $$, captured here via $! of
-      # the bash background process — same value.
-      _ch_wave_pids=()
-      _ch_wave_child_pids=()
-      for _k in $(seq 0 $((_n - 1))); do
-        _prompt="${_ch_prompts[$((_ch_offset + _k))]}"
-        # Background-launch single-run leerie. Each child runs its own
-        # full provision → seed → orchestrator → fetch_branch →
-        # host_finalize → destroy_machine pipeline on the laptop, and
-        # writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
-        "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly --chain-id "$_ch_id" &
-        _ch_wave_pids+=($!)
-        _ch_wave_child_pids+=($!)
-      done
+        # Ensure laptop HEAD = current_base so seed-repo.sh ships the
+        # right starting state to each worker.
+        git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
+          || { remote_log "--chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
 
-      # Wait for ALL wave-N jobs, capture per-child rc.
-      _ch_failed=0
-      for _p in "${_ch_wave_pids[@]}"; do
-        if ! wait "$_p"; then
-          _ch_failed=$((_ch_failed + 1))
+        # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so
+        # we can identify which fly-machine.json files belong to this
+        # wave. remote/<pid>.json is written by provision.sh post-
+        # provision; the pid is the per-job ./leerie's own $$,
+        # captured here via $! of the bash background process.
+        _ch_wave_pids=()
+        _ch_wave_child_pids=()
+        for _k in $(seq 0 $((_n - 1))); do
+          _prompt="${_ch_prompts[$((_ch_offset + _k))]}"
+          # Background-launch single-run leerie. Each child runs its
+          # own full provision → seed → orchestrator → fetch_branch →
+          # host_finalize → destroy_machine pipeline on the laptop,
+          # and writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
+          "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly --chain-id "$_ch_id" &
+          _ch_wave_pids+=($!)
+          _ch_wave_child_pids+=($!)
+        done
+
+        # Wait for ALL wave-N jobs, capture per-child rc.
+        _ch_failed=0
+        for _p in "${_ch_wave_pids[@]}"; do
+          if ! wait "$_p"; then
+            _ch_failed=$((_ch_failed + 1))
+          fi
+        done
+
+        # Tag every just-spawned run (whether finalized or paused-on-
+        # failure) with chain_id + wave_idx via the remote/<child-pid>.json
+        # → fly-machine.json → run.json chain. We tag BEFORE the failure
+        # check so paused runs are discoverable by `leerie --resume
+        # <chain-id>` / `--kill <chain-id>` / etc.
+        for _cp in "${_ch_wave_child_pids[@]}"; do
+          _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
+          [ -f "$_ch_remote_pointer" ] || continue
+          _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
+          [ -z "$_ch_mid" ] && continue
+          _ch_run_json="$LEERIE_STATE_HOST_DIR/runs/$_ch_mid/run.json"
+          [ -f "$_ch_run_json" ] || continue
+          update_run_json "$_ch_run_json" chain_id "$_ch_id" wave_idx "$_wave_idx" || true
+        done
+
+        if [ "$_ch_failed" -gt 0 ]; then
+          remote_log "wave $_wave_idx: $_ch_failed/$_n job(s) failed; chain paused"
+          echo ""
+          echo "Some wave-$_wave_idx jobs paused on failure. Recover with:"
+          echo "    leerie --resume $_ch_id"
+          echo "After paused runs complete, the chain state is recoverable"
+          echo "via single-run verbs; re-running 'leerie --chain --wave ...'"
+          echo "mints a new chain_id and starts from wave 0 (intentional —"
+          echo "cross-submission resume is not supported in MVP)."
+          exit 1
         fi
-      done
-
-      if [ "$_ch_failed" -gt 0 ]; then
-        remote_log "wave $_wave_idx: $_ch_failed/$_n job(s) failed; chain paused"
-        echo ""
-        echo "Some wave-$_wave_idx jobs paused on failure. Recover with:"
-        echo "    leerie --resume $_ch_id"
-        echo "After paused runs complete, re-run:"
-        echo "    leerie --chain --wave ... (the wave loop will skip already-done waves)"
-        exit 1
       fi
 
-      # Tag each just-finalized run with chain_id + wave_idx via the
-      # remote/<child-pid>.json → fly-machine.json → run.json chain.
+      # Gather wave-N branch names from run.json (single discovery
+      # surface that works for both the just-fanned path and the
+      # resume path).
       _ch_wave_branches=()
-      for _cp in "${_ch_wave_child_pids[@]}"; do
-        _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
-        [ -f "$_ch_remote_pointer" ] || continue
-        _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
-        [ -z "$_ch_mid" ] && continue
-        _ch_run_json="$LEERIE_STATE_HOST_DIR/runs/$_ch_mid/run.json"
-        [ -f "$_ch_run_json" ] || continue
-        update_run_json "$_ch_run_json" chain_id "$_ch_id" wave_idx "$_wave_idx" || true
-        # Collect this run's branch name for synth-merge.
-        _ch_branch="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("branch",""))' "$_ch_run_json" 2>/dev/null)"
+      while IFS= read -r _ch_branch; do
         [ -n "$_ch_branch" ] && _ch_wave_branches+=("$_ch_branch")
-      done
+      done < <(_wave_branches "$_ch_id" "$_wave_idx")
 
       # Synth-merge between waves: build the next wave's base branch.
       if [ "$((_wave_idx + 1))" -lt "${#_ch_waves[@]}" ]; then
@@ -1535,21 +1613,32 @@ PY
         # origin/<branch> works as-is.
         # Preserve any caller PYTHONPATH (e.g. test seam that shadows
         # chain.git_ops with a stub) by prepending our leerie dir.
+        # Single-quoted python source + argv pass-through avoids shell-
+        # quoting bugs when $USER_REPO or branch names contain
+        # apostrophes (legal in git refs, uncommon but possible in paths).
         _ch_branches_repr="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${_ch_wave_branches[@]}")"
-        if ! PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$_ch_leerie_dir" python3 -c "
+        if ! PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$_ch_leerie_dir" python3 -c '
 import json, sys
 from chain.git_ops import synth_merge_branches, SynthMergeConflict
-branches = json.loads('$_ch_branches_repr')
+repo, base, branches_json, stage = sys.argv[1:5]
+branches = json.loads(branches_json)
 try:
-    synth_merge_branches('$USER_REPO', '$_ch_current_base', branches, '$_ch_next_stage')
+    synth_merge_branches(repo, base, branches, stage)
 except SynthMergeConflict as exc:
-    sys.stderr.write(f'synth-merge conflict on {exc.branch}: {exc.output}\n')
+    sys.stderr.write(f"synth-merge conflict on {exc.branch}: {exc.output}\n")
     sys.exit(1)
-"; then
+' "$USER_REPO" "$_ch_current_base" "$_ch_branches_repr" "$_ch_next_stage"; then
           remote_log "wave $_wave_idx: synth-merge conflict; chain paused"
           echo ""
-          echo "Resolve the conflict in $USER_REPO, then re-run:"
-          echo "    leerie --chain --wave ... (the wave loop will resume from wave $((_wave_idx + 1)))"
+          echo "Wave-$_wave_idx PRs are open (each per-job host_finalize"
+          echo "pushed its branch). Synth-merge into the wave-$((_wave_idx + 1))"
+          echo "staging branch conflicted. To recover:"
+          echo "  1. cd $USER_REPO"
+          echo "  2. Resolve the conflict (the workspace is on a half-merged"
+          echo "     staging branch named leerie/stage/${_ch_id}-wave-$((_wave_idx + 1)))."
+          echo "  3. git commit + git push origin leerie/stage/${_ch_id}-wave-$((_wave_idx + 1))"
+          echo "  4. Submit a fresh chain for wave-$((_wave_idx + 1))+ work,"
+          echo "     or open the wave-$((_wave_idx + 1))+ PRs manually."
           exit 1
         fi
         # Push the staged base branch to origin so subsequent wave's

@@ -133,7 +133,10 @@ orchestrator and not used anywhere in this repo.
   *except* for documented non-error structured exits like
   `EXIT_NEEDS_ANSWERS=10`, where `die()`'s `leerie: error:` prefix would
   mislabel a non-error deferred-clarification signal. Both helpers live in
-  `leerie.py`.
+  `leerie.py`. The `chain/` subpackage is the second deliberate
+  exception: it provides its own `chain/_log.py::log()` and `die()`
+  because the package-isolation invariant forbids importing from
+  `orchestrator/leerie.py`.
 - **Type hints** on every function signature. Use PEP 604 union syntax
   (`str | None`, not `Optional[str]`) — Python 3.10+ is the minimum.
 - **Comments explain *why*, not *what*.** Well-named identifiers
