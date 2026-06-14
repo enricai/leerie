@@ -295,3 +295,18 @@ def test_chain_mode_detach_rc_130_unchanged(tmp_path):
     assert "[stub] destroy_machine called" not in combined
     assert "[stub] stop_machine called" not in combined
     assert "still running on Fly" in combined
+
+
+def test_chain_mode_detach_banner_includes_chain_scoped_commands(tmp_path):
+    """When LEERIE_CHAIN_ID is set, the rc=130 detach banner lists
+    chain-scoped recovery commands in addition to the run-scoped ones.
+    """
+    result = _run_decide_teardown_chain(rc=130, tmp_path=tmp_path)
+    combined = result.stdout + result.stderr
+    # Run-scoped (existing) commands still shown.
+    assert "leerie --resume rid-001" in combined
+    # Chain-scoped commands surfaced.
+    assert "leerie --status test-chain-uuid-001" in combined
+    assert "leerie --attach test-chain-uuid-001" in combined
+    assert "leerie --stop   test-chain-uuid-001" in combined
+    assert "leerie --kill   test-chain-uuid-001" in combined

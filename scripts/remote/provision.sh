@@ -470,6 +470,17 @@ decide_teardown() {
       if [ -z "${LEERIE_RUN_ID:-}" ]; then
         echo "  (run-id was not exported yet; check leerie --list to find it.)" >&2
       fi
+      # Chain-aware addition: if this run is part of a chain, surface the
+      # chain-scoped commands too so the user can act on the whole chain
+      # instead of just this run.
+      if [ -n "${LEERIE_CHAIN_ID:-}" ]; then
+        echo "" >&2
+        echo "  This run is part of chain ${LEERIE_CHAIN_ID}. Chain-scoped:" >&2
+        echo "    leerie --status ${LEERIE_CHAIN_ID}      # full chain state" >&2
+        echo "    leerie --attach ${LEERIE_CHAIN_ID}      # poll until chain done" >&2
+        echo "    leerie --stop   ${LEERIE_CHAIN_ID}      # pause whole chain" >&2
+        echo "    leerie --kill   ${LEERIE_CHAIN_ID}      # destroy coordinator + all workers" >&2
+      fi
       echo "  Machine: $mid (still running on Fly)" >&2
       echo "================================================================" >&2
       # Intentionally no stop/destroy — the orchestrator must keep running.
