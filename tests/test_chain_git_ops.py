@@ -22,7 +22,15 @@ def origin_repo(tmp_path: Path) -> Path:
     """Bare git repo that acts as the remote 'origin'."""
     origin = tmp_path / "origin.git"
     origin.mkdir()
-    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    # `-b main` pins the bare repo's HEAD symbolic ref to refs/heads/main
+    # regardless of the runner's init.defaultBranch config. Without this,
+    # CI runners (which default to `master`) leave HEAD pointing at a
+    # nonexistent branch after we push HEAD:main — subsequent `git clone`
+    # then checks out an empty working tree.
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
     return origin
 
 
@@ -31,7 +39,10 @@ def seeded_origin(origin_repo: Path, tmp_path: Path) -> Path:
     """Bare origin with an initial commit on main so branches can be created."""
     seed = tmp_path / "seed"
     seed.mkdir()
-    subprocess.run(["git", "init", str(seed)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(seed)],
+        check=True, capture_output=True,
+    )
     subprocess.run(
         ["git", "remote", "add", "origin", str(origin_repo)],
         cwd=seed, check=True, capture_output=True,

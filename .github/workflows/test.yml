@@ -38,6 +38,11 @@ jobs:
       - name: Syntax check (from CLAUDE.md task-completion checklist)
         run: python -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"
 
+      - name: Set git identity (CI runners have no global config)
+        run: |
+          git config --global user.email "ci@leerie.invalid"
+          git config --global user.name "Leerie CI"
+
       - name: Run tests with coverage
         run: pytest tests/ -ra --cov=orchestrator --cov-report=term --cov-report=xml
 

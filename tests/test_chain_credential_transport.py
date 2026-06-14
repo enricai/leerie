@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -101,6 +102,10 @@ def _invoke_helper(
 # Credential acquisition fallback chain
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
 def test_returns_keychain_blob_on_darwin(tmp_path: Path) -> None:
     """On Darwin, when the stub `security` binary returns a JSON blob,
     the helper prints it verbatim."""
@@ -147,6 +152,10 @@ def test_returns_nonzero_when_no_creds_available(tmp_path: Path) -> None:
     assert out == ""
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
 def test_keychain_wins_over_file_on_darwin(tmp_path: Path) -> None:
     """The Keychain path is the macOS canonical source; prefer it over
     a stale on-disk file."""

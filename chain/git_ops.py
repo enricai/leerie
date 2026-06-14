@@ -201,8 +201,20 @@ def synth_merge_branches(
         )
 
     for branch in dep_branches:
+        # `git merge --no-ff` always creates a merge commit, which needs
+        # an author/committer identity. The repo may not have local
+        # `user.email`/`user.name` set, and the laptop's global git
+        # config might also be unset (rare but possible — also the
+        # case in CI containers). Pass a bot identity defensively via
+        # `-c` so the merge succeeds regardless of ambient config.
+        # Bot identity matches write_audit_artifact's convention.
         merge = _run(
-            ["git", "merge", "--no-ff", "--no-edit", f"origin/{branch}"],
+            [
+                "git",
+                "-c", "user.email=leerie-chain@bot.invalid",
+                "-c", "user.name=leerie-chain",
+                "merge", "--no-ff", "--no-edit", f"origin/{branch}",
+            ],
             cwd=repo_path, check=False,
         )
         if merge.returncode != 0:
