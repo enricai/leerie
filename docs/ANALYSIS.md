@@ -7,9 +7,9 @@
 > source text — preprocess → lex → parse/AST → semantic graph — so the facts
 > are deterministic: same input, same output.
 >
-> **Provenance.** Generated 2026-06-18 against commit `4a7785d` (release
-> 0.7.2). The primary subject, `orchestrator/leerie.py`, is pinned by content
-> hash `sha256:e7175fa9a52dd03d08c911511201d580a49e0903e626de347e318b4ad050574f`.
+> **Provenance.** Generated 2026-06-18 against commit `5b62ae3` (release
+> 0.8.9). The primary subject, `orchestrator/leerie.py`, is pinned by content
+> hash `sha256:7b657ac3e7fe7c5f91d21a73a12d8998f77932f8d30b951146c62b92848248af`.
 >
 > **Regenerate.** `python3 docs/tools/leerie_extract.py orchestrator/leerie.py`.
 > If the headline numbers in §1–§2 differ from a fresh run, this document is
@@ -30,7 +30,7 @@ correct deep perspective on this project.
 
 - **Compiler A — the analysis tool.** `docs/tools/leerie_extract.py` is a real
   front end run *over* leerie's source to produce the deterministic facts in
-  §1–§2. When this document says "888 `If` nodes" or "fan-in of `claude_p` is
+  §1–§2. When this document says "896 `If` nodes" or "fan-in of `claude_p` is
   13," that is Compiler A's output, not prose.
 
 - **Compiler B — leerie itself.** Leerie *is* a compiler. Its source language
@@ -67,14 +67,14 @@ The repository's tracked files are the "translation units." Counted from
 
 | Layer | Files | Largest |
 |---|---|---|
-| Orchestrator (all control flow) | `orchestrator/leerie.py` | **15,011 lines** |
-| Launcher (portable bash) | `leerie` | 3,012 lines |
-| Canonical docs | `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`, `INSTALL`, `USAGE` | 3,052 / 4,743 |
+| Orchestrator (all control flow) | `orchestrator/leerie.py` | **15,158 lines** |
+| Launcher (portable bash) | `leerie` | 3,861 lines |
+| Canonical docs | `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`, `INSTALL`, `USAGE` | 3,026 / 4,706 |
 | Worker prompts | `prompts/*.md` (12 files) | `reconciler.md` 541 |
 | Worktree mechanics (bash) | `scripts/*.sh` | — |
 | Remote/Fly mechanics (bash) | `scripts/remote/*.sh` (11 files) | `seed-repo.sh` 850 |
-| Chain service (Python, stdlib) | `chain/*.py` (8 modules) | `server.py` 492 |
-| Tests | `tests/test_*.py` (≈155 files) | `test_reconciler_cycle_gate.py` 2,739 |
+| Chain sequencer (laptop, Shape A) | `chain/*.py` (3 modules) | `git_ops.py` 363 |
+| Tests | `tests/test_*.py` (154 files) | `test_reconciler_cycle_gate.py` 2,739 |
 
 The single most important preprocessing fact: **one file, `leerie.py`, holds
 all orchestrator control flow** (a deliberate design choice — readable
@@ -83,27 +83,27 @@ much here; almost the entire "semantics of leerie" lives in one parseable AST.
 
 ### 1.2 Stage L — Lex (the token census)
 
-`tokenize` over `leerie.py`: **80,841 tokens**.
+`tokenize` over `leerie.py`: **81,816 tokens**.
 
 | Token class | Count | Reading |
 |---|---|---|
 | `OP` | 29,411 | operator-dense (subscripts, calls, dict literals) |
 | `NAME` | 23,568 | identifiers + keywords |
 | `STRING` | 4,881 | many prompt fragments and messages |
-| `COMMENT` | 2,704 | **155,497 comment chars ≈ 22.3% of bytes** — heavily annotated "why" |
-| `FSTRING_START` | 930 | 930 f-strings (dynamic prompt/message assembly) |
+| `COMMENT` | 2,724 | **156,672 comment chars ≈ 22.2% of bytes** — heavily annotated "why" |
+| `FSTRING_START` | 941 | 941 f-strings (dynamic prompt/message assembly) |
 | `NUMBER` | 549 | caps, timeouts, byte budgets |
 
 Keyword frequency exposes the dominant idiom — **branching and guarding**:
 
 ```
-if 1008   return 493   for 487   not 425   await 151   async 81
-try 112   except 122   raise 54   with 18
+if 1019   return 497   for 501   not 430   await 152   async 81
+try 114   except 124   raise 54   with 18
 ```
 
-`if` appears 1,008 times. This is the lexical signature of the "code enforces"
+`if` appears 1,019 times. This is the lexical signature of the "code enforces"
 principle: the file is mostly conditionals that validate worker output and
-gate state transitions. The `async`/`await` counts (81 / 151) mark it as an
+gate state transitions. The `async`/`await` counts (81 / 152) mark it as an
 asyncio program (parallel worker waves).
 
 The lexer also harvests the project's literal **vocabulary** from string
@@ -113,32 +113,32 @@ symbols `EXIT_NEEDS_ANSWERS`, `EXIT_BUDGET_INFEASIBLE`, `EXIT_LOCKED`
 
 ### 1.3 Stage S — Parse / AST (the declared surface)
 
-`ast.parse` yields **60,834 AST nodes**. The node histogram is itself a
+`ast.parse` yields **61,632 AST nodes**. The node histogram is itself a
 fingerprint of the architecture:
 
 | Node | Count | Meaning |
 |---|---|---|
-| `If` | 888 | enforcement/guard density |
-| `Compare` | 621 | predicate-heavy validation |
-| `BoolOp` | 451 | compound conditions |
-| `Try` / `ExceptHandler` | 112 / 122 | defensive subprocess + IO handling |
-| `Call` | 3,592 | — |
-| `FunctionDef` / `AsyncFunctionDef` | 219 / 73 | 292 `def`s total |
-| `Await` | 151 | concurrency points |
+| `If` | 896 | enforcement/guard density |
+| `Compare` | 634 | predicate-heavy validation |
+| `BoolOp` | 463 | compound conditions |
+| `Try` / `ExceptHandler` | 114 / 124 | defensive subprocess + IO handling |
+| `Call` | 3,646 | — |
+| `FunctionDef` / `AsyncFunctionDef` | 222 / 73 | 295 `def`s total |
+| `Await` | 152 | concurrency points |
 | `Raise` | 54 | explicit failure surfacing |
 
 Declared module surface:
 
-- **231 module-level functions**
+- **234 module-level functions**
 - **8 classes** (one core, `State`; the rest are small — see §2.5)
-- **142 module-level constants**
+- **145 module-level constants**
 - **21 import statements** (see §2.1)
 
 ### 1.4 Determinism contract
 
 Compiler A is pure stdlib, reads only, and is order-stable. The committed
 tool was re-run during this analysis and reproduced the headline numbers
-byte-for-byte (`sha256` equal, 15011 / 80841 / 231 / 8 / 142). That is the
+byte-for-byte (`sha256` equal, 15158 / 81816 / 234 / 8 / 145). That is the
 operational meaning of "deterministic documentation": the report is a
 *function* of the source, and the function is checked into the repo.
 
@@ -317,7 +317,7 @@ on the run *directory*), `save` (temp-file write + `os.replace` = atomic),
 `load`, `bump_workers` (raises `WorkerError` past `max_total_workers` — the
 runtime budget backstop), `add_telemetry`, `release_lock`, `__del__`.
 
-### 2.6 The function surface — 231 functions, grouped
+### 2.6 The function surface — 234 functions, grouped
 
 Compiler A buckets the names by prefix; the buckets *are* the subsystem map:
 
@@ -346,7 +346,7 @@ The 14 `check_*` functions are the heart of the "code enforces" principle:
 **Fan-in (most-depended-on primitives)** — the leaf utilities every pass calls:
 
 ```
-log 41   die 33   run_proc 17   claude_p 13   load_prompt 12   now 11
+log 42   die 33   run_proc 18   claude_p 13   load_prompt 12   now 11
 _read_toml_key 10   compute_run_branch 8   _resolve_positive_int_pref 8
 _confidence_issues 6   _run_checked_loop 6
 ```
@@ -359,7 +359,7 @@ _confidence_issues 6   _run_checked_loop 6
 **Fan-out (the drivers)** — functions that orchestrate many others:
 
 ```
-main 40   _run_phases 27   phase_reconcile 21   run_final_conformance 16
+main 40   _run_phases 28   phase_reconcile 21   run_final_conformance 16
 settle_subtask 16   _run_conformance_phase 14   phase_provision 13
 phase_plan 11   phase_overlap_judge 11   integrate_wave 11
 ```
@@ -401,7 +401,7 @@ any) and the deterministic gate that follows it:
 | 6 | `phase_finalize` | **emit object code** | pr_writer (sonnet) | `finalize.sh` verify + push/PR (host) |
 
 Visual control flow (verified by reading the `_run_phases` source body,
-`orchestrator/leerie.py:14130-14219`; a static call list does not encode
+`orchestrator/leerie.py:14276-14385`; a static call list does not encode
 order, so this was confirmed line-by-line, not inferred):
 
 ```
@@ -663,17 +663,32 @@ proving the orchestrator is dead via `/proc` scan), `collect-subtrees.sh`,
 `decide_teardown` runs `fetch_branch` *before* `destroy_machine`, and any sync
 failure leaves the machine RUNNING.
 
-### 5.5 The chain service — a meta-compiler over runs
+### 5.5 The chain sequencer — a meta-compiler over runs (Shape A)
 
-`chain/` is a persistent, stdlib-only Fly app (`leerie-chain`) that sequences N
-ordered waves of leerie runs (DESIGN §19). It is the same "deterministic driver
-+ delegated work" pattern one level up: SQLite (WAL) holds chain/run state;
-`POST /chains` launches wave-0 machines via the Fly Machines REST API; a
-HMAC-verified `POST /webhooks/fly` on `io.fly.machine.exited` advances waves
-(all-done → next wave; any-failed → `paused`; no-next → `done`). The chain
-machine holds the GitHub PAT so the no-credentials-on-worker invariant is
-preserved. HTTP surface: `POST /chains`, `GET /chains`, `GET /chains/<id>`,
-`GET /chains/<id>/log`, `DELETE /chains/<id>`, `POST /webhooks/fly`.
+`chain/` is **not** a service. As of 0.8.x (DESIGN §19, "Shape A") a chain is a
+**laptop-side wave sequencer**: `leerie --chain --wave a,b --wave c` mints a
+`chain_id`, then for each wave runs N normal `./leerie "<prompt>" --runtime fly
+--chain-id <id>` jobs in parallel, waits for all to finalize, and synth-merges
+that wave's branches into a staging branch `leerie/stage/<chain-id>-wave-<N+1>`
+that seeds the next wave. Each job reuses the single-run path verbatim
+(provision → seed → orchestrator → `decide_teardown` → `fetch_branch` →
+`host_finalize` → `destroy_machine`); the wrapper just loops and merges.
+
+There is **no coordinator** — no SQLite, no HTTP server, no webhooks, and no Fly
+machine that holds credentials (the v3/v4 designs that had those were rejected
+for adding failure modes without reducing footprint). A chain exists only as the
+set of single runs sharing a `chain_id` tag in their `run.json`; `wave_idx`
+records membership. Chain-scoped verbs (`--status` / `--stop` / `--kill` /
+`--resume` / `--finalize <chain-id>`, `--list --chains`) work by iterating
+`$LEERIE_STATE_HOST_DIR/runs/*/run.json`, filtering on `chain_id`, and
+dispatching to the existing single-run verb per discovered run. GitHub
+credentials live only on the laptop (`gh auth`, `~/.git-credentials`); workers
+never see them (the `seed-auth.sh` exclusion list). The `chain/` Python package
+is now just `__init__.py`, `_log.py` (its own `log`/`die` — the package may not
+import `orchestrator/leerie.py`), and `git_ops.py` (`synth_merge_branches`,
+`create_stage_branch`, `push_branch`, `open_pr`, …). It is still a meta-compiler
+over runs — a chain is sequenced waves of compiles — only now laptop-sequenced,
+not service-coordinated.
 
 ---
 
@@ -701,14 +716,14 @@ sub-commands consume it:
 ## 7. How the project keeps itself deterministic
 
 The orchestrator shells out to `claude` and `flyctl` — both non-deterministic —
-yet the suite (~155 test files) is fully deterministic via three techniques:
+yet the suite (154 test files) is fully deterministic via three techniques:
 
 1. **Pure-function unit tests** for everything checkable (the 30 `resolve_*`,
    6 `validate_*`, 14 `check_*`, `_derive_run_status`), loaded by importing
    `leerie.py` as a module through an `importlib` conftest fixture.
 2. **Monkeypatched `_invoke`** returning canned JSON envelopes, so async phase
-   / heal / telemetry logic runs against a fake LLM; plus an in-process
-   `HTTPServer` + `:memory:` SQLite for the chain app.
+   / heal / telemetry logic runs against a fake LLM; the chain is covered by
+   `git_ops` unit tests plus a bash launcher-sequencer harness (no HTTP/SQLite).
 3. **A bash subprocess harness** that *sources* the real `.sh` scripts with a
    fake `flyctl`/`claude` placed first on `PATH`, asserting exit codes and
    stdout.
@@ -758,9 +773,9 @@ Total worker invocations across the whole derivation are hard-bounded by
 # Stages P/L/S/SEM over the orchestrator (JSON to stdout, digest to stderr):
 python3 docs/tools/leerie_extract.py orchestrator/leerie.py /tmp/leerie_ast.json
 
-# Headline numbers expected at commit 4a7785d:
-#   lines=15011 tokens=80841 ast_nodes=60834 functions=231 classes=8 constants=142
-#   sha256=e7175fa9a52dd03d08c911511201d580a49e0903e626de347e318b4ad050574f
+# Headline numbers expected at commit 5b62ae3:
+#   lines=15158 tokens=81816 ast_nodes=61632 functions=234 classes=8 constants=145
+#   sha256=7b657ac3e7fe7c5f91d21a73a12d8998f77932f8d30b951146c62b92848248af
 ```
 
 The extractor (`docs/tools/leerie_extract.py`) is pure stdlib and read-only.
@@ -786,7 +801,7 @@ because a static call list does not encode branches or loops.)
 | Config | `resolve_*` (30), `_read_toml_key`, `_parse_bool_envtoml` |
 | Self-heal | `phase_judge`, `phase_heal`, `heal_*`, `request_patch`, `replay_capture` |
 | Prompt preprocessor | `load_prompt`, `_PROMPT_INCLUDE_RE` |
-| Chain service | `chain/server.py` (`make_server`), `chain/state.py` (`ChainState`) |
+| Chain (laptop sequencer) | `leerie --chain` wave loop (launcher); `chain/git_ops.py` (`synth_merge_branches`) |
 
 ## Appendix C — Cross-reference to the canon
 
