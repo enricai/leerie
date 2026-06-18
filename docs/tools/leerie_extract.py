@@ -179,15 +179,24 @@ def main() -> None:
             self.stack: list[str] = []
 
         def _enter(self, node, qual):
-            edges, seq = [], []
+            # Collect calls with source position so the sequence reflects
+            # textual order. ast.walk yields BFS order, which is meaningless
+            # for reading control flow. NOTE: source order is still not
+            # execution order (branches/loops), so true pipeline order must be
+            # verified by reading driver bodies, not inferred from this list.
+            hits = []
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Call):
                     c = sub.func
                     nm = c.id if isinstance(c, ast.Name) else (c.attr if isinstance(c, ast.Attribute) else None)
                     if nm and nm in func_names:
-                        seq.append(nm)
-                        if nm not in edges:
-                            edges.append(nm)
+                        hits.append((getattr(sub, "lineno", 0), getattr(sub, "col_offset", 0), nm))
+            hits.sort()
+            seq = [nm for _, _, nm in hits]
+            edges = []
+            for nm in seq:
+                if nm not in edges:
+                    edges.append(nm)
             callgraph[qual], ordered[qual] = edges, seq
 
         def visit_FunctionDef(self, node):

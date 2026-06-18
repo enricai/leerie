@@ -154,7 +154,7 @@ The import list proves the stdlib-preferred claim from `CLAUDE.md`. Of 21
 imports, **exactly one is third-party**:
 
 ```
-stdlib: argparse asyncio contextlib copy fcntl json os re shutil signal
+stdlib: __future__.annotations  argparse asyncio contextlib copy fcntl json os re shutil signal
         subprocess sys time uuid  +  collections.deque  collections.abc
         datetime  pathlib  zoneinfo
 3rd-party: tenacity  (AsyncRetrying, RetryError, retry_if_result,
@@ -328,7 +328,7 @@ Compiler A buckets the names by prefix; the buckets *are* the subsystem map:
 | `check_*` | 14 | **deterministic enforcement gates** (return issue lists) |
 | `validate_*` | 6 | structural output validators (`die` on violation) |
 | `run_*` | 8 | subprocess + worker drivers (`run_proc`, `run_script`, `run_streaming`, `run_implementer`, `run_conformer`, …) |
-| `heal_*`, `judge`, `replay_capture`, `request_patch` | — | self-improvement loop (§6) |
+| `heal_*`, `judge_capture`, `phase_judge`, `replay_capture`, `request_patch` | — | self-improvement loop (§6) |
 | `_cgroup_*` | 4 | cgroup-v2 memory containment |
 | `_tarjan_sccs`, `_build_predecessor_graph`, `_attribute_cycle_edges`, `_shared_files_in_scc` | — | the scheduler's graph algorithms |
 | `_DescendantTracker`, `_enumerate_descendants`, `_terminate_proc_tree`, `_signal_pids` | — | worker subtree termination |
@@ -400,25 +400,30 @@ any) and the deterministic gate that follows it:
 | 5b | `run_conformer` | **lint/peephole** | conformer (sonnet) | protected-path re-check (advisory) |
 | 6 | `phase_finalize` | **emit object code** | pr_writer (sonnet) | `finalize.sh` verify + push/PR (host) |
 
-Visual control flow (from `_run_phases`' extracted ordered-call sequence):
+Visual control flow (verified by reading the `_run_phases` source body,
+`orchestrator/leerie.py:14130-14219`; a static call list does not encode
+order, so this was confirmed line-by-line, not inferred):
 
 ```
 preflight
    │
    ▼
-phase_classify ──▶ gather_answers? ──▶ phase_provision
-   │                                        │
-   ▼                                        ▼
-phase_plan (×planner_samples → select best) ──▶ detect_no_work? ──[empty]──▶ done (exit 0)
+phase_classify ──▶ phase_provision ──▶ gather_answers?   (provision precedes clarify; both skipped on --resume)
+   │
+   ▼
+phase_plan (×planner_samples → select best)
    │
    ▼
 phase_reconcile ──[unresolved requires]──▶ reconciler ──▶ _tarjan_sccs (acyclic?) ──[cycle]──▶ retry/die
    │
    ▼
+detect_no_work? ──[every planner cleared its gate + plan empty]──▶ _finish_no_work_run ──▶ done (exit 0)
+   │ (work remains)
+   ▼
 phase_overlap_judge ──[>1 planner]──▶ overlap judge ──▶ apply collisions ──▶ _tarjan_sccs
    │
    ▼
-schedule (topo-sort → waves[])  ──▶ check_budget_feasibility (EXIT 11?)  ──▶ write_plan
+schedule (topo-sort → waves[]) ──▶ check_budget_feasibility (EXIT 11?) ──▶ validate_plan ──▶ write_plan
    │
    ▼
 phase_execute   for wave in waves:   implementers ‖ ... ──▶ integrate_wave ──▶ conform ──▶ settle_subtask
@@ -441,8 +446,10 @@ clarification because *what to ask* depends on *what kind of task it is*
 run_mise_install → [fallback] gather_provision_fixtures → load_prompt →
 claude_p → check_provision_output`. The LLM `provision` worker fires *only*
 when the deterministic lockfile table returns empty. This is the single §12
-carve-out (DESIGN §6½): the only place an LLM-generated artifact is rendered
-into a later prompt — contained by a frozen argv-allowlist
+carve-out in the live compile (DESIGN §6½): the only place in the task→PR
+pipeline where an LLM-generated artifact is rendered into a later prompt (the
+offline heal loop in §6 does too, but post-run) — contained by a frozen
+argv-allowlist
 (`_PROVISION_ARGV0_ALLOW`: pnpm/npm/yarn/pip/uv/go/cargo/...) and a
 shell-metachar denylist.
 
@@ -680,8 +687,9 @@ sub-commands consume it:
 - **`phase_judge`** (`main → phase_judge`): replays harvested calls through a
   `judge` worker scoring `{schema_ok, factual_ok, hallucination_ok}` →
   verdict files.
-- **`phase_heal`**: `heal_baseline → heal_apply_patch → check_convergence →
-  heal_replay_patched → request_patch`. The `patch_generator` worker proposes a
+- **`phase_heal`**: `heal_baseline` runs once to measure the noise floor, then
+  a loop of `request_patch → heal_apply_patch → heal_replay_patched →
+  check_convergence`. The `patch_generator` worker proposes a
   minimal edit to a *worker system prompt* (`anchor` must be a literal
   substring of the live prompt — code-validated), and the loop replays to see
   if pass-rate improves (threshold `0.9`, ≤10 rounds, plateau detection). This
@@ -715,12 +723,12 @@ source text so it cannot silently drift.
 
 ## 8. A grammar of the pipeline
 
-A normal run, as a grammar (derived from `_run_phases`' ordered call sequence;
+A normal run, as a grammar (verified against the `_run_phases` source body;
 `?` = conditional, `‖` = parallel, `{n}` = bounded by a cap):
 
 ```
-run            ::= preflight classify provision plan reconcile? overlap_judge?
-                   ( no_work_exit | schedule setup execute_waves finalize )
+run            ::= preflight classify provision clarify? plan reconcile?
+                   ( no_work_exit | overlap_judge? schedule setup execute_waves finalize )
 
 classify       ::= classifier_worker  ▷ check_classifier_output            [opus]
 clarify?       ::= gather_answers      ▷ SOURCE_OF_TRUTH_VALUES gate       (zero questions by default)
@@ -736,7 +744,7 @@ wave           ::= ( implementer_worker ){max_parallel,‖}                  [so
                    ▷ conformer_worker?  ▷ settle_subtask
 finalize       ::= final_conformer ▷ pr_writer ▷ host( push ▷ gh_pr_create )
 
-no_work_exit   ::= ε                                                       (all planners ready + empty → exit 0)
+no_work_exit   ::= ε                  (decided after reconcile: every planner cleared its gate + plan empty → exit 0)
 ```
 
 Total worker invocations across the whole derivation are hard-bounded by
@@ -759,7 +767,10 @@ The extractor (`docs/tools/leerie_extract.py`) is pure stdlib and read-only.
 Its four stages correspond to §1.1–§1.4. The JSON it emits contains the full
 constant list, function/class records (with signatures, line spans, and
 one-line docstrings), and the complete intra-module call graph with per-function
-ordered call sequences — the raw material for every table above.
+call sequences ordered by source position — the raw material for the tables
+above. (Runtime control-flow order — the §3.1 pipeline and the §8 grammar — was
+confirmed by reading the `_run_phases` and `phase_heal` driver bodies directly,
+because a static call list does not encode branches or loops.)
 
 ## Appendix B — Subsystem index (where to look in the code)
 
