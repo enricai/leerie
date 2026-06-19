@@ -422,6 +422,14 @@ CORPUS_MANIFEST_VERSION = 1
 # ROOT/"corpus" so the working-tree corpus is read.
 CORPUS_DIR_ENV = "LEERIE_CORPUS_DIR"
 
+# Acting workers reconstruct env on replay (Tier 2); everything else is
+# text-tier. (Mirrors the model-default acting/judgment split.)
+ACTING_WORKER_TYPES = ("implementer", "conformer", "integrator", "provision")
+
+# Flipped to True in Increment B once _snapshot_env_fixture / replay_in_env
+# land. Until then, env capture die()s with a clear message.
+_ENV_CAPTURE_READY = False
+
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
 # LEERIE_CONFIDENCE_ROUNDS env var → leerie.toml → DEFAULT_CAPS
@@ -7320,6 +7328,179 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
 
     (out_dir / "REPORT.json").write_text(json.dumps(report, indent=2))
     return report
+
+
+def _utc_now_iso() -> str:
+    """UTC ISO-8601 with millisecond precision + Z (matches _capture_call)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _next_case_id(corpus_dir: Path, call_type: str,
+                  base: str | None = None) -> str:
+    """Allocate the next free case id for a call_type, e.g.
+    'classifier-001'. `base` overrides the call_type stem (from --case)."""
+    stem = base or call_type
+    cases_dir = corpus_dir / "cases" / call_type
+    existing = {p.stem for p in cases_dir.glob(f"{stem}-*.json")} \
+        if cases_dir.exists() else set()
+    i = 1
+    while f"{stem}-{i:03d}" in existing:
+        i += 1
+    return f"{stem}-{i:03d}"
+
+
+async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
+                         caps: dict, st: "State", models: dict[str, str],
+                         efforts: dict[str, str | None], *,
+                         call_types: list[str] | None = None,
+                         case_name: str | None = None,
+                         tier: str = "text",
+                         tolerance: float | None = None) -> dict:
+    """Promote a run's known-good calls into the golden corpus and pin a
+    baseline (DESIGN §14).
+
+    Steps: (1) read <leerie_root>/runs/<run-id>/calls.ndjson, select
+    success && parsed_ok records (optionally filtered by call_type);
+    (2) write each as cases/<call_type>/<case_id>.json; (3) for env-tier
+    cases, snapshot fixtures (Increment B); (4) run phase_regress once
+    against the current prompts to measure and pin baseline_pass_rate,
+    prompt_sha, and judge_prompt_sha into manifest.json.
+    """
+    if tier not in ("text", "all"):
+        # Env capture needs the fixture snapshotter from Increment B.
+        if tier == "env" and not _ENV_CAPTURE_READY:
+            die("corpus capture --tier env requires the Tier-2 fixture "
+                "snapshotter (Increment B) — not yet available")
+
+    calls_path = leerie_root / "runs" / run_id / "calls.ndjson"
+    if not calls_path.exists():
+        die(f"corpus capture: no calls.ndjson for run {run_id!r}")
+
+    records: list[dict] = []
+    for line in calls_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not (rec.get("success") and rec.get("parsed_ok")):
+            continue
+        if call_types is not None and rec.get("call_type") not in call_types:
+            continue
+        records.append(rec)
+
+    if not records:
+        die(f"corpus capture: no success && parsed_ok records in run "
+            f"{run_id!r} matching the filter")
+
+    manifest = _load_corpus_manifest(corpus_dir)
+    manifest.setdefault("captured_from", [])
+    manifest["captured_from"].append({"run_id": run_id, "ts": _utc_now_iso()})
+    manifest.setdefault("defaults", {
+        "tolerance": REGRESS_TOLERANCE_DEFAULT,
+        "n_text": REGRESS_N_TEXT_DEFAULT, "n_env": REGRESS_N_ENV_DEFAULT})
+
+    by_type: dict[str, list[str]] = {}
+    for rec in records:
+        ct = rec["call_type"]
+        case_id = _next_case_id(corpus_dir, ct, case_name)
+        case_dir = corpus_dir / "cases" / ct
+        case_dir.mkdir(parents=True, exist_ok=True)
+        case_tier = "env" if (tier in ("env", "all")
+                              and ct in ACTING_WORKER_TYPES) else "text"
+        fixture_ptr = None
+        if case_tier == "env":
+            fixture_ptr = _snapshot_env_fixture(  # Increment B
+                corpus_dir, case_id, rec, leerie_root, run_id)
+        (case_dir / f"{case_id}.json").write_text(json.dumps({
+            "case_id": case_id, "call_type": ct,
+            "captured_from_run": run_id, "fixture": fixture_ptr,
+            "record": rec,
+        }, indent=2))
+        by_type.setdefault(ct, []).append((case_id, case_tier))
+
+    # Merge into manifest call_types (append to any existing case list).
+    for ct, items in by_type.items():
+        entry = manifest["call_types"].setdefault(ct, {
+            "tier": items[0][1], "cases": [],
+            "baseline_pass_rate": 0.0,
+            "n": REGRESS_N_ENV_DEFAULT if items[0][1] == "env"
+                 else REGRESS_N_TEXT_DEFAULT,
+            "tolerance": REGRESS_ENV_TOLERANCE_DEFAULT if items[0][1] == "env"
+                         else REGRESS_TOLERANCE_DEFAULT,
+        })
+        for case_id, _ in items:
+            if case_id not in entry["cases"]:
+                entry["cases"].append(case_id)
+
+    # Write a provisional manifest so phase_regress can read the cases.
+    _validate_corpus_manifest(manifest)
+    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    # Pin the baseline: measure the current prompts' pass-rate over the
+    # freshly-written cases.
+    out_dir = st.run_dir / "corpus-capture-out"
+    report = await phase_regress(corpus_dir, out_dir, caps, st, models,
+                                 efforts, tier=tier if tier != "text" else "text",
+                                 call_types=list(by_type.keys()),
+                                 tolerance=tolerance)
+    now = _utc_now_iso()
+    for ct in by_type:
+        cur = report["per_call_type"].get(ct, {}).get("current", 0.0)
+        manifest["call_types"][ct]["baseline_pass_rate"] = cur
+        manifest["call_types"][ct]["prompt_sha"] = _prompt_sha(ct)
+        manifest["call_types"][ct]["baseline_captured_at"] = now
+    manifest["judge_prompt_sha"] = _prompt_sha("judge")
+    _validate_corpus_manifest(manifest)
+    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    log(f"corpus capture: pinned baseline for {sorted(by_type)} from run "
+        f"{run_id!r}")
+    return manifest
+
+
+def corpus_list(corpus_dir: Path) -> None:
+    """Print the corpus manifest summary (one line per call_type)."""
+    manifest = _load_corpus_manifest(corpus_dir)
+    cts = manifest.get("call_types", {})
+    if not cts:
+        log("corpus: empty (no manifest or no call_types)")
+        return
+    log(f"corpus: {len(cts)} call_type(s) at {corpus_dir}")
+    for ct in sorted(cts):
+        cfg = cts[ct]
+        log(f"  {ct:20s} tier={cfg['tier']:4s} cases={len(cfg['cases']):3d} "
+            f"baseline={cfg['baseline_pass_rate']:.2%} "
+            f"tol={cfg['tolerance']:.2f} n={cfg['n']}")
+
+
+def _update_baseline(corpus_dir: Path, report: dict) -> None:
+    """Re-pin manifest baselines + shas from a fresh --regress report
+    (after an intentional prompt change)."""
+    manifest = _load_corpus_manifest(corpus_dir)
+    now = _utc_now_iso()
+    for ct, r in report.get("per_call_type", {}).items():
+        if ct in manifest["call_types"]:
+            manifest["call_types"][ct]["baseline_pass_rate"] = r["current"]
+            manifest["call_types"][ct]["prompt_sha"] = _prompt_sha(ct)
+            manifest["call_types"][ct]["baseline_captured_at"] = now
+    manifest["judge_prompt_sha"] = _prompt_sha("judge")
+    _validate_corpus_manifest(manifest)
+    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    log("corpus: baseline re-pinned (--update-baseline)")
+
+
+def _print_regress_report(report: dict) -> None:
+    """Render a --regress report to the log."""
+    log(f"regress: overall={report['overall']}")
+    for ct in sorted(report.get("per_call_type", {})):
+        r = report["per_call_type"][ct]
+        log(f"  {ct:20s} {r['verdict']:9s} current={r['current']:.2%} "
+            f"baseline={r['baseline']:.2%} tol={r['tolerance']:.2f} "
+            f"({r['passes']}/{r['total']})")
+    for w in report.get("warnings", []):
+        log(f"  WARN: {w}")
 
 
 def heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
