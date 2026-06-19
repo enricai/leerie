@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,13 @@ def load_prompt(name: str) -> str:
     raw = (PROMPTS / f"{name}.md").read_text()
     return _PROMPT_INCLUDE_RE.sub(
         lambda m: (PROMPTS / m.group(1)).read_text(), raw)
+
+
+def _prompt_sha(name: str) -> str:
+    """sha256 of the post-include prompt text for `name`. Used for corpus
+    provenance: a changed sha means the prompt (or one of its includes)
+    moved since the baseline was pinned."""
+    return hashlib.sha256(load_prompt(name).encode("utf-8")).hexdigest()
 
 # Minimum `claude` CLI version that supports `--json-schema` in `claude -p`
 # mode. Anthropic CHANGELOG v2.1.22 (2026-01-28): "Fixed structured outputs
@@ -374,6 +382,7 @@ EXIT_BUDGET_INFEASIBLE = 11
 # state.json (DESIGN §6 *Single owner per run dir*). 75 aligns with
 # the BSD sysexits.h EX_TEMPFAIL convention.
 EXIT_LOCKED = 75
+EXIT_REGRESSED = 12       # leerie --regress: a call_type regressed past tolerance
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -391,6 +400,27 @@ SOURCE_OF_TRUTH_FILE = "leerie.toml"
 RUNTIME_VALUES = ("local", "fly")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
+
+# --- Behavioral regression gate (DESIGN §14, golden corpus) -------------
+# Defaults track HEAL_N_REPLAYS_DEFAULT: the gate reuses heal's n-replay
+# pass-rate pattern. The env tier is noisier and costlier, so it replays
+# fewer times under a wider tolerance.
+REGRESS_TOLERANCE_DEFAULT = 0.15        # text-tier pass-rate drop allowed before REGRESSED
+REGRESS_N_TEXT_DEFAULT = 5              # replays per text-tier case (tracks HEAL_N_REPLAYS_DEFAULT)
+REGRESS_N_ENV_DEFAULT = 3              # replays per env-tier case (slower/costlier)
+REGRESS_ENV_TOLERANCE_DEFAULT = 0.20    # env-tier pass-rate drop allowed before REGRESSED
+
+REGRESS_TOLERANCE_ENV = "LEERIE_REGRESS_TOLERANCE"
+REGRESS_TOLERANCE_FILE = SOURCE_OF_TRUTH_FILE   # leerie.toml
+
+CORPUS_TIERS = ("text", "env")
+CORPUS_MANIFEST_VERSION = 1
+
+# The corpus lives in the leerie tool repo (it guards prompts/*.md). In the
+# container the launcher bind-mounts it read-write at /corpus and sets
+# LEERIE_CORPUS_DIR; on the host (tests, direct invocation) it defaults to
+# ROOT/"corpus" so the working-tree corpus is read.
+CORPUS_DIR_ENV = "LEERIE_CORPUS_DIR"
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -1969,6 +1999,57 @@ def _validate_run_json(data: dict) -> None:
         )
 
 
+def _validate_corpus_manifest(data: dict) -> None:
+    """Enforce logical invariants on corpus/manifest.json (DESIGN §14).
+
+    Mirrors _validate_run_json: pure validation, raises ValueError on any
+    violation; the caller decides whether to die() or warn.
+
+    Invariants:
+      1. top-level: version == CORPUS_MANIFEST_VERSION; call_types is a dict.
+      2. each call_type entry: tier in CORPUS_TIERS; cases a non-empty list
+         of strings; baseline_pass_rate a float in [0,1]; n an int >= 1
+         (not a bool); tolerance a float in [0,1].
+      3. judge_prompt_sha, when present, is a non-empty str.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("corpus manifest must be a JSON object")
+    if data.get("version") != CORPUS_MANIFEST_VERSION:
+        raise ValueError(
+            f"corpus manifest version must be {CORPUS_MANIFEST_VERSION}, "
+            f"got {data.get('version')!r}")
+    cts = data.get("call_types")
+    if not isinstance(cts, dict):
+        raise ValueError("corpus manifest call_types must be a JSON object")
+    for ct, cfg in cts.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"call_type {ct!r}: entry must be an object")
+        if cfg.get("tier") not in CORPUS_TIERS:
+            raise ValueError(
+                f"call_type {ct!r}: tier must be one of {CORPUS_TIERS}, "
+                f"got {cfg.get('tier')!r}")
+        cases = cfg.get("cases")
+        if not isinstance(cases, list) or not cases:
+            raise ValueError(f"call_type {ct!r}: cases must be a non-empty list")
+        if not all(isinstance(c, str) for c in cases):
+            raise ValueError(f"call_type {ct!r}: case ids must be strings")
+        rate = cfg.get("baseline_pass_rate")
+        if not isinstance(rate, (int, float)) or isinstance(rate, bool) \
+                or not (0.0 <= rate <= 1.0):
+            raise ValueError(
+                f"call_type {ct!r}: baseline_pass_rate must be in [0,1]")
+        n = cfg.get("n")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError(f"call_type {ct!r}: n must be an int >= 1")
+        tol = cfg.get("tolerance")
+        if not isinstance(tol, (int, float)) or isinstance(tol, bool) \
+                or not (0.0 <= tol <= 1.0):
+            raise ValueError(f"call_type {ct!r}: tolerance must be in [0,1]")
+    jsha = data.get("judge_prompt_sha")
+    if jsha is not None and (not isinstance(jsha, str) or not jsha):
+        raise ValueError("judge_prompt_sha must be a non-empty string")
+
+
 # --- PR body composition (DESIGN §6 "Finalization") ---------------------
 
 def compose_pr_body(state: dict, run_id: str) -> str:
@@ -3238,6 +3319,16 @@ def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
         repo_root, cli_value,
         env_var=HEAL_DIR_ENV, file_key="heal_dir",
         file_name=HEAL_DIR_FILE, default=HEAL_DIR_DEFAULT)
+
+
+def resolve_corpus_dir() -> Path:
+    """Resolve the golden-corpus directory. LEERIE_CORPUS_DIR (set by the
+    launcher to the writable /corpus bind-mount in-container) wins; else
+    ROOT/'corpus' (host/test runs read the working-tree corpus)."""
+    env = os.environ.get(CORPUS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    return ROOT / "corpus"
 
 
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
