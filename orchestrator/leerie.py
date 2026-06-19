@@ -7394,6 +7394,42 @@ def check_convergence(state: HealState, config: dict) -> str:
     return "CONTINUE"
 
 
+def compare_to_baseline(results: dict[str, list[dict]], manifest: dict) -> dict:
+    """Deterministic regression verdict (DESIGN §14, the §12 enforcement
+    point). Pure Python — no model judgment.
+
+    `results` maps each call_type to the flat list of judge verdict dicts
+    phase_regress produced (one per replay per case). `manifest` is the
+    validated corpus manifest. A call_type REGRESSES when its
+    freshly-measured pass-rate falls more than `tolerance` below the pinned
+    `baseline_pass_rate`. Mirrors check_convergence's REGRESSED arm.
+    Empty corpus → OK with a warning (a green gate then proves nothing).
+    """
+    call_types = manifest.get("call_types", {})
+    if not call_types:
+        return {"overall": "OK", "per_call_type": {},
+                "warnings": ["corpus is empty — no call_types to compare; "
+                             "a green gate proves nothing"]}
+    per: dict[str, dict] = {}
+    overall = "OK"
+    for ct, cfg in call_types.items():
+        total = len(cfg["cases"]) * cfg["n"]
+        verdicts = results.get(ct, [])
+        passes = sum(1 for v in verdicts if v.get("passed") is True)
+        # Guard total == 0 (validator forbids empty cases, but never divide
+        # by zero regardless).
+        current = (passes / total) if total > 0 else 0.0
+        baseline = cfg["baseline_pass_rate"]
+        tolerance = cfg["tolerance"]
+        verdict = "REGRESSED" if current < baseline - tolerance else "OK"
+        if verdict == "REGRESSED":
+            overall = "REGRESSED"
+        per[ct] = {"current": current, "baseline": baseline,
+                   "tolerance": tolerance, "passes": passes,
+                   "total": total, "verdict": verdict}
+    return {"overall": overall, "per_call_type": per, "warnings": []}
+
+
 def write_heal_report(call_type: str, state: HealState,
                       best_patch_text: str = "") -> Path:
     """Render a markdown heal report to <heal_dir>/<call_type>/healing-<call_type>.md.
