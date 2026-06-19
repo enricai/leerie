@@ -2,6 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 
 class _MiniState:
     def __init__(self, tmp: Path):
@@ -86,3 +88,28 @@ def test_corpus_capture_call_type_filter(leerie, tmp_path, monkeypatch):
         call_types=["planner"], tier="text"))
     assert (corpus / "cases" / "planner" / "planner-001.json").exists()
     assert not (corpus / "cases" / "classifier").exists()
+
+
+def test_corpus_capture_rejects_unknown_tier(leerie, tmp_path, monkeypatch):
+    leerie_root = tmp_path / "state"
+    _seed_run(leerie_root, "r1")
+    st = _MiniState(leerie_root / "runs" / "r1")
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.corpus_capture(
+            "r1", tmp_path / "corpus", leerie_root, dict(leerie.DEFAULT_CAPS),
+            st, {}, {}, tier="bogus"))
+
+
+def test_corpus_capture_env_tier_dies_before_increment_b(leerie, tmp_path,
+                                                         monkeypatch):
+    # _ENV_CAPTURE_READY is False until Increment B (Task B2) flips it.
+    leerie_root = tmp_path / "state"
+    _seed_run(leerie_root, "r1")
+    st = _MiniState(leerie_root / "runs" / "r1")
+    if leerie._ENV_CAPTURE_READY:
+        import pytest as _pt
+        _pt.skip("env capture is ready; guard no longer applies")
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.corpus_capture(
+            "r1", tmp_path / "corpus", leerie_root, dict(leerie.DEFAULT_CAPS),
+            st, {}, {}, tier="env"))

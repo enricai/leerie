@@ -7366,11 +7366,12 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     against the current prompts to measure and pin baseline_pass_rate,
     prompt_sha, and judge_prompt_sha into manifest.json.
     """
-    if tier not in ("text", "all"):
-        # Env capture needs the fixture snapshotter from Increment B.
-        if tier == "env" and not _ENV_CAPTURE_READY:
-            die("corpus capture --tier env requires the Tier-2 fixture "
-                "snapshotter (Increment B) — not yet available")
+    if tier not in ("text", "env", "all"):
+        die(f"corpus capture: unknown tier {tier!r} (expected: text, env, all)")
+    # Env capture needs the fixture snapshotter from Increment B.
+    if tier in ("env", "all") and not _ENV_CAPTURE_READY:
+        die("corpus capture --tier env requires the Tier-2 fixture "
+            "snapshotter (Increment B) — not yet available")
 
     calls_path = leerie_root / "runs" / run_id / "calls.ndjson"
     if not calls_path.exists():
@@ -7402,7 +7403,7 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
         "tolerance": REGRESS_TOLERANCE_DEFAULT,
         "n_text": REGRESS_N_TEXT_DEFAULT, "n_env": REGRESS_N_ENV_DEFAULT})
 
-    by_type: dict[str, list[str]] = {}
+    by_type: dict[str, list[tuple[str, str]]] = {}
     for rec in records:
         ct = rec["call_type"]
         case_id = _next_case_id(corpus_dir, ct, case_name)
@@ -7443,7 +7444,7 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     # freshly-written cases.
     out_dir = st.run_dir / "corpus-capture-out"
     report = await phase_regress(corpus_dir, out_dir, caps, st, models,
-                                 efforts, tier=tier if tier != "text" else "text",
+                                 efforts, tier=tier,
                                  call_types=list(by_type.keys()),
                                  tolerance=tolerance)
     now = _utc_now_iso()
