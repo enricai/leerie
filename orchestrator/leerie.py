@@ -428,7 +428,7 @@ ACTING_WORKER_TYPES = ("implementer", "conformer", "integrator", "provision")
 
 # Flipped to True in Increment B once _snapshot_env_fixture / replay_in_env
 # land. Until then, env capture die()s with a clear message.
-_ENV_CAPTURE_READY = False
+_ENV_CAPTURE_READY = True
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -7485,6 +7485,120 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     log(f"corpus capture: pinned baseline for {sorted(by_type)} from run "
         f"{run_id!r}")
     return manifest
+
+
+# --- Tier-2 (acting-worker) environment snapshotting (DESIGN §14) ----------
+#
+# Step-1 trace of what an acting worker's `claude_p` call actually receives,
+# so `_snapshot_env_fixture` records only deterministically-capturable values
+# (no fabrication). Line refs are into this file.
+#
+#   - cwd: `run_implementer` (claude_p cwd=worktree, ~L12631) and
+#     `run_conformer` (cwd=worktree, ~L12992) both pass the subtask's worktree
+#     ROOT as cwd. The worker is told "Your current working directory IS your
+#     isolated worktree". So cwd relative to the worktree root is "" — replay
+#     cuts a fresh worktree at the bundle base and runs there.
+#   - allowed_tools: both pass `ACT_TOOLS` (= f"{_READ_BASE},Bash,Write,Edit",
+#     L353) — a module constant, NOT a field on the call record. Deterministic
+#     for every acting worker, so we record ACT_TOOLS rather than reading a
+#     (never-present) record field.
+#   - add_dirs: neither acting call passes `add_dirs` to claude_p (defaults to
+#     None, L6494). So no extra mounted dirs — add_dirs_rel = [].
+#   - autonomous: both pass autonomous=True (L12633 / L12994).
+#   - diff base / base SHA: the mechanical diff check in `settle_subtask`
+#     diffs against `compute_run_branch(st.run_id)` (= "leerie/runs/<run-id>",
+#     L13701-13703) and the conformer is handed `diff_base=run_branch`
+#     (L13343). The run branch is ephemeral (gone post-run); it is cut from
+#     `working_branch` at run start (L14750). The stable, reconstructible base
+#     is therefore `working-branch`'s HEAD — what the worktree branched from —
+#     which we bundle so replay starts from the same tree the worker saw.
+#   - LEERIE_DIR paths in user_content: the implementer prompt embeds the
+#     ABSOLUTE leerie_dir ("LEERIE_DIR is {leerie_dir}", L12594; spec at
+#     "{leerie_dir}/subtasks/{sid}.json", L12595; checkpoints/criteria). For a
+#     subtask, leerie_dir == the run dir, so we freeze that subtree
+#     (leerie_dir/) and record its absolute path (leerie_dir_abs) for replay.
+#   - build/lint/test commands: NOT on the call record. They are inferred at
+#     conformance time via `_infer_build_lint_test(repo_root)` (L13333) and
+#     handed only to the conformer — never to the implementer, never stored on
+#     the record. So these fields stay empty here (brief default) and are
+#     reconstructed by the replay harness, not snapshotted.
+def _snapshot_env_fixture(corpus_dir: Path, case_id: str, record: dict,
+                          leerie_root: Path, run_id: str, *,
+                          src_repo: Path | None = None,
+                          base_sha: str | None = None) -> str:
+    """Snapshot the environment a Tier-2 (acting) worker saw, so
+    replay_in_env can reconstruct it (DESIGN §14). Writes
+    fixtures/<case_id>/{repo.bundle, leerie_dir/, env.json} and returns the
+    fixture pointer. `src_repo`/`base_sha` derive from run state when not
+    given (overridable for tests)."""
+    run_dir = leerie_root / "runs" / run_id
+    if src_repo is None:
+        # The host repo the run operated on (USER_REPO == /work in-container).
+        src_repo = Path(os.environ.get("USER_REPO") or os.getcwd())
+    if base_sha is None:
+        # Per the Step-1 trace: the worker's worktree branched from
+        # working_branch; resolve its HEAD as the reconstructible base.
+        wb = (run_dir / "working-branch").read_text().strip() \
+            if (run_dir / "working-branch").exists() else "HEAD"
+        res = subprocess.run(["git", "-C", str(src_repo), "rev-parse", wb],
+                             capture_output=True, text=True)
+        base_sha = res.stdout.strip() or "HEAD"
+
+    fdir = corpus_dir / "fixtures" / case_id
+    fdir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Bundle the base repo state so the replay harness can `git clone` it.
+    #    `git bundle` will not pack a bare SHA ("Refusing to create empty
+    #    bundle"), and a plain `git clone` of the bundle only checks out a
+    #    tree when the bundle records a HEAD ref. We must therefore produce a
+    #    bundle whose HEAD points at `base_sha` — but `base_sha` (the run's
+    #    working-branch HEAD) is generally NOT the source repo's current HEAD
+    #    at capture time (the repo sits on the integrated run branch), and we
+    #    must not mutate the shared source repo's HEAD/branches. So bundle from
+    #    a throwaway local clone detached at `base_sha`: the clone is a fast
+    #    object-hardlink (no `--no-local`), gets `git checkout`ed to the exact
+    #    base, and `bundle create … HEAD` then records HEAD -> base_sha. The
+    #    scratch dir lives under the disposable corpus tree and is always
+    #    cleaned up.
+    scratch = fdir / "_scratch_clone"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    try:
+        subprocess.run(["git", "clone", "--quiet", str(src_repo),
+                        str(scratch)], check=True,
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(scratch), "checkout", "--quiet",
+                        base_sha], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(scratch), "bundle", "create",
+                        str(fdir / "repo.bundle"), "HEAD"], check=True,
+                       capture_output=True, text=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # 2. Freeze the LEERIE_DIR subtree the worker's user_content references.
+    #    Exclude the disposable/volatile dirs: worktrees (rebuilt on replay),
+    #    logs and calls.ndjson (telemetry, not inputs), *-out scratch.
+    leerie_dir_dst = fdir / "leerie_dir"
+    if leerie_dir_dst.exists():
+        shutil.rmtree(leerie_dir_dst)
+    shutil.copytree(run_dir, leerie_dir_dst, ignore=shutil.ignore_patterns(
+        "worktrees", "logs", "calls.ndjson", "*-out"))
+
+    # 3. Record the env (fields per the run_implementer / settle_subtask trace
+    #    in the comment block above — only deterministically-capturable values).
+    env = {
+        "cwd_rel": "",                       # worktree root is the worker's cwd
+        "allowed_tools": ACT_TOOLS,          # acting workers always get ACT_TOOLS
+        "add_dirs_rel": [],                  # no --add-dir passed to acting calls
+        "build_cmd": "",                     # inferred at replay, not on record
+        "lint_cmd": "",                      # inferred at replay, not on record
+        "test_cmd": "",                      # inferred at replay, not on record
+        "diff_base": base_sha,
+        "leerie_dir_abs": str(run_dir),
+        "autonomous": True,
+    }
+    (fdir / "env.json").write_text(json.dumps(env, indent=2))
+    return f"fixtures/{case_id}/"
 
 
 def corpus_list(corpus_dir: Path) -> None:
