@@ -791,6 +791,24 @@ export LEERIE_VERBOSITY=stream
 export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
 
+# Behavioral regression gate (DESIGN §14). Runs claude on your subscription;
+# local mode only (the working-tree prompts/ must be visible to the gate).
+# Re-run the committed golden corpus through the CURRENT prompts and exit
+# EXIT_REGRESSED=12 if any call_type's judged pass-rate dropped past tolerance:
+leerie --regress                      # text tier (judgment workers) by default
+leerie --regress --tier all           # include env tier (acting workers; slow/costly)
+leerie --regress --call-type classifier --call-type planner
+leerie --regress --update-baseline    # re-pin manifest after an INTENTIONAL prompt change
+export LEERIE_REGRESS_TOLERANCE=0.10  # global tolerance override (else per-call_type manifest value)
+
+# Promote a run's known-good calls into the corpus and pin a baseline:
+leerie --corpus-capture <run-id>                       # text tier
+leerie --corpus-capture <run-id> --tier env            # snapshot acting-worker fixtures too
+leerie --corpus-capture <run-id> --call-type classifier --case smoke
+
+# Print the corpus manifest summary:
+leerie --corpus-list
+
 # Override the host-side per-repo state directory (default:
 # $HOME/.leerie/<basename>/). Each repo gets its own subtree under
 # $HOME so Colima auto-shares it. Cross-repo basename collisions are
@@ -2129,6 +2147,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh`, post-cleanup branch verification; launcher then pushes on host | verify the run branch is non-empty; run `cleanup.sh --subtask-branches` to delete per-subtask branches; **post-cleanup branch verification** (`git show-ref --verify` on the run branch — if the branch disappeared after cleanup, `die()` routes to the pause branch to preserve the machine for recovery); record `finished_at` in `run.json`; delete the per-subtask branches `leerie/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). **The push + PR step has moved to the host launcher** (DESIGN §6 *Finalization*). A successfully finalized run (`finished_at` set AND `current_phase` == "phase 6: finalize") is **terminal on resume** — the orchestrator returns immediately without re-executing phases 4→5→6, preventing a concurrent `decide_teardown` race. |
 | Post-run Judge | `phase_judge`, `judge_capture` | standalone post-run phase (not part of main orchestrate flow): reads `calls.ndjson`, runs one `judge_capture()` per record in parallel under `asyncio.Semaphore(max_parallel)`, writes per-record verdicts to `<judge-dir>/<call_id>.json` and a summary `INDEX.json`; uses `prompts/judge.md` rubric |
 | Post-run Heal | `HealState`, `heal_baseline`, `heal_apply_patch`, `heal_replay_patched`, `request_patch`, `phase_heal` | heal-loop phases: `HealState` persists failing_samples / baseline / history / best_so_far at `<heal-dir>/<call_type>/state.json`; `heal_baseline(call_type, failing_records, n, heal_dir, caps, st, models)` runs n unpatched replays per record + judge, writes baseline verdicts + state; `heal_apply_patch(call_type, iter_n, patch_text, anchor_match, heal_dir, failing_records)` materialises patched prompts under `iter-<N>/patched-prompts/`; `heal_replay_patched(call_type, iter_n, n, heal_dir, caps, st, models)` runs n patched replays per record + judge, appends iteration record to state.history; `request_patch(state, iter_n, st, caps, models)` invokes the `patch_generator` worker (schema `SCHEMAS["patch_generator"]`, SID `heal-patch-<call_type>-iter<N>`, prompt from `prompts/patch_generator.md`) and returns `(anchor, replacement)` — raises `ValueError` if the returned anchor is not a literal substring of the resolved prompt body (code-enforced per the prompts-are-advisory principle); `phase_heal(call_type, failing_records, heal_dir, caps, st, models, request_patch_fn=None, n, config)` drives the full baseline→loop→report cycle; `request_patch_fn` defaults to the real `request_patch` when `None`, or accepts a sync/async 2-arg stub for testing |
+| Post-run Regress | `phase_regress`, `corpus_capture`, `corpus_list`, `compare_to_baseline`, `replay_in_env` | standalone post-run gate (not part of the orchestrate flow): replays the committed `corpus/` through the *current* `prompts/` (Tier 1 via `replay_capture`, Tier 2 via `replay_in_env`), judges each replay via `judge_capture`, and `compare_to_baseline` turns the per-`call_type` judged pass-rates into a deterministic `REGRESSED`/`OK` verdict (DESIGN §14). `leerie --regress` exits `EXIT_REGRESSED=12` iff `overall == "REGRESSED"`. `leerie --corpus-capture --from <run-id>` promotes `success && parsed_ok` records into the corpus and pins the baseline; `leerie --corpus-list` prints the manifest summary. |
 
 `phase_classify` runs before `gather_answers` because the question set depends
 on the classification.
@@ -4305,6 +4324,27 @@ Two concurrent runs in the same repository share no coordination state.
                     └── scores.json          per-sample per-replay pass/fail verdicts
 ```
 
+The behavioral regression corpus is committed in the leerie tool repo (it
+guards `prompts/*.md`), not under the state root:
+
+```
+corpus/                                       (committed; DESIGN §14)
+├── manifest.json                             per-call_type baseline pass-rate, n,
+│                                             tolerance, tier, prompt_sha, judge_prompt_sha
+├── cases/<call_type>/<case_id>.json          one frozen calls.ndjson envelope per case
+│                                             {case_id, call_type, captured_from_run, fixture, record}
+└── fixtures/<case_id>/                       Tier-2 (env/acting-worker) cases only
+    ├── repo.bundle                           git bundle of the base repo state
+    ├── leerie_dir/                           frozen subtasks/<sid>.json, artifacts/, etc.
+    └── env.json                              {cwd_rel, allowed_tools, add_dirs_rel,
+                                              build_cmd, lint_cmd, test_cmd, diff_base,
+                                              leerie_dir_abs, autonomous}
+```
+
+In local mode the launcher bind-mounts `$LEERIE_REPO/corpus` read-write at
+`/corpus` and sets `LEERIE_CORPUS_DIR=/corpus`; `--regress` reads it, the
+`--corpus-capture` writes flow back to the host repo through that mount.
+
 The `<run-id>` is the container/machine ID assigned by the container
 runtime at creation time (DESIGN §6). There is no temporary directory
 or rename step — the run directory is created with its final name from
@@ -4683,6 +4723,34 @@ truth; replay results are ephemeral scoring artifacts.
 
 Both judge (n=1 replay, then score) and heal (n=N replays, baseline vs patched)
 build on this primitive.
+
+### Behavioral regression gate — corpus, replay tiers, comparator
+
+Maps to `DESIGN.md` §14. The gate reuses the NDJSON envelope, `replay_capture`,
+`judge_capture`, and `SCHEMAS["judge"]` unchanged; it adds the corpus format
+and these functions:
+
+- `corpus_capture(run_id, corpus_dir, leerie_root, caps, st, models, efforts, *, call_types=None, case_name=None, tier="text", tolerance=None) -> dict` — select `success && parsed_ok` records from `<state-root>/runs/<run-id>/calls.ndjson`, write `cases/<call_type>/<case_id>.json`, snapshot Tier-2 fixtures, then run `phase_regress` once against the current prompts to pin `baseline_pass_rate`, `prompt_sha`, `judge_prompt_sha` into `manifest.json`.
+- `phase_regress(corpus_dir, out_dir, caps, st, models, efforts, tier="all", call_types=None, tolerance=None) -> dict` — per selected case, `n` × replay (Tier 1: `replay_capture(override_system_prompt=load_prompt(ct))`; Tier 2: `replay_in_env(...)`) → `judge_capture`; runs under `asyncio.Semaphore(caps["max_parallel"])`; writes per-replay verdicts + `REPORT.json`; returns `compare_to_baseline(...)`.
+- `compare_to_baseline(results, manifest) -> dict` — pure Python. Per `call_type`: `current = passes / (len(cases) * n)`; `REGRESSED` iff `current < baseline_pass_rate - tolerance`. `overall = "REGRESSED"` if any per-type verdict is `REGRESSED`. Empty corpus → `OK` with a warning. The §12 enforcement point.
+- `replay_in_env(record, fixture, *, override_system_prompt) -> tuple[dict, dict]` — Tier-2 only: materialise `repo.bundle` into a temp clone + worktree, restore `leerie_dir/`, rewrite the absolute `LEERIE_DIR` path in `user_content`, invoke `claude_p` directly with `_suppress_capture=True`. Worktree is disposable.
+- `_validate_corpus_manifest(data) -> None` — mirrors `_validate_run_json`; raises `ValueError` on invariant violations.
+
+`corpus/manifest.json` shape:
+
+```json
+{
+  "version": 1,
+  "captured_from": [{"run_id": "…", "ts": "…Z"}],
+  "defaults": {"tolerance": 0.15, "n_text": 5, "n_env": 3},
+  "judge_prompt_sha": "<sha256 of prompts/judge.md post-include at baseline>",
+  "call_types": {
+    "classifier": {"tier": "text", "cases": ["classifier-001"],
+      "baseline_pass_rate": 0.95, "n": 5, "tolerance": 0.15,
+      "baseline_captured_at": "…Z", "prompt_sha": "<sha256 post-include>"}
+  }
+}
+```
 
 ---
 

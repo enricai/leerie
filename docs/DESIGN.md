@@ -2651,6 +2651,55 @@ governs an implementer's confidence loop governs the heal loop's patch
 iteration — the number of rounds, the success threshold, and the plateau
 detection window are all configured, not left open-ended.
 
+### Behavioral regression gate / golden corpus
+
+The judge and heal skills observe a *single run*. The behavioral regression
+gate extends the same primitives to a *committed, versioned baseline* so a
+prompt edit that makes a worker behave worse is caught before it ships — the
+verification gap §16 is honest about ("the behavioral quality of the workers
+… is the unverified surface").
+
+The gate assembles already-built primitives — capture, replay, judge, the
+n-replay pass-rate from `heal_baseline`, the `REGRESSED` verdict from
+`check_convergence` — into three pieces:
+
+1. A **golden corpus** (`corpus/`, committed in this repo): real captured
+   calls (`corpus/cases/<call_type>/<case_id>.json`) plus a per-`call_type`
+   **baseline pass-rate** pinned at capture time (`corpus/manifest.json`).
+   The corpus guards `prompts/*.md`, so it lives in the leerie tool repo and
+   is reviewed in PRs alongside the prompts it guards.
+2. A **comparator** that re-runs the corpus through the *current* prompts,
+   judges each fresh output, and **fails when the judged pass-rate drops
+   below baseline beyond a tolerance.**
+3. Two replay **tiers**. Because every worker's `system_prompt` is
+   `load_prompt(<call_type>)` verbatim and all per-task context is in
+   `user_content`, judgment workers (Tier 1, "text") replay as pure
+   functions via `replay_capture` with the current prompt swapped in.
+   Acting workers (Tier 2, "env") build `user_content` from on-disk state
+   and mutate a worktree, so they replay via `replay_in_env`, which
+   reconstructs an isolated worktree + `LEERIE_DIR` from a snapshotted
+   fixture before re-executing.
+
+**§12 applied — measurement, not trust.** The judge rubric stays advisory (a
+prompt). The verdict *accounting* (counting `passed`), the pass-rate
+computation, the baseline comparison, and the non-zero exit code are real
+Python in `compare_to_baseline` — no model judgment in the decision. The gate
+never trusts a worker's self-report; it independently re-executes and
+re-judges. This is the same shape this section already documents for the judge
+("verdict accounting is real Python") and heal ("convergence check … is real
+Python"), extended from one run to a committed baseline.
+
+**Runtime.** A local verb (`leerie --regress`) plus an optional self-hosted /
+`workflow_dispatch` job. It is **not** a hosted-CI PR check: `claude -p` runs
+on the user's subscription with no API key, so a hosted GitHub runner cannot
+execute it. It runs in local mode, where the launcher bind-mounts the
+working-tree `prompts/` over the baked-in copy, so the gate tests *edited*
+prompts. Editing `prompts/judge.md` moves the measuring instrument and
+invalidates the baseline; the gate warns loudly and requires a re-baseline.
+
+**Honesty.** A green gate means "no regression on the captured cases," not
+"no regression anywhere." The corpus is a sample.
+
 ---
 
 ## 15. Known limitations
