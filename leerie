@@ -2078,7 +2078,8 @@ _value_flags=" --run-id --answers --pr-template --max-workers \
 --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \
---heal-dir --phase --host-no-push --status --chain-id "
+--heal-dir --phase --host-no-push --status --chain-id \
+--corpus-capture --tier --call-type --case --regress-tolerance "
 for arg in "$@"; do
   # Skip if this arg is the value of a previous value-taking flag.
   if [ -n "$_prev" ]; then
@@ -3220,6 +3221,19 @@ except Exception:
 }
 
 # --- run -----------------------------------------------------------------
+# Behavioral regression gate verbs (--regress / --corpus-capture /
+# --corpus-list, DESIGN §14) run claude in local mode but must NOT trigger
+# the host-side push+PR finalize, and need the corpus dir mounted writable
+# (the code mount at /opt/leerie-image is :ro). Detect them up front.
+LEERIE_CORPUS_VERB=""
+for _a in "$@"; do
+  case "$_a" in
+    --regress|--corpus-capture|--corpus-list) LEERIE_CORPUS_VERB=1 ;;
+  esac
+done
+# Ensure the host-side corpus bind source exists before nerdctl mounts it
+# (always safe to mkdir the tool's own corpus dir).
+mkdir -p "$LEERIE_REPO/corpus"
 container_rc=0
 if [ "$RUNTIME" = "fly" ]; then
   # --- remote execution path (Fly.io Machines) -------------------------
@@ -3876,6 +3890,8 @@ else
     -v "$USER_REPO:/work" \
     -v "$LEERIE_REPO:/opt/leerie-image:ro" \
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
+    -v "$LEERIE_REPO/corpus:/corpus" \
+    -e LEERIE_CORPUS_DIR=/corpus \
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
@@ -3910,7 +3926,7 @@ if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   exit "$container_rc"
 fi
 
-if [ "$RUNTIME" != "fly" ]; then
+if [ "$RUNTIME" != "fly" ] && [ -z "${LEERIE_CORPUS_VERB:-}" ]; then
   # Locate the most-recent run dir under .leerie/runs/ that has a run.json
   # with finished_at set. The orchestrator writes run.json at finalize.
   # `find` + sort isn't portable with -printf; iterate and pick newest.

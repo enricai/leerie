@@ -3361,6 +3361,32 @@ def resolve_corpus_dir() -> Path:
     return ROOT / "corpus"
 
 
+def resolve_regress_tolerance(repo_root: Path,
+                              cli_value: float | None) -> float | None:
+    """Optional GLOBAL tolerance override for --regress. CLI > env > toml >
+    None (None = use each call_type's manifest tolerance). Bad env/file
+    values die() at startup; out-of-range values die()."""
+    val: float | None = cli_value
+    if val is None:
+        env = os.environ.get(REGRESS_TOLERANCE_ENV, "").strip()
+        if env:
+            try:
+                val = float(env)
+            except ValueError:
+                die(f"{REGRESS_TOLERANCE_ENV}={env!r} is not a float")
+    if val is None:
+        file_val = _read_toml_key(repo_root / REGRESS_TOLERANCE_FILE,
+                                  "regress_tolerance")
+        if file_val is not None:
+            try:
+                val = float(file_val)
+            except ValueError:
+                die(f"leerie.toml: regress_tolerance={file_val!r} is not a float")
+    if val is not None and not (0.0 <= val <= 1.0):
+        die(f"regress tolerance must be in [0,1], got {val}")
+    return val
+
+
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
     """Resolve the heal-loop max-iterations cap. Order:
     --heal-max-rounds CLI flag → LEERIE_HEAL_MAX_ROUNDS env var →
@@ -14819,7 +14845,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         host_no_push=getattr(args, "host_no_push", None))
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="leerie", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -15110,6 +15136,39 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "'heal' reads the judge index for failing call_types "
                          "and runs the self-heal loop for each, writing healing "
                          "reports to <run-dir>/<heal-dir>/.")
+    # --- Behavioral regression gate (DESIGN §14) ---
+    ap.add_argument("--regress", action="store_true",
+                    help="re-run the golden corpus through the CURRENT "
+                         "prompts; exit EXIT_REGRESSED=12 if any call_type's "
+                         "judged pass-rate dropped past tolerance (local mode)")
+    ap.add_argument("--corpus-capture", metavar="RUN_ID",
+                    dest="corpus_capture_from",
+                    help="promote success+parsed_ok records from RUN_ID's "
+                         "calls.ndjson into corpus/ and pin a baseline")
+    ap.add_argument("--corpus-list", action="store_true", dest="corpus_list",
+                    help="print the corpus manifest summary and exit")
+    ap.add_argument("--tier", choices=("text", "env", "all"), default=None,
+                    help="with --regress/--corpus-capture: which corpus tier "
+                         "to run (text=judgment, env=acting workers)")
+    ap.add_argument("--call-type", action="append", dest="regress_call_types",
+                    metavar="CT",
+                    help="restrict --regress/--corpus-capture to this "
+                         "call_type (repeatable)")
+    ap.add_argument("--case", dest="corpus_case_name", metavar="NAME",
+                    help="with --corpus-capture: base name for captured cases")
+    ap.add_argument("--update-baseline", action="store_true",
+                    dest="update_baseline",
+                    help="with --regress: re-pin manifest.json (baseline + "
+                         "shas) after an INTENTIONAL prompt change")
+    ap.add_argument("--regress-tolerance", type=float, default=None,
+                    dest="regress_tolerance", metavar="FLOAT",
+                    help="global pass-rate tolerance override for --regress "
+                         "(else per-call_type manifest value)")
+    return ap
+
+
+def main() -> None:
+    ap = _build_arg_parser()
     args = ap.parse_args()
 
     # --list short-circuits everything else: read <state-root>/runs/* and
@@ -15122,6 +15181,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             status_filter=args.status_filter,
             runtime_filter=args.runtime,
         )
+        return
+
+    # --corpus-list: read-only manifest summary (no claude).
+    if getattr(args, "corpus_list", False):
+        corpus_list(resolve_corpus_dir())
         return
 
     if not shutil.which("claude"):
@@ -15291,6 +15355,40 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         repo_root, getattr(args, "heal_max_rounds", None))
     args.heal_success_threshold = resolve_heal_success_threshold(
         repo_root, getattr(args, "heal_success_threshold", None))
+
+    # --regress / --corpus-capture: behavioral regression gate (DESIGN §14).
+    # Both run claude (replays + judge) so they land here, after caps /
+    # models / efforts / leerie_root are resolved. --corpus-list is handled
+    # earlier (read-only, no claude). On regression, exit EXIT_REGRESSED=12.
+    if args.regress or args.corpus_capture_from:
+        corpus_dir = resolve_corpus_dir()
+        regress_tol = resolve_regress_tolerance(
+            Path(os.getcwd()), args.regress_tolerance)
+        if args.corpus_capture_from:
+            run_id = args.corpus_capture_from
+            cap_st = State(leerie_root, run_id)   # telemetry/budget during baseline replays
+            if not cap_st.load():
+                die(f"corpus capture: no state for run {run_id!r}")
+            asyncio.run(corpus_capture(
+                run_id, corpus_dir, leerie_root, caps, cap_st, models, efforts,
+                call_types=args.regress_call_types,
+                case_name=args.corpus_case_name,
+                tier=args.tier or "text", tolerance=regress_tol))
+            return
+        # --regress
+        regress_run_id = f"regress-{uuid.uuid4().hex[:12]}"
+        regress_st = State(leerie_root, regress_run_id)
+        out_dir = regress_st.run_dir / "regress-out"
+        report = asyncio.run(phase_regress(
+            corpus_dir, out_dir, caps, regress_st, models, efforts,
+            tier=args.tier or "text",
+            call_types=args.regress_call_types, tolerance=regress_tol))
+        _print_regress_report(report)
+        if args.update_baseline:
+            _update_baseline(corpus_dir, report)
+        if report["overall"] == "REGRESSED":
+            sys.exit(EXIT_REGRESSED)
+        return
 
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # orchestrate() flow — just pick an existing run and run the skill.
