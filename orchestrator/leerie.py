@@ -6805,6 +6805,80 @@ async def replay_capture(record: dict, *,
     return (envelope, structured)
 
 
+def _load_fixture(corpus_dir: Path, case: dict) -> dict:
+    """Load a Tier-2 fixture descriptor for a case: the fixture dir and
+    its env.json."""
+    rel = case.get("fixture")
+    if not rel:
+        raise ValueError(f"case {case.get('case_id')!r} has no fixture")
+    fdir = corpus_dir / rel.rstrip("/")
+    env = json.loads((fdir / "env.json").read_text())
+    return {"dir": fdir, "env": env}
+
+
+async def replay_in_env(record: dict, fixture: dict, *,
+                        override_system_prompt: str) -> tuple[dict, dict]:
+    """Tier-2 replay: reconstruct the env an acting worker saw and
+    re-execute it with the CURRENT prompt (DESIGN §14).
+
+    Materialises fixture/repo.bundle into a temp clone, cuts a fresh
+    detached worktree at env['diff_base'], restores fixture/leerie_dir/ to a
+    temp LEERIE_DIR, rewrites the absolute LEERIE_DIR path baked into the
+    record's user_content, and invokes claude_p directly (not
+    replay_capture, which is text-only) with _suppress_capture=True. The
+    worktree/clone are disposable and removed after the replay.
+    """
+    import tempfile
+    fdir = fixture["dir"]
+    env = fixture["env"]
+    call_type = record["call_type"]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        clone = tmp / "repo"
+        r = await run_proc(["git", "clone", "--quiet",
+                            str(fdir / "repo.bundle"), str(clone)])
+        if r.returncode != 0:
+            return ({"is_error": True, "result": ""}, {})
+        wt = tmp / "wt"
+        r = await run_proc(["git", "-C", str(clone), "worktree", "add",
+                            "--detach", str(wt), env["diff_base"]])
+        if r.returncode != 0:
+            return ({"is_error": True, "result": ""}, {})
+
+        # Restore the frozen LEERIE_DIR and rewrite the absolute path.
+        leerie_dir = tmp / "leerie_dir"
+        shutil.copytree(fdir / "leerie_dir", leerie_dir)
+        user_content = record["user_content"]
+        orig = env.get("leerie_dir_abs")
+        if orig:
+            user_content = user_content.replace(orig, str(leerie_dir))
+
+        cwd = str(wt / env["cwd_rel"]) if env.get("cwd_rel") else str(wt)
+        add_dirs = [str(wt / r2) for r2 in env.get("add_dirs_rel", [])] or None
+
+        st_dir = tmp / "st"
+        st_dir.mkdir()
+        (st_dir / "state.json").write_text("{}")
+        replay_st = _ReplayState(st_dir, st_dir / "state.json")
+        caps = dict(DEFAULT_CAPS)
+
+        structured = await claude_p(
+            user_prompt=user_content,
+            system_prompt=override_system_prompt,
+            schema_key=call_type,
+            cwd=cwd,
+            allowed_tools=env.get("allowed_tools") or INSPECT_TOOLS,
+            max_turns=40,
+            autonomous=bool(env.get("autonomous", True)),
+            caps=caps, st=replay_st,
+            model=record.get("model", MODEL_DEFAULT),
+            sid=f"regress-env-{call_type}",
+            add_dirs=add_dirs,
+            _suppress_capture=True,
+        )
+        return (replay_st.last_envelope, structured)
+
+
 def _accumulate_telemetry(data: dict, envelope: dict) -> None:
     """Accumulate run-weight signals from a worker envelope into `data`.
     Shared between State and _ReplayState."""
