@@ -7383,15 +7383,31 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
                         record, override_system_prompt=current_prompt)
             except Exception:
                 envelope = {}
-            # Judge the replayed output, not the frozen one (mirrors
-            # heal_baseline._run_one).
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", ""))
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, efforts,
-                                          caps, st)
+            # §12: a replay that crashed, errored, or returned no output
+            # produced nothing gradeable. Deciding that is code's job — a
+            # deterministic hard FAIL. Do NOT hand the judge the frozen
+            # known-good content (which it might score as a pass and mask
+            # the regression). Only judge a replay that actually returned
+            # fresh output.
+            fresh = envelope.get("result")
+            if not fresh or envelope.get("is_error", False):
+                verdict = {
+                    "passed": False,
+                    "dimensions": {"schema_ok": False, "factual_ok": False,
+                                   "hallucination_ok": False},
+                    "rationale": "replay produced no gradeable output "
+                                 "(crashed, errored, or empty result)",
+                    "suggested_fixes": [],
+                }
+            else:
+                # Judge the REPLAYED output, not the frozen one (mirrors
+                # heal_baseline._run_one).
+                judge_record = dict(record)
+                judge_record["response_content"] = fresh
+                judge_record["parsed_ok"] = True
+                judge_record["success"] = True
+                verdict = await judge_capture(judge_record, models, efforts,
+                                              caps, st)
             case_out = out_dir / ct / case["case_id"]
             case_out.mkdir(parents=True, exist_ok=True)
             (case_out / f"verdict-{replay_idx}.json").write_text(

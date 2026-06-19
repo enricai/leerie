@@ -176,3 +176,29 @@ def test_phase_regress_env_tier_uses_replay_in_env(leerie, tmp_path,
         tier="all"))
     assert called["env"] == 3 and called["text"] == 0   # env path, n=3
     assert report["overall"] == "OK"
+
+
+def test_phase_regress_replay_crash_is_hard_fail_without_judging(
+        leerie, tmp_path, monkeypatch):
+    corpus = _write_corpus(tmp_path)
+    judged = {"n": 0}
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        raise RuntimeError("worker emitted schema-invalid output twice")
+
+    async def fake_judge(record, models, efforts, caps, st):
+        judged["n"] += 1
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}  # would PASS if (wrongly) consulted
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    report = asyncio.run(leerie.phase_regress(
+        corpus, tmp_path / "out", dict(leerie.DEFAULT_CAPS), st, {}, {},
+        tier="text"))
+    # A crashed replay is a deterministic FAIL — judge is never consulted,
+    # so the known-good frozen content cannot mask the regression.
+    assert judged["n"] == 0
+    assert report["overall"] == "REGRESSED"

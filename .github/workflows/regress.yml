@@ -23,6 +23,7 @@ jobs:
       - name: Run behavioral regression gate
         id: gate
         run: |
+          set -o pipefail
           ./leerie --regress --tier "${{ github.event.inputs.tier || 'text' }}" \
             | tee regress.log
       - name: Summarise

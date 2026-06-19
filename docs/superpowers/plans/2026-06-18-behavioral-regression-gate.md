@@ -30,7 +30,7 @@ These shaped the design; do not re-litigate them mid-implementation.
 
 2. **The `:ro` code mount blocks in-container corpus writes.** `corpus/` lives under `$LEERIE_REPO`, mounted read-only. `--regress` only *reads* the corpus (fine), but `--corpus-capture` must *write* it. Resolution (Task A6): the launcher adds a **separate writable mount** `-v "$LEERIE_REPO/corpus:/corpus"` and sets `-e LEERIE_CORPUS_DIR=/corpus`; the orchestrator resolves the corpus dir from that env var, falling back to `ROOT/"corpus"` for host/test runs.
 
-3. **Verbs are `--`-prefixed (decided).** `leerie --regress`, `leerie --corpus-capture --from <run-id>`, `leerie --corpus-list`. This matches every existing verb (`--resume`, `--list`, `--phase`, `--chain`); the spec's bare-verb spelling (`leerie regress`) would be swallowed by argparse's `task` positional. Document the deviation in DESIGN/IMPLEMENTATION.
+3. **Verbs are `--`-prefixed (decided).** `leerie --regress`, `leerie --corpus-capture <run-id>`, `leerie --corpus-list`. This matches every existing verb (`--resume`, `--list`, `--phase`, `--chain`); the spec's bare-verb spelling (`leerie regress`) would be swallowed by argparse's `task` positional. Document the deviation in DESIGN/IMPLEMENTATION.
 
 4. **`replay_capture` returns `(envelope, structured_output)`, not a verdict.** To judge a replay you must build a synthetic record whose `response_content` is `envelope.get("result")`, exactly as `heal_baseline._run_one` does (`leerie.py:7060-7068`), then call `judge_capture`. `phase_regress` mirrors that shape.
 
@@ -124,7 +124,7 @@ invalidates the baseline; the gate warns loudly and requires a re-baseline.
 - [ ] **Step 2: Add the IMPLEMENTATION §4 phase-table row.** In `docs/IMPLEMENTATION.md`, in the §4 phase walkthrough table, after the `Post-run Heal` row add:
 
 ```markdown
-| Post-run Regress | `phase_regress`, `corpus_capture`, `corpus_list`, `compare_to_baseline`, `replay_in_env` | standalone post-run gate (not part of the orchestrate flow): replays the committed `corpus/` through the *current* `prompts/` (Tier 1 via `replay_capture`, Tier 2 via `replay_in_env`), judges each replay via `judge_capture`, and `compare_to_baseline` turns the per-`call_type` judged pass-rates into a deterministic `REGRESSED`/`OK` verdict (DESIGN §14). `leerie --regress` exits `EXIT_REGRESSED=12` iff `overall == "REGRESSED"`. `leerie --corpus-capture --from <run-id>` promotes `success && parsed_ok` records into the corpus and pins the baseline; `leerie --corpus-list` prints the manifest summary. |
+| Post-run Regress | `phase_regress`, `corpus_capture`, `corpus_list`, `compare_to_baseline`, `replay_in_env` | standalone post-run gate (not part of the orchestrate flow): replays the committed `corpus/` through the *current* `prompts/` (Tier 1 via `replay_capture`, Tier 2 via `replay_in_env`), judges each replay via `judge_capture`, and `compare_to_baseline` turns the per-`call_type` judged pass-rates into a deterministic `REGRESSED`/`OK` verdict (DESIGN §14). `leerie --regress` exits `EXIT_REGRESSED=12` iff `overall == "REGRESSED"`. `leerie --corpus-capture <run-id>` promotes `success && parsed_ok` records into the corpus and pins the baseline; `leerie --corpus-list` prints the manifest summary. |
 ```
 
 - [ ] **Step 3: Add the IMPLEMENTATION §8 corpus layout.** In `docs/IMPLEMENTATION.md` §8, after the run-dir tree, add a sibling block describing the corpus (in the leerie tool repo, not the state root):
