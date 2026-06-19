@@ -79,6 +79,16 @@ def test_rejects_n_bool(leerie):
         leerie._validate_corpus_manifest(_ct(n=True))
 
 
+def test_rejects_pass_rate_bool(leerie):
+    with pytest.raises(ValueError, match="baseline_pass_rate"):
+        leerie._validate_corpus_manifest(_ct(baseline_pass_rate=True))
+
+
+def test_rejects_tolerance_bool(leerie):
+    with pytest.raises(ValueError, match="tolerance"):
+        leerie._validate_corpus_manifest(_ct(tolerance=True))
+
+
 def test_rejects_tolerance_out_of_range(leerie):
     with pytest.raises(ValueError, match="tolerance"):
         leerie._validate_corpus_manifest(_ct(tolerance=-0.1))
