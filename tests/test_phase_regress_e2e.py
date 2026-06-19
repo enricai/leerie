@@ -123,3 +123,56 @@ def test_phase_regress_warns_on_unchanged_prompt(leerie, tmp_path, monkeypatch):
         corpus, tmp_path / "out", dict(leerie.DEFAULT_CAPS), st, {}, {},
         tier="text"))
     assert any("unchanged" in w for w in report["warnings"])
+
+
+def test_phase_regress_env_tier_uses_replay_in_env(leerie, tmp_path,
+                                                    monkeypatch):
+    corpus = tmp_path / "corpus"
+    (corpus / "cases" / "implementer").mkdir(parents=True)
+    case = {
+        "case_id": "implementer-010", "call_type": "implementer",
+        "captured_from_run": "r1", "fixture": "fixtures/implementer-010/",
+        "record": {"call_id": "imp-1", "call_type": "implementer",
+                   "model": "sonnet", "system_prompt": "old",
+                   "user_content": "do it", "response_content": "{}",
+                   "parsed_ok": True, "success": True},
+    }
+    (corpus / "cases" / "implementer" / "implementer-010.json").write_text(
+        json.dumps(case))
+    (corpus / "manifest.json").write_text(json.dumps({
+        "version": 1, "defaults": {},
+        "call_types": {"implementer": {
+            "tier": "env", "cases": ["implementer-010"],
+            "baseline_pass_rate": 0.8, "n": 3, "tolerance": 0.20,
+            "prompt_sha": "x"}}}))
+
+    called = {"env": 0, "text": 0}
+
+    def fake_load_fixture(corpus_dir, c):
+        return {"dir": corpus_dir / "fixtures" / "implementer-010",
+                "env": {"diff_base": "HEAD"}}
+
+    async def fake_replay_in_env(record, fixture, *, override_system_prompt):
+        called["env"] += 1
+        return ({"result": "env output", "is_error": False}, {})
+
+    async def fake_replay_capture(record, *, override_system_prompt=None,
+                                  cwd=None):
+        called["text"] += 1
+        return ({"result": "text", "is_error": False}, {})
+
+    async def fake_judge(record, models, efforts, caps, st):
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}
+
+    monkeypatch.setattr(leerie, "_load_fixture", fake_load_fixture)
+    monkeypatch.setattr(leerie, "replay_in_env", fake_replay_in_env)
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay_capture)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    report = asyncio.run(leerie.phase_regress(
+        corpus, tmp_path / "out", dict(leerie.DEFAULT_CAPS), st, {}, {},
+        tier="all"))
+    assert called["env"] == 3 and called["text"] == 0   # env path, n=3
+    assert report["overall"] == "OK"
