@@ -1,0 +1,36 @@
+# Behavioral regression gate (DESIGN §14). NOT a hosted-CI PR check:
+# `claude -p` needs subscription auth absent on GitHub-hosted runners, so
+# this runs only on a SELF-HOSTED runner with `claude` authenticated and
+# the leerie container runtime (colima/containerd) available.
+name: regress
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "corpus tier (text|env|all); env is slow/costly"
+        required: false
+        default: "text"
+  # Optional nightly run; uncomment to enable.
+  # schedule:
+  #   - cron: "0 7 * * *"
+
+jobs:
+  regress:
+    runs-on: [self-hosted, leerie]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run behavioral regression gate
+        id: gate
+        run: |
+          ./leerie --regress --tier "${{ github.event.inputs.tier || 'text' }}" \
+            | tee regress.log
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Behavioral regression gate (${{ github.event.inputs.tier || 'text' }})"
+            echo '```'
+            tail -n 40 regress.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
