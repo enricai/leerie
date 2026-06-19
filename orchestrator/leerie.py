@@ -2050,6 +2050,28 @@ def _validate_corpus_manifest(data: dict) -> None:
         raise ValueError("judge_prompt_sha must be a non-empty string")
 
 
+def _load_corpus_manifest(corpus_dir: Path) -> dict:
+    """Read + validate corpus/manifest.json. Missing file → an empty
+    manifest (compare_to_baseline then returns OK with a warning)."""
+    path = corpus_dir / "manifest.json"
+    if not path.exists():
+        return {"version": CORPUS_MANIFEST_VERSION, "call_types": {},
+                "defaults": {}}
+    data = json.loads(path.read_text())
+    _validate_corpus_manifest(data)
+    return data
+
+
+def _load_corpus_cases(corpus_dir: Path, call_type: str,
+                       case_ids: list[str]) -> list[dict]:
+    """Load the frozen case envelopes for one call_type."""
+    cases: list[dict] = []
+    for cid in case_ids:
+        p = corpus_dir / "cases" / call_type / f"{cid}.json"
+        cases.append(json.loads(p.read_text()))
+    return cases
+
+
 # --- PR body composition (DESIGN §6 "Finalization") ---------------------
 
 def compose_pr_body(state: dict, run_id: str) -> str:
@@ -7201,6 +7223,103 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
     log(f"heal_baseline: {call_type}: {len(failing_records)} sample(s), "
         f"n={n}, baseline pass_rate={overall_pass_rate:.2%}")
     return hs
+
+
+async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
+                        st: "State", models: dict[str, str],
+                        efforts: dict[str, str | None],
+                        tier: str = "all",
+                        call_types: list[str] | None = None,
+                        tolerance: float | None = None) -> dict:
+    """Re-run the golden corpus through the *current* prompts and compare
+    judged pass-rates to the pinned baseline (DESIGN §14).
+
+    Tier 1 (text): n × replay_capture with the current load_prompt(ct)
+    swapped in → judge_capture. Tier 2 (env): n × replay_in_env in a
+    reconstructed worktree → judge_capture. Replays run under
+    asyncio.Semaphore(caps["max_parallel"]) (same pattern as phase_judge).
+    Per-replay verdicts and REPORT.json are written under out_dir.
+
+    `tolerance`, when not None, overrides every call_type's manifest
+    tolerance (the global LEERIE_REGRESS_TOLERANCE knob). Returns the
+    compare_to_baseline report (with provenance warnings appended).
+    """
+    manifest = _load_corpus_manifest(corpus_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    selected: dict[str, dict] = {}
+    for ct, cfg in manifest["call_types"].items():
+        if call_types is not None and ct not in call_types:
+            continue
+        if tier != "all" and cfg["tier"] != tier:
+            continue
+        cfg = dict(cfg)
+        if tolerance is not None:
+            cfg["tolerance"] = tolerance
+        selected[ct] = cfg
+
+    sem = asyncio.Semaphore(caps["max_parallel"])
+
+    async def _replay_and_judge(ct: str, cfg: dict, case: dict,
+                                replay_idx: int) -> tuple[str, dict]:
+        async with sem:
+            record = case["record"]
+            current_prompt = load_prompt(ct)
+            try:
+                if cfg["tier"] == "env":
+                    fixture = _load_fixture(corpus_dir, case)
+                    envelope, _ = await replay_in_env(
+                        record, fixture, override_system_prompt=current_prompt)
+                else:
+                    envelope, _ = await replay_capture(
+                        record, override_system_prompt=current_prompt)
+            except Exception:
+                envelope = {}
+            # Judge the replayed output, not the frozen one (mirrors
+            # heal_baseline._run_one).
+            judge_record = dict(record)
+            judge_record["response_content"] = (
+                envelope.get("result") or record.get("response_content", ""))
+            judge_record["parsed_ok"] = not envelope.get("is_error", True)
+            judge_record["success"] = not envelope.get("is_error", True)
+            verdict = await judge_capture(judge_record, models, efforts,
+                                          caps, st)
+            case_out = out_dir / ct / case["case_id"]
+            case_out.mkdir(parents=True, exist_ok=True)
+            (case_out / f"verdict-{replay_idx}.json").write_text(
+                json.dumps(verdict, indent=2))
+            status = "pass" if verdict.get("passed") else "FAIL"
+            log(f"  regress-{ct}-{case['case_id']}#{replay_idx}: {status}")
+            return (ct, verdict)
+
+    tasks = []
+    for ct, cfg in selected.items():
+        cases = _load_corpus_cases(corpus_dir, ct, cfg["cases"])
+        for case in cases:
+            for idx in range(cfg["n"]):
+                tasks.append(_replay_and_judge(ct, cfg, case, idx))
+
+    pairs = await gather_or_cancel(*tasks) if tasks else []
+    results: dict[str, list[dict]] = {}
+    for ct, verdict in pairs:
+        results.setdefault(ct, []).append(verdict)
+
+    report = compare_to_baseline(results, {**manifest, "call_types": selected})
+
+    # Provenance warnings (§14): judge rubric moved, or prompt unchanged.
+    if manifest.get("judge_prompt_sha") and \
+            _prompt_sha("judge") != manifest["judge_prompt_sha"]:
+        report["warnings"].append(
+            "prompts/judge.md changed since baseline — the measuring "
+            "instrument moved; re-baseline with --update-baseline before "
+            "trusting this verdict")
+    for ct, cfg in selected.items():
+        if cfg.get("prompt_sha") and _prompt_sha(ct) == cfg["prompt_sha"]:
+            report["warnings"].append(
+                f"{ct}: prompt unchanged since baseline (expected to pass)")
+
+    (out_dir / "REPORT.json").write_text(json.dumps(report, indent=2))
+    return report
 
 
 def heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
