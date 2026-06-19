@@ -352,7 +352,8 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
-`_validate_run_json`, `_derive_run_status`)
+`_validate_run_json`, `_derive_run_status`, `compare_to_baseline`,
+`_validate_corpus_manifest`)
 including a coupling test that the
 retry-policy markers match the live check-function strings. The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
@@ -360,6 +361,15 @@ remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `update_run_json` — is tested via bash-harness subprocess tests with
 stubbed `flyctl`. No coverage target is set — the suite was
 introduced from scratch and a number now would be arbitrary.
+
+The behavioral regression gate (DESIGN §14) is covered by
+`test_corpus_manifest_validator.py`, `test_compare_to_baseline.py` (incl. a
+coupling test that its `REGRESSED` semantics match `check_convergence`),
+`test_phase_regress_e2e.py`, `test_corpus_capture.py`,
+`test_snapshot_env_fixture.py`, `test_replay_in_env.py`, and
+`test_regress_launcher.py`. The live capture/replay path (`leerie
+--corpus-capture` / `--regress`) needs an authenticated `claude` and lives in
+the same on-demand tier as `claude_p`.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful
 testing requires a stub or live `claude` binary and lives in a separate
@@ -384,6 +394,10 @@ Before marking a change complete:
       are valid JSON and all referenced skill/command paths still exist.
       The `version` field is duplicated across the two manifests;
       `tests/test_version_flag.py` guards them from drifting.
+- [ ] `python3 -c 'import sys; sys.path.insert(0,"orchestrator"); import json, leerie; leerie._validate_corpus_manifest(json.load(open("corpus/manifest.json")))'`
+      — if `corpus/` or the regression-gate code (`_validate_corpus_manifest`,
+      `compare_to_baseline`, `phase_regress`, `corpus_capture`) was touched,
+      confirm the committed manifest still validates. (DESIGN §14.)
 - [ ] `python3 -c 'import json; [json.loads(l) for l in open("<state-root>/runs/<run>/calls.ndjson")]'`
       — if the telemetry writer (`_capture_call`) was touched, confirm a
       representative run produces a well-formed `calls.ndjson` (each line

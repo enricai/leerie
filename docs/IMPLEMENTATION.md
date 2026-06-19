@@ -4849,5 +4849,16 @@ worker invocation function (`claude_p`) is not unit-tested because
 meaningful testing requires a stub or live `claude` binary — that's a
 separate end-to-end tier.
 
+**Behavioral quality gate (DESIGN §14).** The regression gate adds
+code-enforced behavioral-quality coverage of worker prompts against a
+committed corpus. `compare_to_baseline` and `_validate_corpus_manifest` are
+unit-tested; the capture/replay pipeline is covered by
+`test_phase_regress_e2e.py`, `test_corpus_capture.py`,
+`test_snapshot_env_fixture.py`, `test_replay_in_env.py`, and
+`test_regress_launcher.py`. This partially closes the DESIGN §16 gap ("the
+behavioral quality of worker outputs is unverified") — for the captured cases
+only. Prompt regressions that fall outside the committed corpus remain in the
+untested tier.
+
 First real step: one run on a throwaway repo with a small, fully-specified
 task.
