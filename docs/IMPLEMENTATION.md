@@ -4770,6 +4770,29 @@ override applied uniformly across call_types.
 }
 ```
 
+**Tier 2 (env / acting workers).** `implementer`, `conformer`, `integrator`,
+and `provision` build `user_content` from on-disk state (`LEERIE_DIR`,
+`subtasks/<sid>.json`, the worktree CWD, BUILD/LINT/TEST commands) and mutate
+a worktree when re-executed, so they cannot replay as pure functions.
+`corpus_capture --tier env` snapshots a fixture per case:
+
+- `repo.bundle` — `git bundle create` of the base repo state the worktree was
+  cut from (captured against the small committed throwaway fixture repo so it
+  stays tiny).
+- `leerie_dir/` — frozen `subtasks/<sid>.json`, `artifacts/`, provision recipe
+  — everything the worker's `user_content` references under `LEERIE_DIR`.
+- `env.json` — `{cwd_rel, allowed_tools, add_dirs_rel, build_cmd, lint_cmd,
+  test_cmd, diff_base, leerie_dir_abs, autonomous}`.
+
+`replay_in_env(record, fixture, *, override_system_prompt)` materialises
+`repo.bundle` into a temp clone, cuts a fresh detached worktree at
+`diff_base`, restores `leerie_dir/`, rewrites the absolute `LEERIE_DIR` path
+in the record's `user_content` to the temp path, and invokes `claude_p`
+directly (not `replay_capture`, which is text-only) with
+`_suppress_capture=True`. The worktree is disposable and removed after each
+replay. Tier-2 replays run real builds/tests → slow and token-costly, hence
+`n_env=3`, tolerance `0.20`, and env tier is opt-in (`--tier env|all`).
+
 ---
 
 ## 11. Verification status of the code
