@@ -241,6 +241,19 @@ nerdctl run --rm hello-world
 You should see "Hello from Docker!" (containerd uses the same image).
 If that fails, leerie will too.
 
+## Optional host tools
+
+These are not required to run leerie, but unlock additional automation:
+
+**`gh` (GitHub CLI)** — enables automatic PR creation at the end of each
+run. Without it, leerie pushes the run branch and prints a `gh pr create`
+command for you to run manually. Install from https://cli.github.com, then
+authenticate:
+
+```bash
+gh auth login
+```
+
 ## Fly.io runtime (optional)
 
 By default leerie runs workers locally via `nerdctl`. Passing `--runtime fly`
