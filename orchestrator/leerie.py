@@ -2070,6 +2070,37 @@ def _load_corpus_manifest(corpus_dir: Path) -> dict:
     return data
 
 
+def _atomic_write_manifest(corpus_dir: Path, manifest: dict) -> None:
+    """Validate + atomically write corpus/manifest.json (DESIGN §14).
+
+    Mirrors State.save's temp-file + os.replace idiom so a crash mid-write
+    never leaves a half-written manifest on the shared read-write corpus
+    mount (REGR-04). The validator runs before every write — an invalid
+    manifest never reaches disk."""
+    _validate_corpus_manifest(manifest)
+    target = corpus_dir / "manifest.json"
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2))
+    tmp.replace(target)   # atomic on POSIX; best-effort on Windows
+
+
+def _warn_if_degenerate_baseline(call_type: str, rate: float,
+                                 tolerance: float) -> None:
+    """Warn loudly when a freshly-pinned baseline is un-failable (REGR-03).
+
+    `compare_to_baseline` regresses on `current < baseline - tolerance`.
+    A measured pass-rate is always >= 0, so a baseline <= tolerance can
+    never trip — the gate then silently proves nothing for that call_type.
+    Per the SPEC this is warn-loudly (not refuse): the run still pins, so
+    an operator can deliberately seed a low baseline. Kept as real Python
+    (§12 — the check enforces, the prompt does not)."""
+    if rate <= tolerance:
+        log(f"WARNING: {call_type}: pinned baseline_pass_rate={rate:.2%} "
+            f"<= tolerance={tolerance:.2f} — the regression gate is "
+            f"un-failable for {call_type} (a regression can never trip). "
+            f"Re-capture against healthier prompts or lower the tolerance.")
+
+
 def _load_corpus_case(corpus_dir: Path, call_type: str, cid: str) -> dict:
     """Load one frozen case envelope. Raises FileNotFoundError (missing file)
     or json.JSONDecodeError (corrupt file); phase_regress isolates these
@@ -7598,26 +7629,47 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
             if case_id not in entry["cases"]:
                 entry["cases"].append(case_id)
 
-    # Write a provisional manifest so phase_regress can read the cases.
-    _validate_corpus_manifest(manifest)
-    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    # phase_regress reads its cases from the on-disk manifest, so we must
+    # write a *provisional* manifest (baseline_pass_rate still 0.0) before
+    # measuring. That provisional state is degenerate — every new call_type
+    # would be un-failable — so a crash between here and the real pin must
+    # not leave it on disk (REGR-04). Snapshot the pre-capture manifest bytes
+    # and roll back to them (or remove the file entirely if there was none)
+    # if phase_regress fails. The atomic helper guarantees the rollback write
+    # itself can't tear.
+    manifest_path = corpus_dir / "manifest.json"
+    prior_manifest_bytes = (manifest_path.read_text()
+                            if manifest_path.exists() else None)
+    _atomic_write_manifest(corpus_dir, manifest)
 
     # Pin the baseline: measure the current prompts' pass-rate over the
     # freshly-written cases.
     out_dir = st.run_dir / "corpus-capture-out"
-    report = await phase_regress(corpus_dir, out_dir, caps, st, models,
-                                 efforts, tier=tier,
-                                 call_types=list(by_type.keys()),
-                                 tolerance=tolerance)
+    try:
+        report = await phase_regress(corpus_dir, out_dir, caps, st, models,
+                                     efforts, tier=tier,
+                                     call_types=list(by_type.keys()),
+                                     tolerance=tolerance)
+    except BaseException:
+        # Restore the host manifest to its pre-capture state so a mid-capture
+        # crash never leaves a usable-but-degenerate (0.0-baseline) manifest.
+        if prior_manifest_bytes is None:
+            manifest_path.unlink(missing_ok=True)
+        else:
+            tmp = manifest_path.with_suffix(".json.tmp")
+            tmp.write_text(prior_manifest_bytes)
+            tmp.replace(manifest_path)
+        raise
     now = _utc_now_iso()
     for ct in by_type:
         cur = report["per_call_type"].get(ct, {}).get("current", 0.0)
         manifest["call_types"][ct]["baseline_pass_rate"] = cur
         manifest["call_types"][ct]["prompt_sha"] = _prompt_sha(ct)
         manifest["call_types"][ct]["baseline_captured_at"] = now
+        _warn_if_degenerate_baseline(
+            ct, cur, manifest["call_types"][ct]["tolerance"])
     manifest["judge_prompt_sha"] = _prompt_sha("judge")
-    _validate_corpus_manifest(manifest)
-    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    _atomic_write_manifest(corpus_dir, manifest)
     log(f"corpus capture: pinned baseline for {sorted(by_type)} from run "
         f"{run_id!r}")
     return manifest
@@ -7762,9 +7814,10 @@ def _update_baseline(corpus_dir: Path, report: dict) -> None:
             manifest["call_types"][ct]["baseline_pass_rate"] = r["current"]
             manifest["call_types"][ct]["prompt_sha"] = _prompt_sha(ct)
             manifest["call_types"][ct]["baseline_captured_at"] = now
+            _warn_if_degenerate_baseline(
+                ct, r["current"], manifest["call_types"][ct]["tolerance"])
     manifest["judge_prompt_sha"] = _prompt_sha("judge")
-    _validate_corpus_manifest(manifest)
-    (corpus_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    _atomic_write_manifest(corpus_dir, manifest)
     log("corpus: baseline re-pinned (--update-baseline)")
 
 
