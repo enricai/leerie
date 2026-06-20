@@ -119,10 +119,18 @@ fi
 # which could mutate PATH unpredictably). HOME is load-bearing for
 # claude (creds at ~/.claude/.credentials.json); USER/LOGNAME are read
 # by tools that introspect identity.
-# In rootless mode root IS the host user — skip the privilege drop so
-# bind-mounted host dirs remain accessible.
+# In rootless mode root IS the host user, so bind-mounted dirs (outer
+# UID 0) are ours — but claude refuses --dangerously-skip-permissions
+# when getuid()==0. We remap to the leerie user's UID/GID (baked in at
+# image build time from HOST_UID/HOST_GID) in a nested user namespace
+# via unshare: outer UID 0 → inner UID leerie (explicit), so all
+# bind-mounts remain owned by us. Image dirs (outer UID leerie) are
+# traversed via their mode-755 bits, not by ownership.
 if [ "$ROOTLESS" = "true" ]; then
-  exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+  _leerie_uid="$(id -u leerie)"
+  _leerie_gid="$(id -g leerie)"
+  exec unshare --user --map-user="$_leerie_uid" --map-group="$_leerie_gid" \
+    env HOME=/home/leerie USER=leerie LOGNAME=leerie \
     python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi
 exec runuser -u leerie -- \

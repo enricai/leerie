@@ -3863,6 +3863,18 @@ else
     fi
   fi
 
+  # Rootless nerdctl (non-root host user) runs the container in a user
+  # namespace where PID 1 appears as UID 0. container-entry.sh uses
+  # `unshare --user` to remap to the leerie UID so claude accepts
+  # --dangerously-skip-permissions (which it refuses when getuid()==0).
+  # The OCI default seccomp profile blocks unshare(CLONE_NEWUSER) inside
+  # containers, so we lift it for rootless runs. Single-tenant dev tool;
+  # the security trade-off is acceptable.
+  ROOTLESS_SECOPT=()
+  if [ "$(id -u)" != "0" ]; then
+    ROOTLESS_SECOPT=(--security-opt seccomp=unconfined)
+  fi
+
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
   nerdctl run \
@@ -3873,6 +3885,7 @@ else
     -e LEERIE_INSPECT_DIRS= \
     -e LEERIE_STATE_DIR=/leerie-state \
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"} \
+    ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"} \
     -v "$USER_REPO:/work" \
     -v "$LEERIE_REPO:/opt/leerie-image:ro" \
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
