@@ -15468,6 +15468,19 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     return ap
 
 
+def _die_run_locked(run_id: str, run_dir: Path) -> None:
+    """Log the standard single-owner-per-run message and exit
+    EXIT_LOCKED. Shared by the entry-State guard and the
+    --corpus-capture guard so the wording cannot drift between sites
+    (DESIGN §6 *Single owner per run dir*)."""
+    log(f"another orchestrator already owns run {run_id!r} "
+        f"(holding flock on {run_dir}). "
+        f"Tail it without spawning a duplicate: "
+        f"`leerie --resume {run_id}`. "
+        f"If the holder is wedged, kill it and retry.")
+    sys.exit(EXIT_LOCKED)
+
+
 def main() -> None:
     ap = _build_arg_parser()
     args = ap.parse_args()
@@ -15556,12 +15569,7 @@ def main() -> None:
         # the check here is the load-bearing one for any code path
         # that bypasses the launcher (manual `python3 leerie.py
         # --resume`, future verbs, etc.).
-        log(f"another orchestrator already owns run {run_id!r} "
-            f"(holding flock on {e.run_dir}). "
-            f"Tail it without spawning a duplicate: "
-            f"`leerie --resume {run_id}`. "
-            f"If the holder is wedged, kill it and retry.")
-        sys.exit(EXIT_LOCKED)
+        _die_run_locked(run_id, e.run_dir)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -15667,7 +15675,14 @@ def main() -> None:
             Path(os.getcwd()), args.regress_tolerance)
         if args.corpus_capture_from:
             run_id = args.corpus_capture_from
-            cap_st = State(leerie_root, run_id)   # telemetry/budget during baseline replays
+            # Same single-owner guard as the entry State: the target run
+            # dir may be flock-held by a live orchestrator. Without this,
+            # capturing from a locked run died with a raw StateLockedError
+            # traceback instead of the documented EXIT_LOCKED pivot.
+            try:
+                cap_st = State(leerie_root, run_id)   # telemetry/budget during baseline replays
+            except StateLockedError as e:
+                _die_run_locked(run_id, e.run_dir)
             if not cap_st.load():
                 die(f"corpus capture: no state for run {run_id!r}")
             asyncio.run(corpus_capture(
@@ -15679,17 +15694,31 @@ def main() -> None:
         # --regress
         regress_run_id = f"regress-{uuid.uuid4().hex[:12]}"
         regress_st = State(leerie_root, regress_run_id)
-        out_dir = regress_st.run_dir / "regress-out"
-        report = asyncio.run(phase_regress(
-            corpus_dir, out_dir, caps, regress_st, models, efforts,
-            tier=args.tier or "text",
-            call_types=args.regress_call_types, tolerance=regress_tol))
-        _print_regress_report(report)
-        if args.update_baseline:
-            _update_baseline(corpus_dir, report)
-        if report["overall"] == "REGRESSED":
-            sys.exit(EXIT_REGRESSED)
-        return
+        # The regress-<uuid> State is throwaway scratch for this single
+        # invocation (telemetry/budget during replays). Remove its run
+        # dir on EVERY exit path so the state root does not accumulate a
+        # leaked dir per --regress (REGR-05). The finally also runs before
+        # the EXIT_REGRESSED sys.exit below — SystemExit propagates through
+        # finally, so the dir is cleaned up and exit code 12 is preserved.
+        # Only the regress-<uuid> dir minted here is removed; the entry
+        # container-id run dir and any user run dir are never touched.
+        try:
+            out_dir = regress_st.run_dir / "regress-out"
+            report = asyncio.run(phase_regress(
+                corpus_dir, out_dir, caps, regress_st, models, efforts,
+                tier=args.tier or "text",
+                call_types=args.regress_call_types, tolerance=regress_tol))
+            _print_regress_report(report)
+            if args.update_baseline:
+                _update_baseline(corpus_dir, report)
+            if report["overall"] == "REGRESSED":
+                sys.exit(EXIT_REGRESSED)
+            return
+        finally:
+            # Release the flock before rmtree so the dir is not held open
+            # by this process's lock fd when it is removed.
+            regress_st.release_lock()
+            shutil.rmtree(regress_st.run_dir, ignore_errors=True)
 
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # orchestrate() flow — just pick an existing run and run the skill.
