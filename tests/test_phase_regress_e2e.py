@@ -202,3 +202,122 @@ def test_phase_regress_replay_crash_is_hard_fail_without_judging(
     # so the known-good frozen content cannot mask the regression.
     assert judged["n"] == 0
     assert report["overall"] == "REGRESSED"
+
+
+def test_judge_failure_isolated(leerie, tmp_path, monkeypatch):
+    """REGR-01: a judge_capture raise fails only that replay — the run still
+    computes `overall`, writes REPORT.json, and no exception escapes."""
+    corpus = _write_corpus(tmp_path)
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        return ({"result": "fresh output", "is_error": False}, {})
+
+    async def exploding_judge(record, models, efforts, caps, st):
+        # Mirrors a WorkerError from 2× schema-invalid judge output.
+        raise RuntimeError("judge emitted schema-invalid output twice")
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", exploding_judge)
+
+    st = _MiniState(tmp_path)
+    out = tmp_path / "out"
+    # The whole point: asyncio.run must NOT propagate — gather_or_cancel
+    # would re-raise an unguarded judge raise and abort the run.
+    report = asyncio.run(leerie.phase_regress(
+        corpus, out, dict(leerie.DEFAULT_CAPS), st, {}, {}, tier="text"))
+
+    # Every replay's judge raised → all FAIL → REGRESSED for the all-fail
+    # call_type, and the report is still produced + written.
+    assert report["overall"] == "REGRESSED"
+    assert report["per_call_type"]["classifier"]["passes"] == 0
+    assert report["per_call_type"]["classifier"]["total"] == 3
+    assert (out / "REPORT.json").exists()
+
+
+def test_judge_is_error_envelope_is_hard_fail(leerie, tmp_path, monkeypatch):
+    """A replay that returns {"is_error": True} is a counted FAIL and the
+    judge is never consulted (the frozen content cannot mask a regression)."""
+    corpus = _write_corpus(tmp_path)
+    judged = {"n": 0}
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        return ({"is_error": True, "result": ""}, {})
+
+    async def fake_judge(record, models, efforts, caps, st):
+        judged["n"] += 1
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}  # would PASS if (wrongly) consulted
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    report = asyncio.run(leerie.phase_regress(
+        corpus, tmp_path / "out", dict(leerie.DEFAULT_CAPS), st, {}, {},
+        tier="text"))
+    assert judged["n"] == 0
+    assert report["overall"] == "REGRESSED"
+    assert report["per_call_type"]["classifier"]["passes"] == 0
+
+
+def test_judge_empty_result_is_hard_fail(leerie, tmp_path, monkeypatch):
+    """A replay that returns an empty result is a counted FAIL and the judge
+    is never consulted."""
+    corpus = _write_corpus(tmp_path)
+    judged = {"n": 0}
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        return ({"result": ""}, {})
+
+    async def fake_judge(record, models, efforts, caps, st):
+        judged["n"] += 1
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    report = asyncio.run(leerie.phase_regress(
+        corpus, tmp_path / "out", dict(leerie.DEFAULT_CAPS), st, {}, {},
+        tier="text"))
+    assert judged["n"] == 0
+    assert report["overall"] == "REGRESSED"
+    assert report["per_call_type"]["classifier"]["passes"] == 0
+
+
+def test_bad_case_file_isolated(leerie, tmp_path, monkeypatch):
+    """REGR-02: one valid case + one whose case file is corrupt — the run
+    completes, writes REPORT.json, and the bad case contributes a FAIL."""
+    corpus = _write_corpus(tmp_path)
+    # Add a second case id to the manifest whose case file is corrupt JSON.
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    manifest["call_types"]["classifier"]["cases"] = [
+        "classifier-001", "classifier-002"]
+    (corpus / "manifest.json").write_text(json.dumps(manifest))
+    (corpus / "cases" / "classifier" / "classifier-002.json").write_text(
+        "{ corrupt")
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        return ({"result": "fresh output", "is_error": False}, {})
+
+    async def fake_judge(record, models, efforts, caps, st):
+        # The valid case's replays would PASS.
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    out = tmp_path / "out"
+    report = asyncio.run(leerie.phase_regress(
+        corpus, out, dict(leerie.DEFAULT_CAPS), st, {}, {}, tier="text"))
+
+    # The run completed and wrote a report despite the corrupt case file.
+    assert (out / "REPORT.json").exists()
+    # Denominator still reflects both cases × n=3 = 6; the corrupt case
+    # contributed 3 FAILs while the valid case contributed 3 passes.
+    cls = report["per_call_type"]["classifier"]
+    assert cls["total"] == 6
+    assert cls["passes"] == 3

@@ -2070,14 +2070,18 @@ def _load_corpus_manifest(corpus_dir: Path) -> dict:
     return data
 
 
+def _load_corpus_case(corpus_dir: Path, call_type: str, cid: str) -> dict:
+    """Load one frozen case envelope. Raises FileNotFoundError (missing file)
+    or json.JSONDecodeError (corrupt file); phase_regress isolates these
+    per-case so one bad file fails only that case (DESIGN §14)."""
+    p = corpus_dir / "cases" / call_type / f"{cid}.json"
+    return json.loads(p.read_text())
+
+
 def _load_corpus_cases(corpus_dir: Path, call_type: str,
                        case_ids: list[str]) -> list[dict]:
     """Load the frozen case envelopes for one call_type."""
-    cases: list[dict] = []
-    for cid in case_ids:
-        p = corpus_dir / "cases" / call_type / f"{cid}.json"
-        cases.append(json.loads(p.read_text()))
-    return cases
+    return [_load_corpus_case(corpus_dir, call_type, cid) for cid in case_ids]
 
 
 # --- PR body composition (DESIGN §6 "Finalization") ---------------------
@@ -7406,8 +7410,27 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
                 judge_record["response_content"] = fresh
                 judge_record["parsed_ok"] = True
                 judge_record["success"] = True
-                verdict = await judge_capture(judge_record, models, efforts,
-                                              caps, st)
+                try:
+                    verdict = await judge_capture(judge_record, models,
+                                                  efforts, caps, st)
+                except Exception:
+                    # §12: a judge that crashed (e.g. a WorkerError from 2×
+                    # schema-invalid judge output, or an infra error) graded
+                    # nothing. Deciding that is code's job — a deterministic
+                    # hard FAIL for this replay, NOT a fall-back to judging
+                    # the frozen known-good content (which could mask the
+                    # regression) and NOT a counted pass. Catch broad
+                    # Exception only so asyncio.CancelledError still
+                    # propagates and gather_or_cancel's sibling cancellation
+                    # keeps working.
+                    verdict = {
+                        "passed": False,
+                        "dimensions": {"schema_ok": False,
+                                       "factual_ok": False,
+                                       "hallucination_ok": False},
+                        "rationale": "judge errored — deterministic hard FAIL",
+                        "suggested_fixes": [],
+                    }
             case_out = out_dir / ct / case["case_id"]
             case_out.mkdir(parents=True, exist_ok=True)
             (case_out / f"verdict-{replay_idx}.json").write_text(
@@ -7416,15 +7439,38 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
             log(f"  regress-{ct}-{case['case_id']}#{replay_idx}: {status}")
             return (ct, verdict)
 
+    # §14/§12: a missing or corrupt case file must fail only that case, not
+    # abort the whole run. Load each case id with isolation; on a load error
+    # contribute cfg["n"] deterministic hard-FAIL verdicts for that case so
+    # compare_to_baseline's len(cfg["cases"]) * cfg["n"] denominator still
+    # matches and the bad case counts as FAILs rather than crashing the
+    # gather (gather_or_cancel re-raises the first exception and aborts).
     tasks = []
+    prefail: dict[str, list[dict]] = {}
     for ct, cfg in selected.items():
-        cases = _load_corpus_cases(corpus_dir, ct, cfg["cases"])
-        for case in cases:
+        for cid in cfg["cases"]:
+            try:
+                case = _load_corpus_case(corpus_dir, ct, cid)
+            except (FileNotFoundError, json.JSONDecodeError, ValueError):
+                prefail.setdefault(ct, []).extend(
+                    {
+                        "passed": False,
+                        "dimensions": {"schema_ok": False,
+                                       "factual_ok": False,
+                                       "hallucination_ok": False},
+                        "rationale": "case file missing or corrupt — "
+                                     "deterministic hard FAIL",
+                        "suggested_fixes": [],
+                    }
+                    for _ in range(cfg["n"]))
+                log(f"  regress-{ct}-{cid}: case file missing or corrupt — "
+                    f"{cfg['n']} hard FAILs")
+                continue
             for idx in range(cfg["n"]):
                 tasks.append(_replay_and_judge(ct, cfg, case, idx))
 
     pairs = await gather_or_cancel(*tasks) if tasks else []
-    results: dict[str, list[dict]] = {}
+    results: dict[str, list[dict]] = {ct: list(v) for ct, v in prefail.items()}
     for ct, verdict in pairs:
         results.setdefault(ct, []).append(verdict)
 
