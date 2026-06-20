@@ -1,8 +1,28 @@
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True,
+                   capture_output=True, text=True)
+
+
+def _make_repo(p: Path) -> str:
+    """Real-git fixture (init + commit) returning the base SHA — mirrors
+    tests/test_snapshot_env_fixture.py:_make_repo."""
+    p.mkdir(parents=True)
+    _git("init", "-q", cwd=p)
+    _git("config", "user.email", "t@t", cwd=p)
+    _git("config", "user.name", "t", cwd=p)
+    (p / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git("add", "-A", cwd=p)
+    _git("commit", "-qm", "init", cwd=p)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=p,
+                          capture_output=True, text=True).stdout.strip()
 
 
 class _MiniState:
@@ -27,6 +47,10 @@ def _seed_run(leerie_root: Path, run_id: str) -> None:
          "parsed_ok": False, "success": False},   # filtered out
         {"call_id": "id-good-2", "call_type": "planner", "model": "opus",
          "system_prompt": "p", "user_content": "u3", "response_content": "r3",
+         "parsed_ok": True, "success": True},
+        # Acting-worker record — promoted to an env-tier case when tier="env".
+        {"call_id": "id-good-3", "call_type": "implementer", "model": "sonnet",
+         "system_prompt": "p", "user_content": "u4", "response_content": "{}",
          "parsed_ok": True, "success": True},
     ]
     (run_dir / "calls.ndjson").write_text(
@@ -100,19 +124,62 @@ def test_corpus_capture_rejects_unknown_tier(leerie, tmp_path, monkeypatch):
             st, {}, {}, tier="bogus"))
 
 
-def test_corpus_capture_env_tier_dies_before_increment_b(leerie, tmp_path,
-                                                         monkeypatch):
-    # _ENV_CAPTURE_READY is False until Increment B (Task B2) flips it.
+def test_corpus_capture_env_tier_snapshots_fixture_and_pins_env_defaults(
+        leerie, tmp_path, monkeypatch):
+    """Live env-tier coverage (REGR-08): an acting-worker record drives
+    _snapshot_env_fixture, a fixture is snapshotted, and the manifest entry
+    is env-tier with n == REGRESS_N_ENV_DEFAULT and tolerance ==
+    REGRESS_ENV_TOLERANCE_DEFAULT."""
     leerie_root = tmp_path / "state"
     _seed_run(leerie_root, "r1")
-    st = _MiniState(leerie_root / "runs" / "r1")
-    if leerie._ENV_CAPTURE_READY:
-        import pytest as _pt
-        _pt.skip("env capture is ready; guard no longer applies")
-    with pytest.raises(SystemExit):
-        asyncio.run(leerie.corpus_capture(
-            "r1", tmp_path / "corpus", leerie_root, dict(leerie.DEFAULT_CAPS),
-            st, {}, {}, tier="env"))
+    corpus = tmp_path / "corpus"
+
+    # Real-git source repo for the env snapshot; the run's working-branch is
+    # `main` so _snapshot_env_fixture resolves the base SHA from it.
+    repo = tmp_path / "repo"
+    base = _make_repo(repo)
+    run_dir = leerie_root / "runs" / "r1"
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                            cwd=repo, capture_output=True,
+                            text=True).stdout.strip()
+    (run_dir / "working-branch").write_text(branch)
+    # _snapshot_env_fixture resolves src_repo from USER_REPO when not given.
+    monkeypatch.setenv("USER_REPO", str(repo))
+
+    async def fake_phase_regress(corpus_dir, out_dir, caps, st, models,
+                                 efforts, tier="all", call_types=None,
+                                 tolerance=None):
+        # Report a healthy current for every freshly-promoted call_type.
+        manifest = leerie._load_corpus_manifest(corpus_dir)
+        per = {ct: {"current": 0.9, "baseline": 0.9, "tolerance": 0.20,
+                    "passes": 0, "total": 0, "verdict": "OK"}
+               for ct in manifest["call_types"]}
+        return {"overall": "OK", "per_call_type": per, "warnings": []}
+
+    monkeypatch.setattr(leerie, "phase_regress", fake_phase_regress)
+
+    st = _MiniState(run_dir)
+    asyncio.run(leerie.corpus_capture(
+        "r1", corpus, leerie_root, dict(leerie.DEFAULT_CAPS), st, {}, {},
+        call_types=["implementer"], tier="env"))
+
+    # A fixture was snapshotted for the implementer case.
+    case_path = corpus / "cases" / "implementer" / "implementer-001.json"
+    assert case_path.exists()
+    case = json.loads(case_path.read_text())
+    fixture_ptr = case["fixture"]
+    assert fixture_ptr == "fixtures/implementer-001/"
+    fdir = corpus / fixture_ptr
+    assert (fdir / "repo.bundle").exists()
+    assert (fdir / "env.json").exists()
+
+    # The manifest entry is env-tier with the env n/tolerance defaults.
+    manifest = leerie._load_corpus_manifest(corpus)
+    leerie._validate_corpus_manifest(manifest)
+    entry = manifest["call_types"]["implementer"]
+    assert entry["tier"] == "env"
+    assert entry["n"] == leerie.REGRESS_N_ENV_DEFAULT
+    assert entry["tolerance"] == leerie.REGRESS_ENV_TOLERANCE_DEFAULT
 
 
 # --- REGR-03: degenerate-baseline warning at pin time ----------------------

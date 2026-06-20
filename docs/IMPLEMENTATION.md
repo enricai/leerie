@@ -793,8 +793,10 @@ leerie "task" --source-of-truth codebase
 
 # Behavioral regression gate (DESIGN §14). Runs claude on your subscription;
 # local mode only (the working-tree prompts/ must be visible to the gate).
-# Re-run the committed golden corpus through the CURRENT prompts and exit
-# EXIT_REGRESSED=12 if any call_type's judged pass-rate dropped past tolerance:
+# Re-run the golden corpus through the CURRENT prompts and exit
+# EXIT_REGRESSED=12 if any call_type's judged pass-rate dropped past tolerance.
+# The corpus is captured on-demand (capture first with `--corpus-capture`) and
+# is unseeded by default — with no `corpus/` the gate is vacuously green:
 leerie --regress                      # text tier (judgment workers) by default
 leerie --regress --tier all           # include env tier (acting workers; slow/costly)
 leerie --regress --call-type classifier --call-type planner
@@ -4852,15 +4854,17 @@ meaningful testing requires a stub or live `claude` binary — that's a
 separate end-to-end tier.
 
 **Behavioral quality gate (DESIGN §14).** The regression gate adds
-code-enforced behavioral-quality coverage of worker prompts against a
-committed corpus. `compare_to_baseline` and `_validate_corpus_manifest` are
-unit-tested; the capture/replay pipeline is covered by
-`test_phase_regress_e2e.py`, `test_corpus_capture.py`,
-`test_snapshot_env_fixture.py`, `test_replay_in_env.py`, and
-`test_regress_launcher.py`. This partially closes the DESIGN §16 gap ("the
-behavioral quality of worker outputs is unverified") — for the captured cases
-only. Prompt regressions that fall outside the committed corpus remain in the
-untested tier.
+code-enforced behavioral-quality coverage of worker prompts against an
+on-demand corpus (`leerie --corpus-capture`). The corpus is **currently
+unseeded** — no `corpus/` is committed in this repo today, so the gate is
+mechanically complete but vacuously green until a corpus is captured.
+`compare_to_baseline` and `_validate_corpus_manifest` are unit-tested; the
+capture/replay pipeline is covered by `test_phase_regress_e2e.py`,
+`test_corpus_capture.py`, `test_snapshot_env_fixture.py`,
+`test_replay_in_env.py`, and `test_regress_launcher.py`. Once a corpus is
+captured, this partially closes the DESIGN §16 gap ("the behavioral quality of
+worker outputs is unverified") — for the captured cases only. Prompt
+regressions that fall outside the corpus remain in the untested tier.
 
 First real step: one run on a throwaway repo with a small, fully-specified
 task.

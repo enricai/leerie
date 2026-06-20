@@ -367,9 +367,12 @@ The behavioral regression gate (DESIGN §14) is covered by
 coupling test that its `REGRESSED` semantics match `check_convergence`),
 `test_phase_regress_e2e.py`, `test_corpus_capture.py`,
 `test_snapshot_env_fixture.py`, `test_replay_in_env.py`, and
-`test_regress_launcher.py`. The live capture/replay path (`leerie
---corpus-capture` / `--regress`) needs an authenticated `claude` and lives in
-the same on-demand tier as `claude_p`.
+`test_regress_launcher.py`. The corpus itself is captured on-demand (`leerie
+--corpus-capture`) and is currently unseeded — no `corpus/` is committed, so
+the gate is mechanically complete but vacuously green until a corpus is
+captured. The live capture/replay path (`leerie --corpus-capture` /
+`--regress`) needs an authenticated `claude` and lives in the same on-demand
+tier as `claude_p`.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful
 testing requires a stub or live `claude` binary and lives in a separate
@@ -394,10 +397,12 @@ Before marking a change complete:
       are valid JSON and all referenced skill/command paths still exist.
       The `version` field is duplicated across the two manifests;
       `tests/test_version_flag.py` guards them from drifting.
-- [ ] `python3 -c 'import sys; sys.path.insert(0,"orchestrator"); import json, leerie; leerie._validate_corpus_manifest(json.load(open("corpus/manifest.json")))'`
+- [ ] `python3 -c 'import os, sys; sys.path.insert(0,"orchestrator"); import json, leerie; (leerie._validate_corpus_manifest(json.load(open("corpus/manifest.json"))) if os.path.exists("corpus/manifest.json") else print("skipped — no corpus (unseeded)"))'`
       — if `corpus/` or the regression-gate code (`_validate_corpus_manifest`,
       `compare_to_baseline`, `phase_regress`, `corpus_capture`) was touched,
-      confirm the committed manifest still validates. (DESIGN §14.)
+      confirm the manifest still validates. The corpus is captured on-demand
+      (`leerie --corpus-capture`) and is currently unseeded — with no
+      `corpus/manifest.json` the command skips cleanly (exit 0). (DESIGN §14.)
 - [ ] `python3 -c 'import json; [json.loads(l) for l in open("<state-root>/runs/<run>/calls.ndjson")]'`
       — if the telemetry writer (`_capture_call`) was touched, confirm a
       representative run produces a well-formed `calls.ndjson` (each line

@@ -2663,11 +2663,15 @@ The gate assembles already-built primitives — capture, replay, judge, the
 n-replay pass-rate from `heal_baseline`, the `REGRESSED` verdict from
 `check_convergence` — into three pieces:
 
-1. A **golden corpus** (`corpus/`, committed in this repo): real captured
-   calls (`corpus/cases/<call_type>/<case_id>.json`) plus a per-`call_type`
+1. A **golden corpus** (`corpus/`): real captured calls
+   (`corpus/cases/<call_type>/<case_id>.json`) plus a per-`call_type`
    **baseline pass-rate** pinned at capture time (`corpus/manifest.json`).
-   The corpus guards `prompts/*.md`, so it lives in the leerie tool repo and
-   is reviewed in PRs alongside the prompts it guards.
+   The corpus is captured *on-demand* (`leerie --corpus-capture <run-id>`)
+   and is **currently unseeded** — no `corpus/` exists in the repo today, so
+   the gate is mechanically complete but vacuously green until a corpus is
+   captured. Once captured, the corpus guards `prompts/*.md`, so it lives in
+   the leerie tool repo and is reviewed in PRs alongside the prompts it
+   guards.
 2. A **comparator** that re-runs the corpus through the *current* prompts,
    judges each fresh output, and **fails when the judged pass-rate drops
    below baseline beyond a tolerance.**
