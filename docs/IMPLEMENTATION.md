@@ -4337,8 +4337,7 @@ corpus/                                       (committed; DESIGN §14)
     ├── repo.bundle                           git bundle of the base repo state
     ├── leerie_dir/                           frozen subtasks/<sid>.json, artifacts/, etc.
     └── env.json                              {cwd_rel, allowed_tools, add_dirs_rel,
-                                              build_cmd, lint_cmd, test_cmd, diff_base,
-                                              leerie_dir_abs, autonomous}
+                                              diff_base, leerie_dir_abs, autonomous}
 ```
 
 In local mode the launcher bind-mounts `$LEERIE_REPO/corpus` read-write at
@@ -4781,8 +4780,8 @@ a worktree when re-executed, so they cannot replay as pure functions.
   stays tiny).
 - `leerie_dir/` — frozen `subtasks/<sid>.json`, `artifacts/`, provision recipe
   — everything the worker's `user_content` references under `LEERIE_DIR`.
-- `env.json` — `{cwd_rel, allowed_tools, add_dirs_rel, build_cmd, lint_cmd,
-  test_cmd, diff_base, leerie_dir_abs, autonomous}`.
+- `env.json` — `{cwd_rel, allowed_tools, add_dirs_rel, diff_base,
+  leerie_dir_abs, autonomous}`.
 
 `replay_in_env(record, fixture, *, override_system_prompt)` materialises
 `repo.bundle` into a temp clone, cuts a fresh detached worktree at
@@ -4790,7 +4789,10 @@ a worktree when re-executed, so they cannot replay as pure functions.
 in the record's `user_content` to the temp path, and invokes `claude_p`
 directly (not `replay_capture`, which is text-only) with
 `_suppress_capture=True`. The worktree is disposable and removed after each
-replay. Tier-2 replays run real builds/tests → slow and token-costly, hence
+replay. Tier-2 re-runs the full acting worker in the reconstructed worktree and
+grades its *fresh output* via `judge_capture` (judge-on-output) — it does not
+run builds/lint/tests and the verdict is not derived from build/test results.
+Re-invoking a whole acting worker per replay is slow and token-costly, hence
 `n_env=3`, tolerance `0.20`, and env tier is opt-in (`--tier env|all`).
 
 ---

@@ -7705,11 +7705,12 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
 #     "{leerie_dir}/subtasks/{sid}.json", L12595; checkpoints/criteria). For a
 #     subtask, leerie_dir == the run dir, so we freeze that subtree
 #     (leerie_dir/) and record its absolute path (leerie_dir_abs) for replay.
-#   - build/lint/test commands: NOT on the call record. They are inferred at
-#     conformance time via `_infer_build_lint_test(repo_root)` (L13333) and
-#     handed only to the conformer — never to the implementer, never stored on
-#     the record. So these fields stay empty here (brief default) and are
-#     reconstructed by the replay harness, not snapshotted.
+#   - build/lint/test commands: NOT part of Tier-2 replay at all. They are
+#     inferred at conformance time via `_infer_build_lint_test(repo_root)`
+#     (L13333) and handed only to the conformer — never to the implementer,
+#     never stored on the record. `replay_in_env` re-executes the acting
+#     worker and the verdict is judge-on-output (`judge_capture`); it never
+#     runs builds/lint/tests, so these fields are not snapshotted in env.json.
 def _snapshot_env_fixture(corpus_dir: Path, case_id: str, record: dict,
                           leerie_root: Path, run_id: str, *,
                           src_repo: Path | None = None,
@@ -7778,9 +7779,6 @@ def _snapshot_env_fixture(corpus_dir: Path, case_id: str, record: dict,
         "cwd_rel": "",                       # worktree root is the worker's cwd
         "allowed_tools": ACT_TOOLS,          # acting workers always get ACT_TOOLS
         "add_dirs_rel": [],                  # no --add-dir passed to acting calls
-        "build_cmd": "",                     # inferred at replay, not on record
-        "lint_cmd": "",                      # inferred at replay, not on record
-        "test_cmd": "",                      # inferred at replay, not on record
         "diff_base": base_sha,
         "leerie_dir_abs": str(run_dir),
         "autonomous": True,

@@ -49,6 +49,11 @@ def test_snapshot_produces_clonable_bundle_and_env(leerie, tmp_path):
     assert (fdir / "leerie_dir" / "subtasks" / "task-1.json").exists()
     env = json.loads((fdir / "env.json").read_text())
     assert "diff_base" in env and "leerie_dir_abs" in env and "autonomous" in env
+    # REGR-06: replay_in_env never reads build/lint/test commands, so the
+    # Tier-2 snapshot must not carry these dead fields (verdict is
+    # judge-on-output, not build/test results).
+    assert "build_cmd" not in env and "lint_cmd" not in env \
+        and "test_cmd" not in env
     # The bundle clones cleanly and contains the base commit.
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", str(fdir / "repo.bundle"),
