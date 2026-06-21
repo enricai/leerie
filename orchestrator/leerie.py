@@ -426,10 +426,6 @@ CORPUS_DIR_ENV = "LEERIE_CORPUS_DIR"
 # text-tier. (Mirrors the model-default acting/judgment split.)
 ACTING_WORKER_TYPES = ("implementer", "conformer", "integrator", "provision")
 
-# Flipped to True in Increment B once _snapshot_env_fixture / replay_in_env
-# land. Until then, env capture die()s with a clear message.
-_ENV_CAPTURE_READY = True
-
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
 # LEERIE_CONFIDENCE_ROUNDS env var → leerie.toml → DEFAULT_CAPS
@@ -7561,10 +7557,6 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     """
     if tier not in ("text", "env", "all"):
         die(f"corpus capture: unknown tier {tier!r} (expected: text, env, all)")
-    # Env capture needs the fixture snapshotter from Increment B.
-    if tier in ("env", "all") and not _ENV_CAPTURE_READY:
-        die("corpus capture --tier env requires the Tier-2 fixture "
-            "snapshotter (Increment B) — not yet available")
 
     calls_path = leerie_root / "runs" / run_id / "calls.ndjson"
     if not calls_path.exists():
