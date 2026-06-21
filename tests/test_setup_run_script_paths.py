@@ -105,6 +105,20 @@ def test_new_worktree_branches_off_run_branch():
     assert 'leerie/staging' not in src
 
 
+def test_new_worktree_idempotency_check_uses_fixed_string():
+    """The already-present check must use -xF (fixed-string, whole-line) so it
+    works for absolute LEERIE_STATE_DIR values like /leerie-state.
+
+    The old pattern `grep -q "worktree .*/${WT}$"` expands to a double-slash
+    when $WT is absolute, e.g. `worktree .*/` + `/leerie-state/...` =
+    `worktree .*/` + `/leerie-state/...`.  grep never finds a match, the
+    script falls through to `git worktree add` on an existing directory, and
+    every continuation retry dies with "fatal: '...' already exists"."""
+    src = _script("new-worktree.sh")
+    assert 'grep -qxF "worktree $WT"' in src
+    assert 'grep -q "worktree .*/' not in src
+
+
 # --- integrate.sh ---------------------------------------------------------
 
 def test_integrate_takes_run_id_arg():

@@ -20,7 +20,7 @@ WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 PARENT_BRANCH="leerie/runs/${RUN_ID}"
 
-if git worktree list --porcelain | grep -q "worktree .*/${WT}$"; then
+if git worktree list --porcelain | grep -qxF "worktree $WT"; then
   : # already present — reuse it
 elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   # branch exists but worktree was removed — re-attach
