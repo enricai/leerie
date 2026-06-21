@@ -83,10 +83,12 @@ def test_regress_leaves_no_throwaway_dir(leerie, tmp_path, monkeypatch):
     assert leftovers == [], f"throwaway regress dir leaked: {leftovers}"
 
 
-def test_regress_regressed_still_cleans_up_and_exits_12(leerie, tmp_path,
-                                                        monkeypatch):
-    """REGR-05: the EXIT_REGRESSED path still removes the throwaway dir
-    AND preserves the exit code (cleanup runs before the sys.exit)."""
+def test_regress_regressed_retains_artifacts_and_exits_12(leerie, tmp_path,
+                                                          monkeypatch):
+    """REGR-05 (review #2): on REGRESSED the throwaway run dir is RETAINED
+    (it holds regress-out/REPORT.json + per-replay verdicts for debugging)
+    while the exit code is still EXIT_REGRESSED. Only a clean OK pass
+    discards it (covered by test_regress_leaves_no_throwaway_dir)."""
     state_root = _drive_main(
         leerie, tmp_path, monkeypatch,
         ["--run-id", "container-abc", "--regress"])
@@ -101,7 +103,9 @@ def test_regress_regressed_still_cleans_up_and_exits_12(leerie, tmp_path,
     assert exc.value.code == leerie.EXIT_REGRESSED
 
     leftovers = list((state_root / "runs").glob("regress-*"))
-    assert leftovers == [], f"throwaway regress dir leaked: {leftovers}"
+    assert len(leftovers) == 1, (
+        "REGRESSED run dir should be retained for debugging, "
+        f"found: {leftovers}")
 
 
 def test_corpus_capture_locked_target_exits_locked(leerie, tmp_path,

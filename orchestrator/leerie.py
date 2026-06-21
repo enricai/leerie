@@ -2098,11 +2098,24 @@ def _warn_if_degenerate_baseline(call_type: str, rate: float,
 
 
 def _load_corpus_case(corpus_dir: Path, call_type: str, cid: str) -> dict:
-    """Load one frozen case envelope. Raises FileNotFoundError (missing file)
-    or json.JSONDecodeError (corrupt file); phase_regress isolates these
-    per-case so one bad file fails only that case (DESIGN §14)."""
+    """Load one frozen case envelope. Raises FileNotFoundError (missing file),
+    json.JSONDecodeError (unparseable file), or ValueError (valid JSON but the
+    wrong shape — missing the `record`/`case_id` keys `_replay_and_judge`
+    dereferences). phase_regress isolates all three per-case so one bad file
+    fails only that case rather than aborting the whole run (DESIGN §14)."""
     p = corpus_dir / "cases" / call_type / f"{cid}.json"
-    return json.loads(p.read_text())
+    case = json.loads(p.read_text())
+    # Shape-check at the load boundary: `_replay_and_judge` reads
+    # case["record"] and case["case_id"] OUTSIDE its try, so a structurally
+    # malformed (but valid-JSON) case would KeyError there and escape the
+    # per-case isolation. Raising ValueError here keeps the guard at the one
+    # boundary phase_regress already catches.
+    if not isinstance(case, dict) or "record" not in case \
+            or "case_id" not in case:
+        raise ValueError(
+            f"corpus case {cid!r} for {call_type!r} is malformed "
+            f"(missing 'record' or 'case_id')")
+    return case
 
 
 def _load_corpus_cases(corpus_dir: Path, call_type: str,
@@ -15687,13 +15700,17 @@ def main() -> None:
         regress_run_id = f"regress-{uuid.uuid4().hex[:12]}"
         regress_st = State(leerie_root, regress_run_id)
         # The regress-<uuid> State is throwaway scratch for this single
-        # invocation (telemetry/budget during replays). Remove its run
-        # dir on EVERY exit path so the state root does not accumulate a
-        # leaked dir per --regress (REGR-05). The finally also runs before
-        # the EXIT_REGRESSED sys.exit below — SystemExit propagates through
-        # finally, so the dir is cleaned up and exit code 12 is preserved.
-        # Only the regress-<uuid> dir minted here is removed; the entry
-        # container-id run dir and any user run dir are never touched.
+        # invocation (telemetry/budget during replays). On a clean OK pass
+        # the dir is removed so the state root does not accumulate a leaked
+        # dir per --regress (REGR-05). But when the gate REGRESSED — or an
+        # exception escaped — the run dir holds the artifacts you debug a
+        # failure with (regress-out/REPORT.json + per-replay verdict-*.json),
+        # so it is RETAINED. `clean_ok` is set True only on the green return
+        # path; the EXIT_REGRESSED sys.exit raises SystemExit before it is
+        # set, and any exception likewise leaves it False, so the finally
+        # discards the dir only on success. Only the regress-<uuid> dir minted
+        # here is ever removed; the entry/user run dirs are never touched.
+        clean_ok = False
         try:
             out_dir = regress_st.run_dir / "regress-out"
             report = asyncio.run(phase_regress(
@@ -15704,13 +15721,17 @@ def main() -> None:
             if args.update_baseline:
                 _update_baseline(corpus_dir, report)
             if report["overall"] == "REGRESSED":
+                log(f"regression detected — artifacts retained at "
+                    f"{regress_st.run_dir} (REPORT.json + per-replay verdicts)")
                 sys.exit(EXIT_REGRESSED)
+            clean_ok = True
             return
         finally:
-            # Release the flock before rmtree so the dir is not held open
+            # Release the flock before any rmtree so the dir is not held open
             # by this process's lock fd when it is removed.
             regress_st.release_lock()
-            shutil.rmtree(regress_st.run_dir, ignore_errors=True)
+            if clean_ok:
+                shutil.rmtree(regress_st.run_dir, ignore_errors=True)
 
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # orchestrate() flow — just pick an existing run and run the skill.

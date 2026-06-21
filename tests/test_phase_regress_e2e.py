@@ -321,3 +321,39 @@ def test_bad_case_file_isolated(leerie, tmp_path, monkeypatch):
     cls = report["per_call_type"]["classifier"]
     assert cls["total"] == 6
     assert cls["passes"] == 3
+
+
+def test_malformed_case_file_isolated(leerie, tmp_path, monkeypatch):
+    """REGR-02 (review #1 — shape gap): a case file that is valid JSON but
+    missing the record/case_id keys _replay_and_judge dereferences is
+    isolated as a hard FAIL at the load boundary. Without the shape guard in
+    _load_corpus_case this KeyErrors inside _replay_and_judge (outside its
+    try) and aborts the whole run via gather_or_cancel."""
+    corpus = _write_corpus(tmp_path)
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    manifest["call_types"]["classifier"]["cases"] = [
+        "classifier-001", "classifier-002"]
+    (corpus / "manifest.json").write_text(json.dumps(manifest))
+    # Valid JSON, wrong shape — no "record"/"case_id".
+    (corpus / "cases" / "classifier" / "classifier-002.json").write_text(
+        json.dumps({"call_type": "classifier", "note": "missing record"}))
+
+    async def fake_replay(record, *, override_system_prompt=None, cwd=None):
+        return ({"result": "fresh output", "is_error": False}, {})
+
+    async def fake_judge(record, models, efforts, caps, st):
+        return {"passed": True, "dimensions": {}, "rationale": "",
+                "suggested_fixes": []}
+
+    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "judge_capture", fake_judge)
+
+    st = _MiniState(tmp_path)
+    out = tmp_path / "out"
+    report = asyncio.run(leerie.phase_regress(
+        corpus, out, dict(leerie.DEFAULT_CAPS), st, {}, {}, tier="text"))
+
+    assert (out / "REPORT.json").exists()
+    cls = report["per_call_type"]["classifier"]
+    assert cls["total"] == 6
+    assert cls["passes"] == 3   # malformed case → 3 hard FAILs, valid → 3 pass
