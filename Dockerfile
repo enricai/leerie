@@ -67,19 +67,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Chromium + matching chromedriver, baked at image build time so workers
-# running Rails system tests (Capybara + Selenium :headless_chrome) have a
-# browser available without any runtime apt-get. Installing from Debian's own
-# repos guarantees the browser and driver versions are always in sync — no
-# Selenium Manager download needed. X11/GL/NSS/NSPR/GBM are pulled in
-# automatically as Chromium deps. fonts-liberation prevents glyph-fallback
-# rendering artifacts in screenshot-based assertions.
+# Chromium + matching chromedriver, baked at image build time so workers that
+# need a real browser (system/integration tests, visual assertions, CSP checks,
+# Selenium/Capybara/Playwright/Puppeteer scenarios, etc.) have one available
+# without any runtime apt-get. Installing from Debian's own repos guarantees
+# the browser and driver versions are always in sync — no Selenium Manager
+# download needed at runtime. X11/GL/NSS/NSPR/GBM are pulled in automatically
+# as Chromium deps. fonts-liberation prevents glyph-fallback rendering
+# artifacts in screenshot-based assertions.
 #
-# Note: workers running inside the container are the non-root `leerie` user.
-# Chrome's SUID sandbox won't work in many container configurations even for
-# non-root users; the Rails project's ApplicationSystemTestCase should pass
-# --no-sandbox + --disable-dev-shm-usage via Selenium::WebDriver::Chrome::Options
-# (see docs/IMPLEMENTATION.md §0.5 "Rails system tests").
+# Note: workers run as the non-root `leerie` user. Chrome's SUID sandbox does
+# not work in this container configuration; callers must pass --no-sandbox
+# (and typically --disable-dev-shm-usage) when launching Chrome. See
+# docs/IMPLEMENTATION.md §0.5 "Browser-based testing" for details and examples.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       chromium \
       chromium-driver \
