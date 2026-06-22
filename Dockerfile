@@ -76,11 +76,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # as Chromium deps. fonts-liberation prevents glyph-fallback rendering
 # artifacts in screenshot-based assertions.
 #
+# libc6 is listed explicitly to force an upgrade if the debian:13-slim base
+# image snapshot lags the current trixie repos. Without it, the chromium binary
+# (compiled against the current trixie glibc) fails at load time with:
+#   undefined symbol: localtime64_r (fatal)
+# ld.so aborts before Chrome executes a single instruction, producing a
+# SIGTRAP/core-dump that looks like a sandbox crash but is actually a glibc
+# ABI mismatch. Listing libc6 here makes apt upgrade it in the same
+# transaction as chromium, keeping the versions in sync.
+#
 # The required container flags (--no-sandbox, --disable-setuid-sandbox,
 # --disable-dev-shm-usage) are baked into /etc/chromium.d/leerie-container-flags
 # below so callers need no Chrome-specific configuration. See
 # docs/IMPLEMENTATION.md §0.5 "Browser-based testing" for details.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      libc6 \
       chromium \
       chromium-driver \
       fonts-liberation \

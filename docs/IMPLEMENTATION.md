@@ -184,17 +184,22 @@ Base layers (top-down):
   dev headers cover native-extension compilation: `node-gyp` (sharp,
   bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `mysql2`, `ffi`), and
   Python C extensions.
-- `chromium` + `chromium-driver` + `fonts-liberation` — headless Chrome for
-  browser-based testing (Selenium, Capybara, Playwright, Puppeteer, or any
-  tool that drives a real browser). Installed from Debian's own repos at image
-  build time so the browser and chromedriver versions are always in sync;
+- `libc6` + `chromium` + `chromium-driver` + `fonts-liberation` — headless
+  Chrome for browser-based testing (Selenium, Capybara, Playwright, Puppeteer,
+  or any tool that drives a real browser). Installed from Debian's own repos at
+  image build time so the browser and chromedriver versions are always in sync;
   Selenium Manager has nothing to download at runtime.
+  `libc6` is listed explicitly so apt upgrades it in the same transaction as
+  chromium: the `debian:13-slim` base image snapshot can lag the current trixie
+  glibc, causing chromium to fail at load time with
+  `undefined symbol: localtime64_r (fatal)` — a glibc ABI mismatch that
+  produces a SIGTRAP before Chrome executes a single instruction.
   `/home/leerie/.cache/selenium` is pre-created and chowned to `leerie` so
   Selenium Manager cache writes don't fail even if a download is attempted.
   Workers run as the non-root `leerie` user — Chrome's SUID sandbox won't work
-  in this container configuration; callers must pass `--no-sandbox` (and
-  typically `--disable-dev-shm-usage`) when launching Chrome (see
-  *Browser-based testing* note below).
+  in this container configuration; the required flags are baked in via
+  `/etc/chromium.d/leerie-container-flags` (see *Browser-based testing* note
+  below).
 - Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
   → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
   `ARG NODE_VERSION` so the version is reproducible across builds.
