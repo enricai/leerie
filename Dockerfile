@@ -102,17 +102,95 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # --no-sandbox:              disable Chrome's user-namespace sandbox (not
 #                            available in unprivileged containers).
-# --disable-setuid-sandbox:  suppress the SUID sandbox-helper lookup. Without
-#                            this, Chrome finds /usr/lib/chromium/chrome-sandbox
-#                            and tries to exec it; SUID is stripped in rootless
-#                            containers so the exec fails and Chrome dies with
-#                            SIGTRAP before it fully initializes — even when
-#                            --no-sandbox is present.
+# --disable-setuid-sandbox:  suppress the SUID sandbox-helper lookup.
 # --disable-dev-shm-usage:   redirect shared-memory to /tmp; /dev/shm is
 #                            typically 64 MB in containers and Chrome's
 #                            renderer can exceed that under load.
 RUN echo 'CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"' \
     > /etc/chromium.d/leerie-container-flags
+
+# Replace the Debian chrome_crashpad_handler with a protocol-compatible stub.
+#
+# Root cause: in this container environment Chrome spawns the crashpad handler
+# with --initial-client-fd=<fd> but WITHOUT --database (Debian's packaging
+# changed the invocation flow). The real handler exits immediately with
+# "database is required", Chrome detects the handler died before completing the
+# IPC handshake, and calls __builtin_trap() → SIGTRAP → exit 133.
+#
+# The handshake protocol (discovered by instrumenting the socket):
+#   1. Chrome sends a 40-byte hello through --initial-client-fd
+#   2. Handler must respond with 8 bytes + a server-socket FD via SCM_RIGHTS
+#   3. Chrome unblocks and continues startup; the server socket receives crash
+#      notifications for the lifetime of the browser process
+#
+# The stub below implements this protocol, stays alive as a monitor, and
+# silently discards crash reports (we have no crash database in-container).
+RUN cat > /usr/lib/chromium/chrome_crashpad_handler << 'STUB'
+#!/usr/bin/env python3
+"""
+Crashpad IPC stub for Debian Chromium in rootless containers.
+Chrome expects: read 40-byte hello → reply 8 bytes + server socket FD via
+SCM_RIGHTS. Without this handshake Chrome SIGTRAPs on startup.
+"""
+import sys, os, socket, struct, time
+
+def main():
+    fd = None
+    for arg in sys.argv[1:]:
+        if arg.startswith('--initial-client-fd='):
+            fd = int(arg.split('=', 1)[1])
+            break
+
+    if fd is None:
+        # Called as an exception handler (post-crash) without a client FD —
+        # just sleep so we don't loop-crash Chrome's crash-reporting path.
+        time.sleep(86400)
+        return
+
+    try:
+        os.read(fd, 4096)   # consume Chrome's 40-byte hello
+    except OSError:
+        time.sleep(86400)
+        return
+
+    # Create the Unix-domain server socket that Chrome will send crashes to.
+    sock_path = f'/tmp/.cpstub_{os.getpid()}.sock'
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        srv.bind(sock_path)
+        srv.listen(10)
+
+        # Send 8-byte ack + server FD back to Chrome via SCM_RIGHTS.
+        client = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                    struct.pack('i', srv.fileno()))]
+            client.sendmsg([b'\x00' * 8], anc)
+        finally:
+            client.detach()
+
+        # Stay alive as the crash monitor; discard crash reports.
+        srv.settimeout(1.0)
+        while True:
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except socket.timeout:
+                pass
+            except Exception:
+                break
+            time.sleep(0.1)
+    finally:
+        try: srv.close()
+        except: pass
+        try: os.unlink(sock_path)
+        except: pass
+
+main()
+STUB
+RUN chmod +x /usr/lib/chromium/chrome_crashpad_handler
 
 # mise — polyglot version manager (formerly rtx). Owns the per-repo
 # runtime version selection (DESIGN §6½). Reads .tool-versions natively
