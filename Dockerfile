@@ -67,6 +67,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Chromium + matching chromedriver, baked at image build time so workers
+# running Rails system tests (Capybara + Selenium :headless_chrome) have a
+# browser available without any runtime apt-get. Installing from Debian's own
+# repos guarantees the browser and driver versions are always in sync — no
+# Selenium Manager download needed. X11/GL/NSS/NSPR/GBM are pulled in
+# automatically as Chromium deps. fonts-liberation prevents glyph-fallback
+# rendering artifacts in screenshot-based assertions.
+#
+# Note: workers running inside the container are the non-root `leerie` user.
+# Chrome's SUID sandbox won't work in many container configurations even for
+# non-root users; the Rails project's ApplicationSystemTestCase should pass
+# --no-sandbox + --disable-dev-shm-usage via Selenium::WebDriver::Chrome::Options
+# (see docs/IMPLEMENTATION.md §0.5 "Rails system tests").
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium \
+      chromium-driver \
+      fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
 # mise — polyglot version manager (formerly rtx). Owns the per-repo
 # runtime version selection (DESIGN §6½). Reads .tool-versions natively
 # and .nvmrc / .python-version / .ruby-version / rust-toolchain.toml
@@ -179,6 +198,7 @@ RUN mkdir -p /home/leerie/.local/share/mise \
              /home/leerie/.cache/leerie/pip \
              /home/leerie/.cache/leerie/go-mod \
              /home/leerie/.cache/leerie/cargo \
+             /home/leerie/.cache/selenium \
              /home/leerie/.gnupg \
     && chown leerie:"${HOST_GID}" /home/leerie \
     && chown -R leerie:"${HOST_GID}" /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg \

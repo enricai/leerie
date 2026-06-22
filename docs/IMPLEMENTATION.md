@@ -184,6 +184,17 @@ Base layers (top-down):
   dev headers cover native-extension compilation: `node-gyp` (sharp,
   bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `mysql2`, `ffi`), and
   Python C extensions.
+- `chromium` + `chromium-driver` + `fonts-liberation` — headless Chrome for
+  Rails system tests (Capybara / Selenium `:headless_chrome`). Installed from
+  Debian's own repos at image build time so the browser and chromedriver
+  versions are always in sync; Selenium Manager has nothing to download at
+  runtime. `/home/leerie/.cache/selenium` is pre-created and chowned to
+  `leerie` so Selenium Manager cache writes don't fail even if a download is
+  attempted. Workers run as the non-root `leerie` user — Chrome's SUID sandbox
+  won't work in all container configurations; Rails projects should pass
+  `--no-sandbox` and `--disable-dev-shm-usage` via
+  `Selenium::WebDriver::Chrome::Options` in `ApplicationSystemTestCase` (see
+  *Rails system tests* note below).
 - Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
   → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
   `ARG NODE_VERSION` so the version is reproducible across builds.
@@ -523,6 +534,35 @@ normalizes filenames NFC → NFD (libarchive); rsync preserves filename
 bytes verbatim. Bundles sidestep the problem entirely — filenames
 travel as pack-format binary objects, materialized natively by the
 receiving git.
+
+### Rails system tests (Capybara / Selenium)
+
+Chromium and its matching chromedriver are baked into the image (see *Image
+build* above), so Rails system tests using `:headless_chrome` have a browser
+available without any runtime installation. The Selenium cache directory
+(`/home/leerie/.cache/selenium`) is pre-created and chowned to `leerie` so
+Selenium Manager cache writes succeed if it ever runs.
+
+**`--no-sandbox` requirement.** Workers run as the non-root `leerie` user
+inside a container. Chrome's SUID sandbox does not work in this configuration
+(no `cap_net_admin`, no `user_ns` from inside an already-unprivileged
+container). Without `--no-sandbox`, Chromium exits immediately with
+`Failed to move to new namespace`. Rails projects targeting leerie should
+configure their `ApplicationSystemTestCase`:
+
+```ruby
+class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+  options = Selenium::WebDriver::Chrome::Options.new
+  options.add_argument("--no-sandbox")
+  options.add_argument("--disable-dev-shm-usage")  # avoids /dev/shm size limits
+  driven_by :selenium, using: :headless_chrome,
+            screen_size: [1400, 1400], options: options
+end
+```
+
+`--disable-dev-shm-usage` redirects Chrome's shared-memory usage to `/tmp`,
+avoiding failures in containers where `/dev/shm` is the default 64 MB and
+Chrome's renderer exceeds it under load.
 
 ### macOS-specific: Colima auto-share scope
 
