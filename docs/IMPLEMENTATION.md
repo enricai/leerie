@@ -543,43 +543,27 @@ any runtime installation. The Selenium cache directory
 (`/home/leerie/.cache/selenium`) is pre-created and chowned to `leerie` so
 Selenium Manager cache writes succeed if it ever runs.
 
-**`--no-sandbox` requirement.** Workers run as the non-root `leerie` user
-inside a container. Chrome's SUID sandbox does not work in this configuration
-(no `cap_net_admin`, no `user_ns` from inside an already-unprivileged
-container). Without `--no-sandbox`, Chromium exits immediately with
-`Failed to move to new namespace`. Any test suite or tool that launches Chrome
-inside a leerie worker must pass `--no-sandbox`. `--disable-dev-shm-usage` is
-also recommended — it redirects Chrome's shared-memory usage to `/tmp`,
-avoiding renderer crashes in containers where `/dev/shm` is the default 64 MB.
+**Container flags — baked in, no project changes required.** Three flags are
+needed to run Chromium in a rootless container:
 
-Framework-specific examples:
+- `--no-sandbox` — disables Chrome's user-namespace sandbox, which is
+  unavailable in unprivileged containers.
+- `--disable-setuid-sandbox` — suppresses the SUID sandbox-helper lookup.
+  Without this, Chrome finds `/usr/lib/chromium/chrome-sandbox` and tries to
+  exec it; SUID is stripped in rootless containers, so the exec fails and
+  Chrome crashes with `SIGTRAP` before fully initializing — *even when
+  `--no-sandbox` is present*. This is the most common silent failure mode.
+- `--disable-dev-shm-usage` — redirects shared-memory to `/tmp`; `/dev/shm`
+  is typically 64 MB in containers and Chrome's renderer can exceed it.
 
-**Selenium (Ruby — e.g. Rails/Capybara):**
-```ruby
-options = Selenium::WebDriver::Chrome::Options.new
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-driven_by :selenium, using: :headless_chrome,
-          screen_size: [1400, 1400], options: options
-```
+These are written to `/etc/chromium.d/leerie-container-flags` at image build
+time, so the `/usr/bin/chromium` wrapper picks them up automatically on every
+invocation. **No project-level Chrome flag configuration is required** — the
+image handles it.
 
-**Selenium (Python):**
-```python
-from selenium.webdriver.chrome.options import Options
-opts = Options()
-opts.add_argument("--no-sandbox")
-opts.add_argument("--disable-dev-shm-usage")
-opts.add_argument("--headless=new")
-driver = webdriver.Chrome(options=opts)
-```
-
-**Playwright (Node):**
-```js
-const browser = await chromium.launch({
-  executablePath: "/usr/bin/chromium",
-  args: ["--no-sandbox", "--disable-dev-shm-usage"],
-});
-```
+Projects that construct a `ChromeOptions` / `Options` object and add these
+flags explicitly are fine; the flags are idempotent. Projects that don't touch
+Chrome options at all also work, because the wrapper sets them globally.
 
 ### macOS-specific: Colima auto-share scope
 

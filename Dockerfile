@@ -76,15 +76,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # as Chromium deps. fonts-liberation prevents glyph-fallback rendering
 # artifacts in screenshot-based assertions.
 #
-# Note: workers run as the non-root `leerie` user. Chrome's SUID sandbox does
-# not work in this container configuration; callers must pass --no-sandbox
-# (and typically --disable-dev-shm-usage) when launching Chrome. See
-# docs/IMPLEMENTATION.md §0.5 "Browser-based testing" for details and examples.
+# The required container flags (--no-sandbox, --disable-setuid-sandbox,
+# --disable-dev-shm-usage) are baked into /etc/chromium.d/leerie-container-flags
+# below so callers need no Chrome-specific configuration. See
+# docs/IMPLEMENTATION.md §0.5 "Browser-based testing" for details.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       chromium \
       chromium-driver \
       fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+# Bake container-appropriate Chrome flags into /etc/chromium.d/ so every
+# Chromium invocation from this image works correctly without callers needing
+# to know about rootless-container specifics.
+#
+# --no-sandbox:              disable Chrome's user-namespace sandbox (not
+#                            available in unprivileged containers).
+# --disable-setuid-sandbox:  suppress the SUID sandbox-helper lookup. Without
+#                            this, Chrome finds /usr/lib/chromium/chrome-sandbox
+#                            and tries to exec it; SUID is stripped in rootless
+#                            containers so the exec fails and Chrome dies with
+#                            SIGTRAP before it fully initializes — even when
+#                            --no-sandbox is present.
+# --disable-dev-shm-usage:   redirect shared-memory to /tmp; /dev/shm is
+#                            typically 64 MB in containers and Chrome's
+#                            renderer can exceed that under load.
+RUN echo 'CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"' \
+    > /etc/chromium.d/leerie-container-flags
 
 # mise — polyglot version manager (formerly rtx). Owns the per-repo
 # runtime version selection (DESIGN §6½). Reads .tool-versions natively
