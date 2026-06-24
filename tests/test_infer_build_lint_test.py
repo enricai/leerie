@@ -101,3 +101,41 @@ def test_polyglot_node_python_picks_npm_build(leerie, tmp_path):
 def test_makefile_infers_make(leerie, tmp_path):
     (tmp_path / "Makefile").write_text("all:\n\techo ok\n")
     assert _infer(leerie, tmp_path)["build"] == "make"
+
+
+def test_rails_repo_infers_bin_rails_test(leerie, tmp_path):
+    (tmp_path / "Gemfile.lock").write_text("GEM\n  specs:\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "rails").write_text("#!/usr/bin/env ruby\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["test"] == "bin/rails test"
+    assert blt["build"] == ""
+
+
+def test_gemfile_lock_without_bin_rails_does_not_infer_rails_test(leerie, tmp_path):
+    """Sinatra/Grape repos have Gemfile.lock but no bin/rails."""
+    (tmp_path / "Gemfile.lock").write_text("GEM\n  specs:\n")
+    assert _infer(leerie, tmp_path)["test"] == ""
+
+
+def test_rubocop_yml_infers_rubocop(leerie, tmp_path):
+    (tmp_path / ".rubocop.yml").write_text("AllCops:\n  NewCops: enable\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["lint"] == "bundle exec rubocop"
+    assert blt["test"] == ""
+
+
+def test_rubocop_yaml_infers_rubocop(leerie, tmp_path):
+    (tmp_path / ".rubocop.yaml").write_text("AllCops:\n  NewCops: enable\n")
+    assert _infer(leerie, tmp_path)["lint"] == "bundle exec rubocop"
+
+
+def test_polyglot_node_rails_picks_npm_test_and_rails_test_not_overridden(leerie, tmp_path):
+    """When both package.json and a Rails repo exist, npm test wins for
+    test (checked first); Rails detection does not overwrite it."""
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "Gemfile.lock").write_text("GEM\n  specs:\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "rails").write_text("#!/usr/bin/env ruby\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["test"] == "npm test"

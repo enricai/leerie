@@ -114,6 +114,30 @@ def test_count_multiple_blt_shapes(leerie, tmp_path):
         log, leerie._BLT_AXIS_RES["test"]) == 4
 
 
+def test_count_bin_rails_test(leerie, tmp_path):
+    """bin/rails test must match the test axis regex."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _bash_event("a", "bin/rails test test/models/ 2>&1"),
+        _result_event("a", "1 runs, 1 assertions, 0 failures"),
+    ])
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_count_rubocop_matches_lint_axis(leerie, tmp_path):
+    """rubocop (bare and via bundle exec) must match the lint axis regex."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _bash_event("a", "bundle exec rubocop app/ 2>&1"),
+        _result_event("a", "no offenses"),
+        _bash_event("b", "rubocop --only Style 2>&1"),
+        _result_event("b", "no offenses"),
+    ])
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["lint"]) == 2
+
+
 def test_count_build_matches_tsc_and_next_build(leerie, tmp_path):
     """Build regex must catch `pnpm build`, `tsc`, `next build`."""
     log = tmp_path / "w.log"
