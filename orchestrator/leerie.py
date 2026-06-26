@@ -14769,7 +14769,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     else:
         die("--run-id is required (the launcher passes the container/machine ID)")
     try:
-        st = State(leerie_root, run_id)
+        st = State(leerie_root, run_id, repo_root=repo_root)
     except StateLockedError as e:
         # Another orchestrator already owns this run dir (likely the
         # user ran `--resume` while the original orchestrator was still
@@ -14884,7 +14884,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     if args.phase:
         phase_run_id = resolve_run_id(leerie_root, args.run_id)
         try:
-            phase_st = State(leerie_root, phase_run_id)
+            phase_st = State(leerie_root, phase_run_id, repo_root=repo_root)
         except StateLockedError as e:
             # `--phase judge|heal` mutates state.json (writes
             # `dangerously_skip_permissions` below, then runs workers
