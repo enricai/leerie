@@ -14759,7 +14759,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `leerie_root/runs/<run-id>/` (see DESIGN.md §6, §10). The run_id
     # is the container/machine ID — the launcher always passes it via
     # --run-id.
-    leerie_root = resolve_leerie_root(Path(os.getcwd()))
+    repo_root = Path(os.getcwd())
+    leerie_root = resolve_leerie_root(repo_root)
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:
@@ -14791,7 +14792,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # Both die() on a bad value so typos in leerie.toml or env vars are
     # caught at startup, not mid-planner. argparse already rejected any bad
     # --source-of-truth / --model[-*] before we got here.
-    repo_root = Path(os.getcwd())
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
     args.runtime = resolve_runtime(repo_root, args.runtime)
     models = resolve_models(repo_root, args)
