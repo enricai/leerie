@@ -107,6 +107,22 @@ ENV MISE_NODE_COREPACK=true
 ENV MISE_RUBY_COMPILE=false
 ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
+# Rootless containerd (Linux + nerdctl without setuid) runs the orchestrator
+# inside `unshare --user --map-user=leerie_uid`, which maps outer UID 0 →
+# inner UID leerie_uid but leaves outer UID leerie_uid unmapped (appears as
+# overflow UID 65534/nobody). Image-layer dirs pre-created and chowned to
+# leerie therefore appear unwritable to the process. /tmp is root-owned
+# (outer 0 → inner leerie_uid) and always writable. Redirect tools that
+# otherwise write to ~/ into /tmp so they don't fail with EACCES.
+#
+# XDG_CACHE_HOME: rubocop reads this for its cache root
+#   (falls back to ~/.cache/rubocop_cache without it).
+# MISE_STATE_DIR: mise reads this for tracked-configs and other state
+#   (falls back to ~/.local/state/mise without it).
+# The explicitly bind-mounted caches (pip, pnpm, go, cargo, mise-data) all
+# have their own env vars and are unaffected by XDG_CACHE_HOME.
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV MISE_STATE_DIR=/tmp/.mise-state
 
 # Pre-install LTS Node + Python via `mise install --system`. Lands
 # binaries under /usr/local/share/mise/installs/<tool>/<version>.
@@ -175,10 +191,13 @@ RUN mkdir -p /inspect && chown leerie:"${HOST_GID}" /inspect
 # ~/.gnupg and fails with EACCES). The .gnupg subdir is pre-created
 # at mode 0700, which GPG requires.
 RUN mkdir -p /home/leerie/.local/share/mise \
+             /home/leerie/.local/state/mise \
              /home/leerie/.cache/leerie/pnpm-store \
              /home/leerie/.cache/leerie/pip \
              /home/leerie/.cache/leerie/go-mod \
              /home/leerie/.cache/leerie/cargo \
+             /home/leerie/.cache/rubocop_cache \
+             /home/leerie/.cache/selenium \
              /home/leerie/.gnupg \
     && chown leerie:"${HOST_GID}" /home/leerie \
     && chown -R leerie:"${HOST_GID}" /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg \
