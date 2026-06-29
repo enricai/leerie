@@ -341,6 +341,14 @@ branch, run before `provision_machine`. Two variants:
 
 **Per-repo derived image path** (`.leerie/Dockerfile` present):
 
+The relevant bash surface:
+
+| Function / variable | Location in `leerie` | Purpose |
+|---|---|---|
+| `_set_fly_per_repo_image()` | before `resolve_fly_image_tag()` call in the `RUNTIME=fly` block | Detects `.leerie/Dockerfile`, computes tag, sets `LEERIE_FLY_IMAGE` + context vars; no-op when absent |
+| `_FLY_PER_REPO_DOCKERFILE` | module-level (set by `_set_fly_per_repo_image`) | Absolute path to `.leerie/Dockerfile`; empty string when no per-repo Dockerfile |
+| `_FLY_BASE_TAG` | module-level (set by `_set_fly_per_repo_image`) | Base Fly tag (`registry.fly.io/$APP:$VERSION`) passed as `BASE_IMAGE` build-arg |
+
 Before `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()`
 detects `.leerie/Dockerfile`, computes a 12-character hex hash of its
 content, and sets `LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`.
