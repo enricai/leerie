@@ -2226,6 +2226,39 @@ polyglot Node+Rails repo, `npm test` wins the test axis while
 `bundle exec rubocop` still fills the lint axis if no ESLint/Ruff config
 exists.
 
+**Declared BLT commands (`.leerie/config.toml`).** A repo may commit
+`.leerie/config.toml` with explicit `build`, `lint`, and/or `test` keys
+that override the corresponding axis from inference. Missing keys fall
+through to `_infer_build_lint_test()`. An empty-string value means "not
+applicable" — same convention as inference — and is preserved rather than
+replaced by inference. The file also accepts a `setup_packages` key
+(comma-separated apt package names) stored for future Dockerfile generation
+but not consumed by BLT resolution.
+
+Resolution is implemented by two functions:
+
+- **`_load_blt_config(repo_root: Path) -> dict[str, str] | None`** — reads
+  `.leerie/config.toml` via `_read_toml_key()` for each of `build`, `lint`,
+  `test`, `setup_packages`. Returns `None` when the file is absent; returns a
+  dict containing only the keys present in the file (no defaults for absent
+  keys).
+
+- **`resolve_blt(repo_root: Path) -> dict[str, str]`** — calls
+  `_load_blt_config()`; for each axis, uses the declared value if present
+  (including empty string), otherwise falls through to
+  `_infer_build_lint_test()`. Logs which axes came from config vs inference.
+  This is the function called by both `_run_conformance_phase` and
+  `phase_final_conformance` — neither calls `_infer_build_lint_test` directly.
+
+`.leerie/config.toml` format (flat key = value, same parser as `leerie.toml`):
+
+```toml
+build = "make build"
+lint  = "ruff check ."
+test  = "pytest -x"
+# setup_packages = "libvips-dev fonts-noto"
+```
+
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`
 entries collected during phase 2½ (see DESIGN §5 `requires.extent`); each
@@ -4801,6 +4834,7 @@ enforcement functions:
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a `("file", content, "prompts/<call_type>.md")` triple; parity/coupling test; unknown call_type raises |
 | `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`, unless `--strict-conformer` is on), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Java/Maven, Gradle, C#/.NET, PHP, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
+| `test_resolve_blt.py` | `_load_blt_config()` and `resolve_blt()`: no config → full inference fallthrough; all-3-keys → declared values used; partial config → declared key wins others inferred; empty-string value treated as "not applicable" not a fallthrough; config overrides inference even when inference would return a value; `_load_blt_config` returns None when file absent and dict of only-present keys otherwise, including `setup_packages` |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
