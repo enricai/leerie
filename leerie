@@ -2547,6 +2547,154 @@ if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     || { remote_log "error: container image build failed"; exit 1; }
 fi
 
+# --- per-repo derived image (local nerdctl) -----------------------------
+# When the repo supplies .leerie/Dockerfile (or setup_packages in
+# .leerie/config.toml generates one), the launcher builds a derived
+# image that includes repo-specific system packages. Subsequent runs
+# reuse the cached image; a rebuild fires only when the base version
+# or the Dockerfile content changes.
+
+# Return the sha256 of a file, portably across Linux (sha256sum) and
+# macOS (shasum). Outputs only the hex digest.
+_leerie_sha256() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    shasum -a 256 "$f" | awk '{print $1}'
+  fi
+}
+
+# Compute a sanitized repo identifier from the git remote URL (or
+# basename fallback) for use in the image tag. Tag chars: [a-z0-9._-].
+_leerie_repo_id() {
+  local raw sanitized
+  raw="$(git -C "$USER_REPO" remote get-url origin 2>/dev/null || true)"
+  if [ -z "$raw" ]; then
+    raw="$(basename "$USER_REPO")"
+  else
+    # Extract owner/repo from HTTPS or SSH URLs, strip .git suffix.
+    # https://github.com/owner/repo.git → owner/repo
+    # git@github.com:owner/repo.git    → owner/repo
+    raw="${raw%.git}"
+    raw="$(printf '%s' "$raw" | sed -E 's|.*[:/]([^/:]+/[^/:]+)$|\1|')"
+  fi
+  # Lowercase and replace non-tag chars with '-'.
+  sanitized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9._/]|-|g')"
+  # Replace '/' with '-' to keep the tag a single-component path element.
+  sanitized="$(printf '%s' "$sanitized" | tr '/' '-')"
+  printf '%s' "$sanitized"
+}
+
+# Returns the per-repo image tag when a .leerie/Dockerfile is present
+# (real or auto-generated); empty string otherwise.
+resolve_repo_image_tag() {
+  local dockerfile="$USER_REPO/.leerie/Dockerfile"
+  if [ ! -f "$dockerfile" ]; then
+    # Check setup_packages — if set and no Dockerfile, we'll auto-generate.
+    local sp
+    sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
+                "$USER_REPO/.leerie/config.toml" 2>/dev/null \
+            || true; } \
+          | head -1 \
+          | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
+                    s/[[:space:]]*$//;
+                    s/^"(.*)"$/\1/;
+                    s/^'"'"'(.*)'"'"'$/\1/')"
+    if [ -z "$sp" ]; then
+      # No Dockerfile and no setup_packages — use base image.
+      echo ""
+      return
+    fi
+    # setup_packages is set; a Dockerfile will be auto-generated (see below).
+  fi
+  local repo_id
+  repo_id="$(_leerie_repo_id)"
+  echo "leerie-repo/${repo_id}:${LEERIE_VERSION}"
+}
+
+# Build the per-repo derived image. Caller has already verified the build
+# is needed (image absent, Dockerfile changed, or base version changed).
+build_repo_image() {
+  local repo_image_tag="$1"
+  local dockerfile="$USER_REPO/.leerie/Dockerfile"
+  remote_log "building per-repo container image ($repo_image_tag)..."
+  nerdctl build \
+    --build-arg BASE_IMAGE="$IMAGE_TAG" \
+    --build-arg HOST_UID="$(id -u)" \
+    --build-arg HOST_GID="$(id -g)" \
+    -t "$repo_image_tag" \
+    -f "$dockerfile" \
+    "$USER_REPO" \
+    || { remote_log "error: per-repo container image build failed"; exit 1; }
+}
+
+# Determine whether a per-repo image build is needed and run it.
+REPO_IMAGE_TAG=""
+_leerie_config_toml="$USER_REPO/.leerie/config.toml"
+_leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
+
+# Auto-generate a Dockerfile from setup_packages if no Dockerfile exists.
+if [ ! -f "$_leerie_dockerfile" ] && [ -f "$_leerie_config_toml" ]; then
+  _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
+                "$_leerie_config_toml" 2>/dev/null \
+            || true; } \
+          | head -1 \
+          | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
+                    s/[[:space:]]*$//;
+                    s/^"(.*)"$/\1/;
+                    s/^'"'"'(.*)'"'"'$/\1/')"
+  if [ -n "$_sp" ]; then
+    # Convert comma-separated list to space-separated package names.
+    _sp_packages="$(printf '%s' "$_sp" | tr ',' ' ' | tr -s ' ')"
+    remote_log "auto-generating .leerie/Dockerfile from setup_packages: $_sp_packages"
+    mkdir -p "$USER_REPO/.leerie"
+    # Write to a temp file then move atomically so a half-written file is
+    # never visible to the hash check below.
+    _gen_df_tmp="$USER_REPO/.leerie/.Dockerfile.gen.$$"
+    printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
+      > "$_gen_df_tmp"
+    for _pkg in $_sp_packages; do
+      printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
+    done
+    printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
+    mv "$_gen_df_tmp" "$_leerie_dockerfile"
+    unset _gen_df_tmp _pkg
+  fi
+  unset _sp _sp_packages
+fi
+unset _leerie_config_toml
+
+# Only proceed if a Dockerfile is now present (real or auto-generated).
+if [ -f "$_leerie_dockerfile" ]; then
+  REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
+  if [ -n "$REPO_IMAGE_TAG" ]; then
+    # Hash file stores "<base_version>:<dockerfile_sha256>" so either
+    # the base version or Dockerfile content change triggers a rebuild.
+    _hash_file="$LEERIE_STATE_HOST_DIR/.dockerfile-hash"
+    _cur_df_sha="$(_leerie_sha256 "$_leerie_dockerfile")"
+    _cur_hash="${LEERIE_VERSION}:${_cur_df_sha}"
+    _stored_hash=""
+    [ -f "$_hash_file" ] && _stored_hash="$(cat "$_hash_file" 2>/dev/null || true)"
+
+    _need_build=false
+    if ! nerdctl image inspect "$REPO_IMAGE_TAG" >/dev/null 2>&1; then
+      _need_build=true
+    elif [ "$_cur_hash" != "$_stored_hash" ]; then
+      _need_build=true
+    fi
+
+    if [ "$_need_build" = "true" ]; then
+      build_repo_image "$REPO_IMAGE_TAG"
+      printf '%s\n' "$_cur_hash" > "$_hash_file"
+    else
+      remote_log "per-repo image up-to-date ($REPO_IMAGE_TAG); skipping build"
+    fi
+    unset _hash_file _cur_df_sha _cur_hash _stored_hash _need_build
+  fi
+fi
+unset _leerie_dockerfile
+
 # --- translate --inspect-dir paths into bind-mounts ---------------------
 # Each --inspect-dir path points at a host-absolute directory the
 # inspect-bucket workers need read access to (--add-dir under the hood).
@@ -3935,7 +4083,7 @@ else
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
     -w /work \
-    "$IMAGE_TAG" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
+    "${REPO_IMAGE_TAG:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
 fi
 
 # --- host-side finalize (push + PR) -------------------------------------
