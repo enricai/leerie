@@ -360,7 +360,7 @@ def _run_ensure_image_per_repo(
     tmp_path: Path,
     build_push_rc: int = 0,
     base_cached: bool = False,
-) -> tuple[subprocess.CompletedProcess, Path, Path]:
+) -> tuple[subprocess.CompletedProcess, Path, Path, str, str]:
     """Run ensure_image with _FLY_PER_REPO_DOCKERFILE set (per-repo path)."""
     launcher = _launcher_text()
     sha256_block = _extract_block(launcher, _SHA256_MARKER_START, _SHA256_MARKER_END)
