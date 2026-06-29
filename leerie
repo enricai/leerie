@@ -2543,7 +2543,8 @@ if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
     -t "$IMAGE_TAG" \
-    "$LEERIE_REPO"
+    "$LEERIE_REPO" \
+    || { remote_log "error: container image build failed"; exit 1; }
 fi
 
 # --- translate --inspect-dir paths into bind-mounts ---------------------
