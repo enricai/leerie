@@ -1661,10 +1661,13 @@ laptop state" = host commits plus host dirty edits):
 The dirty set is computed on the host where worktree paths
 (`.leerie/runs/<run-id>/worktrees/...`) structurally cannot appear,
 because worktrees live only on the machine. A defensive filter
-excludes `.git/*`, `.leerie/*`, and `.leerie/runs/*/worktrees/*` paths
-before handing the file list to rsync's `--files-from=-` — protects
-against a future change that lets host-side paths name worktree files
-or surfaces host-side `.leerie/` run state to the machine.
+excludes `.git/*` and non-whitelisted `.leerie/*` paths before handing
+the file list to rsync's `--files-from=-` — protects against a future
+change that lets host-side paths name worktree files or surfaces
+host-side `.leerie/` run state to the machine. Exception: the three
+committed config files (`.leerie/config.toml`, `.leerie/Dockerfile`,
+`.leerie/.leerie-setup.sh`) are repo-owned declarations that workers
+need on the machine and pass through the filter.
 
 The repo-local `.claude/` directory is force-included in the dirty
 set even when `.gitignore` excludes it (the common case). Workers
