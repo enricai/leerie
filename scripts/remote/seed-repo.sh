@@ -408,9 +408,15 @@ for line in sys.stdin.read().splitlines():
     # .git/ and .leerie/ are coordination state, never transported here.
     # .git/ → bundle path creates it natively on the machine.
     # .leerie/ → host-side run state; the machine writes its own.
+    # Exception: committed config files (.leerie/config.toml, .leerie/Dockerfile,
+    # .leerie/.leerie-setup.sh) are repo-owned declarations that workers need.
     if line.startswith(".git/") or line == ".git":
         continue
-    if line.startswith(".leerie/") or line == ".leerie":
+    if line.startswith(".leerie/"):
+        if line not in (".leerie/config.toml", ".leerie/Dockerfile",
+                        ".leerie/.leerie-setup.sh"):
+            continue
+    elif line == ".leerie":
         continue
     # Defensive: drop worktree paths if they ever surface.
     if "/.leerie/runs/" in line and "/worktrees/" in line:
