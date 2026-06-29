@@ -2248,7 +2248,7 @@ Resolution is implemented by two functions:
   (including empty string), otherwise falls through to
   `_infer_build_lint_test()`. Logs which axes came from config vs inference.
   This is the function called by both `_run_conformance_phase` and
-  `phase_final_conformance` — neither calls `_infer_build_lint_test` directly.
+  `run_final_conformance` — neither calls `_infer_build_lint_test` directly.
 
 `.leerie/config.toml` format (flat key = value, same parser as `leerie.toml`):
 
