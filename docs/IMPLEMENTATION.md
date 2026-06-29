@@ -323,7 +323,9 @@ and again after every version bump — otherwise `flyctl machine run`
 fails at provision time with an unfriendly "manifest unknown" error.
 
 The launcher closes that gap with `ensure_image()` in the `RUNTIME=fly`
-branch, run before `provision_machine`:
+branch, run before `provision_machine`. Two variants:
+
+**Base image path** (no `.leerie/Dockerfile`):
 
 1. Cache check: if `$XDG_CACHE_HOME/leerie/published-tags.txt` already
    has `$FLY_IMAGE_TAG`, skip everything.
@@ -336,6 +338,30 @@ branch, run before `provision_machine`:
    `--local-build` CLI flag or `LEERIE_LOCAL_BUILD=1` env var).
    build-push.sh handles the actual remote-vs-local mode dispatch.
 4. On success, append the tag to the positive cache.
+
+**Per-repo derived image path** (`.leerie/Dockerfile` present):
+
+Before `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()`
+detects `.leerie/Dockerfile`, computes a 12-character hex hash of its
+content, and sets `LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`.
+`resolve_fly_image_tag()` returns that value (via the existing
+`LEERIE_FLY_IMAGE` override hook). `ensure_image()` then:
+
+1. Cache check on the per-repo tag — skip if already in
+   `published-tags.txt`.
+2. Ensure the base image is published: check the cache for the base tag
+   (`registry.fly.io/$APP:$VERSION`); on miss, invoke build-push.sh for
+   the base image first and cache the result.
+3. Build and push the per-repo image: invoke build-push.sh with
+   `--dockerfile $USER_REPO/.leerie/Dockerfile --build-arg
+   BASE_IMAGE=registry.fly.io/$APP:$VERSION --tag <per-repo-tag>`.
+4. Append the per-repo tag to the positive cache.
+
+The per-repo tag format is `registry.fly.io/$APP:$VERSION-$HASH` where
+`$HASH` is the first 12 hex characters of `sha256($LEERIE_DOCKERFILE)`.
+A rebuild fires automatically when the Dockerfile content or the leerie
+version changes — the hash changes, a cache miss occurs, and
+ensure_image re-runs build-push.sh.
 
 Results are cached at `$XDG_CACHE_HOME/leerie/published-tags.txt` (default
 `~/.cache/leerie/published-tags.txt`), one line per `<tag>` known to be
