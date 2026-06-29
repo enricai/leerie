@@ -266,9 +266,15 @@ Internally, the remote-builder path runs:
 flyctl deploy --build-only --push --remote-only \
   --app <fly-app-name> \
   --config <tmp-fly.toml> \
-  --dockerfile Dockerfile \
+  --dockerfile <DOCKERFILE> \
+  [--build-arg KEY=VAL ...] \
   --image-label <VERSION>
 ```
+
+`<DOCKERFILE>` defaults to `$LEERIE_REPO/Dockerfile`; pass `--dockerfile
+<path>` to override (used by `ensure_image()` for per-repo images). Pass
+`--build-arg KEY=VAL` one or more times to forward build arguments to
+flyctl; this flag is repeatable and accumulated before forwarding.
 
 The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the
 `[build] image = "..."` line stripped. That line is correct for
