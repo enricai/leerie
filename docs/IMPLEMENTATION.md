@@ -228,6 +228,28 @@ Base layers (top-down):
   privilege via `runuser -u leerie -- ...` to invoke the orchestrator.
   See DESIGN §6 *Memory containment* for the full mechanism.
 
+### Per-repo derived image (local nerdctl)
+
+After the base image is confirmed present, the launcher checks for a
+`.leerie/Dockerfile` in the user's repo (or auto-generates one from
+`setup_packages` — see DESIGN §6½ *Per-repo container image*). The
+relevant bash surface:
+
+| Function / variable | Location in `leerie` | Purpose |
+|---|---|---|
+| `_leerie_sha256 <file>` | after base-build block | Portable sha256 of a file — uses `sha256sum` (Linux) or `shasum -a 256` (macOS) |
+| `_leerie_repo_id` | after base-build block | Sanitized repo identifier from `git remote get-url origin` (or `basename $USER_REPO` fallback); lowercase, `[a-z0-9._-]` only, `/` → `-` |
+| `resolve_repo_image_tag()` | after base-build block | Returns `leerie-repo/<repo-id>:<LEERIE_VERSION>` when a Dockerfile is present (real or to-be-auto-generated), empty string otherwise |
+| `build_repo_image <tag>` | after base-build block | Runs `nerdctl build --build-arg BASE_IMAGE=<IMAGE_TAG> --build-arg HOST_UID/GID -t <tag> -f .leerie/Dockerfile <USER_REPO>`; exits 1 on failure |
+| `REPO_IMAGE_TAG` | after base-build block | Set to `resolve_repo_image_tag()` output when a Dockerfile exists; empty string otherwise |
+| `$LEERIE_STATE_HOST_DIR/.dockerfile-hash` | after base-build block | Stores `<LEERIE_VERSION>:<sha256>` of the last-built Dockerfile; rebuild fires on mismatch or image absence |
+
+**Rebuild triggers** (checked in order): (1) `nerdctl image inspect "$REPO_IMAGE_TAG"` fails, OR (2) `<LEERIE_VERSION>:<sha256>` of the current Dockerfile differs from the stored hash. Second run with unchanged Dockerfile hits the skip path ("per-repo image up-to-date; skipping build").
+
+**Auto-generation from `setup_packages`**: when `.leerie/config.toml` declares `setup_packages` and no `.leerie/Dockerfile` exists, the launcher generates an apt-install Dockerfile at `.leerie/Dockerfile` (atomic write via temp file + `mv`) before the build-decision block. A committed Dockerfile always takes precedence — `setup_packages` is ignored when both exist.
+
+**`nerdctl run` image arg**: `"${REPO_IMAGE_TAG:-$IMAGE_TAG}"` — falls back to the base image transparently when no repo Dockerfile is present.
+
 ### Registry publish path (fly.io / remote Machines)
 
 Fly.io Machines pull an image from a registry rather than using a

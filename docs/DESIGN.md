@@ -1857,13 +1857,37 @@ This is the "CI yaml" analog: the repo author tells leerie exactly how
 to build, lint, and test, the same way they tell GitHub Actions.
 
 The file also accepts a `setup_packages` key (comma-separated apt
-package names) for future Dockerfile auto-generation, but it is not
-consumed by BLT resolution.
+package names) that triggers per-repo image auto-generation (see below);
+it is not consumed by BLT resolution.
 
 Resolution is handled by `resolve_blt(repo_root)` (calls
 `_load_blt_config()` first, then fills missing axes from inference),
 which is what both `_run_conformance_phase` and `run_final_conformance`
 call — neither calls `_infer_build_lint_test` directly any longer.
+
+### Per-repo container image
+
+System packages requiring root (C libraries for native gems, fonts,
+specialized tooling) cannot be installed by `.leerie-setup.sh` — that
+hook runs as the unprivileged `leerie` user. A repo that needs such
+packages commits `.leerie/Dockerfile` that extends the base image with
+`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds a derived
+image tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is
+derived from the git remote URL, sanitized to tag chars) and uses it for
+all subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile`
+exists but `.leerie/config.toml` declares `setup_packages`, the launcher
+auto-generates an apt-install Dockerfile and proceeds through the same
+build path. A committed Dockerfile always takes precedence — `setup_packages`
+is ignored when both are present.
+
+Rebuild is triggered by any of: the derived image is absent, the sha256
+of the Dockerfile changed (stored as `<base_version>:<sha256>` at
+`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`), or the base version changed.
+A second run with an unchanged Dockerfile skips the build entirely.
+
+The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
+so the base image is used transparently when no repo Dockerfile is
+present.
 
 ---
 
