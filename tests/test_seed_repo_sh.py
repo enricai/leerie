@@ -354,10 +354,10 @@ def test_seed_repo_pipes_bundle_via_ssh_console(tmp_path):
 def test_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     """seed_repo's combined bundle+rsync payload obeys .gitignore
     (skipping build artifacts and gitignored .claude/ entries from the
-    bundle), hard-skips .leerie/, and hard-includes the repo-local
-    `.claude/` directory via the rsync delta even when .gitignore
-    excludes it. Restores test coverage that existed at HEAD~1 for the
-    tar-pipeline seed; the bundle-based seed must preserve the same
+    bundle), drops non-whitelisted .leerie/ paths, and hard-includes the
+    repo-local `.claude/` directory via the rsync delta even when
+    .gitignore excludes it. Restores test coverage that existed at HEAD~1
+    for the tar-pipeline seed; the bundle-based seed must preserve the same
     behavior so workers always get their hooks/agents/skills/commands.
     """
     repo = tmp_path / "myrepo"
@@ -442,11 +442,11 @@ def test_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     assert "debug.log" not in landed, (
         f"gitignored log file leaked into seed: {landed}"
     )
-    # .leerie/ never rides along regardless of .gitignore (defensive
-    # filter in the porcelain pipeline + .leerie/ not enumerated in
-    # the .claude force-include walk).
+    # Non-whitelisted .leerie/ paths (run state) never ride along.
+    # The fixture only created .leerie/runs/old/state.json — which is
+    # not in the whitelist — so nothing under .leerie/ should land here.
     assert not any(p.startswith(".leerie/") for p in landed), (
-        f"host .leerie/ leaked into seed: {landed}"
+        f"non-whitelisted .leerie/ path leaked into seed: {landed}"
     )
     # .claude/ rides along EVEN THOUGH .gitignore lists it (the
     # regression test — this MUST be force-included).
@@ -455,6 +455,101 @@ def test_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     )
     assert ".claude/hooks/pre-tool-use.sh" in landed, (
         f".claude/hooks/* should be force-included; got: {landed}"
+    )
+
+
+def test_seed_repo_whitelists_leerie_config_files(tmp_path):
+    """The dirty-file filter passes .leerie/config.toml, .leerie/Dockerfile,
+    and .leerie/.leerie-setup.sh through but still drops non-whitelisted
+    .leerie/* paths (run state, arbitrary files).
+
+    The filter runs in seed_repo_dirty over the `git status --porcelain`
+    dirty set. The bundle-clone phase carries all committed tracked files
+    unconditionally; the filter is a defence against host-side .leerie/ run
+    state (dirty/untracked) leaking to the machine via the rsync delta.
+
+    This test exercises the filter directly — it commits only the whitelisted
+    config files, then creates dirty/untracked non-whitelisted .leerie/ state
+    (simulating what a host .leerie/ tree would look like during a run) and
+    confirms those untracked files do NOT ride along in the rsync delta.
+    Covers the filter change at seed-repo.sh lines 415-420.
+    """
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True, capture_output=True,
+    )
+    # Committed source file.
+    (repo / "README.md").write_text("hello")
+    # Committed whitelisted .leerie/ config files — these land via the
+    # bundle clone and must survive (they are not filtered OUT).
+    (repo / ".leerie").mkdir()
+    (repo / ".leerie" / "config.toml").write_text('[leerie]\nbuild = "make"\n')
+    (repo / ".leerie" / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    (repo / ".leerie" / ".leerie-setup.sh").write_text("#!/bin/sh\npip install black\n")
+
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md", ".leerie"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True, capture_output=True,
+    )
+
+    # After commit, create untracked .leerie/ paths that simulate host-side
+    # run state. These must be filtered OUT by seed_repo_dirty even though
+    # they exist on disk — the filter is the guard.
+    (repo / ".leerie" / "runs" / "abc").mkdir(parents=True)
+    (repo / ".leerie" / "runs" / "abc" / "state.json").write_text("{}")
+    # Modify the committed config.toml so it also appears in the dirty set —
+    # the new filter should allow it through even when dirty.
+    (repo / ".leerie" / "config.toml").write_text('[leerie]\nbuild = "make build"\n')
+
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    result = _run_bash(
+        f"source {SEED_SH}; seed_repo",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-leerie-config",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    work = dest / "work"
+    landed = {
+        str(p.relative_to(work))
+        for p in work.rglob("*")
+        if p.is_file()
+    }
+
+    # Committed whitelisted config files land via the bundle clone.
+    assert ".leerie/config.toml" in landed, (
+        f".leerie/config.toml should be present (committed, bundle); got: {landed}"
+    )
+    assert ".leerie/Dockerfile" in landed, (
+        f".leerie/Dockerfile should be present (committed, bundle); got: {landed}"
+    )
+    assert ".leerie/.leerie-setup.sh" in landed, (
+        f".leerie/.leerie-setup.sh should be present (committed, bundle); got: {landed}"
+    )
+    # Untracked .leerie/runs/ state must NOT land — filter drops it.
+    assert ".leerie/runs/abc/state.json" not in landed, (
+        f".leerie/runs/abc/state.json (run state) should be filtered; got: {landed}"
     )
 
 
