@@ -10,13 +10,15 @@
 # Usage:
 #   ./scripts/remote/build-push.sh [OPTIONS]
 #
-#   --app NAME       fly.io app name (default: LEERIE_FLY_APP env, required)
-#   --registry REG   registry prefix (default: registry.fly.io/<APP>)
-#   --tag TAG        override the full image tag (default: <REGISTRY>:<VERSION>)
-#   --push           build and push in one step (implied by both modes below)
-#   --local-build    use local nerdctl/docker build+push (opt-in; see below)
-#   --dry-run        print commands without executing
-#   --help           show this message
+#   --app NAME            fly.io app name (default: LEERIE_FLY_APP env, required)
+#   --registry REG        registry prefix (default: registry.fly.io/<APP>)
+#   --tag TAG             override the full image tag (default: <REGISTRY>:<VERSION>)
+#   --dockerfile PATH     Dockerfile to build (default: $LEERIE_REPO/Dockerfile)
+#   --build-arg KEY=VAL   build argument forwarded to flyctl/nerdctl (repeatable)
+#   --push                build and push in one step (implied by both modes below)
+#   --local-build         use local nerdctl/docker build+push (opt-in; see below)
+#   --dry-run             print commands without executing
+#   --help                show this message
 #
 # Default: Fly's remote builder (no local container runtime required).
 # The remote builder runs Docker inside Fly's infrastructure, authenticates
@@ -72,6 +74,8 @@ REGISTRY=""      # resolved below after --app is parsed
 TAG_OVERRIDE=""
 PUSH=false
 DRY_RUN=false
+DOCKERFILE_OVERRIDE=""
+BUILD_ARGS=()
 # BUILD_MODE: remote (default, via Fly's remote builder) or local
 # (--local-build, via nerdctl/docker on the host). The launcher exports
 # BUILD_MODE based on --local-build / LEERIE_LOCAL_BUILD; the --local-build
@@ -98,6 +102,14 @@ while [ "$#" -gt 0 ]; do
       PUSH=true ;;
     --local-build)
       BUILD_MODE=local ;;
+    --dockerfile)
+      shift; DOCKERFILE_OVERRIDE="$1" ;;
+    --dockerfile=*)
+      DOCKERFILE_OVERRIDE="${1#--dockerfile=}" ;;
+    --build-arg)
+      shift; BUILD_ARGS+=("$1") ;;
+    --build-arg=*)
+      BUILD_ARGS+=("${1#--build-arg=}") ;;
     --dry-run)
       DRY_RUN=true ;;
     --help|-h)
@@ -186,6 +198,12 @@ _build_push_remote() {
   # && leerie ... --runtime fly`) would upload the user's repo as the
   # build context instead of leerie's, and the build fails with
   # "orchestrator: not found".
+  local dockerfile="${DOCKERFILE_OVERRIDE:-$LEERIE_REPO/Dockerfile}"
+  local build_arg_flags=()
+  for arg in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
+    build_arg_flags+=(--build-arg "$arg")
+  done
+
   local rc=0
   (
     cd "$LEERIE_REPO"
@@ -193,7 +211,8 @@ _build_push_remote() {
       --build-only --push --remote-only --depot=false \
       --app "$FLY_APP" \
       --config "$tmp_toml" \
-      --dockerfile "$LEERIE_REPO/Dockerfile" \
+      --dockerfile "$dockerfile" \
+      "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
       --image-label "$LEERIE_VERSION"
   ) || rc=$?
   rm -f "$tmp_toml"
@@ -225,9 +244,20 @@ _build_push_local() {
   fi
   echo "[build-push] local build tool: $build_cmd"
 
+  local dockerfile_flags=()
+  if [ -n "$DOCKERFILE_OVERRIDE" ]; then
+    dockerfile_flags+=(-f "$DOCKERFILE_OVERRIDE")
+  fi
+  local build_arg_flags=()
+  for arg in "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"; do
+    build_arg_flags+=(--build-arg "$arg")
+  done
+
   # Build without HOST_UID/HOST_GID: the Dockerfile ARG defaults (501/20)
   # apply. Source is baked in via COPY instructions — no bind mount required.
   run "$build_cmd" build \
+    "${dockerfile_flags[@]+"${dockerfile_flags[@]}"}" \
+    "${build_arg_flags[@]+"${build_arg_flags[@]}"}" \
     -t "$IMAGE_TAG" \
     "$LEERIE_REPO"
 
