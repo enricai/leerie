@@ -3123,8 +3123,11 @@ Five host caches mounted into the container, all `rw`. Listed in §0.5
   once via pip's own retry, and a persistent failure surfaces as a
   conformer warning (DESIGN §9), not a silent corruption.
 
-Bundler is **not** mounted as a shared cache (open `unlink` races,
-rubygems/bundler#4519). Ruby repos route through `.leerie-setup.sh`.
+- **Bundler** — Mounted. `BUNDLE_PATH` and `BUNDLE_CACHE_ALL=1` are set
+  so `bundle install` reuses cached gems across worktrees and runs.
+  The historic `unlink` race (rubygems/bundler#4519) was fixed in
+  Bundler 2.2+; all supported Ruby versions ship a sufficiently recent
+  Bundler.
 
 ### Worker-driven install (replaces per-worktree replay)
 
