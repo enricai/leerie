@@ -190,3 +190,93 @@ def test_help_mentions_local_build_caveat():
     text = BUILD_PUSH.read_text()
     assert "nerdctl-in-Colima" in text
     assert "Most leerie users should NOT" in text
+
+
+# --- --dockerfile and --build-arg forwarding (Part H.2) ------------------
+
+def test_dockerfile_flag_forwarded_to_flyctl(tmp_path: Path):
+    """--dockerfile <path> must appear verbatim in the flyctl invocation."""
+    custom_df = "/some/repo/.leerie/Dockerfile"
+    r = _run(tmp_path, "--app", "testapp", "--push",
+             "--dockerfile", custom_df)
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert f"--dockerfile {custom_df}" in flyctl_log, \
+        f"expected --dockerfile {custom_df} in flyctl call; got:\n{flyctl_log}"
+
+
+def test_build_arg_forwarded_to_flyctl(tmp_path: Path):
+    """--build-arg KEY=VAL must appear in the flyctl invocation."""
+    r = _run(tmp_path, "--app", "testapp", "--push",
+             "--build-arg", "BASE_IMAGE=registry.fly.io/myapp:0.9.7")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "--build-arg BASE_IMAGE=registry.fly.io/myapp:0.9.7" in flyctl_log, \
+        f"expected --build-arg in flyctl call; got:\n{flyctl_log}"
+
+
+def test_multiple_build_args_all_forwarded_to_flyctl(tmp_path: Path):
+    """Multiple --build-arg flags must all be forwarded to flyctl."""
+    r = _run(tmp_path, "--app", "testapp", "--push",
+             "--build-arg", "FOO=bar",
+             "--build-arg", "BAZ=qux")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "--build-arg FOO=bar" in flyctl_log
+    assert "--build-arg BAZ=qux" in flyctl_log
+
+
+def test_dockerfile_flag_forwarded_to_nerdctl(tmp_path: Path):
+    """--dockerfile <path> must appear as -f <path> in the nerdctl invocation."""
+    custom_df = "/some/repo/.leerie/Dockerfile"
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build",
+             "--dockerfile", custom_df)
+    assert r.returncode == 0, r.stderr
+    nerdctl_log = (tmp_path / "nerdctl.log").read_text()
+    assert f"-f {custom_df}" in nerdctl_log, \
+        f"expected -f {custom_df} in nerdctl call; got:\n{nerdctl_log}"
+
+
+def test_build_arg_forwarded_to_nerdctl(tmp_path: Path):
+    """--build-arg KEY=VAL must appear in the nerdctl invocation."""
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build",
+             "--build-arg", "BASE_IMAGE=leerie:0.9.7")
+    assert r.returncode == 0, r.stderr
+    nerdctl_log = (tmp_path / "nerdctl.log").read_text()
+    assert "--build-arg BASE_IMAGE=leerie:0.9.7" in nerdctl_log, \
+        f"expected --build-arg in nerdctl call; got:\n{nerdctl_log}"
+
+
+def test_no_dockerfile_flag_uses_default(tmp_path: Path):
+    """Without --dockerfile, flyctl must receive the default $LEERIE_REPO/Dockerfile."""
+    r = _run(tmp_path, "--app", "testapp", "--push")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "--dockerfile" in flyctl_log
+    assert "Dockerfile" in flyctl_log
+
+
+def test_no_build_arg_no_build_arg_in_flyctl(tmp_path: Path):
+    """Without --build-arg, flyctl must not receive any --build-arg flags."""
+    r = _run(tmp_path, "--app", "testapp", "--push")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "--build-arg" not in flyctl_log, \
+        f"no --build-arg flags expected in default mode; got:\n{flyctl_log}"
+
+
+def test_no_dockerfile_flag_local_build_no_f_flag(tmp_path: Path):
+    """Without --dockerfile in local-build mode, nerdctl must not receive -f."""
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build")
+    assert r.returncode == 0, r.stderr
+    nerdctl_log = (tmp_path / "nerdctl.log").read_text()
+    # -f should NOT appear since no override was given
+    assert " -f " not in nerdctl_log, \
+        f"no -f flag expected without --dockerfile; got:\n{nerdctl_log}"
+
+
+def test_unknown_arg_still_rejected(tmp_path: Path):
+    """Unknown arguments must still be rejected after the new flags are added."""
+    r = _run(tmp_path, "--app", "testapp", "--unknown-flag")
+    assert r.returncode == 1
+    assert "unknown argument" in r.stderr
