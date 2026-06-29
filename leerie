@@ -3318,6 +3318,37 @@ resolve_fly_image_tag() {
   echo "${LEERIE_FLY_IMAGE:-$tag}"
 }
 
+# Module-level context set by _set_fly_per_repo_image() and read by
+# ensure_image() to build the per-repo derived image on Fly.
+_FLY_PER_REPO_DOCKERFILE=""
+_FLY_BASE_TAG=""
+
+# When .leerie/Dockerfile is present (real or auto-generated), set
+# LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
+# resolve_fly_image_tag() returns the per-repo tag. Also records the
+# Dockerfile path and base tag in _FLY_PER_REPO_DOCKERFILE / _FLY_BASE_TAG
+# for ensure_image() to use when invoking build-push.sh.
+# Idempotent: called once before resolve_fly_image_tag().
+_set_fly_per_repo_image() {
+  local dockerfile="$USER_REPO/.leerie/Dockerfile"
+  if [ ! -f "$dockerfile" ]; then
+    return 0
+  fi
+  local fly_app version base_tag repo_hash per_repo_tag
+  fly_app="$LEERIE_FLY_APP"
+  version="$LEERIE_VERSION"
+  base_tag="registry.fly.io/$fly_app:$version"
+  # First 12 hex chars of the Dockerfile sha256 — short but collision-free
+  # at the scale of per-repo image variants for a single leerie installation.
+  repo_hash="$(_leerie_sha256 "$dockerfile" | cut -c1-12)"
+  per_repo_tag="registry.fly.io/$fly_app:${version}-${repo_hash}"
+  LEERIE_FLY_IMAGE="$per_repo_tag"
+  export LEERIE_FLY_IMAGE
+  _FLY_PER_REPO_DOCKERFILE="$dockerfile"
+  _FLY_BASE_TAG="$base_tag"
+  remote_log "remote: per-repo Fly image tag: $per_repo_tag (base: $base_tag)"
+}
+
 # --- remote: ensure published image -------------------------------------
 # Closes the operator-step gap where the first remote run fails because
 # the registry tag wasn't built/pushed yet. Strategy: cache positive hits
@@ -3325,6 +3356,11 @@ resolve_fly_image_tag() {
 # --push (which is idempotent at the registry — pushing an already-
 # present manifest just no-ops the layers). The cache is a *positive*
 # list only, so a manual `flyctl image` deletion is self-healing.
+#
+# When _FLY_PER_REPO_DOCKERFILE is set (a per-repo .leerie/Dockerfile
+# exists), the base image is ensured first; then build-push.sh is called
+# with --dockerfile and --build-arg BASE_IMAGE=<base_tag> to build and
+# push the derived per-repo image.
 #
 # Skipped entirely when NO_AUTO_PUBLISH=true (the operator manages
 # publishes themselves and accepts the manifest-not-found failure mode).
@@ -3369,6 +3405,36 @@ except Exception:
   local build_args=(--app "$fly_app" --push)
   if [ "${LOCAL_BUILD:-false}" = "true" ]; then
     build_args+=(--local-build)
+  fi
+
+  # Per-repo derived image: ensure the base image is published first, then
+  # build and push the derived image with the per-repo Dockerfile.
+  if [ -n "${_FLY_PER_REPO_DOCKERFILE:-}" ]; then
+    local base_tag="${_FLY_BASE_TAG}"
+    # Ensure base image is cached/published before building the derived one.
+    if [ ! -f "$cache_file" ] || ! grep -Fxq "$base_tag" "$cache_file" 2>/dev/null; then
+      remote_log "remote: ensuring base image $base_tag is published (needed for per-repo build)"
+      if ! "$build_push" "${build_args[@]}"; then
+        remote_log "error: build-push.sh failed for base image; remote run cannot proceed"
+        return 1
+      fi
+      mkdir -p "$cache_dir"
+      printf '%s\n' "$base_tag" >> "$cache_file"
+    fi
+    # Now build and push the per-repo derived image.
+    local per_repo_args=("${build_args[@]}"
+      --dockerfile "$_FLY_PER_REPO_DOCKERFILE"
+      --build-arg "BASE_IMAGE=$base_tag"
+      --tag "$tag"
+    )
+    remote_log "remote: ensuring per-repo image $tag is published (cache miss)"
+    if ! "$build_push" "${per_repo_args[@]}"; then
+      remote_log "error: build-push.sh failed for per-repo image; remote run cannot proceed"
+      return 1
+    fi
+    mkdir -p "$cache_dir"
+    printf '%s\n' "$tag" >> "$cache_file"
+    return 0
   fi
 
   remote_log "remote: ensuring image $tag is published (cache miss)"
@@ -3445,6 +3511,9 @@ if [ "$RUNTIME" = "fly" ]; then
     REWRITTEN_ARGS+=("--host-no-push" "false")
   fi
 
+  # Set LEERIE_FLY_IMAGE to the per-repo derived tag when .leerie/Dockerfile
+  # is present; also records context for ensure_image(). No-op otherwise.
+  _set_fly_per_repo_image
   FLY_IMAGE_TAG="$(resolve_fly_image_tag)"
   export FLY_IMAGE_TAG
 

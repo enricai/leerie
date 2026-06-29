@@ -1869,6 +1869,21 @@ The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
 so the base image is used transparently when no repo Dockerfile is
 present.
 
+**Fly runtime variant.** On `--runtime fly` the same `.leerie/Dockerfile`
+triggers a derived image at `registry.fly.io/$APP:$VERSION-$HASH` where
+`$HASH` is the first 12 hex characters of the Dockerfile's sha256. Before
+`resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()` detects the
+Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
+tag — the existing override hook in `resolve_fly_image_tag()` picks it up
+transparently. `ensure_image()` then first guarantees the base image is
+published (checking `published-tags.txt`; building and pushing if absent),
+then calls `build-push.sh --dockerfile $USER_REPO/.leerie/Dockerfile
+--build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag` to build and push
+the derived image. Both the base tag and the per-repo tag are recorded in
+`published-tags.txt` so subsequent runs skip the build entirely. Without
+`.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
+`ensure_image` proceeds as before.
+
 ---
 
 ## 7. The worker contract
