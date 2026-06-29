@@ -12444,6 +12444,59 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
     return out
 
 
+def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
+    """Read BLT-related keys from .leerie/config.toml.
+
+    Returns None when the file does not exist. Otherwise returns a dict
+    containing only the keys that are present in the file (build, lint,
+    test, setup_packages). Missing keys are not defaulted — the caller
+    (resolve_blt) decides what to do with absent axes.
+
+    Uses _read_toml_key for each key so the flat-parser semantics
+    (first-match-wins, stripped quotes, skip comments/blanks) are shared."""
+    cfg = repo_root / ".leerie" / "config.toml"
+    if not cfg.exists():
+        return None
+    out: dict[str, str] = {}
+    for key in ("build", "lint", "test", "setup_packages"):
+        val = _read_toml_key(cfg, key)
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def resolve_blt(repo_root: Path) -> dict[str, str]:
+    """Return the effective build/lint/test commands for the repo.
+
+    Resolution order (per axis):
+    1. Declared value in .leerie/config.toml — wins unconditionally,
+       including an empty string (which means "not applicable").
+    2. Falls through to _infer_build_lint_test() for any axis not declared.
+
+    Logs which axes came from config vs inference so the conformer's worker
+    log makes the source visible."""
+    declared = _load_blt_config(repo_root)
+    inferred = _infer_build_lint_test(repo_root)
+
+    if declared is None:
+        log("BLT: no .leerie/config.toml — using inference for all axes")
+        return inferred
+
+    blt_axes = ("build", "lint", "test")
+    config_axes = [ax for ax in blt_axes if ax in declared]
+    infer_axes = [ax for ax in blt_axes if ax not in declared]
+    if config_axes:
+        log(f"BLT: config axes={config_axes} infer axes={infer_axes}")
+
+    out: dict[str, str] = {}
+    for ax in blt_axes:
+        if ax in declared:
+            out[ax] = declared[ax]
+        else:
+            out[ax] = inferred[ax]
+    return out
+
+
 def validate_conformance_result(result: dict, worktree: str) -> str | None:
     """Cross-field invariants for the conformer's structured output.
     Returns None when valid, else a one-line error string.
@@ -12994,7 +13047,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     warnings: list[str] = []
     repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
-    blt = _infer_build_lint_test(repo_root)
+    blt = resolve_blt(repo_root)
     run_branch = compute_run_branch(st.run_id)
     last_res: dict | None = None
     blt_feedback: str | None = None
@@ -13128,7 +13181,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
     repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
-    blt = _infer_build_lint_test(repo_root)
+    blt = resolve_blt(repo_root)
 
     warnings: list[str] = []
     last_res: dict | None = None
