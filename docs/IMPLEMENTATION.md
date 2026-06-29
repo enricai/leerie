@@ -3807,8 +3807,9 @@ normalization decision ever happens.
 dirty set from `git status --porcelain` on the host:
 - Modified-but-uncommitted tracked files
 - Untracked-not-ignored files
-- Defensive filter drops `.git/*`, `.leerie/*`, and worktree paths
-  (`.leerie/runs/*/worktrees/*`) before handing the list to rsync
+- Defensive filter drops `.git/*`, non-whitelisted `.leerie/*` paths, and worktree paths
+  (`.leerie/runs/*/worktrees/*`) before handing the list to rsync; exception: `.leerie/config.toml`,
+  `.leerie/Dockerfile`, `.leerie/.leerie-setup.sh` pass through
 - Forced-in `.claude/` (workers need it, often gitignored) —
   enumerated via `find .claude -type f` host-side and appended to
   the dirty list before the defensive filter
@@ -4064,7 +4065,7 @@ Three operations in `re_seed`, in order:
    --porcelain` dirty set, append every file under the repo-local
    `.claude/` directory (force-included even when gitignored — workers
    need its hooks/agents/skills/commands), filter the combined list
-   (drop `.git/*`, `.leerie/*`, and `.leerie/runs/*/worktrees/*` defensive
+   (drop `.git/*`, non-whitelisted `.leerie/*` paths, and `.leerie/runs/*/worktrees/*` defensive
    entries), then rsync the result to `/work` on the machine via
    `fly_rsync_wrapper` from `lib.sh` (transports `rsync --server` over
    `flyctl ssh console -C`). The full-history clone on the machine is
