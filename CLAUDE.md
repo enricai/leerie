@@ -368,7 +368,10 @@ retry-policy markers match the live check-function strings. The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
-stubbed `flyctl`. No coverage target is set — the suite was
+stubbed `flyctl`. The local per-repo image surface —
+`resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image` — is
+tested via bash-harness subprocess tests with stubbed `git` and
+`nerdctl`. No coverage target is set — the suite was
 introduced from scratch and a number now would be arbitrary.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful
