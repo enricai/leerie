@@ -3129,6 +3129,7 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/pip" \
          "$HOME/.cache/leerie/go-mod" \
          "$HOME/.cache/leerie/cargo" \
+         "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR"
 
 CACHE_MOUNTS=(
@@ -3146,6 +3147,9 @@ CACHE_MOUNTS=(
   -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
   -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
   -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
+  -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
+  -e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle"
+  -e "BUNDLE_CACHE_ALL=1"
 )
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
