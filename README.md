@@ -524,6 +524,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
 | `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
 | `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
+| `prompts/config_chat.md` | System prompt: interactive `leerie config --chat` session — reads the repo's CI config and manifests, generates `.leerie/config.toml` and optionally `.leerie/Dockerfile` |
 | `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
 | `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |
 | `scripts/runtime-install.sh` | Per-OS auto-install of the container runtime (Colima on macOS; containerd + nerdctl on Debian / Fedora / Arch). Sourced by `install.sh` and the launcher |
