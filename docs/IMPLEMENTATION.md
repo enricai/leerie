@@ -429,6 +429,7 @@ forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/pip` | `/home/leerie/.cache/leerie/pip` | rw | pip HTTP + wheels cache. Each worker that needs Python deps runs `pip install` / `uv sync` itself in its own worktree against this shared cache; after the first install of a package the cache is warm and subsequent workers' installs are fast. Wheel-build race pypa/pip#9034 is still a theoretical concern but in practice rare given leerie's small worker concurrency (DESIGN §6½). |
 | `~/.cache/leerie/go-mod` | `/home/leerie/.cache/leerie/go-mod` | rw | `GOMODCACHE`. Concurrent-safe via per-module-version `flock` in `cmd/go/internal/modfetch`. |
 | `~/.cache/leerie/cargo` | `/home/leerie/.cache/leerie/cargo` | rw | Whole `CARGO_HOME` (registry + bin + config.lock). Mounting only `registry/` breaks `config.lock` (cargo#11376). Concurrent-safe via cargo's documented flock semantics. |
+| `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
 ### `--inspect-dir` path translation
@@ -3103,7 +3104,7 @@ branch, after the `_write_run_json(...)` block and before
 
 ### Caches
 
-Five host caches mounted into the container, all `rw`. Listed in §0.5
+Six host caches mounted into the container, all `rw`. Listed in §0.5
 "Bind-mount table." Concurrency-safety verdicts:
 
 - **mise installs** — Safe. Version dirs are immutable once installed;
@@ -3122,8 +3123,11 @@ Five host caches mounted into the container, all `rw`. Listed in §0.5
   once via pip's own retry, and a persistent failure surfaces as a
   conformer warning (DESIGN §9), not a silent corruption.
 
-Bundler is **not** mounted as a shared cache (open `unlink` races,
-rubygems/bundler#4519). Ruby repos route through `.leerie-setup.sh`.
+- **Bundler** — Mounted. `BUNDLE_PATH` and `BUNDLE_CACHE_ALL=1` are set
+  so `bundle install` reuses cached gems across worktrees and runs.
+  The historic `unlink` race (rubygems/bundler#4519) was fixed in
+  Bundler 2.2+; all supported Ruby versions ship a sufficiently recent
+  Bundler.
 
 ### Worker-driven install (replaces per-worktree replay)
 
