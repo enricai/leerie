@@ -1776,8 +1776,9 @@ classification and planning, layered top-to-bottom by determinism:
    the tests" subtask does), then runs the command itself from
    its own worktree via its Bash tool. The package-manager
    caches (pnpm store, pip wheel cache, go module cache, cargo
-   registry) are shared across worktrees and across runs, so
-   re-running the install command in worktree N is fast.
+   registry, Bundler gem cache) are shared across worktrees and
+   across runs, so re-running the install command in worktree N
+   is fast.
 
    This shape has three benefits over an orchestrator-driven
    install: (a) the host's checked-out source tree and tracked

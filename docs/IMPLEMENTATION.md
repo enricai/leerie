@@ -433,6 +433,7 @@ forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/go-mod` | `/home/leerie/.cache/leerie/go-mod` | rw | `GOMODCACHE`. Concurrent-safe via per-module-version `flock` in `cmd/go/internal/modfetch`. |
 | `~/.cache/leerie/cargo` | `/home/leerie/.cache/leerie/cargo` | rw | Whole `CARGO_HOME` (registry + bin + config.lock). Mounting only `registry/` breaks `config.lock` (cargo#11376). Concurrent-safe via cargo's documented flock semantics. |
 | `~/.cache/leerie/corepack` | `/home/leerie/.cache/leerie/corepack` | rw | `COREPACK_HOME`. Without this, corepack inherits `XDG_CACHE_HOME=/tmp/.cache` and tries to mkdir `/tmp/.cache/node/corepack/v1`, which fails under rootless UID remapping. Concurrent-safe: corepack downloads tarballs via atomic rename; the cache is read-mostly after first install. |
+| `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
 ### `--inspect-dir` path translation
