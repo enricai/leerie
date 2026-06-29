@@ -3112,7 +3112,7 @@ branch, after the `_write_run_json(...)` block and before
 
 ### Caches
 
-Five host caches mounted into the container, all `rw`. Listed in §0.5
+Six host caches mounted into the container, all `rw`. Listed in §0.5
 "Bind-mount table." Concurrency-safety verdicts:
 
 - **mise installs** — Safe. Version dirs are immutable once installed;
