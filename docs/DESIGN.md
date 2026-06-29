@@ -1846,6 +1846,25 @@ The `die()` handler also sets `finished_at` (for `fetch_branch`
 discovery) but leaves `current_phase` at whatever phase died — those
 runs ARE resumable and fall through normally. (See *§12*.)
 
+### Declared BLT commands
+
+A repo may commit `.leerie/config.toml` with explicit `build`, `lint`,
+and/or `test` keys. When present, these override the corresponding axis
+from `_infer_build_lint_test()`. Missing keys fall through to inference.
+An empty-string value means "not applicable" — same convention as
+today's inference — and is preserved rather than replaced by inference.
+This is the "CI yaml" analog: the repo author tells leerie exactly how
+to build, lint, and test, the same way they tell GitHub Actions.
+
+The file also accepts a `setup_packages` key (comma-separated apt
+package names) for future Dockerfile auto-generation, but it is not
+consumed by BLT resolution.
+
+Resolution is handled by `resolve_blt(repo_root)` (calls
+`_load_blt_config()` first, then fills missing axes from inference),
+which is what both `_run_conformance_phase` and `run_final_conformance`
+call — neither calls `_infer_build_lint_test` directly any longer.
+
 ---
 
 ## 7. The worker contract
