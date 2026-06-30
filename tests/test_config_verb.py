@@ -639,9 +639,6 @@ def test_config_arm_exists_in_launcher():
 def test_config_arm_exits_before_nerdctl_run():
     """The config case arm must `exit 0` before the nerdctl run line."""
     launcher_text = (REPO_ROOT / "leerie").read_text()
-    if "config)" not in launcher_text:
-        # config-010 not yet integrated; skip gracefully
-        pytest.skip("config-010 not yet integrated — coupling test deferred")
     # The exit 0 in the config arm must appear before `nerdctl run`
     config_pos = launcher_text.index("config)")
     nerdctl_run_pos = launcher_text.index("nerdctl run", config_pos)
