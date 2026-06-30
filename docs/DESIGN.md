@@ -1904,6 +1904,53 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 `.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
 `ensure_image` proceeds as before.
 
+### `leerie config` — host-side onramp
+
+Not every repo author wants to hand-write `.leerie/config.toml` or
+`.leerie/Dockerfile`. The `leerie config` verb is a host-side fast-path
+that generates and inspects these files without starting a container.
+
+**Why no container.** Config generation only needs to read the repo's
+existing files (lockfiles, CI yaml, `package.json`, `Gemfile`, etc.) and
+write into `.leerie/`. That is a read-plus-local-write operation — no
+worker isolation, no network, no package-manager caches. Starting a
+container to do it would add thirty-plus seconds of startup overhead with
+no benefit and would complicate the UX: the user is being asked to
+*configure* leerie before running it, so making them provision a machine
+first inverts the sequence.
+
+**Why it is not in the four-verb remote-lifecycle table (§6 "verb
+surface").** That table (`leerie "task" --runtime fly`, `--stop`,
+`--resume`, `--kill`) is explicitly scoped to the remote *run* lifecycle —
+machine allocation, pausing, resuming, and destruction. `leerie config` has
+no run lifecycle; it never allocates a machine or a container. It is a
+host-side utility verb in the same family as `leerie --list`: fast, local,
+and orthogonal to run management.
+
+**Three modes:**
+
+- **`leerie config`** (bare): Reads the effective configuration — merging
+  `.leerie/config.toml` (if present) with BLT inference — and prints a
+  summary of each key, its value, and whether it came from the file or from
+  inference. Useful for auditing what leerie will actually use on the next
+  run without starting one.
+
+- **`leerie config --init`**: Auto-detects BLT commands (the same table
+  used by `_infer_build_lint_test()`) and writes a `.leerie/config.toml`
+  with the detected values as uncommented entries, plus commented-out
+  examples for `setup_packages`. No model involved — this is pure
+  deterministic detection. The user can then edit the generated file, `git
+  add .leerie/`, and commit. Subsequent runs pick up the declared values via
+  `resolve_blt()`.
+
+- **`leerie config --chat`**: Launches an interactive `claude` session (NOT
+  `claude -p` — interactive, not headless) with a config-generation system
+  prompt. The session can read the full repo, ask the user questions, and
+  write `.leerie/config.toml` and optionally `.leerie/Dockerfile` when the
+  repo needs system packages. This mode handles the cases `--init` misses:
+  polyglot Makefile-driven setups, repos with non-standard toolchains, or
+  users who want to explain their setup rather than edit a TOML file.
+
 ---
 
 ## 7. The worker contract
