@@ -27,7 +27,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `.claude-plugin/marketplace.json` | Single-plugin marketplace manifest. Makes the repo itself discoverable via `/plugin marketplace add enricai/leerie` from inside Claude Code. Points at `.` so Claude Code reads the sibling `.claude-plugin/plugin.json`. |
 | `.claude-plugin/plugin.json` | Existing plugin manifest (commands, skills, metadata). The `version` field is the single source of truth for `leerie --version`. |
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
-| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` skip container startup. |
+| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` and `config` skip container startup. |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can perform cgroup-v2 delegation — `mkdir /sys/fs/cgroup/leerie.slice`, enable `+memory +pids` in its `cgroup.subtree_control`, then `chown` to the leerie user — before privilege drop; see DESIGN §6 *Memory containment*). `ulimit -c 0`, the cgroup delegation block, `cd /work`, and the `chown leerie: /work` step all run as root. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
@@ -132,6 +132,40 @@ Maps to `DESIGN.md`: §2 (no plugin-spawned subagents — the launcher is
 plain process exec, not in-session orchestration). §6 *Worker subtree
 termination* and §0.5 of this document describe what runs inside the
 container the launcher starts.
+
+---
+
+### `config`
+
+`leerie config` is a fast-path verb (no container) for generating and
+inspecting the per-repo `.leerie/config.toml` file. Three sub-modes:
+
+- **`leerie config --init`** — creates `.leerie/config.toml` with
+  auto-detected build/lint/test commands (uncommented) and a commented
+  `setup_packages` example. Errors if the file already exists. Prints
+  the created path and suggests `git add .leerie/`. Uses a simple
+  pattern-based BLT inferrer inline in the launcher (Makefile → `make`,
+  `tests/` dir or `pyproject.toml` → `pytest tests/`, `package.json` →
+  pnpm equivalents) so no container or orchestrator import is required.
+
+- **`leerie config`** (bare) — prints the effective build/lint/test
+  values with `[config]` or `[inference]` provenance for each axis.
+  When `.leerie/config.toml` declares a key, its value wins and the
+  provenance shows `[config]`; otherwise inference runs and provenance
+  shows `[inference]`. Also shows `leerie.toml` operational knobs when
+  that file exists.
+
+- **`leerie config --chat`** — launches an interactive `claude` session
+  (NOT `claude -p`) with `prompts/config_chat.md` as the system prompt
+  and `--add-dir <USER_REPO>` so the model can read the repo. The user
+  gets a full interactive Claude session that can write `.leerie/config.toml`
+  and optionally `.leerie/Dockerfile`.
+
+The `config` verb is listed alongside `--version` in the ownership
+short-circuit guard so it never claims a state directory — it can be
+invoked from any directory.
+
+Tested by `tests/test_config_verb.py`.
 
 ---
 

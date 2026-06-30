@@ -323,6 +323,14 @@ These flags are handled by the bash launcher before the container starts.
 A summary appears in the `leerie --help` epilog; see below for full
 details and sub-flags.
 
+**Per-repo configuration (no container required):**
+
+| Verb | Description |
+|------|-------------|
+| `config` | Print the effective build/lint/test config for this repo, with `[config]` or `[inference]` provenance for each axis. Also shows `leerie.toml` operational knobs when present. |
+| `config --init` | Create `.leerie/config.toml` with auto-detected BLT commands (uncommented) and a commented `setup_packages` example. Errors if the file already exists. Prints the path and suggests `git add .leerie/`. |
+| `config --chat` | Open an interactive `claude` session with a config-generation system prompt and `--add-dir` pointing at the current repo. The model can read the repo and write `.leerie/config.toml` (and optionally `.leerie/Dockerfile`). |
+
 **Lifecycle (remote mode):**
 
 | Flag | Description |
