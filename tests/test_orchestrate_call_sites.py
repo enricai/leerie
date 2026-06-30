@@ -165,6 +165,48 @@ def test_orchestrate_reconcile_feeds_schedule_via_plans_var():
         "raw planner output.")
 
 
+# ----- resolve_blt call-site guard (conformer phases) -----------------------
+
+def test_run_conformance_phase_calls_resolve_blt():
+    """_run_conformance_phase must call resolve_blt(repo_root) to pick up
+    declared BLT commands from .leerie/config.toml. If a refactor reverts
+    this to a direct _infer_build_lint_test() call, declared BLT overrides
+    are silently ignored for per-subtask conformance — the unit tests for
+    resolve_blt would still pass because they call the helper directly.
+    This test catches the call-site regression instead.
+    """
+    body = _function_body("_run_conformance_phase")
+    assert "resolve_blt(repo_root)" in body, (
+        "_run_conformance_phase must call resolve_blt(repo_root) — "
+        "not _infer_build_lint_test() directly — so that .leerie/config.toml "
+        "declared BLT commands are honoured during per-subtask conformance. "
+        "Revert the call site back to resolve_blt(repo_root).")
+    assert "_infer_build_lint_test(" not in body, (
+        "_run_conformance_phase must NOT call _infer_build_lint_test() "
+        "directly. Use resolve_blt(repo_root) instead, which delegates to "
+        "_infer_build_lint_test() for any axis not declared in config.")
+
+
+def test_run_final_conformance_calls_resolve_blt():
+    """run_final_conformance must call resolve_blt(repo_root) for the same
+    reason as _run_conformance_phase — the final-tree conformance pass must
+    also respect declared BLT commands. A refactor reverting to
+    _infer_build_lint_test() would let declared commands be ignored on the
+    whole-tree pass while per-subtask conformance honoured them, producing
+    an inconsistency that is invisible to the resolve_blt unit tests.
+    """
+    body = _function_body("run_final_conformance")
+    assert "resolve_blt(repo_root)" in body, (
+        "run_final_conformance must call resolve_blt(repo_root) — "
+        "not _infer_build_lint_test() directly — so that .leerie/config.toml "
+        "declared BLT commands are honoured during the final-tree conformance "
+        "pass. Revert the call site back to resolve_blt(repo_root).")
+    assert "_infer_build_lint_test(" not in body, (
+        "run_final_conformance must NOT call _infer_build_lint_test() "
+        "directly. Use resolve_blt(repo_root) instead, which delegates to "
+        "_infer_build_lint_test() for any axis not declared in config.")
+
+
 def test_settle_subtask_needs_clarification_uses_unified_cap():
     """The unified subtask_continuations cap is the design's defense
     against the worker drifting toward asking instead of researching
