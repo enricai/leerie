@@ -361,6 +361,97 @@ local setup) because nerdctl can't reach Keychain. See
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` — lower auto-compaction threshold
   for worker processes.
 
+### Per-repo configuration: `.leerie/config.toml`
+
+The knobs above (in `leerie.toml` or env vars) are *operational* — they
+control how leerie runs. A separate file, `.leerie/config.toml` committed
+inside your repo's `.leerie/` directory, controls *what leerie builds,
+lints, and tests*. These are different concerns, owned by different
+audiences: `leerie.toml` is for the operator; `.leerie/config.toml` is
+for the repo.
+
+**The problem it solves.** Without `.leerie/config.toml`, leerie
+auto-detects your build/lint/test commands on every run by inspecting
+lockfiles and config files. That works, but it means every worker
+re-discovers the same commands. Declaring them once is the "CI yaml"
+analog — the same way you tell GitHub Actions how to build and test, you
+tell leerie.
+
+**Keys.** The file is flat TOML (same parser as `leerie.toml`):
+
+```toml
+build = "make build"
+lint  = "ruff check ."
+test  = "pytest -x"
+# setup_packages = "libvips-dev fonts-noto"
+```
+
+- `build`, `lint`, `test` — declare the corresponding axis explicitly.
+  Missing keys fall through to auto-detection. An empty string (`""`)
+  means "not applicable" and suppresses detection for that axis.
+- `setup_packages` — comma-separated list of apt package names to
+  install at the system level. Used to auto-generate a
+  `.leerie/Dockerfile` (see below) when no committed Dockerfile exists.
+  Not consumed by BLT resolution.
+
+**Resolution order.** Declared values win over inferred values, per axis.
+The orchestrator calls `resolve_blt()` (which reads `.leerie/config.toml`
+then fills any missing axes from inference); neither the conformance phase
+nor the final conformance pass calls `_infer_build_lint_test()` directly.
+
+**Getting started.** Three entry points:
+
+- **`leerie config`** (bare): prints the effective build/lint/test
+  configuration for the current repo — each axis, its value, and whether
+  it came from `.leerie/config.toml` (`[config]`) or from inference
+  (`[inference]`). Run this to audit what leerie will use on the next
+  run without actually starting one.
+
+- **`leerie config --init`**: auto-detects BLT commands using the same
+  table as inference and writes a `.leerie/config.toml` with the detected
+  values pre-filled (uncommented) and a commented `setup_packages`
+  example. No model involved — pure deterministic detection. Exits 1 if
+  `config.toml` already exists. After it runs: edit the file if needed,
+  then `git add .leerie/ && git commit`.
+
+- **`leerie config --chat`**: opens an interactive `claude` session (not
+  headless — a real interactive session) with a config-generation system
+  prompt and `--add-dir` pointing at your repo. The session reads your
+  repo's CI config, lockfiles, and manifests, asks you questions if
+  needed, and writes `.leerie/config.toml` — and optionally
+  `.leerie/Dockerfile` for repos that need system packages. Use this for
+  polyglot or non-standard setups where `--init` would miss something.
+
+All three sub-modes are host-only fast paths: they exit before `nerdctl
+run` and never start a container.
+
+**Per-repo container image.** If your repo needs system packages (C
+libraries for native gems, fonts, specialized tooling) that require root
+to install, `.leerie-setup.sh` cannot help — it runs as the unprivileged
+`leerie` user. Instead, commit a `.leerie/Dockerfile` that extends the
+base image:
+
+```dockerfile
+ARG BASE_IMAGE
+FROM $BASE_IMAGE
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvips-dev \
+    fonts-noto \
+    && rm -rf /var/lib/apt/lists/*
+USER leerie
+```
+
+The launcher builds a derived image tagged `leerie-repo/<repo-id>:<version>`
+and uses it for all subsequent runs. A second run with an unchanged
+Dockerfile skips the build entirely (the launcher stores a content hash
+and only rebuilds when the Dockerfile or base version changes). If you
+declare `setup_packages` in `.leerie/config.toml` but commit no
+`.leerie/Dockerfile`, the launcher auto-generates a minimal apt-install
+Dockerfile and proceeds through the same build path. A committed
+Dockerfile always takes precedence over `setup_packages`.
+
 The full inventory of CLI flags and environment variables is in the
 [README "Configuration" section](../README.md#configuration).
 
