@@ -5,6 +5,56 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.13]
+
+### Added
+
+- **Per-repo `.leerie/` configuration directory (DESIGN §6½).** Repos may
+  now commit a `.leerie/` directory to declare build/lint/test commands,
+  system dependencies, and a custom container image — eliminating the
+  per-run re-discovery overhead reported by power users.
+
+  - **Declared BLT commands via `.leerie/config.toml`.** Add `build`,
+    `lint`, and/or `test` keys to opt specific axes out of
+    `_infer_build_lint_test()` auto-detection. Missing keys fall through
+    to inference; an empty string means "not applicable." Implemented by
+    new `_load_blt_config()` and `resolve_blt()` functions in
+    `orchestrator/leerie.py`; both conformer call sites updated.
+
+  - **Per-repo container image from `.leerie/Dockerfile`.** A Dockerfile
+    that extends `ARG BASE_IMAGE` / `FROM $BASE_IMAGE` is built into a
+    derived image tagged `leerie-repo/<repo-id>:<version>` (local) or
+    `registry.fly.io/$APP:<version>-<hash>` (Fly). The image is cached and
+    rebuilt only when the base version or Dockerfile content changes. When
+    `.leerie/config.toml` declares `setup_packages` (comma-separated apt
+    package names) and no Dockerfile exists, one is auto-generated. Implemented
+    in the launcher (`resolve_repo_image_tag`, `build_repo_image`); the Fly
+    path extends `build-push.sh` with `--dockerfile` and `--build-arg`
+    forwarding.
+
+  - **Ruby `BUNDLE_PATH` cache mount.** The launcher now mounts
+    `~/.cache/leerie/bundle` as the Bundler gem cache
+    (`BUNDLE_PATH=/home/leerie/.cache/leerie/bundle`,
+    `BUNDLE_CACHE_ALL=1`), so `bundle install` reuses downloaded gems
+    across worktrees and runs — matching the existing pnpm/pip/cargo cache
+    mounts.
+
+  - **`leerie config` onramp verb.** A fast-path launcher verb (no
+    container required) with three modes: bare (print effective config
+    for each BLT axis with `[config]` vs `[inference]` provenance);
+    `--init` (generate `.leerie/config.toml` with auto-detected values
+    and a commented `setup_packages` example, then suggest
+    `git add .leerie/`); `--chat` (launch an interactive `claude`
+    session with `prompts/config_chat.md` as the system prompt so the
+    user can configure leerie conversationally against their own repo).
+
+  - **`.leerie/` seed-transport whitelist.** `scripts/remote/seed-repo.sh`
+    previously dropped all `.leerie/` paths before rsync to Fly machines
+    (to avoid shipping host-side run state). The filter now whitelists
+    `.leerie/config.toml`, `.leerie/Dockerfile`, and
+    `.leerie/.leerie-setup.sh` so committed config declarations reach
+    the machine unchanged.
+
 ## [0.9.5]
 
 ### Fixed
