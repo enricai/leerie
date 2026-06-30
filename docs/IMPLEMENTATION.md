@@ -135,6 +135,37 @@ container the launcher starts.
 
 ---
 
+### `config`
+
+`leerie config` is a host-only fast path — it exits before `nerdctl run`
+and never starts a container. It is listed alongside `--version` in the
+ownership-guard skip-list so it never claims a state directory. Three
+sub-modes:
+
+- **bare (`leerie config`)**: prints effective build/lint/test config for
+  `$USER_REPO` with `[config]` / `[inference]` provenance per axis (reads
+  `.leerie/config.toml` if present, otherwise infers). Also prints any
+  non-comment `key = value` lines from `leerie.toml` when that file exists.
+- **`leerie config --init`**: creates `.leerie/` and writes
+  `.leerie/config.toml` with auto-detected BLT values (uncommented) and a
+  commented `setup_packages` example. Refuses with exit 1 if `config.toml`
+  already exists. Prints the path and suggests `git add .leerie/`.
+- **`leerie config --chat`**: execs interactive `claude` (NOT `claude -p`)
+  with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
+  `--add-dir $USER_REPO`. No container started. Exits 1 if
+  `prompts/config_chat.md` is missing.
+
+All three sub-modes share an inline BLT inferrer (`_config_read_key`,
+`_infer_axis`, `_axis_source`) implemented directly in the launcher bash
+so the verb requires no container and no orchestrator import. The logic
+mirrors the harness in `tests/test_config_verb.py`.
+
+Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
+format and resolution); §6½ *Per-repo container image* (`setup_packages`,
+`prompts/config_chat.md` for the interactive session).
+
+---
+
 ## 0.5. Container shape
 
 Leerie runs entirely inside a single container per run (DESIGN §6 *Worker
