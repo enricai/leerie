@@ -28,12 +28,20 @@ def reset_probe_memo(leerie):
     test. Without this, the first test that sets `_CGROUP_PROBE_RESULT`
     or runs `_detect_cgroup_root()` would force the same value into
     every subsequent test, defeating each test's `_CGROUP_ROOT`
-    monkeypatch."""
+    monkeypatch.
+
+    Also neutralizes `_CGROUP_DELEGATED_SLICE` — in environments where
+    /sys/fs/cgroup/leerie.slice actually exists (e.g., inside a leerie
+    container), `_detect_cgroup_root()` would otherwise bypass the
+    `_CGROUP_ROOT` monkeypatch that each test sets up."""
+    orig_delegated = leerie._CGROUP_DELEGATED_SLICE
     leerie._CGROUP_PROBE_RESULT = None
     leerie._CGROUP_DETECTED_ROOT = None
+    leerie._CGROUP_DELEGATED_SLICE = Path("/sys/fs/cgroup/leerie.slice-does-not-exist-in-tests")
     yield
     leerie._CGROUP_PROBE_RESULT = None
     leerie._CGROUP_DETECTED_ROOT = None
+    leerie._CGROUP_DELEGATED_SLICE = orig_delegated
 
 
 # ---- probe ----------------------------------------------------------------

@@ -197,6 +197,7 @@ _source_runtime_helpers() {
   trap "rm -f '$tmp'" EXIT
   local raw_url="https://raw.githubusercontent.com/enricai/leerie/${REF}/scripts/runtime-install.sh"
   if curl -fsSL "$raw_url" -o "$tmp"; then
+    # shellcheck source=/dev/null
     . "$tmp"
     return 0
   fi
