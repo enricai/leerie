@@ -325,6 +325,8 @@ details and sub-flags.
 
 **Per-repo configuration (no container required):**
 
+`leerie config` is a host-only fast path — it exits before `nerdctl run` and never starts a container.
+
 | Verb | Description |
 |------|-------------|
 | `config` | Print the effective build/lint/test config for this repo, with `[config]` or `[inference]` provenance for each axis. Also shows `leerie.toml` operational knobs when present. |

@@ -137,10 +137,10 @@ container the launcher starts.
 
 ### `config`
 
-`leerie config` is a host-only fast path — it exits before `nerdctl run`
-and never starts a container. It is listed alongside `--version` in the
-ownership-guard skip-list so it never claims a state directory. Three
-sub-modes:
+Launcher bash case arm: `config)`. `leerie config` is a host-only fast
+path — it exits before `nerdctl run` and never starts a container. It is
+listed alongside `--version` in the ownership-guard skip-list so it never
+claims a state directory. Three sub-modes:
 
 - **bare (`leerie config`)**: prints effective build/lint/test config for
   `$USER_REPO` with `[config]` / `[inference]` provenance per axis (reads
