@@ -5,6 +5,23 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.14]
+
+### Fixed
+
+- **`DISALLOWED_TOOLS` hard-deny prevents workers from spawning subagents.**
+  Workers running under `--dangerously-skip-permissions` could call `Agent`,
+  `ScheduleWakeup`, and other tools outside the `--allowedTools` list because
+  `--allowedTools` is a permission pre-approval (soft), not a visibility
+  restriction (hard). A classifier on a real run spawned an Explore subagent,
+  set a 60-second wakeup timer, and exited without calling `StructuredOutput`
+  — crashing the run. A new `DISALLOWED_TOOLS` constant is now passed via
+  `--disallowedTools` on every `claude -p` invocation. Unlike `--allowedTools`,
+  `--disallowedTools` removes tools from the model's context entirely, surviving
+  `--dangerously-skip-permissions`. Denies: `Agent`, `SendMessage`,
+  `ScheduleWakeup`, `CronCreate`/`Delete`/`List`, `RemoteTrigger`,
+  `PushNotification`.
+
 ## [0.9.13]
 
 ### Added
