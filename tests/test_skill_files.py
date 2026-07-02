@@ -77,3 +77,19 @@ def test_llm_self_heal_has_description():
         line.lstrip().startswith("description:") for line in block.splitlines()
     )
     assert has_desc, "skills/llm-self-heal/SKILL.md frontmatter missing description:"
+
+
+def test_skill_files_do_not_hardcode_stale_cwd_relative_leerie_path():
+    """calls.ndjson lives under the resolved state root
+    (<state-root>/runs/<run-id>/), not a CWD-relative .leerie/runs/ path.
+    Guards against the drift fixed by the '.leerie/runs' -> '<state-root>/runs'
+    rewrite from silently reappearing."""
+    stale = ".leerie/runs"
+    for skill_dir in ("judge-llm-batch", "llm-self-heal"):
+        path = _REPO_ROOT / "skills" / skill_dir / "SKILL.md"
+        text = path.read_text()
+        assert stale not in text, (
+            f"{path} hardcodes the stale CWD-relative path '{stale}'; "
+            "calls.ndjson lives under <state-root>/runs/<run-id>/, not a "
+            "repo-relative .leerie/runs/ directory"
+        )
