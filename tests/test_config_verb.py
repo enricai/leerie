@@ -45,8 +45,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 # Shared harness
 # ---------------------------------------------------------------------------
-# The harness mirrors what config-010 will add to the case dispatch at leerie
-# line ~544.  Key invariants the harness encodes:
+# The harness mirrors the `config` case arm in the launcher's case dispatch
+# at leerie line ~558.  Key invariants the harness encodes:
 #
 #  1. `config` is listed in the ownership-short-circuit guard (alongside
 #     --version) so it never claims a state directory.
