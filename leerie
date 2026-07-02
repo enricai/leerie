@@ -559,7 +559,9 @@ case "${1:-}" in
     shift
     # Inline BLT inferrer: returns declared values from .leerie/config.toml,
     # else falls through to simple pattern-based inference.  Runs on the host
-    # with no container — mirrors the harness in tests/test_config_verb.py.
+    # with no container — mirrors orchestrator/leerie.py::_infer_build_lint_test()
+    # by hand (see _infer_axis below); tests/test_config_verb.py's harness embeds
+    # its own separate, narrower inferrer rather than exercising this block.
     _config_read_key() {
       local key="$1" file="${USER_REPO:-$(pwd)}/.leerie/config.toml"
       [ -f "$file" ] || return 0
@@ -570,6 +572,15 @@ case "${1:-}" in
                   s/^\"(.*)\"$/\1/;
                   s/^'(.*)'$/\1/"; } || true
     }
+    # Mirrors orchestrator/leerie.py::_infer_build_lint_test() precedence and
+    # empty-string-means-unknown convention exactly (first-set-wins per axis,
+    # same file checks in the same order). Keep the two in sync by hand —
+    # this verb is host-only bash and cannot import the orchestrator
+    # (DESIGN §6½).
+    _is_rails_repo() {
+      local _user_repo="$1"
+      [ -f "$_user_repo/Gemfile.lock" ] && [ -f "$_user_repo/bin/rails" ]
+    }
     _infer_axis() {
       local axis="$1" _user_repo="${USER_REPO:-$(pwd)}"
       local declared
@@ -579,34 +590,70 @@ case "${1:-}" in
         echo "$declared"
         return
       fi
+      local build="" lint="" test=""
+      if [ -f "$_user_repo/Makefile" ]; then
+        build="make"
+      fi
+      if [ -f "$_user_repo/package.json" ]; then
+        [ -n "$build" ] || build="npm run build"
+        [ -n "$test" ] || test="npm test"
+      fi
+      if [ -f "$_user_repo/pyproject.toml" ] || [ -f "$_user_repo/pytest.ini" ] || \
+         [ -f "$_user_repo/setup.cfg" ]; then
+        [ -n "$test" ] || test="pytest"
+      fi
+      if [ -f "$_user_repo/Cargo.toml" ]; then
+        [ -n "$build" ] || build="cargo build"
+        [ -n "$test" ] || test="cargo test"
+      fi
+      if [ -f "$_user_repo/go.mod" ]; then
+        [ -n "$build" ] || build="go build ./..."
+        [ -n "$test" ] || test="go test ./..."
+      fi
+      if [ -f "$_user_repo/pom.xml" ]; then
+        [ -n "$build" ] || build="mvn package"
+        [ -n "$test" ] || test="mvn test"
+      fi
+      if [ -f "$_user_repo/build.gradle" ] || [ -f "$_user_repo/build.gradle.kts" ]; then
+        if [ -f "$_user_repo/gradlew" ]; then
+          [ -n "$build" ] || build="./gradlew build"
+          [ -n "$test" ] || test="./gradlew test"
+        else
+          [ -n "$build" ] || build="gradle build"
+          [ -n "$test" ] || test="gradle test"
+        fi
+      fi
+      if [ -f "$_user_repo/.eslintrc" ] || [ -f "$_user_repo/.eslintrc.json" ] || \
+         [ -f "$_user_repo/.eslintrc.js" ] || [ -f "$_user_repo/.eslintrc.cjs" ] || \
+         [ -f "$_user_repo/.eslintrc.yaml" ] || [ -f "$_user_repo/.eslintrc.yml" ]; then
+        [ -n "$lint" ] || lint="npx eslint ."
+      fi
+      if [ -f "$_user_repo/.ruff.toml" ] || [ -f "$_user_repo/ruff.toml" ]; then
+        [ -n "$lint" ] || lint="ruff check ."
+      fi
+      if [ -f "$_user_repo/.rubocop.yml" ] || [ -f "$_user_repo/.rubocop.yaml" ]; then
+        [ -n "$lint" ] || lint="bundle exec rubocop"
+      fi
+      if [ -n "$(find "$_user_repo" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
+        [ -n "$build" ] || build="dotnet build"
+        [ -n "$test" ] || test="dotnet test"
+      elif [ -n "$(find "$_user_repo" -maxdepth 1 -name '*.csproj' -print -quit 2>/dev/null)" ]; then
+        [ -n "$build" ] || build="dotnet build"
+        [ -n "$test" ] || test="dotnet test"
+      fi
+      if [ -f "$_user_repo/phpunit.xml" ] || [ -f "$_user_repo/phpunit.xml.dist" ]; then
+        [ -n "$test" ] || test="vendor/bin/phpunit"
+      fi
+      if [ -f "$_user_repo/phpstan.neon" ] || [ -f "$_user_repo/phpstan.neon.dist" ]; then
+        [ -n "$lint" ] || lint="vendor/bin/phpstan analyse"
+      fi
+      if _is_rails_repo "$_user_repo"; then
+        [ -n "$test" ] || test="bin/rails test"
+      fi
       case "$axis" in
-        build)
-          if [ -f "$_user_repo/Makefile" ]; then echo "make"; return; fi
-          if [ -f "$_user_repo/package.json" ]; then echo "pnpm run build"; return; fi
-          if [ -f "$_user_repo/pyproject.toml" ] || [ -f "$_user_repo/setup.py" ]; then
-            echo "python3 -m build"; return
-          fi
-          echo ""
-          ;;
-        lint)
-          if [ -f "$_user_repo/pyproject.toml" ] && \
-             grep -q "ruff\|flake8\|pylint" "$_user_repo/pyproject.toml" 2>/dev/null; then
-            echo "ruff check ."; return
-          fi
-          if [ -f "$_user_repo/package.json" ]; then echo "pnpm run lint"; return; fi
-          echo ""
-          ;;
-        test)
-          if [ -d "$_user_repo/tests" ] || [ -f "$_user_repo/pytest.ini" ] || \
-             [ -f "$_user_repo/pyproject.toml" ]; then
-            if grep -q "pytest" "$_user_repo/pyproject.toml" 2>/dev/null || \
-               [ -d "$_user_repo/tests" ]; then
-              echo "pytest tests/"; return
-            fi
-          fi
-          if [ -f "$_user_repo/package.json" ]; then echo "pnpm test"; return; fi
-          echo ""
-          ;;
+        build) echo "$build" ;;
+        lint) echo "$lint" ;;
+        test) echo "$test" ;;
       esac
     }
     _axis_source() {
