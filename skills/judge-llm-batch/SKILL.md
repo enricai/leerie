@@ -13,7 +13,11 @@ Read leerie LLM call captures from a `calls.ndjson` telemetry file (one
 JSON object per line), filter by `call_type`, evaluate every sample against
 a 3-dimensional rubric, and write a verdict JSON file.
 
-The `calls.ndjson` file lives at `.leerie/runs/<run-id>/calls.ndjson`.
+The `calls.ndjson` file lives at `<state-root>/runs/<run-id>/calls.ndjson`,
+where `<state-root>` is the resolved leerie state directory (default
+`$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
+`--state-dir` / `leerie.toml state_dir`; `/leerie-state` inside the
+container) — never a path relative to CWD.
 
 Output shape:
 
@@ -52,13 +56,17 @@ Output shape:
 <execution_context>
 Arguments parsed from `$ARGUMENTS`:
 - First positional: path to `calls.ndjson` (required). Can also be a
-  `.leerie/runs/<run-id>/` directory — the skill will find
+  `<state-root>/runs/<run-id>/` directory — the skill will find
   `calls.ndjson` inside it.
 - `--call-type <name>` (required): one of `classifier`, `planner`,
   `reconciler`, `implementer`, `integrator`, `conformer`. Filters the
   NDJSON to only lines with this `call_type` value.
 - `--run-id <id>` (optional): if provided, resolves the path as
-  `.leerie/runs/<run-id>/calls.ndjson` relative to CWD.
+  `<state-root>/runs/<run-id>/calls.ndjson`, where `<state-root>` is
+  the resolved leerie state directory (default
+  `$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
+  `--state-dir` / `leerie.toml state_dir`; `/leerie-state` inside the
+  container) — never a path relative to CWD.
 - `--out <path>` (optional): explicit verdict output path; defaults to
   `<ndjson-dir>/judge-out/<call_type>-verdicts.json`.
 
