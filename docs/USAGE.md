@@ -361,6 +361,17 @@ local setup) because nerdctl can't reach Keychain. See
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` — lower auto-compaction threshold
   for worker processes.
 
+### Browser-based system tests just work
+
+Headless Chromium and its matching chromedriver ship pre-installed in the
+leerie image, so Capybara, Selenium, and Playwright system tests run with no
+setup — no browser download step, no driver-version pinning. **No
+project-level ChromeOptions or `--no-sandbox` configuration is required**:
+the container flags Chrome needs to run rootless are baked into the image
+and applied automatically to every invocation. Projects that already set
+`ChromeOptions` (e.g. `--no-sandbox`) continue to work unchanged — the flags
+are idempotent.
+
 ### Per-repo configuration: `.leerie/config.toml`
 
 The knobs above (in `leerie.toml` or env vars) are *operational* — they
