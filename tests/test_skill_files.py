@@ -2,7 +2,10 @@
 with the correct frontmatter name slugs."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+import pytest
 
 
 _REPO_ROOT = Path(__file__).parent.parent
@@ -124,4 +127,62 @@ def test_llm_self_heal_skill_does_not_reintroduce_agent_subagent_patch_step():
         f"{path} does not reference prompts/patch_generator.md; the patch "
         "step must be a `claude -p` call against that worker prompt "
         "(DESIGN.md §2 Constraint 1)"
+    )
+
+
+def test_llm_self_heal_skill_defaults_match_code_constants(leerie):
+    """SKILL.md documents each heal-loop default annotated with its code
+    constant name and claims 'All default values match IMPLEMENTATION.md
+    §2'. Guards against a code-side default change (e.g.
+    HEAL_SUCCESS_THRESHOLD_DEFAULT) silently leaving the skill documenting
+    — and users expecting — behavior the loop no longer performs."""
+    path = _REPO_ROOT / "skills" / "llm-self-heal" / "SKILL.md"
+    text = path.read_text()
+
+    # Numeric/plain-identifier defaults: "(default <val>,\s*`<CONST>`)"
+    numeric_pattern = re.compile(
+        r"\(default\s+([0-9.]+),\s*`([A-Z_]+)`\)"
+    )
+    matches = numeric_pattern.findall(text)
+    expected_constants = {
+        "HEAL_MAX_ROUNDS_DEFAULT",
+        "HEAL_N_REPLAYS_DEFAULT",
+        "HEAL_SUCCESS_THRESHOLD_DEFAULT",
+        "HEAL_PLATEAU_WINDOW_DEFAULT",
+        "HEAL_PLATEAU_DELTA_DEFAULT",
+    }
+    found_constants = {const for _, const in matches}
+    assert found_constants == expected_constants, (
+        f"{path}: expected default annotations for {expected_constants}, "
+        f"found {found_constants}"
+    )
+
+    for raw_value, const_name in matches:
+        assert hasattr(leerie, const_name), (
+            f"{path} documents `{const_name}` but orchestrator/leerie.py "
+            "has no such constant"
+        )
+        documented_value = float(raw_value)
+        code_value = getattr(leerie, const_name)
+        assert documented_value == pytest.approx(code_value), (
+            f"{path} documents {const_name}=default {raw_value}, but "
+            f"orchestrator/leerie.py defines {const_name}={code_value!r}"
+        )
+
+    # Model default: "(default `sonnet`, `MODEL_DEFAULT_PER_WORKER[\"heal\"]`)"
+    model_match = re.search(
+        r'\(default\s+`([a-z0-9_-]+)`,\s*'
+        r'`MODEL_DEFAULT_PER_WORKER\["heal"\]`\)',
+        text,
+    )
+    assert model_match, (
+        f"{path}: expected a `(default `<model>`, "
+        '`MODEL_DEFAULT_PER_WORKER["heal"]`)` annotation'
+    )
+    documented_model = model_match.group(1)
+    code_model = leerie.MODEL_DEFAULT_PER_WORKER["heal"]
+    assert documented_model == code_model, (
+        f"{path} documents MODEL_DEFAULT_PER_WORKER[\"heal\"]=default "
+        f"`{documented_model}`, but orchestrator/leerie.py defines it as "
+        f"{code_model!r}"
     )
