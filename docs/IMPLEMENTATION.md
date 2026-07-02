@@ -2325,6 +2325,11 @@ families (checked in this order; first match wins per axis via
 - **ESLint** (`.eslintrc.*`) → `npx eslint .` (lint)
 - **Ruff** (`.ruff.toml` / `ruff.toml`) → `ruff check .` (lint)
 - **RuboCop** (`.rubocop.yml` / `.rubocop.yaml`) → `bundle exec rubocop` (lint)
+- **Kotlin/detekt** (`detekt.yml` / `detekt.yaml`) → `detekt` (lint) — build/test
+  are already filled by the Gradle family above; detekt fills only the lint
+  axis. ktlint was considered and rejected as a marker: it has no dedicated
+  config file (driven by `.editorconfig` / the Gradle plugin), so it isn't
+  cleanly file-detectable in this inference style.
 - **C#/.NET** (`*.sln` at root, or `*.csproj` at root as fallback) →
   `dotnet build` (build), `dotnet test` (test)
 - **PHP** (`phpunit.xml` / `phpunit.xml.dist`) → `vendor/bin/phpunit` (test);

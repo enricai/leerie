@@ -12580,6 +12580,9 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
     if (repo_root / ".rubocop.yml").is_file() or \
        (repo_root / ".rubocop.yaml").is_file():
         out["lint"] = out["lint"] or "bundle exec rubocop"
+    if (repo_root / "detekt.yml").is_file() or \
+       (repo_root / "detekt.yaml").is_file():
+        out["lint"] = out["lint"] or "detekt"
     if next(repo_root.glob("*.sln"), None) is not None:
         out["build"] = out["build"] or "dotnet build"
         out["test"] = out["test"] or "dotnet test"

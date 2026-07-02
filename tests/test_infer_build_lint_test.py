@@ -217,3 +217,29 @@ def test_phpstan_neon_infers_phpstan(leerie, tmp_path):
     (tmp_path / "phpstan.neon").write_text("parameters:\n  level: max\n")
     blt = _infer(leerie, tmp_path)
     assert blt["lint"] == "vendor/bin/phpstan analyse"
+
+
+# --- Kotlin / detekt ---
+
+def test_detekt_yml_infers_detekt(leerie, tmp_path):
+    (tmp_path / "detekt.yml").write_text("complexity:\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["lint"] == "detekt"
+    assert blt["build"] == ""
+    assert blt["test"] == ""
+
+
+def test_detekt_yaml_infers_detekt(leerie, tmp_path):
+    (tmp_path / "detekt.yaml").write_text("complexity:\n")
+    assert _infer(leerie, tmp_path)["lint"] == "detekt"
+
+
+def test_gradle_and_detekt_fills_build_test_and_lint(leerie, tmp_path):
+    """Gradle fills build/test; detekt fills only the lint axis — the two
+    families are independent and compose rather than override each other."""
+    (tmp_path / "build.gradle.kts").write_text("plugins { kotlin(\"jvm\") }\n")
+    (tmp_path / "detekt.yml").write_text("complexity:\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "gradle build"
+    assert blt["test"] == "gradle test"
+    assert blt["lint"] == "detekt"

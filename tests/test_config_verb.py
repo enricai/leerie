@@ -172,6 +172,9 @@ _infer_axis() {
   if [ -f "$USER_REPO/.rubocop.yml" ] || [ -f "$USER_REPO/.rubocop.yaml" ]; then
     [ -n "$lint" ] || lint="bundle exec rubocop"
   fi
+  if [ -f "$USER_REPO/detekt.yml" ] || [ -f "$USER_REPO/detekt.yaml" ]; then
+    [ -n "$lint" ] || lint="detekt"
+  fi
   if [ -n "$(find "$USER_REPO" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
     [ -n "$build" ] || build="dotnet build"
     [ -n "$test" ] || test="dotnet test"
@@ -895,7 +898,7 @@ def _infer_via_real_launcher(user_repo: Path, tmp_path: Path) -> dict[str, str]:
 
 # One fixture-builder per stack the Python inferrer covers (mirrors the
 # `if` chain in _infer_build_lint_test / _is_rails_repo, orchestrator/
-# leerie.py:12525-12597). Each entry writes exactly the marker files for
+# leerie.py:12525-12600). Each entry writes exactly the marker files for
 # one stack so the parity assertion is unambiguous about which axis each
 # stack is expected to drive.
 _PARITY_FIXTURES: dict[str, Callable[[Path], None]] = {
@@ -917,6 +920,7 @@ _PARITY_FIXTURES: dict[str, Callable[[Path], None]] = {
     "eslint": lambda repo: (repo / ".eslintrc.json").write_text("{}\n"),
     "ruff": lambda repo: (repo / "ruff.toml").write_text("line-length = 100\n"),
     "rubocop": lambda repo: (repo / ".rubocop.yml").write_text("AllCops:\n"),
+    "detekt": lambda repo: (repo / "detekt.yml").write_text("complexity:\n"),
     "dotnet_csproj": lambda repo: (repo / "App.csproj").write_text(
         '<Project Sdk="Microsoft.NET.Sdk" />\n'
     ),
