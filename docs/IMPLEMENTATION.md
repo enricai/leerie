@@ -157,8 +157,12 @@ claims a state directory. Three sub-modes:
 
 All three sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
-so the verb requires no container and no orchestrator import. The logic
-mirrors the harness in `tests/test_config_verb.py`.
+so the verb requires no container and no orchestrator import. `_infer_axis`
+mirrors `_infer_build_lint_test()`'s precedence and family coverage
+(§4 *Phase walkthrough*, below) by hand, since the verb cannot import the
+orchestrator. `tests/test_config_verb.py`'s bash harness currently embeds
+its own separate, narrower inferrer rather than exercising this real
+block — see the coupling gap noted in that file.
 
 Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
 format and resolution); §6½ *Per-repo container image* (`setup_packages`,
