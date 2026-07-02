@@ -382,9 +382,12 @@ stubbed `flyctl`. The local per-repo image surface —
 tested via bash-harness subprocess tests with stubbed `git` and
 `nerdctl`. The `leerie config` verb (all three sub-modes: `--init`,
 bare, `--chat`) is tested in `tests/test_config_verb.py` via a
-self-contained bash harness with stubbed `nerdctl` and `claude`. No
-coverage target is set — the suite was introduced from scratch and a
-number now would be arbitrary.
+self-contained bash harness with stubbed `nerdctl` and `claude`, plus
+a parity guard that extracts the real launcher `config)` case arm and
+diffs its BLT inference against `_infer_build_lint_test()` across a
+fixture matrix so the two can never silently diverge. No coverage
+target is set — the suite was introduced from scratch and a number
+now would be arbitrary.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful
 testing requires a stub or live `claude` binary and lives in a separate
