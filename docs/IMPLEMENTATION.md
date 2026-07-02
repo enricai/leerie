@@ -160,9 +160,13 @@ All three sub-modes share an inline BLT inferrer (`_config_read_key`,
 so the verb requires no container and no orchestrator import. `_infer_axis`
 mirrors `_infer_build_lint_test()`'s precedence and family coverage
 (§4 *Phase walkthrough*, below) by hand, since the verb cannot import the
-orchestrator. `tests/test_config_verb.py`'s bash harness currently embeds
-its own separate, narrower inferrer rather than exercising this real
-block — see the coupling gap noted in that file.
+orchestrator. `tests/test_config_verb.py`'s per-mode unit tests still run
+against a self-contained bash harness (kept in sync with `_infer_axis` by
+hand) for speed and isolation, but a separate parity guard in that file
+extracts the real `config)` case arm verbatim from the shipped launcher
+and diffs its inference output against `_infer_build_lint_test()` across
+a fixture matrix, so the launcher inferrer can no longer silently diverge
+from the Python table.
 
 Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
 format and resolution); §6½ *Per-repo container image* (`setup_packages`,
