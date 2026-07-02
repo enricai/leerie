@@ -634,6 +634,9 @@ case "${1:-}" in
       if [ -f "$_user_repo/.rubocop.yml" ] || [ -f "$_user_repo/.rubocop.yaml" ]; then
         [ -n "$lint" ] || lint="bundle exec rubocop"
       fi
+      if [ -f "$_user_repo/detekt.yml" ] || [ -f "$_user_repo/detekt.yaml" ]; then
+        [ -n "$lint" ] || lint="detekt"
+      fi
       if [ -n "$(find "$_user_repo" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
         [ -n "$build" ] || build="dotnet build"
         [ -n "$test" ] || test="dotnet test"
