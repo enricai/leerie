@@ -97,19 +97,19 @@ def test_skill_files_do_not_hardcode_stale_cwd_relative_leerie_path():
 
 def test_llm_self_heal_skill_does_not_reintroduce_agent_subagent_patch_step():
     """The patch-generation step must be a direct `claude -p` call to
-    prompts/patch_generator.md (DESIGN.md §14 — 'No subagent spawning':
-    workers are headless `claude -p` subprocess invocations, not
-    in-session subagents; the Claude Code Agent tool is not available to
-    the orchestrator and not used anywhere in this repo). Guards against
-    the Agent-tool / subagent_type patch-generation drift fixed by
-    bugfix-001 from silently reappearing."""
+    prompts/patch_generator.md (DESIGN.md §2 Constraint 1 — 'subagents
+    cannot spawn subagents': workers are headless `claude -p` subprocess
+    invocations, not in-session subagents; the Claude Code Agent tool is
+    not available to the orchestrator and not used anywhere in this
+    repo). Guards against the Agent-tool / subagent_type patch-generation
+    drift fixed by bugfix-001 from silently reappearing."""
     path = _REPO_ROOT / "skills" / "llm-self-heal" / "SKILL.md"
     text = path.read_text()
 
     assert "subagent_type" not in text, (
         f"{path} references 'subagent_type'; the patch step must invoke "
         "prompts/patch_generator.md via a direct `claude -p` call, not an "
-        "Agent-tool subagent (DESIGN.md §14)"
+        "Agent-tool subagent (DESIGN.md §2 Constraint 1)"
     )
 
     end = text.index("---", 3)
@@ -117,11 +117,11 @@ def test_llm_self_heal_skill_does_not_reintroduce_agent_subagent_patch_step():
     allowed_tools_block = frontmatter[frontmatter.index("allowed-tools:"):]
     assert "Agent" not in allowed_tools_block, (
         f"{path} lists 'Agent' in its allowed-tools block; this skill must "
-        "not spawn an Agent-tool subagent for patch generation (DESIGN.md §14)"
+        "not spawn an Agent-tool subagent for patch generation (DESIGN.md §2 Constraint 1)"
     )
 
     assert "patch_generator.md" in text, (
         f"{path} does not reference prompts/patch_generator.md; the patch "
         "step must be a `claude -p` call against that worker prompt "
-        "(DESIGN.md §14)"
+        "(DESIGN.md §2 Constraint 1)"
     )
