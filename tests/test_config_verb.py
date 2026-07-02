@@ -16,21 +16,26 @@ Sub-behaviours under test:
       keys (build/lint/test/setup_packages) and the ARG BASE_IMAGE / USER
       leerie Dockerfile guidance.
 
-Strategy: the `config` verb is added to the launcher by config-010 (in-plan
-at the time this test was written). Rather than extracting the block from the
-launcher (which would fail before config-010 lands), these tests use a
-self-contained bash harness that implements the spec and records observable
-side-effects (argv log for claude, nerdctl call log for the no-container
-assertion). Once config-010 integrates the verb into the real launcher a
-coupling test (`test_config_arm_exists_in_launcher`) guards that the harness
-stays in sync.
+Strategy: the per-mode tests (a)-(d) use a self-contained bash harness that
+implements the spec and records observable side-effects (argv log for
+claude, nerdctl call log for the no-container assertion) — this keeps those
+tests fast and independent of the exact launcher wiring. A separate parity
+guard (`test_config_inference_matches_infer_build_lint_test` and friends,
+below) extracts and runs the REAL `config)` case arm out of the launcher
+(following the extract-from-launcher pattern in
+test_launcher_per_repo_image.py) and diffs its inference output against
+orchestrator/leerie.py::_infer_build_lint_test() across a fixture matrix, so
+the launcher's inline inferrer can never silently diverge from the Python
+table again without a red test.
 
 Precedent for this pattern: test_launcher_runtime_knob.py (standalone
-harness for a launcher case arm), test_ensure_image.py (function harness).
+harness for a launcher case arm), test_ensure_image.py (function harness),
+test_launcher_per_repo_image.py (extract-real-block-from-launcher harness).
 """
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -89,9 +94,14 @@ USER_REPO="${USER_REPO:-$(pwd)}"
 LEERIE_REPO="${LEERIE_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 # Inline BLT inferrer: returns declared values from .leerie/config.toml,
-# else falls through to simple pattern-based inference (same logic as
-# orchestrator/_infer_build_lint_test but implemented here for the config verb
-# so the verb requires no container / no orchestrator import).
+# else falls through to pattern-based inference. This mirrors the REAL
+# launcher's `config)` arm inferrer (leerie:565-658), which in turn mirrors
+# orchestrator/leerie.py::_infer_build_lint_test() by hand (DESIGN §6½).
+# Kept in sync manually for the unit-level (per-mode) tests below; the
+# parity guard further down in this file drives the REAL launcher block
+# directly and compares it against _infer_build_lint_test() in-process, so
+# any future divergence between this copy and the launcher/orchestrator is
+# caught even if this copy is not updated.
 _config_read_key() {
   local key="$1" file="$USER_REPO/.leerie/config.toml"
   [ -f "$file" ] || return 0
@@ -101,6 +111,11 @@ _config_read_key() {
               s/[[:space:]]*$//;
               s/^\"(.*)\"$/\1/;
               s/^'(.*)'$/\1/"; } || true
+}
+
+_is_rails_repo() {
+  local repo="$1"
+  [ -f "$repo/Gemfile.lock" ] && [ -f "$repo/bin/rails" ]
 }
 
 _infer_axis() {
@@ -113,35 +128,70 @@ _infer_axis() {
     echo "$declared"
     return
   fi
-  # Simple pattern-based inference (covers the common cases).
+  local build="" lint="" test=""
+  if [ -f "$USER_REPO/Makefile" ]; then
+    build="make"
+  fi
+  if [ -f "$USER_REPO/package.json" ]; then
+    [ -n "$build" ] || build="npm run build"
+    [ -n "$test" ] || test="npm test"
+  fi
+  if [ -f "$USER_REPO/pyproject.toml" ] || [ -f "$USER_REPO/pytest.ini" ] || \
+     [ -f "$USER_REPO/setup.cfg" ]; then
+    [ -n "$test" ] || test="pytest"
+  fi
+  if [ -f "$USER_REPO/Cargo.toml" ]; then
+    [ -n "$build" ] || build="cargo build"
+    [ -n "$test" ] || test="cargo test"
+  fi
+  if [ -f "$USER_REPO/go.mod" ]; then
+    [ -n "$build" ] || build="go build ./..."
+    [ -n "$test" ] || test="go test ./..."
+  fi
+  if [ -f "$USER_REPO/pom.xml" ]; then
+    [ -n "$build" ] || build="mvn package"
+    [ -n "$test" ] || test="mvn test"
+  fi
+  if [ -f "$USER_REPO/build.gradle" ] || [ -f "$USER_REPO/build.gradle.kts" ]; then
+    if [ -f "$USER_REPO/gradlew" ]; then
+      [ -n "$build" ] || build="./gradlew build"
+      [ -n "$test" ] || test="./gradlew test"
+    else
+      [ -n "$build" ] || build="gradle build"
+      [ -n "$test" ] || test="gradle test"
+    fi
+  fi
+  if [ -f "$USER_REPO/.eslintrc" ] || [ -f "$USER_REPO/.eslintrc.json" ] || \
+     [ -f "$USER_REPO/.eslintrc.js" ] || [ -f "$USER_REPO/.eslintrc.cjs" ] || \
+     [ -f "$USER_REPO/.eslintrc.yaml" ] || [ -f "$USER_REPO/.eslintrc.yml" ]; then
+    [ -n "$lint" ] || lint="npx eslint ."
+  fi
+  if [ -f "$USER_REPO/.ruff.toml" ] || [ -f "$USER_REPO/ruff.toml" ]; then
+    [ -n "$lint" ] || lint="ruff check ."
+  fi
+  if [ -f "$USER_REPO/.rubocop.yml" ] || [ -f "$USER_REPO/.rubocop.yaml" ]; then
+    [ -n "$lint" ] || lint="bundle exec rubocop"
+  fi
+  if [ -n "$(find "$USER_REPO" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
+    [ -n "$build" ] || build="dotnet build"
+    [ -n "$test" ] || test="dotnet test"
+  elif [ -n "$(find "$USER_REPO" -maxdepth 1 -name '*.csproj' -print -quit 2>/dev/null)" ]; then
+    [ -n "$build" ] || build="dotnet build"
+    [ -n "$test" ] || test="dotnet test"
+  fi
+  if [ -f "$USER_REPO/phpunit.xml" ] || [ -f "$USER_REPO/phpunit.xml.dist" ]; then
+    [ -n "$test" ] || test="vendor/bin/phpunit"
+  fi
+  if [ -f "$USER_REPO/phpstan.neon" ] || [ -f "$USER_REPO/phpstan.neon.dist" ]; then
+    [ -n "$lint" ] || lint="vendor/bin/phpstan analyse"
+  fi
+  if _is_rails_repo "$USER_REPO"; then
+    [ -n "$test" ] || test="bin/rails test"
+  fi
   case "$axis" in
-    build)
-      if [ -f "$USER_REPO/Makefile" ]; then echo "make"; return; fi
-      if [ -f "$USER_REPO/package.json" ]; then echo "pnpm run build"; return; fi
-      if [ -f "$USER_REPO/pyproject.toml" ] || [ -f "$USER_REPO/setup.py" ]; then
-        echo "python3 -m build"; return
-      fi
-      echo ""
-      ;;
-    lint)
-      if [ -f "$USER_REPO/pyproject.toml" ] && \
-         grep -q "ruff\|flake8\|pylint" "$USER_REPO/pyproject.toml" 2>/dev/null; then
-        echo "ruff check ."; return
-      fi
-      if [ -f "$USER_REPO/package.json" ]; then echo "pnpm run lint"; return; fi
-      echo ""
-      ;;
-    test)
-      if [ -d "$USER_REPO/tests" ] || [ -f "$USER_REPO/pytest.ini" ] || \
-         [ -f "$USER_REPO/pyproject.toml" ]; then
-        if grep -q "pytest" "${USER_REPO}/pyproject.toml" 2>/dev/null || \
-           [ -d "$USER_REPO/tests" ]; then
-          echo "pytest tests/"; return
-        fi
-      fi
-      if [ -f "$USER_REPO/package.json" ]; then echo "pnpm test"; return; fi
-      echo ""
-      ;;
+    build) echo "$build" ;;
+    lint) echo "$lint" ;;
+    test) echo "$test" ;;
   esac
 }
 
@@ -338,8 +388,6 @@ def test_init_config_toml_has_blt_keys(tmp_path):
     """--init writes uncommented build/lint/test keys to config.toml."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
-    # Plant a tests/ dir so BLT inference picks up pytest
-    (user_repo / "tests").mkdir()
     _run_config(user_repo, ["--init"], tmp_path)
     config_text = (user_repo / ".leerie" / "config.toml").read_text()
     assert "build =" in config_text
@@ -391,14 +439,16 @@ def test_init_no_nerdctl_run(tmp_path):
     assert not run_calls, f"nerdctl run was invoked: {run_calls}"
 
 
-def test_init_uses_inferred_blt_from_tests_dir(tmp_path):
-    """--init uses pytest tests/ when a tests/ directory is present."""
+def test_init_uses_inferred_blt_from_pyproject(tmp_path):
+    """--init infers `pytest` for the test axis when pyproject.toml is present
+    (matches _infer_build_lint_test(): a bare tests/ dir alone is NOT a
+    signal — pyproject.toml / pytest.ini / setup.cfg are)."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
-    (user_repo / "tests").mkdir()
+    (user_repo / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     _run_config(user_repo, ["--init"], tmp_path)
     config_text = (user_repo / ".leerie" / "config.toml").read_text()
-    assert "pytest" in config_text
+    assert 'test = "pytest"' in config_text
 
 
 def test_init_uses_inferred_blt_from_makefile(tmp_path):
@@ -409,6 +459,108 @@ def test_init_uses_inferred_blt_from_makefile(tmp_path):
     _run_config(user_repo, ["--init"], tmp_path)
     config_text = (user_repo / ".leerie" / "config.toml").read_text()
     assert 'build = "make"' in config_text
+
+
+def test_init_uses_inferred_blt_from_rails(tmp_path):
+    """--init detects Rails (Gemfile.lock + bin/rails) and Rubocop lint."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "Gemfile.lock").write_text("GEM\n")
+    (user_repo / "bin").mkdir()
+    (user_repo / "bin" / "rails").write_text("#!/usr/bin/env ruby\n")
+    (user_repo / ".rubocop.yml").write_text("AllCops:\n  NewCops: enable\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'lint = "bundle exec rubocop"' in config_text
+    assert 'test = "bin/rails test"' in config_text
+
+
+def test_init_uses_inferred_blt_from_cargo(tmp_path):
+    """--init detects Cargo.toml and infers cargo build/test."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "Cargo.toml").write_text("[package]\nname = \"x\"\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'build = "cargo build"' in config_text
+    assert 'test = "cargo test"' in config_text
+
+
+def test_init_uses_inferred_blt_from_go_mod(tmp_path):
+    """--init detects go.mod and infers go build/test."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "go.mod").write_text("module example.com/x\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'build = "go build ./..."' in config_text
+    assert 'test = "go test ./..."' in config_text
+
+
+def test_init_uses_inferred_blt_from_gradle(tmp_path):
+    """--init detects build.gradle (no gradlew) and infers gradle build/test."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "build.gradle").write_text("apply plugin: 'java'\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'build = "gradle build"' in config_text
+    assert 'test = "gradle test"' in config_text
+
+
+def test_init_uses_inferred_blt_from_gradlew(tmp_path):
+    """--init prefers ./gradlew over bare gradle when gradlew is present."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "build.gradle.kts").write_text("plugins { java }\n")
+    (user_repo / "gradlew").write_text("#!/bin/sh\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'build = "./gradlew build"' in config_text
+    assert 'test = "./gradlew test"' in config_text
+
+
+def test_init_uses_inferred_blt_from_dotnet(tmp_path):
+    """--init detects a *.csproj file and infers dotnet build/test."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "MyApp.csproj").write_text("<Project Sdk=\"Microsoft.NET.Sdk\" />\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'build = "dotnet build"' in config_text
+    assert 'test = "dotnet test"' in config_text
+
+
+def test_init_uses_inferred_blt_from_php(tmp_path):
+    """--init detects phpunit.xml and phpstan.neon for test/lint."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "phpunit.xml").write_text("<phpunit></phpunit>\n")
+    (user_repo / "phpstan.neon").write_text("parameters:\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'test = "vendor/bin/phpunit"' in config_text
+    assert 'lint = "vendor/bin/phpstan analyse"' in config_text
+
+
+def test_init_uses_inferred_blt_from_eslint(tmp_path):
+    """--init detects .eslintrc.json and infers npx eslint for lint."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / ".eslintrc.json").write_text("{}\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'lint = "npx eslint ."' in config_text
+
+
+def test_init_uses_inferred_blt_from_ruff(tmp_path):
+    """--init detects ruff.toml and infers ruff check for lint."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "ruff.toml").write_text("line-length = 100\n")
+    _run_config(user_repo, ["--init"], tmp_path)
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    assert 'lint = "ruff check ."' in config_text
 
 
 def test_init_fails_if_config_already_exists(tmp_path):
@@ -646,4 +798,216 @@ def test_config_arm_exits_before_nerdctl_run():
     exit_pos = launcher_text.find("exit 0", config_pos)
     assert exit_pos < nerdctl_run_pos, (
         "config) arm does not exit before nerdctl run — container path reached"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parity guard: the REAL launcher `config)` arm's inference must match
+# orchestrator/leerie.py::_infer_build_lint_test() exactly.
+#
+# Unlike the per-mode tests above (which run against the harness's own copy
+# of the inferrer for speed/isolation), these tests extract the actual
+# `config)` case-arm body out of the shipped `leerie` launcher — the same
+# extract-from-launcher pattern test_launcher_per_repo_image.py uses for the
+# per-repo-image block — wrap it in a minimal dispatcher, run
+# `config --init` against a fixture repo, and diff the written build/lint/
+# test values against _infer_build_lint_test()'s output for that same
+# fixture (obtained in-process via the `leerie` fixture from conftest.py).
+#
+# If the launcher's `_infer_axis` is ever reverted to the old thin table
+# (Makefile/package.json/pyproject+pytest only), these tests fail on every
+# fixture outside that thin table's coverage (Rails, Cargo, go.mod, gradle,
+# dotnet, php, eslint, ruff) — the drift can no longer land silently.
+# ---------------------------------------------------------------------------
+
+
+def _extract_config_arm() -> str:
+    """Return the real `config)` case-arm body (including the `config)`
+    pattern and trailing `;;`) verbatim from the shipped launcher."""
+    launcher_text = (REPO_ROOT / "leerie").read_text()
+    start_marker = "  config)\n"
+    end_marker = "\n  --list)"
+    s = launcher_text.index(start_marker)
+    e = launcher_text.index(end_marker, s)
+    return launcher_text[s:e]
+
+
+def _run_real_config_arm(
+    user_repo: Path, args: list[str], tmp_path: Path
+) -> subprocess.CompletedProcess:
+    """Run the REAL launcher's `config)` arm (extracted verbatim) against
+    `user_repo`, wrapped in a minimal dispatcher that supplies the
+    `remote_log` and `claude` helpers the arm expects from its enclosing
+    launcher scope."""
+    block = _extract_config_arm()
+    script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'remote_log() { echo "[leerie] $*" >&2; }\n'
+        "claude() {\n"
+        "  printf '%s\\n' \"$*\" >> \"${CLAUDE_LOG:-/dev/null}\"\n"
+        "  return 0\n"
+        "}\n"
+        "export -f claude\n"
+        "\n"
+        'case "${1:-}" in\n'
+        f"{block}\n"
+        "esac\n"
+    )
+    claude_log = tmp_path / "claude.log"
+    claude_log.touch()
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path / "home"),
+        "USER_REPO": str(user_repo),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "CLAUDE_LOG": str(claude_log),
+    }
+    return subprocess.run(
+        ["bash", "-c", script, "--", "config"] + args,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _infer_via_real_launcher(user_repo: Path, tmp_path: Path) -> dict[str, str]:
+    """Drive the real launcher's `config --init` arm against `user_repo`
+    and return the build/lint/test values it wrote to config.toml."""
+    result = _run_real_config_arm(user_repo, ["--init"], tmp_path)
+    assert result.returncode == 0, (
+        f"real config arm exited {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    config_text = (user_repo / ".leerie" / "config.toml").read_text()
+    out: dict[str, str] = {}
+    for key in ("build", "lint", "test"):
+        for line in config_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(f"{key} ="):
+                val = stripped[len(f"{key} ="):].strip()
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                out[key] = val
+                break
+    return out
+
+
+# One fixture-builder per stack the Python inferrer covers (mirrors the
+# `if` chain in _infer_build_lint_test / _is_rails_repo, orchestrator/
+# leerie.py:12525-12597). Each entry writes exactly the marker files for
+# one stack so the parity assertion is unambiguous about which axis each
+# stack is expected to drive.
+_PARITY_FIXTURES: dict[str, Callable[[Path], None]] = {
+    "makefile": lambda repo: (repo / "Makefile").write_text("build:\n\techo hi\n"),
+    "package_json": lambda repo: (repo / "package.json").write_text("{}\n"),
+    "pyproject_pytest": lambda repo: (repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+    ),
+    "cargo": lambda repo: (repo / "Cargo.toml").write_text('[package]\nname = "x"\n'),
+    "go_mod": lambda repo: (repo / "go.mod").write_text("module example.com/x\n"),
+    "maven": lambda repo: (repo / "pom.xml").write_text("<project></project>\n"),
+    "gradle_no_wrapper": lambda repo: (repo / "build.gradle").write_text(
+        "apply plugin: 'java'\n"
+    ),
+    "gradle_kts_with_wrapper": lambda repo: (
+        (repo / "build.gradle.kts").write_text("plugins { java }\n"),
+        (repo / "gradlew").write_text("#!/bin/sh\n"),
+    ),
+    "eslint": lambda repo: (repo / ".eslintrc.json").write_text("{}\n"),
+    "ruff": lambda repo: (repo / "ruff.toml").write_text("line-length = 100\n"),
+    "rubocop": lambda repo: (repo / ".rubocop.yml").write_text("AllCops:\n"),
+    "dotnet_csproj": lambda repo: (repo / "App.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk" />\n'
+    ),
+    "dotnet_sln": lambda repo: (repo / "App.sln").write_text(
+        "Microsoft Visual Studio Solution File\n"
+    ),
+    "phpunit": lambda repo: (repo / "phpunit.xml").write_text("<phpunit></phpunit>\n"),
+    "phpstan": lambda repo: (repo / "phpstan.neon").write_text("parameters:\n"),
+    "rails": lambda repo: (
+        (repo / "Gemfile.lock").write_text("GEM\n"),
+        (repo / "bin").mkdir(),
+        (repo / "bin" / "rails").write_text("#!/usr/bin/env ruby\n"),
+    ),
+}
+
+
+@pytest.mark.parametrize("fixture_name", sorted(_PARITY_FIXTURES))
+def test_config_inference_matches_infer_build_lint_test(fixture_name, tmp_path, leerie):
+    """For every stack _infer_build_lint_test() covers, the REAL launcher's
+    `config --init` arm must produce the identical build/lint/test values."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    _PARITY_FIXTURES[fixture_name](user_repo)
+
+    expected = leerie._infer_build_lint_test(user_repo)
+    actual = _infer_via_real_launcher(user_repo, tmp_path)
+
+    assert actual.get("build", "") == expected["build"], (
+        f"[{fixture_name}] build mismatch: launcher={actual.get('build', '')!r} "
+        f"vs _infer_build_lint_test={expected['build']!r}"
+    )
+    assert actual.get("lint", "") == expected["lint"], (
+        f"[{fixture_name}] lint mismatch: launcher={actual.get('lint', '')!r} "
+        f"vs _infer_build_lint_test={expected['lint']!r}"
+    )
+    assert actual.get("test", "") == expected["test"], (
+        f"[{fixture_name}] test mismatch: launcher={actual.get('test', '')!r} "
+        f"vs _infer_build_lint_test={expected['test']!r}"
+    )
+
+
+def test_config_inference_matches_on_polyglot_repo(tmp_path, leerie):
+    """A repo matching several stacks at once (first-set-wins per axis) must
+    still resolve identically between the launcher and the Python table."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "Makefile").write_text("build:\n\techo hi\n")
+    (user_repo / "package.json").write_text("{}\n")
+    (user_repo / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    (user_repo / "ruff.toml").write_text("line-length = 100\n")
+
+    expected = leerie._infer_build_lint_test(user_repo)
+    actual = _infer_via_real_launcher(user_repo, tmp_path)
+
+    assert actual.get("build", "") == expected["build"]
+    assert actual.get("lint", "") == expected["lint"]
+    assert actual.get("test", "") == expected["test"]
+
+
+def test_config_inference_matches_on_empty_repo(tmp_path, leerie):
+    """A repo with no recognizable markers infers empty strings on every
+    axis in both the launcher and the Python table."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+
+    expected = leerie._infer_build_lint_test(user_repo)
+    actual = _infer_via_real_launcher(user_repo, tmp_path)
+
+    assert actual.get("build", "") == expected["build"] == ""
+    assert actual.get("lint", "") == expected["lint"] == ""
+    assert actual.get("test", "") == expected["test"] == ""
+
+
+def test_config_inference_parity_detects_reverted_launcher_inferrer(tmp_path, leerie):
+    """Sanity-check the parity guard itself: if the launcher's `_infer_axis`
+    is reverted to the pre-config-001 thin table (Makefile/package.json/
+    pyproject+pytest only), this test must fail on a stack the thin table
+    never covered — proving the guard is load-bearing, not a tautology."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    (user_repo / "Cargo.toml").write_text('[package]\nname = "x"\n')
+
+    expected = leerie._infer_build_lint_test(user_repo)
+    assert expected["build"] == "cargo build"
+    assert expected["test"] == "cargo test"
+
+    # Simulate the pre-config-001 thin table's blindness to Cargo: it would
+    # have inferred nothing for a Cargo-only repo.
+    reverted_actual = {"build": "", "lint": "", "test": ""}
+    assert reverted_actual["build"] != expected["build"], (
+        "the pre-config-001 thin table would have (wrongly) agreed with "
+        "_infer_build_lint_test() on Cargo — the parity guard would not "
+        "have caught the regression it exists to catch"
     )
