@@ -559,7 +559,9 @@ case "${1:-}" in
     shift
     # Inline BLT inferrer: returns declared values from .leerie/config.toml,
     # else falls through to simple pattern-based inference.  Runs on the host
-    # with no container — mirrors the harness in tests/test_config_verb.py.
+    # with no container — mirrors orchestrator/leerie.py::_infer_build_lint_test()
+    # by hand (see _infer_axis below); tests/test_config_verb.py's harness embeds
+    # its own separate, narrower inferrer rather than exercising this block.
     _config_read_key() {
       local key="$1" file="${USER_REPO:-$(pwd)}/.leerie/config.toml"
       [ -f "$file" ] || return 0
