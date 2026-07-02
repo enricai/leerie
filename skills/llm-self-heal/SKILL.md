@@ -37,8 +37,12 @@ Patches are proposed evidence — applying them is a separate manual step.
 Arguments parsed from `$ARGUMENTS`:
 - First positional: `<run-id>` or path to a `calls.ndjson` file or its
   parent directory. If a run-id is given, the skill resolves
-  `.leerie/runs/<run-id>/calls.ndjson` and the corresponding heal
-  output dir `.leerie/runs/<run-id>/heal-out/`.
+  `<state-root>/runs/<run-id>/calls.ndjson` and the corresponding heal
+  output dir `<state-root>/runs/<run-id>/heal-out/`, where
+  `<state-root>` is the resolved leerie state directory (default
+  `$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
+  `--state-dir` / `leerie.toml state_dir`; `/leerie-state` inside the
+  container) — never a path relative to CWD.
 - `--call-type <name>` (optional): heal only this call_type; default
   heals all call_types that have failing verdicts in the verdict files
   found under `judge-out/`.
@@ -68,7 +72,7 @@ parameters".
 
 <context>
 Leerie records every `claude -p` worker invocation to
-`.leerie/runs/<run-id>/calls.ndjson` (one line per call, appended
+`<state-root>/runs/<run-id>/calls.ndjson` (one line per call, appended
 immediately after each call returns). The judge-llm-batch skill produces
 verdict JSON files in `judge-out/`. This skill consumes those verdicts
 to close the loop: it replays failing samples against patched prompts
@@ -128,7 +132,7 @@ criterion — the same bar the live orchestrator uses.
 - Confirm CWD contains `orchestrator/leerie.py` and `prompts/`. If
   not, abort: `llm-self-heal must run from the leerie repo root`.
 - Resolve the input path. If a run-id string, check
-  `.leerie/runs/<run-id>/calls.ndjson` exists. If a directory or
+  `<state-root>/runs/<run-id>/calls.ndjson` exists. If a directory or
   file path, resolve accordingly.
 - Confirm `judge-out/` (or `--verdict-dir`) contains at least one
   `*-verdicts.json` file with `pass=false` entries. If none, emit:
