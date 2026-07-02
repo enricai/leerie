@@ -1930,6 +1930,51 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 `.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
 `ensure_image` proceeds as before.
 
+### Browser-based test execution in the base image
+
+The base image ships headless Chromium and a version-matched
+chromedriver (see *Image build*, IMPLEMENTATION.md §0.5). This is
+scoped narrowly: it exists so that workers can **execute** browser-driven
+tests — Selenium, Capybara, Playwright, Puppeteer — inside the
+container, the same way they run any other test command. It is not a
+visual-verification capability; nothing renders a screenshot back to a
+worker or the user. A Rails repo with a Capybara feature-spec suite, or
+a Next.js repo with Playwright e2e tests, needs a real browser to `bundle
+exec rspec` or `pnpm test:e2e` at all — without one, an entire test
+category is unreachable and reports as a false pass (skipped) or a
+misleading failure (driver-not-found) rather than a real result.
+
+**Baked at build time, not resolved at run time.** The browser and its
+driver are installed from Debian's own apt repos in the same
+transaction (`chromium` + `chromium-driver` + the `libc6` bump that
+keeps `chromium` from failing to load — see *Image build*), so the two
+are always version-matched and neither downloads anything when a
+worker's test suite runs. This follows the same reasoning as runtime
+version resolution in §6½ above: keep the model out of the loop for
+something deterministic. Selenium Manager (the common
+auto-download-a-driver mechanism) would otherwise reach out to the
+network on first use inside every fresh worktree — extra latency per
+subtask, and a dependency on network egress the container may not have.
+Baking the browser into the image turns a per-worker runtime concern
+into a one-time build-time concern, consistent with how the image
+separates cross-cutting state (pre-installed in the container) from
+per-worktree state (installed by each worker) elsewhere in this
+section.
+
+**Sandbox flags baked in, not left to each repo.** Workers run as the
+non-root `leerie` user, so Chrome's SUID sandbox cannot work in
+this container regardless of which project's test suite invokes it.
+Rather than expect every repo's test config to discover and set
+`--no-sandbox` / `--disable-setuid-sandbox` / `--disable-dev-shm-usage`
+correctly, the flags are written once into
+`/etc/chromium.d/leerie-container-flags` at image build time (detail:
+IMPLEMENTATION.md §"Browser-based testing"). A project that already
+sets these flags is unaffected — they're idempotent; a project that
+doesn't now still works, because the wrapper applies them globally.
+This mirrors the container-image posture elsewhere in this doc: fix a
+class of failure once at the image layer instead of asking every
+worker, in every worktree, on every run, to route around it correctly.
+
 ### `leerie config` — host-side onramp
 
 Not every repo author wants to hand-write `.leerie/config.toml` or
