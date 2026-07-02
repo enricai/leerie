@@ -89,14 +89,14 @@ properly. Needs end-to-end verification.
 ### `PARTIAL` Auto-discover more languages for build/lint/test
 
 Deterministic BLT detection covers Node.js, Python, Go, Rust, Ruby,
-Java/Gradle, .NET, PHP, and basic Makefile inference, with an LLM
-fallback for ambiguous cases. Remaining gaps: Kotlin and other niche
-stacks. The lint command was `None` on all prior Rails runs because
-leerie only searched for Node.js tooling — Rubocop was never detected.
-A Gemfile-based detection PR fixed this; conformer is now catching real
-test failures. Broader modularization still open — Garry wants a plugin
-model where repo maintainers define their own BLT detection logic for
-niche stacks without requiring changes to leerie core.
+Java/Gradle, Kotlin/detekt, .NET, PHP, and basic Makefile inference,
+with an LLM fallback for ambiguous cases. The lint command was `None`
+on all prior Rails runs because leerie only searched for Node.js
+tooling — Rubocop was never detected. A Gemfile-based detection PR
+fixed this; conformer is now catching real test failures. Broader
+modularization still open — Garry wants a plugin model where repo
+maintainers define their own BLT detection logic for niche stacks
+without requiring changes to leerie core.
 
 ### `BY DESIGN` Conformer leaves linting/test/build errors in PRs
 
