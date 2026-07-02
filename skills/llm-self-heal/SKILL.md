@@ -1,6 +1,6 @@
 ---
 name: llm-self-heal
-description: "Autonomous self-healing loop for leerie worker prompts that produced captured failures. For each call_type with failures, runs a measured n=N baseline (unpatched), then iterates: invoke patch-generator subagent → apply proposed patch → replay patched arm → score → check convergence (SUCCESS/PLATEAUED/BUDGET_EXHAUSTED/TIMEOUT/REGRESSED). Writes a healing-<call_type>.md report per call_type with the best patch and the iteration history. Production prompts in prompts/ stay manual — the skill proposes patches with measured evidence."
+description: "Autonomous self-healing loop for leerie worker prompts that produced captured failures. For each call_type with failures, runs a measured n=N baseline (unpatched), then iterates: invoke patch-generator worker (claude -p) → apply proposed patch → replay patched arm → score → check convergence (SUCCESS/PLATEAUED/BUDGET_EXHAUSTED/TIMEOUT/REGRESSED). Writes a healing-<call_type>.md report per call_type with the best patch and the iteration history. Production prompts in prompts/ stay manual — the skill proposes patches with measured evidence."
 argument-hint: "<run-id-or-ndjson-path> [--call-type <name>] [--max-iterations <N>] [--n-replays <N>] [--success-threshold <0..1>]"
 allowed-tools:
   - Read
@@ -9,7 +9,6 @@ allowed-tools:
   - Bash
   - Glob
   - Grep
-  - Agent
 ---
 
 <objective>
@@ -18,9 +17,9 @@ produced failures in a judge-llm-batch run. The loop iterates:
 
 1. **Baseline** — run n=N unpatched replays per failing sample via
    `claude -p`, score each, establish noise floor.
-2. **Loop** — invoke the `patch-generator` subagent to propose a
-   minimal patch to the system prompt, apply the patch, replay the
-   patched arm, score, check convergence.
+2. **Loop** — invoke the patch-generator worker (a direct `claude -p`
+   call) to propose a minimal patch to the system prompt, apply the
+   patch, replay the patched arm, score, check convergence.
 3. **Report** — write `<heal-dir>/<call_type>/healing-<call_type>.md`
    with the verdict (SUCCESS / PLATEAUED / BUDGET_EXHAUSTED / TIMEOUT /
    REGRESSED), the best patch found, and the full iteration history.
@@ -102,8 +101,8 @@ Under `<heal-dir>/<call_type>/`:
 ```
 state.json           — loop state (history, best-so-far, baseline)
 iter-<N>/
-  patch-request.json   — inputs for the patch-generator subagent
-  patch-response.json  — subagent's structured output
+  patch-request.json   — inputs for the patch-generator worker (claude -p)
+  patch-response.json  — worker's structured output
   applied-patch.txt    — the patched system prompt text
   arm-results.json     — n-replay results per failing sample
   scores.json          — per-sample per-replay pass/fail verdicts
@@ -173,26 +172,34 @@ For each failing sample (those with `pass=false` in the verdict file):
    - `prior_attempts` (array of `{iter, anchor, replacement, strategy,
      pass_rate}` from `state.json` history)
 
-3. **Invoke patch-generator subagent:**
+3. **Invoke patch-generator worker (`claude -p`):** run a direct headless
+   `claude -p` call — the same subprocess mechanism as the replay calls
+   above (see "Replay mechanics"), not the Agent tool:
    ```
-   Agent({
-     subagent_type: "patch-generator",
-     description: "Propose patch for <call_type> iter-<N>",
-     prompt: "<contents of patch-request.json formatted as delimited sections>"
-   })
+   claude -p \
+     --append-system-prompt "$(cat prompts/patch_generator.md)" \
+     --json-schema '<SCHEMAS["patch_generator"] from orchestrator/leerie.py>' \
+     --model <heal-model> \
+     "<contents of patch-request.json formatted as delimited sections>"
    ```
-   Write the subagent's structured output to
+   The schema requires `{anchor, replacement}` (both non-empty strings)
+   with optional `{strategy, pivot_reason}` — matching
+   `SCHEMAS["patch_generator"]` in `orchestrator/leerie.py`.
+   Write the worker's structured output to
    `<heal-dir>/<call_type>/iter-N/patch-response.json`.
-   The subagent emits `{anchor, replacement, strategy, pivot_reason}`.
    If the output is not valid JSON, retry once with a reminder to emit
    only the JSON envelope.
 
-4. **Apply patch:** substitute `anchor` → `replacement` in the current
-   prompt text. Write the resulting prompt to
+4. **Apply patch:** validate that `anchor` is a **literal substring** of
+   the current prompt text — the same code-enforced check
+   `request_patch()` performs in `orchestrator/leerie.py` (per the
+   prompts-are-advisory-code-enforces principle: this check must happen
+   mechanically, not be trusted from the worker's output). If `anchor`
+   is not found verbatim in the current prompt, skip this iteration and
+   log a warning — do not apply a patch that cannot be cleanly located.
+   Otherwise substitute `anchor` → `replacement` in the current prompt
+   text and write the resulting prompt to
    `<heal-dir>/<call_type>/iter-N/applied-patch.txt`.
-   If `anchor` is not found verbatim in the current prompt, skip this
-   iteration and log a warning — do not apply a patch that cannot be
-   cleanly located.
 
 5. **Replay patched arm:** for each failing sample, run `n_replays`
    `claude -p` calls against the patched prompt. Record pass/fail.
