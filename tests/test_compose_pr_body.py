@@ -138,6 +138,24 @@ def test_compose_pr_body_empty_state(leerie):
     assert "None" not in body  # no literal 'None' leaked through
 
 
+def test_compose_pr_body_footer_link_with_version(leerie):
+    """`leerie_version` present → footer links to the repo with a
+    ` v<version>` suffix (leerie.py:2062-2063)."""
+    state = _full_state()
+    state["leerie_version"] = "1.4.0"
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "[leerie v1.4.0](https://github.com/enricai/leerie)" in body
+
+
+def test_compose_pr_body_footer_link_without_version(leerie):
+    """No `leerie_version` in state → footer links to the repo with no
+    version suffix at all (not `[leerie ]`, not `[leerie vNone]`)."""
+    state = _full_state()
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "[leerie](https://github.com/enricai/leerie)" in body
+    assert "[leerie v" not in body
+
+
 def test_compose_pr_body_no_literal_none(leerie):
     """Sweep guard: under no realistic state shape should the literal
     string 'None' appear in the body."""
