@@ -2315,6 +2315,15 @@ or result text containing `Invalid authentication` / `rate limit` /
 above — the gateway has already rejected the request and a fresh request
 will be rejected too until the user's rolling usage window clears.
 
+`_is_auth_or_quota_failure` only ever consults `api_error_status` or the
+result text when the envelope's own `is_error` is truthy. A successful,
+schema-valid envelope never enters the backoff loop, no matter what its
+`result` text says — a worker whose task legitimately discusses API auth
+or rate limiting (e.g. planning a rate-limited endpoint) would otherwise
+trip the text markers on its own correct output, and `claude_p()` would
+burn the full backoff budget re-running an already-successful worker
+before eventually raising a false subscription-cap `WorkerError`.
+
 When `_is_auth_or_quota_failure(envelope)` matches, `claude_p()` enters a
 `tenacity.AsyncRetrying` loop with `wait_exponential_jitter(initial=15,
 max=120, jitter=5)` and `stop_after_delay(auth_retry_max_sec)`. Each

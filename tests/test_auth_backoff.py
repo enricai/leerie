@@ -14,18 +14,20 @@ import pytest
 # --- positives: should classify as auth/quota -----------------------------
 
 @pytest.mark.parametrize("envelope", [
-    {"api_error_status": 401, "result": "Failed to authenticate."},
-    {"api_error_status": "401", "result": ""},
-    {"api_error_status": 429, "result": "Too Many Requests"},
-    {"api_error_status": "429", "result": ""},
-    {"api_error_status": None,
+    {"is_error": True, "api_error_status": 401,
+     "result": "Failed to authenticate."},
+    {"is_error": True, "api_error_status": "401", "result": ""},
+    {"is_error": True, "api_error_status": 429,
+     "result": "Too Many Requests"},
+    {"is_error": True, "api_error_status": "429", "result": ""},
+    {"is_error": True, "api_error_status": None,
      "result": "API Error: 401 Invalid authentication credentials"},
-    {"api_error_status": None,
+    {"is_error": True, "api_error_status": None,
      "result": "rate limit exceeded; try again later"},
-    {"api_error_status": None,
+    {"is_error": True, "api_error_status": None,
      "result": "Anthropic returned a rate-limit error."},
     # mixed case — classifier lowercases the result message
-    {"api_error_status": None,
+    {"is_error": True, "api_error_status": None,
      "result": "INVALID AUTHENTICATION provided"},
 ])
 def test_auth_or_quota_envelopes_match(leerie, envelope):
@@ -39,15 +41,28 @@ def test_auth_or_quota_envelopes_match(leerie, envelope):
     {"api_error_status": None, "result": "ok",
      "structured_output": {"status": "ready"}},
     # generic error that isn't auth/quota
-    {"api_error_status": 500, "result": "Internal server error"},
-    {"api_error_status": "500", "result": ""},
+    {"is_error": True, "api_error_status": 500,
+     "result": "Internal server error"},
+    {"is_error": True, "api_error_status": "500", "result": ""},
     # missing fields entirely
     {},
     # message mentions "auth" but not the specific markers we key on
-    {"api_error_status": None, "result": "build failed: unauthorized?"},
+    {"is_error": True, "api_error_status": None,
+     "result": "build failed: unauthorized?"},
     # schema-error class — handled by the existing 2-attempt loop
-    {"api_error_status": None,
+    {"is_error": False, "api_error_status": None,
      "result": "the run produced no structured_output"},
+    # regression: a *successful*, schema-valid worker whose own output
+    # legitimately discusses API rate limiting / auth (e.g. planning a
+    # rate-limited endpoint) must not be mistaken for a gateway rejection —
+    # is_error=False short-circuits before the text markers are even
+    # consulted. See the "phoenix" api-server-creation.md false-positive.
+    {"is_error": False, "api_error_status": None,
+     "result": "scope/rate-limit/auth idioms + RATE_LIMIT constants",
+     "structured_output": {"status": "ready"}},
+    {"is_error": False, "api_error_status": None,
+     "result": "Invalid authentication is tested by this endpoint's 401 case.",
+     "structured_output": {"status": "ready"}},
 ])
 def test_non_auth_envelopes_do_not_match(leerie, envelope):
     assert leerie._is_auth_or_quota_failure(envelope) is False
@@ -56,7 +71,18 @@ def test_non_auth_envelopes_do_not_match(leerie, envelope):
 def test_classifier_tolerates_non_string_result(leerie):
     """`result` is normally a string, but `str(None)` is `'None'` — the
     classifier coerces via str() so a missing key never raises."""
-    assert leerie._is_auth_or_quota_failure({"result": None}) is False
+    assert leerie._is_auth_or_quota_failure(
+        {"is_error": True, "result": None}) is False
+
+
+def test_classifier_requires_is_error_even_with_401_status(leerie):
+    """`api_error_status` is a passthrough field from the `claude -p`
+    envelope; even so, the classifier only trusts it once `is_error`
+    confirms the call actually failed — defense in depth against any
+    envelope shape where the two could disagree."""
+    assert leerie._is_auth_or_quota_failure(
+        {"is_error": False, "api_error_status": 401,
+         "result": "ok"}) is False
 
 
 # --- cap is wired into DEFAULT_CAPS ---------------------------------------

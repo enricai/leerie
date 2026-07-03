@@ -5525,7 +5525,17 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
     Claude Code subscription window clears. The auth/quota retry loop
     in claude_p() consults this classifier; non-matching envelopes
     fall through to the existing 2-attempt schema loop unchanged.
+
+    Gated on `is_error`: a successful, schema-valid envelope must never
+    match, no matter what its `result` text says. Without this gate, a
+    worker whose task legitimately talks about API rate limiting or auth
+    (e.g. planning a rate-limited endpoint) trips the text markers below
+    on its own correct output — the orchestrator then burns the full
+    backoff budget re-running an already-successful worker and can
+    eventually raise a false "subscription capped" WorkerError.
     """
+    if not envelope.get("is_error"):
+        return False
     status = envelope.get("api_error_status")
     if status in (401, 429, "401", "429"):
         return True
