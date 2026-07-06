@@ -6706,10 +6706,11 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                       "Return output that conforms exactly to the required schema.")
         envelope = await _spawn(retry_note)
 
-        # Auth/quota backoff: 401/429/auth-message envelopes need waiting,
-        # not the immediate corrective retry below. The gateway has already
-        # rejected the request and a fresh request will be rejected too
-        # until the user's Claude Code subscription window clears. Run
+        # Auth/quota backoff: 401/429/529/auth-message envelopes need
+        # waiting, not the immediate corrective retry below. The gateway
+        # has already rejected the request and a fresh request will be
+        # rejected too until the user's Claude Code subscription window
+        # clears (401/429) or the transient overload (529) subsides. Run
         # tenacity's exponential-backoff-with-jitter loop, capped at
         # `auth_retry_max_sec` cumulative seconds. The loop exits when an
         # invocation returns a non-auth envelope (success or a different
