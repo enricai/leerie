@@ -336,7 +336,12 @@ entry along one axis:
   produce it. The orchestrator filters these out of the matching pass
   entirely — they never enter the reconciler's queue — and instead collects
   them into a `preconditions` section of the assembled plan. The human sees
-  the insight as a deploy note rather than a hard edge.
+  the insight as a deploy note rather than a hard edge. When leerie is used
+  as part of a run-group (§20), a sibling repo in the same group is still
+  `external` by design — it is not in *this member's* build graph, and its
+  cross-repo dependency cannot be a hard DAG edge. The `reason` field naming
+  the sibling is what finalize turns into a deploy-ordering note for that
+  member's PR.
 
 The planner is the right classifier because it just did the research that
 surfaced the prerequisite — it can answer "is this satisfiable by a code
@@ -3214,12 +3219,17 @@ what the architecture can guarantee.
 - **Headless usage is metered.** Subscription-based headless usage draws on a
   finite pool, and a large multi-wave run consumes a meaningful amount of it.
   Cost scales with worker count.
-- **Parallelism is single-clone.** Multiple concurrent runs in the same git
+- **Parallelism is single-repo per run.** Multiple concurrent runs in the same git
   clone are explicitly supported via the per-run state and branch design.
   Multiple clones running concurrently are also fine — they are independent
   by construction — but the per-run namespacing applies only within one
-  clone; leerie does nothing to coordinate across clones (it has no need
-  to).
+  clone; leerie does nothing to coordinate across clones within a single run.
+  For workloads that span *multiple repositories*, leerie offers **run-groups**
+  (§20): N isolated single-repo runs launched together with a shared brief and
+  read-only cross-repo visibility. The group boundary is deliberate: it does
+  not merge across repos, does not produce cross-repo DAG edges inside the
+  planning graph, and opens N independent PRs (non-atomic). Cross-repo
+  prerequisites are surfaced as deploy-ordering notes rather than hard edges.
 - **Push assumes a remote named `origin`.** Finalize pushes to `origin` and
   opens the PR against the same remote's GitHub repo. A fork pattern where
   the user's write-access remote is named something else (e.g., `mine`
@@ -3559,3 +3569,162 @@ The task content passed to each per-job worker — what the leerie run
 should do — is a user-authored prompt file, and the worker's behavior
 is model-governed as in any single leerie run. That is the right
 scope for model judgment; the sequencing envelope around it is not.
+
+### Relation to run-groups
+
+Chains and run-groups (§20) share the same foundational shape — laptop
+as sequencer, `run.json` tagging, ID-dispatched verbs — but address
+complementary problems:
+
+| | Chains | Run-groups |
+|---|---|---|
+| **Repos** | One repo | N different repos |
+| **Sequencing** | Sequential waves (A → B → C) | Parallel launch (no ordering between members) |
+| **Integration** | Synth-merge between waves; one staging branch per wave transition | No merge across repos (impossible); N independent branches and PRs |
+| **State dirs** | One `$LEERIE_STATE_HOST_DIR` for all wave jobs | One per-repo `$HOME/.leerie/<basename>/` per member |
+| **Verb scope** | Scan one state dir for `chain_id` | Scan N member state dirs for `group_id` |
+| **Deploy notes** | Not applicable within one repo | Cross-repo `external_preconditions` rendered as deploy-ordering notes |
+
+A "multi-repo chain" — waves that span different repos — is out of scope.
+The two subsystems do not compose: a chain operates on one repository across
+time (waves); a group operates on N repositories in parallel. Mixing them
+would require cross-repo synth-merge, which git does not support.
+
+Both subsystems keep the laptop as the sequencer and use no coordinator
+machine. The ID-dispatch pattern — passing a UUID to each member invocation
+and discovering members by scanning `run.json` files — is identical in shape,
+but the implementation must scan across separate state directories for groups
+rather than within a single state directory as chains do.
+
+---
+
+## 20. Run groups (multi-repo)
+
+A single leerie run is scoped to one repository. Many real features touch
+*multiple* repositories — an API repo and a frontend repo must change
+together for one logical capability. Leerie's answer is the **run-group**: N
+ordinary single-repo leerie runs launched together as a coordinated unit,
+sharing a `group_id` and a brief that makes each member aware of its siblings.
+
+### The core design: N isolated runs, coordinated at launch and reporting
+
+A run-group does not change what a run *is*. Each member is an unchanged,
+fully isolated leerie run:
+
+- **Its own repository** — one writeable repo, one basename-keyed state
+  directory (`$HOME/.leerie/<basename>/`), one `fcntl.flock` (§6), one
+  `state.json`, one flat resume record. Nothing shared at the storage layer.
+- **Its own branch** — one `leerie/runs/<run-id>` branch on that repo's
+  `origin`. The run-branch invariant (§6, "a run branch, once created, is
+  never reset") is untouched.
+- **Its own PR** — one GitHub pull request, opened by that member's
+  `host_finalize` against its repo's main branch.
+- **Its own resume** — `./leerie --resume <run-id>` inside the member's repo
+  works exactly as it does for any standalone run.
+
+The group layer adds four thin capabilities on top:
+
+1. **Shared brief.** The group brief — joint intent plus each member's
+   external contract — is authored once and prepended to every member's
+   prompt. Repo B's planner reads what repo A is building *before* it writes
+   its own plan. This is advisory steering; the write-confinement guarantee
+   (§12) stays code, not prose.
+
+2. **Read-only cross-repo visibility.** Each member is launched with its
+   siblings seeded as read-only inspect-dirs (`--inspect-dir <sibling-repo>`).
+   Workers may `Read`/`Grep`/`Glob` under `/inspect/<name>`; they may not
+   write there. The enforcement mechanism is the existing
+   `filter_offtree_subtasks` guard (§12), unchanged.
+
+3. **Deploy-ordering notes.** When a member's planner declares a cross-repo
+   prerequisite as `requires.extent: external` (§5) naming a sibling repo,
+   those `external_preconditions` are collected and rendered by finalize as a
+   "merge / deploy sibling first" section in that member's PR body. The two
+   PRs cannot merge atomically on GitHub — the inconsistency window between a
+   backend endpoint landing and a frontend using it is a deploy-ordering fact
+   the user already manages (e.g., with feature flags). Leerie surfaces the
+   ordering; it cannot enforce it.
+
+4. **Group-scoped verbs.** `--status`, `--resume`, `--kill`, `--finalize`,
+   and `--list --groups` on a `group_id` discover members by scanning for
+   `group_id`-tagged `run.json` files across the members' *separate* state
+   directories. Each verb dispatches to the existing per-run implementation
+   for each discovered member. The scanning must iterate over the set of
+   member state directories (one per member basename); unlike chain-scoped
+   verbs (§19) it cannot assume a single state directory.
+
+### Why the lean shape
+
+An alternative design would fold N repositories into one run: N run-branches
+in one state, a per-repo namespace inside `state.json`, a shared dependency
+graph that crosses repo boundaries. That design was rejected because it
+rewrites leerie's single most load-bearing invariant — the run-branch as the
+resume contract (§6). The resume guarantees, the per-run flock, and the flat
+state layout are all predicated on one run = one repo. Touching any of them
+risks cascading breakage across the entire orchestrator for a capability (
+cross-repo atomicity) that GitHub does not support anyway.
+
+The lean shape reaches the same user value — a coordinated, contract-accurate
+feature across two repos — because the value comes from the **shared plan**,
+not from atomic joint execution. Two PRs across two repos cannot merge
+atomically on GitHub regardless of design. Keeping each member as an ordinary
+run means resume, state, isolation, and finalize mechanics are untouched.
+
+### State isolation is free
+
+Per-repo state isolation is a consequence of the existing basename-keyed state
+directory design (§6 *Single owner per run dir*): a member that `cd`s into
+`../frontend` resolves `$HOME/.leerie/frontend/` independently of any sibling.
+The `.owner` sidecar guarantees that two concurrent members with distinct
+basenames never collide. The only guard the group launcher must add is a
+rejection of any `--state-dir` / `LEERIE_STATE_DIR` override that would pin
+all members to one shared directory — the same mechanism that works correctly
+for chains (one repo, shared dir is correct) would produce a `.owner`
+collision for a group (N repos, N dirs required).
+
+### Cross-repo visibility is enforced, not advisory
+
+The `--inspect-dir` mechanism mounts a sibling repo read-only into the
+worker's filesystem (`/inspect/<name>`). Locally, this is a kernel-enforced
+`:ro` bind mount. On the Fly runtime, it is convention-enforced (the sibling
+is seeded without the leerie user's write credentials). In both cases,
+`filter_offtree_subtasks` (§12) soft-drops any subtask whose files fall
+outside the member's repository root. This is the same enforcement that
+prevents a single-run worker from writing outside its worktree; the group
+adds no new mechanism, it just applies the existing one to a new directory.
+
+### The laptop is the sequencer; no coordinator machine
+
+The group launcher runs on the laptop (the same node that runs chain fan-out,
+per §19). It mints a `group_id`, fans out one leerie invocation per member
+(each `cd`'d into the member's repo), and waits. After all members complete,
+it tags each member's `run.json` with the shared `group_id` — discovering
+each member's run directory from its basename-keyed state dir using the same
+newest-`finished_at` scan the local finalize already uses. No coordinator
+machine, no in-container group state, no cross-machine protocol. GitHub is
+touched only host-side, per member, by each member's existing `host_finalize`.
+
+### Single-repo is the N=1 degenerate case
+
+A run-group with one member is indistinguishable from a standalone run. The
+`group_id` is written into `run.json` and the group-scoped verbs work, but
+the cross-repo visibility and deploy-ordering machinery have nothing to
+operate on. This means the group verb surface can be tested against a single
+member before any multi-repo integration work.
+
+### What run-groups deliberately do not provide
+
+- **Cross-repo DAG edges.** A planner in repo B cannot declare a hard
+  dependency on a subtask in repo A's plan. Cross-repo prerequisites are
+  always `extent: external` deploy notes (§5), never in-graph edges. The
+  deep design that would support hard cross-repo edges was rejected (see *Why
+  the lean shape* above).
+- **Cross-repo synth-merge.** Each member merges only within its own
+  repository. Git does not support merging across repositories.
+- **Atomic multi-repo landing.** N PRs merge independently; there is no
+  two-phase commit across GitHub repositories.
+- **A coordinator machine.** The laptop is the sequencer, per §19's
+  established pattern.
+- **Multi-repo chains.** Composing chains (sequential same-repo waves) with
+  groups (parallel different-repo runs) is out of scope. The two subsystems
+  are complementary, not composable.
