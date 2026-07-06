@@ -3366,6 +3366,7 @@ is deliberate and is justified in the section named.
 | Gather information from the codebase | §11 | Codebase first, research second, user only for genuine intent. |
 | Compact context at 70% | §10 | Replaced by orchestrator-driven handoff — no channel exists to trigger self-compaction. A lower auto-compaction threshold is an optional backstop only. |
 | (implicit) bounded cost | §13 | A hard cap on total workers; the original bounded every inner loop but not total fan-out. |
+| (extension) multi-repo coordination | §20 | Not in the original specification. Run-groups extend leerie to N isolated single-repo runs sharing a `group_id`, with read-only cross-repo visibility and deploy-ordering notes. The original spec was scoped to one repository; run-groups are a deliberate extension beyond that scope, not a mapping to any original requirement. |
 
 ---
 
