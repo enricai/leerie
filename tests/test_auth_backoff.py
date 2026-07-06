@@ -14,18 +14,17 @@ import pytest
 # --- positives: should classify as auth/quota -----------------------------
 
 @pytest.mark.parametrize("envelope", [
+    # `api_error_status` on the claude -p envelope is always a JSON number
+    # (SDK type `number | null`) — so only the numeric forms are exercised.
     {"is_error": True, "api_error_status": 401,
      "result": "Failed to authenticate."},
-    {"is_error": True, "api_error_status": "401", "result": ""},
     {"is_error": True, "api_error_status": 429,
      "result": "Too Many Requests"},
-    {"is_error": True, "api_error_status": "429", "result": ""},
     # 529 — transient gateway overload; classified alongside 401/429 so
     # it gets the same backoff (a fresh request would just re-hit the
     # overloaded gateway). The exhaustion WorkerError distinguishes it.
     {"is_error": True, "api_error_status": 529,
      "result": "Overloaded"},
-    {"is_error": True, "api_error_status": "529", "result": ""},
     {"is_error": True, "api_error_status": None,
      "result": "API Error: 401 Invalid authentication credentials"},
     {"is_error": True, "api_error_status": None,
@@ -49,7 +48,6 @@ def test_auth_or_quota_envelopes_match(leerie, envelope):
     # generic error that isn't auth/quota
     {"is_error": True, "api_error_status": 500,
      "result": "Internal server error"},
-    {"is_error": True, "api_error_status": "500", "result": ""},
     # missing fields entirely
     {},
     # message mentions "auth" but not the specific markers we key on

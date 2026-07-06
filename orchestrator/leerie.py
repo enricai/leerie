@@ -5538,7 +5538,10 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
     if not envelope.get("is_error"):
         return False
     status = envelope.get("api_error_status")
-    if status in (401, 429, 529, "401", "429", "529"):
+    # `api_error_status` on the claude -p result envelope is always a JSON
+    # number or null (SDK type `api_error_status?: number | null`), so the
+    # numeric set is exhaustive — no string forms ever reach here.
+    if status in (401, 429, 529):
         return True
     msg = str(envelope.get("result") or "").lower()
     return ("invalid authentication" in msg
@@ -6752,7 +6755,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 # A 529 is transient gateway overload, not a subscription
                 # cap — don't misattribute it. 401/429 (and the text-marker
                 # path) stay on the rolling-usage-cap message.
-                if str(envelope.get("api_error_status")) == "529":
+                if envelope.get("api_error_status") == 529:
                     raise WorkerError(
                         "Claude API returned an overloaded (529) error "
                         f"after ~{auth_retry_max_sec}s of retries — the "
