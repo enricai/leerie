@@ -2368,7 +2368,7 @@ state dir), so the discovery is:
 After discovering each member's `run.json`, the launcher calls
 `update_run_json … group_id "$_group_id"` (the same
 runtime-agnostic atomic merge used by the chain wave loop,
-`scripts/remote/lib.sh:42`).
+`scripts/remote/lib.sh:70`).
 
 No new per-child pointer file is required: the durable
 `run.json`-on-disk is the coordination artifact, consistent with how
@@ -2431,7 +2431,7 @@ into the finalize path at two points:
 
 **Key design note:** `reason` in `external_preconditions` is
 unstructured free text (`required` is only `[tag, extent]`,
-`orchestrator/leerie.py:691`). The group launcher, not the planner,
+`orchestrator/leerie.py:731`). The group launcher, not the planner,
 knows which sibling repos are group members — so the deploy note
 identifies sibling members by injected group membership, not by
 parsing planner free-text.
