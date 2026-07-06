@@ -165,8 +165,8 @@ DEFAULT_CAPS = {
     # is in the thousands.
     "worker_pids_max": 256,
     # Auth/quota backoff budget. When `claude -p` returns an envelope
-    # whose `api_error_status` is 401/429 or whose result message names
-    # an auth/rate-limit failure, `claude_p()` retries with tenacity's
+    # whose `api_error_status` is 401/429/529 or whose result message
+    # names an auth/rate-limit failure, `claude_p()` retries with tenacity's
     # `wait_exponential_jitter(initial=15, max=120, jitter=5)` until
     # this many cumulative seconds have elapsed, then bails with a
     # WorkerError that names the Claude Code subscription cap. 300 s
@@ -5516,15 +5516,16 @@ class WorkerError(RuntimeError):
 
 
 def _is_auth_or_quota_failure(envelope: dict) -> bool:
-    """True if the `claude -p` envelope looks like a 401/429/auth-message
-    rejection from the Anthropic gateway.
+    """True if the `claude -p` envelope looks like a 401/429/529/
+    auth-message rejection from the Anthropic gateway.
 
     These need backoff, not the immediate corrective retry that the
     schema-error path uses — the request was rejected before reaching
     a model and a fresh request will be rejected too until the user's
-    Claude Code subscription window clears. The auth/quota retry loop
-    in claude_p() consults this classifier; non-matching envelopes
-    fall through to the existing 2-attempt schema loop unchanged.
+    Claude Code subscription window clears (401/429) or the gateway's
+    transient overload (529) subsides. The auth/quota retry loop in
+    claude_p() consults this classifier; non-matching envelopes fall
+    through to the existing 2-attempt schema loop unchanged.
 
     Gated on `is_error`: a successful, schema-valid envelope must never
     match, no matter what its `result` text says. Without this gate, a
@@ -5537,7 +5538,7 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
     if not envelope.get("is_error"):
         return False
     status = envelope.get("api_error_status")
-    if status in (401, 429, "401", "429"):
+    if status in (401, 429, 529, "401", "429", "529"):
         return True
     msg = str(envelope.get("result") or "").lower()
     return ("invalid authentication" in msg
@@ -6747,6 +6748,15 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 envelope = e.last_attempt.result()
 
             if _is_auth_or_quota_failure(envelope):
+                # A 529 is transient gateway overload, not a subscription
+                # cap — don't misattribute it. 401/429 (and the text-marker
+                # path) stay on the rolling-usage-cap message.
+                if str(envelope.get("api_error_status")) == "529":
+                    raise WorkerError(
+                        "Claude API returned an overloaded (529) error "
+                        f"after ~{auth_retry_max_sec}s of retries — the "
+                        "Anthropic gateway is under transient load. Run "
+                        "--resume to retry.")
                 raise WorkerError(
                     "Claude API returned auth/quota error after "
                     f"~{auth_retry_max_sec}s of retries — your Claude "

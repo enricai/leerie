@@ -2309,11 +2309,16 @@ quoted into the prompt; a second failure raises `WorkerError`.
 #### Auth/quota backoff
 
 A separate retry path handles transient `claude -p` envelope errors that
-indicate the Claude Code subscription is rate-limited (HTTP 401, HTTP 429,
-or result text containing `Invalid authentication` / `rate limit` /
-`rate-limit`). These need *backoff*, not the immediate corrective retry
-above — the gateway has already rejected the request and a fresh request
-will be rejected too until the user's rolling usage window clears.
+indicate the Claude Code subscription is rate-limited (HTTP 401, HTTP 429),
+the gateway is transiently overloaded (HTTP 529), or the result text
+contains `Invalid authentication` / `rate limit` / `rate-limit`. These
+need *backoff*, not the immediate corrective retry above — the gateway
+has already rejected the request and a fresh request will be rejected too
+until the user's rolling usage window clears (401/429) or the overload
+(529) subsides. On budget exhaustion the raised `WorkerError` names the
+subscription cap for 401/429/auth-text and the transient overload for
+529, so the user isn't told to wait for a usage window that isn't the
+actual cause.
 
 `_is_auth_or_quota_failure` only ever consults `api_error_status` or the
 result text when the envelope's own `is_error` is truthy. A successful,

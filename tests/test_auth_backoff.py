@@ -20,6 +20,12 @@ import pytest
     {"is_error": True, "api_error_status": 429,
      "result": "Too Many Requests"},
     {"is_error": True, "api_error_status": "429", "result": ""},
+    # 529 — transient gateway overload; classified alongside 401/429 so
+    # it gets the same backoff (a fresh request would just re-hit the
+    # overloaded gateway). The exhaustion WorkerError distinguishes it.
+    {"is_error": True, "api_error_status": 529,
+     "result": "Overloaded"},
+    {"is_error": True, "api_error_status": "529", "result": ""},
     {"is_error": True, "api_error_status": None,
      "result": "API Error: 401 Invalid authentication credentials"},
     {"is_error": True, "api_error_status": None,
@@ -62,6 +68,14 @@ def test_auth_or_quota_envelopes_match(leerie, envelope):
      "structured_output": {"status": "ready"}},
     {"is_error": False, "api_error_status": None,
      "result": "Invalid authentication is tested by this endpoint's 401 case.",
+     "structured_output": {"status": "ready"}},
+    # regression: the `is_error` key is *absent* entirely (not just
+    # False) on a schema-valid envelope whose text trips a marker.
+    # `envelope.get("is_error")` returns None → falsy → short-circuit.
+    # This is the real-world shape of a successful worker envelope,
+    # which carries no `is_error` field at all.
+    {"api_error_status": None,
+     "result": "rate limit middleware returns 429 on the 11th request",
      "structured_output": {"status": "ready"}},
 ])
 def test_non_auth_envelopes_do_not_match(leerie, envelope):
