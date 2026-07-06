@@ -2281,6 +2281,180 @@ touches happen on the laptop using its existing `gh auth` and
 
 Maps to `DESIGN.md`: §19 *Chain orchestration*.
 
+### Run-group verbs
+
+Run-group orchestration launches N ordinary single-repo leerie runs
+together as a coordinated unit, sharing a `group_id` (DESIGN.md §20).
+Each member is an unchanged, fully isolated run with its own
+basename-keyed state directory, its own run branch, its own PR, and
+its own resume record. The group layer adds a shared brief,
+read-only cross-repo visibility via `--inspect-dir`, deploy-ordering
+notes, and group-scoped verbs — nothing else.
+
+**Contrast with chains (§19):** chain-scoped verbs scan ONE state
+directory for `chain_id`; group-scoped verbs must scan ACROSS the set
+of member state directories (one per member repo basename). The two
+subsystems are complementary in design spirit but do not share
+discovery machinery — `_chain_runs_filter` (`leerie:191`) assumes a
+single `$LEERIE_STATE_HOST_DIR` and cannot be reused directly.
+
+#### `group_id` in `run.json`
+
+`group_id` is an optional string field in `run.json`, written by the
+`--group` launcher arm after all members complete (alongside `chain_id`,
+which is optional for the same reason). `_validate_run_json`
+(`orchestrator/leerie.py:1973`) does not add any invariant check on
+`group_id` — it is informational and orthogonal to the push/pause/kill
+state machine. The field is accepted by the validator without error
+because validators only check fields they know about (unknown keys pass
+through).
+
+#### Launcher `--group` verb
+
+```
+leerie --group \
+  --repo <path> "<prompt>" \
+  --repo <path> "<prompt>" \
+  [--brief <file>] \
+  [<per-member-flags>]
+```
+
+Modeled on the `--chain` arm (`leerie:2033`). The `--group` arm:
+
+1. Parses repeated `--repo <path> "<prompt>"` pairs and an optional
+   `--brief <file>`.
+2. Fails fast if any repo path is not a git repository (mirrors
+   the chain prompt-file check at `leerie:2136`).
+3. Mints a `_group_id` (UUID, same mechanism as `--chain`'s `_ch_id`).
+4. **State-dir guard (mandatory).** Rejects or per-member-namespaces
+   any `--state-dir` / `LEERIE_STATE_DIR` override in the calling
+   environment. These override `_state_dir_default` (`:431`) and would
+   pin every member to one shared state directory, causing a `.owner`
+   collision on member 2. Chains (one repo) forward these safely;
+   groups (N repos) must not. The guard must fire before any member
+   is backgrounded.
+5. Per member: builds the prompt as `<brief>\n\n<member prompt>`,
+   appends `--inspect-dir <sibling-repo>` for every other member
+   (reusing the inspect-dir translation at `leerie:3337`+), and
+   backgrounds:
+   ```bash
+   ( cd <repo> && "${LEERIE_SELF_CMD:-$0}" "<prompt>" <flags> \
+       --group-id "$_group_id" ) &
+   ```
+   (mirrors `leerie:2237-2246` for chains). Each `cd` makes the member
+   resolve its own `USER_REPO` and basename-keyed state directory
+   independently.
+6. Waits for all members (`wait`), then runs group tag-back (below).
+
+Per-member flags are forwarded like `_ch_passthrough` for chains.
+`${LEERIE_SELF_CMD:-$0}` is the same test seam used by chain verbs —
+tests substitute a stub binary via `LEERIE_SELF_CMD`.
+
+#### Group tag-back across state directories (both runtimes)
+
+After `wait`, the launcher writes `group_id` into each member's
+`run.json`. Because each member runs in its own `$HOME/.leerie/<basename>/`
+state directory, the launcher must discover each member's run directory
+from its per-member state dir, not from `$LEERIE_STATE_HOST_DIR`.
+
+The launcher knows each child's PID (`$!`) and repo path (→ basename →
+state dir), so the discovery is:
+
+| Runtime | Discovery mechanism |
+|---------|---------------------|
+| **Local** | After `wait` on a member, scan `~/.leerie/<member-basename>/runs/*/run.json` for the newest file with `finished_at` set. This is the same discovery the local finalize already uses (`leerie:4967-4992`). No cidfile read, no `--rm` race — the `run.json` is durably on disk by the time `wait` returns. |
+| **Fly** | The existing `remote/<child-pid>.json` / `fly-machine.json` pointer path (`leerie:2263-2289`), applied per-member using the member's own state dir. The child's PID is `$!`; the member's state dir is resolved from its basename. |
+
+After discovering each member's `run.json`, the launcher calls
+`update_run_json … group_id "$_group_id"` (the same
+runtime-agnostic atomic merge used by the chain wave loop,
+`scripts/remote/lib.sh:42`).
+
+No new per-child pointer file is required: the durable
+`run.json`-on-disk is the coordination artifact, consistent with how
+chains discover their members.
+
+#### Group-scoped verbs
+
+| Verb | Behavior |
+|------|----------|
+| `leerie --group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher. Mints a fresh `group_id` unless `--group-id <prior-uuid>` is supplied. Fans out one backgrounded member invocation per `--repo`, waits, then runs group tag-back. |
+| `leerie --status <group-id>` | Iterates member state dirs (derived from the group's member repos or a group-manifest the launcher drops), filters `run.json` by `group_id`, renders one row per matched run (run_id, status, branch, notes). Same field-derived status as chain `--status`. |
+| `leerie --resume <group-id>` | Discovers paused members across all member state dirs; invokes `leerie --resume <run-id>` per discovered paused run. |
+| `leerie --kill <group-id>` | Discovers non-destroyed members across all member state dirs; invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
+| `leerie --finalize <group-id>` | Discovers members not yet pushed across all member state dirs; invokes `leerie --finalize <run-id>` per discovered run. |
+| `leerie --list --groups` | Iterates across all leerie state dirs under `$HOME/.leerie/`, groups `run.json` files by `group_id`, renders one row per group (group_id, status, member count). |
+
+These verbs are dispatched by UUID detection (same `8-4-4-4-12` hyphen
+pattern as chain verbs). A UUID that matches a `group_id` across member
+state dirs is a group-scoped dispatch.
+
+#### `_group_runs_filter`
+
+The group-scoped verb implementations build on `_group_runs_filter`,
+a private launcher helper that scans a **set** of state directories
+(one per member repo basename) for `run.json` files tagged with a
+given `group_id`. Signature:
+
+```
+_group_runs_filter <group_id> <verb> <state_dir_1> [<state_dir_2> ...]
+```
+
+Emits matching run-ids one per line, filtered by the same per-verb
+logic as `_chain_runs_filter` (`stop` / `kill` / `finalize` / `resume`
+/ `running`). The key difference: `_chain_runs_filter` iterates
+`$LEERIE_STATE_HOST_DIR/runs/*/run.json` (one directory); `_group_runs_filter`
+iterates `<state_dir_N>/runs/*/run.json` for each supplied directory.
+
+#### Deploy-ordering notes
+
+When a member's planner declares a cross-repo prerequisite as
+`requires.extent: external` (DESIGN.md §5), those entries accumulate
+in `State.data["external_preconditions"]` (written at plan time,
+`orchestrator/leerie.py:9684`). The entry shape is:
+`{tag, reasons:[{sid, reason}], originating_subtasks}`.
+
+The deploy-note plumbing threads `external_preconditions` from State
+into the finalize path at two points:
+
+1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14642`):
+   `external_preconditions` is added as a field in the JSON payload
+   passed to the `pr_writer` worker, alongside `task`, `commit_log`,
+   etc. The pr_writer prompt instructs the worker to render a
+   "⚠ Deploy-ordering" section when the field is non-empty.
+
+2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2098`):
+   The deterministic fallback PR body is extended to render a
+   "⚠ Deploy-ordering" section from `external_preconditions` when
+   present in state. This ensures the deploy note appears even when
+   the `pr_writer` LLM worker fails or is skipped.
+
+**Key design note:** `reason` in `external_preconditions` is
+unstructured free text (`required` is only `[tag, extent]`,
+`orchestrator/leerie.py:691`). The group launcher, not the planner,
+knows which sibling repos are group members — so the deploy note
+identifies sibling members by injected group membership, not by
+parsing planner free-text.
+
+#### No new schema, state, or cap changes
+
+This is the point of the lean shape (DESIGN.md §20 *Why the lean
+shape*). The following are explicitly unchanged:
+
+- `STATE_FIELDS` / `state.json` schema — `group_id` lives in
+  `run.json` (the per-run sidecar), not in `state.json`.
+- Subtask schema and planner schema — group members are ordinary runs.
+- `DEFAULT_CAPS` — no new per-member cap; each member consumes from
+  its own run's cap budget.
+- `filter_offtree_subtasks` (DESIGN.md §12) — the existing guard
+  enforces write-confinement for siblings seeded as inspect-dirs,
+  unchanged.
+- Branch helpers (`new-worktree.sh`, `setup-run.sh`, `integrate.sh`,
+  `finalize.sh`, `host-finalize.sh`) — each member's finalize runs
+  its own existing `host_finalize` against its own repo.
+
+Maps to `DESIGN.md`: §20 *Run groups (multi-repo)*.
+
 ---
 
 ## 3. Worker invocation contract
