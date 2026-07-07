@@ -171,3 +171,75 @@ def test_compose_pr_body_no_literal_none(leerie):
     for state in states:
         body = leerie.compose_pr_body(state, "feat-foo-abc123")
         assert "None" not in body, f"literal 'None' leaked for state={state}"
+
+
+# --- deploy-ordering notes (DESIGN §20 run groups) -------------------------
+
+def test_compose_pr_body_no_deploy_section_when_absent(leerie):
+    """No external_preconditions → no deploy-ordering section rendered."""
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
+    assert "Deploy-ordering" not in body
+    assert "⚠" not in body
+
+
+def test_compose_pr_body_deploy_section_when_preconditions_present(leerie):
+    """external_preconditions present → deploy-ordering section rendered."""
+    state = _full_state()
+    state["external_preconditions"] = [
+        {
+            "tag": "storage-volumes-api",
+            "reasons": [
+                {"sid": "feat-001", "reason": "adds /volumes endpoint consumed here"}
+            ],
+            "originating_subtasks": ["feat-001"],
+        }
+    ]
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "⚠ Deploy-ordering" in body
+    assert "storage-volumes-api" in body
+    assert "adds /volumes endpoint consumed here" in body
+
+
+def test_compose_pr_body_deploy_section_empty_list_no_section(leerie):
+    """Empty external_preconditions list → no deploy-ordering section."""
+    state = _full_state()
+    state["external_preconditions"] = []
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "Deploy-ordering" not in body
+
+
+def test_compose_pr_body_deploy_section_multiple_entries(leerie):
+    """Multiple preconditions each render as a separate bullet."""
+    state = _full_state()
+    state["external_preconditions"] = [
+        {
+            "tag": "auth-service",
+            "reasons": [{"sid": "feat-001", "reason": "auth token API required"}],
+            "originating_subtasks": ["feat-001"],
+        },
+        {
+            "tag": "billing-api",
+            "reasons": [{"sid": "feat-002", "reason": "billing plan check needed"}],
+            "originating_subtasks": ["feat-002"],
+        },
+    ]
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "auth-service" in body
+    assert "auth token API required" in body
+    assert "billing-api" in body
+    assert "billing plan check needed" in body
+
+
+def test_compose_pr_body_deploy_section_no_reasons(leerie):
+    """A precondition with no reason text still renders the tag."""
+    state = _full_state()
+    state["external_preconditions"] = [
+        {
+            "tag": "some-external-dep",
+            "reasons": [],
+            "originating_subtasks": [],
+        }
+    ]
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "some-external-dep" in body
+    assert "None" not in body

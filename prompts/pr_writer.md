@@ -44,7 +44,15 @@ The orchestrator gives you, in your prompt, a JSON payload:
     "residuals": [{"rule": "...", "why_not_fixed": "..."}],
     "failed_axes": [{"axis": "build|lint|tests", "command": "...", "summary": "..."}],
     "warnings": ["...", "..."]
-  } | absent
+  } | absent,
+  "external_preconditions": [
+    {
+      "tag": "<capability tag, e.g. 'storage-volumes-api'>",
+      "reasons": [{"sid": "<subtask-id>", "reason": "<free-text reason>"}],
+      "originating_subtasks": ["<sid>", ...]
+    },
+    ...
+  ] | absent
 }
 ```
 
@@ -84,6 +92,18 @@ entry, in the order *failed axes → residuals → warnings*. Quote the
 `summary` / `why_not_fixed` text verbatim — these are warnings for
 the human reviewer, not your interpretation. Do not invent fixes,
 do not downplay failures, do not omit entries.
+
+`external_preconditions` lists cross-repo prerequisites that the
+planner declared as `requires.extent: external` (out-of-graph
+dependencies). The field is **absent** when no such prerequisites
+were declared (the common case). When present, render a
+`## ⚠ Deploy-ordering` section in the PR body (or fold it into an
+equivalent section the template defines). For each entry: one bullet
+naming the `tag` (the capability tag) and the `reason` text from
+each `reasons` entry. The intent is: a reviewer reading the PR knows
+to merge and deploy the named dependency before merging this PR. Do
+not parse or interpret the reason text — quote it as-is. Do not
+invent ordering constraints beyond what the data says.
 
 ## Output
 
