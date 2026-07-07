@@ -120,10 +120,10 @@ def test_non_object_existing_is_recovered(leerie, tmp_path):
 def test_group_id_written_and_preserved(leerie, tmp_path):
     """group_id is written by _write_run_json and survives a subsequent merge.
 
-    Stage 3b of the run-group design: the orchestrator writes group_id into
-    run.json at run-start; later incremental writes (push, PR) must not
-    clobber it.  This is the durable round-trip claim distinct from the
-    pure-validation tests in test_run_json_invariants.py."""
+    The orchestrator writes group_id into run.json at run-start
+    (DESIGN §20); later incremental writes (push, PR) must not clobber it.
+    This is the durable round-trip claim distinct from the pure-validation
+    tests in test_run_json_invariants.py."""
     leerie._write_run_json(
         tmp_path,
         run_id="feat-foo-abc123",
