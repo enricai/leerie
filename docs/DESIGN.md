@@ -3646,13 +3646,14 @@ The group layer adds four thin capabilities on top:
    the user already manages (e.g., with feature flags). Leerie surfaces the
    ordering; it cannot enforce it.
 
-4. **Group-scoped verbs.** `--status`, `--resume`, `--kill`, `--finalize`,
-   and `--list --groups` on a `group_id` discover members by scanning for
-   `group_id`-tagged `run.json` files across the members' *separate* state
-   directories. Each verb dispatches to the existing per-run implementation
-   for each discovered member. The scanning must iterate over the set of
-   member state directories (one per member basename); unlike chain-scoped
-   verbs (§19) it cannot assume a single state directory.
+4. **Group-scoped verbs.** `--status`, `--stop`, `--resume`, `--kill`,
+   `--finalize`, and `--list --groups` on a `group_id` discover members by
+   scanning for `group_id`-tagged `run.json` files across the members'
+   *separate* state directories. Each verb dispatches to the existing per-run
+   implementation for each discovered member. The scanning must iterate over
+   the set of member state directories (one per member basename); unlike
+   chain-scoped verbs (§19) it cannot assume a single state directory.
+   (`--stop` is Fly-runtime-only; it pauses running machines.)
 
 ### Why the lean shape
 

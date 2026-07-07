@@ -2385,6 +2385,7 @@ chains discover their members.
 |------|----------|
 | `leerie --group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher. Mints a fresh `group_id` unless `--group-id <prior-uuid>` is supplied. Fans out one backgrounded member invocation per `--repo`, waits, then runs group tag-back. |
 | `leerie --status <group-id>` | Iterates member state dirs (derived from the group's member repos or a group-manifest the launcher drops), filters `run.json` by `group_id`, renders one row per matched run (run_id, status, branch, notes). Same field-derived status as chain `--status`. |
+| `leerie --stop <group-id>` | Discovers running Fly members across all member state dirs; invokes `leerie --stop <run-id>` per discovered run. Fly-runtime only (pauses machines). |
 | `leerie --resume <group-id>` | Discovers paused members across all member state dirs; invokes `leerie --resume <run-id>` per discovered paused run. |
 | `leerie --kill <group-id>` | Discovers non-destroyed members across all member state dirs; invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
 | `leerie --finalize <group-id>` | Discovers members not yet pushed across all member state dirs; invokes `leerie --finalize <run-id>` per discovered run. |

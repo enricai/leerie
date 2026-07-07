@@ -278,6 +278,7 @@ leerie --group --group-id <prior-group-id> \
 
 # Group-scoped verbs (UUID → group scope across member state dirs):
 leerie --status   <group-id>   # render per-member run states
+leerie --stop     <group-id>   # pause every running member (Fly runtime only)
 leerie --resume   <group-id>   # resume every paused member run
 leerie --kill     <group-id>   # destroy every member run
 leerie --finalize <group-id>   # push + open PR for every unpushed member

@@ -399,6 +399,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 # Group-scoped verbs: UUID → group scope (scans each member's state dir).
 ./leerie --status   <group-id>        # render per-member run states
+./leerie --stop     <group-id>        # pause every running member (Fly runtime only)
 ./leerie --resume   <group-id>        # resume every paused member run
 ./leerie --kill     <group-id>        # destroy every member run
 ./leerie --finalize <group-id>        # push + open PR for every unpushed member
