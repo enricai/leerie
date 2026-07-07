@@ -466,7 +466,13 @@ Python-layer `group_id` in `run.json` (`_validate_run_json`,
 `_write_run_json`, `_derive_run_status`) is in
 `tests/test_group_run_json.py`. State-dir isolation (distinct
 basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
-`--state-dir`) is in `tests/test_group_state_dir_guard.py`. No coverage
+`--state-dir`) is in `tests/test_group_state_dir_guard.py`. The
+capture engine (DESIGN §6½) — `_parse_apt_intents`, `_merge_setup_packages`,
+`_capture_installs_from_logs`, and `capture_repo_deps` — is tested in
+`tests/test_capture_deps.py` against a synthetic JSONL fixture in the
+`_iter_log_tool_use` shape, covering parser cases, merger union/no-op/
+never-clobber, scanner dedup, write, warm-repo no-op, committed-Dockerfile
+skip, write-failure non-fatal, and opt-out. No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
