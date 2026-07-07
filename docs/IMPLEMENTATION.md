@@ -2738,8 +2738,9 @@ that override the corresponding axis from inference. Missing keys fall
 through to `_infer_build_lint_test()`. An empty-string value means "not
 applicable" — same convention as inference — and is preserved rather than
 replaced by inference. The file also accepts a `setup_packages` key
-(comma-separated apt package names) stored for future Dockerfile generation
-but not consumed by BLT resolution.
+(comma-separated apt package names) that triggers per-repo Dockerfile
+auto-generation (see §6½ *Auto-capture of repo dependencies*); it is
+not consumed by BLT resolution.
 
 Resolution is implemented by two functions:
 
