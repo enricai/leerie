@@ -426,7 +426,11 @@ bare, `--chat`) is tested in `tests/test_config_verb.py` via a
 self-contained bash harness with stubbed `nerdctl` and `claude`, plus
 a parity guard that extracts the real launcher `config)` case arm and
 diffs its BLT inference against `_infer_build_lint_test()` across a
-fixture matrix so the two can never silently diverge. No coverage
+fixture matrix so the two can never silently diverge. The `--group`
+launcher arm and group-scoped ID-dispatched verbs are tested in
+`tests/test_group_launcher.py` via the same bash-harness pattern
+(stubbed `./leerie`, multi-state-dir fixtures), modeled on
+`tests/test_chain_launcher_id_dispatch.py`. No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
