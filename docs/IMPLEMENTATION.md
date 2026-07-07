@@ -3765,6 +3765,81 @@ this needs no new parameter or call-site change. The `prompts/implementer.md`
 §3 evidence gate and §4 Implement step name this block so the worker
 reconciles the pattern it followed against the discovered conventions.
 
+### Auto-capture of repo dependencies
+
+Implements DESIGN §6½ *Auto-capture of repo dependencies*. All Python
+surface lives in `orchestrator/leerie.py`.
+
+#### Capture functions
+
+| Function | Signature | Role |
+|----------|-----------|------|
+| `_parse_apt_intents` | `(command: str) -> list[str]` | Split a shell command on `&&`, `;`, `\|`; find `apt[-get] install` segments; take tokens after `install`; drop flags (`-y`, `--no-install-recommends`, etc.) and non-package tokens (`sudo`, `apt`, `apt-get`, `install`); keep tokens matching `^[a-z0-9][a-z0-9+._-]*$`; split `pkg=ver` → keep name; dedup, stable order. Uses a narrow `_APT_INSTALL_RE` pattern; `_INSTALL_CMD_HINT_RE` is the coarse pre-filter. |
+| `_capture_installs_from_logs` | `(log_dir: Path) -> tuple[list[str], list[str]]` | Iterates `sorted(log_dir.glob("*.log"))`; calls `_iter_log_tool_use` on each (existing parser at `:13362`); for `kind == "Bash"` feeds `input["command"]` to `_parse_apt_intents` and a language-install matcher (`pnpm`/`pip`/`npm`/`yarn`/`cargo`/`bundle`); returns `(apt_packages, install_commands)` — both deduped, stable order. |
+| `_merge_setup_packages` | `(existing: str, captured: list[str]) -> str \| None` | Parses `existing` (space- or comma-separated, per DESIGN §6½); takes the union with `captured`; returns the merged string only if it grew (else `None` → no write). Preserves user-narrowed lists: only genuinely-new packages are appended; nothing is removed. |
+| `_write_config_toml_keys` | `(cfg_path: Path, updates: dict[str, str]) -> None` | Minimal deterministic TOML upsert. Creates the file with a leerie header (matching `config --init` heredoc tone, `leerie:741-758`) if absent; otherwise replaces the first *uncommented* `key =` line for each key, or appends if absent. Never touches commented lines. Writes via temp-file + `os.replace()` (State.save atomicity discipline). |
+| `capture_repo_deps` | `(repo_root: Path, st: State) -> None` | Main entry point. Calls `resolve_capture_deps(repo_root)`; if disabled, returns immediately. Calls `_capture_installs_from_logs(st.run_dir / "logs")`; calls `_merge_setup_packages` to compute the union. If a committed `.leerie/Dockerfile` exists, skips `setup_packages` write (the Dockerfile is authoritative). Otherwise writes updates via `_write_config_toml_keys` and logs one line prompting `git add .leerie/ && git commit`. Entire function body is wrapped in `try/except Exception` — any error is logged at debug level and swallowed (non-fatal). |
+| `resolve_capture_deps` | `(repo_root: Path) -> bool` | CLI > env `LEERIE_CAPTURE_DEPS` > `leerie.toml` / `.leerie/config.toml` `capture_deps` key; default `True`. Mirrors the precedence shape of `resolve_no_push` (`:15531`). |
+
+#### Finalize hook point
+
+`capture_repo_deps` is called from `phase_finalize` (`:14731`), after
+`finished_at` is written and run-branch verification completes (~`:14818`),
+wrapped in a `try/except` that swallows all exceptions (non-fatal). The
+resume-of-finished guard at `:14900-14905` returns before finalize, so
+capture never re-fires on a completed resume. A partial resume that
+reaches finalize re-runs capture — the union merge makes this a no-op when
+nothing new was found. `st.run_dir / "logs" / "*.log"` is populated by this
+point.
+
+#### Language-dep Dockerfile template (launcher, gated on `bake_language_deps`)
+
+When the launcher auto-generates `.leerie/Dockerfile` from `setup_packages`
+(see *Per-repo derived image* above) and `bake_language_deps` resolves to
+`true` (default), the generated Dockerfile includes a language-dep layer
+after the apt `RUN`:
+
+```dockerfile
+COPY <lockfiles> <manifests> [patches/] [.npmrc] [pnpm-workspace.yaml] ./
+RUN <detected install command>
+```
+
+The `COPY` set is derived from `detect_recipe_from_lockfiles`
+(`:4889`) / `_lockfile_table_entries` (`:4773`) — the same table that
+drives `phase_provision`. For pnpm repos this includes workspace
+`package.json`s, `patches/`, `.npmrc`, and `pnpm-workspace.yaml` in
+addition to the lockfile and root manifest, because `pnpm install
+--frozen-lockfile` requires them. On a build failure (e.g. missing
+patch file), the launcher falls back to `bake_language_deps=false` (apt
+layer only) and logs loudly.
+
+**Lockfile-sha rebuild trigger.** Every lockfile in the `COPY` set has
+its `sha256` folded into `.dockerfile-hash` (`:3313-3315`). A lockfile
+change triggers a full image rebuild; an unrelated source file change
+does not. This keeps rebuilds narrow while ensuring the image always
+reflects the current dependency state.
+
+When `bake_language_deps=false`, the auto-generated Dockerfile contains
+only the apt layer (`USER root; apt-get install ...; USER leerie`),
+identical to the pre-existing path.
+
+#### Config knobs
+
+Two new keys in `.leerie/config.toml` / `leerie.toml`, added to the
+config surface documented in §2 (precedence: CLI > env `LEERIE_*` >
+`leerie.toml` > `.leerie/config.toml`):
+
+| Key | Env override | Default | Meaning |
+|-----|-------------|---------|---------|
+| `capture_deps` | `LEERIE_CAPTURE_DEPS` | `true` | Enable finalize-time dependency capture. Set to `false` to disable entirely. |
+| `bake_language_deps` | `LEERIE_BAKE_LANGUAGE_DEPS` | `true` | Include language-dep `COPY`+`RUN` layer in auto-generated Dockerfile. Set to `false` for apt-only bake. |
+
+Both keys are resolved by their respective `resolve_*` functions before
+the finalize hook fires. Both are documented in `leerie config --init`
+output as commented examples alongside `setup_packages`.
+
+Conforms to DESIGN §6½ *Auto-capture of repo dependencies*.
+
 ---
 
 ## 7. Git worktree mechanics (`scripts/*.sh`)
