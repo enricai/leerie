@@ -2385,6 +2385,7 @@ chains discover their members.
 |------|----------|
 | `leerie --group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher. Mints a fresh `group_id` unless `--group-id <prior-uuid>` is supplied. Fans out one backgrounded member invocation per `--repo`, waits, then runs group tag-back. |
 | `leerie --status <group-id>` | Iterates member state dirs (derived from the group's member repos or a group-manifest the launcher drops), filters `run.json` by `group_id`, renders one row per matched run (run_id, status, branch, notes). Same field-derived status as chain `--status`. |
+| `leerie --stop <group-id>` | Discovers running Fly members across all member state dirs; invokes `leerie --stop <run-id>` per discovered run. Fly-runtime only (pauses machines). |
 | `leerie --resume <group-id>` | Discovers paused members across all member state dirs; invokes `leerie --resume <run-id>` per discovered paused run. |
 | `leerie --kill <group-id>` | Discovers non-destroyed members across all member state dirs; invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
 | `leerie --finalize <group-id>` | Discovers members not yet pushed across all member state dirs; invokes `leerie --finalize <run-id>` per discovered run. |
@@ -5431,6 +5432,7 @@ enforcement functions:
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
+| `test_group_launcher.py` | `--group` fan-out arm and group-scoped ID-dispatched verbs: state-dir guard rejects `--state-dir` arg and `LEERIE_STATE_DIR` env before fan-out; each member child receives `--group-id <uuid>` and `--inspect-dir` for all sibling repos; brief content prepended to each member prompt; distinct per-member state dirs even with inherited env; non-git repo path rejected; `--status <group-id>` finds members across separate state dirs and excludes non-members; `--resume/--kill/--finalize <group-id>` dispatch across member state dirs; `--list --groups` groups `run.json` files by `group_id` across all `~/.leerie/*/` dirs; chain regressions: `--kill/--resume <chain-id>` still route to chain scope. Modeled on `tests/test_chain_launcher_id_dispatch.py`. |
 
 Run with `pytest tests/` from the repo root. The full suite (~1700
 tests across the deterministic-enforcement, bash-harness, and remote

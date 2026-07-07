@@ -257,6 +257,77 @@ for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
 PY
 }
 
+# Emit (one per line) run-ids in the set of <state_dir> arguments whose
+# run.json carries group_id=<group_id> AND matches the per-verb filter
+# <verb>. Functionally identical to _chain_runs_filter but accepts a
+# variable-length list of state directories instead of a single
+# $LEERIE_STATE_HOST_DIR — run-groups scatter members across separate
+# per-repo state dirs so a single-dir scan misses them.
+#
+# Signature:
+#   _group_runs_filter <group_id> <verb> <state_dir_1> [<state_dir_2> ...]
+_group_runs_filter() {
+  local group_id="$1" verb="$2"
+  shift 2
+  case "$verb" in
+    stop|kill|finalize|resume|running) ;;
+    *)
+      remote_log "_group_runs_filter: unknown verb '$verb' (expected one of: stop kill finalize resume running)"
+      return 2
+      ;;
+  esac
+  # Pass all state dirs as extra argv; Python reads sys.argv[3:].
+  python3 - "$group_id" "$verb" "$@" <<'PY'
+import json, sys
+from pathlib import Path
+group_id = sys.argv[1]
+verb = sys.argv[2]
+state_dirs = [Path(d) for d in sys.argv[3:]]
+
+
+def matches(data: dict, verb: str) -> bool:
+    if verb == "stop":
+        return (
+            not data.get("pushed_at")
+            and not data.get("killed_at")
+            and not data.get("paused_at")
+            and bool(data.get("fly_machine_id"))
+        )
+    if verb == "kill":
+        return data.get("killed_at") is None and bool(data.get("fly_machine_id"))
+    if verb == "finalize":
+        return not data.get("pushed_at") and not data.get("killed_at")
+    if verb == "resume":
+        return bool(data.get("paused_at")) and not data.get("killed_at")
+    if verb == "running":
+        return (
+            bool(data.get("fly_machine_id"))
+            and bool(data.get("group_id"))
+            and not data.get("pushed_at")
+            and not data.get("paused_at")
+            and not data.get("killed_at")
+        )
+    sys.stderr.write(f"_group_runs_filter: unknown verb {verb!r}\n")
+    sys.exit(2)
+
+
+for state_dir in state_dirs:
+    runs_dir = state_dir / "runs"
+    for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+        rj = run_dir / "run.json"
+        if not rj.is_file():
+            continue
+        try:
+            data = json.loads(rj.read_text())
+        except (OSError, ValueError):
+            continue
+        if data.get("group_id") != group_id:
+            continue
+        if matches(data, verb):
+            print(run_dir.name)
+PY
+}
+
 # Emit (one per line) the branch field of every run with chain_id=<id>
 # AND wave_idx=<idx>. Used by the --chain wave loop to gather wave-N
 # branch names for synth-merge. Works for both the just-fanned path
@@ -812,8 +883,12 @@ TOML
     # groups by chain_id, and prints one row per chain. Used by users
     # (and by the deprecated --list-chains alias) to see what chains
     # exist in the local state dir.
+    # --list --groups iterates all $HOME/.leerie/*/runs/*/run.json across
+    # every per-repo state dir, groups by group_id, and prints one row per
+    # group. Used to see all run-groups across all repos.
     _list_runtime=""
     _list_chains_only=0
+    _list_groups_only=0
     _list_rest=("$@")
     shift
     while [ "$#" -gt 0 ]; do
@@ -821,6 +896,7 @@ TOML
         --runtime) _list_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _list_runtime="${1#--runtime=}"; shift ;;
         --chains) _list_chains_only=1; shift ;;
+        --groups) _list_groups_only=1; shift ;;
         # --runs is the historical default; accept it as a no-op so the
         # documented `leerie --list --runs` form keeps working.
         --runs)   shift ;;
@@ -897,6 +973,77 @@ for r in sorted(rows, key=lambda x: x[4], reverse=True):
 PY
       exit 0
     fi
+
+    # --list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
+    # every per-repo state dir, group by group_id, render one row per group.
+    if [ "$_list_groups_only" = "1" ]; then
+      python3 - "$HOME/.leerie" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+leerie_home = Path(sys.argv[1])
+if not leerie_home.is_dir():
+    print("(no groups found)")
+    sys.exit(0)
+
+# Scan all per-repo state dirs under $HOME/.leerie/.
+groups = {}  # group_id -> {"runs": [], "repos": set()}
+for state_dir in leerie_home.iterdir():
+    if not state_dir.is_dir():
+        continue
+    runs_dir = state_dir / "runs"
+    if not runs_dir.is_dir():
+        continue
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        rj = run_dir / "run.json"
+        if not rj.is_file():
+            continue
+        try:
+            data = json.loads(rj.read_text())
+        except (OSError, ValueError):
+            continue
+        gid = data.get("group_id")
+        if not gid:
+            continue
+        bucket = groups.setdefault(gid, {"runs": [], "repos": set()})
+        bucket["runs"].append(data)
+        bucket["repos"].add(state_dir.name)
+
+if not groups:
+    print("(no groups found)")
+    sys.exit(0)
+
+rows = []
+for gid, info in groups.items():
+    n_runs = len(info["runs"])
+    repos_str = ",".join(sorted(info["repos"]))
+    started = min((r.get("started_at", "") for r in info["runs"] if r.get("started_at")), default="")
+    n_pushed = sum(1 for r in info["runs"] if r.get("pushed_at"))
+    n_paused = sum(1 for r in info["runs"] if r.get("paused_at"))
+    n_killed = sum(1 for r in info["runs"] if r.get("killed_at"))
+    if n_killed:
+        status = "killed"
+    elif n_paused:
+        status = "paused"
+    elif n_pushed == n_runs:
+        status = "done"
+    else:
+        status = "in-progress"
+    rows.append((gid, status, f"{n_pushed}/{n_runs}", repos_str, started))
+
+headers = ("group_id", "status", "pushed", "repos", "started_at")
+widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*("-" * w for w in widths)))
+for r in sorted(rows, key=lambda x: x[4], reverse=True):
+    print(fmt.format(*r))
+PY
+      exit 0
+    fi
+
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
         echo "leerie: --list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
@@ -1248,12 +1395,32 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     export USER_REPO
     # Peek at the first positional arg for UUID dispatch.
     # Chain-id stop: iterate runs with matching chain_id, stop each.
+    # Group-id stop: if no chain runs found, try group_id across all state dirs.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _sp_chain="$1"; shift
       _sp_pass_args=("$@")
       _sp_run_ids="$(_chain_runs_filter "$_sp_chain" stop)"
       if [ -z "$_sp_run_ids" ]; then
-        remote_log "--stop: no running runs found for chain $_sp_chain"
+        # Try group_id fallback.
+        _sp_group_state_dirs=()
+        if [ -d "$HOME/.leerie" ]; then
+          for _sp_sd in "$HOME/.leerie"/*/; do
+            [ -d "$_sp_sd" ] && _sp_group_state_dirs+=("$_sp_sd")
+          done
+        fi
+        if [ "${#_sp_group_state_dirs[@]}" -gt 0 ]; then
+          _sp_grp_ids="$(_group_runs_filter "$_sp_chain" stop "${_sp_group_state_dirs[@]}")"
+          if [ -n "$_sp_grp_ids" ]; then
+            echo "$_sp_grp_ids" | while read -r _rid; do
+              [ -z "$_rid" ] && continue
+              remote_log "--stop: pausing run $_rid (group $_sp_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" --stop "$_rid" "${_sp_pass_args[@]}" || remote_log "--stop: $_rid failed (continuing)"
+            done
+            remote_log "--stop: group $_sp_chain pause pass complete"
+            exit 0
+          fi
+        fi
+        remote_log "--stop: no running runs found for chain/group $_sp_chain"
         exit 0
       fi
       echo "$_sp_run_ids" | while read -r _rid; do
@@ -1357,16 +1524,36 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    # Peek for UUID-formatted chain-id as the first positional arg.
+    # Peek for UUID-formatted chain-id / group-id as the first positional arg.
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # find runs with matching chain_id, invoke single-run kill on each.
+    # Group-id kill: if no chain runs found, try group_id across all state dirs.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _kc_chain="$1"; shift
       # Pass through --force / --runtime / etc. flags to per-run kill.
       _kc_pass_args=("$@")
       _kc_run_ids="$(_chain_runs_filter "$_kc_chain" kill)"
       if [ -z "$_kc_run_ids" ]; then
-        remote_log "--kill: no live runs found for chain $_kc_chain (already destroyed or never ran)"
+        # Try group_id fallback.
+        _kc_group_state_dirs=()
+        if [ -d "$HOME/.leerie" ]; then
+          for _kc_sd in "$HOME/.leerie"/*/; do
+            [ -d "$_kc_sd" ] && _kc_group_state_dirs+=("$_kc_sd")
+          done
+        fi
+        if [ "${#_kc_group_state_dirs[@]}" -gt 0 ]; then
+          _kc_grp_ids="$(_group_runs_filter "$_kc_chain" kill "${_kc_group_state_dirs[@]}")"
+          if [ -n "$_kc_grp_ids" ]; then
+            echo "$_kc_grp_ids" | while read -r _rid; do
+              [ -z "$_rid" ] && continue
+              remote_log "--kill: destroying run $_rid (group $_kc_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" --kill "$_rid" "${_kc_pass_args[@]}" || remote_log "--kill: destroy failed for $_rid (continuing)"
+            done
+            remote_log "--kill: group $_kc_chain destroyed"
+            exit 0
+          fi
+        fi
+        remote_log "--kill: no live runs found for chain/group $_kc_chain (already destroyed or never ran)"
         exit 0
       fi
       echo "$_kc_run_ids" | while read -r _rid; do
@@ -1517,14 +1704,33 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    # Chain-id dispatch: `--finalize <uuid>` finalizes every run-id
-    # belonging to a chain that hasn't already been pushed.
+    # Chain-id / group-id dispatch: `--finalize <uuid>` finalizes every
+    # run-id belonging to a chain/group that hasn't already been pushed.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _fc_chain="$1"; shift
       _fc_pass_args=("$@")
       _fc_run_ids="$(_chain_runs_filter "$_fc_chain" finalize)"
       if [ -z "$_fc_run_ids" ]; then
-        remote_log "--finalize: no pending runs found for chain $_fc_chain"
+        # Try group_id fallback.
+        _fc_group_state_dirs=()
+        if [ -d "$HOME/.leerie" ]; then
+          for _fc_sd in "$HOME/.leerie"/*/; do
+            [ -d "$_fc_sd" ] && _fc_group_state_dirs+=("$_fc_sd")
+          done
+        fi
+        if [ "${#_fc_group_state_dirs[@]}" -gt 0 ]; then
+          _fc_grp_ids="$(_group_runs_filter "$_fc_chain" finalize "${_fc_group_state_dirs[@]}")"
+          if [ -n "$_fc_grp_ids" ]; then
+            echo "$_fc_grp_ids" | while read -r _rid; do
+              [ -z "$_rid" ] && continue
+              remote_log "--finalize: finalizing run $_rid (group $_fc_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" --finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "--finalize: $_rid failed (continuing)"
+            done
+            remote_log "--finalize: group $_fc_chain finalize pass complete"
+            exit 0
+          fi
+        fi
+        remote_log "--finalize: no pending runs found for chain/group $_fc_chain"
         exit 0
       fi
       echo "$_fc_run_ids" | while read -r _rid; do
@@ -1858,16 +2064,18 @@ PY
     ;;
   --status)
     # ID-dispatched status verb.
-    # UUID-pattern id (8-4-4-4-12) → enumerate runs with matching
-    # chain_id and render per-run states.
+    # UUID-pattern id (8-4-4-4-12) → try chain_id first (one state dir),
+    # then group_id (across all per-repo state dirs under $HOME/.leerie/).
     # Other ids fall through to the existing --list mechanism (run-level).
     shift
     _st_id="${1:-}"
     if [ -z "$_st_id" ]; then
-      remote_log "--status: <id> is required (chain-id or run-id)"; exit 1
+      remote_log "--status: <id> is required (chain-id, group-id, or run-id)"; exit 1
     fi
     if echo "$_st_id" | grep -qiE "$UUID_PATTERN"; then
-      python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY'
+      # Try chain_id first (runs in current state dir).
+      _st_chain_rc=0
+      python3 - "$LEERIE_STATE_HOST_DIR" "$_st_id" <<'PY' || _st_chain_rc=$?
 import json, sys
 from pathlib import Path
 
@@ -1888,8 +2096,8 @@ for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
     matched.append((run_dir.name, data))
 
 if not matched:
-    print(f"chain {chain_id}: no runs found", file=sys.stderr)
-    sys.exit(1)
+    # Signal "not found as chain" via exit 2 (distinct from error exit 1).
+    sys.exit(2)
 
 def status_of(d):
     if d.get("killed_at"): return "killed"
@@ -1914,6 +2122,70 @@ rows.sort(key=lambda r: (str(r[0]), r[1]))
 print(f"chain {chain_id}: {len(rows)} run(s)")
 print()
 headers = ("wave", "run_id", "status", "branch", "notes")
+widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*("-" * w for w in widths)))
+for r in rows:
+    print(fmt.format(*(str(c) for c in r)))
+PY
+      if [ "$_st_chain_rc" -eq 0 ]; then
+        exit 0
+      fi
+      if [ "$_st_chain_rc" -ne 2 ]; then
+        exit "$_st_chain_rc"
+      fi
+      # chain_id not found (exit 2); try group_id across all state dirs.
+      python3 - "$HOME/.leerie" "$_st_id" <<'PY'
+import json, sys
+from pathlib import Path
+
+leerie_home = Path(sys.argv[1])
+group_id = sys.argv[2]
+matched = []
+if leerie_home.is_dir():
+    for state_dir in leerie_home.iterdir():
+        if not state_dir.is_dir():
+            continue
+        runs_dir = state_dir / "runs"
+        for run_dir in runs_dir.iterdir() if runs_dir.is_dir() else []:
+            rj = run_dir / "run.json"
+            if not rj.is_file():
+                continue
+            try:
+                data = json.loads(rj.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("group_id") != group_id:
+                continue
+            matched.append((run_dir.name, data))
+
+if not matched:
+    print(f"group {group_id}: no runs found", file=sys.stderr)
+    sys.exit(1)
+
+def status_of(d):
+    if d.get("killed_at"): return "killed"
+    if d.get("paused_at"): return "paused"
+    if d.get("sync_failed_at"): return "sync-failed"
+    if d.get("pr_url"): return "done-pr"
+    if d.get("pushed_at"): return "done-pushed"
+    if d.get("finished_at"): return "done-local"
+    return "in-progress"
+
+rows = []
+for rid, d in matched:
+    rows.append((
+        rid,
+        status_of(d),
+        d.get("branch", ""),
+        d.get("pr_url", "") or d.get("push_error", "") or d.get("pause_reason", ""),
+    ))
+rows.sort(key=lambda r: r[0])
+
+print(f"group {group_id}: {len(rows)} member(s)")
+print()
+headers = ("run_id", "status", "branch", "notes")
 widths = [max(len(h), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
 fmt = "  ".join(f"{{:<{w}}}" for w in widths)
 print(fmt.format(*headers))
@@ -1982,8 +2254,9 @@ PY
   --resume)
     # ID-dispatch fast-path: `--resume <uuid>` handles chain runs in two
     # tiers: (1) auto-resume paused runs, (2) list running runs for the
-    # user to reattach to. Non-UUID args fall through to the existing
-    # run-id resume path below.
+    # user to reattach to. If the UUID is a group_id (no chain runs found),
+    # dispatch group-scoped resume instead. Non-UUID args fall through to
+    # the existing run-id resume path below.
     if [ "$#" -ge 2 ] && echo "$2" | grep -qiE "$UUID_PATTERN"; then
       _rs_chain="$2"
       shift 2
@@ -1991,7 +2264,35 @@ PY
       _rs_paused="$(_chain_runs_filter "$_rs_chain" resume)"
       _rs_running="$(_chain_runs_filter "$_rs_chain" running)"
       if [ -z "$_rs_paused" ] && [ -z "$_rs_running" ]; then
-        remote_log "--resume: no resumable runs found for chain $_rs_chain"
+        # No chain runs found — try group_id across all per-repo state dirs.
+        _rs_group_state_dirs=()
+        if [ -d "$HOME/.leerie" ]; then
+          for _rs_sd in "$HOME/.leerie"/*/; do
+            [ -d "$_rs_sd" ] && _rs_group_state_dirs+=("$_rs_sd")
+          done
+        fi
+        if [ "${#_rs_group_state_dirs[@]}" -gt 0 ]; then
+          _rs_grp_paused="$(_group_runs_filter "$_rs_chain" resume "${_rs_group_state_dirs[@]}")"
+          _rs_grp_running="$(_group_runs_filter "$_rs_chain" running "${_rs_group_state_dirs[@]}")"
+          if [ -n "$_rs_grp_paused" ] || [ -n "$_rs_grp_running" ]; then
+            if [ -n "$_rs_grp_paused" ]; then
+              echo "$_rs_grp_paused" | while read -r _rid; do
+                [ -z "$_rid" ] && continue
+                remote_log "--resume: resuming paused run $_rid (group $_rs_chain)"
+                "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+              done
+              remote_log "--resume: group $_rs_chain resume pass complete"
+            fi
+            if [ -n "$_rs_grp_running" ]; then
+              remote_log "--resume: running group members (reattach with leerie --resume <run-id>):"
+              echo "$_rs_grp_running" | while read -r _rid; do
+                echo "    $_rid"
+              done
+            fi
+            exit 0
+          fi
+        fi
+        remote_log "--resume: no resumable runs found for chain/group $_rs_chain"
         exit 0
       fi
       # Tier 1: auto-resume paused runs.
@@ -2438,6 +2739,301 @@ except SynthMergeConflict as exc:
       --*) remote_log "--chain-attach: expected <chain-id>, got flag '$_ca_chain_id'"; exit 1 ;;
     esac
     exec "$0" --attach "$_ca_chain_id"
+    ;;
+  --group)
+    # Laptop-side run-group fan-out. A group is N ordinary single-repo
+    # leerie runs launched together with a shared group_id. Each member
+    # runs in its own basename-keyed state directory, on its own run
+    # branch, and opens its own PR — nothing is shared except the
+    # group_id and read-only cross-repo visibility via --inspect-dir.
+    #
+    # Usage:
+    #   leerie --group \
+    #     --repo <path> "<prompt>" \
+    #     --repo <path> "<prompt>" \
+    #     [--brief <file>] \
+    #     [<per-member-flags>]
+    #
+    # Modeled on the --chain arm (leerie:2033) but cd's into each member
+    # repo so each resolves its own USER_REPO and basename-keyed state
+    # directory independently. See DESIGN.md §20 and IMPLEMENTATION.md
+    # "Run-group verbs".
+    shift
+    _grp_repos=()       # parallel: repo paths
+    _grp_prompts=()     # parallel: member prompts
+    _grp_brief_file=""
+    _grp_id_override=""
+    _grp_passthrough=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --repo)
+          _grp_repo="${2:-}"
+          _grp_prompt="${3:-}"
+          if [ -z "$_grp_repo" ] || [ -z "$_grp_prompt" ]; then
+            remote_log "--group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
+          fi
+          _grp_repos+=("$_grp_repo")
+          _grp_prompts+=("$_grp_prompt")
+          shift 3
+          ;;
+        --repo=*)
+          remote_log "--group: --repo does not support = form; use: --repo <path> \"<prompt>\""; exit 1
+          ;;
+        --brief) _grp_brief_file="${2:-}"; shift 2 ;;
+        --brief=*) _grp_brief_file="${1#--brief=}"; shift ;;
+        --group-id) _grp_id_override="${2:-}"; shift 2 ;;
+        --group-id=*) _grp_id_override="${1#--group-id=}"; shift ;;
+        # State-dir guard (MANDATORY): --state-dir / LEERIE_STATE_DIR
+        # would pin ALL members to one shared directory. Unlike chains
+        # (single repo → shared dir is fine), a group needs each member
+        # in its own basename-keyed state dir. Reject both forms.
+        --state-dir|--state-dir=*)
+          remote_log "--group: --state-dir is not supported; each member uses its own \$HOME/.leerie/<basename> directory"
+          echo "  Remove --state-dir or use per-member leerie invocations." >&2
+          exit 1
+          ;;
+        # Per-member flags forwarded to each member's ./leerie invocation.
+        --*=*) _grp_passthrough+=("$1"); shift ;;
+        --*)
+          if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+            _grp_passthrough+=("$1" "$2"); shift 2
+          else
+            _grp_passthrough+=("$1"); shift
+          fi
+          ;;
+        *) remote_log "--group: unexpected argument: $1"; exit 1 ;;
+      esac
+    done
+
+    # State-dir guard: also reject LEERIE_STATE_DIR from the environment.
+    if [ -n "${LEERIE_STATE_DIR:-}" ]; then
+      remote_log "--group: LEERIE_STATE_DIR is set in the environment; this would pin all members to one state directory"
+      echo "  Unset LEERIE_STATE_DIR before running --group, or use per-member leerie invocations." >&2
+      exit 1
+    fi
+
+    if [ "${#_grp_repos[@]}" -lt 2 ]; then
+      remote_log "--group: at least two --repo arguments are required"
+      echo "  Usage: leerie --group --repo <path> \"<prompt>\" --repo <path> \"<prompt>\" [--brief <file>]" >&2
+      exit 1
+    fi
+
+    # Validate each repo is a git repository before fan-out.
+    for _gr in "${_grp_repos[@]}"; do
+      if [ ! -d "$_gr" ]; then
+        remote_log "--group: repo path not found: $_gr"; exit 1
+      fi
+      if ! git -C "$_gr" rev-parse --git-dir >/dev/null 2>&1; then
+        remote_log "--group: not a git repository: $_gr"; exit 1
+      fi
+    done
+
+    # Validate brief file if supplied.
+    if [ -n "$_grp_brief_file" ]; then
+      if [ ! -f "$_grp_brief_file" ]; then
+        remote_log "--group: brief file not found: $_grp_brief_file"; exit 1
+      fi
+      if [ ! -s "$_grp_brief_file" ]; then
+        remote_log "--group: brief file is empty: $_grp_brief_file"; exit 1
+      fi
+      _grp_brief_content="$(cat "$_grp_brief_file")"
+    else
+      _grp_brief_content=""
+    fi
+
+    # Mint or validate group_id.
+    if [ -n "$_grp_id_override" ]; then
+      _grp_id_stripped="$(echo "$_grp_id_override" | tr -d '[:space:]')"
+      if [ "$_grp_id_stripped" != "$_grp_id_override" ]; then
+        remote_log "--group: --group-id value had surrounding whitespace; stripped to '$_grp_id_stripped'"
+        _grp_id_override="$_grp_id_stripped"
+      fi
+      unset _grp_id_stripped
+      if ! echo "$_grp_id_override" | grep -qiE "$UUID_PATTERN"; then
+        remote_log "--group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        exit 1
+      fi
+      _grp_id="$(echo "$_grp_id_override" | tr '[:upper:]' '[:lower:]')"
+      remote_log "--group: reusing group_id $_grp_id"
+    else
+      _grp_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    fi
+
+    # Source lib.sh for update_run_json (used in tag-back below).
+    _grp_leerie_dir="$(cd "$(dirname "$0")" && pwd)"
+    # shellcheck disable=SC1091
+    . "$_grp_leerie_dir/scripts/remote/lib.sh"
+
+    # Signal handler: kill in-flight member children on Ctrl-C / SIGTERM.
+    _grp_child_pids=()
+    _grp_cleanup_done=0
+    _grp_kill_children() {
+      [ "$_grp_cleanup_done" -eq 1 ] && return 0
+      _grp_cleanup_done=1
+      for _p in "${_grp_child_pids[@]:-}"; do
+        kill -TERM "$_p" 2>/dev/null || true
+      done
+      _grp_deadline=$(( $(date +%s) + 2 ))
+      while [ "$(date +%s)" -lt "$_grp_deadline" ]; do
+        _grp_remaining=()
+        for _p in "${_grp_child_pids[@]:-}"; do
+          kill -0 "$_p" 2>/dev/null && _grp_remaining+=("$_p")
+        done
+        _grp_child_pids=("${_grp_remaining[@]}")
+        [ "${#_grp_child_pids[@]}" -eq 0 ] && break
+        sleep 0.1
+      done
+      for _p in "${_grp_child_pids[@]:-}"; do
+        kill -KILL "$_p" 2>/dev/null || true
+      done
+      wait 2>/dev/null || true
+    }
+    trap '_grp_kill_children; exit 130' INT
+    trap '_grp_kill_children; exit 143' TERM
+
+    echo ""
+    echo "group submitted:"
+    echo "  group_id: $_grp_id"
+    echo "  members:  ${#_grp_repos[@]}"
+    echo ""
+    echo "  Recovery (if a member pauses on failure):"
+    echo "    leerie --resume $_grp_id"
+    echo "    leerie --group --group-id $_grp_id --repo ..."
+    echo ""
+
+    # Fan-out: background one ./leerie per member.
+    # Each member cd's into its repo (so USER_REPO + state dir resolve
+    # from basename), carries --group-id, and has all siblings as
+    # --inspect-dir (read-only cross-repo visibility).
+    _grp_n="${#_grp_repos[@]}"
+    for _gi in $(seq 0 $((_grp_n - 1))); do
+      _grp_member_repo="${_grp_repos[$_gi]}"
+      _grp_member_prompt="${_grp_prompts[$_gi]}"
+
+      # Resolve absolute path for inspect-dir (collect_inspect_path
+      # needs absolute paths; the member's cwd will be the member repo,
+      # but siblings are given as absolute paths).
+      _grp_member_repo_abs="$(cd "$_grp_member_repo" && pwd)"
+
+      # Build --inspect-dir flags for every OTHER member (siblings).
+      _grp_inspect_args=()
+      for _gj in $(seq 0 $((_grp_n - 1))); do
+        [ "$_gj" -eq "$_gi" ] && continue
+        _grp_sibling_abs="$(cd "${_grp_repos[$_gj]}" && pwd)"
+        _grp_inspect_args+=(--inspect-dir "$_grp_sibling_abs")
+      done
+
+      # Prepend brief to prompt if provided.
+      if [ -n "$_grp_brief_content" ]; then
+        _grp_full_prompt="${_grp_brief_content}
+
+${_grp_member_prompt}"
+      else
+        _grp_full_prompt="$_grp_member_prompt"
+      fi
+
+      (
+        cd "$_grp_member_repo_abs" || exit 1
+        "${LEERIE_SELF_CMD:-"$0"}" "$_grp_full_prompt" \
+          "${_grp_inspect_args[@]}" \
+          --group-id "$_grp_id" \
+          "${_grp_passthrough[@]}"
+      ) &
+      _grp_child_pids+=($!)
+    done
+
+    # Wait for ALL members, capture per-child rc.
+    _grp_failed=0
+    for _p in "${_grp_child_pids[@]}"; do
+      if ! wait "$_p"; then
+        _grp_failed=$((_grp_failed + 1))
+      fi
+    done
+
+    # Clear signal trap; fan-out complete.
+    trap - INT TERM
+
+    # Group tag-back: write group_id into each member's run.json.
+    # Discovery: scan <member-state-dir>/runs/*/run.json for the newest
+    # run.json with finished_at set — same mechanism as the local
+    # finalize discovery (leerie:4967-4992). The member's state dir is
+    # derived from its repo basename (same as _state_dir_default does
+    # for USER_REPO).
+    for _gi in $(seq 0 $((_grp_n - 1))); do
+      _grp_member_repo="${_grp_repos[$_gi]}"
+      _grp_member_basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$_grp_member_repo")"
+      _grp_member_state_dir="$HOME/.leerie/$_grp_member_basename"
+
+      # Discover the member's run.json: newest run dir with finished_at.
+      _grp_run_json="$(python3 - "$_grp_member_state_dir" <<'PY'
+import json, os, sys
+from pathlib import Path
+state_dir = Path(sys.argv[1])
+runs_dir = state_dir / "runs"
+best_mtime = 0
+best_path = ""
+for rj in runs_dir.glob("*/run.json") if runs_dir.is_dir() else []:
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    if not data.get("finished_at"):
+        continue
+    mtime = rj.stat().st_mtime
+    if mtime > best_mtime:
+        best_mtime = mtime
+        best_path = str(rj)
+print(best_path)
+PY
+)"
+      if [ -z "$_grp_run_json" ] || [ ! -f "$_grp_run_json" ]; then
+        # Fly runtime: try remote/<child-pid>.json pointer, then
+        # fly-machine.json scan — same as chain tag-back (leerie:2263-2289).
+        _grp_cp="${_grp_child_pids[$_gi]}"
+        _grp_remote_ptr="$_grp_member_state_dir/remote/$_grp_cp.json"
+        _grp_mid=""
+        if [ -f "$_grp_remote_ptr" ]; then
+          _grp_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_grp_remote_ptr" 2>/dev/null)"
+        fi
+        if [ -z "$_grp_mid" ]; then
+          _grp_mid="$(python3 -c '
+import json, sys
+from pathlib import Path
+state_dir, pid = Path(sys.argv[1]), int(sys.argv[2])
+for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
+    try:
+        d = json.loads(fmj.read_text())
+    except (OSError, ValueError):
+        continue
+    if d.get("launcher_pid") == pid:
+        print(fmj.parent.name)
+        break
+' "$_grp_member_state_dir" "$_grp_cp" 2>/dev/null)"
+        fi
+        if [ -n "$_grp_mid" ]; then
+          _grp_run_json="$_grp_member_state_dir/runs/$_grp_mid/run.json"
+        fi
+      fi
+
+      if [ -n "$_grp_run_json" ] && [ -f "$_grp_run_json" ]; then
+        update_run_json "$_grp_run_json" group_id "$_grp_id" || true
+      else
+        remote_log "--group: could not locate run.json for member $_grp_member_repo (tag-back skipped)"
+      fi
+    done
+
+    if [ "$_grp_failed" -gt 0 ]; then
+      remote_log "group $_grp_id: $_grp_failed/${_grp_n} member(s) failed"
+      echo ""
+      echo "Some group members paused on failure. To recover:"
+      echo "  leerie --resume $_grp_id"
+      exit 1
+    fi
+
+    echo ""
+    remote_log "group $_grp_id: all ${_grp_n} member(s) complete"
+    echo "  Inspect: leerie --status $_grp_id  |  leerie --list --groups"
+    exit 0
     ;;
 esac
 
