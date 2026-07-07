@@ -2300,9 +2300,14 @@ single `$LEERIE_STATE_HOST_DIR` and cannot be reused directly.
 
 #### `group_id` in `run.json`
 
-`group_id` is an optional string field in `run.json`, written by the
-`--group` launcher arm after all members complete (alongside `chain_id`,
-which is optional for the same reason). `_validate_run_json`
+`group_id` is an optional string field in `run.json`. It is written
+at two points: (1) by the orchestrator at run-start when `--group-id`
+is supplied as a CLI arg (`orchestrator/leerie.py:15022`), so the
+field appears in `run.json` immediately when the run begins; and (2)
+by the `--group` launcher arm after all members complete, via
+`update_run_json … group_id "$_group_id"` (the tag-back step in
+`leerie`). The `chain_id` field follows the same pattern.
+`_validate_run_json`
 (`orchestrator/leerie.py:1973`) does not add any invariant check on
 `group_id` — it is informational and orthogonal to the push/pause/kill
 state machine. The field is accepted by the validator without error
