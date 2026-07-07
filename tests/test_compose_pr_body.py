@@ -159,7 +159,7 @@ def test_compose_pr_body_footer_link_without_version(leerie):
 def test_compose_pr_body_no_literal_none(leerie):
     """Sweep guard: under no realistic state shape should the literal
     string 'None' appear in the body."""
-    # Various partial states
+    # Various partial states including deploy-ordering shapes with null fields
     states = [
         {},
         {"task": "x"},
@@ -167,6 +167,9 @@ def test_compose_pr_body_no_literal_none(leerie):
         {"task": "x", "waves": []},
         {"task": "x", "answers": {}},
         {"task": "x", "categories": [None]},
+        # deploy-ordering shapes: null tag, null reasons, null reason text
+        {"task": "x", "external_preconditions": [{"tag": None, "reasons": [], "originating_subtasks": []}]},
+        {"task": "x", "external_preconditions": [{"tag": "dep", "reasons": [{"sid": "s1", "reason": None}], "originating_subtasks": []}]},
     ]
     for state in states:
         body = leerie.compose_pr_body(state, "feat-foo-abc123")
