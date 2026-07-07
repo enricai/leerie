@@ -115,6 +115,35 @@ def test_non_object_existing_is_recovered(leerie, tmp_path):
     assert data == {"run_id": "recovered"}
 
 
+# --- group_id (DESIGN §20 run groups) -----------------------------------------
+
+def test_group_id_written_and_preserved(leerie, tmp_path):
+    """group_id is written by _write_run_json and survives a subsequent merge.
+
+    Stage 3b of the run-group design: the orchestrator writes group_id into
+    run.json at run-start; later incremental writes (push, PR) must not
+    clobber it.  This is the durable round-trip claim distinct from the
+    pure-validation tests in test_run_json_invariants.py."""
+    leerie._write_run_json(
+        tmp_path,
+        run_id="feat-foo-abc123",
+        branch="leerie/runs/feat-foo-abc123",
+        working_branch="main",
+        started_at="2026-05-26T14:00:00+00:00",
+        task="add /volumes endpoint",
+        group_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    )
+    data = json.loads((tmp_path / "run.json").read_text())
+    assert data["group_id"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    # Simulate a subsequent merge (push update) — group_id must survive.
+    leerie._write_run_json(tmp_path, pushed_at="2026-05-26T15:00:00+00:00")
+    data = json.loads((tmp_path / "run.json").read_text())
+    assert data["group_id"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    assert data["run_id"] == "feat-foo-abc123"
+    assert data["pushed_at"] == "2026-05-26T15:00:00+00:00"
+
+
 def test_full_lifecycle(leerie, tmp_path):
     """End-to-end: simulate the full sequence of writes during a run
     lifecycle — start, finalize, push success, PR success — and
