@@ -2436,6 +2436,36 @@ knows which sibling repos are group members — so the deploy note
 identifies sibling members by injected group membership, not by
 parsing planner free-text.
 
+#### Planner steering (`prompts/planner.md`)
+
+When a group member's planner receives a group brief (a shared context
+block prepended by the launcher, marked `## Group brief` or similar),
+`prompts/planner.md` contains a positive instruction directing it to:
+
+1. **Read the sibling's contract.** Use `Read`, `Grep`, and `Glob`
+   under `/inspect/<name>/` to locate and read the sibling's API
+   surface, type definitions, schema, or interface files — not just
+   the brief.
+2. **Honor the interface.** Subtasks must conform to the sibling's
+   actual types, field names, and endpoints as found in the code.
+3. **Declare the dependency.** Add a `requires` entry with
+   `extent: "external"` whose `reason` names the sibling repo and the
+   specific contract item, for every subtask that depends on a
+   sibling-owned contract.
+
+This is advisory steering per DESIGN.md §12 ("prompts advisory, code
+enforces"): the write-confinement guarantee stays code
+(`filter_offtree_subtasks`), not the prompt. The instruction lifts
+reliable cross-repo-aware planning from emergent (task-text-driven) to
+dependable (explicit prompt rule).
+
+The planner prompt also documents the runtime asymmetry: inspect-dir
+read-only is kernel-enforced locally (`:ro` bind-mount) but
+convention-enforced on Fly (`chown leerie:` in `seed-repo.sh`). The
+practical guarantee is the same for planning — acting workers that get
+`/inspect/` do not receive `--add-dir` on Fly either — but the
+mechanism differs.
+
 #### No new schema, state, or cap changes
 
 This is the point of the lean shape (DESIGN.md §20 *Why the lean
