@@ -260,6 +260,28 @@ leerie --list --chains         # group runs by chain_id
 
 # Deprecated --chain-* aliases (kept for backwards compat) shim to
 # the new verbs above.
+
+# Run-groups: launch N single-repo leerie runs together as a coordinated
+# unit. Each member runs in its own state dir (basename-keyed), its own
+# branch, and opens its own PR. Members share a group_id and read-only
+# cross-repo visibility via --inspect-dir; the optional --brief file is
+# prepended to every member's prompt.
+leerie --group \
+  --repo ../api     "add /volumes endpoint" \
+  --repo ../frontend "add-disk dialog" \
+  --brief group-brief.md          # optional shared brief
+
+# Resubmit with an existing group_id (keeps the same group):
+leerie --group --group-id <prior-group-id> \
+  --repo ../api     "add /volumes endpoint" \
+  --repo ../frontend "add-disk dialog"
+
+# Group-scoped verbs (UUID → group scope across member state dirs):
+leerie --status   <group-id>   # render per-member run states
+leerie --resume   <group-id>   # resume every paused member run
+leerie --kill     <group-id>   # destroy every member run
+leerie --finalize <group-id>   # push + open PR for every unpushed member
+leerie --list --groups         # list all groups across state dirs
 ```
 
 Inside Claude Code (after `/plugin install leerie@enricai-leerie`):
