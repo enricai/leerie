@@ -434,7 +434,13 @@ launcher arm and group-scoped ID-dispatched verbs are tested in
 `tests/test_chain_launcher_id_dispatch.py`. Group-scoped verb dispatch
 across two state dirs (combined paused/unpushed + pushed fixture, plus
 `--stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
-No coverage
+Fan-out core contract (cwd per member, `--inspect-dir` for siblings,
+brief prepend) is in `tests/test_group_launcher_fanout.py`.
+Python-layer `group_id` in `run.json` (`_validate_run_json`,
+`_write_run_json`, `_derive_run_status`) is in
+`tests/test_group_run_json.py`. State-dir isolation (distinct
+basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
+`--state-dir`) is in `tests/test_group_state_dir_guard.py`. No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
