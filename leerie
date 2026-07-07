@@ -4155,7 +4155,7 @@ for arg in "$@"; do
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    --finalize|--stop|--kill|--re-seed|--accept-blocked|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|config)
+    --finalize|--stop|--kill|--re-seed|--accept-blocked|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|--group|config)
       # Launcher-only verbs — normally dispatched at the top-level case
       # (line ~553) when they appear as $1. If one appears here it was
       # in a non-$1 position (e.g. `leerie <id> --finalize --runtime fly`
