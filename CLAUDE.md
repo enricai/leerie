@@ -380,6 +380,29 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie --resume   <chain-id>        # resume every paused chain run
 ./leerie --finalize <chain-id>        # push + open PR for every unpushed run
 ./leerie --list --chains              # group runs by chain_id
+
+# Group verbs: launch N single-repo runs together as a coordinated unit.
+# Each member runs in its own state dir (basename-keyed), its own branch,
+# and opens its own PR — nothing is shared except the group_id and a
+# read-only view of siblings via --inspect-dir. The shared brief narrows
+# each planner to the joint intent; cross-repo prerequisites are rendered
+# as deploy-ordering notes in each member's PR body.
+./leerie --group \
+  --repo ../api   "add /volumes endpoint" \
+  --repo ../frontend "add-disk dialog" \
+  --brief group-brief.md            # optional shared brief (prepended to each member's prompt)
+
+# Resubmit a prior group (reuse its group_id instead of minting a new one):
+./leerie --group --group-id <prior-group-id> \
+  --repo ../api   "add /volumes endpoint" \
+  --repo ../frontend "add-disk dialog"
+
+# Group-scoped verbs: UUID → group scope (scans each member's state dir).
+./leerie --status   <group-id>        # render per-member run states
+./leerie --resume   <group-id>        # resume every paused member run
+./leerie --kill     <group-id>        # destroy every member run
+./leerie --finalize <group-id>        # push + open PR for every unpushed member
+./leerie --list --groups              # list all groups across state dirs
 ```
 
 ## Testing
