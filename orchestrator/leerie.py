@@ -2129,7 +2129,7 @@ def compose_pr_body(state: dict, run_id: str) -> str:
     leerie_version = state.get("leerie_version")
     version_suffix = f" v{leerie_version}" if leerie_version else ""
     duration = _format_run_duration(started_at, finished_at)
-    return (
+    body = (
         "## Task\n"
         "\n"
         f"{task}\n"
@@ -2152,6 +2152,21 @@ def compose_pr_body(state: dict, run_id: str) -> str:
         f"Run `leerie --list` on the host that produced this PR to "
         f"locate full run state (state.json) for run ID `{run_id}`.\n"
     )
+    preconditions = state.get("external_preconditions") or []
+    if preconditions:
+        body += "\n## ⚠ Deploy-ordering\n\n"
+        body += ("One or more cross-repo prerequisites were declared by the "
+                 "planner. Merge and deploy the following before merging this PR:\n\n")
+        for entry in preconditions:
+            tag = entry.get("tag") or "(unknown)"
+            reasons = entry.get("reasons") or []
+            reason_texts = [r.get("reason", "") for r in reasons if r.get("reason")]
+            if reason_texts:
+                combined = "; ".join(reason_texts)
+                body += f"- **{tag}** — {combined}\n"
+            else:
+                body += f"- **{tag}**\n"
+    return body
 
 
 def _write_run_json(run_dir: Path, **fields) -> None:
@@ -14668,6 +14683,9 @@ async def _compose_pr_via_llm(st: "State",
         fc = _final_conformance_payload(st)
         if fc is not None:
             payload["final_conformance"] = fc
+        preconditions = st.data.get("external_preconditions") or []
+        if preconditions:
+            payload["external_preconditions"] = preconditions
 
         sys_prompt = load_prompt("pr_writer")
         model = models.get("pr_writer", MODEL_DEFAULT_PER_WORKER.get(
@@ -15001,6 +15019,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             working_branch=working_branch,
             started_at=st.data["started_at"],
             task=task,
+            **({"group_id": args.group_id} if args.group_id else {}),
         )
         # Provision per-repo deps (DESIGN §6½). Runs after classify (so a
         # docs-only run can short-circuit). On `--resume` the
@@ -15415,6 +15434,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "'heal' reads the judge index for failing call_types "
                          "and runs the self-heal loop for each, writing healing "
                          "reports to <run-dir>/<heal-dir>/.")
+    ap.add_argument("--group-id", metavar="UUID",
+                    help="run-group identifier (UUID). Written into run.json "
+                         "alongside chain_id. Set by the --group launcher arm "
+                         "when fanning out N member runs; a member with a "
+                         "group_id behaves identically to a standalone run "
+                         "otherwise. See DESIGN.md §20 and IMPLEMENTATION.md "
+                         "'Run-group verbs'.")
     args = ap.parse_args()
 
     # --list short-circuits everything else: read <state-root>/runs/* and

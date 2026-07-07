@@ -2300,9 +2300,14 @@ single `$LEERIE_STATE_HOST_DIR` and cannot be reused directly.
 
 #### `group_id` in `run.json`
 
-`group_id` is an optional string field in `run.json`, written by the
-`--group` launcher arm after all members complete (alongside `chain_id`,
-which is optional for the same reason). `_validate_run_json`
+`group_id` is an optional string field in `run.json`. It is written
+at two points: (1) by the orchestrator at run-start when `--group-id`
+is supplied as a CLI arg (`orchestrator/leerie.py:15022`), so the
+field appears in `run.json` immediately when the run begins; and (2)
+by the `--group` launcher arm after all members complete, via
+`update_run_json … group_id "$_group_id"` (the tag-back step in
+`leerie`). The `chain_id` field follows the same pattern.
+`_validate_run_json`
 (`orchestrator/leerie.py:1973`) does not add any invariant check on
 `group_id` — it is informational and orthogonal to the push/pause/kill
 state machine. The field is accepted by the validator without error
@@ -2411,13 +2416,13 @@ iterates `<state_dir_N>/runs/*/run.json` for each supplied directory.
 When a member's planner declares a cross-repo prerequisite as
 `requires.extent: external` (DESIGN.md §5), those entries accumulate
 in `State.data["external_preconditions"]` (written at plan time,
-`orchestrator/leerie.py:9684`). The entry shape is:
+`orchestrator/leerie.py:9700`). The entry shape is:
 `{tag, reasons:[{sid, reason}], originating_subtasks}`.
 
 The deploy-note plumbing threads `external_preconditions` from State
 into the finalize path at two points:
 
-1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14642`):
+1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14686`):
    `external_preconditions` is added as a field in the JSON payload
    passed to the `pr_writer` worker, alongside `task`, `commit_log`,
    etc. The pr_writer prompt instructs the worker to render a

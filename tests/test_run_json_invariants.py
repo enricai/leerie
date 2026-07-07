@@ -267,3 +267,23 @@ def test_accepts_empty_dict(leerie):
     A reader can still infer 'in-progress' or 'corrupt-sidecar' from the
     absence of fields."""
     leerie._validate_run_json({})
+
+
+# --- group_id (DESIGN §20 run groups) --------------------------------------
+
+def test_accepts_group_id(leerie):
+    """group_id is informational and orthogonal to push/pause/kill state.
+    No invariant check; it passes through like any other unknown field."""
+    leerie._validate_run_json(_minimal_run_json(
+        group_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    ))
+
+
+def test_accepts_group_id_with_push_state(leerie):
+    """group_id coexists with a pushed run without triggering any invariant."""
+    leerie._validate_run_json(_minimal_run_json(
+        finished_at="2026-05-26T11:00:00+00:00",
+        pushed_at="2026-05-26T11:00:05+00:00",
+        pr_url="https://github.com/owner/repo/pull/42",
+        group_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    ))
