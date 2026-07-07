@@ -2411,13 +2411,13 @@ iterates `<state_dir_N>/runs/*/run.json` for each supplied directory.
 When a member's planner declares a cross-repo prerequisite as
 `requires.extent: external` (DESIGN.md §5), those entries accumulate
 in `State.data["external_preconditions"]` (written at plan time,
-`orchestrator/leerie.py:9684`). The entry shape is:
+`orchestrator/leerie.py:9700`). The entry shape is:
 `{tag, reasons:[{sid, reason}], originating_subtasks}`.
 
 The deploy-note plumbing threads `external_preconditions` from State
 into the finalize path at two points:
 
-1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14642`):
+1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14686`):
    `external_preconditions` is added as a field in the JSON payload
    passed to the `pr_writer` worker, alongside `task`, `commit_log`,
    etc. The pr_writer prompt instructs the worker to render a
