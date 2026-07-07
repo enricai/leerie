@@ -2249,6 +2249,82 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 `.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
 `ensure_image` proceeds as before.
 
+### Auto-capture of repo dependencies
+
+At the end of a normal (non-resume) finalize, leerie scans this run's
+`logs/*.log` files to extract install intents — system-package `apt-get
+install` commands (including failed ones; the intent is the signal, not
+the outcome) and the language install command the workers actually used
+(`pnpm install`, `pip install`, `npm ci`, `cargo fetch`, `bundle install`,
+etc.). Two distinct bake paths follow.
+
+**System packages → `setup_packages` → warm apt layer.** Captured apt
+packages are union-merged into `setup_packages` in `.leerie/config.toml`
+(never clobber: only new discoveries are appended; user-edited values and
+comments are preserved). The existing launcher auto-generation path (see
+*Per-repo container image* above) turns the updated `setup_packages` into a
+derived apt-install Dockerfile next run. Workers that previously failed
+every `apt-get install` attempt (because they run unprivileged) find the
+package pre-installed; the install-intent loop stops.
+
+**Language deps → richer Dockerfile bake (gated on `bake_language_deps`,
+default true).** When `bake_language_deps` is enabled, the auto-generated
+`.leerie/Dockerfile` (and, when `build_repo_image` builds it, the derived
+image) also includes a language-dep layer: `COPY` for the lockfile, manifest
+files, and any ancillary inputs the package manager requires (workspace
+`package.json`s, `patches/`, `.npmrc`, `pnpm-workspace.yaml`), followed by
+`RUN <detected install command>` (`pnpm install --frozen-lockfile`,
+`pip install -r requirements.txt`, etc.). Workers that inherit this image
+find their `node_modules` / site-packages already populated — the per-worker
+install drops to near-zero.
+
+**Rebuild tradeoff.** A lockfile change triggers a full image rebuild
+(`build_repo_image` fires when the hash mismatches). To keep rebuilds
+narrow, `.dockerfile-hash` folds in the sha256 of every lockfile that
+participates in the `COPY` list. A change to an unrelated source file does
+not invalidate the layer. The cost — minutes per rebuild — is paid once
+across all subsequent runs, a clear net win against per-worker install time
+accumulated across hundreds of workers.
+
+**Trigger and idempotence.** Capture fires exactly once, during a normal
+(non-resume) run's finalize phase, after `finished_at` is written and
+run-branch verification completes. On a `--resume` of an already-finished
+run the resume guard returns before finalize; capture does not re-fire. On a
+`--resume` that reaches finalize (partial resume), capture re-runs — the
+union merge makes this a no-op when nothing new was found. When the union
+adds no new packages and no new install command is detected, the function
+returns immediately without touching `.leerie/config.toml`.
+
+**No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
+`.leerie/Dockerfile`) as uncommitted files in the user's working tree.
+Leerie logs one line: *"captured N package(s)/install command — run `git add
+.leerie/ && git commit` to bake into the next run's image."* The user
+controls when and whether to commit. This preserves the committed-Dockerfile
+authority rule: a user who has hand-authored `.leerie/Dockerfile` is not
+surprised by an auto-commit altering it.
+
+**Non-fatal.** Any error during capture or write — log parsing failure,
+TOML write error, filesystem permission issue — is caught, logged at debug
+level, and swallowed. A run must never fail because dependency capture
+failed. The run is marked complete regardless.
+
+**Opt-out.** Set `capture_deps = false` in `.leerie/config.toml` or
+`leerie.toml`, `LEERIE_CAPTURE_DEPS=0` in the environment, or pass
+`--no-capture-deps` (where supported) to disable capture entirely. The
+existing `capture_deps` knob is resolved by `resolve_capture_deps()` with
+CLI > env > `leerie.toml` / `.leerie/config.toml` precedence.
+
+**Committed Dockerfile is authoritative.** When `.leerie/Dockerfile` is
+already committed to the repo, capture skips writing `setup_packages` — the
+Dockerfile speaks for itself. This mirrors the existing rule: `setup_packages`
+is ignored when a committed Dockerfile is present (see *Per-repo container
+image* above).
+
+**Fly parity.** Capture writes the same files regardless of runtime. On
+`--runtime fly` the `.leerie/config.toml` and `.leerie/Dockerfile` changes
+are included in the `seed-repo.sh` whitelist so the Fly derived-image path
+picks them up on the next run identically to the local nerdctl path.
+
 ### Browser-based test execution in the base image
 
 The base image ships headless Chromium and a version-matched
