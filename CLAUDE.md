@@ -284,6 +284,17 @@ export LEERIE_MAX_PARALLEL=6
 # leerie.toml:
 ./leerie "task" --strict-conformer
 
+# Disable finalize-time dependency capture (DESIGN §6½). Default: enabled.
+# Also `capture_deps = false` in .leerie/config.toml / leerie.toml:
+export LEERIE_CAPTURE_DEPS=0
+./leerie "task"
+
+# Disable the language-dep COPY+RUN layer in the auto-generated Dockerfile
+# (bake apt packages only). Default: enabled. Also `bake_language_deps =
+# false` in .leerie/config.toml / leerie.toml:
+export LEERIE_BAKE_LANGUAGE_DEPS=0
+./leerie "task"
+
 # Waive §12 mechanical read-only enforcement on judgment workers
 # (use on repos where the planner needs pnpm/tsc/vitest visibility —
 # also LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or
