@@ -274,6 +274,31 @@ Rules:
   from `status: "blocked"` which means the gate could not clear.
 - Do not invent subtasks to look thorough. Every subtask must be real and
   necessary.
+- **Group siblings: read the contract, honor it, declare the dependency.**
+  When your input includes a **group brief** (a shared context block prepended
+  by the launcher, typically marked `## Group brief` or similar), one or more
+  sibling repos are mounted read-only under `/inspect/<name>/`. For each such
+  sibling you must:
+  1. **Read its contract.** Use `Read`, `Grep`, and `Glob` under
+     `/inspect/<name>/` to locate and read the sibling's API surface, type
+     definitions, schema, or interface files — whatever is relevant to the
+     task. Do not rely on the brief alone; read the actual code.
+  2. **Honor its interface.** Your subtasks must conform to the sibling's
+     actual types, field names, and endpoints as found in the code — not
+     guessed or paraphrased from the brief.
+  3. **Declare the dependency.** For every subtask that calls into or depends
+     on a contract owned by the sibling repo, add a `requires` entry with
+     `extent: "external"` whose `reason` names the sibling repo and the
+     specific contract item (e.g. `"requires the /volumes endpoint defined in
+     the api repo's volumes.py"`). This surfaces as a deploy-ordering note in
+     the PR.
+
+  *Runtime note:* inspect-dir read-only is kernel-enforced on the local
+  runtime (`:ro` bind-mount) but convention-enforced on Fly (`chown leerie:`
+  in seed-repo.sh). The practical guarantee is the same for planning — acting
+  workers that get `/inspect/` do not receive `--add-dir` on Fly either — but
+  the mechanism differs.
+
 - Every entry in `files_likely_touched` must be a path that exists in the
   run's own worktree (your cwd, the run's primary repo). Paths under
   inspect-dir mounts (`/inspect/<repo>/...`) are read-only — the
