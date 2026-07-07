@@ -431,7 +431,10 @@ fixture matrix so the two can never silently diverge. The `--group`
 launcher arm and group-scoped ID-dispatched verbs are tested in
 `tests/test_group_launcher.py` via the same bash-harness pattern
 (stubbed `./leerie`, multi-state-dir fixtures), modeled on
-`tests/test_chain_launcher_id_dispatch.py`. No coverage
+`tests/test_chain_launcher_id_dispatch.py`. Group-scoped verb dispatch
+across two state dirs (combined paused/unpushed + pushed fixture, plus
+`--stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
+No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
