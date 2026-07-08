@@ -5662,6 +5662,7 @@ enforcement functions:
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
 | `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that every producer's retryable-path return tags a `failure_kind` in `_RETRYABLE_FAILURE_KINDS` (`validate_result`, `check_branch_has_commits`, the inline dirty-worktree check in `settle_subtask`) |
 | `test_state_fields.py` | `STATE_FIELDS` tuple parity, in both directions: against the §8 field table, and against every `st.data[...] = …` / `setdefault(...)` write in `leerie.py`. This is the mechanism §8's "this table is canonical" claim relies on |
+| `test_blocked_clear_on_complete.py` | Fix 2 state semantics: `settle_subtask` pops `blocked[sid]` when terminal status is `"complete"` and leaves it untouched on `"failed"` / `"blocked"`; safe no-op when no `blocked` key present; only the completing sid is removed from a multi-sid dict; coupling test that `settle_subtask` source contains the exact `st.data.get("blocked", {}).pop(sid, None)` expression |
 | `test_validate_plan.py` | `validate_plan()` (every rule in §5) |
 | `test_validate_result.py` | `validate_result()` (every status-branch invariant) |
 | `test_check_merge_committed.py` | `check_merge_committed()` (real-git fixtures) |
