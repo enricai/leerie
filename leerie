@@ -844,6 +844,98 @@ TOML
           "Help me configure leerie for this repo."
         exit 0
         ;;
+      --recapture)
+        # Re-scan the latest completed run's logs for this repo and rewrite
+        # setup_packages in .leerie/config.toml.  Uses the same orchestrator-side
+        # python functions as finalize-time capture (Stage 4), called via a
+        # host-side python3 seam.  Host-only — no nerdctl invoked.
+        # With --force: wholesale replace (bake_language_deps unaffected).
+        # Without --force: never-clobber union (only new packages appended).
+        shift  # consume --recapture; next arg may be --force
+        _recapture_force=false
+        if [ "${1:-}" = "--force" ]; then
+          _recapture_force=true
+          shift
+        fi
+        _leerie_state_dir="${LEERIE_STATE_HOST_DIR:-$HOME/.leerie/$(basename "$_user_repo")}"
+        _runs_dir="$_leerie_state_dir/runs"
+        if [ ! -d "$_runs_dir" ]; then
+          remote_log "config --recapture: no runs directory at $_runs_dir; nothing to recapture"
+          exit 1
+        fi
+        # Find the newest finished run (has finished_at in run.json).
+        _newest_log_dir="$(python3 - "$_runs_dir" <<'PY'
+import json, sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+best = ("", "")  # (finished_at, logs_dir)
+for run_dir in runs.iterdir():
+    if not run_dir.is_dir():
+        continue
+    rj = run_dir / "run.json"
+    if not rj.is_file():
+        continue
+    try:
+        data = json.loads(rj.read_text())
+    except (OSError, ValueError):
+        continue
+    fa = data.get("finished_at", "")
+    if fa and fa > best[0]:
+        log_dir = run_dir / "logs"
+        if log_dir.is_dir():
+            best = (fa, str(log_dir))
+print(best[1])
+PY
+        )"
+        if [ -z "$_newest_log_dir" ]; then
+          remote_log "config --recapture: no completed run with logs found in $_runs_dir"
+          exit 1
+        fi
+        remote_log "config --recapture: scanning $_newest_log_dir ..."
+        # Call orchestrator functions via python3.  The orchestrator's leerie.py
+        # must be importable (it's on the host path via the leerie install).
+        _recapture_rc=0
+        python3 - "$_user_repo" "$_newest_log_dir" "$_recapture_force" \
+            "$LEERIE_REPO/orchestrator/leerie.py" <<'PY' || _recapture_rc=$?
+import sys, importlib.util, pathlib
+
+user_repo = pathlib.Path(sys.argv[1])
+log_dir   = pathlib.Path(sys.argv[2])
+force     = sys.argv[3] == "true"
+orch_path = pathlib.Path(sys.argv[4])
+
+# Load the orchestrator module by path so we never mutate sys.path permanently.
+spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+apt_pkgs, _lang = m._capture_installs_from_logs(log_dir)
+cfg_path = user_repo / ".leerie" / "config.toml"
+
+if force:
+    # Wholesale replace: write apt_pkgs directly (even if empty — clears stale).
+    if apt_pkgs:
+        m._write_config_toml_keys(cfg_path, {"setup_packages": " ".join(apt_pkgs)})
+        print(f"config --recapture --force: wrote setup_packages={' '.join(apt_pkgs)!r}")
+    else:
+        print("config --recapture --force: no apt packages found in logs; setup_packages unchanged")
+else:
+    existing = m._read_toml_key(cfg_path, "setup_packages") or ""
+    merged = m._merge_setup_packages(existing, apt_pkgs)
+    if merged is None:
+        print(f"config --recapture: no new packages vs existing {existing!r}; nothing to write")
+    else:
+        m._write_config_toml_keys(cfg_path, {"setup_packages": merged})
+        print(f"config --recapture: wrote setup_packages={merged!r}")
+PY
+        if [ "$_recapture_rc" -ne 0 ]; then
+          remote_log "config --recapture: python3 seam failed (rc=$_recapture_rc); check orchestrator path"
+          exit 1
+        fi
+        unset _recapture_force _leerie_state_dir _runs_dir _newest_log_dir _recapture_rc
+        exit 0
+        ;;
       "")
         echo "Effective leerie config for: $_user_repo"
         echo ""
@@ -866,7 +958,7 @@ TOML
         ;;
       *)
         echo "leerie config: unknown sub-command '$1'" >&2
-        echo "Usage: leerie config [--init | --chat]" >&2
+        echo "Usage: leerie config [--init | --chat | --recapture [--force]]" >&2
         exit 1
         ;;
     esac
@@ -3876,6 +3968,38 @@ REPO_IMAGE_TAG=""
 _leerie_config_toml="$USER_REPO/.leerie/config.toml"
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
 
+# Resolve bake_language_deps preference.
+# Precedence: LEERIE_BAKE_LANGUAGE_DEPS env > leerie.toml > .leerie/config.toml > true.
+_BAKE_LANGUAGE_DEPS=true
+if [ -n "${LEERIE_BAKE_LANGUAGE_DEPS:-}" ]; then
+  case "${LEERIE_BAKE_LANGUAGE_DEPS}" in
+    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
+    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
+  esac
+elif [ -f "$USER_REPO/leerie.toml" ]; then
+  _bld_toml="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
+                      "$USER_REPO/leerie.toml" 2>/dev/null \
+                  | head -1 \
+                  | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
+                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
+  case "${_bld_toml:-}" in
+    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
+    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
+  esac
+  unset _bld_toml
+elif [ -f "$_leerie_config_toml" ]; then
+  _bld_cfg="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
+                     "$_leerie_config_toml" 2>/dev/null \
+                 | head -1 \
+                 | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
+                           s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
+  case "${_bld_cfg:-}" in
+    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
+    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
+  esac
+  unset _bld_cfg
+fi
+
 # Auto-generate a Dockerfile from setup_packages if no Dockerfile exists.
 if [ ! -f "$_leerie_dockerfile" ] && [ -f "$_leerie_config_toml" ]; then
   _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
@@ -3900,8 +4024,182 @@ if [ ! -f "$_leerie_dockerfile" ] && [ -f "$_leerie_config_toml" ]; then
       printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
     done
     printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
+
+    # Language-dep layer (gated on bake_language_deps, default true).
+    # Uses python3 to detect lockfiles/manifests and emit COPY+RUN.
+    # Lockfile+patch shas are embedded as a comment inside the Dockerfile
+    # so the existing Dockerfile-sha naturally folds them into .dockerfile-hash
+    # at BOTH local and Fly hash sites — no second hash-computation needed.
+    if [ "$_BAKE_LANGUAGE_DEPS" = "true" ]; then
+      _lang_layer="$(python3 - "$USER_REPO" <<'PY'
+import sys, os, hashlib
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+
+# Detect lockfile manager (mirrors _lockfile_table_entries precedence).
+has_pnpm  = (repo / "pnpm-lock.yaml").is_file()
+has_yarn  = (repo / "yarn.lock").is_file()
+has_npm   = (repo / "package-lock.json").is_file()
+has_uv    = (repo / "uv.lock").is_file()
+has_poetry = (repo / "poetry.lock").is_file()
+has_pipenv = (repo / "Pipfile.lock").is_file()
+has_go    = (repo / "go.mod").is_file() and (repo / "go.sum").is_file()
+has_cargo = (repo / "Cargo.lock").is_file()
+has_bundle = (repo / "Gemfile.lock").is_file()
+has_composer = (repo / "composer.lock").is_file()
+has_dotnet = (repo / "packages.lock.json").is_file()
+
+copy_files = []
+run_cmd = ""
+lockfile_shas = {}
+
+def sha256(p):
+    h = hashlib.sha256()
+    h.update(p.read_bytes())
+    return h.hexdigest()
+
+if has_pnpm:
+    copy_files.append("pnpm-lock.yaml")
+    # Always include root package.json.
+    if (repo / "package.json").is_file():
+        copy_files.append("package.json")
+    # Include pnpm-workspace.yaml if present (workspace roots).
+    if (repo / "pnpm-workspace.yaml").is_file():
+        copy_files.append("pnpm-workspace.yaml")
+    # Include .npmrc if present.
+    if (repo / ".npmrc").is_file():
+        copy_files.append(".npmrc")
+    # Include workspace children package.json files.
+    try:
+        import re, json as _json
+        ws_raw = (repo / "pnpm-workspace.yaml").read_text() if (repo / "pnpm-workspace.yaml").is_file() else ""
+        # Simple glob extraction from YAML packages list.
+        ws_globs = re.findall(r"[-]\s+['\"]?([^'\"#\n]+)['\"]?", ws_raw)
+        for glob_pat in ws_globs:
+            glob_pat = glob_pat.strip()
+            if not glob_pat:
+                continue
+            import glob as _glob
+            for match in _glob.glob(os.path.join(str(repo), glob_pat, "package.json")):
+                rel = os.path.relpath(match, str(repo))
+                if rel not in copy_files:
+                    copy_files.append(rel)
+    except Exception:
+        pass
+    # Include patches/ directory if present.
+    if (repo / "patches").is_dir():
+        copy_files.append("patches/")
+    lockfile_shas["pnpm-lock.yaml"] = sha256(repo / "pnpm-lock.yaml")
+    run_cmd = "pnpm install --frozen-lockfile"
+elif has_yarn:
+    copy_files += ["yarn.lock"]
+    if (repo / "package.json").is_file():
+        copy_files.append("package.json")
+    lockfile_shas["yarn.lock"] = sha256(repo / "yarn.lock")
+    run_cmd = "yarn install --frozen-lockfile"
+elif has_npm:
+    copy_files += ["package-lock.json"]
+    if (repo / "package.json").is_file():
+        copy_files.append("package.json")
+    lockfile_shas["package-lock.json"] = sha256(repo / "package-lock.json")
+    run_cmd = "npm ci"
+elif has_uv:
+    copy_files.append("uv.lock")
+    if (repo / "pyproject.toml").is_file():
+        copy_files.append("pyproject.toml")
+    lockfile_shas["uv.lock"] = sha256(repo / "uv.lock")
+    run_cmd = "uv sync"
+elif has_poetry:
+    copy_files.append("poetry.lock")
+    if (repo / "pyproject.toml").is_file():
+        copy_files.append("pyproject.toml")
+    lockfile_shas["poetry.lock"] = sha256(repo / "poetry.lock")
+    run_cmd = "poetry install"
+elif has_pipenv:
+    copy_files.append("Pipfile.lock")
+    if (repo / "Pipfile").is_file():
+        copy_files.append("Pipfile")
+    lockfile_shas["Pipfile.lock"] = sha256(repo / "Pipfile.lock")
+    run_cmd = "pipenv install"
+elif has_go:
+    copy_files += ["go.mod", "go.sum"]
+    lockfile_shas["go.sum"] = sha256(repo / "go.sum")
+    run_cmd = "go mod download"
+elif has_cargo:
+    copy_files.append("Cargo.lock")
+    if (repo / "Cargo.toml").is_file():
+        copy_files.append("Cargo.toml")
+    lockfile_shas["Cargo.lock"] = sha256(repo / "Cargo.lock")
+    run_cmd = "cargo fetch"
+elif has_bundle:
+    copy_files.append("Gemfile.lock")
+    if (repo / "Gemfile").is_file():
+        copy_files.append("Gemfile")
+    lockfile_shas["Gemfile.lock"] = sha256(repo / "Gemfile.lock")
+    run_cmd = "bundle install"
+elif has_composer:
+    copy_files.append("composer.lock")
+    if (repo / "composer.json").is_file():
+        copy_files.append("composer.json")
+    lockfile_shas["composer.lock"] = sha256(repo / "composer.lock")
+    run_cmd = "composer install --no-interaction"
+elif has_dotnet:
+    copy_files.append("packages.lock.json")
+    lockfile_shas["packages.lock.json"] = sha256(repo / "packages.lock.json")
+    run_cmd = "dotnet restore"
+
+if not run_cmd:
+    sys.exit(0)
+
+# Emit COPY + RUN lines.
+# Shas are embedded as a comment so the Dockerfile sha captures lockfile drift.
+sha_comment = "# lockfile-shas: " + " ".join(f"{k}={v[:12]}" for k, v in sorted(lockfile_shas.items()))
+copy_line = "COPY " + " ".join(copy_files) + " ./"
+run_line = f"RUN {run_cmd}"
+print(sha_comment)
+print(copy_line)
+print(run_line)
+PY
+      )"
+      if [ -n "$_lang_layer" ]; then
+        printf '%s\n' "$_lang_layer" >> "$_gen_df_tmp"
+      else
+        remote_log "auto-generating: no lockfile detected; skipping language-dep layer"
+      fi
+      unset _lang_layer
+    fi
+
     mv "$_gen_df_tmp" "$_leerie_dockerfile"
     unset _gen_df_tmp _pkg
+
+    # Verify the language-dep layer builds correctly; on failure fall back
+    # to apt-only by regenerating without the COPY+RUN lines.
+    if [ "$_BAKE_LANGUAGE_DEPS" = "true" ] && \
+       grep -q "^COPY " "$_leerie_dockerfile" 2>/dev/null; then
+      if ! nerdctl build \
+           --build-arg BASE_IMAGE="$IMAGE_TAG" \
+           --build-arg HOST_UID="$(id -u)" \
+           --build-arg HOST_GID="$(id -g)" \
+           -t "__leerie_lang_probe_$$" \
+           -f "$_leerie_dockerfile" \
+           "$USER_REPO" \
+           >/dev/null 2>&1; then
+        remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake (bake_language_deps=false for this run)"
+        # Regenerate apt-only Dockerfile without the language-dep layer.
+        _gen_df_tmp2="$USER_REPO/.leerie/.Dockerfile.gen2.$$"
+        printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
+          > "$_gen_df_tmp2"
+        for _pkg2 in $_sp_packages; do
+          printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
+        done
+        printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp2"
+        mv "$_gen_df_tmp2" "$_leerie_dockerfile"
+        unset _gen_df_tmp2 _pkg2
+      else
+        nerdctl image rm "__leerie_lang_probe_$$" >/dev/null 2>&1 || true
+      fi
+    fi
   fi
   unset _sp _sp_packages
 fi

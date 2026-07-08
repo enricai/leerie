@@ -479,3 +479,215 @@ def test_nerdctl_run_uses_repo_image_tag_when_set(tmp_path):
     launcher_text = _launcher_text()
     # The nerdctl run line must use the fallback expression
     assert '"${REPO_IMAGE_TAG:-$IMAGE_TAG}"' in launcher_text
+
+
+# ---------------------------------------------------------------------------
+# Language-dep bake (bake_language_deps, default true)
+# ---------------------------------------------------------------------------
+
+def test_language_dep_layer_included_for_pnpm_repo(tmp_path):
+    """With pnpm-lock.yaml present and bake_language_deps=true, the auto-generated
+    Dockerfile includes COPY of lockfile+manifests and RUN pnpm install."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "libvips-dev"\n')
+    # Simulate a pnpm repo.
+    (user_repo / "package.json").write_text('{"name":"test"}')
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_BAKE_LANGUAGE_DEPS": "true",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    df_content = result.stdout
+    # Must have apt layer.
+    assert "apt-get install" in df_content
+    assert "libvips-dev" in df_content
+    # Must have COPY line including pnpm-lock.yaml.
+    assert "COPY" in df_content
+    assert "pnpm-lock.yaml" in df_content
+    # Must have RUN pnpm install.
+    assert "RUN pnpm install --frozen-lockfile" in df_content
+    # Must have lockfile-shas comment so Dockerfile sha captures lockfile drift.
+    assert "lockfile-shas:" in df_content
+    assert "pnpm-lock.yaml=" in df_content
+
+
+def test_language_dep_layer_includes_patches_for_pnpm(tmp_path):
+    """patches/ directory is included in COPY when present (pnpm patchedDependencies)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    (user_repo / "package.json").write_text('{"name":"test"}')
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+    patches_dir = user_repo / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "foo.patch").write_text("--- a/foo\n+++ b/foo\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "patches/" in result.stdout
+
+
+def test_language_dep_layer_disabled_by_env(tmp_path):
+    """LEERIE_BAKE_LANGUAGE_DEPS=false produces apt-only Dockerfile."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    (user_repo / "package.json").write_text('{"name":"test"}')
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_BAKE_LANGUAGE_DEPS": "false",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    df_content = result.stdout
+    # apt layer present.
+    assert "apt-get install" in df_content
+    assert "curl" in df_content
+    # No language-dep layer.
+    assert "COPY" not in df_content
+    assert "pnpm install" not in df_content
+    assert "lockfile-shas" not in df_content
+
+
+def test_language_dep_disabled_via_zero(tmp_path):
+    """LEERIE_BAKE_LANGUAGE_DEPS=0 is accepted as false."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "libffi-dev"\n')
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
+    (user_repo / "package.json").write_text('{}')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_BAKE_LANGUAGE_DEPS": "0",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COPY" not in result.stdout
+    assert "pnpm install" not in result.stdout
+
+
+def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
+    """A lockfile change causes the Dockerfile sha to differ (because the sha
+    comment line changes), which flips _need_build=true via the hash check."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    (user_repo / "package.json").write_text('{"name":"x"}')
+    lockfile = user_repo / "pnpm-lock.yaml"
+    lockfile.write_text("lockfileVersion: '6.0'\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    # First run: generate Dockerfile, record its sha.
+    result1 = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result1.returncode == 0, result1.stderr
+    df_content_v1 = result1.stdout
+    assert "lockfile-shas:" in df_content_v1
+
+    # Now simulate a lockfile change — the sha comment will differ in a new generation.
+    lockfile.write_text("lockfileVersion: '6.0'\n# changed\n")
+    # Remove the auto-generated Dockerfile so it regenerates.
+    import os
+    os.remove(user_repo / ".leerie" / "Dockerfile")
+
+    result2 = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "0",  # image present
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result2.returncode == 0, result2.stderr
+    df_content_v2 = result2.stdout
+
+    # The lockfile-shas line must differ between v1 and v2 (different sha).
+    import re
+    sha_line_v1 = next((l for l in df_content_v1.splitlines() if "lockfile-shas:" in l), "")
+    sha_line_v2 = next((l for l in df_content_v2.splitlines() if "lockfile-shas:" in l), "")
+    assert sha_line_v1 != sha_line_v2, "lockfile sha comment must differ when lockfile changes"
+
+
+def test_no_lockfile_no_language_dep_layer(tmp_path):
+    """Without any lockfile, only the apt layer is generated even with bake_language_deps=true."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    # No lockfile in user_repo.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_BAKE_LANGUAGE_DEPS": "true",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    df_content = result.stdout
+    assert "apt-get install" in df_content
+    assert "COPY" not in df_content
