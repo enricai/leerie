@@ -125,10 +125,6 @@ def test_settle_subtask_source_text_contains_blocked_pop(leerie):
     blocked-pop expression so this fix can't be silently reverted by a
     future refactor that changes the code but not the tests."""
     import inspect
-    import orchestrator.leerie as _leerie_module  # type: ignore
-    # We can't import orchestrator.leerie directly as a package from
-    # within the test runner that loads via importlib, so use the
-    # already-loaded leerie fixture module.
     src = inspect.getsource(leerie.settle_subtask)
     assert 'st.data.get("blocked", {}).pop(sid, None)' in src, (
         "settle_subtask must contain "
