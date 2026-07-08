@@ -1200,3 +1200,26 @@ def test_poll_loop_attached_pid_not_reaped(leerie, monkeypatch):
 
     asyncio.run(_run())
     assert 800 not in killed, f"Attached PID 800 must not be reaped; killed={killed}"
+
+
+# --- cgroup_sid=None default — constructor compatibility guard ----------------
+
+def test_descendant_tracker_cgroup_sid_defaults_to_none():
+    """Static: `_DescendantTracker.__init__` must declare `cgroup_sid` with
+    a `= None` default so the 3 pre-existing direct `_DescendantTracker(proc.pid)`
+    constructor call sites in this test file keep working without changes.
+    Pin this structurally — a refactor that drops the default breaks all three."""
+    leerie_src = LEERIE_PY.read_text()
+    m = re.search(
+        r"class _DescendantTracker:.*?def __init__\(self[^)]+\):",
+        leerie_src, re.DOTALL,
+    )
+    assert m, "could not locate _DescendantTracker.__init__ in leerie.py"
+    init_sig = m.group(0)
+    assert "cgroup_sid: str | None = None" in init_sig, (
+        "_DescendantTracker.__init__ must declare `cgroup_sid: str | None = None` "
+        "so the 3 pre-existing bare _DescendantTracker(proc.pid) constructors "
+        "in this test file continue to work without any changes. "
+        "A refactor that removes the default or changes the type annotation "
+        "breaks backward compatibility with every existing call site."
+    )
