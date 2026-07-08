@@ -723,20 +723,35 @@ def test_invoke_pid_exhaustion_via_climbing_denials(leerie, leerie_dir,
     denials since the FIRST probe) confirms exhaustion. The probe fires
     once per errored result past the threshold; probe #1 (3rd error)
     latches the baseline, probe #2 (4th error) sees the counter climbed
-    and raises."""
+    and raises. _cgroup_stat is shared with the _DescendantTracker poll
+    loop, which probes it on every iteration and interposes an
+    indeterminate number of calls between the detector's two probes; a
+    monotonically climbing denial counter guarantees probe #2 exceeds
+    whatever value probe #1 latched as the baseline (at_cap stays False
+    since 200 < 256, so the raise comes via denials_climbing)."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "x"}),
         _errored_tool_result(),   # 1
         _errored_tool_result(),   # 2
-        _errored_tool_result(),   # 3 -> probe #1: baseline latches to 0
-        _errored_tool_result(),   # 4 -> probe #2: events 0 -> 7 -> raise
+        _errored_tool_result(),   # 3 -> probe #1: baseline latches
+        _errored_tool_result(),   # 4 -> probe #2: counter climbed -> raise
         json.dumps({"type": "result", "subtype": "success",
                     "structured_output": {"ok": True}, "is_error": False}),
     ]
-    seq = iter([(200, 256, 0), (200, 256, 7)])
+    # _cgroup_stat is shared with the _DescendantTracker poll loop, which
+    # probes it on every iteration and interposes an indeterminate number of
+    # calls between the detector's two probes. A monotonically climbing
+    # ev_max guarantees the detector's 2nd probe exceeds whatever its 1st
+    # probe latched as the baseline, whatever that value was — the tracker's
+    # calls only advance it further. current=200 < max=256 keeps at_cap
+    # False (raise is via denials_climbing) and pressure (200/256 = 0.78)
+    # stays below _PID_REAP_HIGH_WATER (0.90) so reaping never arms.
+    denials = [0]
+    def _climbing_stat(sid):
+        denials[0] += 1
+        return (200, 256, denials[0])
     _enable_fake_cgroup(leerie, monkeypatch, None)
-    monkeypatch.setattr(leerie, "_cgroup_stat",
-                        lambda sid: next(seq, (200, 256, 7)))
+    monkeypatch.setattr(leerie, "_cgroup_stat", _climbing_stat)
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     with pytest.raises(leerie.WorkerError):
