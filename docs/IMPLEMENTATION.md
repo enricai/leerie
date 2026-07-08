@@ -3147,7 +3147,7 @@ never fall inside a `st.data[k] = v; st.save()` pair. `State.save()`
 still writes to a temp file then `os.replace()` for atomicity against
 process crash.
 
-Subprocess cleanup is two-layered, addressing two distinct leak classes:
+Subprocess cleanup is three-layered, addressing two distinct leak classes plus mid-run pressure reduction:
 
 1. **Lifetime descendant tracking (`_DescendantTracker`).** A per-worker
    asyncio task started at spawn polls `_enumerate_descendants(proc.pid)`
@@ -3178,11 +3178,34 @@ Subprocess cleanup is two-layered, addressing two distinct leak classes:
    reap *after* `_terminate_proc_tree`, catching any backgrounded
    subprocess that was orphaned during the run.
 
-The two layers compose: `_terminate_proc_tree` is broad and
+Layers 1 and 2 compose: `_terminate_proc_tree` is broad and
 synchronous (one call, kills attached subtree), the tracker is narrow
 and historical (kills only what it observed, including processes
 that have since reparented away). Neither alone is sufficient; both
 together close the leak.
+
+3. **Mid-run PID reaping (`_poll_loop` + `_reparented_orphans`).** A
+   pressure-gated reducer that sits under the PID-exhaustion-detection
+   backstop (see below) and proactively reaps orphaned subprocesses before
+   `pids.max` is reached. `_DescendantTracker` gains a `cgroup_sid: str | None = None`
+   parameter (default `None` so existing direct constructors in the test
+   suite keep working and the reaper is inert without a cgroup). `_invoke`
+   threads the in-scope `cgroup_sid` into the constructor call. Each
+   `_poll_loop` cycle, when `cgroup_sid` is set, the tracker calls
+   `_cgroup_stat(cgroup_sid)` and computes the pressure ratio
+   `pids.current / pids.max`. Reaping is armed only when that ratio reaches
+   or exceeds `_PID_REAP_HIGH_WATER = 0.90`; when armed, it calls
+   `_reparented_orphans(self._seen)` to obtain the killable set and sends
+   `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
+   soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
+   are pruned from `_seen`; the exit-time `stop_and_reap` path is unchanged.
+   `_reparented_orphans(seen: set[int]) -> list[int]` runs one
+   `ps -eo pid,ppid,etimes` snapshot and returns, sorted oldest-first, the
+   PIDs from `seen` that are simultaneously alive, reparented to init
+   (`ppid == 1`), and at least `_PID_REAP_MIN_AGE_SEC = 60` seconds old.
+   Module-level constants (placed next to `_DESCENDANT_POLL_SEC` /
+   `_PID_EXHAUSTION_WINDOW`): `_PID_REAP_HIGH_WATER = 0.90`,
+   `_PID_REAP_LOW_WATER = 0.75`, `_PID_REAP_MIN_AGE_SEC = 60`.
 
 **PID-exhaustion detection (`_cgroup_stat` + `_read_stream` probe).** The
 above cleanup runs at worker *exit*; leaked `run_in_background`
