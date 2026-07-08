@@ -1023,3 +1023,224 @@ def test_config_inference_parity_detects_reverted_launcher_inferrer(tmp_path, le
         "_infer_build_lint_test() on Cargo — the parity guard would not "
         "have caught the regression it exists to catch"
     )
+
+
+# ---------------------------------------------------------------------------
+# config --recapture tests
+# ---------------------------------------------------------------------------
+# These tests verify the dispatch logic of the --recapture arm: argument
+# parsing, state-dir probe, and that it stays within the parity-guard
+# extraction boundaries.  They stub out the python3 seam so they don't
+# require feat-002's orchestrator functions.
+# ---------------------------------------------------------------------------
+
+def _run_real_config_arm_with_state(
+    user_repo: Path,
+    args: list[str],
+    tmp_path: Path,
+    state_dir: Path | None = None,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
+    """Variant of _run_real_config_arm that injects LEERIE_STATE_HOST_DIR
+    and optionally stubs python3 to a no-op for recapture tests."""
+    block = _extract_config_arm()
+    script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'remote_log() { echo "[leerie] $*" >&2; }\n'
+        "claude() {\n"
+        "  printf '%s\\n' \"$*\" >> \"${CLAUDE_LOG:-/dev/null}\"\n"
+        "  return 0\n"
+        "}\n"
+        "export -f claude\n"
+        "\n"
+        'case "${1:-}" in\n'
+        f"{block}\n"
+        "esac\n"
+    )
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": str(tmp_path / "home"),
+        "USER_REPO": str(user_repo),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "CLAUDE_LOG": str(tmp_path / "claude.log"),
+    }
+    if state_dir is not None:
+        env["LEERIE_STATE_HOST_DIR"] = str(state_dir)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", "-c", script, "--", "config"] + args,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_recapture_no_runs_dir_exits_1(tmp_path):
+    """--recapture exits 1 with a diagnostic when no runs directory exists."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # No runs/ subdir — should fail gracefully.
+    result = _run_real_config_arm_with_state(user_repo, ["--recapture"], tmp_path,
+                                             state_dir=state_dir)
+    assert result.returncode == 1
+    assert "no runs directory" in result.stderr or "no runs directory" in result.stderr.lower()
+
+
+def test_recapture_no_finished_run_exits_1(tmp_path):
+    """--recapture exits 1 when there are runs but none are finished."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs" / "run-abc"
+    runs_dir.mkdir(parents=True)
+    # run.json has no finished_at.
+    (runs_dir / "run.json").write_text('{"started_at": "2026-01-01T00:00:00"}')
+    logs_dir = runs_dir / "logs"
+    logs_dir.mkdir()
+
+    result = _run_real_config_arm_with_state(user_repo, ["--recapture"], tmp_path,
+                                             state_dir=state_dir)
+    assert result.returncode == 1
+    assert "no completed run" in result.stderr.lower() or "no completed" in result.stderr
+
+
+def test_recapture_dispatches_to_python3(tmp_path):
+    """--recapture finds a finished run and dispatches to python3 seam."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs" / "run-abc"
+    runs_dir.mkdir(parents=True)
+    # A finished run with logs dir.
+    (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
+    logs_dir = runs_dir / "logs"
+    logs_dir.mkdir()
+
+    # Stub python3 to record the call and exit 0.
+    python3_stub = tmp_path / "python3"
+    python3_stub.write_text(
+        "#!/bin/sh\n"
+        "echo 'python3-stub: config --recapture OK'\n"
+        "exit 0\n"
+    )
+    python3_stub.chmod(0o755)
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path,
+        state_dir=state_dir,
+        extra_env={"PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "python3-stub" in result.stdout or "recapture" in result.stderr.lower()
+
+
+def test_recapture_force_flag_passed_correctly(tmp_path):
+    """--recapture --force passes 'true' as the force argument to the python3 seam."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs" / "run-abc"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
+    (runs_dir / "logs").mkdir()
+
+    # Stub python3 to echo its argv so we can verify force=true is passed.
+    python3_stub = tmp_path / "python3"
+    python3_stub.write_text(
+        "#!/bin/sh\n"
+        "echo \"python3 args: $*\"\n"
+        "exit 0\n"
+    )
+    python3_stub.chmod(0o755)
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture", "--force"], tmp_path,
+        state_dir=state_dir,
+        extra_env={"PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    # The stub echoes its args; the force argument should be 'true'.
+    assert "true" in result.stdout
+
+
+def test_recapture_python3_failure_exits_1(tmp_path):
+    """--recapture exits 1 when the main python3 seam (orchestrator call) fails.
+    The first python3 call (find-newest-run) must succeed; the second (seam) fails."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs" / "run-abc"
+    logs_dir = runs_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
+
+    # Stub python3: first call (find-newest-run discovery) prints the real
+    # logs dir path and exits 0; second call (the seam) exits 1.
+    call_count_file = tmp_path / "python3_calls"
+    call_count_file.write_text("0")
+    python3_stub = tmp_path / "python3"
+    python3_stub.write_text(
+        f"#!/bin/sh\n"
+        f"n=$(cat {call_count_file})\n"
+        f"echo $((n+1)) > {call_count_file}\n"
+        f"if [ \"$n\" = '0' ]; then\n"
+        f"  echo '{logs_dir}'\n"
+        f"  exit 0\n"
+        f"fi\n"
+        f"exit 1\n"
+    )
+    python3_stub.chmod(0o755)
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path,
+        state_dir=state_dir,
+        extra_env={"PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 1
+    assert "python3 seam failed" in result.stderr or "failed" in result.stderr.lower()
+
+
+def test_recapture_arm_within_parity_guard_boundaries():
+    """The --recapture arm must be inside the config) ... --list) extraction
+    boundary used by the parity guard (and thus by the real config arm tests)."""
+    arm = _extract_config_arm()
+    assert "--recapture" in arm, (
+        "--recapture arm is missing from the config) extraction boundary; "
+        "it must be placed between 'config)' and '--list)' in the launcher"
+    )
+
+
+def test_recapture_no_nerdctl(tmp_path):
+    """--recapture must NOT invoke nerdctl (host-side only, no container)."""
+    user_repo = tmp_path / "repo"
+    user_repo.mkdir()
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs" / "run-abc"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
+    (runs_dir / "logs").mkdir()
+
+    nerdctl_log = tmp_path / "nerdctl.log"
+    # Stub nerdctl to record calls and succeed; stub python3 to succeed.
+    python3_stub = tmp_path / "python3"
+    python3_stub.write_text("#!/bin/sh\necho ok\nexit 0\n")
+    python3_stub.chmod(0o755)
+    nerdctl_stub = tmp_path / "nerdctl"
+    nerdctl_stub.write_text(
+        f"#!/bin/sh\necho \"nerdctl $*\" >> {nerdctl_log}\nexit 0\n"
+    )
+    nerdctl_stub.chmod(0o755)
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path,
+        state_dir=state_dir,
+        extra_env={"PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert not nerdctl_log.exists() or nerdctl_log.read_text() == "", (
+        "config --recapture must not invoke nerdctl"
+    )
