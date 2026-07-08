@@ -453,7 +453,14 @@ orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 the fail-closed `enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
 sid validation, and v1/v2 path selection — against
-a fake cgroupfs. The `leerie config` verb (all four sub-modes: `--init`,
+a fake cgroupfs. Mid-run PID reaping (DESIGN §6 *Mid-run PID reaping*) is
+tested in `tests/test_signal_cleanup.py`: `_reparented_orphans` selects only
+alive+ppid==1+old PIDs sorted oldest-first (stubbed ps); `_poll_loop` reaps
+only at ≥90% pressure and stops below 75% (hysteresis); below 90% is a
+byte-identical no-op; young (<60s) and attached (ppid!=1) PIDs are never
+reaped; and a structural guard pins `cgroup_sid: str | None = None` on
+`_DescendantTracker.__init__` so the 3 pre-existing direct-constructor call
+sites remain compatible after the parameter was added. The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and
