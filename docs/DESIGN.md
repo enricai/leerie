@@ -2358,10 +2358,10 @@ level, and swallowed. A run must never fail because dependency capture
 failed. The run is marked complete regardless.
 
 **Opt-out.** Set `capture_deps = false` in `.leerie/config.toml` or
-`leerie.toml`, `LEERIE_CAPTURE_DEPS=0` in the environment, or pass
-`--no-capture-deps` (where supported) to disable capture entirely. The
-existing `capture_deps` knob is resolved by `resolve_capture_deps()` with
-CLI > env > `leerie.toml` / `.leerie/config.toml` precedence.
+`LEERIE_CAPTURE_DEPS=0` in the environment to disable capture entirely.
+The `capture_deps` knob is resolved by `resolve_capture_deps()` with
+`LEERIE_CAPTURE_DEPS` env > `.leerie/config.toml` > default `true`
+precedence. There is no CLI flag and no `leerie.toml` tier.
 
 **Committed Dockerfile is authoritative.** When `.leerie/Dockerfile` is
 already committed to the repo, capture skips writing `setup_packages` — the
