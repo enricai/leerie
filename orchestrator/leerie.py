@@ -1612,7 +1612,54 @@ def _signal_pids(pids: set[int], sig: int) -> None:
             pass
 
 
+def _reparented_orphans(seen: set[int]) -> list[int]:
+    """Return PIDs from `seen` that are currently alive, reparented to
+    init (ppid==1), and older than _PID_REAP_MIN_AGE_SEC seconds —
+    sorted oldest-first (longest-running first, safest to kill first).
+
+    These are the leaked background subprocesses that have finished their
+    immediate work and been orphaned; unlike a recently-launched background
+    test (also ppid==1 but *young*), they have been silent long enough
+    that the age floor distinguishes them. Uses `ps -eo pid,ppid,etimes`
+    where `etimes` is a bare elapsed-seconds integer (POSIX extension,
+    verified present in the container image).
+
+    Returns an empty list on any `ps` failure — same empty-set fallback
+    as `_enumerate_descendants`."""
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,ppid,etimes"],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    candidates: list[tuple[int, int]] = []  # (etimes, pid), for sorting
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid, etimes = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if pid in seen and ppid == 1 and etimes >= _PID_REAP_MIN_AGE_SEC:
+            candidates.append((etimes, pid))
+    # Oldest-first: killing the longest-running orphans first frees the most
+    # slots while touching the fewest recently-launched background processes.
+    candidates.sort(reverse=True)
+    return [pid for _, pid in candidates]
+
+
 _DESCENDANT_POLL_SEC = 0.5
+
+# Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
+# High-water: arm reaping when pids.current/pids.max reaches this ratio.
+# Low-water: stop killing once pressure drops below this ratio (hysteresis).
+# Min-age: only orphans older than this many seconds are eligible — protects
+# recently-launched background tasks the worker may still be waiting on.
+_PID_REAP_HIGH_WATER = 0.90
+_PID_REAP_LOW_WATER = 0.75
+_PID_REAP_MIN_AGE_SEC = 60
 
 # `_invoke`'s PID-exhaustion detector probes the cgroup once the last
 # _PID_EXHAUSTION_WINDOW tool-results hold ≥_PID_EXHAUSTION_ERROR_THRESHOLD
@@ -1660,8 +1707,10 @@ class _DescendantTracker:
     even with `max_parallel` concurrent workers the polling stays on
     one CPU."""
 
-    def __init__(self, leader_pid: int):
+    def __init__(self, leader_pid: int,
+                 cgroup_sid: str | None = None):
         self._leader_pid = leader_pid
+        self._cgroup_sid = cgroup_sid
         self._seen: set[int] = set()
         self._task: asyncio.Task | None = None
         self._stopped = False
@@ -1676,6 +1725,31 @@ class _DescendantTracker:
             while not self._stopped:
                 descendants = _enumerate_descendants(self._leader_pid)
                 self._seen.update(descendants)
+                # Pressure-gated mid-run reaping (DESIGN §6 *Mid-run PID
+                # reaping*). Only active when this tracker was constructed
+                # with a cgroup_sid; otherwise the branch is a no-op and
+                # behavior is byte-identical to before.
+                if self._cgroup_sid is not None:
+                    stat = _cgroup_stat(self._cgroup_sid)
+                    if stat is not None:
+                        cur, mx, _ev = stat
+                        if mx > 0 and cur / mx >= _PID_REAP_HIGH_WATER:
+                            # Armed: pressure is high — reap oldest reparented
+                            # orphans first, stopping once pressure drops.
+                            candidates = _reparented_orphans(self._seen)
+                            killed: set[int] = set()
+                            for pid in candidates:
+                                recheck = _cgroup_stat(self._cgroup_sid)
+                                if recheck is None:
+                                    break
+                                rc, rm, _ = recheck
+                                if rm <= 0 or rc / rm < _PID_REAP_LOW_WATER:
+                                    break
+                                _signal_pids({pid}, signal.SIGKILL)
+                                killed.add(pid)
+                            # Prune killed PIDs from _seen so stop_and_reap
+                            # doesn't double-signal them (harmless but noisy).
+                            self._seen -= killed
                 if not descendants and self._seen:
                     # Worker has been alive long enough to spawn at
                     # least one descendant AND that descendant is now
@@ -6774,7 +6848,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # time leerie could PPID-walk post-exit. The tracker observes them while
     # the chain is still intact, then SIGKILLs the accumulated set at the
     # end. See DESIGN §6 *Cleanup on abnormal exit*.
-    descendant_tracker = _DescendantTracker(proc.pid)
+    descendant_tracker = _DescendantTracker(proc.pid, cgroup_sid)
     descendant_tracker.start()
     envelope: dict | None = None
     # Latch the account's overage state from `rate_limit_event`s as they
@@ -14518,6 +14592,12 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 continue
 
         st.data.setdefault("subtask_status", {})[sid] = status
+        if status == "complete":
+            # A prior failed attempt may have written this sid into the
+            # blocked dict (wave-failure :14902 / integrate precondition).
+            # A resume that completes the subtask must clear the stale entry
+            # so state.json doesn't carry a contradictory blocked record.
+            st.data.get("blocked", {}).pop(sid, None)
         st.save()
 
         if status == "complete":

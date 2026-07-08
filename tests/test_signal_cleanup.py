@@ -916,3 +916,287 @@ def test_descendant_tracker_records_descendants_during_lifetime(leerie):
         )
 
     asyncio.run(_run())
+
+
+# --- _reparented_orphans unit tests ----------------------------------------
+
+def test_reparented_orphans_filters_by_ppid_and_age(leerie, monkeypatch):
+    """`_reparented_orphans` must return only PIDs that are in `seen`,
+    have ppid==1, and have etimes >= _PID_REAP_MIN_AGE_SEC."""
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+
+    # Fake ps output: pid 100 (ppid=1, old), pid 101 (ppid=2, old — attached),
+    # pid 102 (ppid=1, young), pid 103 (ppid=1, old — NOT in seen)
+    fake_ps = (
+        "  PID  PPID ELAPSED\n"
+        f"  100     1 {min_age + 100}\n"
+        f"  101     2 {min_age + 50}\n"
+        f"  102     1 {min_age - 1}\n"
+        f"  103     1 {min_age + 200}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    seen = {100, 101, 102}
+    result = leerie._reparented_orphans(seen)
+    assert result == [100], f"expected [100], got {result}"
+
+
+def test_reparented_orphans_sorted_oldest_first(leerie, monkeypatch):
+    """Older PIDs must appear first in the returned list."""
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+
+    fake_ps = (
+        "  PID  PPID ELAPSED\n"
+        f"  200     1 {min_age + 10}\n"
+        f"  201     1 {min_age + 50}\n"
+        f"  202     1 {min_age + 30}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    seen = {200, 201, 202}
+    result = leerie._reparented_orphans(seen)
+    # Oldest-first: 201 (50), 202 (30), 200 (10)
+    assert result == [201, 202, 200], f"expected oldest-first order, got {result}"
+
+
+def test_reparented_orphans_empty_on_ps_failure(leerie, monkeypatch):
+    """Must return [] if ps fails — same empty-set fallback as
+    _enumerate_descendants."""
+    import subprocess as sp
+
+    def fake_run(cmd, **kwargs):
+        raise sp.SubprocessError("ps failed")
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    result = leerie._reparented_orphans({1, 2, 3})
+    assert result == []
+
+
+def test_reparented_orphans_empty_set_input(leerie, monkeypatch):
+    """Empty seen set always returns []."""
+    fake_ps = "  PID  PPID ELAPSED\n  100     1   999\n"
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    result = leerie._reparented_orphans(set())
+    assert result == []
+
+
+# --- _poll_loop pressure-gated reaping tests -------------------------------
+
+def test_poll_loop_no_reaping_without_cgroup_sid(leerie, monkeypatch):
+    """When cgroup_sid is None, _poll_loop must never call _cgroup_stat
+    or kill anything — byte-identical to the pre-reaping behavior."""
+    import asyncio
+
+    stat_calls: list = []
+    kill_calls: list = []
+
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: stat_calls.append(sid) or None)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: set())
+
+    def fake_signal_pids(pids, s):
+        kill_calls.extend(pids)
+
+    monkeypatch.setattr(leerie, "_signal_pids", fake_signal_pids)
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid=None)
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 3)
+        await tracker.stop_and_reap()
+
+    asyncio.run(_run())
+    assert stat_calls == [], (
+        f"_cgroup_stat must not be called without cgroup_sid; got {stat_calls}")
+    assert kill_calls == [], (
+        f"No PIDs should be killed without cgroup_sid; got {kill_calls}")
+
+
+def test_poll_loop_reaps_above_high_water(leerie, monkeypatch):
+    """_poll_loop must reap orphans when pressure >= high-water and stop
+    killing once pressure drops below low-water."""
+    import asyncio
+
+    killed: list[int] = []
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        f"  500     1 {min_age + 100}\n"
+        f"  501     1 {min_age + 50}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: {500, 501})
+
+    call_count = [0]
+
+    def fake_cgroup_stat(sid):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return (92, 100, 0)   # armed: 92% >= 90%
+        if call_count[0] == 2:
+            return (91, 100, 0)   # still above low-water after 1 kill
+        return (70, 100, 0)       # below low-water: stop
+
+    monkeypatch.setattr(leerie, "_cgroup_stat", fake_cgroup_stat)
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid="test-cgroup")
+        tracker._seen = {500, 501}
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        await tracker.stop_and_reap()
+
+    asyncio.run(_run())
+    assert len(killed) >= 1, f"Expected at least one kill above high-water; got {killed}"
+
+
+def test_poll_loop_below_high_water_kills_nothing(leerie, monkeypatch):
+    """When pressure is below high-water, zero mid-run kills regardless
+    of how many old orphans are present in _seen."""
+    import asyncio
+
+    mid_run_killed: list[int] = []
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        + "".join(f"  {p}     1 {min_age + 200}\n" for p in range(400, 450))
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: set(range(400, 450)))
+    # 58% — below 90% high-water
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: (58, 100, 0))
+
+    def track_kills(pids, s):
+        mid_run_killed.extend(pids)
+
+    monkeypatch.setattr(leerie, "_signal_pids", track_kills)
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid="cg-below")
+        tracker._seen = set(range(400, 450))
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        # Stop without calling stop_and_reap (which would SIGKILL _seen at exit)
+        tracker._stopped = True
+        if tracker._task:
+            tracker._task.cancel()
+            tracker._task = None
+
+    asyncio.run(_run())
+    assert mid_run_killed == [], (
+        f"Expected zero mid-run kills below high-water; got {mid_run_killed}")
+
+
+def test_poll_loop_young_orphan_not_reaped(leerie, monkeypatch):
+    """A reparented PID younger than _PID_REAP_MIN_AGE_SEC must never be
+    reaped — even when pressure is above high-water."""
+    import asyncio
+
+    killed: list[int] = []
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        f"  700     1 {min_age - 1}\n"  # too young
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: {700})
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: (95, 100, 0))  # above high-water
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid="cg-young")
+        tracker._seen = {700}
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        tracker._stopped = True
+        if tracker._task:
+            tracker._task.cancel()
+            tracker._task = None
+
+    asyncio.run(_run())
+    assert 700 not in killed, f"Young PID 700 must not be reaped; killed={killed}"
+
+
+def test_poll_loop_attached_pid_not_reaped(leerie, monkeypatch):
+    """A PID with ppid != 1 (still attached to the worker tree) must not
+    be reaped — only reparented orphans (ppid==1) are eligible."""
+    import asyncio
+
+    killed: list[int] = []
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+
+    # PID 800 is old but ppid=1234 (attached)
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        f"  800  1234 {min_age + 200}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: {800})
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: (95, 100, 0))  # above high-water
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid="cg-attached")
+        tracker._seen = {800}
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        tracker._stopped = True
+        if tracker._task:
+            tracker._task.cancel()
+            tracker._task = None
+
+    asyncio.run(_run())
+    assert 800 not in killed, f"Attached PID 800 must not be reaped; killed={killed}"
