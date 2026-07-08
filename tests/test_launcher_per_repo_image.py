@@ -691,3 +691,61 @@ def test_no_lockfile_no_language_dep_layer(tmp_path):
     df_content = result.stdout
     assert "apt-get install" in df_content
     assert "COPY" not in df_content
+
+
+def test_unrelated_file_change_no_rebuild(tmp_path):
+    """An unrelated repo file change (not a lockfile) does not trigger a rebuild.
+
+    The .dockerfile-hash is derived from Dockerfile content.  When the
+    Dockerfile already exists and only a non-dep file (e.g. src/app.js)
+    changes, the Dockerfile content is unchanged so the stored hash still
+    matches and nerdctl build is NOT invoked.
+    """
+    import hashlib
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    df = leerie_dir / "Dockerfile"
+    df.write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    # Store hash matching current Dockerfile.
+    sha = hashlib.sha256(df.read_bytes()).hexdigest()
+    version = "0.99.test"
+    (state_dir / ".dockerfile-hash").write_text(f"{version}:{sha}\n")
+
+    # Mutate an unrelated source file — not a lockfile.
+    src_dir = user_repo / "src"
+    src_dir.mkdir()
+    (src_dir / "app.js").write_text("console.log('changed');\n")
+
+    result = _run_harness(
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "0",   # image present
+            "NERDCTL_BUILD_RC": "1",     # would fail if invoked
+            "FAKE_GIT_REMOTE": "",
+            "LEERIE_VERSION": version,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    # No rebuild should have fired.
+    assert "per-repo image up-to-date" in result.stderr
+    assert "building per-repo container image" not in result.stderr
+
+
+def test_language_dep_sentinel_strings_in_launcher():
+    """Coupling assertion: the language-dep template sentinel strings exist
+    verbatim in the live launcher source so the test stays tied to reality."""
+    launcher_text = _launcher_text()
+    # The sha comment format string must be present in the Python embedded block.
+    assert "lockfile-shas:" in launcher_text
+    # The pnpm install command used in the RUN layer.
+    assert "pnpm install --frozen-lockfile" in launcher_text
+    # The COPY+RUN emission path.
+    assert "COPY " in launcher_text
+    # bake_language_deps resolution variable.
+    assert "_BAKE_LANGUAGE_DEPS" in launcher_text

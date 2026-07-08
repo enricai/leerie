@@ -1244,3 +1244,73 @@ def test_recapture_no_nerdctl(tmp_path):
     assert not nerdctl_log.exists() or nerdctl_log.read_text() == "", (
         "config --recapture must not invoke nerdctl"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-readability: Python _write_config_toml_keys <-> launcher _config_read_key
+# ---------------------------------------------------------------------------
+# Guards the format contract between the Python writer (used by capture and
+# --recapture) and the bash reader (used by the config arm and the per-repo
+# image block).  A format change in either side that breaks the other will
+# fail this test before the divergence ships.
+# ---------------------------------------------------------------------------
+
+
+def _extract_config_read_key_fn() -> str:
+    """Return the real `_config_read_key` function verbatim from the launcher."""
+    launcher_text = (REPO_ROOT / "leerie").read_text()
+    # The function is defined inside the config) arm.  Extract from the
+    # function header through the closing brace.
+    start_marker = "    _config_read_key() {\n"
+    end_marker = "\n    }\n"
+    s = launcher_text.index(start_marker)
+    e = launcher_text.index(end_marker, s) + len(end_marker)
+    return launcher_text[s:e]
+
+
+def test_write_config_toml_keys_round_trips_via_launcher_read(tmp_path):
+    """Python _write_config_toml_keys writes a config.toml whose values are
+    read back identically by the launcher's _config_read_key bash function.
+
+    This is the format-contract guard: if either writer or reader changes its
+    quoting / spacing convention the test fails before divergence ships.
+    """
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "orchestrator"))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "leerie_orch", REPO_ROOT / "orchestrator" / "leerie.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    cfg_path = leerie_dir / "config.toml"
+
+    # Write a value via the Python writer.
+    test_value = "postgresql libfoo-dev"
+    mod._write_config_toml_keys(cfg_path, {"setup_packages": test_value})
+
+    # Read it back using the real launcher's _config_read_key bash function.
+    fn_text = _extract_config_read_key_fn()
+    script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'USER_REPO="{user_repo}"\n'
+        f"{fn_text}\n"
+        'echo "$(_config_read_key setup_packages)"\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path)},
+    )
+    assert result.returncode == 0, f"bash reader failed: {result.stderr}"
+    read_back = result.stdout.strip()
+    assert read_back == test_value, (
+        f"round-trip mismatch: Python wrote {test_value!r}, "
+        f"launcher _config_read_key returned {read_back!r}"
+    )
