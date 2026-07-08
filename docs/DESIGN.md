@@ -1527,6 +1527,62 @@ whose every shell-spawning call fails — fills the window quickly. Even
 then the kill only fires when the authoritative cgroup read confirms
 exhaustion, so the window merely decides *when to probe*.
 
+**Mid-run PID reaping — reducing the blast radius.** The 0.9.38 window
+detector is a backstop: it *catches* a worker that has already saturated
+`pids.max`. But the root cause — `run_in_background` subprocesses
+reparenting to init and accumulating against the cap throughout the run —
+is not addressed by detection alone. A complementary *reducer* layer sits
+UNDER the backstop inside `_DescendantTracker._poll_loop`: it probes
+`_cgroup_stat` each cycle and, when pressure rises, reaps the safest
+killable set before the cap is hit. The load-bearing safety property: **below
+the pressure gate, behavior is byte-identical to today — zero mid-run
+kills.** Both mechanisms share the same `_cgroup_stat(sid)` call as their
+authoritative source.
+
+*Trigger — pressure-gated, not timer-based.* Each `_poll_loop` cycle, the
+tracker probes `pids.current / pids.max`. Reaping is armed only when that
+ratio reaches or exceeds `_PID_REAP_HIGH_WATER` (0.90). A timer would fire
+under zero pressure — pure downside (could kill a live background test),
+zero upside. Gating at 90% means the only time any process is killed mid-run
+is when the worker is already near EAGAIN death.
+
+*Target — the safest killable set.* From `_seen` (every PID the tracker has
+observed), the reaper selects those that are simultaneously (i) still alive,
+(ii) reparented to init (`ppid == 1`, i.e. no longer attached to the worker
+process chain), and (iii) older than `_PID_REAP_MIN_AGE_SEC` (60 s). PIDs
+are killed **oldest-first**, stopping as soon as `pids.current / pids.max`
+drops below `_PID_REAP_LOW_WATER` (0.75) — hysteresis so one pass does not
+over-kill. Killed PIDs are pruned from `_seen`; the exit-time
+`stop_and_reap` path is unchanged.
+
+*Why the age floor is load-bearing.* A background test the worker just
+launched and is actively awaiting has also reparented to init (`ppid == 1`),
+so `ppid == 1` alone cannot protect it. But it is *young*, so the 60 s floor
+does. A leaked, forgotten orphan is *old*. Oldest-first + stop-at-low-water
+kills the fewest, oldest PIDs needed to relieve pressure.
+
+*Accepted bounded regression.* Above the 90% gate it is possible that a
+live background process older than 60 s is killed. This is strictly better
+than the alternative — a guaranteed total-worker-death-then-full-retry from
+the detector. The gate is what makes the tradeoff acceptable: the imperfect
+reap is only ever attempted when the worker is already near EAGAIN death and
+the backstop would otherwise fire regardless.
+
+*Reducer-under-backstop composition.* Both the mid-run reaper and the 0.9.38
+window detector read `_cgroup_stat(sid)` — one authoritative exhaustion
+source. If reaping keeps pressure below the cap, the detector's window never
+confirms → never fires. If reaping stays too conservative and pressure still
+hits the cap, the detector catches it → retry-fresh. The two mechanisms are
+cleanly layered; neither duplicates the other's logic.
+
+*Rejected alternative — `cgroup.procs` broker verb.* `cgroup.procs` is a
+more precise orphan list (only PIDs actually still in the cgroup), but
+reading and killing from it would require a new `list`/`kill` verb on
+`scripts/cgroup-broker.py`, widening the single audited root surface that
+§12 principle guards. `_seen ∩ (alive, ppid==1, old)` covers the same
+population without a new root verb; the `cgroup.procs` path is noted here
+as the rejected alternative.
+
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
 accidental Ctrl-C catastrophic — and it conflated user intent ("stop
