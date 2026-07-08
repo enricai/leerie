@@ -463,6 +463,49 @@ declare `setup_packages` in `.leerie/config.toml` but commit no
 Dockerfile and proceeds through the same build path. A committed
 Dockerfile always takes precedence over `setup_packages`.
 
+**Auto-capture of dependencies.** After each normal (non-resume) run,
+leerie automatically scans the run's logs to find the system-package
+`apt-get install` intents workers attempted — including failed ones, since
+the intent is the signal. Captured package names are union-merged into
+`setup_packages` in `.leerie/config.toml`: only genuinely new packages
+are appended; user-edited values and comments are never overwritten. The
+next run picks up the updated `setup_packages`, auto-generates a
+Dockerfile with those packages pre-installed, and workers no longer hit
+the "are you root?" failure on every install attempt.
+
+When `bake_language_deps` is enabled (the default), the auto-generated
+Dockerfile also includes a language-dep layer — `COPY` of the lockfiles,
+manifests, and ancillary inputs the package manager needs, followed by
+`RUN <detected install command>` — so workers inherit pre-populated
+`node_modules` / site-packages and per-worker install time drops to
+near-zero. A dependency-input change (lockfile bump, patch edit) triggers
+a full image rebuild; an unrelated source file change does not. See
+DESIGN §6½ for the rebuild-hash mechanism.
+
+Capture is **opt-out**. To disable it: set `capture_deps = false` in
+`.leerie/config.toml`, or set `LEERIE_CAPTURE_DEPS=0` in the environment
+(`leerie.toml` is not consulted for this key). To disable only the
+language-dep layer: set `bake_language_deps = false` in
+`.leerie/config.toml` or `leerie.toml`, or set
+`LEERIE_BAKE_LANGUAGE_DEPS=0`.
+
+Capture **never auto-commits**. It writes `.leerie/config.toml` (and
+optionally the auto-generated `.leerie/Dockerfile`) as uncommitted files
+and logs one line: *"captured N package(s) — run `git add .leerie/ && git
+commit` to bake into the next run's image."* You control when to commit.
+When a committed `.leerie/Dockerfile` already exists, capture skips the
+`setup_packages` write entirely — the Dockerfile is authoritative.
+
+To re-run capture manually against the latest finished run (for example,
+after editing `.leerie/config.toml` by hand):
+
+```
+leerie config --recapture           # union-merge only (never clobbers user edits)
+leerie config --recapture --force   # wholesale replace
+```
+
+This is a host-only fast path — no container is started.
+
 The full inventory of CLI flags and environment variables is in the
 [README "Configuration" section](../README.md#configuration).
 
