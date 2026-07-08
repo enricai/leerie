@@ -141,7 +141,7 @@ container the launcher starts.
 Launcher bash case arm: `config)`. `leerie config` is a host-only fast
 path — it exits before `nerdctl run` and never starts a container. It is
 listed alongside `--version` in the ownership-guard skip-list so it never
-claims a state directory. Three sub-modes:
+claims a state directory. Four sub-modes:
 
 - **bare (`leerie config`)**: prints effective build/lint/test config for
   `$USER_REPO` with `[config]` / `[inference]` provenance per axis (reads
@@ -155,8 +155,14 @@ claims a state directory. Three sub-modes:
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
+- **`leerie config --recapture [--force]`**: host-only (no container). Scans
+  the newest finished run's logs in `$LEERIE_STATE_HOST_DIR/runs/*/` via the
+  same `_capture_installs_from_logs` + `_merge_setup_packages` seam used by
+  finalize-time capture (DESIGN §6½). Without `--force`: never-clobber union
+  (only new packages appended). With `--force`: wholesale replace. Exits 1 if
+  no runs directory or no finished run found.
 
-All three sub-modes share an inline BLT inferrer (`_config_read_key`,
+All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
 so the verb requires no container and no orchestrator import. `_infer_axis`
 mirrors `_infer_build_lint_test()`'s precedence and family coverage
@@ -5597,7 +5603,7 @@ enforcement functions:
 | `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
 | `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
 | `test_base_dockerfile_chromium.py` | Base image `./Dockerfile` (not the per-repo autogen one): asserts `chromium` and `chromium-driver` are installed and the three container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`) are baked into `/etc/chromium.d/leerie-container-flags` after the chromium install (ordering guard) — see *Browser-based testing* above |
-| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |

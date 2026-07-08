@@ -201,6 +201,11 @@ tests/                      pytest suite
 # Launch an interactive Claude session to configure leerie for this repo:
 ./leerie config --chat
 
+# Re-scan the latest completed run's logs and rewrite setup_packages in
+# .leerie/config.toml without starting a new run (host-only, no container):
+./leerie config --recapture
+./leerie config --recapture --force   # wholesale replace (not union)
+
 # Override the default per-repo state directory. Default is
 # $HOME/.leerie/<basename>/ (outside the repo, no .gitignore entry
 # needed). Cross-repo basename collisions are caught at use time via
@@ -447,11 +452,11 @@ orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 `_cgroup_enroll`/`_cgroup_destroy` via a stubbed socket round-trip) and
 the fail-closed `enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
-sid validation, v1/v2 path selection, and the probe round-trip — against
-a fake cgroupfs. The `leerie config` verb (all three sub-modes: `--init`,
-bare, `--chat`) is tested in `tests/test_config_verb.py` via a
-self-contained bash harness with stubbed `nerdctl` and `claude`, plus
-a parity guard that extracts the real launcher `config)` case arm and
+sid validation, and v1/v2 path selection — against
+a fake cgroupfs. The `leerie config` verb (all four sub-modes: `--init`,
+bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
+via a self-contained bash harness with stubbed `nerdctl` and `claude`,
+plus a parity guard that extracts the real launcher `config)` case arm and
 diffs its BLT inference against `_infer_build_lint_test()` across a
 fixture matrix so the two can never silently diverge. The `--group`
 launcher arm and group-scoped ID-dispatched verbs are tested in
