@@ -1066,7 +1066,10 @@ def _run_real_config_arm_with_state(
         "esac\n"
     )
     env = {
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        # _PYBIN first so the --recapture python3 seam resolves to the
+        # interpreter that has runtime deps (tenacity), matching the sibling
+        # seam tests; system python3 may lack them.
+        "PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path / "home"),
         "USER_REPO": str(user_repo),
         "LEERIE_REPO": str(REPO_ROOT),

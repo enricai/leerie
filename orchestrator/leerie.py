@@ -42,14 +42,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tenacity import (
-    AsyncRetrying,
-    RetryCallState,
-    RetryError,
-    retry_if_result,
-    stop_after_delay,
-    wait_exponential_jitter,
-)
+# tenacity is imported lazily inside claude_p() (its sole use site), not at
+# module scope, so orchestrator/leerie.py loads on a bare host python3 that
+# lacks requirements.txt deps. The `config --recapture` host seam
+# (leerie:864) exec_module()s this file on the host, where python3 is not
+# guaranteed to have tenacity; a module-scope import there would crash before
+# run_recapture_deps()'s pathlib guards can print their diagnostic. Do not
+# hoist it back to the top.
 
 ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root
 PROMPTS = ROOT / "prompts"
@@ -7964,6 +7963,17 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         # invocation returns a non-auth envelope (success or a different
         # error class) or when the budget is exhausted.
         if _is_auth_or_quota_failure(envelope):
+            # Lazy import (not module-scope) so this file loads on a bare host
+            # python3 lacking requirements.txt deps — see the module-top note.
+            from tenacity import (
+                AsyncRetrying,
+                RetryCallState,
+                RetryError,
+                retry_if_result,
+                stop_after_delay,
+                wait_exponential_jitter,
+            )
+
             def _log_before_sleep(rs: RetryCallState) -> None:
                 env = rs.outcome.result()
                 marker = (env.get("api_error_status") or "auth/quota")

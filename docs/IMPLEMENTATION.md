@@ -164,6 +164,11 @@ claims a state directory. Four sub-modes:
   `--force` drops the sentinel on each target run so the worker re-fires
   unconditionally. Each run's `State` is flocked (skipped, not fatal, on
   `StateLockedError`). Exits 1 if no runs directory or no finished run found.
+  The seam `exec_module()`s `orchestrator/leerie.py` on the **host**, whose
+  `python3` is not guaranteed to have `requirements.txt` deps (§0), so the
+  orchestrator's sole third-party import (`tenacity`) is deferred into
+  `claude_p()` rather than module scope — the run-discovery guards above are
+  pure pathlib checks and print their diagnostic even when `tenacity` is absent.
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash

@@ -75,7 +75,10 @@ def _run_real_config_arm_with_state(
         "esac\n"
     )
     env: dict[str, str] = {
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        # _PYBIN first so the --recapture python3 seam resolves to the
+        # interpreter that has runtime deps (tenacity), matching the sibling
+        # seam tests; system python3 may lack them.
+        "PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path / "home"),
         "USER_REPO": str(user_repo),
         "LEERIE_REPO": str(REPO_ROOT),
@@ -644,4 +647,54 @@ class TestRecaptureEndToEnd:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert (leerie_dir / "Dockerfile").read_text() == committed, (
             "committed Dockerfile must survive recapture"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: orchestrator module must load on a bare host python3
+# ---------------------------------------------------------------------------
+
+class TestBareHostImport:
+    """The `config --recapture` host seam exec_module()s orchestrator/leerie.py
+    on the host, whose python3 is not guaranteed to have requirements.txt deps
+    (CLAUDE.md §0: the launcher needs no host Python). A module-scope third-party
+    import there would crash before run_recapture_deps()'s pathlib guards can
+    print their diagnostic — the bug these tests pin against."""
+
+    def test_module_imports_without_tenacity(self):
+        """orchestrator/leerie.py loads even when tenacity is unavailable."""
+        import builtins
+        import importlib.util
+
+        real_import = builtins.__import__
+
+        def _blocked_import(name, *args, **kwargs):
+            if name == "tenacity" or name.startswith("tenacity."):
+                raise ModuleNotFoundError("No module named 'tenacity'")
+            return real_import(name, *args, **kwargs)
+
+        orch_path = REPO_ROOT / "orchestrator" / "leerie.py"
+        spec = importlib.util.spec_from_file_location("leerie_bare", orch_path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(builtins, "__import__", _blocked_import):
+            # Mirrors the launcher seam's load path (leerie:864 exec_module).
+            spec.loader.exec_module(module)
+        assert hasattr(module, "run_recapture_deps")
+
+    def test_no_module_scope_tenacity_import(self):
+        """`from tenacity import` must appear only inside claude_p(), never at
+        module scope — guards against a future 'hoist imports to top' cleanup
+        reintroducing the crash."""
+        import ast
+
+        orch_path = REPO_ROOT / "orchestrator" / "leerie.py"
+        tree = ast.parse(orch_path.read_text())
+        module_scope_tenacity = [
+            node
+            for node in tree.body  # top-level statements only
+            if isinstance(node, ast.ImportFrom) and node.module == "tenacity"
+        ]
+        assert not module_scope_tenacity, (
+            "tenacity must be imported lazily inside claude_p(), not at module "
+            "scope — see the note at the top of orchestrator/leerie.py"
         )
