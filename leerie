@@ -4004,9 +4004,6 @@ if [ "$_leerie_do_gen" = "true" ]; then
     printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
 
     # Language-dep layer (gated on bake_language_deps, default true).
-    # Primary: reads persisted language_installs from config.toml (JSON-encoded
-    # list of {manager, command, copy_inputs}) written by the dep_capture worker.
-    # Fallback: lockfile detection when no language_installs are persisted.
     # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
     # Dockerfile sha folds them into .dockerfile-hash (the single hash site
     # below). Each copy_input is existence-checked (p.exists()) before being
@@ -4056,7 +4053,6 @@ def _emit_layer(copy_files, run_cmd, copy_shas):
     print(run_line)
 
 
-# --- Primary path: persisted language_installs from config.toml ---
 persisted_installs = []
 if config_toml and config_toml.is_file():
     try:
@@ -4101,8 +4097,6 @@ if persisted_installs:
             print(f"RUN {run_cmd}")
         emitted = True
     sys.exit(0 if emitted else 0)
-
-# --- Fallback path: lockfile detection (clean first run) ---
 
 def _node_ancillary(repo, copy_files):
     """Append the ancillary inputs a node install needs beyond the lockfile:
