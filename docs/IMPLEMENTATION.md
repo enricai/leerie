@@ -2019,7 +2019,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Twelve worker types (plus the global override), each independently overridable:
+Thirteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2036,14 +2036,15 @@ Twelve worker types (plus the global override), each independently overridable:
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
-| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | *(none)*                  |
+| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | `model_dep_capture`       |
 
 Note: `judge`, `heal`, `pr_writer`, and `dep_capture` do not follow the
-`--model-<W>` / `model_<w>` pattern used by orchestrator workers, because they
+`--model-<W>` CLI flag pattern used by orchestrator workers, because they
 are post-run / finalize-time workers invoked outside the main orchestrate loop.
-`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` supports
-env-var override only (`LEERIE_MODEL_DEP_CAPTURE`). All four still honor the
-global `--model` / `LEERIE_MODEL` override.
+`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` has no
+dedicated CLI flag and supports env-var (`LEERIE_MODEL_DEP_CAPTURE`) and TOML
+key (`model_dep_capture`) overrides only. All four still honor the global
+`--model` / `LEERIE_MODEL` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
@@ -2125,6 +2126,15 @@ model selection:
 | implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
 | integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
+| judge              | *(none)*                         | *(none)*                      | *(none)*                   |
+| heal               | *(none)*                         | *(none)*                      | *(none)*                   |
+| pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
+| dep_capture        | *(none)*                         | *(none)*                      | *(none)*                   |
+
+Note: `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
+workers not in `WORKER_TYPES`; they receive no per-worker effort override (no
+dedicated env var, CLI flag, or TOML key). They do honor the global
+`--effort` / `LEERIE_EFFORT` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=`. A worker that resolves to `None`
