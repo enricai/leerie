@@ -5690,7 +5690,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the eight `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`) plus the three post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the nine `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |

@@ -3264,6 +3264,15 @@ recurs everywhere in the design:
   produces is still externally verified by the orchestrator rather than
   trusted at face value.
 
+- The orchestrator does not trust the `dep_capture` worker to self-select
+  what to write; it schema-validates the worker's structured output
+  (`setup_packages`, `language_installs`) before writing anything to
+  `.leerie/config.toml`. The worker decides content — what the repo
+  genuinely needs — but the code enforces the write path: union merge,
+  never-clobber, and the committed-Dockerfile-authoritative rule are all
+  implemented as deterministic Python checks that the worker cannot
+  override (§6½).
+
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**
 Understanding intent, writing code, decomposing a domain, resolving the
@@ -3443,12 +3452,15 @@ matches the same precedence chain as `--skip-smoke` and
 
 ## 14. Telemetry, judging, and self-healing
 
-Every LLM call in Leerie passes through one of the nine worker types in
+Every main-loop LLM call in Leerie passes through one of the nine worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
-worker role, no overlap, no gap.
+worker role, no overlap, no gap. Post-run skill workers — `judge`, `heal`,
+`pr_writer`, and `dep_capture` — are not in `WORKER_TYPES` (they run outside
+the main orchestrate loop), but they share the same `claude_p()` invocation
+path and emit telemetry records with their `schema_key` as `call_type`.
 
 ### The three pillars
 
