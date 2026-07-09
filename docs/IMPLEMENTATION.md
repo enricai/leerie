@@ -156,12 +156,14 @@ claims a state directory. Four sub-modes:
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
 - **`leerie config --recapture [--force]`**: host-only (no container). Calls
-  `run_recapture_deps()` from the orchestrator module, which resolves the
-  newest finished run with `logs/` (or an explicit `--run-id`), constructs
-  and flocks its `State` (refusing `StateLockedError` → `EXIT_LOCKED`), and
-  invokes `capture_repo_deps` via `asyncio.run`. `--force` drops the
-  `dep_capture.done` sentinel so the worker re-runs even when the run was
-  already captured. Exits 1 if no runs directory or no finished run found.
+  `run_recapture_deps()` from the orchestrator module, which consolidates
+  across **all** finished runs with `logs/` under the state dir (not just the
+  newest — each run's commands inform the dep decision). With an explicit
+  `--run-id`, only that run is targeted. Without `--force`, runs that already
+  have a `dep_capture.done` sentinel are skipped (never-clobber union);
+  `--force` drops the sentinel on each target run so the worker re-fires
+  unconditionally. Each run's `State` is flocked (skipped, not fatal, on
+  `StateLockedError`). Exits 1 if no runs directory or no finished run found.
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
@@ -3961,9 +3963,12 @@ System prompt is `prompts/dep_capture.md`. Output schema:
    seams funnel to the same worker:
    - **`run_recapture_deps(leerie_root, repo_root, force, run_id)`**: the
      on-demand recapture entrypoint invoked by `leerie config --recapture`.
-     Resolves the target run, constructs and flocks its `State` (refusing
-     `StateLockedError` → `EXIT_LOCKED`), loads state, optionally drops the
-     sentinel when `force=True`, then calls `asyncio.run(capture_repo_deps(...))`.
+     When `run_id` is given, targets that run only; otherwise consolidates
+     across **all** finished runs with `logs/` (newest-first). Each target
+     run's `State` is flocked (skipped on `StateLockedError`); with
+     `force=True` the sentinel is dropped before capture. Exits 1 if no
+     runs directory or no finished run found; per-run errors are logged and
+     skipped (non-fatal for multi-run consolidation).
    - **`_backstop_capture_prior_runs(leerie_root, repo_root, caps, models,
      efforts)`**: called at run-start (in `_run_phases`, before
      `phase_classify`) to cover SIGKILL / crash cases where the cancel arm
@@ -5797,7 +5802,8 @@ enforcement functions:
 | `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
 | `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
 | `test_base_dockerfile_chromium.py` | Base image `./Dockerfile` (not the per-repo autogen one): asserts `chromium` and `chromium-driver` are installed and the three container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`) are baked into `/etc/chromium.d/leerie-container-flags` after the chromium install (ordering guard) — see *Browser-based testing* above |
-| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
+| `test_config_recapture.py` | `leerie config --recapture` LLM-seam dispatch and multi-run consolidation: launcher `--recapture` arm dispatches to the python3 seam; exits 1 with diagnostic when no runs directory or no finished run found; `--force` flag passed to the seam; python3 failure exits 1; no `nerdctl` invoked; `--recapture` arm within extraction boundary; `run_recapture_deps` consolidates across ≥2 finished runs (all captured, not just newest); `--force` drops sentinel on each run (wholesale replace semantics); without `--force` already-captured runs are skipped (never-clobber union); Dockerfile survivor tests (committed and generated) |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |

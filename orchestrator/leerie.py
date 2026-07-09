@@ -5637,15 +5637,14 @@ def run_recapture_deps(
 ) -> None:
     """Host-side recapture entrypoint (DESIGN §6½).
 
-    Resolves a target run (or the newest finished run when run_id is None),
-    constructs and flocks its State (refusing StateLockedError → EXIT_LOCKED),
-    then runs capture_repo_deps via asyncio.run over the run's logs/.
+    When run_id is given, targets that specific run only. Otherwise, consolidates
+    across ALL finished runs with logs/ under leerie_root/runs/ — not just the
+    newest — so every past run's install commands inform the dep decision.
 
-    When force=True, the captured values wholly replace existing ones (the
-    standard never-clobber merge in capture_repo_deps is unchanged — `force`
-    drops the sentinel before re-running so the write always executes even
-    when no packages are genuinely new). When force=False, the standard
-    never-clobber union applies.
+    When force=True, drops the sentinel on each target run before capture so
+    the worker fires unconditionally (wholesale replace semantics). Without
+    force, runs that already have a dep_capture.done sentinel are skipped
+    (never-clobber union applies per capture_repo_deps).
 
     Modeled on the --phase judge scaffolding (main(), ~line 16694).
     """
@@ -5663,19 +5662,20 @@ def run_recapture_deps(
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
 
-    # Resolve target run: explicit run_id → newest finished run with logs/.
     if run_id is not None:
+        # Targeted: single named run.
         target_run_dir = leerie_root / "runs" / run_id
         if not target_run_dir.is_dir():
             log(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
             sys.exit(1)
+        target_dirs: list[Path] = [target_run_dir]
     else:
+        # Consolidate across all finished runs that have logs/.
         runs_dir = leerie_root / "runs"
         if not runs_dir.is_dir():
             log(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
             sys.exit(1)
-        best_dir: Path | None = None
-        best_ts = ""
+        finished: list[Path] = []
         for d in runs_dir.iterdir():
             if not d.is_dir():
                 continue
@@ -5686,45 +5686,50 @@ def run_recapture_deps(
                 rdata = json.loads(rj.read_text())
             except (OSError, ValueError):
                 continue
-            fa = rdata.get("finished_at", "")
-            if fa and fa > best_ts and (d / "logs").is_dir():
-                best_ts = fa
-                best_dir = d
-        if best_dir is None:
+            if rdata.get("finished_at") and (d / "logs").is_dir():
+                finished.append(d)
+        if not finished:
             log("recapture: no completed run with logs found; nothing to recapture")
             sys.exit(1)
-        target_run_dir = best_dir
+        # Process newest-first so the most recent installs inform the decision.
+        target_dirs = sorted(finished, reverse=True)
 
-    # Flock the run dir (refuse to race a live orchestrator). --phase judge
-    # pattern: construct State → catch StateLockedError → EXIT_LOCKED.
-    try:
-        target_st = State(leerie_root, target_run_dir.name, repo_root=repo_root)
-    except StateLockedError as e:
-        log(f"recapture: cannot recapture {target_run_dir.name!r}: another "
-            f"orchestrator owns the run (holding flock on {e.run_dir}). "
-            "Wait for it to finish, or kill it first if wedged.")
-        sys.exit(EXIT_LOCKED)
-    target_st.load()  # non-fatal if state.json is missing (older runs)
-
-    if force:
-        # Drop the sentinel so the worker runs unconditionally. Without this,
-        # a run that already wrote config.toml (sentinel present) would skip
-        # the worker and produce no output — defeating the --force intent.
+    ran_any = False
+    for target_run_dir in target_dirs:
         sentinel = target_run_dir / "dep_capture.done"
-        try:
-            sentinel.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if force:
+            # Drop sentinel so the worker fires unconditionally on this run.
+            try:
+                sentinel.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif sentinel.is_file():
+            # Already captured for this run and not forcing — skip.
+            continue
 
-    log(f"recapture: scanning {target_run_dir / 'logs'} ...")
-    try:
-        asyncio.run(capture_repo_deps(
-            repo_root, target_st,
-            caps=caps, models=models, efforts=efforts,
-        ))
-    except Exception as exc:
-        log(f"recapture: error during dep_capture: {exc}")
-        sys.exit(1)
+        # Flock the run dir (refuse to race a live orchestrator). --phase judge
+        # pattern: construct State → catch StateLockedError → skip (not fatal
+        # for multi-run consolidation; we still capture the others).
+        try:
+            target_st = State(leerie_root, target_run_dir.name, repo_root=repo_root)
+        except StateLockedError as e:
+            log(f"recapture: skipping {target_run_dir.name!r}: another "
+                f"orchestrator owns the run (holding flock on {e.run_dir}).")
+            continue
+        target_st.load()  # non-fatal if state.json is missing (older runs)
+
+        log(f"recapture: scanning {target_run_dir / 'logs'} ...")
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, target_st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+            ran_any = True
+        except Exception as exc:
+            log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
+
+    if not ran_any and not force:
+        log("recapture: all eligible runs already captured (use --force to re-run)")
 
 
 def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
