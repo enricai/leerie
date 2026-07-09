@@ -642,3 +642,165 @@ class TestResolveCaptureDeps:
         (repo / ".leerie").mkdir(parents=True)
         (repo / ".leerie" / "config.toml").write_text('capture_deps = "false"\n')
         assert leerie.resolve_capture_deps(repo) is True
+
+
+# ---------------------------------------------------------------------------
+# Idempotency sentinel (dep_capture.done) — written by capture_repo_deps,
+# read by _backstop_capture_prior_runs.
+# ---------------------------------------------------------------------------
+
+class TestDepCaptureSentinel:
+    """sentinel file + state field written; backstop skips captured runs."""
+
+    def test_sentinel_file_written_after_successful_write(
+            self, leerie, tmp_path, monkeypatch):
+        """capture_repo_deps writes <run_dir>/dep_capture.done on success."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        st = _make_fake_state(tmp_path, ["apt-get install -y git"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        worker_result = {
+            "setup_packages": ["git"],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        sentinel = Path(st.run_dir) / "dep_capture.done"
+        assert sentinel.is_file(), "dep_capture.done sentinel must be written"
+
+    def test_state_field_set_after_successful_write(
+            self, leerie, tmp_path, monkeypatch):
+        """capture_repo_deps sets st.data['dep_capture_done'] = True."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        st = _make_fake_state(tmp_path, ["apt-get install -y curl"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        worker_result = {
+            "setup_packages": ["curl"],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        assert st.data.get("dep_capture_done") is True
+
+    def test_sentinel_written_even_on_noop(
+            self, leerie, tmp_path, monkeypatch):
+        """Sentinel is written even when the merge produces no new packages
+        (the worker ran; no need to run again in the backstop)."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        # Already has postgresql — worker returns same list → no-op merge.
+        (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+        st = _make_fake_state(tmp_path, ["apt-get install -y postgresql"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        worker_result = {
+            "setup_packages": ["postgresql"],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        sentinel = Path(st.run_dir) / "dep_capture.done"
+        assert sentinel.is_file(), "sentinel written even for no-op captures"
+
+
+class TestBackstopCapturePriorRuns:
+    """_backstop_capture_prior_runs skips captured runs, processes uncaptured ones."""
+
+    def test_skips_run_with_sentinel(self, leerie, tmp_path, monkeypatch):
+        """A run dir with dep_capture.done present is skipped."""
+        leerie_root = tmp_path / "state"
+        runs_dir = leerie_root / "runs"
+        run_dir = runs_dir / "run-001"
+        log_dir = run_dir / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "worker-001.log").write_text("")
+        # Write the sentinel — backstop must skip this run.
+        (run_dir / "dep_capture.done").write_text("1\n")
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        called = []
+
+        async def _fake_capture(repo_root, st, **kwargs):
+            called.append(getattr(st, "run_dir", None))
+
+        with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
+            asyncio.run(leerie._backstop_capture_prior_runs(
+                leerie_root, repo,
+                caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        assert called == [], "run with sentinel must not trigger capture"
+
+    def test_captures_run_without_sentinel(self, leerie, tmp_path, monkeypatch):
+        """A run dir with logs/ but no dep_capture.done triggers capture."""
+        leerie_root = tmp_path / "state"
+        runs_dir = leerie_root / "runs"
+        run_dir = runs_dir / "run-002"
+        log_dir = run_dir / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "worker-001.log").write_text("")
+        # No sentinel — backstop should invoke capture.
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        called = []
+
+        async def _fake_capture(repo_root, st, **kwargs):
+            called.append(getattr(st, "run_dir", None))
+
+        with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
+            asyncio.run(leerie._backstop_capture_prior_runs(
+                leerie_root, repo,
+                caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        assert len(called) == 1 and called[0] == run_dir
+
+    def test_skips_run_without_logs_dir(self, leerie, tmp_path, monkeypatch):
+        """A run dir without a logs/ subdirectory is not eligible for capture."""
+        leerie_root = tmp_path / "state"
+        runs_dir = leerie_root / "runs"
+        run_dir = runs_dir / "run-003"
+        run_dir.mkdir(parents=True)
+        # No logs/ dir — not eligible.
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        called = []
+
+        async def _fake_capture(repo_root, st, **kwargs):
+            called.append(getattr(st, "run_dir", None))
+
+        with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
+            asyncio.run(leerie._backstop_capture_prior_runs(
+                leerie_root, repo,
+                caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        assert called == [], "run without logs/ must not trigger capture"
