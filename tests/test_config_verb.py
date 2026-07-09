@@ -1271,10 +1271,10 @@ def _make_finished_run_with_apt_log(state_dir: Path, command: str) -> None:
     (logs_dir / "worker-001.log").write_text(json.dumps(event) + "\n")
 
 
-def test_recapture_removes_generated_dockerfile_end_to_end(tmp_path):
-    """GAP 4a: a real --recapture that writes a new setup_packages must remove
-    a *generated* .leerie/Dockerfile so it regenerates next run. Uses the real
-    python3 + orchestrator seam (no python3 stub)."""
+def test_recapture_reports_corpus_end_to_end(tmp_path):
+    """--recapture with a finished run extracts the command corpus and reports
+    it on stdout. It does NOT write to config.toml (LLM wiring is a follow-on)
+    and does NOT remove the generated Dockerfile. Uses the real python3 seam."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1289,17 +1289,15 @@ def test_recapture_removes_generated_dockerfile_end_to_end(tmp_path):
         extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    # config.toml gained the package.
-    assert "postgresql" in (leerie_dir / "config.toml").read_text()
-    # Generated Dockerfile was removed so it regenerates next run.
-    assert not (leerie_dir / "Dockerfile").exists(), (
-        "generated Dockerfile should be removed after a writing recapture"
-    )
+    # The seam reports corpus stats or a LLM-not-wired advisory — does not write.
+    assert (leerie_dir / "config.toml").read_text() == ""
+    # Generated Dockerfile is left untouched (no write triggered removal).
+    assert (leerie_dir / "Dockerfile").exists()
 
 
 def test_recapture_keeps_committed_dockerfile_end_to_end(tmp_path):
-    """GAP 4: a --recapture that writes must NOT remove a hand-committed
-    Dockerfile (no sentinel) — it is authoritative."""
+    """--recapture must NOT remove a hand-committed Dockerfile (no sentinel) —
+    it is authoritative and the seam never removes committed files."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1320,8 +1318,8 @@ def test_recapture_keeps_committed_dockerfile_end_to_end(tmp_path):
 
 
 def test_recapture_noop_keeps_generated_dockerfile(tmp_path):
-    """GAP 4: a --recapture that writes NOTHING (no new packages) must leave an
-    existing generated Dockerfile in place (no spurious removal)."""
+    """--recapture must not remove an existing generated Dockerfile —
+    the seam now only reports the corpus and never removes files."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1343,9 +1341,9 @@ def test_recapture_noop_keeps_generated_dockerfile(tmp_path):
 
 
 def test_recapture_keeps_committed_generated_dockerfile_with_sentinel(tmp_path):
-    """D3: --recapture must NOT remove a COMMITTED (git-tracked) generated
-    Dockerfile even though it carries the sentinel — a committed Dockerfile is
-    authoritative (DESIGN §6½). Only an untracked generated file is removed."""
+    """--recapture must NOT remove a COMMITTED (git-tracked) generated Dockerfile
+    even though it carries the sentinel — a committed Dockerfile is authoritative
+    (DESIGN §6½). The seam never removes any files."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)

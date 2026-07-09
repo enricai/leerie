@@ -666,6 +666,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "provision": "high",
     "integrator": "high",
     "pr_writer": "high",
+    "dep_capture": "high",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -677,6 +678,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
 MODEL_JUDGE_ENV = "LEERIE_MODEL_JUDGE"
 MODEL_HEAL_ENV = "LEERIE_MODEL_HEAL"
 MODEL_PR_WRITER_ENV = "LEERIE_MODEL_PR_WRITER"
+MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"
 
 # Telemetry enabled/disabled — see IMPLEMENTATION.md §2 "Telemetry".
 # Resolution order: --telemetry/--no-telemetry CLI → LEERIE_TELEMETRY env →
@@ -1308,6 +1310,43 @@ SCHEMAS: dict[str, dict] = {
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
             "body": {"type": "string", "minLength": 1},
             "used_template": {"type": ["string", "null"]},
+        },
+    },
+    "dep_capture": {
+        # DESIGN §6½: LLM worker that reads the shell commands workers
+        # ran (extracted from logs/*.log via _iter_log_tool_use) and
+        # decides what the repo genuinely needs across all languages and
+        # frameworks. Code enforces via this schema; the worker decides
+        # content; _write_config_toml_keys writes it deterministically.
+        "type": "object",
+        "required": ["setup_packages", "language_installs"],
+        "properties": {
+            "setup_packages": {
+                # apt packages for the warm apt layer in .leerie/Dockerfile.
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "language_installs": {
+                # Per-manager install commands the Dockerfile bakes in via
+                # COPY + RUN layers. `copy_inputs` are repo-relative paths
+                # COPYed in before the RUN (e.g. requirements.txt,
+                # package.json). Hallucinated paths are validated against
+                # the repo and skipped; the RUN is still emitted.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["manager", "command"],
+                    "properties": {
+                        "manager": {"type": "string"},
+                        "command": {"type": "string"},
+                        "copy_inputs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "dockerfile_notes": {"type": ["string", "null"]},
         },
     },
     "provision": {
@@ -3573,6 +3612,14 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
                            or pr_writer_file or global_file
                            or MODEL_DEFAULT_PER_WORKER.get(
                                "pr_writer", MODEL_DEFAULT))
+    dep_capture_cli = getattr(args, "dep_capture_model", None)
+    dep_capture_env = from_env(MODEL_DEP_CAPTURE_ENV)
+    dep_capture_file = from_file("model_dep_capture")
+    models["dep_capture"] = (dep_capture_cli or dep_capture_env
+                             or global_cli or global_env
+                             or dep_capture_file or global_file
+                             or MODEL_DEFAULT_PER_WORKER.get(
+                                 "dep_capture", MODEL_DEFAULT))
     return models
 
 
@@ -3634,6 +3681,9 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     efforts["pr_writer"] = (global_cli or global_env or global_file
                             or EFFORT_DEFAULT_PER_WORKER.get(
                                 "pr_writer", EFFORT_DEFAULT))
+    efforts["dep_capture"] = (global_cli or global_env or global_file
+                              or EFFORT_DEFAULT_PER_WORKER.get(
+                                  "dep_capture", EFFORT_DEFAULT))
     return efforts
 
 
@@ -5272,67 +5322,13 @@ _INSTALL_CMD_HINT_RE = re.compile(
     r"yum|pacman|go install|make|bundle install|gem install|mise install)\b"
 )
 
-# Narrow regex: a shell segment that is an apt[-get] install invocation.
-_APT_INSTALL_RE = re.compile(
-    r"(?:sudo\s+(?:-[A-Za-z]+\s+)*)?apt(?:-get)?\s+install\b"
-)
-
-# Narrow regex: a language install command worth capturing.
-_LANG_INSTALL_RE = re.compile(
-    r"^\s*(?:"
-    r"pnpm\s+install|"
-    r"npm\s+(?:ci|install)|"
-    r"yarn\s+install|"
-    r"pip[23]?\s+install|"
-    r"uv\s+sync|"
-    r"poetry\s+install|"
-    r"cargo\s+fetch|"
-    r"bundle\s+install|"
-    r"composer\s+install|"
-    r"dotnet\s+restore|"
-    r"go\s+mod\s+download"
-    r")"
-)
-
-# Valid apt package-name token (split pkg=ver → keep pkg name).
-_APT_PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+._-]*$")
-# Flag-like tokens to drop when parsing apt install args.
-_APT_FLAG_RE = re.compile(r"^-")
-
-
-def _parse_apt_intents(command: str) -> list[str]:
-    """Extract apt package names from a shell command string.
-
-    Splits on shell operators (&&, ;, |), finds segments that are
-    apt[-get] install invocations, drops flags and noise tokens, and
-    returns a stable-ordered deduplicated list of package names.
-    """
-    # Split on shell operators and collect apt-install segments.
-    segments = re.split(r"&&|;|\|", command)
-    seen: dict[str, None] = {}  # ordered set via dict insertion order
-    for seg in segments:
-        seg = seg.strip()
-        if not _APT_INSTALL_RE.search(seg):
-            continue
-        tokens = seg.split()
-        # Find the 'install' keyword and collect everything after it.
-        collecting = False
-        for tok in tokens:
-            if not collecting:
-                if tok == "install":
-                    collecting = True
-                continue
-            # Drop flags.
-            if _APT_FLAG_RE.match(tok):
-                continue
-            # Drop noise words that can appear before 'install'.
-            if tok in ("sudo", "apt", "apt-get", "install"):
-                continue
-            # Split pkg=version and keep name only.
-            name = tok.split("=")[0]
-            if _APT_PKG_RE.match(name):
-                seen[name] = None
-    return list(seen)
+# Byte budget for the dep_capture command extraction. Extracted Bash
+# commands from logs/*.log (deduped, newest-first) are admitted until this
+# ceiling; any truncation is noted in the worker prompt. Sized to admit
+# the full command set for essentially every run (~50–80k tokens undeduped,
+# ~66k worst-case) while bounding the LLM input. Mirrors the
+# _FIXTURE_TOTAL_BUDGET idiom in gather_provision_fixtures.
+_DEPCAP_TOTAL_BUDGET = 307200  # 300KB ≈ 75k tokens at 4 bytes/token
 
 
 def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
@@ -5397,27 +5393,32 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
     os.replace(tmp, cfg_path)
 
 
-def _capture_installs_from_logs(
-        log_dir: Path) -> tuple[list[str], list[str]]:
-    """Scan worker JSONL logs in log_dir and return (apt_packages, lang_cmds).
+def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
+    """Extract all distinct Bash commands from worker logs for dep_capture input.
 
-    Iterates sorted *.log files via _iter_log_tool_use; for each Bash
-    tool_use feeds the command to _parse_apt_intents and a language-install
-    matcher. Returns stable-ordered deduplicated lists.
+    Iterates log files newest-first (reverse-sorted by name; worker logs are
+    named with sortable timestamps/sids), deduplicates commands, and admits
+    them under _DEPCAP_TOTAL_BUDGET bytes. Returns (commands_text, hit_ceiling).
     """
-    apt_seen: dict[str, None] = {}
-    lang_seen: dict[str, None] = {}
-    for log_path in sorted(log_dir.glob("*.log")):
+    seen: dict[str, None] = {}  # ordered set, dedup
+    for log_path in sorted(log_dir.glob("*.log"), reverse=True):
         for kind, inp, _result in _iter_log_tool_use(log_path):
             if kind != "Bash":
                 continue
             cmd = inp.get("command", "")
-            for pkg in _parse_apt_intents(cmd):
-                apt_seen[pkg] = None
-            if _LANG_INSTALL_RE.match(cmd):
-                stripped = cmd.strip().split("\n")[0].strip()
-                lang_seen[stripped] = None
-    return list(apt_seen), list(lang_seen)
+            if cmd:
+                seen[cmd] = None
+    total_bytes = 0
+    hit_ceiling = False
+    lines: list[str] = []
+    for cmd in seen:
+        encoded = (cmd + "\n---\n").encode()
+        if total_bytes + len(encoded) > _DEPCAP_TOTAL_BUDGET:
+            hit_ceiling = True
+            break
+        lines.append(cmd)
+        total_bytes += len(encoded)
+    return "\n---\n".join(lines), hit_ceiling
 
 
 def resolve_capture_deps(repo_root: Path) -> bool:
@@ -5446,14 +5447,31 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
-def capture_repo_deps(repo_root: Path, st: object) -> None:
-    """Scan this run's logs and write setup_packages to .leerie/config.toml.
+async def capture_repo_deps(
+        repo_root: Path,
+        st: object,
+        caps: dict | None = None,
+        models: dict[str, str] | None = None,
+        efforts: dict[str, str | None] | None = None,
+) -> None:
+    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml.
 
-    Called from phase_finalize, wrapped in try/except (non-fatal).
+    Called from phase_finalize (awaited), wrapped in try/except (non-fatal).
+    Extracts the Bash commands workers ran from logs/*.log via
+    _extract_depcap_commands, invokes the dep_capture worker via claude_p,
+    then writes setup_packages and language_installs to .leerie/config.toml
+    via _write_config_toml_keys, union-merged never-clobber.
+
     Skips writing when a committed .leerie/Dockerfile already exists
-    (it is authoritative and setup_packages is ignored in that case).
+    (it is authoritative; DESIGN §6½). Honors the capture_deps opt-out.
+    When caps/models/efforts are None (e.g. finalize called without them),
+    falls back gracefully — no worker is spawned.
     """
     if not resolve_capture_deps(repo_root):
+        return
+    if caps is None or models is None or efforts is None:
+        log("capture: skipped dep_capture worker (caps/models/efforts not "
+            "available at finalize time)")
         return
     log_dir = getattr(st, "run_dir", None)
     if log_dir is None:
@@ -5461,11 +5479,8 @@ def capture_repo_deps(repo_root: Path, st: object) -> None:
     log_dir = Path(log_dir) / "logs"
     if not log_dir.is_dir():
         return
-    apt_pkgs, _lang_cmds = _capture_installs_from_logs(log_dir)
-    if not apt_pkgs:
-        return
-    # Skip setup_packages write when a committed .leerie/Dockerfile exists;
-    # it is authoritative (DESIGN §6½) and setup_packages is ignored.
+    # Skip when a committed .leerie/Dockerfile exists; it is authoritative
+    # (DESIGN §6½) and setup_packages / language_installs are ignored.
     dockerfile = repo_root / ".leerie" / "Dockerfile"
     if dockerfile.is_file():
         try:
@@ -5475,18 +5490,79 @@ def capture_repo_deps(repo_root: Path, st: object) -> None:
                 capture_output=True)
             if result.returncode == 0:
                 log("capture: .leerie/Dockerfile is committed — skipping "
-                    "setup_packages write (Dockerfile is authoritative)")
+                    "dep_capture (Dockerfile is authoritative)")
                 return
         except Exception:
             pass
-    cfg_path = repo_root / ".leerie" / "config.toml"
-    existing = _read_toml_key(cfg_path, "setup_packages") or ""
-    merged = _merge_setup_packages(existing, apt_pkgs)
-    if merged is None:
+    commands_text, hit_ceiling = _extract_depcap_commands(log_dir)
+    if not commands_text.strip():
+        log("capture: no Bash commands found in logs — skipping dep_capture")
         return
-    _write_config_toml_keys(cfg_path, {"setup_packages": merged})
-    log(f"capture: wrote setup_packages={merged!r} to {cfg_path}; "
-        "run `git add .leerie/ && git commit` to bake next run")
+    # Budget pre-check: don't spawn if the run has exhausted max_total_workers.
+    wc = st.data.get("worker_count", 0) if hasattr(st, "data") else 0
+    if wc >= caps["max_total_workers"]:
+        log(f"capture: skipped dep_capture worker (worker budget exhausted at "
+            f"{wc}/{caps['max_total_workers']})")
+        return
+    sys_prompt = load_prompt("dep_capture")
+    model = models.get("dep_capture", MODEL_DEFAULT)
+    effort = efforts.get("dep_capture")
+    truncation_note = (
+        "\n\n[NOTE: command list was truncated at the byte budget ceiling — "
+        "the most recent commands are shown first]"
+        if hit_ceiling else ""
+    )
+    user_prompt = (
+        f"Shell commands run by workers during this leerie run "
+        f"(newest-first, deduplicated):\n\n{commands_text}{truncation_note}"
+    )
+    if hasattr(st, "bump_workers"):
+        st.bump_workers(caps)
+    result = await claude_p(
+        user_prompt=user_prompt,
+        system_prompt=sys_prompt,
+        schema_key="dep_capture",
+        cwd=str(repo_root),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=10,
+        autonomous=False,
+        caps=caps,
+        st=st,
+        model=model,
+        effort=effort,
+        sid="dep-capture",
+    )
+    setup_packages: list[str] = result.get("setup_packages") or []
+    language_installs: list[dict] = result.get("language_installs") or []
+    cfg_path = repo_root / ".leerie" / "config.toml"
+    updates: dict[str, str] = {}
+    if setup_packages:
+        existing = _read_toml_key(cfg_path, "setup_packages") or ""
+        merged = _merge_setup_packages(existing, setup_packages)
+        if merged is not None:
+            updates["setup_packages"] = merged
+    if language_installs:
+        # Serialize language_installs as a JSON string into the TOML value.
+        # The launcher reads this key and parses it when building the Dockerfile.
+        existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
+        try:
+            existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
+        except (json.JSONDecodeError, ValueError):
+            existing_list = []
+        existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
+        new_entries = [e for e in language_installs
+                       if e.get("manager") and e["manager"] not in existing_managers]
+        if new_entries:
+            merged_list = existing_list + new_entries
+            updates["language_installs"] = json.dumps(merged_list, separators=(",", ":"))
+    if updates:
+        _write_config_toml_keys(cfg_path, updates)
+        pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
+        li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
+        log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
+            "run `git add .leerie/ && git commit` to bake next run")
+    else:
+        log("capture: dep_capture found no new deps to write")
 
 
 def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
@@ -7623,7 +7699,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # (`judge`, `patch_generator`) that are not main-loop workers but
     # do invoke claude_p with their own schema.
     _allowed_schema_keys = set(WORKER_TYPES) | {
-        "judge", "patch_generator", "pr_writer"}
+        "judge", "patch_generator", "pr_writer", "dep_capture"}
     if schema_key not in _allowed_schema_keys:
         raise ValueError(
             f"claude_p called with unknown schema_key {schema_key!r}; "
@@ -15740,7 +15816,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Capture-and-bake hook (DESIGN §6½). Non-fatal: any error is
     # swallowed so capture failure never blocks a run from completing.
     try:
-        capture_repo_deps(Path(os.getcwd()), st)
+        await capture_repo_deps(
+            Path(os.getcwd()), st,
+            caps=caps, models=models, efforts=efforts,
+        )
     except Exception as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
