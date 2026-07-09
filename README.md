@@ -442,7 +442,7 @@ details and sub-flags.
 - **Model** (per worker, highest first): `--model-<worker>` →
   `--model` → `LEERIE_MODEL_<WORKER>` → `LEERIE_MODEL` →
   `model_<worker>` in `leerie.toml` → `model` in `leerie.toml` →
-  per-worker default (`implementer`, `conformer` → `sonnet`; everything
+  per-worker default (`implementer`, `conformer`, `satisfied_probe` → `sonnet`; everything
   else → `opus`). The judgment-vs-acting split keeps the
   most-frequently-invoked workers on the lower-cost model while
   every judgment step gets Opus-grade reasoning. To restore the
