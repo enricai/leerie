@@ -2436,35 +2436,36 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 
 ### Auto-capture of repo dependencies
 
-At the end of a normal (non-resume) finalize, leerie scans this run's
-`logs/*.log` files to extract system-package `apt-get install` intents
-(including failed ones; the intent is the signal, not the outcome). Those
-intents feed the system-package bake path below. The language-dep bake is
-**not** fed by this scan — it is driven entirely by the launcher's own
-build-time lockfile detection (see below), so no per-command capture is
-needed for it. (The log scanner also collects the language install
-commands the workers ran, but that list is diagnostic only and is not
-persisted.) Two distinct bake paths follow.
+At the end of a normal (non-resume) finalize, leerie invokes the `dep_capture`
+LLM worker. The worker reads the complete set of shell commands workers ran
+(extracted from `logs/*.log` via `_iter_log_tool_use`, deduped, newest-first,
+bounded to a byte budget of ~300 KB) and **decides** what the repo genuinely
+needs across all languages and frameworks. Its structured output (`setup_packages`
+and `language_installs`) is validated against a JSON schema and written to
+`.leerie/config.toml` deterministically — code enforces; the model decides
+content (§12 *Prompts are advisory, code enforces*). The `dep_capture` worker
+defaults to `opus`/`high` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
-**System packages → `setup_packages` → warm apt layer.** Captured apt
-packages are union-merged into `setup_packages` in `.leerie/config.toml`
-(never clobber: only new discoveries are appended; user-edited values and
-comments are preserved). The existing launcher auto-generation path (see
-*Per-repo container image* above) turns the updated `setup_packages` into a
-derived apt-install Dockerfile next run. Workers that previously failed
-every `apt-get install` attempt (because they run unprivileged) find the
-package pre-installed; the install-intent loop stops.
+**System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
+`setup_packages` output is union-merged into `setup_packages` in
+`.leerie/config.toml` (never clobber: only new packages are appended;
+user-edited values and comments are preserved). The existing launcher
+auto-generation path (see *Per-repo container image* above) turns the updated
+`setup_packages` into a derived apt-install Dockerfile next run. Workers that
+previously failed every `apt-get install` attempt (because they run unprivileged)
+find the package pre-installed; the install-intent loop stops.
 
-**Language deps → richer Dockerfile bake (gated on `bake_language_deps`,
-default true).** When `bake_language_deps` is enabled, the auto-generated
-`.leerie/Dockerfile` (and, when `build_repo_image` builds it, the derived
-image) also includes a language-dep layer: `COPY` for the lockfile, manifest
-files, and any ancillary inputs the package manager requires (workspace
-`package.json`s, `patches/`, `.npmrc`, `pnpm-workspace.yaml`), followed by
-`RUN <detected install command>` (`pnpm install --frozen-lockfile`,
-`pip install -r requirements.txt`, etc.). Workers that inherit this image
-find their `node_modules` / site-packages already populated — the per-worker
-install drops to near-zero.
+**Language deps → `language_installs` → richer Dockerfile bake (gated on
+`bake_language_deps`, default true).** `dep_capture`'s `language_installs`
+output (per-manager `{manager, command, copy_inputs}` entries) is written to
+`.leerie/config.toml`, keyed by manager, never-clobber. When `bake_language_deps`
+is enabled, the auto-generated `.leerie/Dockerfile` (and, when `build_repo_image`
+builds it, the derived image) also includes a language-dep layer: `COPY` for the
+lockfile, manifest files, and any ancillary inputs the package manager requires,
+followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
+`pip install -r requirements.txt`, etc.). Workers that inherit this image find
+their `node_modules` / site-packages already populated — the per-worker install
+drops to near-zero.
 
 **Rebuild tradeoff.** A dependency-input change triggers a full image
 rebuild (`build_repo_image` fires when the hash mismatches). To keep
