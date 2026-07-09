@@ -19,6 +19,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -484,8 +485,6 @@ def test_missing_logs_dir_is_silent_noop(leerie, tmp_path, monkeypatch):
 def test_write_failure_is_catchable(leerie, tmp_path, monkeypatch):
     """_write_config_toml_keys raising propagates from capture_repo_deps
     as a catchable Exception — the phase_finalize guard can catch it."""
-    from unittest.mock import patch
-
     repo = tmp_path / "repo"
     repo.mkdir()
     st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
