@@ -2511,9 +2511,20 @@ is ignored when a committed Dockerfile is present (see *Per-repo container
 image* above).
 
 **Fly parity.** Capture writes the same files regardless of runtime. On
-`--runtime fly` the `.leerie/config.toml` and `.leerie/Dockerfile` changes
-are included in the `seed-repo.sh` whitelist so the Fly derived-image path
-picks them up on the next run identically to the local nerdctl path.
+`--runtime fly` the workflow is split across two directions:
+- **Machine → host (stream-back).** After the run-state tar, `fetch-branch.sh`
+  best-effort streams `/work/.leerie/config.toml` and `/work/.leerie/Dockerfile`
+  from the Fly Machine back to `$USER_REPO/.leerie/` (or `$LEERIE_STATE_HOST_DIR`).
+  Each file is existence-guarded on the remote side and never clobbers a
+  host-edited file; failure is non-fatal and does not affect `fetch_branch`'s
+  return code. This fires only on a clean finish (the same condition gate that
+  runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
+  host-side `--recapture` / next-run backstop instead.
+- **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
+  files (including a previously streamed-back and committed `config.toml`
+  or `Dockerfile`) are included in the `seed-repo.sh` dirty-delta filter so
+  they reach the machine's `/work/.leerie/` on the next run. The Fly
+  derived-image path then picks them up identically to the local nerdctl path.
 
 ### Browser-based test execution in the base image
 

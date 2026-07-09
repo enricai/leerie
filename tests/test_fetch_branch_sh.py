@@ -66,16 +66,25 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
     )
 
 
-def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) -> Path:
+def _make_fake_flyctl(
+    tmp_path: Path,
+    machine_runs_dir: Path,
+    git_repo: Path,
+    machine_leerie_dir: Path | None = None,
+) -> Path:
     """Write a stub flyctl that routes machine exec calls locally.
 
-    The stub handles the three flyctl machine exec invocations that
-    fetch_branch makes:
+    The stub handles the flyctl machine exec invocations that fetch_branch
+    makes:
       1. python3 -c '...'  — run the discovery snippet, rewriting the
          hardcoded /work/.leerie/runs path to machine_runs_dir.
       2. git -C /work bundle create - <branch>  — run against git_repo.
       3. tar -cC /work/.leerie/runs <run-id>  — run against machine_runs_dir.
+      4. test -f /work/.leerie/<file>  — probe against machine_leerie_dir.
+      5. cat /work/.leerie/<file>  — stream from machine_leerie_dir.
 
+    machine_leerie_dir is the local directory standing in for /work/.leerie on
+    the Fly machine.  When None, Step 4/5 calls silently fail (file absent).
     All other invocations succeed silently.
     """
     # Write the discovery helper script as a separate file to avoid quoting
@@ -85,6 +94,9 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
         "RUNS_DIR_PLACEHOLDER", repr(str(machine_runs_dir))
     )
     discover_py.write_text(snippet)
+
+    # Machine-side .leerie/ directory (stands in for /work/.leerie/).
+    mleerie = str(machine_leerie_dir) if machine_leerie_dir else ""
 
     stub = tmp_path / "flyctl"
     stub.write_text(
@@ -96,6 +108,7 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
         # paths to point at the test fixtures.
         f'REPO={git_repo}\n'
         f'MRUNS={machine_runs_dir}\n'
+        f'MLEERIE={mleerie}\n'
         # Parse out the -C argument.
         'CMD=""\n'
         'while [ $# -gt 0 ]; do\n'
@@ -129,6 +142,20 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
         '  tar*-cC*/work/.leerie/runs*)\n'
         # rewrite "tar -cC /work/.leerie/runs <run-id>" → "tar -cC $MRUNS <run-id>"
         '    NEWCMD="${CMD//\\/work\\/.leerie\\/runs/$MRUNS}"\n'
+        '    eval "$NEWCMD"\n'
+        '    exit $?\n'
+        '    ;;\n'
+        # Step 4 probe: "test -f /work/.leerie/<file>"
+        '  *test*-f*/work/.leerie/*)\n'
+        '    [ -z "$MLEERIE" ] && exit 1\n'
+        '    NEWCMD="${CMD//\\/work\\/.leerie/$MLEERIE}"\n'
+        '    eval "$NEWCMD"\n'
+        '    exit $?\n'
+        '    ;;\n'
+        # Step 4 stream: "cat /work/.leerie/<file>"
+        '  *cat*/work/.leerie/*)\n'
+        '    [ -z "$MLEERIE" ] && exit 1\n'
+        '    NEWCMD="${CMD//\\/work\\/.leerie/$MLEERIE}"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
@@ -550,4 +577,158 @@ def test_fetch_branch_exports_run_id(tmp_path):
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
     assert f"RUN_ID={run_id}" in result.stdout, (
         f"LEERIE_REMOTE_RUN_ID not exported correctly. stdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 4: .leerie/ stream-back tests
+# ---------------------------------------------------------------------------
+
+def _make_run_fixture(
+    tmp_path: Path, run_id: str
+) -> tuple[Path, Path, Path]:
+    """Return (repo, machine_runs, run_branch) for a basic completed run."""
+    repo = _make_git_repo(tmp_path)
+    run_branch = f"leerie/runs/{run_id}"
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", run_branch],
+        check=True, capture_output=True,
+    )
+    machine_runs = tmp_path / "machine_runs"
+    run_dir = machine_runs / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "finished_at": "2026-01-01T00:00:00Z",
+        "branch": run_branch,
+        "working_branch": "main",
+    }))
+    (run_dir / "state.json").write_text("{}")
+    return repo, machine_runs, run_branch
+
+
+def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
+    """Step 4 copies config.toml and Dockerfile from the machine to the
+    host .leerie/ dir when neither exists on the host yet."""
+    run_id = "feat-streamback-001"
+    repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
+
+    # Create machine-side .leerie/ files.
+    machine_leerie = tmp_path / "machine_leerie"
+    machine_leerie.mkdir()
+    (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
+    (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "LEERIE_MACHINE_ID": "m-streamback",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+
+    host_leerie = repo / ".leerie"
+    assert (host_leerie / "config.toml").exists(), "config.toml not streamed to host"
+    assert (host_leerie / "Dockerfile").exists(), "Dockerfile not streamed to host"
+    assert (host_leerie / "config.toml").read_text() == "[config]\nsetup_packages = []\n"
+    assert (host_leerie / "Dockerfile").read_text() == "FROM debian:13\n"
+
+
+def test_step4_never_clobbers_existing_host_file(tmp_path):
+    """Step 4 skips a file when the host target already exists."""
+    run_id = "feat-noclobber-002"
+    repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
+
+    # Pre-create host .leerie/config.toml with user-edited content.
+    host_leerie = repo / ".leerie"
+    host_leerie.mkdir()
+    original_content = "# hand-edited\n[config]\nsetup_packages = ['git']\n"
+    (host_leerie / "config.toml").write_text(original_content)
+
+    # Machine has a different version.
+    machine_leerie = tmp_path / "machine_leerie"
+    machine_leerie.mkdir()
+    (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
+    (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "LEERIE_MACHINE_ID": "m-noclobber",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+    # config.toml must be unchanged.
+    assert (host_leerie / "config.toml").read_text() == original_content, (
+        "Step 4 must not clobber an existing host-side config.toml"
+    )
+    # Dockerfile was absent on the host — should have been written.
+    assert (host_leerie / "Dockerfile").exists(), "Dockerfile should be written when absent on host"
+
+
+def test_step4_nonfatal_when_machine_file_absent(tmp_path):
+    """Step 4 is non-fatal: fetch_branch still returns 0 when no .leerie/
+    files exist on the machine (machine_leerie_dir is absent)."""
+    run_id = "feat-nonfatal-003"
+    repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
+
+    # Stub with no machine .leerie/ dir — test -f will fail for all files.
+    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=None)
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "LEERIE_MACHINE_ID": "m-nofail",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, (
+        "fetch_branch must return 0 even when no machine .leerie/ files exist; "
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_step4_uses_leerie_state_host_dir(tmp_path):
+    """Step 4 writes to LEERIE_STATE_HOST_DIR when the env var is set."""
+    run_id = "feat-statehostdir-004"
+    repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
+
+    machine_leerie = tmp_path / "machine_leerie"
+    machine_leerie.mkdir()
+    (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['curl']\n")
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+
+    custom_host_dir = tmp_path / "custom_leerie_state"
+    custom_host_dir.mkdir()
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "LEERIE_MACHINE_ID": "m-hostdir",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "LEERIE_STATE_HOST_DIR": str(custom_host_dir),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+    # File must land in custom_host_dir, not repo/.leerie/.
+    assert (custom_host_dir / "config.toml").exists(), (
+        "config.toml must be written to LEERIE_STATE_HOST_DIR when set"
+    )
+    assert not (repo / ".leerie" / "config.toml").exists(), (
+        "config.toml must NOT be written to USER_REPO/.leerie when "
+        "LEERIE_STATE_HOST_DIR is set"
     )
