@@ -483,9 +483,10 @@ Additionally, two post-run workers run outside the main orchestrate loop and are
 
 **Per-worker model defaults:** judgment workers (classifier, planner,
 reconciler, plan_overlap_judge, provision, integrator) default to Opus;
-the acting workers (implementer, conformer) default to Sonnet — their
-job is concrete subtask execution where throughput matters more than
-broad-context judgment. To revert to the
+the acting workers (implementer, conformer) and `satisfied_probe` default
+to Sonnet — their job is concrete subtask execution or lightweight
+per-subtask probing where throughput matters more than broad-context
+judgment. To revert to the
 all-Sonnet pattern of earlier versions, set `LEERIE_MODEL=sonnet` or
 pass `--model sonnet`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2
 *Model selection* for the full precedence table.
