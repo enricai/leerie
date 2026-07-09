@@ -502,9 +502,12 @@ Python-layer `group_id` in `run.json` (`_validate_run_json`,
 basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
 `--state-dir`) is in `tests/test_group_state_dir_guard.py`. The
 capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_packages`,
-and `capture_repo_deps` (async, with stubbed `claude_p`) — is tested in
-`tests/test_capture_deps.py` against a synthetic JSONL fixture in the
-`_iter_log_tool_use` shape, covering command extraction, budget ceiling truncation,
+and `capture_repo_deps` (async, with stubbed `claude_p`) — is tested across two
+files. `tests/test_dep_capture_budget.py` covers the extraction+budget unit
+(`_extract_depcap_commands`) in focused isolation: dedup, newest-first ordering,
+budget gate (`_DEPCAP_TOTAL_BUDGET`), `hit_ceiling` flag semantics, non-Bash
+filtering, and malformed-line tolerance. `tests/test_capture_deps.py` covers the
+integration: command extraction, budget ceiling truncation,
 merger union/no-op/never-clobber, schema-validated worker output →
 setup_packages + language_installs write, committed-Dockerfile
 skip, write-failure non-fatal, and opt-out. No coverage
