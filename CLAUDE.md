@@ -507,7 +507,12 @@ and `capture_repo_deps` (async, with stubbed `claude_p`) — is tested in
 `_iter_log_tool_use` shape, covering command extraction, budget ceiling truncation,
 merger union/no-op/never-clobber, schema-validated worker output →
 setup_packages + language_installs write, committed-Dockerfile
-skip, write-failure non-fatal, and opt-out. No coverage
+skip, write-failure non-fatal, and opt-out. The `dep_capture` schema
+contract — required fields, `language_installs` item shape, valid/invalid
+instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
+exclusion, effort/model defaults) — is pinned in
+`tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
+No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
