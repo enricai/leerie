@@ -4004,14 +4004,13 @@ if [ "$_leerie_do_gen" = "true" ]; then
     printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
 
     # Language-dep layer (gated on bake_language_deps, default true).
-    # Uses python3 to detect lockfiles/manifests and emit COPY+RUN.
-    # Every COPY-input sha (lockfiles, manifests, workspace children,
-    # patches/*, .npmrc) is embedded as a comment inside the Dockerfile, so the
+    # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
     # Dockerfile sha folds them into .dockerfile-hash (the single hash site
-    # below). The Fly path inherits this same generated Dockerfile via the
-    # seed-repo whitelist, so no second hash-computation is needed there.
+    # below). Each copy_input is existence-checked (p.exists()) before being
+    # added to the COPY list — hallucinated paths are silently dropped while
+    # the RUN line is always emitted.
     if [ "$_BAKE_LANGUAGE_DEPS" = "true" ]; then
-      _lang_layer="$(python3 - "$USER_REPO" <<'PY'
+      _lang_layer="$(python3 - "$USER_REPO" "$_leerie_config_toml" <<'PY'
 import glob as _glob
 import hashlib
 import json as _json
@@ -4021,7 +4020,83 @@ import sys
 from pathlib import Path
 
 repo = Path(sys.argv[1])
+config_toml = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
+
+def sha256(p):
+    h = hashlib.sha256()
+    h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def _hash_copy_files(repo, copy_files):
+    copy_shas = {}
+    for rel in copy_files:
+        p = repo / rel.rstrip("/")
+        if p.is_file():
+            copy_shas[rel] = sha256(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    copy_shas[os.path.relpath(f, str(repo))] = sha256(f)
+    return copy_shas
+
+
+def _emit_layer(copy_files, run_cmd, copy_shas):
+    sha_comment = "# copy-input-shas: " + " ".join(
+        f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
+    )
+    copy_line = "COPY " + " ".join(copy_files) + " ./"
+    run_line = f"RUN {run_cmd}"
+    print(sha_comment)
+    print(copy_line)
+    print(run_line)
+
+
+persisted_installs = []
+if config_toml and config_toml.is_file():
+    try:
+        raw = config_toml.read_text()
+    except OSError:
+        raw = ""
+    # Extract the language_installs value from a flat TOML file.
+    # The value is a JSON string (possibly quoted with " or ').
+    for line in raw.splitlines():
+        m = re.match(
+            r"^\s*language_installs\s*=\s*(?:\"(.*)\"|'(.*)'|(.*))$",
+            line.strip(),
+        )
+        if m:
+            val = m.group(1) or m.group(2) or m.group(3) or ""
+            val = val.strip()
+            if val:
+                try:
+                    persisted_installs = _json.loads(val)
+                    if not isinstance(persisted_installs, list):
+                        persisted_installs = []
+                except (ValueError, TypeError):
+                    persisted_installs = []
+            break
+
+if persisted_installs:
+    emitted = False
+    for entry in persisted_installs:
+        if not isinstance(entry, dict):
+            continue
+        run_cmd = (entry.get("command") or "").strip()
+        copy_inputs = entry.get("copy_inputs") or []
+        if not run_cmd:
+            continue
+        # Validate each copy_input; skip hallucinated paths but always emit RUN.
+        copy_files = [ci for ci in copy_inputs if ci and (repo / ci).exists()]
+        if copy_files:
+            copy_shas = _hash_copy_files(repo, copy_files)
+            _emit_layer(copy_files, run_cmd, copy_shas)
+        else:
+            # No valid copy inputs: emit RUN without COPY.
+            print(f"RUN {run_cmd}")
+        emitted = True
+    sys.exit(0 if emitted else 0)
 
 def _node_ancillary(repo, copy_files):
     """Append the ancillary inputs a node install needs beyond the lockfile:
@@ -4076,11 +4151,6 @@ has_dotnet = (repo / "packages.lock.json").is_file()
 
 copy_files = []
 run_cmd = ""
-
-def sha256(p):
-    h = hashlib.sha256()
-    h.update(p.read_bytes())
-    return h.hexdigest()
 
 if has_pnpm:
     copy_files.append("pnpm-lock.yaml")
@@ -4145,24 +4215,11 @@ if not run_cmd:
 # only a lockfile bump — triggers a rebuild. A patch edit that leaves the
 # lockfile untouched must still invalidate the image (DESIGN §6½: "every
 # lockfile that participates in the COPY list"; patches participate).
-copy_shas = {}
-for rel in copy_files:
-    p = repo / rel.rstrip("/")
-    if p.is_file():
-        copy_shas[rel] = sha256(p)
-    elif p.is_dir():  # e.g. patches/ — hash each contained file, sorted-stable
-        for f in sorted(p.rglob("*")):
-            if f.is_file():
-                copy_shas[os.path.relpath(f, str(repo))] = sha256(f)
+copy_shas = _hash_copy_files(repo, copy_files)
 
 # Emit COPY + RUN lines.
 # Shas are embedded as a comment so the Dockerfile sha captures dep-input drift.
-sha_comment = "# copy-input-shas: " + " ".join(f"{k}={v[:12]}" for k, v in sorted(copy_shas.items()))
-copy_line = "COPY " + " ".join(copy_files) + " ./"
-run_line = f"RUN {run_cmd}"
-print(sha_comment)
-print(copy_line)
-print(run_line)
+_emit_layer(copy_files, run_cmd, copy_shas)
 PY
       )"
       if [ -n "$_lang_layer" ]; then

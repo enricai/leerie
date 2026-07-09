@@ -1465,3 +1465,210 @@ def test_write_config_toml_keys_round_trips_via_launcher_read(tmp_path):
         f"round-trip mismatch: Python wrote {test_value!r}, "
         f"launcher _config_read_key returned {read_back!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dockerfile language-layer bake-from-persisted-installs tests
+#
+# The launcher's Python heredoc (the _lang_layer block, leerie ~4016) now
+# reads `language_installs` from config.toml as its PRIMARY source, falling
+# back to lockfile detection when none are persisted.  These tests extract
+# that Python script verbatim from the launcher and invoke it directly so
+# the logic under test is always the live launcher code.
+# ---------------------------------------------------------------------------
+
+
+def _extract_lang_layer_script() -> str:
+    """Return the Python heredoc body for the _lang_layer block verbatim."""
+    launcher_text = (REPO_ROOT / "leerie").read_text()
+    start_marker = '_lang_layer="$(python3 - "$USER_REPO" "$_leerie_config_toml" <<\'PY\'\n'
+    end_marker = "\nPY\n"
+    s = launcher_text.index(start_marker) + len(start_marker)
+    e = launcher_text.index(end_marker, s)
+    return launcher_text[s:e]
+
+
+def _run_lang_layer(
+    tmp_path: Path,
+    repo_files: dict[str, str] | None = None,
+    config_toml_content: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run the lang-layer Python script against a synthetic repo.
+
+    repo_files: {relative_path: content} to write into the fake repo.
+    config_toml_content: content for .leerie/config.toml (None = no file).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    for rel, content in (repo_files or {}).items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+
+    if config_toml_content is not None:
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(exist_ok=True)
+        (leerie_dir / "config.toml").write_text(config_toml_content)
+        config_toml_arg = str(leerie_dir / "config.toml")
+    else:
+        config_toml_arg = str(repo / ".leerie" / "config.toml")  # non-existent
+
+    script = _extract_lang_layer_script()
+    script_file = tmp_path / "lang_layer.py"
+    script_file.write_text(script)
+
+    return subprocess.run(
+        ["python3", str(script_file), str(repo), config_toml_arg],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_lang_layer_persisted_installs_copy_and_run(tmp_path):
+    """With language_installs in config.toml, emits COPY + RUN from persisted data."""
+    import json
+
+    installs = [{"manager": "pip", "command": "pip install -r requirements.txt",
+                 "copy_inputs": ["requirements.txt"]}]
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={"requirements.txt": "pytest\n"},
+        config_toml_content=f'language_installs = "{json.dumps(installs, separators=(",", ":"))}\"\n',
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "COPY requirements.txt" in output
+    assert "RUN pip install -r requirements.txt" in output
+    assert "copy-input-shas:" in output
+
+
+def test_lang_layer_persisted_installs_hallucinated_copy_input_dropped(tmp_path):
+    """Hallucinated copy_inputs (non-existent files) are dropped from COPY but RUN remains."""
+    import json
+
+    installs = [
+        {
+            "manager": "pip",
+            "command": "pip install -r requirements.txt",
+            "copy_inputs": ["requirements.txt", "hallucinated-lockfile.txt"],
+        }
+    ]
+    # Only requirements.txt exists; hallucinated-lockfile.txt does not.
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={"requirements.txt": "pytest\n"},
+        config_toml_content=f'language_installs = "{json.dumps(installs, separators=(",", ":"))}\"\n',
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "hallucinated-lockfile.txt" not in output, "hallucinated path must be dropped"
+    assert "requirements.txt" in output, "existing copy_input must be kept"
+    assert "RUN pip install -r requirements.txt" in output, "RUN must always be emitted"
+
+
+def test_lang_layer_persisted_installs_all_copy_inputs_missing_run_still_emitted(tmp_path):
+    """When all copy_inputs are hallucinated, RUN is still emitted without COPY."""
+    import json
+
+    installs = [
+        {
+            "manager": "pip",
+            "command": "pip install -r requirements.txt",
+            "copy_inputs": ["no-such-file.txt"],
+        }
+    ]
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={},
+        config_toml_content=f'language_installs = "{json.dumps(installs, separators=(",", ":"))}\"\n',
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "RUN pip install -r requirements.txt" in output, "RUN must appear even with no valid COPY inputs"
+    assert "no-such-file.txt" not in output
+
+
+def test_lang_layer_persisted_installs_multi_manager(tmp_path):
+    """Multiple managers each get their own COPY+RUN layer."""
+    import json
+
+    installs = [
+        {"manager": "pip", "command": "pip install -r requirements.txt",
+         "copy_inputs": ["requirements.txt"]},
+        {"manager": "npm", "command": "npm ci",
+         "copy_inputs": ["package-lock.json", "package.json"]},
+    ]
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={
+            "requirements.txt": "pytest\n",
+            "package-lock.json": "{}",
+            "package.json": '{"name":"x"}',
+        },
+        config_toml_content=f'language_installs = "{json.dumps(installs, separators=(",", ":"))}\"\n',
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "RUN pip install -r requirements.txt" in output
+    assert "RUN npm ci" in output
+    assert "COPY requirements.txt" in output
+    assert "COPY package-lock.json" in output or "package-lock.json" in output
+
+
+def test_lang_layer_fallback_to_lockfile_detection_when_no_persisted(tmp_path):
+    """Without language_installs in config.toml, lockfile detection fires."""
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={
+            "requirements.txt": "pytest\n",
+            "uv.lock": "# uv lockfile\n",
+            "pyproject.toml": "[project]\nname='x'\n",
+        },
+        config_toml_content=None,  # no config.toml → lockfile detection
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "RUN uv sync" in output
+    assert "COPY uv.lock" in output
+
+
+def test_lang_layer_fallback_when_language_installs_empty(tmp_path):
+    """Empty language_installs list → falls through to lockfile detection."""
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={
+            "pnpm-lock.yaml": "lockfileVersion: 6\n",
+            "package.json": '{"name":"x"}',
+        },
+        config_toml_content='language_installs = "[]"\n',
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    output = result.stdout
+    assert "RUN pnpm install --frozen-lockfile" in output
+
+
+def test_lang_layer_no_lockfile_and_no_persisted_exits_0_no_output(tmp_path):
+    """No config.toml language_installs and no lockfile → exits 0 with no output."""
+    result = _run_lang_layer(
+        tmp_path,
+        repo_files={},  # empty repo
+        config_toml_content=None,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert result.stdout.strip() == "", "no output when nothing detected"
+
+
+def test_lang_layer_hash_stable_on_identical_regen(tmp_path):
+    """Identical inputs produce identical output (hash stability for .dockerfile-hash)."""
+    import json
+
+    installs = [{"manager": "pip", "command": "pip install -r requirements.txt",
+                 "copy_inputs": ["requirements.txt"]}]
+    cfg = f'language_installs = "{json.dumps(installs, separators=(",", ":"))}\"\n'
+    kwargs = dict(
+        repo_files={"requirements.txt": "pytest\n"},
+        config_toml_content=cfg,
+    )
+    r1 = _run_lang_layer(tmp_path, **kwargs)
+    r2 = _run_lang_layer(tmp_path, **kwargs)
+    assert r1.stdout == r2.stdout, "identical inputs must produce identical output"

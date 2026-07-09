@@ -3985,21 +3985,35 @@ When the launcher auto-generates `.leerie/Dockerfile` from `setup_packages`
 after the apt `RUN`:
 
 ```dockerfile
-COPY <lockfiles> <manifests> [patches/] [.npmrc] [pnpm-workspace.yaml] ./
-RUN <detected install command>
+COPY <copy_inputs> ./
+RUN <install command>
 ```
 
-The `COPY` set is computed by an inline `python3` heredoc inside the
-launcher's auto-gen block that mirrors `_lockfile_table_entries`'s
-manager-precedence by hand (the launcher cannot import the
-orchestrator). For **all** node ecosystems (pnpm, yarn, npm) a shared
-`_node_ancillary` helper adds workspace `package.json`s, `patches/`,
-`.npmrc`, and `pnpm-workspace.yaml` to the lockfile + root manifest,
-because the frozen install requires them — workspace globs come from
-`pnpm-workspace.yaml` (pnpm) or `package.json`'s `workspaces` field
-(yarn/npm, both list and `{packages: [...]}` forms). On a build failure
-(e.g. a missing patch file), the launcher falls back to
-`bake_language_deps=false` (apt layer only) and logs loudly.
+The `COPY`+`RUN` layer is determined by an inline `python3` heredoc in
+the launcher's auto-gen block with two tiers:
+
+1. **Primary — persisted `language_installs` from `.leerie/config.toml`.**
+   The `dep_capture` worker writes a `language_installs` JSON array (keyed
+   by `manager`) to `.leerie/config.toml`. When this key is present, the
+   launcher reads it, iterates over every `{manager, command, copy_inputs}`
+   entry, and emits one `COPY`+`RUN` block per manager. Each `copy_input`
+   is validated with `p.exists()` before being added to the `COPY` list —
+   hallucinated paths are silently dropped while the `RUN` line is always
+   emitted (the install command itself is authoritative; the COPY list is
+   advisory). Multiple managers yield multiple `COPY`+`RUN` layers.
+
+2. **Fallback — lockfile detection (clean first run).** When no
+   `language_installs` key is present in config.toml (e.g. on the very
+   first run before `dep_capture` has fired), the heredoc mirrors
+   `_lockfile_table_entries`'s manager-precedence by hand to detect a
+   single lockfile manager. For **all** node ecosystems (pnpm, yarn, npm)
+   a shared `_node_ancillary` helper adds workspace `package.json`s,
+   `patches/`, `.npmrc`, and `pnpm-workspace.yaml`, because the frozen
+   install requires them — workspace globs come from `pnpm-workspace.yaml`
+   (pnpm) or `package.json`'s `workspaces` field (yarn/npm, both list and
+   `{packages: [...]}` forms). On a build failure (e.g. a missing patch
+   file), the launcher falls back to `bake_language_deps=false` (apt layer
+   only) and logs loudly.
 
 **COPY-input-sha rebuild trigger.** Every file that participates in the
 `COPY` list — lockfiles, manifests, workspace children, `patches/*`,
@@ -5797,7 +5811,7 @@ enforcement functions:
 | `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
 | `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
 | `test_base_dockerfile_chromium.py` | Base image `./Dockerfile` (not the per-repo autogen one): asserts `chromium` and `chromium-driver` are installed and the three container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`) are baked into `/etc/chromium.d/leerie-container-flags` after the chromium install (ordering guard) — see *Browser-based testing* above |
-| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam (`run_recapture_deps`) when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run`. Also covers the Dockerfile language-layer bake-from-persisted-installs logic (extracted Python heredoc invoked directly): persisted `language_installs` → COPY+RUN emitted per manager; hallucinated copy_inputs silently dropped while RUN always emitted; all copy_inputs missing → RUN without COPY; multi-manager → multiple COPY+RUN layers; no persisted installs → lockfile-detection fallback; empty `language_installs` list → lockfile fallback; no lockfile and no persisted installs → empty output; identical inputs → identical output (hash stability). |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
