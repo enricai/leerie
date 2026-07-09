@@ -927,31 +927,13 @@ else:
     print("config --recapture: no Bash commands found in logs; nothing to capture.")
 PY
 )" || _recapture_rc=$?
-        # Echo the seam's human-readable lines (drop the machine marker).
-        printf '%s\n' "$_recapture_out" | grep -v '^LEERIE_RECAPTURE_WROTE$' || true
+        printf '%s\n' "$_recapture_out" || true
         if [ "$_recapture_rc" -ne 0 ]; then
           remote_log "config --recapture: python3 seam failed (rc=$_recapture_rc); check orchestrator path"
           exit 1
         fi
-        # If setup_packages changed and an UNCOMMITTED *generated* Dockerfile
-        # exists, remove it so the next `leerie` run regenerates the image from
-        # the new packages. A committed Dockerfile is authoritative (DESIGN §6½)
-        # and is left untouched even if it carries the sentinel — same
-        # git-tracked authority test as the auto-gen guard and capture_repo_deps.
-        _gen_sentinel="# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
-        if printf '%s\n' "$_recapture_out" | grep -q '^LEERIE_RECAPTURE_WROTE$'; then
-          _df="$_user_repo/.leerie/Dockerfile"
-          if [ -f "$_df" ] && IFS= read -r _df_line < "$_df" 2>/dev/null && \
-             [ "$_df_line" = "$_gen_sentinel" ] && \
-             ! git -C "$_user_repo" ls-files --error-unmatch \
-                 ".leerie/Dockerfile" >/dev/null 2>&1; then
-            rm -f "$_df"
-            remote_log "config --recapture: removed generated .leerie/Dockerfile; it regenerates on next run"
-          fi
-          unset _df _df_line
-        fi
         unset _recapture_force _leerie_state_dir _runs_dir _newest_log_dir \
-              _recapture_rc _recapture_out _gen_sentinel
+              _recapture_rc _recapture_out
         exit 0
         ;;
       "")
