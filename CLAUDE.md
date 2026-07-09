@@ -522,7 +522,14 @@ language_installs write, committed-Dockerfile skip, write-failure non-fatal,
 and opt-out. Source-coupling guards in the same file pin that `main()`'s
 `KeyboardInterrupt` and `InterruptedBySignal` handlers each invoke
 `capture_repo_deps` (the cancel-arm seam — the fix is inert without the
-wiring). No coverage
+wiring). The worker-driven write path specifically — `capture_repo_deps`
+invoked with a stubbed `_invoke` returning a fixed structured_output envelope
+(mirroring `test_phase_judge.py`'s `_JUDGE_ENVELOPE` pattern) — is separately
+covered in `tests/test_dep_capture_worker.py`: schema-validated output written
+to `.leerie/config.toml`, warm-repo never-clobber (mtime unchanged when all
+deps already present), union append for new packages, env + config-file opt-out
+(worker not invoked), committed `.leerie/Dockerfile` guard (worker not invoked),
+missing logs dir silent no-op, and non-fatal write failure. No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
