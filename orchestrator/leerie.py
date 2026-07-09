@@ -5529,8 +5529,8 @@ async def capture_repo_deps(
         if merged is not None:
             updates["setup_packages"] = merged
     if language_installs:
-        # Serialize language_installs as a JSON string into the TOML value.
-        # The launcher reads this key and parses it when building the Dockerfile.
+        # JSON-in-TOML because TOML has no inline array type compatible with
+        # the flat _read_toml_key/_write_config_toml_keys surface.
         existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
         try:
             existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
@@ -5586,7 +5586,6 @@ async def _backstop_capture_prior_runs(
         sentinel = run_dir / "dep_capture.done"
         if sentinel.is_file():
             continue
-        # This run has logs but no completed capture. Run capture now.
         log(f"backstop: running dep_capture for prior run {run_dir.name}")
         try:
 
