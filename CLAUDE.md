@@ -201,7 +201,7 @@ tests/                      pytest suite
 # Launch an interactive Claude session to configure leerie for this repo:
 ./leerie config --chat
 
-# Re-scan the latest completed run's logs and rewrite setup_packages in
+# Run the dep_capture LLM worker over past runs' logs and write/update
 # .leerie/config.toml without starting a new run (host-only, no container):
 ./leerie config --recapture
 ./leerie config --recapture --force   # wholesale replace (not union)
@@ -329,6 +329,10 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # Override the model for the finalize-time PR-writer worker (default sonnet).
 # Also LEERIE_MODEL_PR_WRITER or `model_pr_writer` in leerie.toml.
 ./leerie "task" --pr-writer-model opus
+
+# Override the model for the dep_capture worker (default opus). Env-var only
+# (no CLI flag or leerie.toml key — dep_capture is a post-run worker):
+export LEERIE_MODEL_DEP_CAPTURE=sonnet
 
 # Filter `--list` output by run status:
 ./leerie --list --status paused
@@ -524,8 +528,7 @@ isolation: dedup, newest-first ordering, budget gate (`_DEPCAP_TOTAL_BUDGET`),
 `tests/test_capture_deps.py` covers the integration against a synthetic
 JSONL fixture in the `_iter_log_tool_use` shape: absence pins
 (`TestRegexPathAbsent`) that assert the four deleted regex-path symbols
-(`_parse_apt_intents`, `_capture_installs_from_logs`, `_LANG_INSTALL_RE`,
-`_APT_INSTALL_RE`) no longer exist on the module (so the regex path can never
+no longer exist on the module (so the regex path can never
 silently return); command extraction, budget ceiling truncation, merger
 union/no-op/never-clobber, schema-validated worker output → setup_packages +
 language_installs write, committed-Dockerfile skip, write-failure non-fatal,
