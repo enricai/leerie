@@ -1,6 +1,8 @@
 """Tests for the capture engine (DESIGN §6½ — Auto-capture of repo dependencies).
 
-Covers: _merge_setup_packages, _extract_depcap_commands,
+Covers: absence pins for deleted regex-path symbols (_parse_apt_intents,
+_capture_installs_from_logs, _LANG_INSTALL_RE, _APT_INSTALL_RE),
+_merge_setup_packages, _extract_depcap_commands,
 capture_repo_deps (writes setup_packages + language_installs via stubbed
 claude_p, committed-Dockerfile skip, write-failure non-fatal, opt-out),
 resolve_capture_deps.
@@ -14,6 +16,34 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Absence pins — regex path must not exist
+# ---------------------------------------------------------------------------
+
+class TestRegexPathAbsent:
+    """Assert that the four regex-path symbols were deleted and cannot return."""
+
+    def test_parse_apt_intents_absent(self, leerie):
+        assert not hasattr(leerie, "_parse_apt_intents"), (
+            "_parse_apt_intents was re-introduced; the regex capture path must stay deleted"
+        )
+
+    def test_capture_installs_from_logs_absent(self, leerie):
+        assert not hasattr(leerie, "_capture_installs_from_logs"), (
+            "_capture_installs_from_logs was re-introduced; the regex capture path must stay deleted"
+        )
+
+    def test_lang_install_re_absent(self, leerie):
+        assert not hasattr(leerie, "_LANG_INSTALL_RE"), (
+            "_LANG_INSTALL_RE was re-introduced; the regex capture path must stay deleted"
+        )
+
+    def test_apt_install_re_absent(self, leerie):
+        assert not hasattr(leerie, "_APT_INSTALL_RE"), (
+            "_APT_INSTALL_RE was re-introduced; the regex capture path must stay deleted"
+        )
 
 
 # ---------------------------------------------------------------------------

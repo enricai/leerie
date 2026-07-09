@@ -512,13 +512,17 @@ capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_pack
 sentinel (`dep_capture_done` state field + `<run_dir>/dep_capture.done`
 file), and `_backstop_capture_prior_runs` (skips runs with sentinel, captures
 runs without) — is tested in `tests/test_capture_deps.py` against a synthetic
-JSONL fixture in the `_iter_log_tool_use` shape, covering command extraction,
-budget ceiling truncation, merger union/no-op/never-clobber, schema-validated
-worker output → setup_packages + language_installs write, committed-Dockerfile
-skip, write-failure non-fatal, and opt-out. Source-coupling guards in the same
-file pin that `main()`'s `KeyboardInterrupt` and `InterruptedBySignal` handlers
-each invoke `capture_repo_deps` (the cancel-arm seam — the fix is inert without
-the wiring). No coverage
+JSONL fixture in the `_iter_log_tool_use` shape, covering: absence pins
+(`TestRegexPathAbsent`) that assert the four deleted regex-path symbols
+(`_parse_apt_intents`, `_capture_installs_from_logs`, `_LANG_INSTALL_RE`,
+`_APT_INSTALL_RE`) no longer exist on the module (so the regex path can never
+silently return); command extraction, budget ceiling truncation, merger
+union/no-op/never-clobber, schema-validated worker output → setup_packages +
+language_installs write, committed-Dockerfile skip, write-failure non-fatal,
+and opt-out. Source-coupling guards in the same file pin that `main()`'s
+`KeyboardInterrupt` and `InterruptedBySignal` handlers each invoke
+`capture_repo_deps` (the cancel-arm seam — the fix is inert without the
+wiring). No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
