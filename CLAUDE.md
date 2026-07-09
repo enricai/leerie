@@ -538,6 +538,15 @@ schema contract — required fields, `language_installs` item shape, valid/inval
 instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
 exclusion, effort/model defaults) — is pinned in
 `tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
+The three orchestrator wiring seams that are only verifiable by source
+inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
+`test_phase_finalize_capture_hook.py`'s `inspect.getsource` approach):
+`main()`'s `KeyboardInterrupt` and `InterruptedBySignal` exit arms each
+invoke `capture_repo_deps` inside their own `asyncio.run()` wrapped in a
+non-fatal `try/except Exception`; `_run_phases()` calls
+`_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
+crash recovery path); and the `dep_capture` prompt file exists alongside
+`SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
