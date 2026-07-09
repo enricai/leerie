@@ -1094,7 +1094,10 @@ def test_recapture_no_runs_dir_exits_1(tmp_path):
     result = _run_real_config_arm_with_state(user_repo, ["--recapture"], tmp_path,
                                              state_dir=state_dir)
     assert result.returncode == 1
-    assert "no runs directory" in result.stderr or "no runs directory" in result.stderr.lower()
+    # run_recapture_deps uses log() → stdout; the bash wrapper echoes
+    # "python3 seam failed" to stderr. Check both.
+    combined = result.stdout + result.stderr
+    assert "no runs directory" in combined.lower()
 
 
 def test_recapture_no_finished_run_exits_1(tmp_path):
@@ -1112,7 +1115,9 @@ def test_recapture_no_finished_run_exits_1(tmp_path):
     result = _run_real_config_arm_with_state(user_repo, ["--recapture"], tmp_path,
                                              state_dir=state_dir)
     assert result.returncode == 1
-    assert "no completed run" in result.stderr.lower() or "no completed" in result.stderr
+    # run_recapture_deps uses log() → stdout; check both stdout and stderr.
+    combined = result.stdout + result.stderr
+    assert "no completed run" in combined.lower()
 
 
 def test_recapture_dispatches_to_python3(tmp_path):
@@ -1175,8 +1180,7 @@ def test_recapture_force_flag_passed_correctly(tmp_path):
 
 
 def test_recapture_python3_failure_exits_1(tmp_path):
-    """--recapture exits 1 when the main python3 seam (orchestrator call) fails.
-    The first python3 call (find-newest-run) must succeed; the second (seam) fails."""
+    """--recapture exits 1 when the python3 seam (orchestrator call) fails."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
     state_dir = tmp_path / "state"
@@ -1185,20 +1189,12 @@ def test_recapture_python3_failure_exits_1(tmp_path):
     logs_dir.mkdir(parents=True)
     (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
 
-    # Stub python3: first call (find-newest-run discovery) prints the real
-    # logs dir path and exits 0; second call (the seam) exits 1.
-    call_count_file = tmp_path / "python3_calls"
-    call_count_file.write_text("0")
+    # Stub python3 to fail (the new launcher makes a single python3 call
+    # that handles both run-discovery and the orchestrator seam).
     python3_stub = tmp_path / "python3"
     python3_stub.write_text(
-        f"#!/bin/sh\n"
-        f"n=$(cat {call_count_file})\n"
-        f"echo $((n+1)) > {call_count_file}\n"
-        f"if [ \"$n\" = '0' ]; then\n"
-        f"  echo '{logs_dir}'\n"
-        f"  exit 0\n"
-        f"fi\n"
-        f"exit 1\n"
+        "#!/bin/sh\n"
+        "exit 1\n"
     )
     python3_stub.chmod(0o755)
 
@@ -1271,10 +1267,28 @@ def _make_finished_run_with_apt_log(state_dir: Path, command: str) -> None:
     (logs_dir / "worker-001.log").write_text(json.dumps(event) + "\n")
 
 
+def _make_claude_stub(stub_dir: Path, structured_output: dict) -> None:
+    """Write a claude stub that emits a valid dep_capture stream-json result."""
+    import json as _json
+    payload = _json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "structured_output": structured_output,
+    })
+    stub = stub_dir / "claude"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' '{payload}'\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+
+
 def test_recapture_reports_corpus_end_to_end(tmp_path):
-    """--recapture with a finished run extracts the command corpus and reports
-    it on stdout. It does NOT write to config.toml (LLM wiring is a follow-on)
-    and does NOT remove the generated Dockerfile. Uses the real python3 seam."""
+    """--recapture with a finished run invokes dep_capture and writes deps.
+    A stub claude returning empty lists leaves config.toml unchanged.
+    Does NOT remove the generated Dockerfile. Uses the real python3 seam."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1283,21 +1297,24 @@ def test_recapture_reports_corpus_end_to_end(tmp_path):
     (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\n")
     state_dir = tmp_path / "state"
     _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+    stub_dir = tmp_path / "stubs"
+    stub_dir.mkdir()
+    _make_claude_stub(stub_dir, {"setup_packages": [], "language_installs": []})
 
     result = _run_real_config_arm_with_state(
         user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
-        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+        extra_env={"PATH": f"{stub_dir}:{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
     )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
-    # The seam reports corpus stats or a LLM-not-wired advisory — does not write.
+    assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    # Empty dep_capture result → no new deps → config.toml unchanged.
     assert (leerie_dir / "config.toml").read_text() == ""
-    # Generated Dockerfile is left untouched (no write triggered removal).
+    # Generated Dockerfile is left untouched (capture_repo_deps never removes files).
     assert (leerie_dir / "Dockerfile").exists()
 
 
 def test_recapture_keeps_committed_dockerfile_end_to_end(tmp_path):
     """--recapture must NOT remove a hand-committed Dockerfile (no sentinel) —
-    it is authoritative and the seam never removes committed files."""
+    it is authoritative and capture_repo_deps never removes files."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1306,35 +1323,43 @@ def test_recapture_keeps_committed_dockerfile_end_to_end(tmp_path):
     (leerie_dir / "Dockerfile").write_text(committed)
     state_dir = tmp_path / "state"
     _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+    stub_dir = tmp_path / "stubs"
+    stub_dir.mkdir()
+    _make_claude_stub(stub_dir, {"setup_packages": [], "language_installs": []})
 
     result = _run_real_config_arm_with_state(
         user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
-        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+        extra_env={"PATH": f"{stub_dir}:{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
     )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
     assert (leerie_dir / "Dockerfile").read_text() == committed, (
         "committed Dockerfile must survive recapture"
     )
 
 
 def test_recapture_noop_keeps_generated_dockerfile(tmp_path):
-    """--recapture must not remove an existing generated Dockerfile —
-    the seam now only reports the corpus and never removes files."""
+    """--recapture must not remove an existing generated Dockerfile.
+    When the LLM returns packages already declared, merge is a no-op and
+    the generated Dockerfile is left untouched."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
-    # Already declares postgresql, so recapture finds nothing new.
+    # Already declares postgresql; stub returns postgresql again → no-op merge.
     (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
     sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
     (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\n")
     state_dir = tmp_path / "state"
     _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+    stub_dir = tmp_path / "stubs"
+    stub_dir.mkdir()
+    # Stub returns postgresql; _merge_setup_packages sees it already present → no write.
+    _make_claude_stub(stub_dir, {"setup_packages": ["postgresql"], "language_installs": []})
 
     result = _run_real_config_arm_with_state(
         user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
-        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+        extra_env={"PATH": f"{stub_dir}:{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
     )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
     assert (leerie_dir / "Dockerfile").exists(), (
         "no-op recapture must not remove the generated Dockerfile"
     )

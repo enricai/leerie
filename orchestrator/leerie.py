@@ -289,6 +289,11 @@ STATE_FIELDS = (
     # the time the run started (or resumed). Persisted so the PR footer can
     # show the exact version that produced the run, which aids debugging.
     "leerie_version",
+    # dep_capture_done: set to True in state.json and written as a sentinel
+    # file (<run_dir>/dep_capture.done) after capture_repo_deps completes a
+    # successful write. The run-start backstop checks the sentinel file to
+    # skip runs already captured (idempotency).
+    "dep_capture_done",
 )
 
 CATEGORIES = [
@@ -5563,6 +5568,163 @@ async def capture_repo_deps(
             "run `git add .leerie/ && git commit` to bake next run")
     else:
         log("capture: dep_capture found no new deps to write")
+    # Write idempotency sentinel. Both a state field (for in-run readers)
+    # and a lightweight file (for the next-run backstop, which reads past
+    # run dirs without constructing a full State).
+    run_dir_path = getattr(st, "run_dir", None)
+    if run_dir_path is not None:
+        try:
+            (Path(run_dir_path) / "dep_capture.done").write_text("1\n")
+        except Exception:
+            pass
+    if hasattr(st, "data"):
+        try:
+            st.data["dep_capture_done"] = True
+        except Exception:
+            pass
+
+
+async def _backstop_capture_prior_runs(
+        leerie_root: Path,
+        repo_root: Path,
+        caps: dict,
+        models: dict[str, str],
+        efforts: dict[str, str | None],
+) -> None:
+    """Scan prior runs for uncaptured logs and run dep_capture over them.
+
+    Called at run-start (before phase_classify) to cover the SIGKILL / crash
+    case where the cancel-arm could not fire. A run is eligible when its
+    logs/ directory exists and its dep_capture.done sentinel file is absent.
+    Non-fatal: any per-run error is logged and skipped.
+    """
+    runs_dir = leerie_root / "runs"
+    if not runs_dir.is_dir():
+        return
+    for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        log_dir = run_dir / "logs"
+        if not log_dir.is_dir():
+            continue
+        sentinel = run_dir / "dep_capture.done"
+        if sentinel.is_file():
+            continue
+        # This run has logs but no completed capture. Run capture now.
+        log(f"backstop: running dep_capture for prior run {run_dir.name}")
+        try:
+
+            class _BackstopState:
+                pass
+
+            bst = _BackstopState()
+            bst.run_dir = run_dir  # type: ignore[attr-defined]
+            bst.data = {}  # type: ignore[attr-defined]
+            bst.bump_workers = lambda _caps: None  # type: ignore[attr-defined]
+            await capture_repo_deps(
+                repo_root, bst,
+                caps=caps, models=models, efforts=efforts,
+            )
+        except Exception as exc:
+            log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
+
+
+def run_recapture_deps(
+        leerie_root: Path,
+        repo_root: Path,
+        force: bool = False,
+        run_id: str | None = None,
+) -> None:
+    """Host-side recapture entrypoint (DESIGN §6½).
+
+    Resolves a target run (or the newest finished run when run_id is None),
+    constructs and flocks its State (refusing StateLockedError → EXIT_LOCKED),
+    then runs capture_repo_deps via asyncio.run over the run's logs/.
+
+    When force=True, the captured values wholly replace existing ones (the
+    standard never-clobber merge in capture_repo_deps is unchanged — `force`
+    drops the sentinel before re-running so the write always executes even
+    when no packages are genuinely new). When force=False, the standard
+    never-clobber union applies.
+
+    Modeled on the --phase judge scaffolding (main(), ~line 16694).
+    """
+    caps = dict(DEFAULT_CAPS)
+
+    # Minimal args namespace so resolve_models/efforts can read env vars and
+    # TOML but have no CLI overrides (this is a host-side non-interactive call).
+    class _MinimalArgs:
+        model = None
+        dep_capture_model = None
+        pr_writer_model = None
+        effort = None
+
+    _args = _MinimalArgs()
+    models = resolve_models(repo_root, _args)
+    efforts = resolve_efforts(repo_root, _args)
+
+    # Resolve target run: explicit run_id → newest finished run with logs/.
+    if run_id is not None:
+        target_run_dir = leerie_root / "runs" / run_id
+        if not target_run_dir.is_dir():
+            log(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
+            sys.exit(1)
+    else:
+        runs_dir = leerie_root / "runs"
+        if not runs_dir.is_dir():
+            log(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
+            sys.exit(1)
+        best_dir: Path | None = None
+        best_ts = ""
+        for d in runs_dir.iterdir():
+            if not d.is_dir():
+                continue
+            rj = d / "run.json"
+            if not rj.is_file():
+                continue
+            try:
+                rdata = json.loads(rj.read_text())
+            except (OSError, ValueError):
+                continue
+            fa = rdata.get("finished_at", "")
+            if fa and fa > best_ts and (d / "logs").is_dir():
+                best_ts = fa
+                best_dir = d
+        if best_dir is None:
+            log("recapture: no completed run with logs found; nothing to recapture")
+            sys.exit(1)
+        target_run_dir = best_dir
+
+    # Flock the run dir (refuse to race a live orchestrator). --phase judge
+    # pattern: construct State → catch StateLockedError → EXIT_LOCKED.
+    try:
+        target_st = State(leerie_root, target_run_dir.name, repo_root=repo_root)
+    except StateLockedError as e:
+        log(f"recapture: cannot recapture {target_run_dir.name!r}: another "
+            f"orchestrator owns the run (holding flock on {e.run_dir}). "
+            "Wait for it to finish, or kill it first if wedged.")
+        sys.exit(EXIT_LOCKED)
+    target_st.load()  # non-fatal if state.json is missing (older runs)
+
+    if force:
+        # Drop the sentinel so the worker runs unconditionally. Without this,
+        # a run that already wrote config.toml (sentinel present) would skip
+        # the worker and produce no output — defeating the --force intent.
+        sentinel = target_run_dir / "dep_capture.done"
+        try:
+            sentinel.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    log(f"recapture: scanning {target_run_dir / 'logs'} ...")
+    try:
+        asyncio.run(capture_repo_deps(
+            repo_root, target_st,
+            caps=caps, models=models, efforts=efforts,
+        ))
+    except Exception as exc:
+        log(f"recapture: error during dep_capture: {exc}")
+        sys.exit(1)
 
 
 def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
@@ -16010,6 +16172,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
+        # Run-start backstop (DESIGN §6½): before phase_classify, scan prior
+        # runs that produced logs but whose dep_capture.done sentinel is absent.
+        # Covers the SIGKILL / crash case where the cancel-arm capture couldn't
+        # run. Non-fatal: any error is logged and ignored.
+        await _backstop_capture_prior_runs(
+            leerie_dir, Path(os.getcwd()), caps, models, efforts)
         await phase_classify(task, st, caps, args.clarify, models, efforts)
         log(f"run id: {st.run_id}")
         # Initialize run.json with the immutable run-identity fields
@@ -16861,6 +17029,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         log("interrupted by user (SIGINT) — worktree cleanup; "
             f"state preserved (resume with leerie --resume {st.run_id})")
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+        # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except Exception as _cap_exc:
+            log(f"capture: non-fatal error during cancel-arm capture "
+                f"({_cap_exc})")
         exit_code = 130
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
@@ -16871,6 +17049,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         log(f"interrupted by signal ({e}) — worktree cleanup; "
             f"state preserved (resume with leerie --resume {st.run_id})")
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+        # Non-fatal.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except Exception as _cap_exc:
+            log(f"capture: non-fatal error during signal-arm capture "
+                f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1
