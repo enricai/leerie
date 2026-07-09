@@ -484,13 +484,15 @@ registered worker pid is excluded from the reap set, a
 that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
 `_zombie_reaper` (the fix is inert without the wiring). The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
-discovery, bundle fetch, run-state tar, and `no_push` strip via bash-harness
-subprocess tests with a stubbed `flyctl`. The Step 4 best-effort `.leerie/`
-stream-back seam is owned exclusively by
-`tests/test_fetch_branch_leerie_streamback.py` (imports stub helpers from
-`test_fetch_branch_sh` to avoid duplication): streams both files when host
-has neither, never clobbers an existing `config.toml`, never clobbers an
-existing `Dockerfile`, non-fatal when machine files are absent, streams only
+discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
+stream-back (both files streamed when host has neither, never clobbers an
+existing host file, non-fatal on absent machine files, respects
+`LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests with a stubbed
+`flyctl`. The expanded Step 4 best-effort `.leerie/` stream-back contracts are
+covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
+helpers from `test_fetch_branch_sh` to avoid duplication): streams both files
+when host has neither, never clobbers an existing `config.toml`, never clobbers
+an existing `Dockerfile`, non-fatal when machine files are absent, streams only
 the present machine file when only one exists, skips both when both host
 files exist, and respects `LEERIE_STATE_HOST_DIR` for the destination root. The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
