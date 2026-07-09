@@ -355,8 +355,8 @@ details and sub-flags.
 | `config` | Print the effective build/lint/test config for this repo, with `[config]` or `[inference]` provenance for each axis. Also shows `leerie.toml` operational knobs when present. |
 | `config --init` | Create `.leerie/config.toml` with auto-detected BLT commands (uncommented) and a commented `setup_packages` example. Errors if the file already exists. Prints the path and suggests `git add .leerie/`. |
 | `config --chat` | Open an interactive `claude` session with a config-generation system prompt and `--add-dir` pointing at the current repo. The model can read the repo and write `.leerie/config.toml` (and optionally `.leerie/Dockerfile`). |
-| `config --recapture` | Host-only (no container). Re-scans the newest finished run's logs and rewrites `setup_packages` / the language-dep Dockerfile stanza via the same capture engine used at finalize. Never-clobber: only new packages are appended (hand-edited values are preserved). When `setup_packages` changes and a generated (sentinel-marked) `.leerie/Dockerfile` is present, it is removed so the next run regenerates the image. |
-| `config --recapture --force` | Same as `--recapture` but wholesale-replaces `setup_packages` instead of union-merging. Use when you want to discard hand-edits and reflect only what the logs proved. |
+| `config --recapture` | Host-only (no container). Consolidates across **all** finished runs' logs (not just the newest) and writes merged `setup_packages` / language-dep installs to `.leerie/config.toml` via the dep_capture LLM worker. Never-clobber union: already-captured runs (sentinel present) are skipped. |
+| `config --recapture --force` | Same as `--recapture` but drops the sentinel on every target run so the worker re-fires unconditionally (wholesale replace). Use when you want to re-derive deps even for runs that were already captured. |
 
 **Lifecycle (remote mode):**
 
