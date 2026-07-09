@@ -4033,7 +4033,6 @@ def sha256(p):
 
 
 def _hash_copy_files(repo, copy_files):
-    """Hash every file in copy_files list; dirs are hashed file-by-file."""
     copy_shas = {}
     for rel in copy_files:
         p = repo / rel.rstrip("/")
@@ -4047,7 +4046,6 @@ def _hash_copy_files(repo, copy_files):
 
 
 def _emit_layer(copy_files, run_cmd, copy_shas):
-    """Print sha comment, COPY line, and RUN line for one manager layer."""
     sha_comment = "# copy-input-shas: " + " ".join(
         f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
     )
