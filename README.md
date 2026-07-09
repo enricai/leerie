@@ -394,7 +394,7 @@ details and sub-flags.
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`. Unset → `implementer` and `conformer` → `sonnet`; everything else → `opus`. |
+| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`. Unset → `implementer`, `conformer`, and `satisfied_probe` → `sonnet`; everything else → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `high`, acting workers inherit Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `high`; acting workers (implementer, conformer) inherit Claude default. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
@@ -418,7 +418,7 @@ details and sub-flags.
 | `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
 | `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
 | `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
-| `LEERIE_MODEL_DEP_CAPTURE` | — | Model alias for the finalize-time dep_capture worker. Env-var only (no CLI flag or `leerie.toml` key — dep_capture is a post-run worker). Unset → default `opus`. |
+| `LEERIE_MODEL_DEP_CAPTURE` | `model_dep_capture` | Model alias for the finalize-time dep_capture worker. No per-worker CLI flag (unlike `pr_writer`); controlled via env var and `leerie.toml` key only. Unset → default `opus`. |
 | `LEERIE_CAPTURE_DEPS` | `capture_deps` (`.leerie/config.toml` only — not `leerie.toml`) | Enable finalize-time dependency capture (truthy → on). Precedence: `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` > default `true`. Set to `false` / `0` to disable entirely. |
 | `LEERIE_BAKE_LANGUAGE_DEPS` | `bake_language_deps` | Include a language-dep `COPY`+`RUN` layer in the auto-generated `.leerie/Dockerfile` (truthy → on). Precedence: `LEERIE_BAKE_LANGUAGE_DEPS` > `leerie.toml` > `.leerie/config.toml` > default `true`. Set to `false` for an apt-only bake. |
 | `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
@@ -461,7 +461,7 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Leerie spawns eight kinds of `claude -p` worker. Each is a separate
+Leerie spawns nine kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
 | Worker | Prompt source | Default model | Runs per task | Returns |
@@ -470,6 +470,7 @@ subprocess; there is no in-session agent nesting.
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
 | `reconciler` | `prompts/reconciler.md` | opus | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | eight arrays — `renames` / `added_provides` / `added_subtasks` / `conditional_drops` / `dropped_requires` (resolution; `conditional_drops` drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition; `dropped_requires` removes an over-specified `requires` entry — an aggregate or coarser synonym of what the consumer itself provides — and ALSO plays a cycle-breaking role on retry); `dependency_edges` / `merged_subtasks` (cycle-breaking-only, used on retry when leerie's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
 | `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | opus | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
+| `satisfied_probe` | `prompts/satisfied_probe.md` | sonnet | 0 or 1 per subtask (phase 3, before scheduling; skipped when `--skip-satisfied-check`) | `{satisfied: bool, evidence: str}` — soft-drops subtasks already met on the base tree. DESIGN §8 |
 | `provision` | `prompts/provision.md` | opus | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See DESIGN §6½ |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
