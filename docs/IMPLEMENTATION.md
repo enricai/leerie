@@ -2004,10 +2004,11 @@ pr_writer) — default to Sonnet.
 | judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
+| dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `judge`,
-`heal`, and `pr_writer` all default to `sonnet`).
+`heal`, and `pr_writer` all default to `sonnet`; `dep_capture` defaults to `opus`).
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2037,14 +2038,14 @@ Twelve worker types (plus the global override), each independently overridable:
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
+| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | *(none)*                  |
 
-Note: `judge`, `heal`, and `pr_writer` use dedicated CLI flags
-(`--judge-model`, `--heal-model`, `--pr-writer-model`) rather than the
-`--model-<W>` pattern used by orchestrator workers, because they are
-post-run / finalize-time skill workers invoked outside the main
-orchestrate loop and do not participate in the `--model` global-default
-resolution path. They still honor the global `--model` / `LEERIE_MODEL`
-override.
+Note: `judge`, `heal`, `pr_writer`, and `dep_capture` do not follow the
+`--model-<W>` / `model_<w>` pattern used by orchestrator workers, because they
+are post-run / finalize-time workers invoked outside the main orchestrate loop.
+`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` supports
+env-var override only (`LEERIE_MODEL_DEP_CAPTURE`). All four still honor the
+global `--model` / `LEERIE_MODEL` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
@@ -2096,10 +2097,11 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | judge        | unset   | post-run scoring; no need to pin |
 | heal         | unset   | post-run patch generation; no need to pin |
 | pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
+| dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
-workers above and for the finalize-time `pr_writer` worker.
+workers above and for the finalize-time `pr_writer` and `dep_capture` workers.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -3910,20 +3912,39 @@ surface lives in `orchestrator/leerie.py`.
 
 #### Capture functions
 
-| Function | Signature | Role |
-|----------|-----------|------|
-| `_parse_apt_intents` | `(command: str) -> list[str]` | Split a shell command on `&&`, `;`, `\|`; find `apt[-get] install` segments; take tokens after `install`; drop flags (`-y`, `--no-install-recommends`, etc.) and non-package tokens (`sudo`, `apt`, `apt-get`, `install`); keep tokens matching `^[a-z0-9][a-z0-9+._-]*$`; split `pkg=ver` → keep name; dedup, stable order. Uses a narrow `_APT_INSTALL_RE` pattern; `_INSTALL_CMD_HINT_RE` is the coarse pre-filter. |
-| `_capture_installs_from_logs` | `(log_dir: Path) -> tuple[list[str], list[str]]` | Iterates `sorted(log_dir.glob("*.log"))`; calls `_iter_log_tool_use` on each; for `kind == "Bash"` feeds `input["command"]` to `_parse_apt_intents` and a language-install matcher (`pnpm`/`pip`/`npm`/`yarn`/`cargo`/`bundle`); returns `(apt_packages, install_commands)` — both deduped, stable order. **Only `apt_packages` is consumed** (by `capture_repo_deps`); `install_commands` is captured for diagnostics but not persisted — the language-dep bake is driven by the launcher's own build-time lockfile detection, not by these captured commands (see the language-dep template below). |
+| Function / Constant | Signature / Value | Role |
+|---------------------|-------------------|------|
+| `_DEPCAP_TOTAL_BUDGET` | `307200` (bytes) | Byte ceiling for the commands text fed to the dep_capture worker (~300 KB ≈ 75k tokens). Mirrors the `gather_provision_fixtures` add_bytes/hit_ceiling idiom. |
+| `_extract_depcap_commands` | `(log_dir: Path) -> tuple[str, bool]` | Iterates `sorted(log_dir.glob("*.log"), reverse=True)` (newest-first); calls `_iter_log_tool_use` on each; collects distinct `command` values from `kind == "Bash"` tool-use blocks into an insertion-order dict. Then admits commands under `_DEPCAP_TOTAL_BUDGET` bytes (separator `\n---\n`). Returns `(commands_text, hit_ceiling)`. |
 | `_merge_setup_packages` | `(existing: str, captured: list[str]) -> str \| None` | Parses `existing` (space- or comma-separated, per DESIGN §6½); takes the union with `captured`; returns the merged string only if it grew (else `None` → no write). Preserves user-narrowed lists: only genuinely-new packages are appended; nothing is removed. |
 | `_write_config_toml_keys` | `(cfg_path: Path, updates: dict[str, str]) -> None` | Minimal deterministic TOML upsert. Creates the file with a leerie header (matching the launcher's `config --init` heredoc tone) if absent; otherwise replaces the first *uncommented* `key =` line for each key, or appends if absent. Never touches commented lines. Writes via temp-file + `os.replace()` (State.save atomicity discipline). |
-| `capture_repo_deps` | `(repo_root: Path, st: State) -> None` | Main entry point. Calls `resolve_capture_deps(repo_root)`; if disabled, returns immediately. Calls `_capture_installs_from_logs(st.run_dir / "logs")`; calls `_merge_setup_packages` to compute the union. If a committed `.leerie/Dockerfile` exists, skips `setup_packages` write (the Dockerfile is authoritative). Otherwise writes updates via `_write_config_toml_keys` and logs one line prompting `git add .leerie/ && git commit`. Entire function body is wrapped in `try/except Exception` — any error is logged at debug level and swallowed (non-fatal). |
+| `capture_repo_deps` | `async (repo_root: Path, st: State, caps: dict \| None, models: dict[str, str] \| None, efforts: dict[str, str \| None] \| None) -> None` | Main entry point. Guards: `resolve_capture_deps`, caps/models/efforts availability, `log_dir` existence, committed `.leerie/Dockerfile` skip. Calls `_extract_depcap_commands` to build the command corpus; if empty, returns. Checks worker budget; invokes `claude_p(schema_key='dep_capture', ...)` with `load_prompt("dep_capture")`. Writes `setup_packages` (via `_merge_setup_packages`, never-clobber) and `language_installs` (new managers only, keyed by `manager` field, never-clobber) to `.leerie/config.toml` via `_write_config_toml_keys`. Entire function body wrapped in `try/except Exception` — any error is logged and swallowed (non-fatal). |
 | `resolve_capture_deps` | `(repo_root: Path) -> bool` | env `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` `capture_deps` key; default `True`. No CLI flag and no `leerie.toml` tier (env → config → default only). |
+
+#### dep_capture worker
+
+`dep_capture` is a non-WORKER_TYPES worker (like `pr_writer`) registered in
+`SCHEMAS`, `_allowed_schema_keys`, `MODEL_DEFAULT_PER_WORKER` (opus),
+`EFFORT_DEFAULT_PER_WORKER` (high), and `resolve_models`/`resolve_efforts`.
+Its env-override constant is `MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"`.
+System prompt is `prompts/dep_capture.md`. Output schema:
+
+```json
+{
+  "setup_packages": ["string"],
+  "language_installs": [
+    {"manager": "string", "command": "string", "copy_inputs": ["string"]}
+  ],
+  "dockerfile_notes": "string | null"
+}
+```
 
 #### Finalize hook point
 
-`capture_repo_deps` is called from `phase_finalize`, after `finished_at`
-is written and run-branch verification completes, wrapped in a
-`try/except` that swallows all exceptions (non-fatal). The
+`capture_repo_deps` is called (with `await`) from `phase_finalize`, after
+`finished_at` is written and run-branch verification completes, wrapped in a
+`try/except` that swallows all exceptions (non-fatal). `caps`, `models`, and
+`efforts` are forwarded from `phase_finalize`'s parameters. The
 resume-of-finished guard in `_run_phases` returns before `phase_finalize`
 is reached, so capture never re-fires on a completed resume. A partial
 resume that reaches finalize re-runs capture — the union merge makes this

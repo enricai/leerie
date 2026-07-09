@@ -256,7 +256,7 @@ def test_judgment_workers_pinned_set(leerie):
     reasoning depth is bounded by the DESIGN §8 evidence gate."""
     assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == {
         "classifier", "planner", "reconciler", "plan_overlap_judge",
-        "provision", "integrator", "pr_writer",
+        "provision", "integrator", "pr_writer", "dep_capture",
     }
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
