@@ -529,7 +529,12 @@ covered in `tests/test_dep_capture_worker.py`: schema-validated output written
 to `.leerie/config.toml`, warm-repo never-clobber (mtime unchanged when all
 deps already present), union append for new packages, env + config-file opt-out
 (worker not invoked), committed `.leerie/Dockerfile` guard (worker not invoked),
-missing logs dir silent no-op, and non-fatal write failure. No coverage
+missing logs dir silent no-op, and non-fatal write failure. The `dep_capture`
+schema contract — required fields, `language_installs` item shape, valid/invalid
+instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
+exclusion, effort/model defaults) — is pinned in
+`tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
+No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
