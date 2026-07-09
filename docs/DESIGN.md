@@ -2476,14 +2476,36 @@ does not invalidate the layer. The cost — minutes per rebuild — is paid once
 across all subsequent runs, a clear net win against per-worker install time
 accumulated across hundreds of workers.
 
-**Trigger and idempotence.** Capture fires exactly once, during a normal
-(non-resume) run's finalize phase, after `finished_at` is written and
-run-branch verification completes. On a `--resume` of an already-finished
-run the resume guard returns before finalize; capture does not re-fire. On a
-`--resume` that reaches finalize (partial resume), capture re-runs — the
-union merge makes this a no-op when nothing new was found. When the union
-adds no new packages and no new install command is detected, the function
-returns immediately without touching `.leerie/config.toml`.
+**Trigger seams.** All three funnel to one `dep_capture` worker — the trigger
+differs, the decision-maker does not:
+
+- **Clean finish → finalize.** `capture_repo_deps` is called (with `await`)
+  from `phase_finalize` after `finished_at` is written and run-branch
+  verification completes. On a `--resume` of an already-finished run the
+  resume guard returns before finalize; capture does not re-fire. On a
+  `--resume` that reaches finalize (partial resume), capture re-runs — the
+  union merge makes this a no-op when nothing new was found.
+- **Cancel / SIGTERM → cancel arm in `main()`.** Catchable signals
+  (`KeyboardInterrupt` / `InterruptedBySignal`) surface in `main()` after
+  `asyncio.run(orchestrate)` unwinds, with a real Python window before the
+  `finally` cleanup block. A best-effort `asyncio.run(capture_repo_deps(...))`
+  runs there — the same post-loop pattern as the `RateLimitedExit` arm.
+  Non-fatal; covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
+- **SIGKILL / crash / host-side → backstop + `--recapture`.** Covered two
+  ways, both host-side, modeled on the `--phase judge` scaffolding:
+  *Run-start backstop* — at run start, before `phase_classify`, a scan of
+  prior run dirs detects any with `logs/` but no `dep_capture.done` sentinel
+  and runs capture over them automatically. *On-demand `--recapture`* — the
+  `leerie config --recapture` verb resolves the target run, constructs and
+  flocks its `State` (refusing to race a live orchestrator via
+  `StateLockedError`), and runs the worker via `asyncio.run`.
+
+**Idempotency.** After a successful write, `capture_repo_deps` writes a
+lightweight `<run_dir>/dep_capture.done` sentinel file and sets
+`dep_capture_done = True` in `state.json`. The run-start backstop skips
+any run whose sentinel file is already present. When the union merge adds
+no new packages and no new install command, the function returns immediately
+without touching `.leerie/config.toml`.
 
 **No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
 `.leerie/Dockerfile`) as uncommitted files in the user's working tree.

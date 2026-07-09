@@ -155,13 +155,13 @@ claims a state directory. Four sub-modes:
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
-- **`leerie config --recapture [--force]`**: host-only (no container). Scans
-  the newest finished run's logs in `$LEERIE_STATE_HOST_DIR/runs/*/` via
-  `_extract_depcap_commands` and reports the command corpus that the
-  `dep_capture` LLM worker would receive. Full LLM invocation via
-  `capture_repo_deps` (the async path used by `phase_finalize`) is not yet
-  wired into `--recapture`; use the in-run finalize path or wait for the
-  follow-on wiring. Exits 1 if no runs directory or no finished run found.
+- **`leerie config --recapture [--force]`**: host-only (no container). Calls
+  `run_recapture_deps()` from the orchestrator module, which resolves the
+  newest finished run with `logs/` (or an explicit `--run-id`), constructs
+  and flocks its `State` (refusing `StateLockedError` → `EXIT_LOCKED`), and
+  invokes `capture_repo_deps` via `asyncio.run`. `--force` drops the
+  `dep_capture.done` sentinel so the worker re-runs even when the run was
+  already captured. Exits 1 if no runs directory or no finished run found.
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
@@ -3935,17 +3935,47 @@ System prompt is `prompts/dep_capture.md`. Output schema:
 }
 ```
 
-#### Finalize hook point
+#### Capture trigger seams
 
-`capture_repo_deps` is called (with `await`) from `phase_finalize`, after
-`finished_at` is written and run-branch verification completes, wrapped in a
-`try/except` that swallows all exceptions (non-fatal). `caps`, `models`, and
-`efforts` are forwarded from `phase_finalize`'s parameters. The
-resume-of-finished guard in `_run_phases` returns before `phase_finalize`
-is reached, so capture never re-fires on a completed resume. A partial
-resume that reaches finalize re-runs capture — the union merge makes this
-a no-op when nothing new was found. `st.run_dir / "logs" / "*.log"` is
-populated by this point.
+`capture_repo_deps` is called from three seams; all are non-fatal (wrapped in
+`try/except`):
+
+1. **Finalize (clean finish).** Called with `await` from `phase_finalize`,
+   after `finished_at` is written and run-branch verification completes.
+   `caps`, `models`, and `efforts` are forwarded from `phase_finalize`'s
+   parameters. The resume-of-finished guard in `_run_phases` returns before
+   `phase_finalize` is reached, so capture never re-fires on a completed
+   resume. A partial resume that reaches finalize re-runs capture — the union
+   merge makes this a no-op when nothing new was found.
+   `st.run_dir / "logs" / "*.log"` is populated by this point.
+
+2. **Cancel / SIGTERM arm (catchable signals).** In `main()`'s
+   `KeyboardInterrupt` and `InterruptedBySignal` exception handlers, after
+   `st.save()`, a best-effort `asyncio.run(capture_repo_deps(...))` runs in
+   its own event loop — the same post-loop pattern as the `RateLimitedExit`
+   arm. Non-fatal: any exception is logged and suppressed. This covers the
+   Ctrl-C and `nerdctl stop` cases where the orchestrator gets a real Python
+   window before the `finally` cleanup block.
+
+3. **Host-side (`run_recapture_deps` / run-start backstop).** Two host-side
+   seams funnel to the same worker:
+   - **`run_recapture_deps(leerie_root, repo_root, force, run_id)`**: the
+     on-demand recapture entrypoint invoked by `leerie config --recapture`.
+     Resolves the target run, constructs and flocks its `State` (refusing
+     `StateLockedError` → `EXIT_LOCKED`), loads state, optionally drops the
+     sentinel when `force=True`, then calls `asyncio.run(capture_repo_deps(...))`.
+   - **`_backstop_capture_prior_runs(leerie_root, repo_root, caps, models,
+     efforts)`**: called at run-start (in `_run_phases`, before
+     `phase_classify`) to cover SIGKILL / crash cases where the cancel arm
+     could not fire. Scans `leerie_root/runs/` for run dirs that have `logs/`
+     but no `dep_capture.done` sentinel and calls `capture_repo_deps` over
+     each via a lightweight ad-hoc state object.
+
+**Idempotency sentinel.** `capture_repo_deps` writes `<run_dir>/dep_capture.done`
+(a one-line file) and sets `st.data["dep_capture_done"] = True` after a
+successful write. The run-start backstop skips runs whose sentinel file is
+present. The `dep_capture_done` state field is defined in `STATE_FIELDS` and
+documented in the state-schema table above.
 
 #### Language-dep Dockerfile template (launcher, gated on `bake_language_deps`)
 
@@ -5459,6 +5489,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json` at the time the run started (or resumed). Persisted so the PR footer and Run metadata block can show the exact version that produced the run, which aids debugging when a run was produced by an older release. |
+| `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. Combined with the sibling sentinel file `<run_dir>/dep_capture.done`, this makes the next-run backstop idempotent: the backstop skips runs whose sentinel file is present, and the cancel-arm capture skips already-captured runs. Absent on runs where capture was skipped or has not yet run. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/leerie.md`):
