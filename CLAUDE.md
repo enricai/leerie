@@ -504,10 +504,13 @@ basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
 capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_packages`,
 and `capture_repo_deps` (async, with stubbed `claude_p`) — is tested in
 `tests/test_capture_deps.py` against a synthetic JSONL fixture in the
-`_iter_log_tool_use` shape, covering command extraction, budget ceiling truncation,
-merger union/no-op/never-clobber, schema-validated worker output →
-setup_packages + language_installs write, committed-Dockerfile
-skip, write-failure non-fatal, and opt-out. No coverage
+`_iter_log_tool_use` shape, covering: absence pins (`TestRegexPathAbsent`) that
+assert the four deleted regex-path symbols (`_parse_apt_intents`,
+`_capture_installs_from_logs`, `_LANG_INSTALL_RE`, `_APT_INSTALL_RE`) no longer
+exist on the module (so the regex path can never silently return); command
+extraction, budget ceiling truncation, merger union/no-op/never-clobber,
+schema-validated worker output → setup_packages + language_installs write,
+committed-Dockerfile skip, write-failure non-fatal, and opt-out. No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
