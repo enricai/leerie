@@ -511,8 +511,12 @@ capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_pack
 `capture_repo_deps` (async, with stubbed `claude_p`), the idempotency
 sentinel (`dep_capture_done` state field + `<run_dir>/dep_capture.done`
 file), and `_backstop_capture_prior_runs` (skips runs with sentinel, captures
-runs without) — is tested in `tests/test_capture_deps.py` against a synthetic
-JSONL fixture in the `_iter_log_tool_use` shape, covering: absence pins
+runs without) — is tested across four files. `tests/test_dep_capture_budget.py`
+covers the extraction+budget unit (`_extract_depcap_commands`) in focused
+isolation: dedup, newest-first ordering, budget gate (`_DEPCAP_TOTAL_BUDGET`),
+`hit_ceiling` flag semantics, non-Bash filtering, and malformed-line tolerance.
+`tests/test_capture_deps.py` covers the integration against a synthetic
+JSONL fixture in the `_iter_log_tool_use` shape: absence pins
 (`TestRegexPathAbsent`) that assert the four deleted regex-path symbols
 (`_parse_apt_intents`, `_capture_installs_from_logs`, `_LANG_INSTALL_RE`,
 `_APT_INSTALL_RE`) no longer exist on the module (so the regex path can never
