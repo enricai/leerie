@@ -5399,12 +5399,7 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
 
 
 def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
-    """Extract all distinct Bash commands from worker logs for dep_capture input.
-
-    Iterates log files newest-first (reverse-sorted by name; worker logs are
-    named with sortable timestamps/sids), deduplicates commands, and admits
-    them under _DEPCAP_TOTAL_BUDGET bytes. Returns (commands_text, hit_ceiling).
-    """
+    """Dedup Bash commands from worker logs, newest-first, bounded to _DEPCAP_TOTAL_BUDGET bytes."""
     seen: dict[str, None] = {}  # ordered set, dedup
     for log_path in sorted(log_dir.glob("*.log"), reverse=True):
         for kind, inp, _result in _iter_log_tool_use(log_path):
@@ -5459,19 +5454,7 @@ async def capture_repo_deps(
         models: dict[str, str] | None = None,
         efforts: dict[str, str | None] | None = None,
 ) -> None:
-    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml.
-
-    Called from phase_finalize (awaited), wrapped in try/except (non-fatal).
-    Extracts the Bash commands workers ran from logs/*.log via
-    _extract_depcap_commands, invokes the dep_capture worker via claude_p,
-    then writes setup_packages and language_installs to .leerie/config.toml
-    via _write_config_toml_keys, union-merged never-clobber.
-
-    Skips writing when a committed .leerie/Dockerfile already exists
-    (it is authoritative; DESIGN §6½). Honors the capture_deps opt-out.
-    When caps/models/efforts are None (e.g. finalize called without them),
-    falls back gracefully — no worker is spawned.
-    """
+    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal)."""
     if not resolve_capture_deps(repo_root):
         return
     if caps is None or models is None or efforts is None:
@@ -5503,7 +5486,6 @@ async def capture_repo_deps(
     if not commands_text.strip():
         log("capture: no Bash commands found in logs — skipping dep_capture")
         return
-    # Budget pre-check: don't spawn if the run has exhausted max_total_workers.
     wc = st.data.get("worker_count", 0) if hasattr(st, "data") else 0
     if wc >= caps["max_total_workers"]:
         log(f"capture: skipped dep_capture worker (worker budget exhausted at "
@@ -5591,13 +5573,7 @@ async def _backstop_capture_prior_runs(
         models: dict[str, str],
         efforts: dict[str, str | None],
 ) -> None:
-    """Scan prior runs for uncaptured logs and run dep_capture over them.
-
-    Called at run-start (before phase_classify) to cover the SIGKILL / crash
-    case where the cancel-arm could not fire. A run is eligible when its
-    logs/ directory exists and its dep_capture.done sentinel file is absent.
-    Non-fatal: any per-run error is logged and skipped.
-    """
+    """Cover SIGKILL/crash: run dep_capture over prior runs with logs/ but no sentinel."""
     runs_dir = leerie_root / "runs"
     if not runs_dir.is_dir():
         return
@@ -5635,19 +5611,7 @@ def run_recapture_deps(
         force: bool = False,
         run_id: str | None = None,
 ) -> None:
-    """Host-side recapture entrypoint (DESIGN §6½).
-
-    When run_id is given, targets that specific run only. Otherwise, consolidates
-    across ALL finished runs with logs/ under leerie_root/runs/ — not just the
-    newest — so every past run's install commands inform the dep decision.
-
-    When force=True, drops the sentinel on each target run before capture so
-    the worker fires unconditionally (wholesale replace semantics). Without
-    force, runs that already have a dep_capture.done sentinel are skipped
-    (never-clobber union applies per capture_repo_deps).
-
-    Modeled on the --phase judge scaffolding (main(), ~line 16694).
-    """
+    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
     caps = dict(DEFAULT_CAPS)
 
     # Minimal args namespace so resolve_models/efforts can read env vars and
@@ -5663,14 +5627,12 @@ def run_recapture_deps(
     efforts = resolve_efforts(repo_root, _args)
 
     if run_id is not None:
-        # Targeted: single named run.
         target_run_dir = leerie_root / "runs" / run_id
         if not target_run_dir.is_dir():
             log(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
             sys.exit(1)
         target_dirs: list[Path] = [target_run_dir]
     else:
-        # Consolidate across all finished runs that have logs/.
         runs_dir = leerie_root / "runs"
         if not runs_dir.is_dir():
             log(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
@@ -5704,7 +5666,6 @@ def run_recapture_deps(
             except Exception:
                 pass
         elif sentinel.is_file():
-            # Already captured for this run and not forcing — skip.
             continue
 
         # Flock the run dir (refuse to race a live orchestrator). --phase judge
