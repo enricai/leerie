@@ -509,7 +509,10 @@ runs without) — is tested in `tests/test_capture_deps.py` against a synthetic
 JSONL fixture in the `_iter_log_tool_use` shape, covering command extraction,
 budget ceiling truncation, merger union/no-op/never-clobber, schema-validated
 worker output → setup_packages + language_installs write, committed-Dockerfile
-skip, write-failure non-fatal, and opt-out. No coverage
+skip, write-failure non-fatal, and opt-out. Source-coupling guards in the same
+file pin that `main()`'s `KeyboardInterrupt` and `InterruptedBySignal` handlers
+each invoke `capture_repo_deps` (the cancel-arm seam — the fix is inert without
+the wiring). No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 

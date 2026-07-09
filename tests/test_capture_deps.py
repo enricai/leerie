@@ -804,3 +804,43 @@ class TestBackstopCapturePriorRuns:
             ))
 
         assert called == [], "run without logs/ must not trigger capture"
+
+
+# ---------------------------------------------------------------------------
+# Source-coupling guards: cancel-arm seam wiring in main()
+# ---------------------------------------------------------------------------
+
+class TestCancelArmWiring:
+    """Source-coupling guards: main() must invoke capture_repo_deps in both
+    SIGINT (KeyboardInterrupt) and SIGTERM (InterruptedBySignal) handlers.
+    The fix is inert without the wiring — these guards pin it."""
+
+    def test_keyboard_interrupt_arm_invokes_capture(self, leerie):
+        import inspect
+        src = inspect.getsource(leerie.main)
+        # Locate the KeyboardInterrupt except block and verify capture_repo_deps
+        # appears between it and the exit_code = 130 assignment.
+        ki_idx = src.find("except KeyboardInterrupt:")
+        assert ki_idx != -1, "main() must have a KeyboardInterrupt handler"
+        exit_130_idx = src.find("exit_code = 130", ki_idx)
+        assert exit_130_idx != -1, "KeyboardInterrupt arm must set exit_code = 130"
+        arm_src = src[ki_idx:exit_130_idx]
+        assert "capture_repo_deps" in arm_src, (
+            "KeyboardInterrupt arm in main() must invoke capture_repo_deps "
+            "before setting exit_code = 130"
+        )
+
+    def test_interrupted_by_signal_arm_invokes_capture(self, leerie):
+        import inspect
+        src = inspect.getsource(leerie.main)
+        # Locate the InterruptedBySignal except block.
+        ibs_idx = src.find("except InterruptedBySignal")
+        assert ibs_idx != -1, "main() must have an InterruptedBySignal handler"
+        # The signal number line follows the capture block.
+        signum_idx = src.find("signum = getattr(signal", ibs_idx)
+        assert signum_idx != -1, (
+            "InterruptedBySignal arm must resolve signum after capture")
+        arm_src = src[ibs_idx:signum_idx]
+        assert "capture_repo_deps" in arm_src, (
+            "InterruptedBySignal arm in main() must invoke capture_repo_deps"
+        )
