@@ -483,12 +483,16 @@ registered worker pid is excluded from the reap set, a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
 that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
 `_zombie_reaper` (the fix is inert without the wiring). The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
-is tested in `tests/test_fetch_branch_sh.py` via bash-harness subprocess
-tests with a stubbed `flyctl`, covering run discovery, bundle fetch,
-run-state tar, `no_push` strip, and the Step 4 best-effort `.leerie/`
-stream-back: streams both files when absent on the host, never clobbers an
-existing host file, is non-fatal when machine files are absent, and respects
-`LEERIE_STATE_HOST_DIR` for the destination root. The `leerie config` verb (all four sub-modes: `--init`,
+is tested across two files. `tests/test_fetch_branch_sh.py` covers run
+discovery, bundle fetch, run-state tar, and `no_push` strip via bash-harness
+subprocess tests with a stubbed `flyctl`. The Step 4 best-effort `.leerie/`
+stream-back seam is owned exclusively by
+`tests/test_fetch_branch_leerie_streamback.py` (imports stub helpers from
+`test_fetch_branch_sh` to avoid duplication): streams both files when host
+has neither, never clobbers an existing `config.toml`, never clobbers an
+existing `Dockerfile`, non-fatal when machine files are absent, streams only
+the present machine file when only one exists, skips both when both host
+files exist, and respects `LEERIE_STATE_HOST_DIR` for the destination root. The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and
