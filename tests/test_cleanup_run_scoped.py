@@ -116,9 +116,11 @@ def test_cleanup_run_id_removes_worktrees_but_preserves_state(tmp_path):
     (run_dir / "criteria").mkdir()
     (run_dir / "criteria" / "feat-001.md").write_text("# criteria")
 
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
     r = subprocess.run(
         [str(CLEANUP_SH), "--run-id", run_id],
-        cwd=repo, capture_output=True, text=True, check=False,
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
     )
     assert r.returncode == 0, f"cleanup.sh failed: {r.stderr}"
     # State dir and state.json must survive as an audit trail.
@@ -163,9 +165,11 @@ def test_cleanup_subtask_branches_deletes_only_subtask_branches(tmp_path):
             cwd=repo, check=True,
         )
 
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
     r = subprocess.run(
         [str(CLEANUP_SH), "--run-id", run_id, "--subtask-branches"],
-        cwd=repo, capture_output=True, text=True, check=False,
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
     )
     assert r.returncode == 0, f"cleanup.sh failed: {r.stderr}"
 

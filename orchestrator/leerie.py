@@ -5629,14 +5629,12 @@ def run_recapture_deps(
     if run_id is not None:
         target_run_dir = leerie_root / "runs" / run_id
         if not target_run_dir.is_dir():
-            log(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
-            sys.exit(1)
+            die(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
         target_dirs: list[Path] = [target_run_dir]
     else:
         runs_dir = leerie_root / "runs"
         if not runs_dir.is_dir():
-            log(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
-            sys.exit(1)
+            die(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
         finished: list[Path] = []
         for d in runs_dir.iterdir():
             if not d.is_dir():
@@ -5651,8 +5649,7 @@ def run_recapture_deps(
             if rdata.get("finished_at") and (d / "logs").is_dir():
                 finished.append(d)
         if not finished:
-            log("recapture: no completed run with logs found; nothing to recapture")
-            sys.exit(1)
+            die("recapture: no completed run with logs found; nothing to recapture")
         # Process newest-first so the most recent installs inform the decision.
         target_dirs = sorted(finished, reverse=True)
 
