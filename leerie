@@ -910,26 +910,21 @@ spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
-apt_pkgs, _lang = m._capture_installs_from_logs(log_dir)
-cfg_path = user_repo / ".leerie" / "config.toml"
-
-if force:
-    # Wholesale replace: write apt_pkgs directly (even if empty — clears stale).
-    if apt_pkgs:
-        m._write_config_toml_keys(cfg_path, {"setup_packages": " ".join(apt_pkgs)})
-        print(f"config --recapture --force: wrote setup_packages={' '.join(apt_pkgs)!r}")
-        print("LEERIE_RECAPTURE_WROTE")  # machine marker: config.toml changed
-    else:
-        print("config --recapture --force: no apt packages found in logs; setup_packages unchanged")
+# dep_capture is now an LLM worker (invoked async via capture_repo_deps in
+# phase_finalize). The host-side --recapture path requires an asyncio.run
+# wrapper and a live claude binary; that full wiring is a follow-on task.
+# For now, extract the command corpus and report it so the operator knows
+# what the dep_capture worker would receive, without writing anything.
+commands_text, hit_ceiling = m._extract_depcap_commands(log_dir)
+if commands_text.strip():
+    truncation = " (truncated at budget ceiling)" if hit_ceiling else ""
+    print(f"config --recapture: extracted {len(commands_text.splitlines())} "
+          f"command lines from logs{truncation}.")
+    print("config --recapture: LLM dep_capture worker not yet wired in "
+          "--recapture; re-run the full leerie task to invoke it via "
+          "phase_finalize, or use `capture_deps = false` to opt out.")
 else:
-    existing = m._read_toml_key(cfg_path, "setup_packages") or ""
-    merged = m._merge_setup_packages(existing, apt_pkgs)
-    if merged is None:
-        print(f"config --recapture: no new packages vs existing {existing!r}; nothing to write")
-    else:
-        m._write_config_toml_keys(cfg_path, {"setup_packages": merged})
-        print(f"config --recapture: wrote setup_packages={merged!r}")
-        print("LEERIE_RECAPTURE_WROTE")  # machine marker: config.toml changed
+    print("config --recapture: no Bash commands found in logs; nothing to capture.")
 PY
 )" || _recapture_rc=$?
         # Echo the seam's human-readable lines (drop the machine marker).

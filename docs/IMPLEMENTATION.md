@@ -156,16 +156,12 @@ claims a state directory. Four sub-modes:
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
 - **`leerie config --recapture [--force]`**: host-only (no container). Scans
-  the newest finished run's logs in `$LEERIE_STATE_HOST_DIR/runs/*/` via the
-  same `_capture_installs_from_logs` + `_merge_setup_packages` seam used by
-  finalize-time capture (DESIGN §6½). Without `--force`: never-clobber union
-  (only new packages appended). With `--force`: wholesale replace. Exits 1 if
-  no runs directory or no finished run found. When the recapture actually
-  writes `setup_packages` (the seam emits a `LEERIE_RECAPTURE_WROTE` marker on
-  stdout) and a *generated* `.leerie/Dockerfile` is present (its first line is
-  the `# leerie-generated: …` sentinel), the launcher removes it so the next
-  `leerie` run regenerates the image from the new packages. A hand-committed
-  Dockerfile (no sentinel) is left untouched.
+  the newest finished run's logs in `$LEERIE_STATE_HOST_DIR/runs/*/` via
+  `_extract_depcap_commands` and reports the command corpus that the
+  `dep_capture` LLM worker would receive. Full LLM invocation via
+  `capture_repo_deps` (the async path used by `phase_finalize`) is not yet
+  wired into `--recapture`; use the in-run finalize path or wait for the
+  follow-on wiring. Exits 1 if no runs directory or no finished run found.
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
