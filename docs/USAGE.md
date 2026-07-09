@@ -464,23 +464,34 @@ Dockerfile and proceeds through the same build path. A committed
 Dockerfile always takes precedence over `setup_packages`.
 
 **Auto-capture of dependencies.** After each normal (non-resume) run,
-leerie automatically scans the run's logs to find the system-package
-`apt-get install` intents workers attempted — including failed ones, since
-the intent is the signal. Captured package names are union-merged into
-`setup_packages` in `.leerie/config.toml`: only genuinely new packages
-are appended; user-edited values and comments are never overwritten. The
-next run picks up the updated `setup_packages`, auto-generates a
-Dockerfile with those packages pre-installed, and workers no longer hit
-the "are you root?" failure on every install attempt.
+leerie invokes the `dep_capture` LLM worker. The worker reads the
+complete set of shell commands workers ran (extracted from the run's
+`logs/` directory, deduped, newest-first, bounded to a byte budget) and
+**decides** what the repo genuinely needs across all languages and
+frameworks — apt packages, pip, pnpm, cargo, go, and any other package
+manager the repo uses, including failed installs and multi-step setups
+that no regex pattern would enumerate. Its output (`setup_packages` and
+`language_installs`) is validated against a JSON schema and written to
+`.leerie/config.toml` deterministically — code enforces; the model
+decides content (see DESIGN §6½ *Prompts are advisory, code enforces*).
+
+**System packages → `setup_packages` → warm apt layer.** The worker's
+`setup_packages` output is union-merged into `setup_packages` in
+`.leerie/config.toml`: only genuinely new packages are appended;
+user-edited values and comments are never overwritten. The next run
+picks up the updated list, auto-generates a Dockerfile with those
+packages pre-installed, and workers no longer hit the "are you root?"
+failure on every install attempt.
 
 When `bake_language_deps` is enabled (the default), the auto-generated
 Dockerfile also includes a language-dep layer — `COPY` of the lockfiles,
 manifests, and ancillary inputs the package manager needs, followed by
-`RUN <detected install command>` — so workers inherit pre-populated
-`node_modules` / site-packages and per-worker install time drops to
-near-zero. A dependency-input change (lockfile bump, patch edit) triggers
-a full image rebuild; an unrelated source file change does not. See
-DESIGN §6½ for the rebuild-hash mechanism.
+`RUN <install command>` — driven by the worker's `language_installs`
+output, so workers inherit pre-populated `node_modules` / site-packages
+and per-worker install time drops to near-zero. A dependency-input
+change (lockfile bump, patch edit) triggers a full image rebuild; an
+unrelated source file change does not. See DESIGN §6½ for the
+rebuild-hash mechanism.
 
 Capture is **opt-out**. To disable it: set `capture_deps = false` in
 `.leerie/config.toml`, or set `LEERIE_CAPTURE_DEPS=0` in the environment
@@ -496,8 +507,9 @@ commit` to bake into the next run's image."* You control when to commit.
 When a committed `.leerie/Dockerfile` already exists, capture skips the
 `setup_packages` write entirely — the Dockerfile is authoritative.
 
-To re-run capture manually against the latest finished run (for example,
-after editing `.leerie/config.toml` by hand):
+To re-run capture manually — the `dep_capture` worker reads past runs'
+logs and decides the full dependency set (for example, after editing
+`.leerie/config.toml` by hand, or to recover from a cancelled run):
 
 ```
 leerie config --recapture           # union-merge only (never clobbers user edits)
