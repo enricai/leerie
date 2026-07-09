@@ -373,6 +373,45 @@ PY
     fi
   fi
 
+  # --- Step 4: stream .leerie/config.toml + Dockerfile back (best-effort) ----
+  # On a clean Fly finish the in-container dep_capture worker has already
+  # written /work/.leerie/config.toml and /work/.leerie/Dockerfile.  Stream
+  # them home so the bake loop persists across the machine->host boundary.
+  # Existence-guarded on both sides, non-fatal, and never clobbers a
+  # host-edited file (skip if the host target already exists).
+  # Cancel/kill recovery (where fetch_branch never runs) is left to the
+  # host-side --recapture / next-run backstop.
+  local host_leerie_root
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    host_leerie_root="$LEERIE_STATE_HOST_DIR"
+  else
+    host_leerie_root="$USER_REPO/.leerie"
+  fi
+
+  local _cap_file
+  for _cap_file in config.toml Dockerfile; do
+    local _remote_path="/work/.leerie/$_cap_file"
+    local _host_path="$host_leerie_root/$_cap_file"
+    # Skip if host target already exists (never clobber a host-edited file).
+    if [ -e "$_host_path" ]; then
+      continue
+    fi
+    # Existence-guard on the machine side before attempting transfer.
+    if ! _fetch_machine_exec test -f "$_remote_path" 2>/dev/null; then
+      continue
+    fi
+    remote_log "remote: streaming .leerie/$_cap_file to host ..."
+    mkdir -p "$host_leerie_root" 2>/dev/null || true
+    if _fetch_machine_exec cat "$_remote_path" \
+         > "$_host_path" 2>/dev/null; then
+      remote_log "remote: .leerie/$_cap_file written to $host_leerie_root/"
+    else
+      # Non-fatal: remove a partial write and continue.
+      rm -f "$_host_path" 2>/dev/null || true
+      remote_log "fetch_branch: warning: failed to stream .leerie/$_cap_file (non-fatal)"
+    fi
+  done
+
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"
   return 0
 }
