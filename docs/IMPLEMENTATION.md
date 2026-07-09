@@ -3985,21 +3985,35 @@ When the launcher auto-generates `.leerie/Dockerfile` from `setup_packages`
 after the apt `RUN`:
 
 ```dockerfile
-COPY <lockfiles> <manifests> [patches/] [.npmrc] [pnpm-workspace.yaml] ./
-RUN <detected install command>
+COPY <copy_inputs> ./
+RUN <install command>
 ```
 
-The `COPY` set is computed by an inline `python3` heredoc inside the
-launcher's auto-gen block that mirrors `_lockfile_table_entries`'s
-manager-precedence by hand (the launcher cannot import the
-orchestrator). For **all** node ecosystems (pnpm, yarn, npm) a shared
-`_node_ancillary` helper adds workspace `package.json`s, `patches/`,
-`.npmrc`, and `pnpm-workspace.yaml` to the lockfile + root manifest,
-because the frozen install requires them — workspace globs come from
-`pnpm-workspace.yaml` (pnpm) or `package.json`'s `workspaces` field
-(yarn/npm, both list and `{packages: [...]}` forms). On a build failure
-(e.g. a missing patch file), the launcher falls back to
-`bake_language_deps=false` (apt layer only) and logs loudly.
+The `COPY`+`RUN` layer is determined by an inline `python3` heredoc in
+the launcher's auto-gen block with two tiers:
+
+1. **Primary — persisted `language_installs` from `.leerie/config.toml`.**
+   The `dep_capture` worker writes a `language_installs` JSON array (keyed
+   by `manager`) to `.leerie/config.toml`. When this key is present, the
+   launcher reads it, iterates over every `{manager, command, copy_inputs}`
+   entry, and emits one `COPY`+`RUN` block per manager. Each `copy_input`
+   is validated with `p.exists()` before being added to the `COPY` list —
+   hallucinated paths are silently dropped while the `RUN` line is always
+   emitted (the install command itself is authoritative; the COPY list is
+   advisory). Multiple managers yield multiple `COPY`+`RUN` layers.
+
+2. **Fallback — lockfile detection (clean first run).** When no
+   `language_installs` key is present in config.toml (e.g. on the very
+   first run before `dep_capture` has fired), the heredoc mirrors
+   `_lockfile_table_entries`'s manager-precedence by hand to detect a
+   single lockfile manager. For **all** node ecosystems (pnpm, yarn, npm)
+   a shared `_node_ancillary` helper adds workspace `package.json`s,
+   `patches/`, `.npmrc`, and `pnpm-workspace.yaml`, because the frozen
+   install requires them — workspace globs come from `pnpm-workspace.yaml`
+   (pnpm) or `package.json`'s `workspaces` field (yarn/npm, both list and
+   `{packages: [...]}` forms). On a build failure (e.g. a missing patch
+   file), the launcher falls back to `bake_language_deps=false` (apt layer
+   only) and logs loudly.
 
 **COPY-input-sha rebuild trigger.** Every file that participates in the
 `COPY` list — lockfiles, manifests, workspace children, `patches/*`,
