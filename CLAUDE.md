@@ -547,6 +547,14 @@ schema contract — required fields, `language_installs` item shape, valid/inval
 instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
 exclusion, effort/model defaults) — is pinned in
 `tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
+The full model/effort resolution precedence for `dep_capture` (CLI >
+per-worker env > global CLI > global env > per-worker TOML > global TOML >
+`MODEL_DEFAULT`; effort: global CLI > global env > global TOML >
+`EFFORT_DEFAULT_PER_WORKER["dep_capture"]`; `MODEL_DEP_CAPTURE_ENV`
+constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` but present
+in `EFFORT_DEFAULT_PER_WORKER` with value `"high"`) is pinned in
+`tests/test_resolve_dep_capture_model.py` (mirrors `test_resolve_models.py`
+and `test_resolve_efforts.py`).
 The three orchestrator wiring seams that are only verifiable by source
 inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
 `test_phase_finalize_capture_hook.py`'s `inspect.getsource` approach):
