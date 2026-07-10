@@ -1569,12 +1569,14 @@ process chain), and (iii) older than `_PID_REAP_MIN_AGE_SEC` (60 s). PIDs
 are killed **oldest-first**, stopping as soon as `pids.current / pids.max`
 drops below `_PID_REAP_LOW_WATER` (0.75) — hysteresis so one pass does not
 over-kill. Killed PIDs are pruned from `_seen`. The exit-time
-`stop_and_reap` applies the same safe-target filter: it kills only PIDs
-from `_seen` that are simultaneously alive, reparented to init or the
-orchestrator (`ppid in {1, getpid()}`), not in `_ASYNCIO_MANAGED_PIDS`,
-and at least `_PID_REAP_MIN_AGE_SEC` seconds old — so a finishing worker
-never SIGKILLs a PID that has been recycled to a concurrently-running
-sibling worker.
+`stop_and_reap` applies a related but distinct filter via
+`_exit_reap_candidates`: it kills only PIDs from `_seen` that are
+simultaneously alive, reparented to init or the orchestrator
+(`ppid in {1, getpid()}`), and not in `_ASYNCIO_MANAGED_PIDS` — so a
+finishing worker never SIGKILLs a PID that has been recycled to a
+concurrently-running sibling worker. The age floor is intentionally
+omitted at exit-time: the worker is done, so all tracked orphaned
+descendants should be cleaned up regardless of age.
 
 *Why the age floor is load-bearing.* A background test the worker just
 launched and is actively awaiting has also reparented to init (`ppid == 1`),
@@ -1652,10 +1654,12 @@ spawn and discards after its await), and `os.waitpid(pid, WNOHANG)`s each one
 individually — so it only ever reaps PIDs that are already dead orphans, never a
 worker asyncio is still awaiting. Because the subreaper reparents orphans to the
 orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter accepts
-`ppid in (1, getpid())`; exit-time `stop_and_reap` applies the same safe-target
-filter (alive + `ppid in {1, getpid()}` + not in `_ASYNCIO_MANAGED_PIDS` +
-age ≥ `_PID_REAP_MIN_AGE_SEC`), ensuring a finishing worker never SIGKILLs a
-PID that has been recycled to a concurrently-running sibling worker. This is
+`ppid in (1, getpid())`; exit-time `stop_and_reap` applies a related but
+distinct filter via `_exit_reap_candidates` (alive + `ppid in {1, getpid()}` +
+not in `_ASYNCIO_MANAGED_PIDS`, without the age floor — the worker is done so
+all tracked orphans are reaped regardless of age), ensuring a finishing worker
+never SIGKILLs a PID that has been recycled to a concurrently-running sibling
+worker. This is
 chosen over inserting a real init (e.g.
 `nerdctl run --init` / tini as PID 1) because the subreaper (a) covers **both**
 the local and Fly runtimes — `--init` is a nerdctl-local flag and would leave
