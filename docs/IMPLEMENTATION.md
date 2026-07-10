@@ -3254,7 +3254,10 @@ together close the leak.
    `_reparented_orphans(self._seen)` to obtain the killable set and sends
    `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
    soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
-   are pruned from `_seen`; the exit-time `stop_and_reap` path is unchanged.
+   are pruned from `_seen`. The exit-time `stop_and_reap` applies the same
+   safe-target filter (alive + `ppid in {1, getpid()}` + not in
+   `_ASYNCIO_MANAGED_PIDS` + age ≥ `_PID_REAP_MIN_AGE_SEC`), so a finishing
+   worker never SIGKILLs a PID recycled to a concurrently-running sibling.
    `_reparented_orphans(seen: set[int]) -> list[int]` runs one
    `ps -eo pid,ppid,etimes` snapshot and returns, sorted oldest-first, the
    PIDs from `seen` that are simultaneously alive, reparented to init
