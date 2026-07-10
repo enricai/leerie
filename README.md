@@ -654,17 +654,26 @@ for an audit cleanup across every past run).
 
 - **Run hit the Claude Code subscription rate-limit** — leerie detects
   the session-limit message from `claude -p` and exits cleanly.
-  Worktrees are torn down; state and branches are preserved. When the
-  reset time can be parsed unambiguously, leerie sleeps until the reset
-  window and auto-resumes itself. When it cannot (malformed time,
-  unfamiliar timezone, or a future format change), leerie exits with
-  code 75 and prints the manual resume command — re-run that command
-  yourself once the rate-limit clears. Auto-resume passes only
-  `--resume <id>`; CLI-only overrides (`--model`,
-  `--max-workers`, etc.) on the original launch are *not* preserved
-  across an auto-resume. Set those via env (`LEERIE_*`) or `leerie.toml`
-  if you want them to survive — both channels are re-resolved on
-  every `--resume`.
+  Worktrees are torn down; state and branches are preserved. A
+  rate-limit resets on a clock, so leerie auto-resumes: when the reset
+  time can be parsed unambiguously it sleeps until the reset window;
+  when it cannot (malformed time, unfamiliar timezone, or a future
+  format change) it sleeps a fixed backoff (5 min) and re-resumes,
+  polling until the limit clears. Ctrl-C during the wait drops to a
+  manual `--resume`. Auto-resume passes only `--resume <id>`; CLI-only
+  overrides (`--model`, `--max-workers`, etc.) on the original launch
+  are *not* preserved across an auto-resume. Set those via env
+  (`LEERIE_*`) or `leerie.toml` if you want them to survive — both
+  channels are re-resolved on every `--resume`.
+
+- **Run ran out of credits** — distinct from a rate-limit: credits
+  don't reset on a clock (they return on a top-up or billing cycle), so
+  leerie does *not* auto-resume. It tears down worktrees, preserves
+  state and branches, prints an `out of credits — leerie --resume <id>`
+  hint, and exits with code 75. Add credits, then re-run that `--resume`
+  command. (An org with "extra usage" disabled at the org level is *not*
+  out of credits — that's a benign standing state and never triggers
+  this pause.)
 
 - **A subtask reports `blocked`** — the implementer hit something it
   cannot resolve and bailed before integration. Read the blocker reason in
