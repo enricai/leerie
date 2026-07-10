@@ -4028,7 +4028,14 @@ if [ "$_leerie_do_gen" = "true" ]; then
     for _pkg in $_sp_packages; do
       printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
     done
-    printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
+    # End the apt layer with the image still at USER root. Do NOT append a
+    # trailing `USER leerie`: the base image's ENTRYPOINT (container-entry.sh)
+    # is inherited here and MUST run as PID-1 root to set up cgroup containment
+    # and launch the root broker before dropping to leerie via `runuser` (see
+    # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
+    # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
+    # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
+    printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
 
     # Language-dep layer (gated on bake_language_deps, default true).
     # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
@@ -4079,57 +4086,25 @@ def _emit_layer(copy_files, run_cmd, copy_shas):
     sha_comment = "# copy-input-shas: " + " ".join(
         f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
     )
-    copy_line = "COPY " + " ".join(copy_files) + " ./"
-    run_line = f"RUN {run_cmd}"
+    # Docker's `COPY src... ./` flattens each source into ./ by basename: a
+    # directory (patches/ → /work/*.patch, not /work/patches/) and a nested
+    # file (packages/a/package.json → /work/package.json, clobbering the root
+    # manifest) both land wrong. Only top-level files (no "/") are safe to
+    # batch into a single `COPY ... ./`. Everything else needs an explicit
+    # destination that preserves its path, or the baked install fails (ENOENT
+    # on a patch, or a workspace manifest overwriting the root one).
+    def _needs_own_copy(c):
+        return c.endswith("/") or "/" in c
+    top_level = [c for c in copy_files if not _needs_own_copy(c)]
+    own = [c for c in copy_files if _needs_own_copy(c)]
     print(sha_comment)
-    print(copy_line)
-    print(run_line)
+    if top_level:
+        print("COPY " + " ".join(top_level) + " ./")
+    for c in own:
+        # Directories keep their trailing slash on both sides; files map 1:1.
+        print(f"COPY {c} ./{c}")
+    print(f"RUN {run_cmd}")
 
-
-persisted_installs = []
-if config_toml and config_toml.is_file():
-    try:
-        raw = config_toml.read_text()
-    except OSError:
-        raw = ""
-    # Extract the language_installs value from a flat TOML file.
-    # The value is a JSON string (possibly quoted with " or ').
-    for line in raw.splitlines():
-        m = re.match(
-            r"^\s*language_installs\s*=\s*(?:\"(.*)\"|'(.*)'|(.*))$",
-            line.strip(),
-        )
-        if m:
-            val = m.group(1) or m.group(2) or m.group(3) or ""
-            val = val.strip()
-            if val:
-                try:
-                    persisted_installs = _json.loads(val)
-                    if not isinstance(persisted_installs, list):
-                        persisted_installs = []
-                except (ValueError, TypeError):
-                    persisted_installs = []
-            break
-
-if persisted_installs:
-    emitted = False
-    for entry in persisted_installs:
-        if not isinstance(entry, dict):
-            continue
-        run_cmd = (entry.get("command") or "").strip()
-        copy_inputs = entry.get("copy_inputs") or []
-        if not run_cmd:
-            continue
-        # Validate each copy_input; skip hallucinated paths but always emit RUN.
-        copy_files = [ci for ci in copy_inputs if ci and (repo / ci).exists()]
-        if copy_files:
-            copy_shas = _hash_copy_files(repo, copy_files)
-            _emit_layer(copy_files, run_cmd, copy_shas)
-        else:
-            # No valid copy inputs: emit RUN without COPY.
-            print(f"RUN {run_cmd}")
-        emitted = True
-    sys.exit(0 if emitted else 0)
 
 def _node_ancillary(repo, copy_files):
     """Append the ancillary inputs a node install needs beyond the lockfile:
@@ -4168,6 +4143,74 @@ def _node_ancillary(repo, copy_files):
     if (repo / "patches").is_dir() and "patches/" not in copy_files:
         copy_files.append("patches/")
 
+
+# Node package managers whose frozen install reads patches/, workspace
+# manifests, and .npmrc — the persisted-path copy_inputs often omit these
+# (DESIGN §6½ requires the full input set), so we augment via _node_ancillary.
+_NODE_MANAGERS = ("pnpm", "yarn", "npm")
+
+
+def _is_node_context(repo, manager):
+    """True when the install is a node one — by explicit manager string or by
+    the presence of a node lockfile (persisted copy_inputs may not name it)."""
+    if (manager or "").lower() in _NODE_MANAGERS:
+        return True
+    return any(
+        (repo / lf).is_file()
+        for lf in ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
+    )
+
+
+persisted_installs = []
+if config_toml and config_toml.is_file():
+    try:
+        raw = config_toml.read_text()
+    except OSError:
+        raw = ""
+    # Extract the language_installs value from a flat TOML file.
+    # The value is a JSON string (possibly quoted with " or ').
+    for line in raw.splitlines():
+        m = re.match(
+            r"^\s*language_installs\s*=\s*(?:\"(.*)\"|'(.*)'|(.*))$",
+            line.strip(),
+        )
+        if m:
+            val = m.group(1) or m.group(2) or m.group(3) or ""
+            val = val.strip()
+            if val:
+                try:
+                    persisted_installs = _json.loads(val)
+                    if not isinstance(persisted_installs, list):
+                        persisted_installs = []
+                except (ValueError, TypeError):
+                    persisted_installs = []
+            break
+
+if persisted_installs:
+    emitted = False
+    for entry in persisted_installs:
+        if not isinstance(entry, dict):
+            continue
+        run_cmd = (entry.get("command") or "").strip()
+        copy_inputs = entry.get("copy_inputs") or []
+        if not run_cmd:
+            continue
+        # Validate each copy_input; skip hallucinated paths but always emit RUN.
+        copy_files = [ci for ci in copy_inputs if ci and (repo / ci).exists()]
+        # A persisted copy_inputs list often names only the lockfile+manifest.
+        # For node managers, augment with the ancillary inputs a frozen install
+        # requires (patches/, workspace children, .npmrc) — else the bake fails
+        # ENOENT on a patch and silently degrades to apt-only (DESIGN §6½).
+        if _is_node_context(repo, entry.get("manager")):
+            _node_ancillary(repo, copy_files)
+        if copy_files:
+            copy_shas = _hash_copy_files(repo, copy_files)
+            _emit_layer(copy_files, run_cmd, copy_shas)
+        else:
+            # No valid copy inputs: emit RUN without COPY.
+            print(f"RUN {run_cmd}")
+        emitted = True
+    sys.exit(0 if emitted else 0)
 
 # Detect lockfile manager (mirrors _lockfile_table_entries precedence).
 has_pnpm  = (repo / "pnpm-lock.yaml").is_file()
@@ -4299,7 +4342,9 @@ PY
         for _pkg2 in $_sp_packages; do
           printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
         done
-        printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp2"
+        # End at USER root — no trailing `USER leerie` (see the primary
+        # generator above: PID-1 must be root for cgroup containment).
+        printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp2"
         mv "$_gen_df_tmp2" "$_leerie_dockerfile"
         unset _gen_df_tmp2 _pkg2
       else
@@ -5945,9 +5990,48 @@ else
       [ -n "$_cid" ] && nerdctl kill "$_cid" >/dev/null 2>&1 || true
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
-  trap '_kill_container_from_cidfile; exit 130' INT
-  trap '_kill_container_from_cidfile; exit 143' TERM
+
+  # Decoupled streaming (DESIGN §6 *Launcher hang on abnormal container exit*).
+  # In piped mode (`leerie … | tee log`, TTY_FLAGS=-i), the container's I/O is
+  # forwarded by Colima's persistent SSH ControlMaster, which holds a *copy* of
+  # our stdout pipe's write-end for the duration of the run. On a clean exit the
+  # master releases it; on an ABNORMAL client death (PID-1 crash under set -e,
+  # OOM SIGKILL, mid-run kill) the master retains the write-end → `tee` never
+  # gets EOF → the launcher hangs forever and the --rm cleanup never fires
+  # (orphaned Up container, wedged run-dir flock). `ssh -O exit` releases it but
+  # kills concurrent group/chain runs; the mux does NOT retain a plain-FILE fd,
+  # so instead we point nerdctl's stdout at a run-log FILE and stream that file
+  # to our own stdout via a `tail -f` WE own and reap. The EOF gate becomes the
+  # launcher-controlled tail, never the mux — zero blast radius on other runs.
+  # Gated to the piped (-i) case: the interactive (-it) path has a real pty, no
+  # `tee`, and thus no hang, and needs its stdin/pty attached for --clarify.
+  _run_log=""
+  _tail_pid=""
+  if [ "$TTY_FLAGS" = "-i" ] && [ ! -t 1 ]; then
+    _run_log="$LEERIE_STATE_HOST_DIR/.runlog-$$"
+    : > "$_run_log" 2>/dev/null || _run_log=""   # fall back to direct if unwritable
+  fi
+  _reap_tail() {
+    if [ -n "${_tail_pid:-}" ]; then
+      # Let tail drain the final write before we kill it — otherwise a
+      # fast-completing run can lose the last chunk. A short sleep is enough
+      # (tail's default poll is 1s; a brief pause lets its pending read flush).
+      # Do NOT cat the file afterward: tail already streamed it, and a cat would
+      # duplicate the entire log on every clean run.
+      sleep 0.3
+      kill "$_tail_pid" 2>/dev/null || true
+      _tail_pid=""
+    fi
+    # Clear _run_log after removing it so a later trap-driven _reap_tail is a
+    # true no-op rather than re-rm'ing an already-deleted path (single-shot).
+    if [ -n "${_run_log:-}" ]; then
+      rm -f "$_run_log" 2>/dev/null || true
+      _run_log=""
+    fi
+  }
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
+  trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 
   # Forward orchestrator-side LEERIE_* env overrides into the container.
   # The orchestrator's resolve_* functions read os.environ *inside* the
@@ -5994,26 +6078,42 @@ else
     _leerie_env_args+=("-e" "$_name")
   done
 
-  nerdctl run \
-    --rm $TTY_FLAGS \
-    --name "leerie-$(date +%s)-$$" \
-    --label "leerie.launcher_pid=$$" \
-    --cidfile "$_cidfile" \
-    -v "$_cidfile:/run/leerie-cidfile:ro" \
-    -e LEERIE_INSPECT_DIRS= \
-    -e LEERIE_STATE_DIR=/leerie-state \
-    ${_leerie_env_args[@]+"${_leerie_env_args[@]}"} \
-    ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"} \
-    --cgroupns=host \
-    ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"} \
-    -v "$USER_REPO:/work" \
-    -v "$LEERIE_REPO:/opt/leerie-image:ro" \
-    -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
-    ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
-    ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
-    ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
-    -w /work \
-    "${REPO_IMAGE_TAG:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
+  # Assemble the run argv once; the two call forms below differ only in whether
+  # stdout/stderr go to the decouple run-log file (redirections can't be built
+  # via variable expansion in bash, so the run is spelled out in each branch).
+  _run_argv=(
+    --rm $TTY_FLAGS
+    --name "leerie-$(date +%s)-$$"
+    --label "leerie.launcher_pid=$$"
+    --cidfile "$_cidfile"
+    -v "$_cidfile:/run/leerie-cidfile:ro"
+    -e LEERIE_INSPECT_DIRS=
+    -e LEERIE_STATE_DIR=/leerie-state
+    ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
+    ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
+    --cgroupns=host
+    ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"}
+    -v "$USER_REPO:/work"
+    -v "$LEERIE_REPO:/opt/leerie-image:ro"
+    -v "$LEERIE_STATE_HOST_DIR:/leerie-state"
+    ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"}
+    ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}
+    ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"}
+    -w /work
+    "${REPO_IMAGE_TAG:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
+  )
+  if [ -n "$_run_log" ]; then
+    # Decoupled: nerdctl → run-log file; a tail WE own streams the file to our
+    # own stdout so the SSH mux never holds our stdout pipe (see above).
+    ( tail -n +1 -f "$_run_log" 2>/dev/null ) &
+    _tail_pid=$!
+    nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 || container_rc=$?
+    # Stop the tail and flush any trailing bytes it hasn't printed yet.
+    _reap_tail
+  else
+    # Interactive/-it (or run-log uncreatable): nerdctl inherits stdout directly.
+    nerdctl run "${_run_argv[@]}" || container_rc=$?
+  fi
 fi
 
 # --- host-side finalize (push + PR) -------------------------------------

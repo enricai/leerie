@@ -451,8 +451,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips-dev \
     fonts-noto \
     && rm -rf /var/lib/apt/lists/*
-USER leerie
 ```
+
+End with the image still at `USER root` — do **not** append a trailing
+`USER leerie`. The base image's ENTRYPOINT must run as PID-1 root to set up
+cgroup containment before dropping to `leerie` itself via `runuser` (DESIGN §6
+*Memory containment*); a trailing `USER leerie` breaks that and the container
+exits 1.
 
 The launcher builds a derived image tagged `leerie-repo/<repo-id>:<version>`
 and uses it for all subsequent runs. A second run with an unchanged

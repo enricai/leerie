@@ -774,10 +774,29 @@ def test_config_chat_md_mentions_arg_base_image():
     assert "ARG BASE_IMAGE" in text
 
 
-def test_config_chat_md_mentions_user_leerie():
-    """prompts/config_chat.md mentions switching back to `USER leerie`."""
+def test_config_chat_md_instructs_end_at_user_root():
+    """prompts/config_chat.md must instruct ending at `USER root` (PID-1 must
+    stay root — DESIGN §6) and NOT tell the model to append a trailing
+    `USER leerie` (which would break the container-entry root invariant)."""
     text = _config_chat_md()
-    assert "USER leerie" in text
+    assert "USER root" in text
+    # The example Dockerfile block must not end with a `USER leerie` line.
+    assert "\nUSER leerie\n" not in text, (
+        "config_chat.md must not instruct a trailing USER leerie"
+    )
+
+
+def test_usage_md_dockerfile_example_has_no_trailing_user_leerie():
+    """docs/USAGE.md's hand-authored `.leerie/Dockerfile` example must not end
+    with `USER leerie` (same root-PID-1 invariant as config_chat.md — DESIGN
+    §6). A user copying the documented example verbatim must not reintroduce
+    the container-exits-1 defect."""
+    path = REPO_ROOT / "docs" / "USAGE.md"
+    assert path.exists(), "docs/USAGE.md not found"
+    text = path.read_text()
+    assert "\nUSER leerie\n" not in text, (
+        "docs/USAGE.md Dockerfile example must not end with a trailing USER leerie"
+    )
 
 
 def test_config_chat_md_mentions_config_toml():

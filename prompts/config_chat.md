@@ -46,12 +46,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips-dev \
     fonts-noto \
     && rm -rf /var/lib/apt/lists/*
-USER leerie
 ```
 
 The `ARG BASE_IMAGE` / `FROM $BASE_IMAGE` lines are mandatory — leerie
-injects the correct base image (local or Fly-hosted) at build time. Always
-switch back to `USER leerie` at the end. Do not add `ENTRYPOINT` or `CMD`.
+injects the correct base image (local or Fly-hosted) at build time. End with
+the image still at `USER root` — do **not** append a trailing `USER leerie`.
+The base image's ENTRYPOINT must run as PID-1 root to set up cgroup
+containment before dropping to leerie itself (DESIGN §6); a trailing
+`USER leerie` breaks that and the container exits 1. Do not add `ENTRYPOINT`
+or `CMD`.
 
 ## What belongs where
 

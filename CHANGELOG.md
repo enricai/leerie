@@ -597,6 +597,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-repo derived image no longer forces PID 1 to run as `leerie`.**
+  The auto-generated `.leerie/Dockerfile` ended with a trailing
+  `USER leerie`, which overrode the base image's deliberate no-`USER`
+  (root) default. Since the derived image inherits the base
+  `ENTRYPOINT` (`scripts/container-entry.sh`), PID 1 then ran as
+  `leerie` instead of root, so the cgroup-slice writes, the root
+  cgroup broker's socket `bind()`, and the final `runuser` all failed
+  EACCES and the container exited 1 before the orchestrator ever
+  started (`runuser: may not be used by non-root user`). Both
+  generator sites now end the apt layer at `USER root`; the base
+  entrypoint drops to `leerie` itself via `runuser`, per DESIGN §6
+  *Memory containment*. The user-facing hand-authored-`.leerie/Dockerfile`
+  examples in `docs/USAGE.md` and `prompts/config_chat.md` were corrected
+  to match (they had shown a trailing `USER leerie`). Latent since the
+  per-repo derived-image feature (#26); triggered once a repo acquired a
+  `.leerie/config.toml` with `setup_packages`/`language_installs`.
+- **Language-dep bake now copies `patches/` and workspace manifests
+  on the persisted-config path.** A repo using
+  `pnpm.patchedDependencies` (or yarn/npm workspaces) baked without its
+  `patches/` dir, so `pnpm install --frozen-lockfile` failed `ENOENT`
+  on a patch file and the launcher silently degraded to an apt-only
+  image (no baked `node_modules`). The persisted `language_installs`
+  path now augments its `copy_inputs` via `_node_ancillary` for node
+  managers (matching the auto-detect path), and `_emit_layer` emits
+  each directory or nested-path source as its own path-preserving
+  `COPY dir/ ./dir/` line instead of flattening it into `./` (which
+  also fixes a latent workspace-child `package.json` basename clobber).
+- **Launcher no longer hangs after an abnormal container exit.** In
+  piped mode (`leerie … | tee log`), Colima's persistent SSH
+  ControlMaster holds a copy of the launcher's stdout-pipe write-end
+  for the run; on an abnormal container exit (PID-1 crash, OOM
+  SIGKILL, mid-run kill) it retained that copy, so `tee` never
+  received EOF, the launcher never returned, and the `--rm` container
+  was orphaned (wedging the run-dir flock and later `--resume`). The
+  launcher now points `nerdctl run` at a run-log file (the mux does
+  not retain a plain-file fd) and streams it to its own stdout via a
+  `tail -f` it owns and reaps in its EXIT/INT/TERM traps — zero blast
+  radius on concurrent group/chain runs. Gated to the piped, non-TTY
+  case; interactive `-it` runs are unchanged. (DESIGN §6 *Launcher
+  hang on abnormal container exit*.)
+
 ### Added
 
 - **Chain orchestration: laptop-side wave sequencer (`leerie --chain`,

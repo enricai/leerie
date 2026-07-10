@@ -587,3 +587,184 @@ def test_committed_dockerfile_not_overwritten_by_language_installs(tmp_path):
     assert result.stdout == custom_content, (
         "committed Dockerfile must not be overwritten by language_installs bake"
     )
+
+
+# ---------------------------------------------------------------------------
+# Node ancillary inputs on the persisted path (Bug: patches/ omitted → bake
+# fails ENOENT → silent apt-only fallback). DESIGN §6½ requires the full input
+# set (patches/, workspace children, .npmrc) — a persisted copy_inputs list
+# that names only lockfile+manifest must be augmented for node managers.
+# ---------------------------------------------------------------------------
+
+def test_persisted_pnpm_pulls_in_patches_dir(tmp_path):
+    """A persisted pnpm language_install whose copy_inputs omit patches/ must
+    still COPY patches/ — pnpm.patchedDependencies reads them and a frozen
+    install ENOENTs without them."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: 9.0\n")
+    (user_repo / "package.json").write_text('{"name": "x"}\n')
+    (user_repo / "patches").mkdir()
+    (user_repo / "patches" / "foo.patch").write_text("--- a\n+++ b\n")
+    (user_repo / ".leerie" / "config.toml").write_text(_make_config_toml(
+        setup_packages="tini",
+        language_installs=[{
+            "manager": "pnpm",
+            "command": "pnpm install --frozen-lockfile",
+            "copy_inputs": ["package.json", "pnpm-lock.yaml"],
+        }],
+    ))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    # patches/ copied into its own subdir (not flattened into ./).
+    assert "COPY patches/ ./patches/" in result.stdout, result.stdout
+    # Its sha participates in the rebuild-trigger comment.
+    assert "patches/foo.patch=" in result.stdout
+
+
+def test_persisted_pnpm_does_not_flatten_patches(tmp_path):
+    """The dir must NOT be emitted as a flattened `COPY ... patches/ ./`."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: 9.0\n")
+    (user_repo / "package.json").write_text('{"name": "x"}\n')
+    (user_repo / "patches").mkdir()
+    (user_repo / "patches" / "foo.patch").write_text("p\n")
+    (user_repo / ".leerie" / "config.toml").write_text(_make_config_toml(
+        setup_packages="tini",
+        language_installs=[{
+            "manager": "pnpm",
+            "command": "pnpm install --frozen-lockfile",
+            "copy_inputs": ["pnpm-lock.yaml"],
+        }],
+    ))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    # No COPY line ends with `patches/ ./` (the flattening footgun).
+    for line in result.stdout.splitlines():
+        assert not (line.startswith("COPY ") and line.rstrip().endswith("patches/ ./")), (
+            f"patches/ must not be flattened into ./: {line!r}"
+        )
+
+
+def test_persisted_non_node_ignores_patches(tmp_path):
+    """A poetry (non-node) install must NOT pull in a patches/ dir even if one
+    exists — _node_ancillary applies only to node managers."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / "poetry.lock").write_text("[[package]]\n")
+    (user_repo / "pyproject.toml").write_text("[tool.poetry]\n")
+    (user_repo / "patches").mkdir()
+    (user_repo / "patches" / "foo.patch").write_text("p\n")
+    (user_repo / ".leerie" / "config.toml").write_text(_make_config_toml(
+        setup_packages="tini",
+        language_installs=[{
+            "manager": "poetry",
+            "command": "poetry install",
+            "copy_inputs": ["pyproject.toml", "poetry.lock"],
+        }],
+    ))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "patches/" not in result.stdout, result.stdout
+
+
+def test_persisted_node_workspace_child_path_preserved(tmp_path):
+    """A workspace child package.json must be COPYed to its own path, not
+    flattened into ./ where its basename would clobber the root manifest."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / "yarn.lock").write_text("# yarn\n")
+    (user_repo / "package.json").write_text('{"workspaces": ["packages/*"]}\n')
+    (user_repo / "packages" / "a").mkdir(parents=True)
+    (user_repo / "packages" / "a" / "package.json").write_text('{"name": "a"}\n')
+    (user_repo / ".leerie" / "config.toml").write_text(_make_config_toml(
+        setup_packages="tini",
+        language_installs=[{
+            "manager": "yarn",
+            "command": "yarn install --frozen-lockfile",
+            "copy_inputs": ["package.json", "yarn.lock"],
+        }],
+    ))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "COPY packages/a/package.json ./packages/a/package.json" in result.stdout, result.stdout
+
+
+def test_autogen_apt_layer_has_no_trailing_user_leerie(tmp_path):
+    """The bake path's apt layer must not end with USER leerie either (PID-1
+    must stay root — DESIGN §6)."""
+    user_repo = tmp_path / "repo"
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / "requirements.txt").write_text("pytest\n")
+    (user_repo / ".leerie" / "config.toml").write_text(_make_config_toml(
+        setup_packages="git",
+        language_installs=[{
+            "manager": "pip",
+            "command": "pip install -r requirements.txt",
+            "copy_inputs": ["requirements.txt"],
+        }],
+    ))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "USER leerie" not in result.stdout, result.stdout

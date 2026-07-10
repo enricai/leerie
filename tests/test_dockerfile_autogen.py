@@ -214,8 +214,11 @@ def test_autogen_lists_all_declared_packages(tmp_path):
     assert "fonts-noto" in result.stdout
 
 
-def test_autogen_ends_with_user_leerie(tmp_path):
-    """Generated Dockerfile must restore USER leerie at the end."""
+def test_autogen_does_not_end_with_user_leerie(tmp_path):
+    """Generated Dockerfile must NOT append a trailing USER leerie: the base
+    image's ENTRYPOINT (container-entry.sh) must run as PID-1 root to set up
+    cgroup containment before dropping to leerie via runuser (DESIGN §6). A
+    trailing USER leerie makes PID 1 run as leerie and the container exits 1."""
     user_repo = tmp_path / "repo"
     (user_repo / ".leerie").mkdir(parents=True)
     (user_repo / ".leerie" / "config.toml").write_text(
@@ -235,14 +238,15 @@ def test_autogen_ends_with_user_leerie(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
-    lines = result.stdout.strip().splitlines()
-    # USER leerie must appear at the end (last non-empty line)
-    last = next(l for l in reversed(lines) if l.strip())
-    assert last.strip() == "USER leerie", f"expected 'USER leerie' as last line, got: {last!r}"
+    content = result.stdout
+    assert "USER leerie" not in content, (
+        f"generated Dockerfile must not contain USER leerie, got:\n{content}"
+    )
 
 
-def test_autogen_user_root_before_user_leerie(tmp_path):
-    """USER root must appear before USER leerie in the generated Dockerfile."""
+def test_autogen_ends_with_user_root(tmp_path):
+    """The generated apt layer switches to USER root and never leaves it — the
+    image's effective final USER stays root so PID-1 is root (DESIGN §6)."""
     user_repo = tmp_path / "repo"
     (user_repo / ".leerie").mkdir(parents=True)
     (user_repo / ".leerie" / "config.toml").write_text(
@@ -263,7 +267,10 @@ def test_autogen_user_root_before_user_leerie(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     content = result.stdout
-    assert content.index("USER root") < content.index("USER leerie")
+    # USER root appears (before apt); no later USER directive resets it.
+    assert "USER root" in content
+    users = [l.strip() for l in content.splitlines() if l.strip().startswith("USER ")]
+    assert users[-1] == "USER root", f"last USER directive must be root, got: {users}"
 
 
 def test_autogen_log_message_emitted(tmp_path):
@@ -410,10 +417,15 @@ def test_coupling_arg_base_image_in_launcher():
     assert "ARG BASE_IMAGE" in launcher
 
 
-def test_coupling_user_leerie_in_launcher():
-    """The USER leerie printf literal must be present in the launcher source."""
+def test_coupling_no_trailing_user_leerie_printf_in_launcher():
+    """The generator printf must NOT emit a trailing `USER leerie` (DESIGN §6:
+    PID-1 must stay root). Guard against the specific printf literals that
+    previously appended it — a comment mentioning USER leerie is fine, but the
+    `rm -rf .../lists/*\\nUSER leerie` printf must be gone from both sites."""
     launcher = _launcher_text()
-    assert "USER leerie" in launcher
+    assert "/var/lib/apt/lists/*\\nUSER leerie" not in launcher, (
+        "generator must not printf a trailing USER leerie after the apt RUN"
+    )
 
 
 def test_coupling_user_root_in_launcher():

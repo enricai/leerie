@@ -1325,6 +1325,34 @@ TTY adaptation that selects between the two modes; and
 "Concurrency model" for the unchanged in-container worker cleanup
 that runs as the happy path.
 
+**Launcher hang on abnormal container exit (decoupled streaming).**
+There is a second way the "PID 1 must exit" precondition is subverted
+— not the container failing to die, but the *launcher* failing to
+return after it dies. In piped mode (`leerie … | tee log`, the common
+`-i` case), the container's stdout is forwarded by Colima's persistent
+SSH ControlMaster (`ControlPersist=yes`, kept alive by the
+containerd/buildkitd socket forwards). That master holds a *copy* of
+the launcher's stdout-pipe write-end for the duration of the run. On a
+**clean** container exit the master closes its copy and `tee` receives
+EOF. On an **abnormal** exit (PID-1 crash under `set -e`, OOM SIGKILL,
+a mid-run `nerdctl kill`), the master **retains** the write-end — so
+`tee` never receives EOF, the launcher never returns, its EXIT trap
+never fires, and the `--rm` container is orphaned `Up` (holding the
+run-dir flock, wedging `--resume`). This is why clean runs never hang
+and only abnormal exits do. The blast-radius-free fix is *decoupled
+streaming*: the launcher points `nerdctl`'s stdout/stderr at a run-log
+**file** (the master does not retain a plain-file fd), and streams that
+file to its own stdout via a `tail -f` the launcher owns and reaps in
+its EXIT/INT/TERM traps. The EOF gate becomes the launcher-controlled
+`tail`, never the mux — so a stuck master can no longer wedge the
+pipeline, and no concurrent group/chain run is disturbed (contrast
+`ssh -O exit`, which frees the pipe but tears down the shared master
+mid-stream). Gated to the piped (`-i`, non-TTY-stdout) case; the
+interactive `-it` path has a real pty, no `tee`, and thus no hang, and
+keeps its stdin attached for `--clarify`. The stale-container reaper on
+the next `--resume` (below) remains the backstop for the uncatchable
+SIGKILL case where even the trap cannot run.
+
 **Worker subtree termination — Memory containment via cgroup v2.**
 The kernel reap above handles *process lifecycle*, not memory: when
 a worker's tool subtree (a `pnpm test` spawning vitest pools, a
