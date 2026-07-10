@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
-"""Root-privileged cgroup broker for leerie worker containment.
+"""Cgroup broker for leerie worker containment.
 
-Why this exists (DESIGN §6 *Memory containment*, and the reproduced
-cgroup-v2 delegation constraint): the orchestrator runs as the non-root
-`leerie` user, but cgroup enforcement cannot be done from non-root code.
+Why this exists (DESIGN §6 *Memory containment*): the orchestrator runs
+as the dropped-privilege `leerie` user (rootful) or a nested-userns-
+remapped identity (rootless), but cgroup enforcement — creating a worker
+cgroup, setting its limits, enrolling the worker PID, tearing it down —
+requires an identity that actually owns (or was delegated) the relevant
+cgroup subtree:
+  - Migrating a task into a cgroup requires write access to
+    `cgroup.procs` of the destination AND the nearest common ancestor of
+    source and destination (NOT the source itself). Workers are born in
+    a container-runtime-owned scope (`/system.slice/nerdctl-*.scope`
+    locally, the machine scope on Fly, or — rootless — a scope the
+    rootless containerd's own cgroup driver created).
+  - A cgroup subtree keeps its controller limit files (`pids.max`,
+    `memory.max`) owned by whoever created it. Real root, or a UID that
+    was delegated the parent directory and created the subtree itself,
+    can set these; anyone else cannot.
 
-Two kernel facts make non-root self-enforcement impossible, both
-reproduced live (see docs/DESIGN.md §6):
-  1. Migrating a task into a cgroup requires write on `cgroup.procs` of
-     the destination, the source, AND their common ancestor. Workers are
-     born in the root-owned container scope (`/system.slice/nerdctl-*.scope`
-     locally, the machine scope on Fly); moving them into `leerie.slice`
-     crosses the root cgroup, which `leerie` does not own → EACCES/EIO.
-  2. Even inside a properly *delegated* subtree the kernel keeps the
-     controller limit files (`pids.max`, `memory.max`) root-owned — a
-     delegatee may organize processes but not set controller limits.
+This broker is launched by `scripts/container-entry.sh` at PID 1
+*before* the privilege drop to `leerie` — real root in the rootful case,
+the rootlesskit-mapped host UID in the rootless case — and the
+orchestrator drives it over a Unix socket regardless of which identity
+that is. It is the single most-privileged surface in the worker path, so
+it is deliberately tiny and validates every input.
 
-So the operations that matter (create a worker cgroup, set its limits,
-enroll the worker PID, tear it down) must run as root. This broker is
-launched by `scripts/container-entry.sh` at PID 1 (root) *before* the
-privilege drop to `leerie`, and the non-root orchestrator drives it over
-a Unix socket. It is the single root-privileged surface in the worker
-path, so it is deliberately tiny and validates every input.
+Rootless: rootlesskit maps the container's "root" to the real host UID,
+which has no privilege over the top-level `/sys/fs/cgroup` — but systemd
+already delegates a writable subtree per login session at
+`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/`, chowned
+to that UID. `container-entry.sh` anchors `leerie.slice` there instead of
+the top level (via `LEERIE_CGROUP_V2_ROOT`, below) when it detects
+rootless mode. The broker runs as that same delegated UID, and any
+cgroup it creates under that subtree gets that UID's ownership on every
+interface file, so create/enroll/limit-set all work directly. The
+common-ancestor requirement for migration is satisfied because
+`user@<uid>.service` — the ancestor of both the worker's native container
+scope and our `leerie.slice` — is exactly what's delegated.
 
 Protocol (newline-terminated, one request per connection):
   ping                          -> OK
@@ -34,11 +49,14 @@ Protocol (newline-terminated, one request per connection):
 into `leerie-w-<sid>` under the fixed slice — no path traversal. `<pid>`,
 `<mem_bytes>`, `<pids_max>` must be non-negative integers.
 
-cgroup v1 vs v2 (both reproduced): on v2 (Colima) we write the unified
-`leerie.slice/leerie-w-<sid>/{pids,memory}.max`. On v1/hybrid (Fly
-Firecracker VMs) the unified mount has no controllers, so we write the
-split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
-`/sys/fs/cgroup/memory/leerie.slice/...`). The hierarchy is detected once
+cgroup v1 vs v2 (both reproduced): on v2 (Colima, and rootless via the
+delegated user slice) we write the unified
+`<v2-root>/leerie.slice/leerie-w-<sid>/{pids,memory}.max`. On v1/hybrid
+(Fly Firecracker VMs) the unified mount has no controllers, so we write
+the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
+`/sys/fs/cgroup/memory/leerie.slice/...`) — v1/hybrid is always rooted at
+the literal `/sys/fs/cgroup`, since it's only ever observed on Fly
+(rootful Firecracker), never rootless. The hierarchy is detected once
 at startup and reported by `probe` so the orchestrator's telemetry records
 which path was taken.
 """
@@ -52,7 +70,14 @@ import sys
 
 SOCK_PATH = "/run/leerie-cgroup.sock"
 SLICE = "leerie.slice"
-V2_ROOT = "/sys/fs/cgroup"
+# v1/hybrid (Fly Firecracker VMs) is always the literal cgroupfs root — it's
+# never observed rootless, so this one is not overridable.
+V1_ROOT = "/sys/fs/cgroup"
+# v2 unified root. Rootful (Colima, Fly): the literal cgroupfs root.
+# Rootless: container-entry.sh sets LEERIE_CGROUP_V2_ROOT to the
+# systemd-delegated user slice (see module docstring) before launching us,
+# since we have no privilege over the true top level there.
+V2_ROOT = os.environ.get("LEERIE_CGROUP_V2_ROOT", "/sys/fs/cgroup")
 _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Hierarchy is one of: "v2", "v1", "none". Decided at startup by _detect().
@@ -76,8 +101,9 @@ def _detect() -> str:
             ctrls = _read(f"{V2_ROOT}/{SLICE}/cgroup.controllers")
             if "pids" in ctrls and "memory" in ctrls:
                 return "v2"
-        # v1/hybrid: split controllers each at their own mount.
-        if os.path.isdir(f"{V2_ROOT}/pids") and os.path.isdir(f"{V2_ROOT}/memory"):
+        # v1/hybrid: split controllers each at their own mount. Always at
+        # the literal root — never observed rootless (see V1_ROOT above).
+        if os.path.isdir(f"{V1_ROOT}/pids") and os.path.isdir(f"{V1_ROOT}/memory"):
             return "v1"
     except OSError as e:
         _log(f"detect error: {e}")
@@ -180,8 +206,8 @@ def _v2_stat(sid: str) -> tuple[int, int, int]:
 # --- v1 paths (split controllers) -----------------------------------------
 
 def _v1_dirs(sid: str) -> tuple[str, str]:
-    return (f"{V2_ROOT}/pids/{SLICE}/leerie-w-{sid}",
-            f"{V2_ROOT}/memory/{SLICE}/leerie-w-{sid}")
+    return (f"{V1_ROOT}/pids/{SLICE}/leerie-w-{sid}",
+            f"{V1_ROOT}/memory/{SLICE}/leerie-w-{sid}")
 
 
 def _v1_create(sid: str, mem: int, pids: int) -> None:

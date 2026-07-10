@@ -41,11 +41,29 @@ def _entry_text() -> str:
 # --- Fix A: aggregate memory cap in container-entry.sh --------------------
 
 def test_entry_sets_slice_memory_max():
-    """container-entry.sh writes an aggregate cap to leerie.slice/memory.max."""
+    """container-entry.sh writes an aggregate cap to leerie.slice/memory.max
+    (via $LEERIE_SLICE, which resolves to the top-level /sys/fs/cgroup
+    rootful/Fly, or the systemd-delegated user slice when rootless — see
+    DESIGN §6 *Rootless exception*)."""
     text = _entry_text()
-    assert "/sys/fs/cgroup/leerie.slice/memory.max" in text, (
+    assert '"$LEERIE_SLICE/memory.max"' in text, (
         "container-entry.sh must set memory.max on the leerie.slice cgroup "
         "(the parent of all per-worker cgroups) to bound aggregate memory."
+    )
+
+
+def test_entry_leerie_slice_rooted_at_delegated_subtree_when_rootless():
+    """LEERIE_SLICE must resolve under the systemd-delegated user slice in
+    rootless mode, and the plain top-level cgroupfs otherwise — the
+    unprivileged rootlesskit-mapped identity has no write access to the
+    real top-level /sys/fs/cgroup (DESIGN §6 *Rootless exception*)."""
+    text = _entry_text()
+    assert "user.slice/user-${HOST_UID}.slice/user@${HOST_UID}.service" in text, (
+        "rootless mode must anchor CGROUP_ROOT at the systemd-delegated "
+        "user slice, not the top-level /sys/fs/cgroup"
+    )
+    assert 'CGROUP_ROOT="/sys/fs/cgroup"' in text, (
+        "the non-rootless default must remain the plain top-level cgroupfs"
     )
 
 

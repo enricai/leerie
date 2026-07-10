@@ -39,6 +39,11 @@ def broker(tmp_path, monkeypatch):
     (slice_dir / "cgroup.controllers").write_text("memory pids")
 
     monkeypatch.setattr(mod, "V2_ROOT", str(root))
+    # v1/hybrid paths are independent of V2_ROOT (see module docstring —
+    # V1_ROOT is never rootless-overridden), but test_stat_v1_has_no_events
+    # below still exercises the split-hierarchy helpers against this same
+    # fake cgroupfs, so point both at the tmp root.
+    monkeypatch.setattr(mod, "V1_ROOT", str(root))
     mod._HIER = mod._detect()
     return mod
 
@@ -221,3 +226,67 @@ def test_probe_robust_when_child_already_reaped(broker, monkeypatch):
     monkeypatch.setattr(broker.os, "waitpid", gone_wait)
     resp = broker._handle("probe")
     assert resp == "OK v2"
+
+
+# ---- rootless: LEERIE_CGROUP_V2_ROOT (systemd-delegated user slice) -------
+#
+# DESIGN §6 *Rootless exception*: rootlesskit maps container "root" to the
+# real host UID, which has no privilege over the top-level /sys/fs/cgroup.
+# container-entry.sh instead points the broker at the systemd-delegated
+# user slice (/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service)
+# via LEERIE_CGROUP_V2_ROOT, read once at module import. Unlike the `broker`
+# fixture above (which patches V2_ROOT post-import), this exercises the
+# actual env-var-driven initialization path.
+
+@pytest.fixture
+def rootless_broker(tmp_path, monkeypatch):
+    """Load cgroup-broker.py with LEERIE_CGROUP_V2_ROOT pointed at a fake
+    nested user-slice path, set BEFORE import so the module-level
+    `os.environ.get(...)` default resolution is actually exercised."""
+    v2_root = tmp_path / "cgroup" / "user.slice" / "user-1000.slice" / "user@1000.service"
+    v2_slice_dir = v2_root / "leerie.slice"
+    v2_slice_dir.mkdir(parents=True)
+    (v2_root / "cgroup.controllers").write_text("cpu memory pids")
+    (v2_slice_dir / "cgroup.subtree_control").write_text("")
+    (v2_slice_dir / "cgroup.controllers").write_text("memory pids")
+
+    monkeypatch.setenv("LEERIE_CGROUP_V2_ROOT", str(v2_root))
+    spec = importlib.util.spec_from_file_location("cgroup_broker_rootless",
+                                                  _BROKER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod._HIER = mod._detect()
+    return mod
+
+
+def test_rootless_v2_root_read_from_env(rootless_broker, tmp_path):
+    """V2_ROOT must resolve to the env-provided delegated-slice path, not
+    the hardcoded top-level default."""
+    expected = str(tmp_path / "cgroup" / "user.slice" / "user-1000.slice"
+                    / "user@1000.service")
+    assert rootless_broker.V2_ROOT == expected
+
+
+def test_rootless_v1_root_unaffected_by_env(rootless_broker):
+    """V1_ROOT (Fly-only split hierarchy) must stay the literal top-level
+    path regardless of LEERIE_CGROUP_V2_ROOT — v1/hybrid is never rootless."""
+    assert rootless_broker.V1_ROOT == "/sys/fs/cgroup"
+
+
+def test_rootless_detect_picks_v2_at_delegated_root(rootless_broker):
+    assert rootless_broker._HIER == "v2"
+
+
+def test_rootless_create_enroll_destroy_round_trip(rootless_broker):
+    """The full worker-containment sequence — create, enroll (migrate a
+    pid in), destroy — against the delegated-slice root, mirroring what
+    container-entry.sh + the broker do for a real rootless worker."""
+    assert rootless_broker._handle("create wsid 268435456 64") == "OK"
+    d = Path(rootless_broker.V2_ROOT) / rootless_broker.SLICE / "leerie-w-wsid"
+    assert (d / "pids.max").read_text() == "64"
+    assert (d / "memory.max").read_text() == "268435456"
+
+    assert rootless_broker._handle("enroll wsid 4321") == "OK"
+    assert "4321" in (d / "cgroup.procs").read_text()
+
+    assert rootless_broker._handle("destroy wsid") == "OK"

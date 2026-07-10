@@ -1509,12 +1509,16 @@ in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
 
-**The containment must be performed by root — it cannot be delegated to
-the non-root orchestrator.** This was established empirically after a
-run exhausted the VM thread table (a Bun `EAGAIN` panic) because worker
-containment was *silently off*. Two kernel facts make non-root
-self-enforcement impossible, both reproduced live inside a real leerie
-container and on a Fly Firecracker VM:
+**The containment must be performed by an identity that owns (or was
+delegated) the relevant cgroup subtree — it cannot be delegated to the
+dropped-privilege orchestrator.** In the rootful case (Colima, Fly) that
+identity is root; the rootless case has its own delegated identity,
+covered separately below. This was established empirically after a run
+exhausted the VM thread table (a Bun `EAGAIN` panic) because worker
+containment was *silently off*. Two kernel facts make self-enforcement
+from the orchestrator's own (non-root) identity impossible in the
+rootful case, both reproduced live inside a real leerie container and on
+a Fly Firecracker VM:
 
 1. **Cross-scope migration is denied.** Moving a task into a cgroup needs
    write on `cgroup.procs` of the destination, the source, AND their
@@ -1549,7 +1553,9 @@ orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
 orchestrator is started out-of-band by the launcher's ssh-console wrapper
 that drops via `Popen(user="leerie")`). The orchestrator's `_cgroup_*`
 helpers are thin socket clients of the broker; it never writes cgroupfs
-directly.
+directly. (Rootless containerd has no real root to drop from or broker
+as — see *Rootless exception* below for how the same broker still works
+there.)
 
 **Fail-closed gate.** Because a silently-uncapped run is what caused the
 crash, `enforce_and_record_cgroup_containment` runs once per run just
@@ -1569,21 +1575,51 @@ run `die()`s with an actionable message —
 the fatal gate to a loud warning. Persisting the outcome is deliberate:
 the crash left no artifact of the silent failure; now it is visible.
 
-**Rootless exception.** Under rootless containerd (Linux), rootlesskit
-maps the host UID to container UID 0, so "root" inside the container IS
-the unprivileged host user — no actual privilege escalation occurs. In
-this mode the entrypoint detects rootless via `/proc/self/uid_map`
-(non-zero host-start field) and skips both the privilege drop (`runuser`)
-and the `/work` chown (which would reassign ownership into the subuid
-range, breaking host-side access). The cgroup slice-setup writes are
-best-effort (`|| true`) and fail; the root broker cannot enforce
-containment either, because rootless "root" is the unprivileged host
-user without CAP_SYS_ADMIN over the host cgroup tree. The orchestrator
-runs as the mapped root user, which has the same access as the host user.
-**Consequently the fail-closed containment gate stops rootless runs by
-default** (a behavior change — such runs previously continued silently
-with uncapped workers); rootless users must pass
-`--dangerously-allow-uncapped` to proceed without containment.
+**Rootless exception — the systemd-delegated user slice.** Under rootless
+containerd (Linux), rootlesskit maps the host UID to container UID 0, so
+"root" inside the container IS the unprivileged host user. In this mode
+the entrypoint detects rootless via `/proc/self/uid_map` (non-zero
+host-start field) and skips both the privilege drop (`runuser`) and the
+`/work` chown (which would reassign ownership into the subuid range,
+breaking host-side access).
+
+`leerie.slice` is anchored at the cgroup v2 subtree systemd already
+delegates to that UID's login session:
+`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/` — not the
+top-level `/sys/fs/cgroup`, which is root-owned (mode 0555) and off-limits
+to the mapped host UID. `pam_systemd`/logind chown that directory's own
+`cgroup.procs`, `cgroup.subtree_control`, and `cgroup.threads` to the real
+UID, and any cgroup the UID creates underneath it (via `mkdir`) inherits
+that UID's ownership on every interface file the kernel auto-populates,
+including `pids.max` and `memory.max` — so both create and limit-setting
+work directly.
+
+Cross-scope migration works too, by the same rule that requires write
+access to the destination and the nearest common ancestor (not the
+source, described above): a worker's `claude -p` process is born wherever
+the rootless containerd's own cgroup driver placed the container (a scope
+such as `user@<uid>.service/user.slice/nerdctl-<id>.scope`), and since
+both that scope and `leerie.slice` descend from `user@<uid>.service` —
+which is delegated to the real UID — migrating a worker PID from one into
+the other succeeds.
+
+`HOST_UID` (the real host UID rootlesskit mapped container UID 0 to) is
+read from the second field of `/proc/self/uid_map`'s first line. The
+entrypoint passes the resolved root to the broker via the
+`LEERIE_CGROUP_V2_ROOT` environment variable (`scripts/cgroup-broker.py`'s
+`V2_ROOT` reads it, defaulting to the literal `/sys/fs/cgroup` for every
+other runtime). The broker needs no separate privileged identity here: it
+is launched by PID 1 before the privilege drop, at the same
+rootlesskit-mapped identity the whole container runs as — exactly the
+identity `CGROUP_ROOT` is delegated to.
+
+This relies on systemd + cgroup v2 delegating `pids`/`memory` into the
+per-session slice, which is the default on modern systemd hosts. Where
+that isn't the case (a non-systemd init, or a host that doesn't delegate
+those controllers), the slice-setup writes (`|| true`) and the broker's
+write-then-read-back verification in `_detect()` fail silently, and the
+fail-closed containment gate stops the run unless the operator passes
+`--dangerously-allow-uncapped`.
 
 **User-namespace remap for `--dangerously-skip-permissions`.**
 Claude Code rejects `--dangerously-skip-permissions` when
@@ -1610,20 +1646,30 @@ cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` on
 the cgroupfs mount blocks process migration to `cgroup.procs` even for
 the broker — the kernel treats the namespace boundary as a delegation
 boundary. With `--cgroupns=host`, the container sees its real cgroup
-path (e.g., `/system.slice/nerdctl-<id>.scope`) and the root broker can
+path (e.g., `/system.slice/nerdctl-<id>.scope`) and the broker can
 enroll worker PIDs into `leerie.slice/` children. Fly's Firecracker
 microVM boots its own kernel with no cgroup namespace boundary, so this
 flag only affects the local nerdctl path.
-On macOS (Darwin) the launcher sets the mount unconditionally —
-Colima's VM always runs rootful containerd with cgroup v2 and shared
-propagation, but the macOS host has no `/sys/fs/cgroup` to probe.
-On Linux the launcher probes whether `/sys/fs/cgroup` is shared before adding this
-mount; rootless containerd with `rootlesskit --propagation=rslave`
-demotes it to slave, making `rshared` fail. When the probe detects
-this, the mount is omitted and the orchestrator's `_cgroup_probe` falls
-back to uncapped workers (and, absent `--dangerously-allow-uncapped`,
-the fail-closed gate stops the run). Fly's Firecracker microVM exposes
-cgroupfs directly with no launcher flag required.
+
+On macOS (Darwin) the launcher sets the mount unconditionally — Colima's
+VM always runs rootful containerd with cgroup v2 and shared propagation,
+but the macOS host has no `/sys/fs/cgroup` to probe. On native rootful
+Linux the launcher adds the same `rshared` mount unconditionally.
+
+Rootless containerd is its own branch, gated on the
+`containerd-rootless/child_pid` sentinel, and uses a **plain** bind-mount
+with no `bind-propagation` flag: rootlesskit's `--propagation=rslave`
+demotes `/sys/fs/cgroup` to a slave mount inside its sandbox, which is
+incompatible with `bind-propagation=rshared`. Propagation of new mount
+events isn't actually needed here, though — only read/write visibility
+into the already-mounted cgroupfs, so the entrypoint can create and
+manage cgroups under the delegated user slice described above, and a
+plain bind-mount provides exactly that. When cgroup v2 isn't present at
+all (older kernel, disabled unified hierarchy) the mount is skipped and
+`_cgroup_probe` falls back to uncapped workers (and, absent
+`--dangerously-allow-uncapped`, the fail-closed gate stops the run).
+Fly's Firecracker microVM exposes cgroupfs directly with no launcher
+flag required.
 
 `_cgroup_probe` sends a `probe` request to the broker, which does a real
 create+enroll+destroy round-trip of a throwaway cgroup and returns the

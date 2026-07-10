@@ -400,20 +400,28 @@ configuration" above.
 
 **"worker cgroup containment could not be enabled"** — leerie stops
 before running any worker when it cannot enforce per-worker memory/PID
-limits (DESIGN §6 *Memory containment*). Enforcement is done by a root
-broker (`scripts/cgroup-broker.py`) launched by the container entrypoint;
-the run dies if that broker can't operate. Common causes:
+limits (DESIGN §6 *Memory containment*). Enforcement is done by a broker
+(`scripts/cgroup-broker.py`) launched by the container entrypoint; the
+run dies if that broker can't operate. Common causes:
 - **no usable cgroup hierarchy** — the broker handles both a cgroup v2
-  unified mount (Colima) and cgroup v1/hybrid split `pids/` + `memory/`
-  controller mounts (some Fly.io Firecracker VMs), but fails if neither is
-  present — e.g. a host exposing only a partial/hybrid layout without both
+  unified mount (Colima, and rootless containerd via the delegated user
+  slice below) and cgroup v1/hybrid split `pids/` + `memory/` controller
+  mounts (some Fly.io Firecracker VMs), but fails if none is present —
+  e.g. a host exposing only a partial/hybrid layout without both
   controllers, or an unusual container cgroup setup.
-- **rootless containerd (Linux)** — rootless "root" is the unprivileged
-  host user and cannot enforce cgroup containment (no CAP_SYS_ADMIN over
-  the host cgroup tree; `--propagation=rslave` also omits the shared
-  bind-mount). Rootless runs therefore **always** hit this gate and must
-  pass `--dangerously-allow-uncapped` (below) to proceed. This is a change
-  from earlier versions, which ran rootless workers uncapped silently.
+- **rootless containerd (Linux) on a systemd + cgroup v2 host** — leerie
+  anchors the broker's cgroup slice at the systemd-delegated user slice
+  (`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/`)
+  rather than the top-level `/sys/fs/cgroup` (which the rootlesskit-mapped
+  host UID has no privilege over). No host reconfiguration is needed —
+  this delegation already exists on any systemd host with cgroup v2. If
+  you hit this gate on a rootless host anyway, check that
+  `/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.subtree_control`
+  contains `pids` and `memory` (`systemctl --user show containerd
+  -p Slice` confirms the daemon lives under that tree).
+- **rootless containerd on a non-systemd init, or cgroup v1** — there is
+  no equivalent delegated subtree, so containment genuinely cannot be
+  enabled; pass `--dangerously-allow-uncapped` (below) to proceed anyway.
 - **read-only or missing `/sys/fs/cgroup`** — a read-only cgroupfs or an
   absent mount leaves the broker unable to create cgroups.
 - **broker didn't start** — check the container log for a

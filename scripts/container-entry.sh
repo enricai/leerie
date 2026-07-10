@@ -5,11 +5,12 @@
 # /opt/leerie-image/scripts/container-entry.sh inside the container, and
 # referenced by Dockerfile's ENTRYPOINT.
 #
-# Runs as root. The Dockerfile intentionally does NOT have USER leerie —
-# we need PID 1 to be root so it can create /sys/fs/cgroup/leerie.slice
-# and launch the root cgroup broker (which does per-worker cgroup
-# enrollment/limit-setting that non-root code cannot; see DESIGN §6
-# *Memory containment*) before privilege drop.
+# Runs as root (rootful) or rootlesskit-mapped root (rootless — see below).
+# The Dockerfile intentionally does NOT have USER leerie — PID 1 needs to
+# be this identity so it can create the leerie.slice cgroup and launch the
+# cgroup broker (which does per-worker cgroup enrollment/limit-setting
+# that the orchestrator's own dropped-privilege identity cannot; see
+# DESIGN §6 *Memory containment*) before privilege drop.
 # The orchestrator itself runs as leerie via the `runuser` exec at
 # the bottom (local nerdctl path) or via the launcher's Popen(user=
 # "leerie") inside the Fly orchestrator-launch wrapper (the entrypoint
@@ -34,33 +35,63 @@ ulimit -c 0
 # mounted host dirs) and the /work chown (which would reassign host
 # ownership to the subuid range, breaking host-side access).
 ROOTLESS=false
+HOST_UID=""
 if awk 'NR==1 && $2 != 0 { exit 0 } { exit 1 }' /proc/self/uid_map 2>/dev/null; then
   ROOTLESS=true
+  HOST_UID="$(awk 'NR==1 {print $2}' /proc/self/uid_map 2>/dev/null)"
 fi
 
-# Cgroup slice setup (cgroup v2). PID 1 runs as root, creates the
-# leerie.slice cgroup, and enables the memory + pids controllers in its
-# subtree_control so the per-worker child cgroups get the controller
-# files. This is required for the aggregate memory.max cap written below,
-# which runs before the broker launches. Per-worker enforcement itself is
-# done by the root cgroup broker (launched further down), NOT by the
-# orchestrator — non-root code cannot enroll workers or set controller
-# limits (DESIGN §6 *Memory containment*); the broker's _detect() also
+# Cgroup slice root (cgroup v2). Rootful (Colima, Fly): the top-level
+# /sys/fs/cgroup, matching real root's own delegation domain. Rootless:
+# rootlesskit maps container "root" to the real host UID, which has no
+# privilege over /sys/fs/cgroup itself — but systemd (pam_systemd/logind)
+# already delegates a writable subtree per login session at
+# /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/, chowned
+# to that UID (cgroup.procs, cgroup.subtree_control, cgroup.threads, and
+# — critically — any cgroup the UID creates underneath it, whose
+# interface files inherit the creator's ownership). Anchoring leerie.slice
+# there instead of the top level lets the SAME identity that launches the
+# broker below (mapped root == the real host UID) actually create/enroll/
+# limit cgroups, without any host-side systemd or rootlesskit
+# reconfiguration. Cross-scope worker migration still works from here:
+# cgroup v2 only requires write access to the destination and the
+# nearest common ancestor cgroup.procs (not the source), and that
+# ancestor — user@<uid>.service — is exactly what's delegated. See
+# DESIGN §6 *Memory containment* / *Rootless exception*.
+if [ "$ROOTLESS" = "true" ] && [ -n "$HOST_UID" ]; then
+  CGROUP_ROOT="/sys/fs/cgroup/user.slice/user-${HOST_UID}.slice/user@${HOST_UID}.service"
+else
+  CGROUP_ROOT="/sys/fs/cgroup"
+fi
+LEERIE_SLICE="$CGROUP_ROOT/leerie.slice"
+
+# PID 1 creates the leerie.slice cgroup (at CGROUP_ROOT above) and enables
+# the memory + pids controllers in its subtree_control so the per-worker
+# child cgroups get the controller files. This is required for the
+# aggregate memory.max cap written below, which runs before the broker
+# launches. Per-worker enforcement itself is done by the root cgroup
+# broker (launched further down), NOT by the orchestrator — non-root code
+# cannot enroll workers or set controller limits in the rootful case
+# (DESIGN §6 *Memory containment*); the broker's _detect() also
 # creates/enables this slice idempotently, so this block is a
 # belt-and-suspenders prerequisite for the aggregate cap. Best-effort:
-# missing controllers, an older kernel without cgroup v2, or a cgroup
-# v1/hybrid host cause these writes to fail silently — the broker probe
-# then reports the hierarchy it can (or none), and the orchestrator's
-# fail-closed gate decides whether to proceed. On Fly, Firecracker
-# microVMs reboot the kernel fresh each machine start, so the slice
-# never persists across boots. See DESIGN §6 *Memory containment*.
-if [ -d /sys/fs/cgroup ] && [ ! -d /sys/fs/cgroup/leerie.slice ]; then
-  mkdir -p /sys/fs/cgroup/leerie.slice 2>/dev/null || true
+# missing controllers, an older kernel without cgroup v2, a cgroup
+# v1/hybrid host, or (in rootless mode) a host whose rootless init
+# doesn't delegate this subtree (non-systemd, or systemd without
+# pids/memory in the session delegate list) all cause these writes to
+# fail silently — the broker probe then reports the hierarchy it can (or
+# none), and the orchestrator's fail-closed gate decides whether to
+# proceed. On Fly, Firecracker microVMs reboot the kernel fresh each
+# machine start, so the slice never persists across boots. See DESIGN §6
+# *Memory containment*.
+if [ -d /sys/fs/cgroup ] && [ ! -d "$LEERIE_SLICE" ]; then
+  mkdir -p "$LEERIE_SLICE" 2>/dev/null || true
 fi
-if [ -d /sys/fs/cgroup/leerie.slice ]; then
+if [ -d "$LEERIE_SLICE" ]; then
   # Enable memory + pids controllers so child cgroups (per-worker) get
-  # the controller files (memory.max, pids.max). Must happen as root.
-  echo "+memory +pids" > /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
+  # the controller files (memory.max, pids.max). Must happen as root
+  # (rootful) or as the delegated UID (rootless).
+  echo "+memory +pids" > "$LEERIE_SLICE/cgroup.subtree_control" 2>/dev/null || true
 
   # Aggregate memory cap on the slice itself (DESIGN §6 *container
   # boundary's hidden precondition*; IMPLEMENTATION §0.5). The per-worker
@@ -96,24 +127,31 @@ if [ -d /sys/fs/cgroup/leerie.slice ]; then
     fi
   fi
   if [ -n "$_cap" ] && [ "$_cap" -gt 0 ] 2>/dev/null; then
-    echo "$_cap" > /sys/fs/cgroup/leerie.slice/memory.max 2>/dev/null || true
+    echo "$_cap" > "$LEERIE_SLICE/memory.max" 2>/dev/null || true
   fi
 fi
 
-# Root cgroup broker (DESIGN §6 *Memory containment*). The orchestrator runs
+# Cgroup broker (DESIGN §6 *Memory containment*). The orchestrator runs
 # as non-root leerie, but cgroup enforcement — creating a worker cgroup,
 # setting its pids.max/memory.max, and migrating the worker PID into it —
-# cannot be done from non-root code (the kernel keeps controller limit files
-# root-owned in delegated subtrees, and cross-scope task migration needs
-# write on the common-ancestor cgroup leerie doesn't own; both reproduced).
-# So we launch a tiny root broker HERE, at PID 1 before the privilege drop,
-# and the orchestrator drives it over a Unix socket. Best-effort: if it can't
+# cannot be done from the orchestrator's own (non-root, or rootless-mapped)
+# identity: cross-scope task migration needs write on the common-ancestor
+# cgroup leerie doesn't own, and (in the rootful case) the kernel keeps
+# controller limit files root-owned in a subtree that was merely chowned
+# rather than created by the delegatee (both reproduced). So we launch a
+# tiny broker HERE, at PID 1 before the privilege drop, and the
+# orchestrator drives it over a Unix socket. In the rootful case PID 1 is
+# real root; in the rootless case PID 1 is the rootlesskit-mapped host
+# UID, which is exactly the identity CGROUP_ROOT above is delegated to —
+# no separate privilege level is needed or available. LEERIE_CGROUP_V2_ROOT
+# tells the broker which root to operate under (default /sys/fs/cgroup
+# when unset, i.e. every case except rootless). Best-effort: if it can't
 # start, the orchestrator's probe round-trip fails and its fail-closed gate
 # fires (or --dangerously-allow-uncapped downgrades to a warning). It runs on
 # both runtimes; the idle-PID-1 Fly path below still needs it because the
 # orchestrator is launched out-of-band via ssh and connects to this socket.
 if command -v python3 >/dev/null 2>&1; then
-  python3 /opt/leerie-image/scripts/cgroup-broker.py &
+  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &
 fi
 
 cd /work
