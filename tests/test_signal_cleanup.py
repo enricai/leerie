@@ -1432,3 +1432,154 @@ def test_stop_and_reap_source_does_not_blind_kill_seen(leerie):
         "stop_and_reap must not blind-kill self._seen directly. "
         "Filter through _exit_reap_candidates first."
     )
+
+
+# --- stop_and_reap live-process safety filter (integration) ------------------
+#
+# Unlike the monkeypatched tests above, these tests use real spawned subprocesses
+# so the ppid values come from the kernel rather than fake ps output. This makes
+# the test impossible to pass against a naive blind-kill implementation even if
+# the ps-parsing layer were somehow bypassed.
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only test (requires fork/exec and /proc).",
+)
+def test_stop_and_reap_live_pid_safety_filter(leerie):
+    """Live-process integration: stop_and_reap must not kill a PID whose
+    current ppid is foreign (recycled-PID analog) or a PID registered in
+    _ASYNCIO_MANAGED_PIDS (live sibling worker analog), while it MUST kill
+    a genuine direct-child orphan with ppid==os.getpid() that is not managed.
+
+    Three live processes:
+      grandchild — spawned by an intermediate parent; ppid = parent_proc.pid
+          (not 1 and not os.getpid()) → recycled-PID / foreign-parent analog.
+          Must survive stop_and_reap.
+      sibling — direct child of the test process (ppid = os.getpid()), but
+          registered in _ASYNCIO_MANAGED_PIDS → live-sibling-worker analog.
+          Must survive stop_and_reap.
+      orphan — direct child of the test process (ppid = os.getpid()), NOT in
+          _ASYNCIO_MANAGED_PIDS → genuine-orphan analog.
+          Must be killed by stop_and_reap.
+    """
+    import asyncio
+
+    # Install test process as subreaper to match production context.
+    leerie._become_subreaper()
+
+    # Distinct sleep durations make pkill -f selectors unambiguous.
+    GRANDCHILD_MARKER = "sleep 43434"
+    SIBLING_MARKER = "sleep 53535"
+    ORPHAN_MARKER = "sleep 63636"
+
+    original_managed = leerie._ASYNCIO_MANAGED_PIDS.copy()
+
+    async def _run():
+        # ── grandchild ─────────────────────────────────────────────────────
+        # parent_proc (bash) backgrounds sleep and waits on it.
+        # grandchild's ppid = parent_proc.pid, which != 1 and != os.getpid().
+        parent_proc = await asyncio.create_subprocess_exec(
+            "bash", "-c",
+            f"{GRANDCHILD_MARKER} < /dev/null > /dev/null 2>&1 & echo $! ; wait",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        grandchild_pid_line = await parent_proc.stdout.readline()
+        grandchild_pid = int(grandchild_pid_line.strip())
+
+        # ── sibling (managed) ──────────────────────────────────────────────
+        # Direct child of test process; registered in _ASYNCIO_MANAGED_PIDS
+        # to simulate a live claude -p worker that leerie is still awaiting.
+        sibling_proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", f"exec {SIBLING_MARKER}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        leerie._ASYNCIO_MANAGED_PIDS.add(sibling_proc.pid)
+
+        # ── orphan (unmanaged direct child) ───────────────────────────────
+        # Direct child of test process; NOT in _ASYNCIO_MANAGED_PIDS.
+        # stop_and_reap should kill this one.
+        orphan_proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", f"exec {ORPHAN_MARKER}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # Let all three processes settle in the kernel's process table.
+        await asyncio.sleep(0.3)
+
+        try:
+            assert _pid_alive(grandchild_pid), (
+                "grandchild process never started — test setup failure"
+            )
+            assert _pid_alive(sibling_proc.pid), (
+                "sibling process never started — test setup failure"
+            )
+            assert _pid_alive(orphan_proc.pid), (
+                "orphan process never started — test setup failure"
+            )
+
+            # Seed the tracker with all three PIDs, as if the tracker had
+            # observed them during the worker's lifetime.
+            tracker = leerie._DescendantTracker(99999)
+            tracker._seen = {grandchild_pid, sibling_proc.pid, orphan_proc.pid}
+            leaked = await tracker.stop_and_reap()
+
+            # grandchild: ppid=parent_proc.pid (foreign) → must survive
+            assert _pid_alive(grandchild_pid), (
+                f"grandchild PID {grandchild_pid} (ppid={parent_proc.pid} — foreign, "
+                f"neither 1 nor os.getpid()={os.getpid()}) was killed by "
+                f"stop_and_reap. This is the recycled-PID collateral-kill bug: "
+                f"the PID-recycling scenario where an old worker PID is now owned "
+                f"by an unrelated process whose parent is a different orchestrator."
+            )
+
+            # sibling: ppid=os.getpid() but in _ASYNCIO_MANAGED_PIDS → must survive
+            assert _pid_alive(sibling_proc.pid), (
+                f"sibling PID {sibling_proc.pid} (in _ASYNCIO_MANAGED_PIDS) was "
+                f"killed by stop_and_reap. The _ASYNCIO_MANAGED_PIDS exclusion "
+                f"guard is broken — this is the scenario that caused sibling "
+                f"claude -p planners to crash."
+            )
+
+            # Give the kernel a moment to process the SIGKILL before checking.
+            await asyncio.sleep(0.2)
+
+            # orphan: ppid=os.getpid(), not managed → must be killed
+            assert not _pid_running(orphan_proc.pid), (
+                f"orphan PID {orphan_proc.pid} (ppid=os.getpid()={os.getpid()}, "
+                f"not in _ASYNCIO_MANAGED_PIDS) survived stop_and_reap. "
+                f"The safety filter must kill genuine unmanaged orphans."
+            )
+
+            assert leaked == 1, (
+                f"stop_and_reap should kill exactly 1 process (the unmanaged orphan); "
+                f"got leaked={leaked}. grandchild (foreign ppid) and sibling "
+                f"(managed) must both be excluded from the kill set."
+            )
+
+        finally:
+            # Reap all spawned processes so they don't leak across the suite.
+            for proc in (parent_proc, sibling_proc, orphan_proc):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            for proc in (parent_proc, sibling_proc, orphan_proc):
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+
+    try:
+        asyncio.run(_run())
+    finally:
+        leerie._ASYNCIO_MANAGED_PIDS.clear()
+        leerie._ASYNCIO_MANAGED_PIDS.update(original_managed)
+        subprocess.run(["pkill", "-9", "-f", GRANDCHILD_MARKER], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", SIBLING_MARKER], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", ORPHAN_MARKER], capture_output=True)
