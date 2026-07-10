@@ -170,13 +170,18 @@ def test_rate_limited_exit_is_baseexception(leerie):
 
 
 def test_rate_limited_exit_carries_fields(leerie):
-    """The exit's `reset_at` and `raw_message` are how main()'s
-    handler decides between auto-resume and manual-resume — they
-    must be set as attributes, not just constructor args."""
+    """The exit's `reset_at`, `raw_message`, and `out_of_credits` are how
+    main()'s handler decides between pause-and-surface, sleep-to-reset, and
+    fixed-backoff auto-resume — they must be set as attributes, not just
+    constructor args. out_of_credits defaults False (the rate-limit case)."""
     exc = leerie.RateLimitedExit(reset_at=None, raw_message="hi")
     assert exc.reset_at is None
     assert exc.raw_message == "hi"
     assert str(exc) == "hi"
+    assert exc.out_of_credits is False
+    exc2 = leerie.RateLimitedExit(
+        reset_at=None, raw_message="broke", out_of_credits=True)
+    assert exc2.out_of_credits is True
 
 
 # --- main() arm integration ------------------------------------------------
@@ -209,9 +214,11 @@ def test_main_rate_limit_arm_appears_before_keyboard_interrupt():
 
 
 # --- _sleep_then_reexec (auto-resume tail) --------------------------------
-# Shared by both rate-limit arms: cleanup → sleep → os.execv --resume. A
-# reset_at=None rate-limit (out-of-credits) now auto-resumes on a fixed
-# backoff instead of exiting 75 — these pin that behavior.
+# Shared by the clock-based rate-limit arms: cleanup → sleep → os.execv
+# --resume. A reset_at=None rate-limit (unparseable session-limit message)
+# auto-resumes on a fixed backoff instead of exiting 75 — these pin that
+# behavior. Out-of-credits does NOT route through this helper (it
+# pauses-and-surfaces); see test_main_out_of_credits_pauses_and_surfaces.
 
 from types import SimpleNamespace  # noqa: E402
 
@@ -237,7 +244,7 @@ def test_sleep_then_reexec_cleans_sleeps_and_reexecs(leerie, monkeypatch):
     st = _fake_st("run-xyz")
     import pytest
     with pytest.raises(SystemExit):
-        leerie._sleep_then_reexec(st, 300, "out of credits / no reset time")
+        leerie._sleep_then_reexec(st, 300, "rate limited / no reset time")
 
     assert calls.get("cleanup") is True
     assert calls.get("slept") == 300
@@ -310,3 +317,30 @@ def test_rate_limit_no_reset_uses_fixed_backoff_not_exit_75(leerie):
     assert "_sleep_then_reexec(st, wait_seconds, reason)" in src
     # the old "could not parse reset time … exit 75" manual path is gone
     assert "could not parse reset time" not in src
+
+
+def test_main_out_of_credits_pauses_and_surfaces(leerie):
+    """Source-pin the pause-and-surface contract: the RateLimitedExit arm
+    checks `e.out_of_credits` and, for that case, exits EXIT_LOCKED with a
+    --resume hint instead of calling _sleep_then_reexec (out-of-credits has
+    no reset clock, so auto-resuming would spin against the wall). The check
+    must sit inside the RateLimitedExit arm and before the reset_at branch."""
+    import inspect
+    src = inspect.getsource(leerie.main)
+    arm = src[src.find("except RateLimitedExit"):]
+    # the arm must branch on the flag...
+    assert "if e.out_of_credits:" in arm
+    ooc = arm.find("if e.out_of_credits:")
+    reset_branch = arm.find("if e.reset_at is not None")
+    assert ooc != -1 and reset_branch != -1
+    # ...before the clock-based reset_at branch...
+    assert ooc < reset_branch, (
+        "out_of_credits must be checked before the reset_at auto-resume arm")
+    # ...and the out-of-credits body (up to the `else:` that opens the
+    # rate-limit arm) routes to EXIT_LOCKED and never *calls*
+    # _sleep_then_reexec.
+    else_pos = arm.find("\n        else:", ooc)
+    assert else_pos != -1, "out-of-credits `if` must be paired with an `else:`"
+    ooc_block = arm[ooc:else_pos]
+    assert "EXIT_LOCKED" in ooc_block
+    assert "_sleep_then_reexec(" not in ooc_block

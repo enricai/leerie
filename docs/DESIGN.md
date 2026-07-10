@@ -1669,23 +1669,32 @@ hit (delivered as assistant-text content in the verbatim format
 `RateLimitedExit(reset_at, raw)`.
 
 There is a second, subtler trigger: an **out-of-credits mid-stream
-kill**. When the account is overage-blocked (a `rate_limit_event`
-carrying `overageStatus:"rejected"` / `overageDisabledReason:
-"out_of_credits"` — observed with `status:"allowed"`, though the latch
-keys only on those overage fields, not on `status`), the gateway lets
-in-flight requests finish but terminates the
-`claude -p` process the moment credits run out — often mid-turn,
-before a `result` event is emitted. On its own the overage event is
-*not* terminal (empirically, most workers that see it complete
-normally), so it is not treated as a terminal `status`. Instead,
-`_invoke` latches the overage-block state as the stream flows and,
-in its no-result-envelope branch, raises `RateLimitedExit(reset_at=
-None, raw)` *only* when the stream truncated with no `result` event
-**and** the account was overage-blocked. Without this, the truncated
-stream surfaces as a bare `WorkerError`, which bypasses the
-auth/quota backoff (that classifier needs a result envelope to
-inspect) and `die()`s the run non-resumably — the failure mode this
-guard exists to prevent.
+kill**. When credits actually run out, a `rate_limit_event` arrives
+carrying `overageDisabledReason:"out_of_credits"` (or `out_of_overage`)
+— observed with `status:"allowed"` — and the gateway terminates the
+`claude -p` process the moment credits run out, often mid-turn, before
+a `result` event is emitted. `_invoke` latches this **exhaustion**
+state as the stream flows and, in its no-result-envelope branch, raises
+`RateLimitedExit(reset_at=None, out_of_credits=True, raw)` *only* when
+the stream truncated with no `result` event **and** an exhaustion
+reason was seen. Without this, the truncated stream surfaces as a bare
+`WorkerError`, which bypasses the auth/quota backoff (that classifier
+needs a result envelope to inspect) and `die()`s the run non-resumably.
+
+The discriminator keys on `overageDisabledReason ∈
+{"out_of_credits", "out_of_overage"}`, **not** on
+`overageStatus:"rejected"`. That distinction is load-bearing:
+`overageStatus:"rejected"` is a *standing config state* for any org
+that has extra-usage (overage) disabled — such orgs emit it in
+**every** `rate_limit_event` (with `overageDisabledReason:
+"org_level_disabled"` and `status:"allowed"`), whether or not the
+worker succeeds. Keying the latch on it caused a false positive:
+plenty of base subscription quota remained, but any unrelated
+mid-stream truncation (a crash, a kill, a reaped subprocess) inherited
+the permanently-latched flag and was misreported as out-of-credits. An
+`org_level_disabled` truncation is therefore *not* an exhaustion event
+— it takes the ordinary `WorkerError` path (retryable / advisory),
+never a pause.
 
 The exception propagates through the existing asyncio cancellation
 chain — `_invoke`'s `BaseException` guard terminates the in-flight
@@ -1697,15 +1706,25 @@ PID-namespace teardown is the abnormal-exit guarantee — see "Worker
 subtree termination — kernel-enforced via the container boundary"
 above). Then:
 
-Both cases now auto-resume — they differ only in the wait — via the shared
-`_sleep_then_reexec(st, wait_seconds, reason)`: worktree-only cleanup, sleep,
-then `os.execv` the orchestrator (`sys.executable __file__ --resume --run-id
-<id>`) into a fresh process. We re-exec the orchestrator, not the launcher: the
-orchestrator already runs inside the container with state on disk; the launcher
-is not baked into the image and would try to launch a new container. The
-`--max-workers` budget persists across the re-exec (`worker_count` lives in
-state.json), so a run that repeatedly hits the rate-limit still respects the cap
-and can never run away. Cleanup runs before the sleep, and because
+A **rate-limit** resets on a clock — wait long enough and it clears on its
+own — so the session-limit and terminal-`status` cases auto-resume via the
+shared `_sleep_then_reexec(st, wait_seconds, reason)`: worktree-only cleanup,
+sleep, then `os.execv` the orchestrator (`sys.executable __file__ --resume
+--run-id <id>`) into a fresh process. **Out-of-credits does not reset on a
+clock** — it clears only when a human tops up or the billing period rolls
+over — so it does *not* auto-resume: `main()` does worktree-only cleanup,
+logs a `leerie --resume <id>` hint, and exits `EXIT_LOCKED` (75). Looping a
+fixed backoff against genuine exhaustion would only spin against the wall,
+burn the persisted worker budget on retries that cannot succeed, and delay
+surfacing "you're out of credits" to the operator.
+
+For the auto-resume (rate-limit) path: we re-exec the orchestrator, not the
+launcher — the orchestrator already runs inside the container with state on
+disk; the launcher is not baked into the image and would try to launch a new
+container. The `--max-workers` budget persists across the re-exec
+(`worker_count` lives in state.json), so a run that repeatedly hits the
+rate-limit still respects the cap and can never run away. Cleanup runs before
+the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
 dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate
 (`setup-run.sh`'s staging-worktree re-creation can't hit a stale-dir conflict).
@@ -1720,19 +1739,24 @@ are intact for the manual `--resume`.
 - If `reset_at` parsed cleanly from the literal message format, `wait_seconds`
   is the time until that moment + a small margin.
 - If the reset clause didn't parse (malformed time, unknown timezone, format
-  change) OR the rate-limit was an **out-of-credits mid-stream kill** (which
-  carries no reset time at all), `wait_seconds` is a fixed
-  `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s). We can't know when the limit refreshes,
-  so we poll: sleep the fixed interval and re-resume. A premature retry (still
-  limited) just re-hits the same clean pause and sleeps again — cheap, and
-  bounded by the persisted worker budget.
+  change), `wait_seconds` is a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s). We
+  can't know when the limit refreshes, so we poll: sleep the fixed interval and
+  re-resume. A premature retry (still limited) just re-hits the same clean pause
+  and sleeps again — cheap, and bounded by the persisted worker budget.
+- If the exit is an **out-of-credits mid-stream kill**
+  (`out_of_credits=True`), there is no auto-resume at all: it does not reset on
+  a clock, so `main()` cleans up worktrees, logs a `leerie --resume <id>` hint,
+  and exits `EXIT_LOCKED`. The operator adds credits, then resumes.
 
-Rationale for the change from the earlier "parse failure → exit 75 manual
-resume" behavior: the old concern was that a *wrong-time* sleep is worse than no
-sleep. With a fixed backoff there is no time being guessed — the trade is
-"retry in 5 min" vs "die and require a human," and an early retry is a harmless
-no-op re-pause. For the out-of-credits case especially (no reset time ever), a
-run now self-heals once credits return instead of stopping.
+Rationale for the fixed-backoff auto-resume on rate-limits (vs. the earlier
+"parse failure → exit 75 manual resume" behavior): the old concern was that a
+*wrong-time* sleep is worse than no sleep. With a fixed backoff there is no time
+being guessed — the trade is "retry in 5 min" vs "die and require a human," and
+an early retry is a harmless
+no-op re-pause. (Out-of-credits is deliberately excluded from this reasoning: it
+has no reset at all, so no interval is ever "right" — auto-resuming it would
+spin against the wall until a human intervenes anyway. It pauses-and-surfaces
+instead; see the `out_of_credits=True` bullet above.)
 
 `_cleanup_on_abnormal_exit(st, full_purge=False)` is the single
 helper for all four paths. The classification happens in `main()`'s

@@ -173,13 +173,14 @@ def test_invoke_raises_when_no_result_event(leerie, leerie_dir, monkeypatch):
             verbosity="stream"))
 
 
-# ----- out-of-credits truncation → resumable rate-limit pause --------------
+# ----- out-of-credits truncation → pause-and-surface -----------------------
 
-# The exact rate_limit_event payload captured from a real out-of-credits
-# kill (navegando run 60c68e71…): the account is overage-blocked
-# (`overageStatus:"rejected"`, `overageDisabledReason:"out_of_credits"`)
-# while `status` is still the benign "allowed". This shape is invariant
-# across the run corpus (992 occurrences).
+# A real out-of-credits kill (navegando run 60c68e71…): the exhaustion
+# reason is `overageDisabledReason:"out_of_credits"` while `status` is
+# still the benign "allowed". The latch keys on `overageDisabledReason`
+# being an exhaustion reason — NOT on `overageStatus:"rejected"`, which is
+# a standing state for orgs with overage disabled (see
+# `_ORG_LEVEL_DISABLED_EVENT` below).
 _OVERAGE_BLOCKED_EVENT = {
     "type": "rate_limit_event",
     "rate_limit_info": {
@@ -189,18 +190,37 @@ _OVERAGE_BLOCKED_EVENT = {
     },
 }
 
+# The false-positive shape (navegando run f77f7456…): an org that has
+# extra-usage (overage) turned OFF at the org level emits this in EVERY
+# rate_limit_event — `overageStatus:"rejected"` with
+# `overageDisabledReason:"org_level_disabled"` and `status:"allowed"`. It
+# is NOT credit exhaustion (plenty of base quota remains); it must not arm
+# the out-of-credits latch. 96/96 events in that run carried this exact
+# shape, yet workers succeeded — the ones that truncated for unrelated
+# reasons were being misreported as out-of-credits before the fix.
+_ORG_LEVEL_DISABLED_EVENT = {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+        "status": "allowed", "resetsAt": 1783620600,
+        "rateLimitType": "five_hour", "overageStatus": "rejected",
+        "overageDisabledReason": "org_level_disabled", "isUsingOverage": False,
+    },
+}
+
 
 def test_invoke_overage_block_plus_truncation_raises_ratelimited(
         leerie, leerie_dir, monkeypatch):
-    """The observed crash: an out-of-credits overage-block event, then a
+    """The observed crash: a genuine out-of-credits exhaustion event, then a
     truncated assistant turn and NO result event — the CLI was killed the
-    moment credits ran out. This must raise RateLimitedExit (routing into
-    main()'s resumable-pause path), NOT a bare WorkerError that bypasses
-    the auth/quota backoff and die()s the run non-resumably.
+    moment credits ran out. This must raise RateLimitedExit with
+    out_of_credits=True (routing into main()'s pause-and-surface path), NOT
+    a bare WorkerError that bypasses the auth/quota backoff and die()s the
+    run non-resumably.
 
-    reset_at is None here: the kill left no result envelope carrying a
-    parseable resetsAt, so main()'s None-reset arm sleeps a fixed
-    RATE_LIMIT_RETRY_BACKOFF_SEC and auto-resumes via _sleep_then_reexec."""
+    reset_at is None: the kill left no result envelope carrying a parseable
+    resetsAt. out_of_credits=True tells main() to pause-and-surface (exit
+    EXIT_LOCKED with a --resume hint) rather than auto-resume — out-of-credits
+    has no reset clock."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps(_OVERAGE_BLOCKED_EVENT),
@@ -216,17 +236,43 @@ def test_invoke_overage_block_plus_truncation_raises_ratelimited(
             timeout=60, sid="reconciler", leerie_dir=leerie_dir,
             verbosity="stream"))
     assert ei.value.reset_at is None
+    assert ei.value.out_of_credits is True
     assert "out of credits" in ei.value.raw_message
+
+
+def test_invoke_org_level_disabled_truncation_raises_workererror(
+        leerie, leerie_dir, monkeypatch):
+    """Regression pin for the reported false positive: an org with overage
+    disabled at the org level emits `overageStatus:"rejected"` /
+    `overageDisabledReason:"org_level_disabled"` in every rate_limit_event.
+    That is NOT credit exhaustion. When a worker stream then truncates for
+    an unrelated reason (no result event), _invoke must raise a plain
+    WorkerError (the ordinary retryable/advisory path) — NOT a
+    RateLimitedExit that would misroute the run into an out-of-credits
+    pause."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps(_ORG_LEVEL_DISABLED_EVENT),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Checking quote usage"}]}}),
+        # Stream truncates — no result event, for an unrelated reason.
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=1))
+    with pytest.raises(leerie.WorkerError):
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="final-conformer-r0", leerie_dir=leerie_dir,
+            verbosity="stream"))
 
 
 def test_invoke_overage_block_with_result_returns_envelope(
         leerie, leerie_dir, monkeypatch):
-    """Control for the 19/28 corpus runs that carried the identical
-    overage-block event yet SUCCEEDED: when a result event DOES arrive,
-    the overage warning is benign and _invoke returns the envelope
-    normally — no RateLimitedExit. This is why the fix keys on the
-    *coincidence* of overage-block AND a missing result event, not on the
-    event alone."""
+    """Control for the corpus runs that carried an exhaustion overage event
+    yet SUCCEEDED: when a result event DOES arrive, the overage warning is
+    benign and _invoke returns the envelope normally — no RateLimitedExit.
+    This is why the fix keys on the *coincidence* of exhaustion AND a
+    missing result event, not on the event alone."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps(_OVERAGE_BLOCKED_EVENT),

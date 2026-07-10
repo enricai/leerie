@@ -1533,19 +1533,34 @@ class RateLimitedExit(BaseException):
 
     Carries:
       - reset_at: datetime | None — parsed from the literal Claude Code
-        message format when present. None means "could not parse
-        unambiguously"; main() prints the manual --resume command and
-        exits without auto-resume rather than guessing a wrong time.
+        message format when present. None means "could not compute a
+        wake time"; main()'s handler then sleeps a fixed backoff and
+        auto-resumes (rate-limits reset on a clock, so a premature retry
+        just re-hits the same clean pause).
+      - out_of_credits: bool — True only for the out-of-credits
+        mid-stream kill (an exhaustion `overageDisabledReason`). This
+        case does NOT auto-resume: out-of-credits has no reset clock (it
+        clears on a top-up / billing cycle, not by waiting), so main()
+        does worktree-only cleanup, logs a --resume hint, and exits
+        EXIT_LOCKED. Looping a fixed backoff against it would only spin
+        against the wall and burn the worker budget.
       - raw_message: str — the verbatim message text (or a synthesized
         envelope for the protocol-level rate_limit_event path),
         surfaced to the user on exit.
 
+    Three main() outcomes, keyed on (out_of_credits, reset_at):
+      - out_of_credits=True → pause-and-surface (EXIT_LOCKED, --resume).
+      - reset_at set → sleep to the reset moment, then auto-resume.
+      - reset_at None (unparseable rate-limit) → fixed-backoff auto-resume.
+
     See DESIGN §6 *Cleanup on abnormal exit* for the auto-resume
     contract."""
-    def __init__(self, reset_at: datetime | None, raw_message: str):
+    def __init__(self, reset_at: datetime | None, raw_message: str,
+                 out_of_credits: bool = False):
         super().__init__(raw_message)
         self.reset_at = reset_at
         self.raw_message = raw_message
+        self.out_of_credits = out_of_credits
 
 
 # Literal Claude Code subscription rate-limit message format, observed
@@ -7214,15 +7229,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     descendant_tracker = _DescendantTracker(proc.pid, cgroup_sid)
     descendant_tracker.start()
     envelope: dict | None = None
-    # Latch the account's overage state from `rate_limit_event`s as they
-    # stream. `overageStatus:"rejected"` / `out_of_credits` is a benign
-    # *warning* on its own — the worker usually completes fine and emits a
-    # `result` event (verified: 19/28 out-of-credits runs in the corpus
-    # exited 0). It only becomes fatal when it coincides with a stream that
-    # truncates *without* a result event: the CLI was killed mid-turn the
-    # moment credits ran out. The no-envelope branch below consults this
-    # latch to route that specific case into the resumable rate-limit pause
-    # instead of a bare WorkerError → die().
+    # Latch actual credit exhaustion from `rate_limit_event`s as they
+    # stream. The discriminator is `overageDisabledReason` being an
+    # *exhaustion* reason (`out_of_credits` / `out_of_overage`), NOT
+    # `overageStatus:"rejected"`. That distinction is load-bearing:
+    # `overageStatus:"rejected"` is a *standing config state* emitted by
+    # every `rate_limit_event` from an org that has overage disabled
+    # (`overageDisabledReason:"org_level_disabled"`, `status:"allowed"`)
+    # — it does NOT mean credits ran out, and plenty of base subscription
+    # quota may remain. Keying the latch on it caused a false positive:
+    # any unrelated mid-stream truncation inherited the permanently-set
+    # flag and was misreported as out-of-credits. Exhaustion is fatal
+    # only when it coincides with a stream that truncates *without* a
+    # result event (the CLI was killed mid-turn the moment credits ran
+    # out); the no-envelope branch below consults this latch to route
+    # that specific case into the pause-and-surface path instead of a
+    # bare WorkerError → die().
     overage_blocked = False
     stderr_chunks: list[bytes] = []
     # Watchdog state: last_event_at is updated by _read_stream on every
@@ -7272,15 +7294,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     sub = event.get("subtype")
                     header = f"{t}/{sub}" if sub else t
                     log_file.write(f"[{now()}] {header}\n{line}\n\n")
-                    # Latch overage-block state (see `overage_blocked`
-                    # declaration above). Tracked here rather than in
-                    # `_summarize_stream_event` because it must survive to
-                    # the post-stream no-envelope check even at quiet
-                    # verbosity, where the summarizer returns None.
+                    # Latch credit-exhaustion state (see `overage_blocked`
+                    # declaration above for why this keys on
+                    # `overageDisabledReason`, NOT `overageStatus`).
+                    # Tracked here rather than in `_summarize_stream_event`
+                    # because it must survive to the post-stream
+                    # no-envelope check even at quiet verbosity, where the
+                    # summarizer returns None.
                     if t == "rate_limit_event":
                         _rli = event.get("rate_limit_info") or {}
-                        if (_rli.get("overageStatus") == "rejected"
-                                or _rli.get("overageDisabledReason")
+                        if (_rli.get("overageDisabledReason")
                                 in ("out_of_credits", "out_of_overage")):
                             overage_blocked = True
                     # PID-exhaustion detection (DESIGN §6 *Detecting PID
@@ -7545,19 +7568,21 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
-        # Out-of-credits mid-stream kill: the account was overage-blocked
-        # and the CLI was terminated before emitting a result event. This
-        # is a rate-limit condition, not a worker fault — route it into the
-        # existing resumable-pause path (main()'s RateLimitedExit handler)
-        # instead of a bare WorkerError, which would bypass the auth/quota
+        # Out-of-credits mid-stream kill: an exhaustion `rate_limit_event`
+        # was seen (overage_blocked) and the CLI was terminated before
+        # emitting a result event. This is a credit condition, not a worker
+        # fault — raise RateLimitedExit(out_of_credits=True) so main()'s
+        # handler pauses-and-surfaces (worktree cleanup + --resume hint +
+        # EXIT_LOCKED) rather than the auto-resume path: out-of-credits has
+        # no reset clock, so looping a fixed backoff would spin against the
+        # wall. A bare WorkerError would instead bypass the auth/quota
         # backoff (it needs an envelope to classify) and die() the run
-        # non-resumably. reset_at is unknown here (the kill left no
-        # resetsAt on a result envelope), so main()'s None-reset arm sleeps a
-        # fixed RATE_LIMIT_RETRY_BACKOFF_SEC and auto-resumes (DESIGN §6). Checked
-        # before the returncode arm because the kill may exit nonzero.
+        # non-resumably. Checked before the returncode arm because the kill
+        # may exit nonzero.
         if overage_blocked:
             raise RateLimitedExit(
                 reset_at=None,
+                out_of_credits=True,
                 raw_message=(
                     f"out of credits — claude -p ({sid}) terminated "
                     "mid-stream with no result event"))
@@ -16988,16 +17013,22 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_code = 1
     except RateLimitedExit as e:
         # Claude Code session-limit / rate-limit (or out-of-credits mid-stream
-        # kill) hit mid-worker. See DESIGN §6 *Rate-limited → auto-resume*. Both
-        # cases now AUTO-RESUME via `_sleep_then_reexec` (worktree-only cleanup →
-        # sleep → os.execv the orchestrator into a fresh `--resume --run-id`
-        # process). They differ only in the wait:
-        #   - reset_at parsed cleanly → sleep until that moment + 30s margin.
-        #   - reset_at is None (parse failed, or the out-of-credits kill left no
-        #     resetsAt) → sleep a fixed RATE_LIMIT_RETRY_BACKOFF_SEC and poll;
-        #     we can't compute a wake time, and an early retry just re-hits the
-        #     same clean pause. (This replaced the old "exit 75, resume
-        #     manually" behavior — a fixed backoff guesses no wrong time.)
+        # kill) hit mid-worker. See DESIGN §6 *Rate-limited → auto-resume*.
+        # Two dispositions:
+        #   1. out_of_credits=True → PAUSE-AND-SURFACE. Out-of-credits has no
+        #      reset clock (it clears on a top-up / billing cycle, not by
+        #      waiting), so auto-resuming would only spin a fixed backoff
+        #      against the wall and burn the worker budget. Instead: worktree
+        #      cleanup, a --resume hint, and EXIT_LOCKED. Checked first.
+        #   2. otherwise (rate-limit) → AUTO-RESUME via `_sleep_then_reexec`
+        #      (worktree-only cleanup → sleep → os.execv the orchestrator into
+        #      a fresh `--resume --run-id` process). The wait differs:
+        #        - reset_at parsed cleanly → sleep until that moment + 30s.
+        #        - reset_at is None (parse failed) → sleep a fixed
+        #          RATE_LIMIT_RETRY_BACKOFF_SEC and poll; we can't compute a
+        #          wake time, and an early retry just re-hits the same clean
+        #          pause. (This replaced the old "exit 75, resume manually"
+        #          behavior — a fixed backoff guesses no wrong time.)
         # We re-exec the orchestrator, not the launcher: the launcher isn't baked
         # into the image and would spawn a new container. `worker_count` persists
         # in state.json so `--max-workers` survives the re-exec — a run that
@@ -17007,30 +17038,54 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # wave-tasks cancel through gather.
         full_purge = False
         st.save()
-        log(f"rate-limited: {e.raw_message}")
-        # `_sleep_then_reexec` runs cleanup itself and either os.execv's (never
-        # returns) or returns an exit code on interrupt/failure — so leave
-        # abnormal=False (the finally must NOT re-run cleanup).
-        abnormal = False
-        if e.reset_at is not None:
-            # `_sleep_then_reexec` runs cleanup first, so the wait is measured
-            # from after cleanup; the +30s margin absorbs the drift, and a
-            # premature wake self-corrects (the re-exec'd run re-hits the limit
-            # and re-sleeps). See the helper's docstring.
-            wait_seconds = max(
-                0,
-                int((e.reset_at - datetime.now(e.reset_at.tzinfo))
-                    .total_seconds())) + 30
-            reason = f"rate limit resets {e.reset_at.isoformat()}"
+        if e.out_of_credits:
+            # Pause-and-surface. Run worktree-only cleanup directly here (state
+            # + run branch preserved), then leave abnormal=False so the finally
+            # doesn't re-run it. EXIT_LOCKED is the launcher's preserve-state
+            # pause pivot — reuse it rather than minting a new code.
+            log(f"out of credits — {e.raw_message}")
+            log(f"  add credits, then resume with: leerie --resume {st.run_id}")
+            abnormal = False
+            try:
+                _cleanup_on_abnormal_exit(st, full_purge=False)
+            except BaseException as cleanup_err:
+                log(f"cleanup failed (non-fatal): {cleanup_err}")
+            # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+            # Non-fatal. Mirrors the cancel-arm pattern.
+            try:
+                asyncio.run(capture_repo_deps(
+                    repo_root, st,
+                    caps=caps, models=models, efforts=efforts,
+                ))
+            except Exception as _cap_exc:
+                log(f"capture: non-fatal error during out-of-credits pause "
+                    f"({_cap_exc})")
+            exit_code = EXIT_LOCKED
         else:
-            wait_seconds = RATE_LIMIT_RETRY_BACKOFF_SEC
-            reason = "out of credits / no reset time"
-        rc = _sleep_then_reexec(st, wait_seconds, reason)
-        if rc is not None:
-            # Interrupted (SIGINT→130, SIGTERM/SIGHUP→128+signum) or execv
-            # failed (→75). Cleanup already ran; state preserved for --resume.
-            exit_code = rc
-        # Otherwise _sleep_then_reexec os.execv'd and never returned.
+            log(f"rate-limited: {e.raw_message}")
+            # `_sleep_then_reexec` runs cleanup itself and either os.execv's
+            # (never returns) or returns an exit code on interrupt/failure — so
+            # leave abnormal=False (the finally must NOT re-run cleanup).
+            abnormal = False
+            if e.reset_at is not None:
+                # `_sleep_then_reexec` runs cleanup first, so the wait is measured
+                # from after cleanup; the +30s margin absorbs the drift, and a
+                # premature wake self-corrects (the re-exec'd run re-hits the limit
+                # and re-sleeps). See the helper's docstring.
+                wait_seconds = max(
+                    0,
+                    int((e.reset_at - datetime.now(e.reset_at.tzinfo))
+                        .total_seconds())) + 30
+                reason = f"rate limit resets {e.reset_at.isoformat()}"
+            else:
+                wait_seconds = RATE_LIMIT_RETRY_BACKOFF_SEC
+                reason = "rate limited / no reset time"
+            rc = _sleep_then_reexec(st, wait_seconds, reason)
+            if rc is not None:
+                # Interrupted (SIGINT→130, SIGTERM/SIGHUP→128+signum) or execv
+                # failed (→75). Cleanup already ran; state preserved for --resume.
+                exit_code = rc
+            # Otherwise _sleep_then_reexec os.execv'd and never returned.
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved
         # so the user can --resume. The explicit "throw this away"

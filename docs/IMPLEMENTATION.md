@@ -2666,18 +2666,24 @@ the `claude -p` process is terminated the instant credits run out, before
 a `result` event is emitted (`_invoke` returns `envelope is None`). That
 truncation is caught earlier, in `_invoke` itself: as events stream, a
 `nonlocal overage_blocked` flag latches when a `rate_limit_event` carries
-`overageStatus == "rejected"` or `overageDisabledReason in
-{"out_of_credits", "out_of_overage"}`. In the no-envelope branch, if
-`overage_blocked` is set, `_invoke` raises `RateLimitedExit(reset_at=None,
-raw)` instead of a bare `WorkerError`, routing the failure into the
-resumable rate-limit pause (DESIGN §6; `main()`'s None-reset arm now sleeps
-`RATE_LIMIT_RETRY_BACKOFF_SEC` and auto-resumes via `_sleep_then_reexec`,
-rather than exiting 75). The overage event alone is *not* treated
-as terminal — it is a benign warning most workers survive; only its
-coincidence with a missing `result` event triggers the pause. Covered by
-`test_invoke_overage_block_plus_truncation_raises_ratelimited` (raises)
-and `test_invoke_overage_block_with_result_returns_envelope` (the benign
-control) in `tests/test_invoke_streaming.py`.
+`overageDisabledReason in {"out_of_credits", "out_of_overage"}` — an
+**exhaustion** reason. In the no-envelope branch, if `overage_blocked` is
+set, `_invoke` raises `RateLimitedExit(reset_at=None, out_of_credits=True,
+raw)` instead of a bare `WorkerError`, routing the failure into `main()`'s
+pause-and-surface arm (worktree cleanup, `--resume` hint, `EXIT_LOCKED`;
+DESIGN §6). The latch does **not** key on `overageStatus == "rejected"`:
+that is a standing state emitted by every `rate_limit_event` from an org
+with overage disabled (`overageDisabledReason:"org_level_disabled"`,
+`status:"allowed"`) and does not mean credits ran out — keying on it
+misclassified unrelated mid-stream truncations as out-of-credits. The
+overage event alone is *not* treated as terminal — it is a benign warning
+most workers survive; only an exhaustion reason coinciding with a missing
+`result` event triggers the pause. Covered by
+`test_invoke_overage_block_plus_truncation_raises_ratelimited` (raises,
+`out_of_credits=True`), `test_invoke_overage_block_with_result_returns_envelope`
+(the benign control), and
+`test_invoke_org_level_disabled_truncation_raises_workererror` (the
+false-positive regression pin) in `tests/test_invoke_streaming.py`.
 
 When `_is_auth_or_quota_failure(envelope)` matches, `claude_p()` enters a
 `tenacity.AsyncRetrying` loop with `wait_exponential_jitter(initial=15,
@@ -3358,15 +3364,22 @@ go stale). The protocol-level path parses `resetsAt` (a Unix timestamp
 in seconds) into a UTC `reset_at`; the text path parses the wall-clock
 time + IANA tz. A **third** raise site lives outside `_summarize_stream_event`: the
 `_invoke` no-result-envelope branch. When a worker stream truncates
-with no `result` event *and* the account was overage-blocked (a
-`rate_limit_event` seen mid-stream with `overageStatus == "rejected"`
-or `overageDisabledReason in {"out_of_credits", "out_of_overage"}`,
-latched into a `nonlocal overage_blocked`), `_invoke` raises
-`RateLimitedExit(reset_at=None, raw)` instead of a bare `WorkerError`
-— the out-of-credits-mid-stream-kill case described under §3 *Auth/quota
+with no `result` event *and* the account hit credit exhaustion (a
+`rate_limit_event` seen mid-stream with `overageDisabledReason in
+{"out_of_credits", "out_of_overage"}`, latched into a `nonlocal
+overage_blocked`), `_invoke` raises `RateLimitedExit(reset_at=None,
+out_of_credits=True, raw)` instead of a bare `WorkerError` — the
+out-of-credits-mid-stream-kill case described under §3 *Auth/quota
 backoff*. It is deliberately raised here, not in `_summarize_stream_event`,
 because the latch must survive to the post-stream no-envelope check even
-at quiet verbosity (where the summarizer returns `None`).
+at quiet verbosity (where the summarizer returns `None`). The latch keys
+on `overageDisabledReason`, **not** on `overageStatus == "rejected"`:
+the latter is a standing state emitted by every `rate_limit_event` from
+an org with overage disabled (`overageDisabledReason:
+"org_level_disabled"`, `status:"allowed"`) and is *not* exhaustion —
+keying on it misclassified unrelated truncations as out-of-credits. An
+`org_level_disabled` truncation therefore takes the ordinary
+`WorkerError` path.
 
 Either source produces a `reset_at: datetime | None`
 (parse failure → `None`, never a wrong-time guess) and the raw
@@ -3381,22 +3394,31 @@ and accepts `--resume --run-id`). The `--max-workers` budget is NOT
 reset across the re-exec: `worker_count` persists in state.json,
 so a run that repeatedly hits the rate-limit still respects the
 user's cap;
-when `reset_at` is None (out-of-credits mid-stream kill, or an
-unparseable session-limit message), sleep a fixed
-`RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) and re-exec `--resume` the same
-way — we can't compute a wake time, so we poll; a premature retry
-re-hits the same clean pause. Both arms route through the shared
-`_sleep_then_reexec(st, wait_seconds, reason) -> int | None` helper
-(cleanup → sleep → `os.execv`). It returns `None` when the `os.execv`
-succeeds (the process is replaced, so the return is unreachable), and an
-**exit code** when the sleep or re-exec was interrupted/failed instead:
-`130` on Ctrl-C (SIGINT), `128 + signum` on SIGTERM/SIGHUP (143 / 129,
-matching main()'s top-level signal arm), and `EXIT_LOCKED` (75) on the
-should-never-happen `os.execv` failure. The caller does
-`rc = _sleep_then_reexec(...); if rc is not None: exit_code = rc` and
-leaves `abnormal = False` (the helper already ran cleanup, so the
-`finally` must not re-run it). The old `reset_at=None → exit 75
-manual-resume` behavior is gone.
+when `reset_at` is None because of an unparseable session-limit
+message, sleep a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) and
+re-exec `--resume` the same way — we can't compute a wake time, so we
+poll; a premature retry re-hits the same clean pause. Both of these
+(clock-based) arms route through the shared `_sleep_then_reexec(st,
+wait_seconds, reason) -> int | None` helper (cleanup → sleep →
+`os.execv`). It returns `None` when the `os.execv` succeeds (the process
+is replaced, so the return is unreachable), and an **exit code** when
+the sleep or re-exec was interrupted/failed instead: `130` on Ctrl-C
+(SIGINT), `128 + signum` on SIGTERM/SIGHUP (143 / 129, matching main()'s
+top-level signal arm), and `EXIT_LOCKED` (75) on the should-never-happen
+`os.execv` failure. The caller does `rc = _sleep_then_reexec(...); if rc
+is not None: exit_code = rc` and leaves `abnormal = False` (the helper
+already ran cleanup, so the `finally` must not re-run it).
+
+The `out_of_credits=True` arm does **not** auto-resume: out-of-credits
+has no reset clock (it clears only on a top-up / billing cycle), so
+`main()` runs `_cleanup_on_abnormal_exit(st, full_purge=False)`
+directly, logs a `leerie --resume <id>` hint, sets `exit_code =
+EXIT_LOCKED` and `abnormal = False`, and falls through to the `finally`
+(which must not re-run cleanup). This is checked *before* the
+`reset_at` branch. `_sleep_then_reexec` is never called for this case.
+The old `reset_at=None → exit 75 manual-resume` behavior is gone for
+rate-limits (they auto-resume), but out-of-credits deliberately
+preserves the surface-and-pause semantics for the reason above.
 
 **Auto-resume override persistence.** The re-exec passes only
 `--resume <id>` as argv — any CLI overrides on the original
