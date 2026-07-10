@@ -642,6 +642,29 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _pid_running(pid: int) -> bool:
+    """True if a process is alive AND not a zombie (state != 'Z').
+
+    `os.kill(pid, 0)` returns True for zombie processes (they still have
+    a PID table entry). This helper distinguishes a truly-running process
+    from one that has exited but not yet been waited on. Used in tests
+    where the test process is the subreaper: after SIGKILL the orphan
+    exits (good) but becomes a zombie because nobody calls waitpid() —
+    _zombie_reaper() would handle that in production."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # field 3 is state: 'Z' for zombie. The comm field (field 2) is
+        # parenthesized and may contain spaces; parse from the last ')'.
+        rparen = data.rfind(")")
+        if rparen == -1:
+            return _pid_alive(pid)
+        state = data[rparen + 2:].split()[0]
+        return state != "Z"
+    except OSError:
+        return False
+
+
 # --- PPID-walk + detached-session reaping ----------------------------------
 
 @pytest.mark.skipif(
@@ -763,16 +786,27 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(leerie):
 def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(leerie):
     """Even on a clean leader exit, Claude Code's `run_in_background:
     true` Bash tool calls leak — the backgrounded subprocesses are spawned
-    in detached POSIX sessions and reparent to PID 1 the moment their
-    immediate parent exits.
+    in detached POSIX sessions and reparent to the subreaper the moment
+    their immediate parent exits.
 
     A naive post-exit PPID-walk finds nothing (the orphans are no longer
     descendants of the dead leader). `_DescendantTracker` solves this by
     polling `_enumerate_descendants` THROUGHOUT the leader's life and
-    accumulating every PID it ever sees. At exit, the accumulated set
-    is SIGKILLed — catching the now-orphaned children."""
+    accumulating every PID it ever sees. At exit, `stop_and_reap` filters
+    to orphaned PIDs (ppid in {1, os.getpid()}, not in _ASYNCIO_MANAGED_PIDS)
+    and SIGKILLs them.
+
+    `_become_subreaper()` is called here to match the production context:
+    in leerie's container, main() installs itself as subreaper so orphaned
+    descendants reparent to os.getpid() rather than to PID 1 or another
+    subreaper. Without this call the test process is not the subreaper, so
+    orphans reparent to a different PID and the ppid filter would not match."""
     import asyncio
     import subprocess
+
+    # Match the production context: install the test process as subreaper so
+    # orphans reparent to os.getpid(), the same ppid stop_and_reap checks.
+    leerie._become_subreaper()
 
     async def _run():
         # Leader backgrounds a sleep then waits briefly so the tracker has
@@ -794,9 +828,9 @@ def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(leerie):
         sleep_pid = int(line.strip())
         # Let the leader exit cleanly
         await proc.wait()
-        # At this point sleep_pid should be orphaned (PPID=1) but still
-        # alive. The tracker should have observed it during its ~0.5s
-        # poll while the parent was alive.
+        # At this point sleep_pid should be orphaned (ppid==os.getpid() because
+        # _become_subreaper() routed reparenting to us) but still alive.
+        # The tracker should have observed it during its ~0.5s poll.
         await asyncio.sleep(0.1)  # let kernel reparent
         # stop_and_reap must kill the orphaned sleep
         leaked = await tracker.stop_and_reap()
@@ -804,13 +838,14 @@ def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(leerie):
             f"tracker reaped {leaked} descendants — expected at least 1 "
             f"(the backgrounded sleep that became an orphan when its "
             f"parent exited). The tracker did not observe the sleep "
-            f"during its polling window."
+            f"during its polling window, or the ppid filter did not match."
         )
-        # Verify the sleep actually died
+        # Verify the sleep actually died (no longer running; may be a zombie
+        # awaiting waitpid() — in production _zombie_reaper handles that).
         await asyncio.sleep(0.2)
-        assert not _pid_alive(sleep_pid), (
-            f"sleep PID {sleep_pid} survived tracker.stop_and_reap. The "
-            f"tracker recorded the PID but SIGKILL didn't deliver — "
+        assert not _pid_running(sleep_pid), (
+            f"sleep PID {sleep_pid} is still running after tracker.stop_and_reap. "
+            f"The tracker recorded the PID but SIGKILL didn't deliver — "
             f"likely a permission or signal-delivery bug."
         )
 
@@ -1230,4 +1265,170 @@ def test_descendant_tracker_cgroup_sid_defaults_to_none():
         "in this test file continue to work without any changes. "
         "A refactor that removes the default or changes the type annotation "
         "breaks backward compatibility with every existing call site."
+    )
+
+
+# --- stop_and_reap safety filter tests ----------------------------------------
+#
+# These tests pin the fix for the PID-recycling collateral-kill bug:
+# stop_and_reap must NOT blindly SIGKILL every PID it ever observed as a
+# descendant, because PIDs recycle — a PID that once belonged to this
+# worker may now belong to a sibling claude -p worker. The fix filters to
+# PIDs that are: alive + ppid in {1, os.getpid()} + not in
+# _ASYNCIO_MANAGED_PIDS (which holds every live worker leader).
+
+def test_stop_and_reap_does_not_kill_foreign_parent_pid(leerie, monkeypatch):
+    """A PID in _seen whose current ppid is NOT 1 or os.getpid() must
+    NOT be killed by stop_and_reap — it's a recycled PID now owned by
+    an unrelated process (e.g. a sibling worker's tool-call grandchild
+    whose parent is the sibling, not init or the orchestrator).
+
+    This is the core of the PID-recycling collateral-kill fix."""
+    import asyncio
+
+    killed: list[int] = []
+
+    # PID 5000: in _seen but ppid=9999 (some other process — not 1 or our pid)
+    # This simulates a recycled PID owned by an unrelated process.
+    fake_ps_out = (
+        "  PID  PPID\n"
+        f"  5000  9999\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants", lambda pid: set())
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999)
+        tracker._seen = {5000}
+        leaked = await tracker.stop_and_reap()
+        assert leaked == 0, (
+            f"stop_and_reap reported killing {leaked} PIDs, but PID 5000 "
+            f"has a foreign parent (ppid=9999) and must not be signaled. "
+            f"killed={killed}"
+        )
+        assert 5000 not in killed, (
+            f"PID 5000 (ppid=9999, foreign parent) was killed — this is "
+            f"the collateral-kill bug that crashed sibling planners. "
+            f"stop_and_reap must only kill PIDs whose ppid is 1 or "
+            f"os.getpid()."
+        )
+
+    asyncio.run(_run())
+
+
+def test_stop_and_reap_does_not_kill_asyncio_managed_pid(leerie, monkeypatch):
+    """A PID in _seen that is also in _ASYNCIO_MANAGED_PIDS must NOT be
+    killed — it's a live sibling claude -p worker whose ppid IS os.getpid()
+    (leerie spawned it), so the ppid filter alone would not protect it.
+    The _ASYNCIO_MANAGED_PIDS exclusion is the critical guard against
+    collateral-killing live sibling workers."""
+    import asyncio
+
+    killed: list[int] = []
+    my_pid = os.getpid()
+
+    # PID 6000: in _seen, ppid=os.getpid() (looks like an orphan reparented
+    # to us), AND in _ASYNCIO_MANAGED_PIDS (it's a live sibling worker).
+    fake_ps_out = (
+        "  PID  PPID\n"
+        f"  6000  {my_pid}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants", lambda pid: set())
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    # Register PID 6000 as a live asyncio-managed worker
+    original_managed = leerie._ASYNCIO_MANAGED_PIDS.copy()
+    leerie._ASYNCIO_MANAGED_PIDS.add(6000)
+    try:
+        async def _run():
+            tracker = leerie._DescendantTracker(99999)
+            tracker._seen = {6000}
+            leaked = await tracker.stop_and_reap()
+            assert leaked == 0, (
+                f"stop_and_reap reported killing {leaked} PIDs, but PID 6000 "
+                f"is in _ASYNCIO_MANAGED_PIDS and must not be signaled. "
+                f"killed={killed}"
+            )
+            assert 6000 not in killed, (
+                f"PID 6000 (a live asyncio-managed worker) was killed — "
+                f"the _ASYNCIO_MANAGED_PIDS exclusion guard is broken. "
+                f"This is the exact collateral-kill scenario where a "
+                f"finishing worker kills a sibling claude -p leader."
+            )
+
+        asyncio.run(_run())
+    finally:
+        leerie._ASYNCIO_MANAGED_PIDS.clear()
+        leerie._ASYNCIO_MANAGED_PIDS.update(original_managed)
+
+
+def test_stop_and_reap_kills_genuine_orphan_with_ppid_1(leerie, monkeypatch):
+    """A PID in _seen with ppid==1 (genuine orphan, reparented to init)
+    and not in _ASYNCIO_MANAGED_PIDS MUST be killed by stop_and_reap.
+    This is the normal backgrounded-subprocess cleanup case."""
+    import asyncio
+
+    killed: list[int] = []
+
+    fake_ps_out = (
+        "  PID  PPID\n"
+        "  7000     1\n"  # ppid=1, genuine orphan
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants", lambda pid: set())
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999)
+        tracker._seen = {7000}
+        leaked = await tracker.stop_and_reap()
+        assert leaked == 1, (
+            f"stop_and_reap should kill genuine orphan PID 7000 "
+            f"(ppid=1, not in _ASYNCIO_MANAGED_PIDS); got leaked={leaked}"
+        )
+        assert 7000 in killed, (
+            f"PID 7000 (genuine orphan, ppid=1) was not killed. "
+            f"stop_and_reap must kill orphaned worker descendants."
+        )
+
+    asyncio.run(_run())
+
+
+def test_stop_and_reap_source_does_not_blind_kill_seen(leerie):
+    """Static guard: stop_and_reap must not call _signal_pids(self._seen, ...)
+    — the blind-kill pattern that caused the PID-recycling collateral kill.
+    It must call _exit_reap_candidates first to filter the safe-to-kill set."""
+    import inspect
+    src = inspect.getsource(leerie._DescendantTracker.stop_and_reap)
+    assert "_exit_reap_candidates" in src, (
+        "stop_and_reap must call _exit_reap_candidates to filter "
+        "the safe-to-kill set — the blind _signal_pids(self._seen, ...) "
+        "pattern has been removed to prevent collateral-killing recycled PIDs."
+    )
+    assert "_signal_pids(self._seen" not in src, (
+        "stop_and_reap must not blind-kill self._seen directly. "
+        "Filter through _exit_reap_candidates first."
     )
