@@ -476,7 +476,14 @@ only at ≥90% pressure and stops below 75% (hysteresis); below 90% is a
 byte-identical no-op; young (<60s) and attached (ppid!=1) PIDs are never
 reaped; and a structural guard pins `cgroup_sid: str | None = None` on
 `_DescendantTracker.__init__` so the 3 pre-existing direct-constructor call
-sites remain compatible after the parameter was added. Zombie reaping (DESIGN
+sites remain compatible after the parameter was added. Exit-time
+`stop_and_reap` safety filter (DESIGN §6 *Worker subtree termination* — the
+PID-recycling collateral-kill fix) is also tested in the same file: a PID
+whose current ppid is foreign (not 1 or os.getpid()) is NOT killed; a PID in
+`_ASYNCIO_MANAGED_PIDS` (a live sibling worker) is NOT killed even when its
+ppid IS os.getpid(); a genuine orphan (ppid==1, not in managed set) IS killed;
+and a static source guard asserts `stop_and_reap` calls `_exit_reap_candidates`
+rather than blindly killing `self._seen`. Zombie reaping (DESIGN
 §6 *Zombie reaping* — the container PID 1 is `runuser`/idle `sleep`, not a
 reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
 against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`

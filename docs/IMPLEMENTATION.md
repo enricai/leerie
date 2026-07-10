@@ -3209,7 +3209,8 @@ Subprocess cleanup is three-layered, addressing two distinct leak classes plus m
    asyncio task started at spawn polls `_enumerate_descendants(proc.pid)`
    every ~0.5s and accumulates every PID ever observed as a descendant
    of the worker. On every exit path — success AND failure — the
-   tracker's `stop_and_reap()` SIGKILLs the accumulated set. This is
+   tracker's `stop_and_reap()` filters the accumulated set via
+   `_exit_reap_candidates` and SIGKILLs the safe subset. This is
    the load-bearing fix for Claude Code's Bash tool with
    `run_in_background: true`: the tool wrapper spawns its user command
    in a detached POSIX session, then the wrapper itself can exit while
@@ -3254,10 +3255,16 @@ together close the leak.
    `_reparented_orphans(self._seen)` to obtain the killable set and sends
    `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
    soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
-   are pruned from `_seen`. The exit-time `stop_and_reap` applies the same
-   safe-target filter (alive + `ppid in {1, getpid()}` + not in
-   `_ASYNCIO_MANAGED_PIDS` + age ≥ `_PID_REAP_MIN_AGE_SEC`), so a finishing
-   worker never SIGKILLs a PID recycled to a concurrently-running sibling.
+   are pruned from `_seen`. The exit-time `stop_and_reap` delegates to
+   `_exit_reap_candidates(seen, exclude)` — a related but distinct filter:
+   alive + `ppid in {1, getpid()}` + not in `_ASYNCIO_MANAGED_PIDS`, with
+   the age floor intentionally omitted (the worker is done; all tracked
+   orphans should be reaped regardless of age) — so a finishing worker never
+   SIGKILLs a PID recycled to a concurrently-running sibling.
+   `_exit_reap_candidates(seen: set[int], exclude: set[int]) -> set[int]`
+   runs `ps -eo pid,ppid` (no etimes needed) and returns the safe-to-kill
+   set; returns an empty set on any `ps` failure (safe fallback). Returns
+   the count of PIDs actually killed (the filtered count, not `len(_seen)`).
    `_reparented_orphans(seen: set[int]) -> list[int]` runs one
    `ps -eo pid,ppid,etimes` snapshot and returns, sorted oldest-first, the
    PIDs from `seen` that are simultaneously alive, reparented to init

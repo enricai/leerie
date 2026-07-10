@@ -1746,6 +1746,49 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
     return [pid for _, pid in candidates]
 
 
+def _exit_reap_candidates(seen: set[int],
+                          exclude: set[int]) -> set[int]:
+    """Return PIDs from `seen` that are safe to SIGKILL at worker exit:
+    still alive (ppid in {1, os.getpid()}) and not in `exclude`.
+
+    Unlike `_reparented_orphans` (which applies a _PID_REAP_MIN_AGE_SEC
+    age floor to protect recently-launched processes during mid-run
+    pressure reaping), exit-time reaping does NOT apply the age floor —
+    the worker is done, so all its tracked orphaned descendants should be
+    cleaned up regardless of age.
+
+    The `exclude` guard is the critical safety net: a recycled PID could
+    land on a sibling `claude -p` leader whose ppid IS os.getpid()
+    (spawned via create_subprocess_exec). `_ASYNCIO_MANAGED_PIDS` is
+    exactly the set of live worker leaders leerie is awaiting — excluding
+    it prevents collateral-killing live siblings (the root cause of
+    'reaped 12 backgrounded subprocess(es)' followed by all planners
+    crashing).
+
+    Returns an empty set on any `ps` failure — safe fallback: skip the
+    kill rather than risk killing the wrong process."""
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,ppid"],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    my_pid = os.getpid()
+    safe: set[int] = set()
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pid in seen and pid not in exclude and ppid in (1, my_pid):
+            safe.add(pid)
+    return safe
+
+
 _DESCENDANT_POLL_SEC = 0.5
 
 # Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
@@ -1866,9 +1909,17 @@ class _DescendantTracker:
             return
 
     async def stop_and_reap(self) -> int:
-        """Stop polling, SIGKILL every accumulated PID, return the
-        count signaled. Safe to call multiple times. Always runs at
-        worker exit, success-path AND failure-path."""
+        """Stop polling, SIGKILL genuinely-orphaned accumulated PIDs,
+        return the count actually signaled. Safe to call multiple times.
+        Always runs at worker exit, success-path AND failure-path.
+
+        Unlike the old blind kill of `_seen`, this filters to PIDs that
+        are still alive, still detached/orphaned (ppid in {1, os.getpid()}),
+        and not in _ASYNCIO_MANAGED_PIDS. The last guard is critical: a
+        recycled PID could land on a sibling `claude -p` worker whose ppid
+        IS os.getpid() — excluding the managed set prevents
+        collateral-killing live siblings (the root cause of 'reaped 12
+        backgrounded subprocess(es)' followed by all planners crashing)."""
         self._stopped = True
         if self._task is not None:
             # One final snapshot to catch anything spawned since the
@@ -1884,9 +1935,16 @@ class _DescendantTracker:
             # reaps it on shutdown.
             self._task.cancel()
             self._task = None
-        if self._seen:
-            _signal_pids(self._seen, signal.SIGKILL)
-        return len(self._seen)
+        if not self._seen:
+            return 0
+        # Filter to safe-to-kill candidates: alive + orphaned + not a live
+        # sibling worker. _ASYNCIO_MANAGED_PIDS is module-level and holds
+        # every live `claude -p` PID currently awaited by _invoke.
+        to_kill = _exit_reap_candidates(self._seen,
+                                        exclude=_ASYNCIO_MANAGED_PIDS)
+        if to_kill:
+            _signal_pids(to_kill, signal.SIGKILL)
+        return len(to_kill)
 
 
 async def _terminate_proc_tree(proc: asyncio.subprocess.Process) -> None:
