@@ -483,7 +483,10 @@ whose current ppid is foreign (not 1 or os.getpid()) is NOT killed; a PID in
 `_ASYNCIO_MANAGED_PIDS` (a live sibling worker) is NOT killed even when its
 ppid IS os.getpid(); a genuine orphan (ppid==1, not in managed set) IS killed;
 and a static source guard asserts `stop_and_reap` calls `_exit_reap_candidates`
-rather than blindly killing `self._seen`. Zombie reaping (DESIGN
+rather than blindly killing `self._seen`; a live-process integration test
+(`test_stop_and_reap_live_pid_safety_filter`) verifies the same three
+invariants using real kernel ppid values (no monkeypatching) so the test
+cannot be defeated by a bypass of the ps-parsing layer. Zombie reaping (DESIGN
 §6 *Zombie reaping* — the container PID 1 is `runuser`/idle `sleep`, not a
 reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
 against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`
