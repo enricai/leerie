@@ -303,7 +303,7 @@ Complete reference for every CLI flag, environment variable, and
 | `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless `--resume`, `--list`, or `--phase` is given. |
 | `--resume` | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
 | `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
-| `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
+| `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, cost, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
@@ -327,11 +327,10 @@ Complete reference for every CLI flag, environment variable, and
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`). |
 | `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
 | `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
-| `--telemetry` / `--no-telemetry` | on | Enable / disable telemetry NDJSON event writing. Also `LEERIE_TELEMETRY=1`/`0` or `telemetry=true`/`false` in `leerie.toml`. |
-| `--telemetry-dir DIR` | `events` | Subdirectory name under the run dir for telemetry NDJSON events. Also `LEERIE_TELEMETRY_DIR` or `telemetry_dir` in `leerie.toml`. |
 | `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `LEERIE_JUDGE_DIR` or `judge_dir` in `leerie.toml`. |
 | `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
+| `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
 | `--version` | — | Print `leerie <version>` and exit. |
 | `--status STATE` | — | With `--list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
@@ -406,8 +405,6 @@ details and sub-flags.
 | `LEERIE_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |
 | `LEERIE_HEAL_MAX_ROUNDS` | `heal_max_rounds` | Maximum heal-loop iterations per `call_type`. Overridden by `--heal-max-rounds`. Unset → default `10`. |
 | `LEERIE_HEAL_SUCCESS_THRESHOLD` | `heal_success_threshold` | Pass-rate threshold for the heal-loop SUCCESS verdict. Overridden by `--heal-success-threshold`. Unset → default `0.9`. |
-| `LEERIE_TELEMETRY` | `telemetry` | Enable / disable telemetry NDJSON event writing (boolean). Overridden by `--telemetry` / `--no-telemetry`. Unset → default `true` (telemetry on). |
-| `LEERIE_TELEMETRY_DIR` | `telemetry_dir` | Subdirectory name under the run dir for telemetry NDJSON events. Overridden by `--telemetry-dir`. Unset → default `events`. |
 | `LEERIE_JUDGE_DIR` | `judge_dir` | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
 | `LEERIE_HEAL_DIR` | `heal_dir` | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
 | `LEERIE_MAX_WORKERS` | `max_workers` | Total worker-invocation budget. Overridden by `--max-workers`. Unset → default `200`. |

@@ -71,7 +71,7 @@ _REQUIRED_FIELDS = {
     "call_id", "run_id", "call_type", "model",
     "system_prompt", "user_content", "response_content",
     "parsed_ok", "input_tokens", "output_tokens",
-    "latency_ms", "success", "ts",
+    "latency_ms", "success", "failure_kind", "cgroup_applied", "ts",
 }
 
 
@@ -138,6 +138,7 @@ def test_single_call_field_values(leerie, tmp_path, monkeypatch):
     assert "test user prompt" in record["user_content"]
     assert record["parsed_ok"] is True
     assert record["success"] is True
+    assert record["failure_kind"] is None
     assert record["input_tokens"] == 500
     assert record["output_tokens"] == 100
     assert record["latency_ms"] >= 0
@@ -234,6 +235,8 @@ def test_failed_call_still_writes_record(leerie, tmp_path, monkeypatch):
         record = json.loads(line)
         assert record["success"] is False
         assert record["parsed_ok"] is False
+        # is_error=True with a non-{401,429,529} status → bare "api_error".
+        assert record["failure_kind"] == "api_error"
 
 
 # ---------------------------------------------------------------------------

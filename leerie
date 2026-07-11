@@ -3275,8 +3275,8 @@ _value_flags=" --run-id --answers --pr-template --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
 --worker-pids-max --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
---heal-success-threshold --verbosity --telemetry-dir --judge-dir \
---heal-dir --phase --host-no-push --status --chain-id \
+--heal-success-threshold --verbosity --judge-dir \
+--heal-dir --phase --host-no-push --status --report --chain-id \
 --seed-depth --seed-shallow-threshold-mb --group-id "
 for arg in "$@"; do
   # Skip if this arg is the value of a previous value-taking flag.

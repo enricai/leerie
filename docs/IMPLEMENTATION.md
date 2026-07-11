@@ -1093,12 +1093,6 @@ export LEERIE_MODEL=sonnet                # or: opus, haiku
 leerie "task" --model opus
 leerie "task" --model-implementer opus --model-classifier haiku
 
-# Telemetry: on by default; disable with --no-telemetry or env var:
-leerie "task" --no-telemetry
-export LEERIE_TELEMETRY=0
-# Override output subdirectory (default: <run-dir>/events/):
-leerie "task" --telemetry-dir my-events
-export LEERIE_TELEMETRY_DIR=my-events
 # Override judge/heal output subdirectories:
 leerie "task" --judge-dir my-judge --heal-dir my-heal
 export LEERIE_JUDGE_DIR=my-judge
@@ -1133,6 +1127,12 @@ leerie --phase judge --run-id bugfix-login-timeout-bug-b81e90
 leerie --phase heal  --run-id bugfix-login-timeout-bug-b81e90
 # Combine with heal-loop knobs:
 leerie --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
+
+# Read-only telemetry report for a run: per-call_type token/cost/latency/
+# failure breakdown + memory peak. Pass a run id, or omit to auto-pick the
+# sole run. Exits without running orchestrate.
+leerie --report bugfix-login-timeout-bug-b81e90
+leerie --report            # auto-picks when exactly one run exists
 
 # Recommended backstop for worker auto-compaction
 # (Claude Code CLI variable — not consumed by leerie itself):
@@ -1814,31 +1814,15 @@ unneeded.
 
 ### Telemetry
 
-Controls whether leerie writes NDJSON telemetry events for LLM calls. Events
-land in `<run-dir>/<telemetry_subdir>/` — already under `<state-root>/` and
-outside the repo, so no `.gitignore` entry is needed. Telemetry is on by default.
-
-Resolution order (highest priority first):
-
-1. **`--telemetry` / `--no-telemetry`** CLI flags (mutually exclusive).
-2. **`LEERIE_TELEMETRY`** environment variable, boolean spellings
-   (`1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`).
-3. **`leerie.toml`**, `telemetry = true|false`.
-4. **Default `True`** (`TELEMETRY_DEFAULT`).
-
-An invalid boolean in env or file is rejected at startup via `die()`.
-
-### Telemetry directory
-
-The subdirectory name (relative to `<run-dir>`) where telemetry NDJSON event
-files are written.
-
-Resolution order (highest priority first):
-
-1. **`--telemetry-dir DIR`** CLI flag.
-2. **`LEERIE_TELEMETRY_DIR`** environment variable.
-3. **`leerie.toml`**, `telemetry_dir = "events"`.
-4. **Default `"events"`** (`TELEMETRY_SUBDIR_DEFAULT`).
+Telemetry is **always on and not configurable** — there is no enable flag. Per
+DESIGN §14, the orchestrator unconditionally writes a per-run append-only
+`calls.ndjson` (one JSON record per `claude -p` call) at the run root
+`<state-root>/runs/<run-id>/calls.ndjson`, plus a `memory.ndjson` resource-usage
+sampler and a `telemetry` aggregate block in `state.json`
+(`{calls, cost_usd, input_tokens, output_tokens}`). All three live under
+`<state-root>/` (outside the repo), so no `.gitignore` entry is needed. The
+per-record schema is specified in §10; consumers are the `judge`/`heal` phases
+(§14) and the `--report` verb (below).
 
 ### Judge output directory
 
@@ -2572,6 +2556,23 @@ into the finalize path at three points:
    LLM-less path. No `run.json` persistence is needed —
    `external_preconditions` is already a `STATE_FIELDS` key in
    `state.json`.
+
+#### Run-summary cost line
+
+Both deterministic renderers also emit a `- Cost:` line in the
+`## Run summary` block (after `- Workers:`), sourced from
+`state.json`'s `telemetry` block: `- Cost: $X.XX (N calls, I in / O out
+tokens)`. Rendered only when the telemetry block is present (omitted on
+pre-classify orphans), matching the deploy-note guard. Both renderers —
+`compose_pr_body` (`orchestrator/leerie.py`, `${x:,.2f}` + `,`-grouped
+tokens) and the `host-finalize.sh` `jq` fallback (`money`/`group`
+helpers reproducing the same 2-decimal, thousands-grouped output) — are
+format-identical **except** for one residual edge: an exact half-cent
+`cost_usd` (e.g. `2.675`) rounds up in `jq` (`round` is half-up) but
+down in Python (IEEE-754 repr of `2.675` is `2.67499…`), a sub-cent
+difference that never arises on a real summed cost. Like the deploy
+note, no `run.json` persistence is needed — the `telemetry` block is a
+`STATE_FIELDS` key.
 
 **Key design note:** `reason` in `external_preconditions` is
 unstructured free text (`required` is only `[tag, extent]`,
@@ -5212,7 +5213,7 @@ prerequisites*, *Accepting external-blocked subtasks*.
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*, *The
 user-visible verb surface*.
 
-#### Unified `leerie --list` (machine column + `--status` + `--runtime` filters)
+#### Unified `leerie --list` (cost column + `--status` + `--runtime` filters)
 
 `list_runs()` in `orchestrator/leerie.py` is extended to surface remote
 runs alongside local runs in a single table. Status and runtime are
@@ -5227,19 +5228,24 @@ typically because `seed_auth` aborted before `phase_classify`).
 `discover_runs()` synthesizes a row dict with `_orphan=True` and
 `started_at` from the fly sidecar; `_derive_run_status()` returns
 `seed-failed` for them (earliest precedence, before the run.json
-corrupt-sidecar check). `_collect_run_rows()` reads `fly_machine_id`
-from `fly-machine.json` for these rows so the machine column populates.
-`resolve_run_id()` accepts orphan ids transitively (no special-casing
-needed once `discover_runs` returns them), so `./leerie --resume
-<orphan-id> --runtime fly` works against a seed-failed run.
+corrupt-sidecar check). `resolve_run_id()` accepts orphan ids
+transitively (no special-casing needed once `discover_runs` returns
+them), so `./leerie --resume <orphan-id> --runtime fly` works against a
+seed-failed run.
 
 Changes:
 
-- `_collect_run_rows()` reads `fly_machine_id` from `run.json` and
-  appends it to each row tuple. Empty string for local runs.
-- `_render_run_table()` adds a `machine` column between `status` and
-  `branch`. Column auto-hides when no row in the result set has a
-  non-empty value (so pure-local users see no extra noise).
+- `_collect_run_rows()` returns a per-run tuple
+  `(run_id, started_at, status, branch, is_fly, cost)`. `is_fly` is a
+  bool derived from `fly_machine_id` in `run.json` or a present
+  `fly-machine.json` — it is **filter-only** (consumed by the
+  `--runtime` filter), never rendered as a column. `cost` is the run's
+  aggregate `$X.XX` from `state.json`'s `telemetry.cost_usd` (present
+  in the state summary `discover_runs` passes through — no extra disk
+  read), or `—` when telemetry is absent (orphans / pre-classify runs).
+- `_render_run_table()` renders columns in the order `run_id,
+  started_at, status, cost, branch` (the filter-only `is_fly` is not a
+  column). The `cost` column is right-aligned; widths auto-size.
 - `--status <state>` argparse flag on `--list` filters rows to only
   those whose derived status matches. `<state>` accepts any value in
   `RUN_STATUSES` (see list above). Invalid values produce an
@@ -5799,6 +5805,8 @@ post-run operation performed by the judge and heal skills.
 | `output_tokens` | int | `usage.output_tokens` from the CLI envelope |
 | `latency_ms` | int | wall-clock milliseconds from subprocess start to return |
 | `success` | bool | whether the call produced a schema-valid result (false on WorkerError or schema retry exhaustion) |
+| `failure_kind` | str \| null | why a call failed, or `null` on success. Derived at the capture site by `_classify_failure_kind` from the returned envelope: `api_error` (with `:auth`/`:quota`/`:overload` suffix for `api_error_status` 401/429/529), `incomplete` (non-`completed` `terminal_reason`, e.g. `--max-turns`), or `schema_parse_failed` (returned but output failed schema validation — the dominant case). **Known gap:** rate-limit / out-of-credits / hard-crash failures raise `RateLimitedExit`/`WorkerError` past the capture block, so no record is written for them and `failure_kind` cannot cover them. |
+| `cgroup_applied` | bool | whether per-worker cgroup memory/PID containment was active for this spawn (`_CGROUP_PROBE_RESULT`); a run with this consistently `false` means the writable `/sys/fs/cgroup` mount did not propagate |
 | `ts` | str (ISO-8601) | UTC timestamp at the moment the line is written |
 
 The judge skill consumes `system_prompt`, `user_content`, `response_content`,
@@ -5815,6 +5823,24 @@ on one `call_type` at a time.
 
 One file per run. Written by the orchestrator; the judge and heal skills
 read it as a post-run harvest.
+
+### Reporting — the `--report` verb
+
+`leerie --report [RUN_ID]` is a read-only telemetry report for a single run;
+like `--list` it exits without running orchestrate. Run selection reuses
+`resolve_run_id` (exact-match a passed id, else auto-pick the sole run, else
+die with the available list). It prints:
+
+- a header (status, duration, and the `state.json` `telemetry` aggregate —
+  calls, `$cost`, in/out tokens);
+- a per-`call_type` breakdown from `calls.ndjson` — count, input/output
+  tokens, average latency, failure count — sorted by call count descending,
+  built by `_aggregate_calls`;
+- a `failures by kind` rollup of `failure_kind` values, when any failed; and
+- a memory-peak line (peak `rss_kb`, max `open_fds`/`thread_count`) from
+  `memory.ndjson`, via `_memory_peak`.
+
+All inputs already exist on disk; `--report` adds no new telemetry.
 
 ### call_type → prompt-resolution table
 
