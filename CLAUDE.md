@@ -612,12 +612,13 @@ entry at `"high"`, prompt file exists). `tests/test_splitter_schema.py` covers
 `SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
 fields (`id`, `title`, `success_criteria_seed`), optional child fields,
 valid/invalid instances, JSON serializability, and the same wiring guards.
-`tests/test_resolve_fit_judge_model.py` covers model and effort resolution for
-`fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from
-`MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both in
-`EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
-chains; isolation (override doesn't bleed to other workers); structural wiring
-guards. `tests/test_recursive_decompose.py` covers `partition_files()` (empty
+`tests/test_resolve_fit_judge_model.py` and
+`tests/test_resolve_fit_judge_splitter_model.py` cover model and effort
+resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both
+absent from `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT`
+fallback); both in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker
+CLI/env/TOML override chains; isolation (override doesn't bleed to other
+workers); structural wiring guards. `tests/test_recursive_decompose.py` covers `partition_files()` (empty
 input, single chunk, exact multiple, partial last chunk, 100% coverage + 0
 overlap guarantee by construction, `chunk_size=1`, order preserved,
 `chunk_size<1` degenerate guard) and `recursive_decompose()` (well-fit subtask
