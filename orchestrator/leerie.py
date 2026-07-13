@@ -4956,7 +4956,6 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         if not lang:
             return [], []
         source = path.read_text(errors="replace")
-        # --- definitions via high-level structure extraction ---
         proc_result = tslp.process(
             source,
             tslp.ProcessConfig(language=lang, structure=True, imports=False),
@@ -4970,7 +4969,6 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
                 _collect_defs(item.children)
 
         _collect_defs(proc_result.structure)
-        # --- call-site references via CST walk ---
         py_lang = tslp.get_language(lang)
         parser = Parser(py_lang)
         tree = parser.parse(source.encode())
@@ -5052,8 +5050,8 @@ def build_repo_map(
         except Exception:
             pass
 
-    files_map: dict[str, list[str]] = {}   # file → defs
-    refs_map: dict[str, set[str]] = {}     # def_symbol → {files that reference it}
+    files_map: dict[str, list[str]] = {}
+    refs_map: dict[str, set[str]] = {}
 
     for dirpath, dirnames, filenames in os.walk(repo_root):
         # Prune skip dirs in-place so os.walk doesn't descend into them
@@ -5235,8 +5233,6 @@ def rank_repo_map(
         key=lambda x: -x[1],
     )
 
-    # Binary-search the largest file count that fits within the token budget.
-    # Start with all files, then binary-search downward.
     total = len(ranked_files)
     if total == 0:
         return ""
