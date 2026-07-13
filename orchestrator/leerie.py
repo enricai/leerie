@@ -4883,6 +4883,387 @@ def _format_task_file_structure(items: list[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# P6 repo-map — build_repo_map + rank_repo_map (DESIGN §5½ §P6)
+# ---------------------------------------------------------------------------
+# tree_sitter and tree_sitter_language_pack are lazy-imported inside each
+# function (same pattern as tenacity inside claude_p) so that orchestrator/
+# leerie.py loads on a bare host python3 that lacks requirements.txt deps.
+# The config --recapture host seam exec_module()s this file on the host where
+# neither tree-sitter package is guaranteed; a module-scope import would crash
+# before the fast-path guards can print their diagnostic.
+
+# TypedDict for the RepoMap return value.  Using a plain dict alias keeps the
+# implementation stdlib-only at module import time.
+# RepoMap = {
+#   "files": {str: [str]},   # file_path → [def_symbol, ...]
+#   "refs":  {str: set[str]} # def_symbol → {file_path, ...}  (files that ref it)
+# }
+
+
+def _repo_map_cache_key(path: Path) -> str:
+    """Return a stable cache key: '<abs_path>@<mtime_ns>'.
+
+    The mtime_ns component means that touching a file produces a new key
+    and forces a re-parse, while leaving it untouched hits the cached
+    result — the Aider diskcache pattern."""
+    return f"{path}@{path.stat().st_mtime_ns}"
+
+
+def _walk_calls(node: "object") -> list[str]:
+    """Collect identifier names from call-expression function positions.
+
+    Walks the tree-sitter CST recursively.  For each `call` node, extracts
+    the function's identifier if the callee is a bare name or the first
+    component of an attribute access (e.g. ``foo(...)`` → ``"foo"``,
+    ``obj.method(...)`` → ``"obj"`` is skipped, only bare-name callees become
+    reference edges).  This approximates cross-file ref edges without requiring
+    a scope resolver."""
+    results: list[str] = []
+
+    def _visit(n: "object") -> None:
+        if n.type == "call":  # type: ignore[attr-defined]
+            func = n.child_by_field_name("function")  # type: ignore[attr-defined]
+            if func and func.type == "identifier":  # type: ignore[attr-defined]
+                text = func.text  # type: ignore[attr-defined]
+                if text:
+                    results.append(
+                        text.decode() if isinstance(text, bytes) else text)
+        for child in n.children:  # type: ignore[attr-defined]
+            _visit(child)
+
+    _visit(node)
+    return results
+
+
+def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
+    """Parse one source file and return ``(defs, refs)``.
+
+    *defs* — list of defined symbol names (functions, classes, methods).
+    *refs* — list of symbol names called/referenced in the file body.
+
+    Uses ``tree_sitter_language_pack.process()`` for definitions (structure)
+    and tree-sitter's CST for call-site references.  Returns ``([], [])``
+    when the language is unsupported or an error occurs (graceful degrade —
+    the file is simply absent from the graph)."""
+    try:
+        import tree_sitter_language_pack as tslp  # noqa: PLC0415
+        from tree_sitter import Parser  # noqa: PLC0415
+    except ImportError:
+        return [], []
+    try:
+        lang = tslp.detect_language(str(path))
+        if not lang:
+            return [], []
+        source = path.read_text(errors="replace")
+        # --- definitions via high-level structure extraction ---
+        proc_result = tslp.process(
+            source,
+            tslp.ProcessConfig(language=lang, structure=True, imports=False),
+        )
+        defs: list[str] = []
+
+        def _collect_defs(items: list) -> None:
+            for item in items:
+                if item.name:
+                    defs.append(item.name)
+                _collect_defs(item.children)
+
+        _collect_defs(proc_result.structure)
+        # --- call-site references via CST walk ---
+        py_lang = tslp.get_language(lang)
+        parser = Parser(py_lang)
+        tree = parser.parse(source.encode())
+        refs = _walk_calls(tree.root_node)
+        return defs, refs
+    except Exception:  # graceful degrade; tree-sitter parse errors, IO, etc.
+        return [], []
+
+
+def build_repo_map(
+    repo_root: Path,
+    leerie_root: Path,
+) -> dict:
+    """Build (or update) the repo-map symbol/reference graph for *repo_root*.
+
+    Walks all source files under *repo_root* (skipping ``node_modules``,
+    ``.git``, ``__pycache__``, virtualenvs, and build outputs), parses each
+    with tree-sitter, extracts definition and call-site symbols, and builds a
+    two-sided graph:
+
+    - ``files``   : ``{file_path: [def_symbol, ...]}``
+    - ``refs``    : ``{def_symbol: {file_path, ...}}``
+
+    Parse results are mtime-cached under
+    ``<leerie_root>/repo-map-cache/<sha256(path)>.pkl`` so that only files
+    whose mtime changed since the last call are re-parsed (the Aider diskcache
+    pattern).  The cache directory is created on first use.
+
+    Returns the ``RepoMap`` dict (always; never raises)."""
+    import pickle  # noqa: PLC0415
+    import hashlib  # noqa: PLC0415
+
+    cache_dir = leerie_root / REPO_MAP_CACHE_DIR
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cache_dir = None  # cache unavailable; proceed without
+
+    _SKIP_DIRS = frozenset({
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+        ".tox", "dist", "build", ".mypy_cache", ".pytest_cache",
+        ".ruff_cache", "target", "vendor", ".bundle",
+    })
+
+    def _cache_path(abs_path: Path) -> Path | None:
+        if cache_dir is None:
+            return None
+        digest = hashlib.sha256(str(abs_path).encode()).hexdigest()
+        return cache_dir / f"{digest}.pkl"
+
+    def _load_cache(abs_path: Path) -> tuple[list[str], list[str]] | None:
+        cp = _cache_path(abs_path)
+        if cp is None or not cp.exists():
+            return None
+        try:
+            with open(cp, "rb") as fh:
+                entry = pickle.load(fh)  # noqa: S301
+            # Validate the cache entry is still fresh (mtime unchanged)
+            if entry.get("mtime_ns") == abs_path.stat().st_mtime_ns:
+                return entry["defs"], entry["refs"]
+        except Exception:
+            pass
+        return None
+
+    def _save_cache(
+        abs_path: Path,
+        defs: list[str],
+        refs: list[str],
+    ) -> None:
+        cp = _cache_path(abs_path)
+        if cp is None:
+            return
+        try:
+            with open(cp, "wb") as fh:
+                pickle.dump({
+                    "mtime_ns": abs_path.stat().st_mtime_ns,
+                    "defs": defs,
+                    "refs": refs,
+                }, fh, protocol=4)
+        except Exception:
+            pass
+
+    files_map: dict[str, list[str]] = {}   # file → defs
+    refs_map: dict[str, set[str]] = {}     # def_symbol → {files that reference it}
+
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        # Prune skip dirs in-place so os.walk doesn't descend into them
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fname in filenames:
+            abs_path = Path(dirpath) / fname
+            rel = str(abs_path.relative_to(repo_root))
+            cached = _load_cache(abs_path)
+            if cached is not None:
+                defs, file_refs = cached
+            else:
+                defs, file_refs = _parse_repo_file(abs_path)
+                _save_cache(abs_path, defs, file_refs)
+            if not defs and not file_refs:
+                continue
+            files_map[rel] = defs
+            # For each symbol referenced (called) in this file, add this
+            # file as a referencing file for that symbol
+            for sym in file_refs:
+                if sym not in refs_map:
+                    refs_map[sym] = set()
+                refs_map[sym].add(rel)
+
+    return {"files": files_map, "refs": refs_map}
+
+
+def _pagerank(
+    graph: dict[str, set[str]],
+    personalization: dict[str, float],
+    damping: float = 0.85,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> dict[str, float]:
+    """Personalized PageRank on a directed graph (stdlib-only, no networkx).
+
+    *graph*           : node → set of outgoing neighbors.
+    *personalization* : node → preference weight (unnormalized).
+
+    Returns node → rank score (higher = more task-relevant)."""
+    # Collect all nodes (including those only appearing as targets)
+    nodes: set[str] = set(graph.keys())
+    for neighbors in graph.values():
+        nodes.update(neighbors)
+    if not nodes:
+        return {}
+
+    n = len(nodes)
+    total_pref = sum(personalization.values()) or 1.0
+    pref: dict[str, float] = {
+        nd: personalization.get(nd, 0.0) / total_pref for nd in nodes
+    }
+    rank: dict[str, float] = {nd: 1.0 / n for nd in nodes}
+    dangling: set[str] = {
+        nd for nd in nodes if nd not in graph or not graph[nd]
+    }
+
+    for _ in range(max_iter):
+        dangling_sum = damping * sum(rank[nd] for nd in dangling) / n
+        new_rank: dict[str, float] = {}
+        for nd in nodes:
+            in_score = sum(
+                rank[src] / len(graph[src])
+                for src in nodes
+                if src in graph and nd in graph[src] and graph[src]
+            )
+            new_rank[nd] = (
+                damping * in_score
+                + dangling_sum
+                + (1.0 - damping) * pref.get(nd, 0.0)
+            )
+        err = sum(abs(new_rank[nd] - rank[nd]) for nd in nodes)
+        rank = new_rank
+        if err < tol:
+            break
+    return rank
+
+
+def _render_repo_map_subgraph(
+    repo_map: dict,
+    ranked_files: list[tuple[str, float]],
+    max_files: int,
+) -> str:
+    """Render the top *max_files* files from *ranked_files* as a compact
+    text block: one line per file listing its defined symbols.
+
+    Symbols are shown as a comma-separated list.  The format is:
+
+        path/to/file.py: SymA, SymB, SymC
+
+    Files with no defs are omitted.  Top-ranked files appear first (highest
+    score → most task-relevant); per the recency-bias principle, the most
+    relevant entries appear at the beginning of the block."""
+    files_map: dict[str, list[str]] = repo_map["files"]
+    lines: list[str] = []
+    for rel, _score in ranked_files[:max_files]:
+        syms = files_map.get(rel)
+        if not syms:
+            continue
+        lines.append(f"{rel}: {', '.join(syms[:30])}")
+    return "\n".join(lines)
+
+
+def _count_tokens_approx(text: str) -> int:
+    """Approximate token count: ~4 bytes per token (GPT/Claude typical)."""
+    return max(1, len(text.encode()) // 4)
+
+
+def rank_repo_map(
+    repo_map: dict,
+    seed_files: list[str],
+    seed_symbols: list[str],
+    token_budget: int | None = None,
+) -> str:
+    """Run personalized PageRank on *repo_map* biased toward *seed_files* and
+    *seed_symbols*, and return a compact ranked-subgraph text string that fits
+    within *token_budget* tokens.
+
+    The subgraph is binary-searched to fit the budget: start with all ranked
+    files, halve max_files until the rendered text fits, then return the
+    largest budget-fitting slice.
+
+    When *token_budget* is ``None``, uses ``DEFAULT_CAPS["repo_map_tokens"]``.
+
+    Returns an empty string when the repo-map is empty or no seed is given
+    and the whole map is empty."""
+    if token_budget is None:
+        token_budget = DEFAULT_CAPS["repo_map_tokens"]
+
+    files_map: dict[str, list[str]] = repo_map.get("files", {})
+    refs_map: dict[str, set[str]] = repo_map.get("refs", {})
+
+    if not files_map:
+        return ""
+
+    # Build a file→file edge graph via shared symbols:
+    # file A → file B when a symbol defined in A is referenced in B
+    # (A is a callee; B is a caller).  This direction means high-in-degree
+    # nodes are widely-used utilities — biasing toward them surfaces the
+    # structural backbone of the task neighborhood.
+    graph: dict[str, set[str]] = {}
+    # Reverse map: def_symbol → file that defines it
+    def_to_file: dict[str, str] = {}
+    for rel, syms in files_map.items():
+        for sym in syms:
+            def_to_file[sym] = rel
+
+    for sym, referencing_files in refs_map.items():
+        definer = def_to_file.get(sym)
+        if definer is None:
+            continue
+        # Edge: definer → each referencing file (definer is called by them)
+        if definer not in graph:
+            graph[definer] = set()
+        for ref_file in referencing_files:
+            if ref_file != definer:
+                graph[definer].add(ref_file)
+
+    # Ensure every file appears as a node (even isolated ones)
+    for rel in files_map:
+        if rel not in graph:
+            graph[rel] = set()
+
+    # Build personalization dict: seed files and files containing seed symbols
+    pref: dict[str, float] = {}
+    seed_set = set(seed_files)
+    for rel in files_map:
+        if rel in seed_set:
+            pref[rel] = pref.get(rel, 0.0) + 1.0
+    for sym in seed_symbols:
+        definer = def_to_file.get(sym)
+        if definer and definer in files_map:
+            pref[definer] = pref.get(definer, 0.0) + 1.0
+        # Also weight files that *reference* the seed symbol
+        for ref_file in refs_map.get(sym, set()):
+            if ref_file in files_map:
+                pref[ref_file] = pref.get(ref_file, 0.0) + 0.5
+
+    # Fall back to uniform personalization when no seed resolves
+    if not pref:
+        pref = {rel: 1.0 for rel in files_map}
+
+    ranks = _pagerank(graph, pref)
+
+    # Sort files by rank descending (most relevant first)
+    ranked_files: list[tuple[str, float]] = sorted(
+        ((rel, ranks.get(rel, 0.0)) for rel in files_map),
+        key=lambda x: -x[1],
+    )
+
+    # Binary-search the largest file count that fits within the token budget.
+    # Start with all files, then binary-search downward.
+    total = len(ranked_files)
+    if total == 0:
+        return ""
+
+    lo, hi = 1, total
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _render_repo_map_subgraph(repo_map, ranked_files, mid)
+        if _count_tokens_approx(candidate) <= token_budget:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best
+
+
 def validate_plan(subtasks: dict) -> None:
     """Structural validation of the merged plan — pure Python set operations.
 
