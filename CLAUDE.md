@@ -644,6 +644,14 @@ guard terminates after `decompose_noprogress_rounds`, migration path uses
 `partition_files` not the splitter LLM, `st.bump_workers` called before every
 `claude_p`); it also carries a parallel set of structural `partition_files`
 tests for regression coverage within that file.
+`tests/test_recursive_decompose_schedule.py` is the integration test for the
+seam between Layer B and the existing scheduler (DESIGN §P1 end-of-pipeline
+claim): leaf ids from `recursive_decompose` carry a valid domain prefix so
+`schedule()` cross-domain wiring and `validate_plan`'s id-prefix check both
+pass; a ready plan built from stubbed leaves feeds `schedule()` and produces
+the correct topo-sorted wave partition (independent leaves in wave 0, a
+dependent leaf in wave 1); and `validate_plan` accepts the full leaf set
+without errors.
 The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
 pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 `decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
