@@ -142,8 +142,9 @@ DEFAULT_CAPS = {
     # promoting a prompt-governed limit to a code guarantee.
     "confidence_rounds": 8,
     # Per-worker cgroup memory cap (bytes). Each `claude -p` worker is
-    # enrolled (by the root cgroup broker — see scripts/cgroup-broker.py and
-    # DESIGN §6, because non-root enrollment cannot work) in its own child
+    # enrolled (by the cgroup broker — see scripts/cgroup-broker.py and
+    # DESIGN §6, because the dropped-privilege orchestrator can't enroll
+    # workers or set controller limits itself) in its own child
     # cgroup `leerie-w-<sid>` under leerie.slice on both runtimes, and the
     # broker sets the cgroup's memory.max to this value. When a worker's tool
     # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
@@ -571,7 +572,9 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # --dangerously-allow-uncapped bypass (DESIGN §6 *Memory containment*).
 # By default, if the cgroup broker probe fails (broker down, no usable cgroup
 # hierarchy — neither a v2 unified mount nor v1 pids+memory controller mounts —
-# read-only cgroupfs, or rootless containerd which can't enforce containment),
+# read-only cgroupfs, or a rootless host whose systemd doesn't delegate
+# pids+memory into the per-session user slice — non-systemd init, or an
+# older/overridden delegation config; DESIGN §6 *Rootless exception*),
 # leerie die()s before the first worker rather than run workers uncapped — a
 # silently-uncapped run is what
 # let a conformer's runaway subtree exhaust the VM thread table (the Bun
@@ -7934,7 +7937,7 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
     return running, in_conformer, done, completed + 1, len(waves)
 
 
-# --- cgroup containment for worker subtrees (via the root broker) --------
+# --- cgroup containment for worker subtrees (via the cgroup broker) ------
 # Each `claude -p` worker (and every descendant it forks: bash children,
 # vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
 # cgroup `leerie-w-<sid>`. The cgroup's memory.max and pids.max bound how
@@ -7945,18 +7948,24 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # DESIGN §6 Worker subtree termination, AND for the thread/PID-table
 # exhaustion crash (Bun EAGAIN) that motivated the broker.
 #
-# THE BROKER, AND WHY (reproduced live — see DESIGN §6). The orchestrator
-# runs as non-root leerie, and cgroup enforcement CANNOT be done from
-# non-root code:
+# THE BROKER, AND WHY (reproduced live — see DESIGN §6). Cgroup enforcement
+# must be done by an identity that owns (or was delegated) the relevant
+# subtree, not by the dropped-privilege orchestrator (non-root leerie
+# rootful; a nested-userns-remapped identity rootless):
 #   1. Migrating a task into a cgroup needs write on `cgroup.procs` of the
 #      destination, the source, AND their common ancestor. Workers are born
-#      in the root-owned container scope; moving them into `leerie.slice`
-#      crosses the root cgroup, which leerie doesn't own → EACCES/EIO.
-#   2. Even inside a properly delegated subtree the kernel keeps controller
-#      limit files (`pids.max`, `memory.max`) root-owned.
-# So `scripts/cgroup-broker.py` runs as root (launched by container-entry.sh
-# at PID 1 before the privilege drop) and performs create/enroll/destroy on
-# the orchestrator's behalf over a Unix socket. It also handles cgroup v1
+#      in the container-runtime-owned scope; moving them into `leerie.slice`
+#      crosses a cgroup the leerie user doesn't own → EACCES/EIO.
+#   2. In the rootful case, even inside a delegated subtree the kernel keeps
+#      controller limit files (`pids.max`, `memory.max`) owned by root when
+#      the subtree was merely chowned rather than created by the delegatee —
+#      so the leerie user can organize processes but not set limits.
+# So `scripts/cgroup-broker.py` runs at that owning identity — real root
+# rootful, the rootlesskit-mapped host UID rootless (which owns the
+# systemd-delegated user slice; DESIGN §6 *Rootless exception*) — launched by
+# container-entry.sh at PID 1 before the privilege drop, and performs
+# create/enroll/destroy on the orchestrator's behalf over a Unix socket. It
+# handles cgroup v1
 # (Fly Firecracker VMs are v1/hybrid) vs v2 (Colima) transparently. The
 # functions below are thin socket clients; the public names/signatures are
 # unchanged so `_invoke`'s call sites are untouched, except `_cgroup_create`
@@ -7968,7 +7977,7 @@ _CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
 
 
 def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
-    """Send one request to the root broker and return its response line
+    """Send one request to the cgroup broker and return its response line
     (without trailing newline). Raises OSError if the broker is
     unreachable or the round-trip fails."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -7980,7 +7989,7 @@ def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
 
 def _cgroup_probe() -> bool:
     """Once-per-run probe, memoized in `_CGROUP_PROBE_RESULT`: does the
-    root broker exist AND can it round-trip a create+enroll+destroy of a
+    cgroup broker exist AND can it round-trip a create+enroll+destroy of a
     throwaway cgroup? This is the true test of the path workers use — the
     old direct-write probe passed on hosts where non-root enrollment
     actually fails (the bug this replaced). A passing probe records the
@@ -8090,7 +8099,7 @@ def enforce_and_record_cgroup_containment(st: "State",
     """Fail-closed containment gate + state recording, run once per run
     just before the first worker spawns (DESIGN §6 *Memory containment*).
 
-    Probes the root broker end-to-end (create+enroll+destroy round-trip),
+    Probes the cgroup broker end-to-end (create+enroll+destroy round-trip),
     records `{enforced, hierarchy}` into `st.data` (merges — `st.data` is
     already loaded/seeded by the time this runs), then `die()`s if
     containment can't be enabled — unless the operator explicitly waived
@@ -8128,11 +8137,13 @@ def enforce_and_record_cgroup_containment(st: "State",
         return
     die("worker cgroup containment could not be enabled — workers would "
         "run uncapped and a runaway subtree can exhaust the VM thread/PID "
-        "table (the Bun EAGAIN crash). The root cgroup broker "
+        "table (the Bun EAGAIN crash). The cgroup broker "
         "(scripts/cgroup-broker.py, launched by container-entry.sh at "
         "PID 1) is down, or this host has no usable cgroup hierarchy / "
-        "read-only cgroupfs (including rootless containerd, which cannot "
-        "enforce containment). See docs/INSTALL.md (cgroup delegation). "
+        "read-only cgroupfs. On rootless containerd this fires only when "
+        "the host's systemd doesn't delegate pids+memory into the "
+        "per-session user slice (non-systemd init, or an older/overridden "
+        "delegation config). See docs/INSTALL.md (cgroup delegation). "
         "To run anyway without containment, pass --dangerously-allow-uncapped "
         f"(or set {DANGEROUS_ALLOW_UNCAPPED_ENV}=1).")
 
@@ -8216,7 +8227,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # operational chatter and stays gated.
     if verbosity != "quiet":
         log(f"  [{sid}] spawned (pid={proc.pid})")
-    # cgroup containment: ask the root broker to create the worker cgroup
+    # cgroup containment: ask the cgroup broker to create the worker cgroup
     # and enroll the worker (and every descendant it forks — the kernel
     # propagates cgroup membership down the process tree). These are
     # synchronous socket round-trips to the broker made directly in this
@@ -17821,8 +17832,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "containment could not be enabled (cgroup broker "
                          "down, no usable cgroup hierarchy — neither a v2 "
                          "unified mount nor v1 pids+memory controller mounts "
-                         "— read-only cgroupfs, or rootless containerd, which "
-                         "cannot enforce containment). Default is to die() "
+                         "— read-only cgroupfs, or a rootless host whose "
+                         "systemd doesn't delegate pids+memory into the "
+                         "per-session user slice). Default is to die() "
                          "before the first worker — silently-uncapped workers "
                          "can exhaust the VM thread/PID table (DESIGN §6 "
                          "Memory containment). This downgrades that fatal gate "

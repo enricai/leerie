@@ -4057,7 +4057,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
     # End the apt layer with the image still at USER root. Do NOT append a
     # trailing `USER leerie`: the base image's ENTRYPOINT (container-entry.sh)
     # is inherited here and MUST run as PID-1 root to set up cgroup containment
-    # and launch the root broker before dropping to leerie via `runuser` (see
+    # and launch the cgroup broker before dropping to leerie via `runuser` (see
     # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
     # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
     # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
@@ -5955,7 +5955,12 @@ else
   # --cgroupns=host is required alongside the bind-mount: nerdctl's
   # default --cgroupns=private + nsdelegate on the cgroupfs mount
   # blocks non-root process migration to cgroup.procs (the kernel
-  # treats the namespace boundary as a delegation boundary).
+  # treats the namespace boundary as a delegation boundary). It is also
+  # load-bearing for the rootless delegated path (DESIGN §6 *Rootless
+  # exception*): only with cgroupns=host does the container see the true
+  # host cgroup tree at its real path, so the absolute
+  # /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/ slice
+  # that container-entry.sh anchors leerie.slice under actually resolves.
   # If the host doesn't have cgroup v2 (kernel <5.x or unified hier
   # disabled) the bind-mount no-ops cleanly and the orchestrator's
   # _cgroup_probe returns False, falling back to the pre-fix

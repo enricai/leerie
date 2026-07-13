@@ -334,7 +334,11 @@ def _handle(line: str) -> str:
 def main() -> int:
     global _HIER
     _HIER = _detect()
-    _log(f"hierarchy={_HIER}")
+    # Emit V2_ROOT so a rootless bug report can distinguish "v2 at the
+    # systemd-delegated user slice" from "v2 at the top-level cgroupfs" —
+    # the whole rootless path is best-effort, so this is the only positive
+    # signal of which root the broker actually operated under.
+    _log(f"hierarchy={_HIER} v2_root={V2_ROOT}")
 
     if os.path.exists(SOCK_PATH):
         os.unlink(SOCK_PATH)

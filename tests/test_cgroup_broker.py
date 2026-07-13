@@ -1,6 +1,6 @@
-"""Tests for the root cgroup broker (`scripts/cgroup-broker.py`).
+"""Tests for the cgroup broker (`scripts/cgroup-broker.py`).
 
-The broker is the single root-privileged surface in the worker
+The broker is the single most-privileged surface in the worker
 containment path (DESIGN §6 *Memory containment*), so its input
 validation and protocol dispatch are security-relevant and pinned here.
 We import the broker module and point its `V2_ROOT` at a tmp directory

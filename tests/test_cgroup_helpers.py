@@ -2,12 +2,13 @@
 
 Since the containment fix, these helpers (`_cgroup_probe`,
 `_cgroup_create`, `_cgroup_enroll`, `_cgroup_destroy` in
-`orchestrator/leerie.py`) are thin clients of the root cgroup broker
+`orchestrator/leerie.py`) are thin clients of the cgroup broker
 (`scripts/cgroup-broker.py`): they send a text request over a Unix
 socket and act on the response. The direct cgroupfs writes moved to the
-broker, which runs as root — the only privilege level where cgroup
-enrollment / limit-setting works (see DESIGN §6 *Memory containment* and
-the reproduced non-root delegation constraint).
+broker, which runs at an identity that owns (or was delegated) the cgroup
+subtree — real root rootful, the rootlesskit-mapped host UID rootless —
+the only identities where cgroup enrollment / limit-setting works (see
+DESIGN §6 *Memory containment* and the reproduced delegation constraint).
 
 So these tests mock `_cgroup_request` (the socket round-trip) and pin the
 client contracts:
