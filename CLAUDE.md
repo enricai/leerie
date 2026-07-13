@@ -671,6 +671,17 @@ in `tests/test_check_functions.py` (G3:
 but the graph is empty, stays quiet for a non-code repo). `tests/test_repo_map.py`
 now carries a `HAS_TREESITTER` module skip gate (G4) mirroring
 `test_build_repo_map.py`.
+`_tree_sitter_extraction_works()` itself — the functional probe the G4/G6
+skip gates and degrade warning both delegate to — is pinned directly in
+`tests/test_tree_sitter_probe.py`: the True branch (real, unstubbed
+`_parse_repo_file` on a working tree-sitter host) is gated on
+`HAS_TREESITTER` so it skips rather than fails on an incompatible host;
+the two False branches — `_parse_repo_file` raising (simulates an
+installed-but-incompatible language-pack version lacking `process()`) and
+`_parse_repo_file` returning `([], [])` (extracts nothing) — are
+host-independent and always run, since they are the load-bearing proof
+that the probe fails closed regardless of the local tree-sitter install
+state.
 The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
 pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 `decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
