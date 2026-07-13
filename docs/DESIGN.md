@@ -204,16 +204,22 @@ so much more conceptually involved than its siblings that batching it with them
 degrades the plan for everything else — the case where the right move is to
 isolate it into its own subtask cluster rather than split it or leave it. The
 planner prompt asks for exactly this judgment (§2). It is **not** backed by a
-code check, and that is a considered decision, not an omission: file count — and
-every other mechanical proxy tested against the real plan corpus (planner
-text-length, `requires`/`provides` fan-out, text-per-file density, across a full
-threshold sweep) — cannot separate a genuinely dilutive subtask from a
-legitimately batched migration sweep. The best achievable signal still
-misclassifies a large fraction of legitimate batched sweeps as dilution. Per §12, a signal that cannot
-be checked mechanically without misfiring belongs in the prompt, not in code, so
-no `validate_plan` reject or `DEFAULT_CAPS` threshold is added for it. (Contrast
-`UNCOVERED_MIGRATION_SURFACE`, which *is* a code check because migration coverage
-*is* mechanically countable.)
+code check, and that is a considered decision, not an omission: **sizing is the
+wrong variable — fit is the variable.** Two independent studies (Stanford/Microsoft:
+30× intrinsic same-task token variance; BAGEN: 47% estimation ceiling) plus our
+own estimator confirm that no pre-execution size predictor achieves useful
+precision. File count, planner text-length, `requires`/`provides` fan-out, and
+text-per-file density all fail the same way — they are proxies for a quantity
+(turn count) that cannot be predicted. What *can* be judged is *Task-Context
+Fit*: whether a subtask's scope and context are co-minimized (minimum necessary
+complexity, maximum relevance). That judgment is tractable; size prediction is
+not. Per §12, a signal that cannot be checked mechanically without misfiring
+belongs in the prompt, not in code, so no `validate_plan` reject or
+`DEFAULT_CAPS` threshold is added for it. The structural mechanism that gives
+the planner the codebase knowledge needed to make this judgment well — and the
+recursive fit-judge that replaces the self-scored `decomposition_quality` axis
+— is described in §5½. (Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a
+code check because migration coverage *is* mechanically countable.)
 
 ### Cross-domain dependencies
 
@@ -588,91 +594,122 @@ the dependency is satisfied in the filesystem the dependent subtask starts from.
 
 ---
 
-## §P6. Codebase structural map
+## 5½. ENRIC grounding — codebase-structural decomposition (P6 + P1)
 
-*Status: planned — config scaffolding (DEFAULT_CAPS, STATE_FIELDS,
-`resolve_skip_repo_map`) landed in the first wave; feature implementation
-(`build_repo_map`, `rank_repo_map`, planner/splitter injection) is the next
-wave.*
+Leerie's planner is a judgment worker: it reads a task description and a
+light grep/glob seed of the codebase, then decomposes. The weakness of that
+baseline is structural: an LLM instructed to "investigate the repo" in a prompt
+forms shallow, prompt-driven splits. The ENRIC framework identifies two
+principles that close this gap — P6 (questions shaped by the codebase itself)
+and P1 (Task-Context Fit as the sizing variable) — and telemetry over 200 runs
+confirms exactly this failure: 20% of runs exhaust the implementer's context
+budget mid-execution, 84% of those concentrated in migration sweeps where the
+planner packed 30–65 files into one subtask.
 
-Leerie's planner today uses ad-hoc grep/glob to investigate the repository.
-This works for well-separated, self-describing layouts but produces shallow
-splits on migration-heavy workloads (e.g. a 64-file date-format sweep) where
-the planner cannot see the full file surface or its dependency structure
-before decomposing.
+### P6 — codebase structural map (foundation)
 
-**P6 (foundation): give the planner real codebase structure.**
+P6's thesis: decomposition quality comes from the system *knowing* the codebase
+before the LLM acts, so shallow splits are structurally impossible. The
+mechanism is a **repo-map** — a tree-sitter symbol/reference graph computed
+once and mtime-cached at `<state-root>/repo-map-cache/`.
 
-1. **`build_repo_map(repo_root) → RepoMap`** — deterministic, mtime-cached.
-   Uses tree-sitter tag extraction (defs/refs/signatures per source file,
-   multi-language via prebuilt parsers; `universal-ctags`/`ast-grep` fallback
-   for long-tail languages). Cache keyed by file mtime at
-   `<state-root>/repo-map-cache/` (constant `REPO_MAP_CACHE_DIR`) so only
-   changed files re-parse. Measured on navegando: 4 ms/file, 450-node graph,
-   PageRank ranked 13/15 task-relevant symbols in 0.92 s.
-2. **`rank_repo_map(repo_map, seed_files, seed_symbols) → ranked_subgraph`** —
-   personalized PageRank biased toward the current task/subtask's
-   files+symbols. Emits a k-hop ego-graph, binary-searched to fit a token
-   budget (`DEFAULT_CAPS["repo_map_tokens"]` ≈ 1 000), with the most
-   task-relevant symbols placed at prompt extremes (lost-in-the-middle
-   mitigation).
-3. **Inject into planning context.** The ranked subgraph enriches the planner
-   `ctx` and the splitter, re-ranked per node's files. This generalises the
-   existing `extract_task_file_structure` seed.
+**`build_repo_map(repo_root) → RepoMap`** extracts definitions, references,
+and signatures per source file via tree-sitter `tags.scm` queries (multi-language
+via prebuilt parsers; `universal-ctags`/`ast-grep` fallback for long-tail
+languages). It builds a file/symbol reference graph (defs→refs edges), caching
+by file mtime so only changed files re-parse. Measured on a real Python repo:
+4 ms/file, 450-node graph, warm re-parse negligible.
 
-**Skip toggle.** `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` /
-`skip_repo_map` in `leerie.toml` (resolved by `resolve_skip_repo_map`,
-state field `skip_repo_map`). When set, `build_repo_map()` is not called and
-the planner degrades gracefully to the prior grep/glob-only path. Default: off.
+**`rank_repo_map(repo_map, seed_files, seed_symbols) → ranked_subgraph`** runs
+personalized PageRank biased toward the current task's files and symbols,
+emits a k-hop ego-graph, and binary-search-fits the result to a token budget
+(default ~1 k tokens, a new `DEFAULT_CAPS["repo_map_tokens"]` entry), ranking
+top symbols at prompt extremes for recency bias. Measured: 13/15 task-relevant
+symbols in the top-ranked subgraph in 0.92 s on a 450-node graph.
 
----
+The ranked subgraph is injected into the planner context (and, per subtask, into
+the splitter, re-ranked to each node's files). This generalizes the existing
+`extract_task_file_structure` seed — P6 is a structurally richer version of
+what leerie already does in embryo. A `--skip-repo-map` flag
+(`LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml`) degrades to the
+current grep/glob-only planner for repos where tree-sitter cannot parse.
 
-## §P1. Recursive judge + splitter
+### P1 — recursive fit-judge (mechanism)
 
-*Status: planned — config scaffolding (DEFAULT_CAPS thresholds/depths,
-STATE_FIELDS) landed in the first wave; feature implementation
-(`fit_judge` worker, `splitter` worker, `recursive_decompose`) is the next
-wave.*
+P1's thesis: *size is irrelevant; fit is the variable.* A subtask is correctly
+decomposed when its scope and context are co-minimized — not when it is under N
+files. That is a **judgment**, which is tractable; size prediction (§5) is not.
 
-After first-pass decomposition (§5), subtasks that are too broad are split
-recursively until each leaf passes the P1 Task-Context Fit criterion: minimum
-necessary complexity, maximum relevance. Fit is *judged*, not predicted (no
-pre-execution size estimator works — 30× intrinsic token variance, BAGEN 47%
-estimation ceiling).
+**`fit_judge` worker** scores one subtask's Task-Context Fit as a confidence
+0–1 (plus a rationale and a "what is diffuse" field). It is read-only
+(`INSPECT_TOOLS`), fed the subtask spec plus its P6-ranked subgraph. The rubric
+is P1 (co-minimized scope and context) plus leerie's "single verifiable unit /
+one conceptual thing" criterion.
 
-**Mechanism.**
+*Measured discriminating power*: on 24 telemetry-labeled subtasks, oversized
+subtasks scored a mean of 0.26, well-fit subtasks a mean of 0.84 — a 0.57
+separation, 88% accuracy at a **0.70 threshold**
+(`DEFAULT_CAPS["decompose_fit_threshold"] = 0.70`). The originally-planned 0.95
+threshold over-split 100% of well-fit subtasks (their scores sit at 0.82–0.93);
+0.70 was empirically selected, not assumed.
 
-1. **`SCHEMAS["fit_judge"]`** — scores one subtask's P1 Task-Context Fit as a
-   confidence 0–1 (+ rationale). Read-only (`INSPECT_TOOLS`), fed the subtask
-   spec + its P6 ranked subgraph. Rubric = P1 co-minimized scope+context.
-   *Measured on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs
-   well-fit mean 0.84 — 0.57 separation, 88% accuracy at threshold 0.70.*
-2. **`SCHEMAS["splitter"]`** — code partitions for migration-heavy subtasks
-   (deterministic chunker, 100% coverage by construction, LLM only titles +
-   writes criteria); LLM splits for structurally-coupled subtasks (backstopped
-   by the existing `UNCOVERED_MIGRATION_SURFACE` check).
-3. **`recursive_decompose(subtask, depth) → list[leaf_subtasks]`**:
-   - `conf = fit_judge(subtask)` — if `conf ≥ decompose_fit_threshold` or
-     `depth ≥ decompose_max_depth`, return `[subtask]`.
-   - Otherwise split and recurse.
-   - No-progress guard: `decompose_noprogress_rounds` consecutive rounds with
-     no child improving above parent's score → accept as leaf with warning.
-   - Every judge/split call goes through `st.bump_workers` — a runaway tree
-     hits the worker-cap backstop.
+**Splitter — code partitions, LLM labels.** An unconstrained LLM splitter
+dropped 14 of 29 files in measured testing (silent under-coverage — the §12
+lesson). Migration files are empirically independent: a 29-file sweep had only
+3 import edges and 4/29 coupled pairs — a DAG → embarrassingly parallel. The
+split mechanism therefore separates by structural type:
 
-**Bounds (all in `DEFAULT_CAPS`).**
+- **Migrations (dominant case, 84% of truncations):** `partition_files(exhaustive_list, ~8)`
+  — a *deterministic* chunker that achieves 100% coverage and 0 overlap by
+  construction. The exhaustive file list comes from P6 / `_grep_old_pattern`. A
+  `splitter` worker only **titles and writes success criteria** for each
+  pre-computed chunk; it never decides which files go where.
+- **Coupled minority:** the `splitter` worker emits children along structural seams
+  that the repo-map exposes, backstopped by the existing `UNCOVERED_MIGRATION_SURFACE`
+  check (`_check_migration_surface`) which already rejects any split that fails to
+  cover every file.
 
-| Key | Value | Rationale |
-|---|---|---|
-| `decompose_fit_threshold` | 0.70 | Empirically measured; 0.95 over-splits 100% of well-fit subtasks |
-| `decompose_max_depth` | 5 | 2⁵=32 leaves per subtask; more than enough for 64-file sweeps |
-| `decompose_noprogress_rounds` | 2 | Prevents degenerate splitter from looping to max depth |
-| `repo_map_tokens` | 1000 | ~5% of typical planner context; keeps injection below noise |
+**`recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
 
-**Wire-in.** After each per-category planner returns its first-pass subtasks
-in `phase_plan` (`plan_one`), `recursive_decompose` is run over each; the
-union of all leaves is the flat set fed to the existing path:
-`phase_reconcile` → `phase_overlap_judge` → `schedule()` → `validate_plan`.
+```
+conf = fit_judge(subtask)                         # P1 confidence, measured discriminating
+if conf >= 0.70 or depth >= MAX_DEPTH(5):
+    return [subtask]                              # leaf
+children = split(subtask)                         # code-partition (migration) or
+                                                  # LLM-splitter (coupled)
+for each child: recurse(child, depth + 1)
+# no-progress guard: 2 consecutive rounds where no child's conf rises above
+# the parent's → accept parent as leaf + emit warning
+flatten the tree → leaf subtasks
+```
+
+Bounds: `DEFAULT_CAPS["decompose_max_depth"] = 5`,
+`DEFAULT_CAPS["decompose_fit_threshold"] = 0.70` (measured),
+`DEFAULT_CAPS["decompose_noprogress_rounds"] = 2`. Every judge/split call
+passes through `st.bump_workers` — a runaway tree hits the worker-cap backstop.
+
+### Wire-in to `phase_plan`
+
+After each per-category planner returns its first-pass subtasks, `recursive_decompose`
+runs over each subtask; the union of all leaves is the flat set. The **existing**
+path then continues unchanged: `phase_reconcile` → `phase_overlap_judge` →
+`schedule()` → `validate_plan` → `write_plan` → `phase_execute`. The existing
+self-scored `decomposition_quality` axis is superseded by the independent
+`fit_judge` (removing the self-grading bias BAGEN documents).
+
+The runtime truncation backstop (`_record_run_health` surfacing
+`truncated_worker_count`) is retained: truncation is now rare, but the signal
+remains so that residual cases are observable. A mid-run split path (splitting
+a running subtask) is prototype-validated and available as a future addition;
+build it only if post-ship telemetry shows residual truncation after P6+P1 ships.
+
+### ENRIC principles mapping
+
+Seven ENRIC principles map to leerie. P3, P4, P5, and P7 are already implemented
+(§12 code-enforcement, waves+conformer, parallelize-only-independent,
+`--runtime fly` async). P6 and P1 are the gaps that §5½ closes. P2 (prompt
+discipline) is partially covered by §12's read-only enforcement on judgment
+workers.
 
 ---
 
