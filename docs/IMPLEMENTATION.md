@@ -67,7 +67,7 @@ Current runtime deps:
   (`build_repo_map`). Deliberate exception to the stdlib-preferred
   policy: tree-sitter's mtime-cached symbol/reference graph is the
   structural foundation that prevents shallow planner splits
-  (DESIGN §18 *Future work* — P6 repo-map design pending). Ships a
+  (DESIGN §5½ *P6 — codebase structural map*). Ships a
   prebuilt manylinux wheel; no C build needed.
 - `tree-sitter-language-pack` — prebuilt grammar collection (Python,
   TypeScript, JavaScript, Ruby, Go, Rust, …) for `tree-sitter`. Paired
