@@ -624,10 +624,11 @@ fields (`id`, `title`, `success_criteria_seed`), optional child fields,
 valid/invalid instances, JSON serializability, the same wiring guards, no
 top-level `files` field (splitter never decides partition), and the child
 `requires` array uses the `_REQUIRES_ITEM` shape (tag + extent enum).
-`tests/test_resolve_fit_judge_model.py` covers model and effort resolution for
-`fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from
-`MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both in
-`EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
+`tests/test_resolve_fit_judge_model.py` and
+`tests/test_resolve_fit_judge_splitter_model.py` cover model and effort
+resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent
+from `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both
+in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
 chains; isolation (override doesn't bleed to other workers); structural wiring
 guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
 44 tests across parametrized invariant sweeps (input sizes 0, 1, 8, 29, 64;
