@@ -625,6 +625,12 @@ is a leaf at score ≥ 0.70, oversized subtask recurses then children are judged
 depth cap terminates at `decompose_max_depth`, no-progress guard terminates
 after `decompose_noprogress_rounds`, migration path uses `partition_files` not
 the splitter LLM, `st.bump_workers` called before every `claude_p`).
+The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
+pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
+`decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
+citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
+well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
+`test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
