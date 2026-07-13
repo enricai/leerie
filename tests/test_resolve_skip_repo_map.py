@@ -32,10 +32,18 @@ def test_cli_flag_wins(leerie, repo_root, monkeypatch):
         repo_root, cli_value=True) is True
 
 
-def test_env_set_true(leerie, repo_root, monkeypatch):
-    monkeypatch.setenv("LEERIE_SKIP_REPO_MAP", "1")
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_env_set_true(leerie, repo_root, monkeypatch, value):
+    monkeypatch.setenv("LEERIE_SKIP_REPO_MAP", value)
     assert leerie.resolve_skip_repo_map(
         repo_root, cli_value=False) is True
+
+
+@pytest.mark.parametrize("value", ["0", "false"])
+def test_env_set_false(leerie, repo_root, monkeypatch, value):
+    monkeypatch.setenv("LEERIE_SKIP_REPO_MAP", value)
+    assert leerie.resolve_skip_repo_map(
+        repo_root, cli_value=False) is False
 
 
 def test_file_set_true_no_env(leerie, repo_root):
