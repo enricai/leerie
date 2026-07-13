@@ -673,6 +673,14 @@ seed_files from `task_file_items` respected); skip path (ctx omits `repo_map`,
 baseline keys present, values match inputs); empty-repo degrade (`rank_repo_map`
 returns `""` → key omitted); exception-swallow degrade (`build_repo_map`
 raises → exception caught, ctx emitted without `repo_map`).
+The P1 Layer C wiring — `phase_plan` recursion expansion — is tested in
+`tests/test_phase_plan_recursion_wiring.py`: source-coupling guard (`phase_plan`
+source contains `recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`,
+expansion loop precedes final logging); integration — one oversized subtask (stubbed
+`recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two
+first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
+leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
+empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

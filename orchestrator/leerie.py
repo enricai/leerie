@@ -11164,6 +11164,20 @@ async def phase_plan(task: str, st: State, caps: dict,
                 samples, repo_root, c)
             plans.append(best)
 
+    # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
+    # counts from the planner level, not from inside recursive_decompose itself.
+    log("  expanding subtasks via recursive_decompose (P1 Layer C)")
+    for plan in plans:
+        first_pass = plan.get("subtasks", [])
+        if not first_pass:
+            continue
+        leaves: list[dict] = []
+        for subtask in first_pass:
+            expanded = await recursive_decompose(
+                subtask, 0, st, caps, models, efforts, repo_root)
+            leaves.extend(expanded)
+        plan["subtasks"] = leaves
+
     for category, plan in zip(cats, plans):
         n = len(plan.get("subtasks", []))
         status = plan.get("status", "ready")
