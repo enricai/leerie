@@ -142,6 +142,37 @@ def test_splitter_rejects_missing_children_field(leerie):
         jsonschema.validate({}, leerie.SCHEMAS["splitter"])
 
 
+# --- files field not required (splitter never decides partition) -----------
+
+def test_splitter_no_top_level_files_required(leerie):
+    """The splitter schema must NOT require a top-level files field.
+
+    Migration path: partition_files() (code) computes the partition; the
+    splitter LLM only labels pre-computed chunks.  Requiring files at the
+    top level would grant the model file-selection authority that DESIGN §P1
+    explicitly removes from it.
+    """
+    schema = leerie.SCHEMAS["splitter"]
+    assert "files" not in schema.get("required", [])
+    assert "files" not in schema.get("properties", {})
+
+
+def test_splitter_child_requires_item_shape(leerie):
+    """The requires field on each child uses the standard _REQUIRES_ITEM shape
+    (tag + extent enum).  Ensures the child schema reuses the shared contract
+    rather than a weaker free-form object.
+    """
+    item = leerie.SCHEMAS["splitter"]["properties"]["children"]["items"]
+    requires_prop = item.get("properties", {}).get("requires", {})
+    assert requires_prop.get("type") == "array"
+    item_schema = requires_prop.get("items", {})
+    assert item_schema.get("type") == "object"
+    assert "tag" in item_schema.get("required", [])
+    assert "extent" in item_schema.get("required", [])
+    extent_prop = item_schema.get("properties", {}).get("extent", {})
+    assert "enum" in extent_prop, "extent must be an enum (in_plan / external)"
+
+
 # --- JSON serializability ---------------------------------------------------
 
 def test_splitter_schema_is_json_serializable(leerie):
