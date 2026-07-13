@@ -631,6 +631,13 @@ pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
 well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
 `test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
+The P6 Layer A wiring — `phase_plan` ctx injection — is tested in
+`tests/test_phase_plan_repo_map_ctx.py`: repo-map enabled path (ctx contains
+`repo_map` string, non-empty, JSON-serializable, contains known symbol names,
+seed_files from `task_file_items` respected); skip path (ctx omits `repo_map`,
+baseline keys present, values match inputs); empty-repo degrade (`rank_repo_map`
+returns `""` → key omitted); exception-swallow degrade (`build_repo_map`
+raises → exception caught, ctx emitted without `repo_map`).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
