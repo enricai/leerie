@@ -186,10 +186,16 @@ def test_fit_judge_rejects_missing_score(leerie):
         )
 
 
-# --- JSON serializability ---------------------------------------------------
+# --- JSON serializability and round-trip ------------------------------------
 
 def test_fit_judge_schema_is_json_serializable(leerie):
     json.dumps(leerie.SCHEMAS["fit_judge"])
+
+
+def test_fit_judge_schema_round_trips(leerie):
+    """Schema survives json.dumps → json.loads with identical content."""
+    schema = leerie.SCHEMAS["fit_judge"]
+    assert json.loads(json.dumps(schema)) == schema
 
 
 # --- wiring checks ----------------------------------------------------------
