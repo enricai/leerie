@@ -1536,14 +1536,17 @@ orchestrator write the cgroupfs directly. It appeared to work but did
 not: the direct-write probe passed while the actual per-worker enroll
 silently failed on both runtimes, so every worker ran uncapped.
 
-The fix is a **root cgroup broker** (`scripts/cgroup-broker.py`).
-`scripts/container-entry.sh` is PID 1 and runs as root (the Dockerfile
-intentionally omits `USER leerie`); *before the privilege drop* it
-launches the broker, which listens on a Unix socket at
+The fix is a **cgroup broker** (`scripts/cgroup-broker.py`).
+`scripts/container-entry.sh` is PID 1 (the Dockerfile intentionally omits
+`USER leerie`); *before the privilege drop* it launches the broker at the
+identity that owns (or was delegated) the slice — real root in the rootful
+case (Colima, Fly), the rootlesskit-mapped host UID in the rootless case
+(which owns the systemd-delegated user slice; see *Rootless exception*
+below). The broker listens on a Unix socket at
 `/run/leerie-cgroup.sock` (world-connectable; every request is
-validated). The broker performs `create` / `enroll` / `destroy` as root
-— the only privilege level where enrollment and limit-setting work — and
-detects the cgroup hierarchy: **v2** (Colima) uses the unified
+validated). It performs `create` / `enroll` / `destroy` at that owning
+identity — the only identities where enrollment and limit-setting work —
+and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
 on Fly Firecracker VMs, whose unified mount exposes no controllers) uses
 the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,

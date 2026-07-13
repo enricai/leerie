@@ -290,11 +290,14 @@ Base layers (top-down):
   risk from `su leerie -c "git config --global"` and matches the posture
   of every major CI image.
 - `WORKDIR /work`, `ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]`.
-  **No `USER leerie` directive** — ENTRYPOINT runs as root so the
-  entrypoint can create the `/sys/fs/cgroup/leerie.slice` cgroup and
-  launch the **root cgroup broker** (which performs per-worker
-  enrollment/limit-setting that non-root code cannot) before dropping
-  privilege via `runuser -u leerie -- ...` to invoke the orchestrator.
+  **No `USER leerie` directive** — ENTRYPOINT runs as PID 1 at the
+  slice-owning identity (real root rootful; the rootlesskit-mapped host
+  UID rootless) so the entrypoint can create the
+  `/sys/fs/cgroup/leerie.slice` cgroup and launch the **cgroup broker**
+  (which performs per-worker enrollment/limit-setting the dropped-privilege
+  orchestrator cannot) before dropping privilege via
+  `runuser -u leerie -- ...` to invoke the orchestrator (the `runuser`
+  drop is skipped in rootless mode — DESIGN §6 *Rootless exception*).
   See DESIGN §6 *Memory containment* for the full mechanism.
 
 ### Per-repo derived image (local nerdctl)
@@ -963,9 +966,9 @@ leerie/
 │   │                              the local-runtime post-run path in leerie,
 │   │                              decide_teardown's Fly clean-exit branch, and
 │   │                              `leerie --finalize <run-id>` (§7 Host-side finalize)
-│   ├── cgroup-broker.py           root-privileged cgroup broker (create/enroll/destroy over a Unix socket; v1+v2); the non-root orchestrator drives it
+│   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a Unix socket; v1+v2); the dropped-privilege orchestrator drives it
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
-│   ├── container-entry.sh         container PID 1 (root): create leerie.slice + launch root cgroup broker + cd /work + drop to leerie via runuser
+│   ├── container-entry.sh         container PID 1 (root rootful / mapped-UID rootless): create leerie.slice + launch cgroup broker + cd /work + drop to leerie via runuser (rootful)
 │   ├── install.sh                 one-command installer (curl | bash); preflight git/claude/curl +
 │   │                               runtime preflight (colima / nerdctl) + clones + symlinks
 │   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS;
@@ -1327,8 +1330,9 @@ is engaged.
 ### Containment override (dangerous)
 
 Worker cgroup containment (DESIGN §6 *Memory containment*) is enforced by
-a root broker (`scripts/cgroup-broker.py`); the orchestrator can neither
-enroll workers nor set their limits itself. Just before the first worker
+a cgroup broker (`scripts/cgroup-broker.py`) running at the slice-owning
+identity; the dropped-privilege orchestrator can neither enroll workers
+nor set their limits itself. Just before the first worker
 spawns (in `_run_phases`, past the resume short-circuits so zero-worker
 completed/no-work resumes are not gated), `enforce_and_record_cgroup_containment`
 probes the broker end-to-end and records `{enforced, hierarchy}` in
@@ -4239,7 +4243,7 @@ pre-existing path. The generated Dockerfile ends with the image still at
 `USER root` — it does **not** append a trailing `USER leerie`. The base
 image's ENTRYPOINT (`scripts/container-entry.sh`) is inherited by the
 derived image and **must** run as PID-1 root to set up cgroup containment
-and launch the root broker before dropping to leerie itself via `runuser`
+and launch the cgroup broker before dropping to leerie itself via `runuser`
 (DESIGN §6 *Memory containment*; the base Dockerfile deliberately omits
 `USER leerie` for the same reason). A trailing `USER leerie` here would
 override that, making PID 1 run as leerie — cgroup writes, the broker

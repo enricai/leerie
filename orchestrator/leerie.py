@@ -8140,10 +8140,10 @@ def enforce_and_record_cgroup_containment(st: "State",
         "table (the Bun EAGAIN crash). The cgroup broker "
         "(scripts/cgroup-broker.py, launched by container-entry.sh at "
         "PID 1) is down, or this host has no usable cgroup hierarchy / "
-        "read-only cgroupfs. On rootless containerd this fires only when "
-        "the host's systemd doesn't delegate pids+memory into the "
-        "per-session user slice (non-systemd init, or an older/overridden "
-        "delegation config). See docs/INSTALL.md (cgroup delegation). "
+        "read-only cgroupfs, or — rootless — a host whose systemd doesn't "
+        "delegate pids+memory into the per-session user slice (non-systemd "
+        "init, or an older/overridden delegation config). See "
+        "docs/INSTALL.md (cgroup delegation). "
         "To run anyway without containment, pass --dangerously-allow-uncapped "
         f"(or set {DANGEROUS_ALLOW_UNCAPPED_ENV}=1).")
 
