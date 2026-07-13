@@ -2027,12 +2027,15 @@ pr_writer) — default to Sonnet.
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
 | dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
+| fit_judge    | opus    | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `judge`,
 `heal`, `pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture` is **absent** from `MODEL_DEFAULT_PER_WORKER` — its `opus` default
-comes from the global `MODEL_DEFAULT` fallback.
+`dep_capture`, `fit_judge`, and `splitter` are **absent** from
+`MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from the global
+`MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2045,7 +2048,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Thirteen worker types (plus the global override), each independently overridable:
+Fifteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2059,6 +2062,8 @@ Thirteen worker types (plus the global override), each independently overridable
 | implementer        | `LEERIE_MODEL_IMPLEMENTER`      | `--model-implementer`        | `model_implementer`       |
 | integrator         | `LEERIE_MODEL_INTEGRATOR`       | `--model-integrator`         | `model_integrator`        |
 | conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
+| fit_judge          | `LEERIE_MODEL_FIT_JUDGE`        | `--model-fit_judge`          | `model_fit_judge`         |
+| splitter           | `LEERIE_MODEL_SPLITTER`         | `--model-splitter`           | `model_splitter`          |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
@@ -3495,7 +3500,7 @@ tool-verified feedback, not intrinsic self-review.
 | `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by all 8 worker schemas. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by all 10 worker schemas (including `fit_judge` and `splitter`). |
 
 ### Per-worker mechanical checks
 
