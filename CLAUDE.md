@@ -602,6 +602,16 @@ non-fatal `try/except Exception`; `_run_phases()` calls
 `_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
 crash recovery path); and the `dep_capture` prompt file exists alongside
 `SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
+The P6 ranking contract (DESIGN §P6) is pinned in `tests/test_rank_repo_map.py`
+across three classes: `TestSeedNeighborhoodRanking` (seed-adjacent nodes rank
+above unrelated nodes — direct seed file, 1-hop neighbor, seed symbol biases
+definer, all connected before unrelated, large-graph unrelated cluster at tail);
+`TestTokenBudgetEnforcement` (output fits within explicit budget and within
+`DEFAULT_CAPS["repo_map_tokens"]` when None; `None` budget equals the cap value;
+empty map returns `""`); `TestBinarySearchShrink` (lowering the budget yields
+shorter output and fewer files; increasing budgets yield non-decreasing lengths;
+1-token budget yields empty or a single very-short entry). Fixture is built
+directly (no `build_repo_map`) — isolates ranking. No LLM calls; deterministic.
 The P1 recursive decomposition surface (DESIGN §P1) is tested across four
 files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
 required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
