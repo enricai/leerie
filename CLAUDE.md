@@ -682,6 +682,20 @@ installed-but-incompatible language-pack version lacking `process()`) and
 host-independent and always run, since they are the load-bearing proof
 that the probe fails closed regardless of the local tree-sitter install
 state.
+The gate *wiring* itself — as opposed to the probe's own runtime
+contract — is pinned in `tests/test_repo_map_gate_wiring.py` via
+source-coupling assertions (mirroring `test_dep_capture_wiring.py`):
+`conftest._has_treesitter()`'s source references
+`_tree_sitter_extraction_works` (proving delegation to the functional
+probe, not a bare `ImportError` check); `conftest` exposes a
+module-level `HAS_TREESITTER` bool; and each of `test_build_repo_map.py`,
+`test_repo_map.py`, `test_phase_plan_repo_map_ctx.py` both imports
+`HAS_TREESITTER` from `tests.conftest` and contains a `skipif`
+referencing it (module- or class-level — `test_phase_plan_repo_map_ctx.py`
+gates only its `TestRepoMapEnabled` class). This guards against a silent
+regression — reverting to an ImportError-only gate, or dropping the
+skipif from one file — re-introducing the 19-test host-sensitive failure
+with no other signal.
 The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
 pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 `decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
