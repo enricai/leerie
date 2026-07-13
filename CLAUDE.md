@@ -631,6 +631,22 @@ pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
 well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
 `test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
+The P6 repo-map builder is pinned in two files.
+`tests/test_repo_map.py` covers `build_repo_map` (symbol/def extraction, class
+methods, ref edges, relative-path keys, empty-repo, skip-.git/node_modules),
+the mtime cache (dir created on first use, unchanged file served from cache
+sentinel, changed file re-parsed, only-changed file re-parsed),
+`rank_repo_map` (string result, token-budget fits, seed-file/seed-symbol bias,
+empty map, determinism, very-tight budget), `_parse_repo_file` (unsupported
+extension, markdown, python defs + refs), `_walk_calls` (bare call extracted,
+attribute call not extracted), and `_pagerank` (dangling node, personalization,
+empty). `tests/test_build_repo_map.py` (added by subtask test-001) provides a
+focused HAS_TREESITTER-gated supplement: symbol graph (defs, class defs, ref
+edge, keys shape, relative-path invariant), mtime cache (cache dir created,
+sentinel cache hit, changed file re-parsed, only-changed file re-parsed with
+sentinel for unchanged), and graceful degrade (empty file, binary file, empty
+repo, skip-.git/node_modules). Uses a `pytestmark` module-level skip gate so
+CI without tree-sitter-language-pack skips all tests cleanly.
 The P6 Layer A wiring — `phase_plan` ctx injection — is tested in
 `tests/test_phase_plan_repo_map_ctx.py`: repo-map enabled path (ctx contains
 `repo_map` string, non-empty, JSON-serializable, contains known symbol names,
