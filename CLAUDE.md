@@ -602,6 +602,12 @@ non-fatal `try/except Exception`; `_run_phases()` calls
 `_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
 crash recovery path); and the `dep_capture` prompt file exists alongside
 `SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
+The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
+pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
+`decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
+citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
+well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
+`test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
