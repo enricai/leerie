@@ -3538,6 +3538,29 @@ DESIGN.md §8 for the distinction).
 
 No-op when the task doesn't reference files.
 
+### P6 repo-map — `build_repo_map` + `rank_repo_map`
+
+Implements DESIGN §5½ §P6 *Codebase structural map*. Both functions are
+deterministic, lazy-import tree-sitter (so the module loads on a bare host
+Python that lacks the package), and call no LLM.
+
+| Symbol | Purpose |
+|--------|---------|
+| `_repo_map_cache_key(path)` | Returns `"<abs_path>@<mtime_ns>"` — a stable cache key that changes when a file is touched. |
+| `_walk_calls(node)` | Walks a tree-sitter CST recursively, collecting bare-name identifiers from `call` expression function positions. Returns `list[str]`. Attribute callees (e.g. `obj.method`) are skipped — only bare-name callees become ref edges. |
+| `_parse_repo_file(path)` | Parses one source file with `tree_sitter_language_pack.process()` (for defs/structure) and a tree-sitter CST walk (for call-site refs). Returns `(defs: list[str], refs: list[str])`. Returns `([], [])` on unsupported language or any error (graceful degrade). |
+| `build_repo_map(repo_root, leerie_root)` | Walks all source files under `repo_root` (skipping `.git`, `node_modules`, `__pycache__`, etc.), parses each with `_parse_repo_file`, and builds `{"files": {rel_path: [def_sym, ...]}, "refs": {def_sym: {rel_path, ...}}}`. mtime-caches per-file parse results under `<leerie_root>/<REPO_MAP_CACHE_DIR>/<sha256(abs_path)>.pkl` — only files whose `mtime_ns` changed since the last call are re-parsed (Aider diskcache pattern). Cache dir created on first use. Always returns a valid dict; never raises. |
+| `_pagerank(graph, personalization, damping, max_iter, tol)` | Personalized PageRank on a directed `dict[str, set[str]]` graph. Pure stdlib (no networkx). Handles dangling nodes (no out-edges) via a dangling-mass redistribution term. Converges when sum of per-node rank deltas < `tol`. Returns `dict[str, float]` (node → rank score). |
+| `_render_repo_map_subgraph(repo_map, ranked_files, max_files)` | Renders the top `max_files` files from `ranked_files` as a compact text block: one line per file listing its defined symbols (`path: Sym1, Sym2, ...`). Files with no defs are omitted. |
+| `_count_tokens_approx(text)` | Approximate token count: `max(1, len(text.encode()) // 4)` — ~4 bytes per token (GPT/Claude typical). Used by `rank_repo_map`'s binary-search budget fit. |
+| `rank_repo_map(repo_map, seed_files, seed_symbols, token_budget)` | Builds a file→file edge graph via shared symbols (definer → referencing files), runs personalized PageRank biased toward `seed_files` and files that define/reference `seed_symbols`, then binary-searches the largest prefix of the ranked-file list that fits within `token_budget` tokens (default `DEFAULT_CAPS["repo_map_tokens"]`). Returns the ranked subgraph as a plain text string. Returns `""` when the map is empty. |
+
+**Edge direction:** `build_repo_map` tracks `refs[sym] = {files that call sym}`. `rank_repo_map` builds a file→file edge from the definer of `sym` to each file that references it — so widely-referenced utility files accumulate high in-degree and surface as structural backbone.
+
+**Personalization in `rank_repo_map`:** seed files get weight 1.0; files defining a seed symbol get 1.0; files *referencing* a seed symbol get 0.5. When no seed resolves to a known file, uniform personalization is used (scores all files equally, falling back to link structure only).
+
+**Skip flag:** `resolve_skip_repo_map` (see §2 "Skip flags") gates the call; when `True`, `build_repo_map` is not called and the planner degrades to the prior grep/glob-only path.
+
 ### Phantom-path check
 
 `PHANTOM_PATH` fires when a `files_likely_touched` entry does not exist
