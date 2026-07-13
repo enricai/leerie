@@ -1,5 +1,5 @@
 """Tests for resolve_skip_repo_map() — the --skip-repo-map opt-out that
-suppresses the P6 repo-map structural context injection (DESIGN §P6).
+suppresses the P6 repo-map structural context injection (DESIGN §5½ (P6)).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_REPO_MAP env var →
 skip_repo_map in leerie.toml → False.

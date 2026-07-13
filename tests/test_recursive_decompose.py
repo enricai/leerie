@@ -1,4 +1,4 @@
-"""Tests for partition_files() and recursive_decompose() (DESIGN §P1).
+"""Tests for partition_files() and recursive_decompose() (DESIGN §5½ (P1)).
 
 partition_files: deterministic chunker — 100% coverage + 0 overlap guaranteed
 by construction. Tests verify this on small and large inputs.
@@ -322,12 +322,14 @@ def test_recursive_decompose_noprogress_guard(leerie, capsys):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — migration path uses partition_files, not splitter LLM
+# recursive_decompose — migration: partition_files owns files, splitter labels
 # ---------------------------------------------------------------------------
 
-def test_recursive_decompose_migration_uses_partition_not_splitter(leerie):
-    """When files_likely_touched > 8, the code-partition path runs instead
-    of the splitter LLM worker (DESIGN §P1 measured correction)."""
+def test_recursive_decompose_migration_partition_owns_files_splitter_only_labels(leerie):
+    """When files_likely_touched > 8, partition_files() owns the file→chunk
+    assignment (100% coverage), and the splitter is invoked ONLY in label-only
+    mode to title each chunk (DESIGN §5½ "the LLM only labels"). The splitter
+    never decides which files go where."""
     big_files = [f"src/migrate_{i:03d}.ts" for i in range(24)]
     parent = {
         "id": "sweep",
@@ -341,31 +343,135 @@ def test_recursive_decompose_migration_uses_partition_not_splitter(leerie):
     efforts = {"fit_judge": "high", "splitter": "high"}
 
     splitter_calls: list[str] = []
-    judge_calls: list[str] = []
 
-    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+    async def fake_claude_p(*args, schema_key, sid="", user_prompt="", **kwargs):
         if schema_key == "fit_judge":
-            judge_calls.append(sid)
-            # Parent sid ends with "-d0"; children end with "-d1".
             if sid.endswith("-d0"):
                 return _fit_response(0.20)   # parent: low → split via partition
             return _fit_response(0.85)        # children: high → leaf
         elif schema_key == "splitter":
             splitter_calls.append(sid)
-            pytest.fail("splitter LLM must NOT be called for a large file set")
+            # Label-only: echo distinct titles/criteria per pre-assigned id.
+            import re
+            ids = re.findall(r'"id": "(sweep-\d+)"', user_prompt)
+            return {"children": [
+                {"id": i, "title": f"Labeled {i}",
+                 "success_criteria_seed": f"crit {i}"} for i in ids]}
         pytest.fail(f"unexpected schema_key {schema_key!r}")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
         leaves = _run(leerie.recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
-    # No splitter LLM calls — partition_files handles the split.
-    assert splitter_calls == []
-    # 24 files / 8 per chunk = 3 children + 1 parent judge = 4 judge calls.
+    # Splitter IS called (label-only), exactly once for the migration parent.
+    assert len(splitter_calls) == 1
+    assert splitter_calls[0].startswith("splitter-label-")
+    # 24 files / 8 per chunk = 3 children.
     assert len(leaves) == 3
-    # Every original file appears in exactly one leaf.
+    # partition_files owns coverage: every original file in exactly one leaf.
     leaf_files = [f for leaf in leaves for f in leaf.get("files_likely_touched", [])]
     assert sorted(leaf_files) == sorted(big_files)
+
+
+def test_recursive_decompose_migration_children_have_distinct_labels(leerie):
+    """G1 regression: migration chunk children must NOT copy the parent's
+    identical title/criteria — each chunk gets a distinct label (from the
+    splitter, or the deterministic fallback)."""
+    big_files = [f"src/m{i:02d}.ts" for i in range(24)]
+    parent = {"id": "mig", "title": "Parent title",
+              "success_criteria_seed": "parent criteria",
+              "files_likely_touched": big_files}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", user_prompt="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.20 if sid.endswith("-d0") else 0.85)
+        # splitter returns per-id labels
+        import re
+        ids = re.findall(r'"id": "(mig-\d+)"', user_prompt)
+        return {"children": [
+            {"id": i, "title": f"Distinct {i}",
+             "success_criteria_seed": f"c {i}"} for i in ids]}
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+    titles = [leaf["title"] for leaf in leaves]
+    crits = [leaf["success_criteria_seed"] for leaf in leaves]
+    assert len(set(titles)) == len(titles)   # all distinct
+    assert len(set(crits)) == len(crits)
+    assert "Parent title" not in titles       # not a bare parent-copy
+
+
+def test_recursive_decompose_migration_label_fallback_on_splitter_failure(leerie):
+    """G1 §12 belt-and-suspenders: if the label-only splitter crashes, every
+    chunk still gets a DISTINCT deterministic title (never identical, never a
+    crash)."""
+    big_files = [f"src/m{i:02d}.ts" for i in range(24)]
+    parent = {"id": "mig", "title": "Parent",
+              "success_criteria_seed": "seed",
+              "files_likely_touched": big_files}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.20 if sid.endswith("-d0") else 0.85)
+        raise leerie.WorkerError("simulated splitter crash")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+    titles = [leaf["title"] for leaf in leaves]
+    assert len(leaves) == 3
+    assert len(set(titles)) == len(titles)   # deterministic fallback is distinct
+
+
+# ---------------------------------------------------------------------------
+# recursive_decompose — C0 regression: claude_p called with the REAL signature
+# ---------------------------------------------------------------------------
+
+def test_recursive_decompose_calls_claude_p_with_full_signature(leerie):
+    """C0 regression. The two claude_p call sites in recursive_decompose must
+    pass every REQUIRED keyword-only arg of the real claude_p (cwd, autonomous,
+    caps, ...). A permissive ``**kwargs`` stub hid a missing-arg bug that
+    crashed every live run with TypeError. This stub binds each call against
+    the real signature, so a missing required arg fails here."""
+    import inspect
+    real_sig = inspect.signature(leerie.claude_p)
+
+    parent = {"id": "sig", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.py"]}  # coupled path exercises splitter
+    caps = _make_caps(leerie, decompose_max_depth=1)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    bound_ok: list[str] = []
+
+    async def faithful_claude_p(*args, **kwargs):
+        # Raises TypeError if a required kw-only arg is missing — exactly like
+        # the real claude_p would.
+        real_sig.bind(*args, **kwargs)
+        bound_ok.append(kwargs.get("schema_key"))
+        if kwargs.get("schema_key") == "fit_judge":
+            return _fit_response(0.30)
+        return _split_response("sig", 1)
+
+    with patch.object(leerie, "claude_p", new=faithful_claude_p):
+        _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+    # Both a fit_judge and a splitter call bound successfully.
+    assert "fit_judge" in bound_ok
+    assert "splitter" in bound_ok
 
 
 # ---------------------------------------------------------------------------
@@ -399,3 +505,66 @@ def test_recursive_decompose_bump_workers_every_call(leerie):
     with patch.object(leerie, "claude_p", new=fake_claude_p):
         _run(leerie.recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+
+# ---------------------------------------------------------------------------
+# recursive_decompose — G2: repo-map reaches fit_judge / splitter
+# ---------------------------------------------------------------------------
+
+def test_recursive_decompose_injects_repo_map_into_worker_prompts(leerie):
+    """G2: when a repo_map is passed, each fit_judge/splitter prompt is grounded
+    with a per-node ranked subgraph (rank_repo_map re-ranked to the node's
+    files). Uses a stubbed rank_repo_map so the test is parser-independent."""
+    parent = {"id": "g2", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.py"]}  # coupled path → splitter too
+    caps = _make_caps(leerie, decompose_max_depth=1)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    SENTINEL = "RANKED-SUBGRAPH-SENTINEL-42"
+    prompts_seen: dict[str, str] = {}
+
+    async def fake_claude_p(*args, schema_key, user_prompt="", **kwargs):
+        prompts_seen[schema_key] = user_prompt
+        if schema_key == "fit_judge":
+            return _fit_response(0.30)
+        return _split_response("g2", 1)
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p), \
+         patch.object(leerie, "rank_repo_map", return_value=SENTINEL):
+        _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp"),
+            repo_map={"files": {"a.py": ["f"]}, "refs": {}}))
+
+    assert SENTINEL in prompts_seen.get("fit_judge", "")
+    assert SENTINEL in prompts_seen.get("splitter", "")
+
+
+def test_recursive_decompose_no_repo_map_when_none(leerie):
+    """G2: with repo_map=None (skip_repo_map / build failure), no ranked
+    subgraph is injected and rank_repo_map is never called."""
+    parent = {"id": "g2b", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.py"]}
+    caps = _make_caps(leerie, decompose_max_depth=1)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    prompts_seen: dict[str, str] = {}
+
+    async def fake_claude_p(*args, schema_key, user_prompt="", **kwargs):
+        prompts_seen[schema_key] = user_prompt
+        if schema_key == "fit_judge":
+            return _fit_response(0.30)
+        return _split_response("g2b", 1)
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p), \
+         patch.object(leerie, "rank_repo_map",
+                      side_effect=AssertionError("must not be called")):
+        _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp"),
+            repo_map=None))
+
+    assert "RANKED REPO-MAP" not in prompts_seen.get("fit_judge", "")
+    assert "RANKED REPO-MAP" not in prompts_seen.get("splitter", "")

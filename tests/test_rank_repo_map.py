@@ -1,4 +1,4 @@
-"""Unit tests for rank_repo_map (DESIGN §P6).
+"""Unit tests for rank_repo_map (DESIGN §5½ (P6)).
 
 Pins the three load-bearing contracts of the personalized-PageRank ranking:
 

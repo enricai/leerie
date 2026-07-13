@@ -21,7 +21,7 @@ The orchestrator gives you, in your prompt:
   (`codebase`, `research`, or `both`), any `clarification_answers`
   the user gave, and (when available) a `repo_map` — a ranked
   subgraph of the codebase's symbol/reference graph, personalized to
-  the task's referenced files via PageRank (DESIGN §P6). Use the
+  the task's referenced files via PageRank (DESIGN §5½ (P6)). Use the
   `repo_map` to ground your decomposition in real structural seams
   rather than surface-level file names: prefer cuts along actual
   dependency boundaries exposed by the graph. The `repo_map` field is

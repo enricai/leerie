@@ -340,7 +340,7 @@ local setup) because nerdctl can't reach Keychain. See
   `--max-workers`). Per-worker cgroup containment keeps an OOM inside
   one worker's cgroup, so high wave-level parallelism is safe. Users
   on smaller VMs can opt down.
-- `--skip-repo-map` — skip the P6 codebase structural map (DESIGN §P6).
+- `--skip-repo-map` — skip the P6 codebase structural map (DESIGN §5½ (P6)).
   Suppresses `build_repo_map()` and the ranked subgraph injected into
   planner and splitter context; the planner degrades gracefully to the
   prior grep/glob-only path with no other change in behavior. Use on
@@ -351,7 +351,7 @@ local setup) because nerdctl can't reach Keychain. See
   full surface (resolver function, state field) in
   [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map--build_repo_map--rank_repo_map).
 - **P1 recursive decompose caps** — four internal defaults that bound the
-  fit-judge recursion (DESIGN §P1 *Recursive judge + splitter*). These are
+  fit-judge recursion (DESIGN §5½ (P1) *Recursive judge + splitter*). These are
   not user-tunable via CLI / env / `leerie.toml`; they are listed here so
   operators understand the built-in limits. Full details in
   [`IMPLEMENTATION.md`](IMPLEMENTATION.md#6-caps-and-their-values):

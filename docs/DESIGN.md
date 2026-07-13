@@ -217,8 +217,10 @@ not. Per §12, a signal that cannot be checked mechanically without misfiring
 belongs in the prompt, not in code, so no `validate_plan` reject or
 `DEFAULT_CAPS` threshold is added for it. The structural mechanism that gives
 the planner the codebase knowledge needed to make this judgment well — and the
-recursive fit-judge that replaces the self-scored `decomposition_quality` axis
-— is described in §5½. (Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a
+recursive fit-judge that becomes the authoritative decomposition-quality gate,
+demoting the self-scored `decomposition_quality` axis to a non-gating advisory
+self-report (removing the self-grading bias of letting the planner grade its
+own decomposition) — is described in §5½. (Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a
 code check because migration coverage *is* mechanically countable.)
 
 ### Cross-domain dependencies
@@ -694,8 +696,11 @@ After each per-category planner returns its first-pass subtasks, `recursive_deco
 runs over each subtask; the union of all leaves is the flat set. The **existing**
 path then continues unchanged: `phase_reconcile` → `phase_overlap_judge` →
 `schedule()` → `validate_plan` → `write_plan` → `phase_execute`. The existing
-self-scored `decomposition_quality` axis is superseded by the independent
-`fit_judge` (removing the self-grading bias BAGEN documents).
+self-scored `decomposition_quality` axis is demoted to a non-gating advisory
+self-report: the independent `fit_judge` is now the authoritative
+decomposition-quality gate (removing the self-grading bias BAGEN documents).
+The axis remains in the planner schema as a signal, but `check_planner_output`
+no longer escalates on it — only `task_understanding` gates the planner.
 
 The runtime truncation backstop (`_record_run_health` surfacing
 `truncated_worker_count`) is retained: truncation is now rare, but the signal
@@ -3050,9 +3055,11 @@ artifacts each field names is model-judged; the *presence* of the discipline
 is not.
 
 **Confidence is the only load-bearing gate.** The implementer's
-`root_cause` / `solution` scores (and the planner's `task_understanding`
-/ `decomposition_quality`) are the only signals the orchestrator
-escalates to `failed` or `blocked` on. Tests passing, lint clean, build
+`root_cause` / `solution` scores (and the planner's `task_understanding`)
+are the only confidence signals the orchestrator escalates to `failed` or
+`blocked` on. (The planner's `decomposition_quality` axis is retained as an
+advisory self-report but no longer gates — the independent `fit_judge` is the
+authoritative decomposition-quality gate; see §5½.) Tests passing, lint clean, build
 green, per-criterion satisfaction in a written criteria file — all
 **best-effort signals**. The orchestrator surfaces them as warnings
 attached to the subtask result and to telemetry, never as gating

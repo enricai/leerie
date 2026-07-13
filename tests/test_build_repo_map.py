@@ -1,4 +1,4 @@
-"""Unit tests for build_repo_map(): symbol graph and mtime cache (DESIGN §P6).
+"""Unit tests for build_repo_map(): symbol graph and mtime cache (DESIGN §5½ (P6)).
 
 Pins the three criteria from the subtask spec:
 1. A fixture repo yields a symbol graph with expected def→ref edges.
@@ -21,15 +21,15 @@ from pathlib import Path
 
 import pytest
 
-try:
-    import tree_sitter_language_pack  # noqa: F401
-    HAS_TREESITTER = True
-except ImportError:
-    HAS_TREESITTER = False
+# Gate on the shared FUNCTIONAL probe (conftest) — not mere importability —
+# so an installed-but-incompatible language-pack version (imports fine,
+# extracts nothing) skips cleanly instead of failing.
+from tests.conftest import HAS_TREESITTER
 
 pytestmark = pytest.mark.skipif(
     not HAS_TREESITTER,
-    reason="tree-sitter-language-pack not installed",
+    reason="tree-sitter parser unavailable or incompatible "
+           "(no symbol extraction)",
 )
 
 

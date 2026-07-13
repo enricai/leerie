@@ -1,4 +1,4 @@
-"""Tests for P6 repo-map injection into phase_plan context (DESIGN §P6).
+"""Tests for P6 repo-map injection into phase_plan context (DESIGN §5½ (P6)).
 
 Verifies:
 - With skip_repo_map=False, build_repo_map + rank_repo_map are called and the
@@ -23,6 +23,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+# Gate the extraction-dependent class on the shared functional probe
+# (conftest) — importability alone is insufficient (an incompatible parser
+# version imports but extracts nothing).
+from tests.conftest import HAS_TREESITTER
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +87,11 @@ def _write_fixture_repo(root: Path) -> None:
 # Branch 1: repo-map enabled
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    not HAS_TREESITTER,
+    reason="tree-sitter parser unavailable or incompatible "
+           "(no symbol extraction)",
+)
 class TestRepoMapEnabled:
     """skip_repo_map=False → ctx contains 'repo_map'."""
 

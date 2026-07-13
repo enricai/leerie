@@ -1,4 +1,4 @@
-"""Unit tests for partition_files() — the deterministic chunker (DESIGN §P1).
+"""Unit tests for partition_files() — the deterministic chunker (DESIGN §5½ (P1)).
 
 Verifies the 'complete by construction' invariant: union of chunks == input
 set, no file in two chunks, chunk sizes bounded by the target. Named

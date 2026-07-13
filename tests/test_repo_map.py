@@ -1,4 +1,4 @@
-"""Tests for build_repo_map() and rank_repo_map() (DESIGN §P6).
+"""Tests for build_repo_map() and rank_repo_map() (DESIGN §5½ (P6)).
 
 Covers:
 - build_repo_map on a small multi-file Python fixture produces defs→refs edges
@@ -18,6 +18,19 @@ import time
 from pathlib import Path
 
 import pytest
+
+# These tests hard-assert tree-sitter symbol extraction; without a WORKING
+# parser build_repo_map degrades to an empty graph and the assertions fail
+# rather than skip. Gate on the shared FUNCTIONAL probe (conftest) — not mere
+# importability — so an installed-but-incompatible language-pack version
+# (imports fine, extracts nothing) skips cleanly instead of failing.
+from tests.conftest import HAS_TREESITTER
+
+pytestmark = pytest.mark.skipif(
+    not HAS_TREESITTER,
+    reason="tree-sitter parser unavailable or incompatible "
+           "(no symbol extraction)",
+)
 
 
 # ---------------------------------------------------------------------------

@@ -335,7 +335,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--status STATE` | — | With `--list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
 | `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
-| `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §P6): suppresses `build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
+| `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
 | `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
 | `--pr-template NAME` | none | When the target repo has multiple PR templates in `PULL_REQUEST_TEMPLATE/`, pick this one by basename (with or without `.md`). Also `LEERIE_PR_TEMPLATE` or `pr_template` in `leerie.toml`. |
 | `--pr-writer-model ALIAS` | `sonnet` | Model alias for the finalize-time PR title + body writer. Also `LEERIE_MODEL_PR_WRITER` or `model_pr_writer` in `leerie.toml`. |
@@ -474,8 +474,8 @@ subprocess; there is no in-session agent nesting.
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
-| `fit_judge` | `prompts/fit_judge.md` | opus | 0 or more per subtask (P1 recursive decomposition — one per `recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §P1 |
-| `splitter` | `prompts/splitter.md` | opus | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §P1 |
+| `fit_judge` | `prompts/fit_judge.md` | opus | 0 or more per subtask (P1 recursive decomposition — one per `recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §5½ (P1) |
+| `splitter` | `prompts/splitter.md` | opus | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §5½ (P1) |
 
 Additionally, two post-run workers run outside the main orchestrate loop and are not in `WORKER_TYPES`:
 
@@ -566,8 +566,8 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
 | `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
 | `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
-| `prompts/fit_judge.md` | System prompt: P1 Task-Context Fit scorer — judges whether a subtask's scope and context are co-minimized (DESIGN §P1); calibrated to 0.70 threshold |
-| `prompts/splitter.md` | System prompt: P1 structural splitter — labels pre-partitioned migration chunks or emits structural seams for the coupled-minority case (DESIGN §P1) |
+| `prompts/fit_judge.md` | System prompt: P1 Task-Context Fit scorer — judges whether a subtask's scope and context are co-minimized (DESIGN §5½ (P1)); calibrated to 0.70 threshold |
+| `prompts/splitter.md` | System prompt: P1 structural splitter — labels pre-partitioned migration chunks or emits structural seams for the coupled-minority case (DESIGN §5½ (P1)) |
 | `prompts/config_chat.md` | System prompt: interactive `leerie config --chat` session — reads the repo's CI config and manifests, generates `.leerie/config.toml` and optionally `.leerie/Dockerfile` |
 | `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
 | `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |

@@ -219,6 +219,39 @@ class TestCheckPlannerOutput:
         issues = leerie.check_planner_output(plan, tmp_path, "testing")
         assert not any("INTRA_DOMAIN_CYCLE" in i for i in issues)
 
+    # G3 — decomposition_quality is demoted to an advisory self-report: it is
+    # retained in the schema but NO LONGER gates. The independent fit_judge is
+    # the authoritative decomposition gate (DESIGN §5½).
+    def test_low_decomposition_quality_does_not_gate(self, leerie, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.ts").touch()
+        plan = {"subtasks": [{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["src/foo.ts"],
+            "depends_on": [], "size": "small"}],
+            "status": "ready", "domain": "testing",
+            # decomposition_quality below the 9.0 gate, task_understanding above
+            "confidence": _conf(task_understanding=9.5,
+                                decomposition_quality=2.0)}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("decomposition_quality" in i for i in issues)
+
+    def test_low_task_understanding_still_gates(self, leerie, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.ts").touch()
+        plan = {"subtasks": [{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["src/foo.ts"],
+            "depends_on": [], "size": "small"}],
+            "status": "ready", "domain": "testing",
+            "confidence": _conf(task_understanding=2.0,
+                                decomposition_quality=9.5)}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("task_understanding" in i and "LOW_CONFIDENCE" in i
+                   for i in issues)
+
 
 # --- check_reconciler_output -------------------------------------------- #
 

@@ -291,7 +291,7 @@ export LEERIE_WORKER_PIDS_MAX=2048
 # per-subtask ratio will come in under the default 2.5 estimate:
 ./leerie "task" --skip-budget-check
 
-# Skip the P6 repo-map structural context (DESIGN §P6 *Codebase
+# Skip the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase
 # structural map*): suppresses build_repo_map() and the ranked
 # subgraph injection into planner/splitter context. The planner
 # degrades gracefully to the prior grep/glob-only path. Use on repos
@@ -602,7 +602,7 @@ non-fatal `try/except Exception`; `_run_phases()` calls
 `_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
 crash recovery path); and the `dep_capture` prompt file exists alongside
 `SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
-The P6 ranking contract (DESIGN §P6) is pinned in `tests/test_rank_repo_map.py`
+The P6 ranking contract (DESIGN §5½ (P6)) is pinned in `tests/test_rank_repo_map.py`
 across three classes: `TestSeedNeighborhoodRanking` (seed-adjacent nodes rank
 above unrelated nodes — direct seed file, 1-hop neighbor, seed symbol biases
 definer, all connected before unrelated, large-graph unrelated cluster at tail);
@@ -612,7 +612,7 @@ empty map returns `""`); `TestBinarySearchShrink` (lowering the budget yields
 shorter output and fewer files; increasing budgets yield non-decreasing lengths;
 1-token budget yields empty or a single very-short entry). Fixture is built
 directly (no `build_repo_map`) — isolates ranking. No LLM calls; deterministic.
-The P1 recursive decomposition surface (DESIGN §P1) is tested across four
+The P1 recursive decomposition surface (DESIGN §5½ (P1)) is tested across four
 files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
 required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
 bounds (minimum 0, maximum 1), `confidence` using the `"fit"` axis, valid and
@@ -641,17 +641,36 @@ preserved. `tests/test_recursive_decompose.py` covers `recursive_decompose()`
 (well-fit subtask is a leaf at score ≥ 0.70, oversized subtask recurses then
 children are judged, depth cap terminates at `decompose_max_depth`, no-progress
 guard terminates after `decompose_noprogress_rounds`, migration path uses
-`partition_files` not the splitter LLM, `st.bump_workers` called before every
-`claude_p`); it also carries a parallel set of structural `partition_files`
-tests for regression coverage within that file.
+`partition_files` for the file→chunk partition and invokes the splitter only in
+label-only mode to title each chunk (distinct titles; deterministic fallback on
+splitter failure), `st.bump_workers` called before every `claude_p`, both
+`claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps`
+— the C0 regression guard), and a passed `repo_map` is re-ranked per node and
+injected into fit_judge/splitter prompts); it also carries a parallel set of
+structural `partition_files` tests for regression coverage within that file.
 `tests/test_recursive_decompose_schedule.py` is the integration test for the
-seam between Layer B and the existing scheduler (DESIGN §P1 end-of-pipeline
+seam between Layer B and the existing scheduler (DESIGN §5½ (P1) end-of-pipeline
 claim): leaf ids from `recursive_decompose` carry a valid domain prefix so
 `schedule()` cross-domain wiring and `validate_plan`'s id-prefix check both
 pass; a ready plan built from stubbed leaves feeds `schedule()` and produces
 the correct topo-sorted wave partition (independent leaves in wave 0, a
 dependent leaf in wave 1); and `validate_plan` accepts the full leaf set
 without errors.
+The post-ship gap fixes are pinned in `tests/test_recursive_decompose.py`
+(C0: `test_recursive_decompose_calls_claude_p_with_full_signature` binds each
+`claude_p` call against the real signature so a missing `cwd`/`autonomous`/`caps`
+fails; G1: `..._migration_partition_owns_files_splitter_only_labels`,
+`..._migration_children_have_distinct_labels`,
+`..._migration_label_fallback_on_splitter_failure`; G2:
+`..._injects_repo_map_into_worker_prompts`, `..._no_repo_map_when_none`),
+in `tests/test_check_functions.py` (G3:
+`test_low_decomposition_quality_does_not_gate`,
+`test_low_task_understanding_still_gates` — the axis is advisory, only
+`task_understanding` gates), and in `tests/test_repo_map_degrade_warning.py`
+(G6: `build_repo_map` warns exactly once per process when source files exist
+but the graph is empty, stays quiet for a non-code repo). `tests/test_repo_map.py`
+now carries a `HAS_TREESITTER` module skip gate (G4) mirroring
+`test_build_repo_map.py`.
 The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
 pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 `decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment

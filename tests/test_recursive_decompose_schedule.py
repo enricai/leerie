@@ -1,7 +1,7 @@
 """Integration test: recursive_decompose leaves feed schedule() into waves.
 
 Proves the seam between Layer B (P1 recursive decomposition) and the
-existing Phase 3 scheduler (DESIGN §P1 end-of-pipeline claim):
+existing Phase 3 scheduler (DESIGN §5½ (P1) end-of-pipeline claim):
 
   recursive_decompose() → flat leaf set → schedule(plans) → topo-sorted waves
 
@@ -114,12 +114,19 @@ def test_leaf_ids_preserve_domain_prefix(leerie):
     models = {"fit_judge": "opus", "splitter": "opus"}
     efforts = {"fit_judge": "high", "splitter": "high"}
 
-    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+    async def fake_claude_p(*args, schema_key, sid="", user_prompt="", **kwargs):
         if schema_key == "fit_judge":
             # Parent (depth 0) is low-fit; children (depth 1) are well-fit.
             if sid.endswith("-d0"):
                 return _fit_response(0.20)
             return _fit_response(0.85)
+        if schema_key == "splitter":
+            # Label-only mode: return distinct titles per pre-assigned chunk id.
+            import re
+            ids = re.findall(r'"id": "(deps-sweep-\d+)"', user_prompt)
+            return {"children": [
+                {"id": i, "title": f"Labeled {i}",
+                 "success_criteria_seed": f"crit {i}"} for i in ids]}
         pytest.fail(f"unexpected schema_key {schema_key!r} (sid={sid!r})")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
@@ -233,12 +240,20 @@ def test_recursive_decompose_to_schedule_seam(leerie, capsys):
     models = {"fit_judge": "opus", "splitter": "opus"}
     efforts = {"fit_judge": "high", "splitter": "high"}
 
-    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+    async def fake_claude_p(*args, schema_key, sid="", user_prompt="", **kwargs):
         if schema_key == "fit_judge":
             if sid.endswith("-d0"):
                 return _fit_response(0.15)   # oversized → split
             return _fit_response(0.80)        # children → leaf
-        pytest.fail(f"splitter must not be called for large file sets; sid={sid!r}")
+        if schema_key == "splitter":
+            # Label-only mode: partition_files owns the file assignment; the
+            # splitter only titles each pre-computed chunk (DESIGN §5½).
+            import re
+            ids = re.findall(r'"id": "(deps-datefns-\d+)"', user_prompt)
+            return {"children": [
+                {"id": i, "title": f"Labeled {i}",
+                 "success_criteria_seed": f"crit {i}"} for i in ids]}
+        pytest.fail(f"unexpected schema_key {schema_key!r} (sid={sid!r})")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
         leaves = _run(leerie.recursive_decompose(

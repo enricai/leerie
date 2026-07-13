@@ -63,6 +63,17 @@ class TestSourceCouplingGuard:
             "so that downstream (reconcile→schedule) sees the expanded set."
         )
 
+    def test_phase_plan_passes_repo_map_to_recursive_decompose(self, leerie):
+        """G2 caller-side seam: phase_plan must pass the built repo_map into
+        recursive_decompose, else the per-node P6 grounding is dead code
+        (the callee has the injection logic but never receives a map)."""
+        src = inspect.getsource(leerie.phase_plan)
+        assert "repo_map=repo_map" in src, (
+            "phase_plan must call recursive_decompose(..., repo_map=repo_map) "
+            "so the once-built symbol graph reaches fit_judge/splitter for "
+            "per-node re-ranking (DESIGN §5½ P6)."
+        )
+
     def test_phase_plan_expands_before_logging(self, leerie):
         """The recursive_decompose loop must precede the final logging loop."""
         src = inspect.getsource(leerie.phase_plan)
