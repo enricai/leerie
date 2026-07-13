@@ -291,6 +291,15 @@ export LEERIE_WORKER_PIDS_MAX=2048
 # per-subtask ratio will come in under the default 2.5 estimate:
 ./leerie "task" --skip-budget-check
 
+# Skip the P6 repo-map structural context (DESIGN §P6 *Codebase
+# structural map*): suppresses build_repo_map() and the ranked
+# subgraph injection into planner/splitter context. The planner
+# degrades gracefully to the prior grep/glob-only path. Use on repos
+# where tree-sitter cannot parse the primary language, or to opt out
+# of structural context. Also LEERIE_SKIP_REPO_MAP=1 or
+# `skip_repo_map = true` in leerie.toml. Default: off.
+./leerie "task" --skip-repo-map
+
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + --resume).
 # Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in

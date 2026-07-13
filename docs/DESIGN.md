@@ -588,6 +588,94 @@ the dependency is satisfied in the filesystem the dependent subtask starts from.
 
 ---
 
+## §P6. Codebase structural map
+
+*Status: planned — config scaffolding (DEFAULT_CAPS, STATE_FIELDS,
+`resolve_skip_repo_map`) landed in the first wave; feature implementation
+(`build_repo_map`, `rank_repo_map`, planner/splitter injection) is the next
+wave.*
+
+Leerie's planner today uses ad-hoc grep/glob to investigate the repository.
+This works for well-separated, self-describing layouts but produces shallow
+splits on migration-heavy workloads (e.g. a 64-file date-format sweep) where
+the planner cannot see the full file surface or its dependency structure
+before decomposing.
+
+**P6 (foundation): give the planner real codebase structure.**
+
+1. **`build_repo_map(repo_root) → RepoMap`** — deterministic, mtime-cached.
+   Uses tree-sitter tag extraction (defs/refs/signatures per source file,
+   multi-language via prebuilt parsers; `universal-ctags`/`ast-grep` fallback
+   for long-tail languages). Cache keyed by file mtime at
+   `<state-root>/repo-map-cache/` (constant `REPO_MAP_CACHE_DIR`) so only
+   changed files re-parse. Measured on navegando: 4 ms/file, 450-node graph,
+   PageRank ranked 13/15 task-relevant symbols in 0.92 s.
+2. **`rank_repo_map(repo_map, seed_files, seed_symbols) → ranked_subgraph`** —
+   personalized PageRank biased toward the current task/subtask's
+   files+symbols. Emits a k-hop ego-graph, binary-searched to fit a token
+   budget (`DEFAULT_CAPS["repo_map_tokens"]` ≈ 1 000), with the most
+   task-relevant symbols placed at prompt extremes (lost-in-the-middle
+   mitigation).
+3. **Inject into planning context.** The ranked subgraph enriches the planner
+   `ctx` and the splitter, re-ranked per node's files. This generalises the
+   existing `extract_task_file_structure` seed.
+
+**Skip toggle.** `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` /
+`skip_repo_map` in `leerie.toml` (resolved by `resolve_skip_repo_map`,
+state field `skip_repo_map`). When set, `build_repo_map()` is not called and
+the planner degrades gracefully to the prior grep/glob-only path. Default: off.
+
+---
+
+## §P1. Recursive judge + splitter
+
+*Status: planned — config scaffolding (DEFAULT_CAPS thresholds/depths,
+STATE_FIELDS) landed in the first wave; feature implementation
+(`fit_judge` worker, `splitter` worker, `recursive_decompose`) is the next
+wave.*
+
+After first-pass decomposition (§5), subtasks that are too broad are split
+recursively until each leaf passes the P1 Task-Context Fit criterion: minimum
+necessary complexity, maximum relevance. Fit is *judged*, not predicted (no
+pre-execution size estimator works — 30× intrinsic token variance, BAGEN 47%
+estimation ceiling).
+
+**Mechanism.**
+
+1. **`SCHEMAS["fit_judge"]`** — scores one subtask's P1 Task-Context Fit as a
+   confidence 0–1 (+ rationale). Read-only (`INSPECT_TOOLS`), fed the subtask
+   spec + its P6 ranked subgraph. Rubric = P1 co-minimized scope+context.
+   *Measured on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs
+   well-fit mean 0.84 — 0.57 separation, 88% accuracy at threshold 0.70.*
+2. **`SCHEMAS["splitter"]`** — code partitions for migration-heavy subtasks
+   (deterministic chunker, 100% coverage by construction, LLM only titles +
+   writes criteria); LLM splits for structurally-coupled subtasks (backstopped
+   by the existing `UNCOVERED_MIGRATION_SURFACE` check).
+3. **`recursive_decompose(subtask, depth) → list[leaf_subtasks]`**:
+   - `conf = fit_judge(subtask)` — if `conf ≥ decompose_fit_threshold` or
+     `depth ≥ decompose_max_depth`, return `[subtask]`.
+   - Otherwise split and recurse.
+   - No-progress guard: `decompose_noprogress_rounds` consecutive rounds with
+     no child improving above parent's score → accept as leaf with warning.
+   - Every judge/split call goes through `st.bump_workers` — a runaway tree
+     hits the worker-cap backstop.
+
+**Bounds (all in `DEFAULT_CAPS`).**
+
+| Key | Value | Rationale |
+|---|---|---|
+| `decompose_fit_threshold` | 0.70 | Empirically measured; 0.95 over-splits 100% of well-fit subtasks |
+| `decompose_max_depth` | 5 | 2⁵=32 leaves per subtask; more than enough for 64-file sweeps |
+| `decompose_noprogress_rounds` | 2 | Prevents degenerate splitter from looping to max depth |
+| `repo_map_tokens` | 1000 | ~5% of typical planner context; keeps injection below noise |
+
+**Wire-in.** After each per-category planner returns its first-pass subtasks
+in `phase_plan` (`plan_one`), `recursive_decompose` is run over each; the
+union of all leaves is the flat set fed to the existing path:
+`phase_reconcile` → `phase_overlap_judge` → `schedule()` → `validate_plan`.
+
+---
+
 ## 6. Worktree and integration model
 
 ### Isolation
