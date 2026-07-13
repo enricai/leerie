@@ -629,14 +629,20 @@ top-level `files` field (splitter never decides partition), and the child
 `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both in
 `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
 chains; isolation (override doesn't bleed to other workers); structural wiring
-guards. `tests/test_recursive_decompose.py` covers `partition_files()` (empty
-input, single chunk, exact multiple, partial last chunk, 100% coverage + 0
-overlap guarantee by construction, `chunk_size=1`, order preserved,
-`chunk_size<1` degenerate guard) and `recursive_decompose()` (well-fit subtask
-is a leaf at score ≥ 0.70, oversized subtask recurses then children are judged,
-depth cap terminates at `decompose_max_depth`, no-progress guard terminates
-after `decompose_noprogress_rounds`, migration path uses `partition_files` not
-the splitter LLM, `st.bump_workers` called before every `claude_p`).
+guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
+44 tests across parametrized invariant sweeps (input sizes 0, 1, 8, 29, 64;
+chunk-size 1, equals-n, larger-than-n, partial-last-chunk) plus named
+telemetry cases — the 29-file migration sweep and 64-file date-fns sweep that
+drove the design (LLM silently dropped 14/29; code-partition is complete by
+construction). Asserts: 100% coverage (sum of chunk lengths == len(input)),
+zero overlap (no file in two chunks), chunks bounded by chunk_size, and order
+preserved. `tests/test_recursive_decompose.py` covers `recursive_decompose()`
+(well-fit subtask is a leaf at score ≥ 0.70, oversized subtask recurses then
+children are judged, depth cap terminates at `decompose_max_depth`, no-progress
+guard terminates after `decompose_noprogress_rounds`, migration path uses
+`partition_files` not the splitter LLM, `st.bump_workers` called before every
+`claude_p`); it also carries a parallel set of structural `partition_files`
+tests for regression coverage within that file.
 The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
 pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
 `decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
