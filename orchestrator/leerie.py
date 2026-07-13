@@ -11164,11 +11164,8 @@ async def phase_plan(task: str, st: State, caps: dict,
                 samples, repo_root, c)
             plans.append(best)
 
-    # P1 Layer C: recursively decompose first-pass subtasks into leaves
-    # (DESIGN §5½ *Wire-in to phase_plan*). Each subtask is passed through
-    # recursive_decompose; the union of all leaves replaces the original
-    # subtask list. The downstream path (reconcile→overlap→schedule→validate→
-    # write_plan) is unchanged — it receives a flat leaf set just as before.
+    # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
+    # counts from the planner level, not from inside recursive_decompose itself.
     log("  expanding subtasks via recursive_decompose (P1 Layer C)")
     for plan in plans:
         first_pass = plan.get("subtasks", [])
