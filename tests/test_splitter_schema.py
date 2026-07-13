@@ -142,6 +142,28 @@ def test_splitter_rejects_missing_children_field(leerie):
         jsonschema.validate({}, leerie.SCHEMAS["splitter"])
 
 
+# --- files field not required (splitter never decides partition) -----------
+
+def test_splitter_no_top_level_files_required(leerie):
+    """Schema must not require a top-level files field — splitter never decides partition."""
+    schema = leerie.SCHEMAS["splitter"]
+    assert "files" not in schema.get("required", [])
+    assert "files" not in schema.get("properties", {})
+
+
+def test_splitter_child_requires_item_shape(leerie):
+    """Each child's requires array must use the _REQUIRES_ITEM shape (tag + extent enum)."""
+    item = leerie.SCHEMAS["splitter"]["properties"]["children"]["items"]
+    requires_prop = item.get("properties", {}).get("requires", {})
+    assert requires_prop.get("type") == "array"
+    item_schema = requires_prop.get("items", {})
+    assert item_schema.get("type") == "object"
+    assert "tag" in item_schema.get("required", [])
+    assert "extent" in item_schema.get("required", [])
+    extent_prop = item_schema.get("properties", {}).get("extent", {})
+    assert "enum" in extent_prop, "extent must be an enum (in_plan / external)"
+
+
 # --- JSON serializability ---------------------------------------------------
 
 def test_splitter_schema_is_json_serializable(leerie):

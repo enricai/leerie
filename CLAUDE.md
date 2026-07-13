@@ -621,7 +621,9 @@ invalid instance acceptance, JSON serializability, and wiring (`fit_judge` in
 entry at `"high"`, prompt file exists). `tests/test_splitter_schema.py` covers
 `SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
 fields (`id`, `title`, `success_criteria_seed`), optional child fields,
-valid/invalid instances, JSON serializability, and the same wiring guards.
+valid/invalid instances, JSON serializability, the same wiring guards, no
+top-level `files` field (splitter never decides partition), and the child
+`requires` array uses the `_REQUIRES_ITEM` shape (tag + extent enum).
 `tests/test_resolve_fit_judge_model.py` covers model and effort resolution for
 `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from
 `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both in
