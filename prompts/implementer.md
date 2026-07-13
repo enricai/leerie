@@ -214,6 +214,17 @@ prompt (the repo's authoritative design-system / component / style docs — read
 the ones relevant to your subtask). Commit your work to the branch with a clear
 message. Commit only code and project files — never the `.leerie/` directory.
 
+**Commit as soon as the change is written and in scope — BEFORE running any
+verification step** (targeted tests, typecheck, and *especially* anything that
+could be expensive or memory-heavy). Verification comes after the commit. The
+reason is mechanical, not stylistic: an expensive command (a stray full build,
+a heavy suite) can burn your whole turn budget or get your process killed
+mid-run, and if that happens before you have committed, your entire diff is
+lost. Committed first, your work survives even a hard kill — the orchestrator
+keeps a committed diff. So: write → commit → then verify. If verification then
+reveals a fix, make it and commit again; never leave finished, in-scope work
+uncommitted while you run a verification step.
+
 **Environmental issues are out of scope.** If `lint` / `typecheck` /
 `test` failures exist in files **outside your subtask's
 `files_likely_touched` list** — and outside the diff you just wrote
@@ -244,6 +255,18 @@ result is rarely worth the tool-call budget. Don't fire the full command
 in the first place — the conformer will, and that work is theirs. Lint
 (`pnpm lint`, `biome check`, `eslint`) is cheap (under a few seconds)
 and is fine to run scoped or full.
+
+**This holds even if your criteria file names the build** (e.g. a
+criterion like "`pnpm run build` passes"). That criterion is a
+*conformance-phase* signal — the conformer runs the build and records
+the result. It is **not** an instruction for you to run the build here.
+Record it as `met: false` (or "not run — conformance phase owns this")
+in `criteria_results` and move on; do not re-attempt a full build. A
+build that OOMs in this container will burn your entire turn budget and
+get you reaped mid-turn — and if that happens *after* you have committed
+your work, the orchestrator keeps the committed diff, but you will have
+wasted the run. Commit your green work first, then exit; never chase a
+container-hostile build to satisfy a criterion.
 
 ### 5. Self-check against your criteria (informational)
 

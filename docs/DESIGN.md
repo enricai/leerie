@@ -3272,6 +3272,39 @@ Two further disciplines apply, and they sit at the §12 axis:
   §12 boundary again: the guarantee that matters (committed implementer
   work survives the conformer) is a code check, not a prompt rule.
 
+- **Committed work survives a mid-turn worker death.** The clobber guard above
+  protects committed work from the *conformer*; a symmetric threat is the
+  *implementer* worker dying mid-turn. A worker that backgrounds an expensive
+  final verification step (a `pnpm run build`, a heavy test suite) and then has
+  that step OOM-killed gets its `claude -p` session reaped before it writes a
+  checkpoint. The synthesized result is an `incomplete-handoff` whose
+  `checkpoint_path` does not exist — `validate_result` tags it `empty_handoff`.
+  Naively this is treated as a retryable no-op: `settle_subtask` calls `fail()`,
+  which `_reset_subtask_worktree`s away the worktree (destroying any committed
+  diff) and burns `failed_retries` until the whole run dies. But the worker may
+  have *already committed a complete, green diff* and died only at a
+  container-environmental verification step (the build OOMs the same way for
+  sibling subtasks whose criteria don't gate on it — they return before dying
+  and settle `complete`). So before failing an `empty_handoff`, the orchestrator
+  runs the positive-polarity `branch_has_commits_ahead` gate: **if the branch has
+  commits ahead of the run branch, the worker produced a real deliverable** and
+  the result is settled as `complete` — routed through the advisory conformance
+  phase, which records the unfinished verification as a warning — rather than
+  discarded. Only a genuine no-op (no commits) stays retryable, and the
+  commit-presence test is a *positive* proof (`branch_has_commits_ahead`, as
+  distinct from the `check_branch_has_commits` no-op gate on the `complete`
+  path): a
+  worktree that is gone or on which git fails counts as "no proven commits" and
+  is **not** rescued, so an indeterminate git state can never be mistaken for a
+  real deliverable. This is the §12 boundary once more: whether committed work
+  exists is a deterministic git check, not a judgment the prompt could be
+  trusted to make about how the worker died. The prompt half is the *advisory*
+  complement (§12's inverse): the implementer is instructed to commit in-scope
+  work **before** running any verification step, precisely so that a reaped
+  worker's diff is already committed and this code-enforced rescue has something
+  to keep — the prompt reduces how often the rescue must fire, the code
+  guarantees the outcome when it does.
+
 The phase is bounded by a separate cap from the evidence loop: the conformer
 gets a small number of orchestrator-level rounds (default 3) in which to
 detect and fix drift. Exhausting the cap with residuals still present does

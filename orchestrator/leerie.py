@@ -7629,6 +7629,32 @@ async def check_integrator_commit(staging: Path) -> str | None:
 
 # --- branch-has-commits verification -----------------------------------------
 
+async def branch_has_commits_ahead(worktree: str,
+                                   parent_branch: str) -> bool:
+    """True iff the subtask branch has ≥1 commit ahead of `parent_branch`.
+
+    Positive-polarity, unambiguous: returns True ONLY when the worktree
+    exists, `git log parent..HEAD` succeeds, AND its output is non-empty.
+    A missing worktree or a failed git command returns False — "can't
+    prove commits exist" is treated as "no commits," so no caller mistakes
+    an indeterminate state for real committed work. `check_branch_has_commits`
+    (the no-op gate) and the `empty_handoff` rescue in `settle_subtask` both
+    key on this: the rescue keeps committed work only when it can *prove* the
+    commit exists, never on a bare `None`/indeterminate result."""
+    if not Path(worktree).exists():
+        return False  # worktree gone — can't determine, treat as no commits
+    try:
+        r = await run_proc(
+            ["git", "log", f"{parent_branch}..HEAD", "--oneline"],
+            cwd=worktree,
+        )
+    except OSError:
+        return False
+    if r.returncode != 0:
+        return False
+    return bool(r.stdout.strip())
+
+
 async def check_branch_has_commits(sid: str, worktree: str,
                                    parent_branch: str
                                    ) -> tuple[str, str] | None:
@@ -7637,7 +7663,14 @@ async def check_branch_has_commits(sid: str, worktree: str,
     typically `leerie/runs/<run-id>`), else None. An empty diff means the
     worker produced schema-valid JSON claiming success while doing
     nothing — a silent no-op that wastes an integration attempt. The
-    `"no_commits"` kind is retryable per `_RETRYABLE_FAILURE_KINDS`."""
+    `"no_commits"` kind is retryable per `_RETRYABLE_FAILURE_KINDS`.
+
+    Note the deliberate asymmetry with `branch_has_commits_ahead`: an
+    indeterminate state (worktree gone / git failed) returns None here —
+    "don't block" — because this is a *gate* on a `complete` claim, where
+    the safe default is to let it through rather than fail a subtask on an
+    unverifiable git error. The rescue path uses `branch_has_commits_ahead`
+    instead, whose safe default is the opposite (don't rescue unless proven)."""
     if not Path(worktree).exists():
         return None  # worktree gone — can't determine, don't block
     try:
@@ -16793,20 +16826,52 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # "empty_handoff" — retryable because a fresh worker can plausibly
         # do better.
         problem = validate_result(res)
+        rescued_from_empty_handoff = False
         if problem:
             kind, message = problem
-            log(f"  result invariant violated for {sid}: {message}")
-            done = await fail(kind, message)
-            if done is not None:
-                return done
-            continue
+            # An `empty_handoff` (worker ended its turn with no checkpoint —
+            # typically because it backgrounded an expensive final step like a
+            # build that OOM-died, so `claude -p` was reaped mid-turn) must NOT
+            # discard a green, committed diff. `fail()` would `_reset_subtask_
+            # worktree`, destroying the commits, then burn the retry cap. If the
+            # worktree already holds committed work, the worker DID produce a
+            # deliverable — settle it as `complete` and let the advisory
+            # conformance phase (below) record whatever verification step didn't
+            # finish. This is the outcome subtasks whose criteria didn't gate on
+            # the build got by luck (they returned before dying); made
+            # deterministic here. See the fix/empty-handoff-keeps-committed-work
+            # investigation (DESIGN §9).
+            if kind == "empty_handoff" and \
+                    await branch_has_commits_ahead(
+                        worktree, compute_run_branch(st.run_id)):
+                log(f"  {sid}: {message} — but the worktree has committed "
+                    "work; the worker likely ended its turn on an incomplete "
+                    "background task (e.g. an OOM-killed build). Keeping the "
+                    "committed diff and settling via advisory conformance "
+                    "instead of discarding it.")
+                res = {"subtask_id": sid, "status": "complete",
+                       "summary": (res.get("summary")
+                                   or "worker ended its turn with committed "
+                                   "work but no checkpoint (incomplete "
+                                   "background step); committed diff kept"),
+                       "criteria_results": res.get("criteria_results") or []}
+                rescued_from_empty_handoff = True
+            else:
+                log(f"  result invariant violated for {sid}: {message}")
+                done = await fail(kind, message)
+                if done is not None:
+                    return done
+                continue
 
         status = res.get("status")
 
         # CRITIC-pattern confidence + mechanical check on complete results.
         # Separate budget from subtask_continuations so confidence retries
-        # don't consume the handoff/clarification budget.
-        if status == "complete" and \
+        # don't consume the handoff/clarification budget. Skipped for a result
+        # rescued from `empty_handoff`: the worker never returned a confidence
+        # envelope (it was reaped mid-turn), so there is nothing to gate on —
+        # re-spawning it would just repeat the doomed background step.
+        if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
             conf = (res.get("confidence") or {}) \
                 if isinstance(res.get("confidence"), dict) else {}
@@ -16870,19 +16935,32 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 if done is not None:
                     return done
                 continue
-            # uncommitted changes — retryable, same reasoning
+            # uncommitted changes — retryable for a normal `complete`. For a
+            # result rescued from `empty_handoff`, tracked uncommitted changes
+            # are debris a reaped worker left mid-edit; the deliverable is the
+            # already-committed diff, not the debris.
             wt_status = await run_proc(
                 ["git", "status", "--porcelain"], cwd=worktree)
             dirty = [l for l in wt_status.stdout.splitlines()
                      if l and not l.startswith("??")]
             if dirty:
-                done = await fail(
-                    "dirty_worktree",
-                    f"{sid}: worktree has {len(dirty)} uncommitted "
-                    f"change(s) — changes will be lost on integration")
-                if done is not None:
-                    return done
-                continue
+                if rescued_from_empty_handoff:
+                    # Discard the debris rather than fail: a `dirty_worktree`
+                    # fail would `_reset_subtask_worktree` and destroy the very
+                    # commits we are keeping. Best-effort — run_proc returns
+                    # (doesn't raise) on nonzero, so a failed checkout leaves
+                    # the debris for the dirty-worktree guard on the next
+                    # integration step; not fatal here.
+                    await run_proc(["git", "checkout", "--", "."],
+                                   cwd=worktree)
+                else:
+                    done = await fail(
+                        "dirty_worktree",
+                        f"{sid}: worktree has {len(dirty)} uncommitted "
+                        f"change(s) — changes will be lost on integration")
+                    if done is not None:
+                        return done
+                    continue
             # protected-path violation — the worker wrote to .git/ etc.: it is
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)
