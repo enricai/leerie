@@ -11023,14 +11023,6 @@ async def phase_plan(task: str, st: State, caps: dict,
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
     sys_prompt = load_prompt("planner")
-    # confidence_rounds is the worker-internal evidence-gate bound (DESIGN
-    # §8 planner gate). The orchestrator does not enforce it — the planner
-    # bounds itself — but passing it in the context blob is what makes the
-    # user-visible knob real.
-    ctx = json.dumps({"task": task, "source_of_truth": sot,
-                      "clarification_answers": answers,
-                      "confidence_rounds": caps["confidence_rounds"]},
-                     indent=2)
 
     sem = asyncio.Semaphore(caps["max_parallel"])
 
@@ -11045,6 +11037,36 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_file_section:
         log(f"  extracted {len(task_file_items)} structural items "
             "from task-referenced files")
+
+    # P6 repo-map injection (DESIGN §P6). Build the ranked subgraph seeded
+    # from the task-referenced files identified above, and inject it into the
+    # planner context.  When skip_repo_map is True the planner degrades
+    # gracefully to the pre-existing grep/glob-only path.
+    ctx_dict: dict = {
+        "task": task,
+        "source_of_truth": sot,
+        "clarification_answers": answers,
+        # confidence_rounds is the worker-internal evidence-gate bound (DESIGN
+        # §8 planner gate). The orchestrator does not enforce it — the planner
+        # bounds itself — but passing it in the context blob is what makes the
+        # user-visible knob real.
+        "confidence_rounds": caps["confidence_rounds"],
+    }
+    if not st.data.get("skip_repo_map"):
+        try:
+            repo_map = build_repo_map(repo_root, st.leerie_root)
+            seed_files = (
+                [str(Path(item.split(": ", 1)[0])) for item in task_file_items]
+                if task_file_items else []
+            )
+            ranked = rank_repo_map(repo_map, seed_files, [])
+            if ranked:
+                ctx_dict["repo_map"] = ranked
+                log(f"  injected ranked repo-map subgraph "
+                    f"({len(ranked.splitlines())} files) into planner ctx")
+        except Exception:
+            pass  # degrade silently; planner runs without repo-map
+    ctx = json.dumps(ctx_dict, indent=2)
 
     async def plan_one(category: str, sample_idx: int = 0) -> dict | None:
         async with sem:

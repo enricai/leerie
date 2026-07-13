@@ -18,8 +18,16 @@ The orchestrator gives you, in your prompt:
   legal prefix for your output; the orchestrator's validator rejects
   any other.
 - `CONTEXT` — JSON with the overall `task`, the `source_of_truth`
-  (`codebase`, `research`, or `both`), and any `clarification_answers`
-  the user gave.
+  (`codebase`, `research`, or `both`), any `clarification_answers`
+  the user gave, and (when available) a `repo_map` — a ranked
+  subgraph of the codebase's symbol/reference graph, personalized to
+  the task's referenced files via PageRank (DESIGN §P6). Use the
+  `repo_map` to ground your decomposition in real structural seams
+  rather than surface-level file names: prefer cuts along actual
+  dependency boundaries exposed by the graph. The `repo_map` field is
+  absent when `--skip-repo-map` was set or when tree-sitter could not
+  parse the repo's primary language; your investigation falls back to
+  the usual Grep/Glob path.
 
 ## What you do
 
@@ -177,10 +185,15 @@ The orchestrator gives you, in your prompt:
      ambiguity is either flagged or covered by `clarification_answers`.
    - `decomposition_quality` (float 1–10): how confident you are that the
      subtasks are the right cut. Earns ≥ 9.0 only when each subtask has a
-     single checkable success condition, each is sized for one worker
-     context, dependencies are real (verified against the code or other
-     subtasks' `provides`), and the cut covers the domain without leaving
-     gaps or duplications.
+     single checkable success condition, dependencies are real (verified
+     against the code or other subtasks' `provides`), the cut covers the
+     domain without gaps or duplications, and — when a `repo_map` was
+     provided — each cut follows a real structural seam in the graph rather
+     than an arbitrary file-count boundary. Note: the orchestrator runs an
+     independent `fit_judge` (P1) over each subtask after you return; that
+     external judge supersedes self-grading for quality gating, so your
+     `decomposition_quality` score here is an evidence-anchored
+     self-assessment, not the final gate.
 
    The same three universal disciplines apply, with the same field names
    in the `confidence` object:
