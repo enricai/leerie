@@ -2123,10 +2123,13 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | heal         | unset   | post-run patch generation; no need to pin |
 | pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
 | dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
+| fit_judge    | high    | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
+| splitter     | high    | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
-workers above and for the finalize-time `pr_writer` and `dep_capture` workers.
+workers above and for the finalize-time `pr_writer` and `dep_capture` workers,
+and for the P1 decomposition workers `fit_judge` and `splitter`.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2152,6 +2155,8 @@ model selection:
 | implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
 | integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
+| fit_judge          | `LEERIE_EFFORT_FIT_JUDGE`        | `--effort-fit_judge`          | `effort_fit_judge`         |
+| splitter           | `LEERIE_EFFORT_SPLITTER`         | `--effort-splitter`           | `effort_splitter`          |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
 | pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -3624,9 +3629,46 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | P1 fit-judge pass threshold (`decompose_fit_threshold`) | 0.70 | `fit_judge` confidence score at or above which a subtask is accepted as a leaf (well-fit). MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. Not user-tunable via CLI / env / toml. |
 | P1 no-progress guard (`decompose_noprogress_rounds`) | 2 | Consecutive recursion rounds that produce no child with a fit score above the parent's before the subtask is accepted as a leaf with a warning. Prevents a degenerate splitter from looping to `decompose_max_depth`. Not user-tunable via CLI / env / toml. |
 
+### P1 recursive decomposition surface (DESIGN §P1)
+
+`partition_files(files: list[str], chunk_size: int) -> list[list[str]]`
+Deterministic chunker for the migration-sweep path. Splits `files` into
+non-overlapping chunks of at most `chunk_size` (default 8). 100% coverage
+and 0 overlap are guaranteed by construction (no LLM). When `chunk_size < 1`,
+returns `[list(files)]` (degenerate guard). Used by `recursive_decompose()`
+when `len(files) > 8` to partition without calling the splitter LLM worker
+(measured correction: LLM splitter dropped 14/29 migration files in testing).
+
+`recursive_decompose(subtask, depth, st, caps, models, efforts, repo_root, *, _parent_score, _noprogress_count) -> list[dict]`
+Async recursive function implementing DESIGN §P1 *Task-Context Fit*. For each
+subtask: calls `fit_judge` to score Task-Context Fit (0–1); returns `[subtask]`
+if score ≥ 0.70 (threshold from `caps["decompose_fit_threshold"]`) or depth ≥
+`caps["decompose_max_depth"]` (5); checks the no-progress guard
+(`caps["decompose_noprogress_rounds"]` consecutive rounds of no improvement
+accept the subtask as leaf); then splits via either:
+  - **Migration path** (≥ 9 files): `partition_files()` — deterministic, no LLM
+  - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection
+
+Every `fit_judge` and `splitter` invocation calls `st.bump_workers(caps)` before
+calling `claude_p()`. Both workers use `INSPECT_TOOLS` (read-only).
+
+`SCHEMAS["fit_judge"]` — required fields: `score` (number 0–1), `rationale`
+(string), `diffuse` (string, narrates the diffuse coupling when score < 0.70),
+`confidence` (sub-schema via `_confidence_schema(["fit"])`).
+
+`SCHEMAS["splitter"]` — required field: `children` (array, `minItems: 1`). Each
+child mirrors the planner subtask shape: required `id`, `title`,
+`success_criteria_seed`; optional `intent`, `scope_note`, `files_likely_touched`,
+`depends_on`, `requires`, `provides`, `size`, `investigation_notes`.
+
+Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
+(both default to `"high"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
+(default opus via the global `MODEL_DEFAULT` fallback).
+
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
-conformer 60, judge 40, heal patch_generator 40, pr_writer 20. For
+conformer 60, judge 40, heal patch_generator 40, pr_writer 20, fit_judge 30,
+splitter 30. For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its
 scope is narrower (read a diff, read a small set of rules files, update
@@ -5812,7 +5854,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the nine `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the eleven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -5883,7 +5925,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the nine main-loop workers, not the post-run
+self-heal target set is the eleven main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
@@ -5935,6 +5977,10 @@ enforcement functions:
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
 | `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (opus via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "high"`, prompt file exists) |
+| `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "high"`, prompt file exists) |
+| `test_recursive_decompose.py` | `partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates, migration path uses partition_files (not splitter LLM), bump_workers called before every claude_p |
 | `test__read_toml_key.py` | `_read_toml_key()` — the shared `leerie.toml` line parser used by both resolvers |
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
 | `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that every producer's retryable-path return tags a `failure_kind` in `_RETRYABLE_FAILURE_KINDS` (`validate_result`, `check_branch_has_commits`, the inline dirty-worktree check in `settle_subtask`) |

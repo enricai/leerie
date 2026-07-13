@@ -25,7 +25,7 @@ import pytest
 
 WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "satisfied_probe", "provision", "implementer", "integrator",
-           "conformer")
+           "conformer", "fit_judge", "splitter")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
@@ -38,6 +38,8 @@ DEFAULTS = {
     "integrator": "opus",
     "implementer": "sonnet",
     "conformer":  "sonnet",
+    "fit_judge":  "opus",
+    "splitter":   "opus",
 }
 
 
