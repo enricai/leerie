@@ -16839,8 +16839,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # conformance phase (below) record whatever verification step didn't
             # finish. This is the outcome subtasks whose criteria didn't gate on
             # the build got by luck (they returned before dying); made
-            # deterministic here. See the fix/empty-handoff-keeps-committed-work
-            # investigation (DESIGN §9).
+            # deterministic here. See DESIGN §9.
             if kind == "empty_handoff" and \
                     await branch_has_commits_ahead(
                         worktree, compute_run_branch(st.run_id)):
