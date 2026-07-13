@@ -5028,7 +5028,6 @@ def build_repo_map(
         try:
             with open(cp, "rb") as fh:
                 entry = pickle.load(fh)  # noqa: S301
-            # Validate the cache entry is still fresh (mtime unchanged)
             if entry.get("mtime_ns") == abs_path.stat().st_mtime_ns:
                 return entry["defs"], entry["refs"]
         except Exception:
@@ -5071,8 +5070,6 @@ def build_repo_map(
             if not defs and not file_refs:
                 continue
             files_map[rel] = defs
-            # For each symbol referenced (called) in this file, add this
-            # file as a referencing file for that symbol
             for sym in file_refs:
                 if sym not in refs_map:
                     refs_map[sym] = set()
@@ -5195,7 +5192,6 @@ def rank_repo_map(
     # nodes are widely-used utilities — biasing toward them surfaces the
     # structural backbone of the task neighborhood.
     graph: dict[str, set[str]] = {}
-    # Reverse map: def_symbol → file that defines it
     def_to_file: dict[str, str] = {}
     for rel, syms in files_map.items():
         for sym in syms:
@@ -5212,12 +5208,10 @@ def rank_repo_map(
             if ref_file != definer:
                 graph[definer].add(ref_file)
 
-    # Ensure every file appears as a node (even isolated ones)
     for rel in files_map:
         if rel not in graph:
             graph[rel] = set()
 
-    # Build personalization dict: seed files and files containing seed symbols
     pref: dict[str, float] = {}
     seed_set = set(seed_files)
     for rel in files_map:
@@ -5227,18 +5221,15 @@ def rank_repo_map(
         definer = def_to_file.get(sym)
         if definer and definer in files_map:
             pref[definer] = pref.get(definer, 0.0) + 1.0
-        # Also weight files that *reference* the seed symbol
         for ref_file in refs_map.get(sym, set()):
             if ref_file in files_map:
                 pref[ref_file] = pref.get(ref_file, 0.0) + 0.5
 
-    # Fall back to uniform personalization when no seed resolves
     if not pref:
         pref = {rel: 1.0 for rel in files_map}
 
     ranks = _pagerank(graph, pref)
 
-    # Sort files by rank descending (most relevant first)
     ranked_files: list[tuple[str, float]] = sorted(
         ((rel, ranks.get(rel, 0.0)) for rel in files_map),
         key=lambda x: -x[1],
