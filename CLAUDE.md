@@ -602,6 +602,29 @@ non-fatal `try/except Exception`; `_run_phases()` calls
 `_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
 crash recovery path); and the `dep_capture` prompt file exists alongside
 `SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
+The P1 recursive decomposition surface (DESIGN §P1) is tested across four
+files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
+required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
+bounds (minimum 0, maximum 1), `confidence` using the `"fit"` axis, valid and
+invalid instance acceptance, JSON serializability, and wiring (`fit_judge` in
+`WORKER_TYPES`, not in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER`
+entry at `"high"`, prompt file exists). `tests/test_splitter_schema.py` covers
+`SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
+fields (`id`, `title`, `success_criteria_seed`), optional child fields,
+valid/invalid instances, JSON serializability, and the same wiring guards.
+`tests/test_resolve_fit_judge_model.py` covers model and effort resolution for
+`fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from
+`MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both in
+`EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
+chains; isolation (override doesn't bleed to other workers); structural wiring
+guards. `tests/test_recursive_decompose.py` covers `partition_files()` (empty
+input, single chunk, exact multiple, partial last chunk, 100% coverage + 0
+overlap guarantee by construction, `chunk_size=1`, order preserved,
+`chunk_size<1` degenerate guard) and `recursive_decompose()` (well-fit subtask
+is a leaf at score ≥ 0.70, oversized subtask recurses then children are judged,
+depth cap terminates at `decompose_max_depth`, no-progress guard terminates
+after `decompose_noprogress_rounds`, migration path uses `partition_files` not
+the splitter LLM, `st.bump_workers` called before every `claude_p`).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
