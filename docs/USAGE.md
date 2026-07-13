@@ -340,6 +340,33 @@ local setup) because nerdctl can't reach Keychain. See
   `--max-workers`). Per-worker cgroup containment keeps an OOM inside
   one worker's cgroup, so high wave-level parallelism is safe. Users
   on smaller VMs can opt down.
+- `--skip-repo-map` — skip the P6 codebase structural map (DESIGN §P6).
+  Suppresses `build_repo_map()` and the ranked subgraph injected into
+  planner and splitter context; the planner degrades gracefully to the
+  prior grep/glob-only path with no other change in behavior. Use on
+  repos where tree-sitter cannot parse the primary language, or to opt
+  out of structural context. Also `LEERIE_SKIP_REPO_MAP` env var or
+  `skip_repo_map = true` in `leerie.toml`. Precedence: `--skip-repo-map`
+  → `LEERIE_SKIP_REPO_MAP` → `leerie.toml` → default `False`. See the
+  full surface (resolver function, state field) in
+  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map--build_repo_map--rank_repo_map).
+- **P1 recursive decompose caps** — four internal defaults that bound the
+  fit-judge recursion (DESIGN §P1 *Recursive judge + splitter*). These are
+  not user-tunable via CLI / env / `leerie.toml`; they are listed here so
+  operators understand the built-in limits. Full details in
+  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#6-caps-and-their-values):
+  - `repo_map_tokens` (default `1000`) — token budget for the
+    personalized-PageRank-ranked subgraph injected into the planner. The
+    subgraph is binary-searched to fit within this many tokens.
+  - `decompose_max_depth` (default `5`) — maximum recursion depth before
+    a subtask is accepted as a leaf regardless of its fit score. A
+    depth-5 tree can represent up to 32 leaves from one subtask.
+  - `decompose_fit_threshold` (default `0.70`) — `fit_judge` confidence
+    score at or above which a subtask is accepted as a leaf (well-fit).
+    Measured on n=24 telemetry-labeled subtasks: 88% accuracy at 0.70.
+  - `decompose_noprogress_rounds` (default `2`) — consecutive rounds with
+    no child whose fit score exceeds the parent's before the subtask is
+    accepted as a leaf with a warning.
 - `--clarify` — opt into surfacing intent questions to the user
   (default: off). Without it the classifier's filter still runs but
   surviving questions are dropped, and the implementer makes a
