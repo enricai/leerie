@@ -279,8 +279,9 @@ def test_recursive_decompose_depth_cap(leerie):
 # recursive_decompose — no-progress guard
 # ---------------------------------------------------------------------------
 
-def test_recursive_decompose_noprogress_guard(leerie):
-    """If noprogress_rounds consecutive rounds produce no improvement, accept as leaf."""
+def test_recursive_decompose_noprogress_guard(leerie, capsys):
+    """If noprogress_rounds consecutive rounds produce no improvement, accept as leaf
+    and emit a warning via log()."""
     parent = {
         "id": "stuck",
         "title": "Stuck subtask",
@@ -313,6 +314,11 @@ def test_recursive_decompose_noprogress_guard(leerie):
     assert len(leaves) == 1
     # bump_workers must have been called (judge + splitter at each level).
     assert st.bump_workers.call_count >= 1
+    # The no-progress guard must emit a warning via log() (prints to stdout).
+    out = capsys.readouterr().out
+    assert "no-progress guard" in out, (
+        f"Expected 'no-progress guard' warning in stdout; got: {out!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
