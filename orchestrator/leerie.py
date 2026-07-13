@@ -200,6 +200,32 @@ DEFAULT_CAPS = {
     # observed worst case while still flagging the truly-unwinnable
     # 29-subtask runs that motivated the preflight.
     "budget_safety_margin": 1.15,
+    # Repo-map token budget for the personalized-PageRank-ranked subgraph
+    # injected into the planner and splitter (DESIGN §P6 *Codebase structural
+    # map*). The subgraph is binary-searched to fit within this many tokens;
+    # ranked so the most task-relevant symbols appear at the prompt extremes.
+    # ~1000 tokens keeps the injection below 5% of typical planner context.
+    "repo_map_tokens": 1000,
+    # Maximum recursion depth for recursive_decompose() (DESIGN §P1 *P1
+    # recursive judge + splitter*). A depth-5 tree can represent up to 2^5=32
+    # leaves from a single subtask, more than enough for the observed 64-file
+    # migration sweeps (target ~8 leaves). Terminates recursion at depth ≥ 5
+    # even if fit_judge still scores below decompose_fit_threshold.
+    "decompose_max_depth": 5,
+    # P1 fit-judge pass threshold for recursive_decompose() (DESIGN §P1).
+    # A subtask scoring ≥ this value is accepted as a leaf (well-fit).
+    # MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs
+    # well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. The
+    # originally-planned 0.95 threshold over-splits 100% of well-fit subtasks
+    # (their scores cluster at 0.82–0.93); 0.70 is the empirically-derived
+    # optimum (see F1-build-measure.md).
+    "decompose_fit_threshold": 0.70,
+    # No-progress guard for recursive_decompose(). If this many consecutive
+    # recursion rounds produce no child whose fit score exceeds the parent's,
+    # the subtask is accepted as a leaf with a warning rather than recursing
+    # indefinitely. Prevents a degenerate splitter output from looping to
+    # decompose_max_depth.
+    "decompose_noprogress_rounds": 2,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -218,6 +244,7 @@ STATE_FIELDS = (
     "skip_budget_check",
     "strict_conformer",
     "skip_base_baseline",
+    "skip_repo_map",
     # cgroup_containment: recorded by the fail-closed gate
     # (enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
@@ -595,6 +622,22 @@ STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 # leerie.toml → False.
 SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-repo-map bypass (DESIGN §P6 *Codebase structural map*). Suppresses
+# `build_repo_map()` and the ranked-subgraph injection into the planner
+# context. Use on repos where tree-sitter cannot parse the primary language,
+# or where the user wants the prior grep/glob-only planning path. When
+# skipped, the planner receives no repo-map context and degrades gracefully
+# to today's behavior. Resolution order: --skip-repo-map CLI flag →
+# LEERIE_SKIP_REPO_MAP env → skip_repo_map in leerie.toml → False.
+SKIP_REPO_MAP_ENV = "LEERIE_SKIP_REPO_MAP"
+SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
+
+# <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
+# the mtime-keyed per-file parse results produced by build_repo_map() so
+# only changed files are re-parsed on subsequent runs (Aider diskcache
+# pattern). Created on first use by build_repo_map().
+REPO_MAP_CACHE_DIR = "repo-map-cache"
 
 # capture_deps preference (DESIGN §6½). Controls whether phase_finalize
 # scans logs and writes setup_packages / triggers the language-dep bake.
@@ -3693,6 +3736,24 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_BASE_BASELINE_ENV,
         file_key="skip_base_baseline",
         file_name=SKIP_BASE_BASELINE_FILE)
+
+
+def resolve_skip_repo_map(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-repo-map preference. Order:
+    --skip-repo-map CLI flag (action='store_true') →
+    LEERIE_SKIP_REPO_MAP env var →
+    skip_repo_map in leerie.toml → False.
+
+    When True, `build_repo_map()` is not called — the ranked P6 subgraph
+    injection into the planner/splitter context is skipped and the planner
+    degrades gracefully to the prior grep/glob-only path. Use on repos where
+    tree-sitter cannot parse the primary language, or where the user wants to
+    opt out of the structural context."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_REPO_MAP_ENV,
+        file_key="skip_repo_map",
+        file_name=SKIP_REPO_MAP_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -16811,6 +16872,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
+        st.data["skip_repo_map"] = bool(args.skip_repo_map)
         st.data["leerie_version"] = _read_version()
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
@@ -16851,6 +16913,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
                    "skip_base_baseline": bool(args.skip_base_baseline),
+                   "skip_repo_map": bool(args.skip_repo_map),
                    "leerie_version": _read_version()}
         st.save()
         # Fail-closed containment gate + recording, before the first
@@ -17215,6 +17278,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "base is known green or the up-front cost is unwanted. "
                          f"Also {SKIP_BASE_BASELINE_ENV} env or "
                          "skip_base_baseline in leerie.toml. Default: off.")
+    ap.add_argument("--skip-repo-map", action="store_true",
+                    help="skip the P6 repo-map structural context (DESIGN §P6): "
+                         "suppresses build_repo_map() and the ranked subgraph "
+                         "injection into planner/splitter context. The planner "
+                         "degrades gracefully to the prior grep/glob-only path. "
+                         "Use on repos where tree-sitter cannot parse the "
+                         "primary language, or to opt out of structural context. "
+                         f"Also {SKIP_REPO_MAP_ENV} env or "
+                         "skip_repo_map in leerie.toml. Default: off.")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
@@ -17520,6 +17592,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.skip_base_baseline = resolve_skip_base_baseline(
         repo_root, args.skip_base_baseline)
+
+    args.skip_repo_map = resolve_skip_repo_map(
+        repo_root, args.skip_repo_map)
 
     args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
         repo_root, args.dangerously_allow_uncapped)

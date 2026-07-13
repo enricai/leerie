@@ -3975,6 +3975,32 @@ elif [ -f "$_leerie_config_toml" ]; then
   unset _bld_cfg
 fi
 
+# Resolve skip_repo_map preference.
+# Precedence: LEERIE_SKIP_REPO_MAP env > skip_repo_map in leerie.toml > false.
+# Used by the launcher to inject --skip-repo-map into REWRITTEN_ARGS when the
+# user has not passed the flag explicitly (e.g. on Fly runs where leerie.toml
+# is on the host but not on the machine). Python-side resolve_skip_repo_map()
+# provides the authoritative resolution inside the orchestrator; this block
+# ensures the flag propagates correctly on Fly.
+_SKIP_REPO_MAP=false
+if [ -n "${LEERIE_SKIP_REPO_MAP:-}" ]; then
+  case "${LEERIE_SKIP_REPO_MAP}" in
+    0|false|no) _SKIP_REPO_MAP=false ;;
+    1|true|yes)  _SKIP_REPO_MAP=true ;;
+  esac
+elif [ -f "$USER_REPO/leerie.toml" ]; then
+  _srm_toml="$( { grep -E '^[[:space:]]*skip_repo_map[[:space:]]*=' \
+                      "$USER_REPO/leerie.toml" 2>/dev/null \
+                  | head -1 \
+                  | sed -E 's/^[[:space:]]*skip_repo_map[[:space:]]*=[[:space:]]*//;
+                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
+  case "${_srm_toml:-}" in
+    0|false|no) _SKIP_REPO_MAP=false ;;
+    1|true|yes)  _SKIP_REPO_MAP=true ;;
+  esac
+  unset _srm_toml
+fi
+
 # Auto-generate a Dockerfile from setup_packages. Runs when no Dockerfile
 # exists OR when the existing one is an UNCOMMITTED prior leerie-generated file
 # (carries the LEERIE_GENERATED_SENTINEL on line 1 AND is not git-tracked) —
@@ -4637,6 +4663,19 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# Inject --skip-repo-map when resolved from env/toml but not already on CLI.
+# Guards against double-injection (the user may have also passed it explicitly).
+if [ "$_SKIP_REPO_MAP" = "true" ]; then
+  _srm_already=false
+  for _srm_arg in ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}; do
+    [ "$_srm_arg" = "--skip-repo-map" ] && { _srm_already=true; break; }
+  done
+  unset _srm_arg
+  [ "$_srm_already" = "false" ] && REWRITTEN_ARGS+=("--skip-repo-map")
+  unset _srm_already
+fi
+unset _SKIP_REPO_MAP
 
 # --- assemble auth/config mounts ----------------------------------------
 # Per-container config isolation. The shared host ~/.claude.json is a
