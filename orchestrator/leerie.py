@@ -6251,6 +6251,62 @@ def detect_recipe_from_lockfiles(repo_root: Path) -> list[dict]:
     return _lockfile_table_entries(repo_root)
 
 
+def _normalize_pip_installs(recipe: list[dict]) -> list[dict]:
+    """Add `--break-system-packages` to every `pip`/`pip3`/`python -m pip`
+    *install* command that lacks it. Returns a new recipe list (entries
+    are shallow-copied only when rewritten).
+
+    Why this is code, not a prompt rule: the container's system Python is
+    Debian-13 externally-managed (PEP 668) — a bare `pip install` exits
+    non-zero with "externally-managed-environment" (the same failure the
+    Dockerfile already works around at its own `pip3 install
+    --break-system-packages`). The LLM provision worker generates recipes
+    by mirroring the repo's CI, which runs in a venv/runner and needs no
+    such flag, so it never emits one. That gap silently breaks every
+    recipe consumer — most visibly `capture_conformance_baseline`, whose
+    `pip install` then fails and leaves the base-tree test axis recording
+    `command not found` instead of a real pass/fail. Normalizing here, at
+    the single point every consumer reads the recipe as data, fixes all
+    of them at once (§12: prompts advisory, code enforces).
+
+    The flag is safe unconditionally: on a non-externally-managed
+    interpreter (e.g. a mise-managed Python) it is a harmless no-op; on
+    the apt system Python it is required.
+    """
+    out: list[dict] = []
+    for entry in recipe:
+        cmd = entry.get("command") or []
+        if _is_pip_install(cmd) and "--break-system-packages" not in cmd:
+            i = cmd.index("install")
+            new_cmd = cmd[:i + 1] + ["--break-system-packages"] + cmd[i + 1:]
+            out.append({**entry, "command": new_cmd})
+        else:
+            out.append(entry)
+    return out
+
+
+def _is_pip_install(cmd: list[str]) -> bool:
+    """True iff `cmd` (an argv list) is a pip *install* invocation — bare
+    `pip`/`pip3 …` or `python[3] -m pip …` — where the pip subcommand is
+    `install`. The subcommand is the first token after the pip prefix that
+    is not a global option (`pip -v install …` → install), so a leading
+    global flag doesn't hide it. A non-install subcommand (`pip list`)
+    returns False."""
+    if not cmd:
+        return False
+    if cmd[0] in ("pip", "pip3"):
+        rest = cmd[1:]
+    elif cmd[0] in ("python", "python3") and cmd[1:3] == ["-m", "pip"]:
+        rest = cmd[3:]
+    else:
+        return False
+    for tok in rest:
+        if tok.startswith("-"):
+            continue  # global option before the subcommand
+        return tok == "install"  # first non-option token is the subcommand
+    return False
+
+
 def validate_provision_recipe(recipe: list[dict]) -> None:
     """Mechanically bound the provision recipe. Raises ValueError on any
     violation. Called for BOTH the table-emitted recipe and the LLM-
@@ -11189,6 +11245,13 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     except ValueError as e:
         die(f"provision recipe failed validation: {e}")
 
+    # Add --break-system-packages to pip installs before persisting, so
+    # every downstream consumer (baseline capture, prompt injection into
+    # implementer/conformer workers) gets a recipe that actually runs on
+    # the Debian-13 externally-managed system Python. See
+    # _normalize_pip_installs.
+    recipe = _normalize_pip_installs(recipe)
+
     prov["recipe"] = recipe
     st.save()
 
@@ -15545,6 +15608,63 @@ async def _protected_paths_since(worktree: str,
     return [f for f in touched if is_protected_path(f)]
 
 
+async def _blob_sha(worktree: str, ref: str, path: str) -> str | None:
+    """Blob SHA of `path` at `ref` in `worktree`, or None if the path is
+    absent at that ref.
+
+    Uses `git rev-parse --verify -q <ref>:<path>` deliberately: plain
+    `git rev-parse <ref>:<path>` on a missing path prints the literal
+    `<ref>:<path>` string to stdout *and* exits non-zero, so naive
+    callers capture a bogus value; `--verify -q` exits cleanly with empty
+    stdout instead."""
+    r = await run_proc(
+        ["git", "rev-parse", "--verify", "-q", f"{ref}:{path}"],
+        cwd=worktree,
+    )
+    out = r.stdout.strip()
+    return out if (r.returncode == 0 and out) else None
+
+
+async def clobbered_owned_files(worktree: str, base_ref: str,
+                                impl_head: str) -> list[str]:
+    """Return implementer-owned files the conformer reverted-to-base or
+    deleted, i.e. the data-loss signature (DESIGN §9 *No clobbering the
+    implementer's work*). Empty list when clean or on git failure.
+
+    - Owned set = files changed in `base_ref..impl_head` (the reliable
+      owned set; `files_likely_touched` is advisory and NOT used because
+      the implementer may commit outside it).
+    - `impl_head` MUST be the implementer's committed HEAD snapshotted
+      *before the first conformer round* — a per-round HEAD already folds
+      in prior conformer commits, and a round-0 clobber would then read as
+      "implementer never changed it" and be missed.
+    - A file is a clobber iff the implementer changed it (blob@impl !=
+      blob@base) AND at HEAD it is absent (deleted) OR its blob equals
+      base (reverted). A legitimate conformer edit yields a distinct third
+      blob and is not flagged."""
+    if not base_ref or not impl_head:
+        return []
+    r = await run_proc(
+        ["git", "diff", "--name-only", f"{base_ref}..{impl_head}"],
+        cwd=worktree,
+    )
+    if r.returncode != 0:
+        return []
+    owned = [f for f in r.stdout.splitlines() if f]
+    clobbered: list[str] = []
+    for f in owned:
+        b_base = await _blob_sha(worktree, base_ref, f)
+        b_impl = await _blob_sha(worktree, impl_head, f)
+        b_head = await _blob_sha(worktree, "HEAD", f)
+        if b_impl == b_base:
+            continue  # implementer didn't actually change it — not owned
+        if b_head is None:
+            clobbered.append(f"{f} (deleted)")
+        elif b_head == b_base:
+            clobbered.append(f"{f} (reverted-to-base)")
+    return clobbered
+
+
 async def rollback_conformer_commits(worktree: str, before_sha: str) -> None:
     """Hard-reset the subtask branch back to `before_sha`. Used when the
     conformer wrote to a protected path — the implementer's commits
@@ -16010,6 +16130,18 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     run_branch = compute_run_branch(st.run_id)
     last_res: dict | None = None
     blt_feedback: str | None = None
+    # Snapshot the implementer's committed HEAD ONCE, before any conformer
+    # round runs, for the clobber-survival check (DESIGN §9 *No clobbering
+    # the implementer's work*). Must be captured here, not per-round: a
+    # per-round HEAD folds in prior conformer commits, so a round-0
+    # revert-to-base would read as "implementer never changed it" and slip
+    # past the check.
+    impl_head_sha = await _branch_head_sha(worktree)
+    # Set when the conformer reverted/deleted an implementer-owned file.
+    # Under --strict-conformer this blocks the subtask even if the
+    # conformer's own BLT/residuals came back clean (a clobber is the
+    # severest residual — it tried to destroy the implementer's work).
+    clobbered_files: list[str] = []
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
@@ -16057,6 +16189,33 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             f"{len(dirty)} uncommitted change(s) — not "
                             "rolled back, but surfaced as advisory")
 
+        # Clobber-survival check (DESIGN §9 *No clobbering the
+        # implementer's work*): did the conformer revert-to-base or delete
+        # a file the implementer committed? Warn always; under strict mode
+        # roll the conformer's commits back to the implementer HEAD. Not
+        # auto-rolled-back in advisory mode — a legitimate revert-to-base
+        # is git-indistinguishable from a clobber and the phase is advisory.
+        clobbered = await clobbered_owned_files(
+            worktree, run_branch, impl_head_sha)
+        if clobbered:
+            clobbered_files = clobbered
+            warnings.append(
+                f"conformer round {c_round}: reverted/deleted "
+                f"{len(clobbered)} implementer-owned file(s): {clobbered}")
+            if caps.get("strict_conformer"):
+                discarded = await _uncommitted_paths(worktree)
+                if discarded:
+                    warnings.append(
+                        f"conformer round {c_round}: discarding "
+                        f"{len(discarded)} uncommitted file(s) during "
+                        f"clobber rollback: {[line[3:] for line in discarded]}")
+                await rollback_conformer_commits(worktree, impl_head_sha)
+                warnings.append(
+                    f"conformer round {c_round}: strict mode — rolled "
+                    "conformer commits back to implementer HEAD to restore "
+                    "clobbered work")
+                break
+
         # Commit-prefix observability: surface (but don't roll back) any
         # conformer commits whose subject doesn't start with `conformer:`.
         # The prefix lets reviewers identify conformer commits in git log;
@@ -16091,14 +16250,31 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         warnings.extend(_summarize_residuals(last_res))
 
     blocked_reason: str | None = None
-    if caps.get("strict_conformer") and last_res is not None \
-       and not _conformance_clean(last_res):
-        residuals = _summarize_residuals(last_res)
-        blocked_reason = (
-            "strict-conformer: " + "; ".join(residuals[:3])
-            if residuals else "strict-conformer: conformance not clean")
+    if caps.get("strict_conformer"):
+        # A clobber blocks even when the conformer's own BLT/residuals are
+        # clean: it was rolled back above, but strict mode must surface it
+        # for the operator (fix + --resume), not silently complete.
+        if clobbered_files:
+            blocked_reason = (
+                "strict-conformer: conformer reverted/deleted "
+                f"implementer-owned file(s): {clobbered_files}")
+        elif last_res is not None and not _conformance_clean(last_res):
+            residuals = _summarize_residuals(last_res)
+            blocked_reason = (
+                "strict-conformer: " + "; ".join(residuals[:3])
+                if residuals else "strict-conformer: conformance not clean")
 
     return last_res, warnings, blocked_reason
+
+
+def _runner_missing(summary: str) -> bool:
+    """True if a failed baseline command failed because its runner is not
+    on PATH (rather than a real test/build/lint failure). The canonical
+    signature is a shell `command not found`; also treat a bare
+    `No such file or directory` on the command as runner-missing. Used to
+    distinguish "could not measure" from "base is RED"."""
+    s = (summary or "").lower()
+    return "command not found" in s or "no such file or directory" in s
 
 
 def _format_baseline_section(baseline: dict | None) -> str | None:
@@ -16112,34 +16288,68 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     scratch (DESIGN §9 *Base-tree health baseline*). Advisory: the
     mechanical part (which axes were red on base) is code-computed here;
     the judgment (is a given post-change failure the same one) stays with
-    the worker."""
+    the worker.
+
+    An axis whose baseline command could not be measured (`measured:
+    False` — its runner was missing) is surfaced honestly as "could not
+    measure," NOT folded into GREEN or RED: a false GREEN would tell the
+    conformer to treat every failure as new; a false RED gives it a
+    delta it can't use. Every axis dict carries `measured` (set by
+    `capture_conformance_baseline`), so a missing/false value means the
+    axis is not a measured pass."""
     if not baseline:
         return None
     axes = baseline.get("axes") or {}
+
+    def _measured(a: str) -> bool:
+        ax = axes.get(a) or {}
+        return bool(ax.get("ran") and ax.get("measured"))
+
     red = [a for a in ("build", "lint", "tests")
-           if (axes.get(a) or {}).get("ran")
-           and not (axes.get(a) or {}).get("passed")]
+           if _measured(a) and not (axes.get(a) or {}).get("passed")]
+    green = [a for a in ("build", "lint", "tests")
+             if _measured(a) and (axes.get(a) or {}).get("passed")]
+    unmeasured = [a for a in ("build", "lint", "tests")
+                  if (axes.get(a) or {}).get("ran")
+                  and not (axes.get(a) or {}).get("measured")]
+
     lines = ["", "BASELINE:"]
-    if not red:
+    # Only claim GREEN when an axis was *actually* measured and passed —
+    # never when every axis was unmeasurable (e.g. the runner was absent),
+    # which would be a false all-clear (the very framing this baseline
+    # exists to avoid). The `unmeasured` block below carries the honest
+    # "could not measure — attribute failures yourself" guidance in that case.
+    if not red and green:
         lines.append(
-            "  The base tree (before any subtask's change) was GREEN — "
-            "build, lint, and tests all passed (or were not applicable). "
-            "So ANY build/lint/test failure you observe was introduced by "
-            "this run's diff: report it as a residual and try to fix it.")
-        return "\n".join(lines)
-    lines.append(
-        "  The base tree (before any subtask's change) was already RED on "
-        "the following axis/axes: " + ", ".join(red) + ". These failures "
-        "PRE-EXIST on the base and are NOT this run's responsibility — do "
-        "NOT report them as residuals and do NOT try to fix them. Scope "
-        "your build/lint/test judgment to the DELTA: only report a "
-        "build/lint/test failure as a residual if it is NEW relative to "
-        "this base state (i.e. introduced by the diff). Compare with "
-        "`git diff DIFF_BASE..HEAD` to attribute failures.")
-    for a in red:
-        summ = ((axes.get(a) or {}).get("summary") or "").strip()
-        if summ:
-            lines.append(f"  - {a} (pre-existing): {summ[:200]}")
+            "  The base tree (before any subtask's change) was GREEN on "
+            "every axis that could be measured — those passed (or were "
+            "not applicable). So any build/lint/test failure you observe "
+            "on a measured axis was introduced by this run's diff: report "
+            "it as a residual and try to fix it.")
+    elif red:
+        lines.append(
+            "  The base tree (before any subtask's change) was already RED "
+            "on the following axis/axes: " + ", ".join(red) + ". These "
+            "failures PRE-EXIST on the base and are NOT this run's "
+            "responsibility — do NOT report them as residuals and do NOT "
+            "try to fix them. Scope your build/lint/test judgment to the "
+            "DELTA: only report a build/lint/test failure as a residual if "
+            "it is NEW relative to this base state (i.e. introduced by the "
+            "diff). Compare with `git diff DIFF_BASE..HEAD` to attribute "
+            "failures.")
+        for a in red:
+            summ = ((axes.get(a) or {}).get("summary") or "").strip()
+            if summ:
+                lines.append(f"  - {a} (pre-existing): {summ[:200]}")
+    if unmeasured:
+        lines.append(
+            "  The following axis/axes COULD NOT be measured on the base "
+            "tree (the runner was not available): " + ", ".join(unmeasured)
+            + ". There is no baseline for them — attribute any failure on "
+            "these axes yourself, honestly, by whether the failing files "
+            "are in `git diff DIFF_BASE..HEAD`. Do NOT check out or reset "
+            "the tree to another ref to re-derive the base — that destroys "
+            "the implementer's committed work.")
     return "\n".join(lines)
 
 
@@ -16219,29 +16429,51 @@ async def capture_conformance_baseline(
     for axis in ("build", "lint", "tests"):
         cmd = (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
         if not cmd:
-            axes[axis] = {"ran": False, "passed": None, "summary": "",
-                          "command": ""}
+            # Every axis dict carries `measured` so no consumer needs a
+            # default; a not-applicable axis is unmeasured (and, being
+            # ran=False, is neither red nor green).
+            axes[axis] = {"ran": False, "measured": False, "passed": None,
+                          "summary": "", "command": ""}
             continue
         try:
             rc, tail = await run_streaming(
                 ["bash", "-lc", cmd], cwd=str(staging), timeout=timeout,
                 log_path=log_path, label=f"baseline-{axis}: {cmd}",
                 verbosity=verbosity)
-            axes[axis] = {
-                "ran": True, "passed": rc == 0,
-                "command": cmd,
-                # Keep a short tail for the RED warning / conformer context.
-                "summary": (tail or "").strip()[-400:],
-            }
+            summary = (tail or "").strip()[-400:]
+            if rc != 0 and _runner_missing(summary):
+                # The command didn't run — its runner isn't on PATH (e.g.
+                # the recipe's `pip install` failed, so pytest is absent).
+                # This is "could not measure," NOT "base is RED": recording
+                # it as red-with-`command not found` gives the conformer a
+                # useless delta and provokes it to re-derive the baseline
+                # destructively (git stash / checkout <base> -- .). Mark it
+                # unmeasurable so red-axis logic and the conformer prompt
+                # both skip it.
+                axes[axis] = {"ran": True, "measured": False, "passed": None,
+                              "command": cmd, "summary": summary}
+            else:
+                axes[axis] = {
+                    "ran": True, "measured": True, "passed": rc == 0,
+                    "command": cmd,
+                    # Keep a short tail for the RED warning / conformer context.
+                    "summary": summary,
+                }
         except subprocess.TimeoutExpired:
-            axes[axis] = {"ran": True, "passed": False, "command": cmd,
+            axes[axis] = {"ran": True, "measured": True, "passed": False,
+                          "command": cmd,
                           "summary": f"timed out after {int(timeout)}s"}
         except Exception as ex:
-            axes[axis] = {"ran": False, "passed": None, "command": cmd,
+            axes[axis] = {"ran": False, "measured": False, "passed": None,
+                          "command": cmd,
                           "summary": f"{type(ex).__name__}: {ex}"}
 
+    # An axis is RED only if it actually ran AND was measurable AND failed.
+    # Unmeasurable axes (runner missing) are neither red nor green — they
+    # carry no delta and are surfaced separately to the conformer.
     red = [a for a in ("build", "lint", "tests")
-           if axes[a].get("ran") and not axes[a].get("passed")]
+           if axes[a].get("ran") and axes[a].get("measured")
+           and not axes[a].get("passed")]
     baseline = {"axes": axes, "red_axes": red}
     conf = st.data.setdefault("conformance", {})
     conf["_baseline"] = baseline
@@ -16311,6 +16543,15 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
     sys_prompt = load_prompt("conformer")
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
+
+    # Base ref and pre-pass snapshot for the clobber-survival check
+    # (DESIGN §9 *No clobbering the implementer's work*). Staging is cut
+    # from the run branch (setup-run.sh), so `run_branch..staging_before`
+    # is the union of all integrated implementer work; the run branch is
+    # the base version to compare against.
+    run_branch = compute_run_branch(st.run_id)
+    staging_before_sha = await _branch_head_sha(str(staging))
+    clobbered_files: list[str] = []
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
@@ -16413,6 +16654,31 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"{len(dirty)} uncommitted change(s) — not "
                             "rolled back, but surfaced as advisory")
 
+        # Clobber-survival check (DESIGN §9 *No clobbering the
+        # implementer's work*): same guard as the per-subtask phase,
+        # scoped to the integrated staging tree. base=run_branch,
+        # impl_head=staging HEAD captured before this pass.
+        clobbered = await clobbered_owned_files(
+            str(staging), run_branch, staging_before_sha)
+        if clobbered:
+            clobbered_files = clobbered
+            warnings.append(
+                f"final conformer round {c_round}: reverted/deleted "
+                f"{len(clobbered)} integrated file(s): {clobbered}")
+            if caps.get("strict_conformer"):
+                discarded = await _uncommitted_paths(str(staging))
+                if discarded:
+                    warnings.append(
+                        f"final conformer round {c_round}: discarding "
+                        f"{len(discarded)} uncommitted file(s) during "
+                        f"clobber rollback: {[line[3:] for line in discarded]}")
+                await rollback_conformer_commits(
+                    str(staging), staging_before_sha)
+                warnings.append(
+                    f"final conformer round {c_round}: strict mode — "
+                    "rolled conformer commits back to restore clobbered work")
+                break
+
         unprefixed = await _unprefixed_conformer_commits(
             str(staging), before_sha)
         for subject in unprefixed:
@@ -16442,9 +16708,10 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     if last_res is not None:
         warnings.extend(_summarize_residuals(last_res))
 
-    final_blocked = (caps.get("strict_conformer")
-                     and last_res is not None
-                     and not _conformance_clean(last_res))
+    final_blocked = bool(
+        caps.get("strict_conformer")
+        and (clobbered_files
+             or (last_res is not None and not _conformance_clean(last_res))))
 
     st.data.setdefault("conformance", {})["_final"] = {
         "result": last_res,
@@ -16455,8 +16722,10 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     for w in warnings:
         log(f"  final conformance: {w}")
     if final_blocked:
-        die("strict-conformer: final-tree conformance has residuals; "
-            "run blocked. Fix the residuals and --resume.")
+        why = (f"conformer reverted/deleted integrated file(s): "
+               f"{clobbered_files}" if clobbered_files else "has residuals")
+        die(f"strict-conformer: final-tree conformance {why}; "
+            "run blocked. Fix and --resume.")
 
 
 async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
@@ -17155,13 +17424,19 @@ def _base_health_payload(st: "State") -> dict | None:
         return None
     axes = baseline.get("axes") or {}
     ran = {a: (axes.get(a) or {}) for a in ("build", "lint", "tests")}
+    # An axis is RED only if it ran, was measurable, and failed — same
+    # rule as capture_conformance_baseline's red_axes and
+    # _format_baseline_section. An unmeasurable axis (runner missing)
+    # carries no verdict and must not colour base_status red.
     red = [a for a in ("build", "lint", "tests")
-           if ran[a].get("ran") and not ran[a].get("passed")]
+           if ran[a].get("ran") and ran[a].get("measured")
+           and not ran[a].get("passed")]
     return {
         "base_status": "red" if red else "green",
         "base_red_axes": red,
-        # Per-axis ran/passed so the pr_writer can phrase "net of base".
+        # Per-axis ran/measured/passed so the pr_writer can phrase "net of base".
         "axes": {a: {"ran": bool(ran[a].get("ran")),
+                     "measured": bool(ran[a].get("measured")),
                      "passed": ran[a].get("passed")}
                  for a in ("build", "lint", "tests")},
     }

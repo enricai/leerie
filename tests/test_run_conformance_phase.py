@@ -247,6 +247,56 @@ def test_protected_path_commit_is_rolled_back(env):
     assert state["i"] == 1  # loop broke after rollback
 
 
+# --- clobber-survival guard (DESIGN §9) -----------------------------------
+
+def _clobber_impl_file(wt: Path):
+    """Simulate a conformer that reverted an implementer-owned file to the
+    base version (deletes the implementer's content) and commits it — the
+    data-loss signature."""
+    (wt / "src.py").unlink()  # implementer added src.py; base didn't have it
+    _run(["git", "add", "-A"], cwd=wt)
+    _run(["git", "commit", "-q", "-m", "conformer: revert src.py"], cwd=wt)
+
+
+def test_strict_mode_clobber_blocks_even_when_blt_clean(env):
+    """A clobber under --strict-conformer must block the subtask even
+    though the conformer's own result is BLT-clean with no residuals —
+    it is the severest residual, so it blocks like any other strict one."""
+    c = env["leerie"]
+    env["caps"]["strict_conformer"] = True
+    state = _stub_run_conformer(
+        c, [_clean_result()], commits={0: _clobber_impl_file})
+
+    res, warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    # Blocked despite a clean conformer result.
+    assert blocked is not None
+    assert "clobber" in blocked.lower() or "reverted/deleted" in blocked
+    assert "src.py" in blocked
+    assert any("reverted/deleted" in w for w in warnings)
+    # And the clobber was rolled back (implementer's src.py restored).
+    assert (env["worktree"] / "src.py").exists()
+
+
+def test_advisory_mode_clobber_warns_but_does_not_block(env):
+    """In advisory (default) mode a clobber only warns — no block, no
+    auto-rollback (a legit revert-to-base is indistinguishable from a
+    clobber, and the phase is advisory by design)."""
+    c = env["leerie"]
+    assert env["caps"].get("strict_conformer") in (None, False)
+    state = _stub_run_conformer(
+        c, [_clean_result()], commits={0: _clobber_impl_file})
+
+    res, warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert blocked is None  # advisory: never blocks
+    assert any("reverted/deleted" in w for w in warnings)
+
+
 # --- rounds cap is respected ----------------------------------------------
 
 def test_rounds_cap_respected_with_residuals(env):

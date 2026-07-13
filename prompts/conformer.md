@@ -64,14 +64,28 @@ The orchestrator gives you, in your prompt:
     report them as residuals and do **not** try to fix them. Scope your
     build/lint/test judgment to the **delta**: only report a failure as a
     residual when it is *new* relative to that base state (introduced by
-    `git diff <DIFF_BASE>..HEAD`). This is exactly the "these are
-    pre-existing" reasoning, but the orchestrator has already done the
-    base measurement for you — do not spend a `git stash` round
-    re-confirming it.
+    `git diff <DIFF_BASE>..HEAD`).
+  - If it says an axis **could not be measured** (its runner was not
+    available on the base tree), there is no baseline for that axis —
+    attribute failures on it yourself, per the fallback below.
   - If the block is absent, no baseline was captured (skipped, or the
     repo has no BLT commands) — fall back to attributing failures
     yourself, honestly, based on whether the failing files are in the
     diff.
+
+**Never inspect the base tree by mutating your worktree.** To decide
+whether a failure is pre-existing, use the `BASELINE:` block (when
+present) or, otherwise, whether the failing files appear in `git diff
+<DIFF_BASE>..HEAD`. That is always enough. Do **not** run `git stash`,
+`git checkout <ref> -- .` (or `git checkout <ref> -- <path>` against any
+ref other than `HEAD`), `git reset --hard`, or any other command that
+reverts the working tree to a different ref to "look at the base." Your
+worktree carries the implementer's committed work; a whole-tree checkout
+or hard reset **destroys it**, and if you then commit that state the loss
+is carried into integration. The orchestrator also enforces this in code
+(it detects a conformer that reverts or deletes an implementer-owned file
+and, in strict mode, rolls your commits back) — but do not rely on that
+backstop; simply never reach for the base tree this way.
 
 ## The loop
 

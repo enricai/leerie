@@ -3242,6 +3242,35 @@ Two further disciplines apply, and they sit at the §12 axis:
   phase also re-verified the criteria-file hash and rolled back
   conformer commits that touched it; that check was removed when the
   criteria lock was retired — §8.)
+- **No clobbering the implementer's work.** The conformer's charter is
+  *additive* — fix drift, add tests, repair rule violations — never to
+  undo what the implementer built. But it runs with full Bash in the
+  worktree, and a conformer that reaches for the base tree to attribute a
+  pre-existing failure (`git checkout <base-ref> -- .`, `git reset
+  --hard`) can revert or delete the implementer's committed files; if it
+  then commits that state, integration (which merges the committed
+  branch) carries the loss forward silently. So the orchestrator snapshots
+  the implementer's committed HEAD *once, before the first conformer
+  round*, and after the conformer runs computes the implementer's owned
+  set (`git diff --name-only <run-branch>..<impl-HEAD>`) and checks, per
+  owned file, whether the conformer reverted it to the base version or
+  deleted it — a three-way blob comparison of base / implementer /
+  post-conformer content, because a *legitimate* conformer edit leaves a
+  distinct third state and must not be flagged. A detected clobber is
+  surfaced as a loud advisory warning always; under `--strict-conformer`
+  the conformer's commits are rolled back to the implementer HEAD **and
+  the subtask is blocked** (the final-tree pass blocks the run) — a
+  clobber is the severest residual, so it blocks like any other strict
+  residual (fix + `--resume`), even when the conformer's own build/lint/
+  test came back clean. It is *not* silently auto-rolled-back in advisory
+  mode: a legitimate
+  revert-to-base (the implementer's change was wrong and the conformer
+  undid it) is indistinguishable from a clobber by git state alone, and
+  the phase is advisory by design. The same guard applies to the
+  final-tree pass, using the run branch as the base and the staging HEAD
+  captured before that pass as the implementer-work snapshot. This is the
+  §12 boundary again: the guarantee that matters (committed implementer
+  work survives the conformer) is a code check, not a prompt rule.
 
 The phase is bounded by a separate cap from the evidence loop: the conformer
 gets a small number of orchestrator-level rounds (default 3) in which to

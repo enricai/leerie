@@ -5,6 +5,52 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Provision recipe `pip install` now runs on the container's system
+  Python (PEP 668).** `_normalize_pip_installs` adds
+  `--break-system-packages` to every `pip`/`pip3`/`python -m pip install`
+  recipe entry at the single point `phase_provision` persists the recipe,
+  so all consumers — the base-tree baseline installer and the
+  `PROVISION_RECIPE:` prompt block handed to implementer/conformer
+  workers — get a recipe that actually installs on Debian-13
+  externally-managed Python. The LLM provision worker mirrors the repo's
+  CI (which runs in a venv and never emits the flag), so a bare
+  `pip install` was silently failing; most visibly this left the
+  base-tree `tests` axis recording `command not found` instead of a real
+  verdict.
+- **Base-tree baseline distinguishes "could not measure" from "RED".** An
+  axis whose command fails because its runner is missing (e.g. `pytest`
+  absent after the `pip install` failure above) is now recorded
+  `measured: False` and excluded from `red_axes`; `_format_baseline_section`
+  surfaces it to the conformer as an explicit "could not measure —
+  attribute failures yourself" line rather than a misleading pre-existing-RED.
+  A false-RED baseline with no usable delta is what provoked conformers to
+  re-derive the base tree destructively.
+
+### Added
+
+- **Code-enforced guard against a conformer clobbering the implementer's
+  committed work** (DESIGN §9 *No clobbering the implementer's work*).
+  `clobbered_owned_files` detects, via a three-way blob comparison
+  (base / implementer-HEAD / post-conformer-HEAD, using
+  `git rev-parse --verify -q`), when a conformer reverted-to-base or
+  deleted a file the implementer committed — the data-loss signature of a
+  `git checkout <base-ref> -- .` in a conformer worktree. The
+  implementer's committed HEAD is snapshotted once before the round loop
+  (a per-round snapshot would miss a round-0 clobber). Wired into both the
+  per-subtask and final-tree conformance loops; warns always, and under
+  `--strict-conformer` rolls the conformer's commits back to the
+  implementer HEAD **and blocks the subtask** (the final pass blocks the
+  run) even when the conformer's own build/lint/test came back clean — a
+  clobber is the severest residual. Not auto-rolled-back in advisory mode,
+  since a legitimate revert-to-base is git-indistinguishable from a clobber.
+- **Conformer prompt guidance** against inspecting the base tree by
+  mutating the worktree (`git stash`, `git checkout <ref> -- .`,
+  `git reset --hard`) — the advisory layer paired with the code guard above.
+
 ## [0.9.58]
 
 ### Changed

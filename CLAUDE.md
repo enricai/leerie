@@ -733,6 +733,33 @@ expansion loop precedes final logging); integration — one oversized subtask (s
 first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
 empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
+The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
+work* + the base-tree baseline's `measured` field) is tested across three
+files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
+`clobbered_owned_files` against real temp git repos (legit conformer edit not
+flagged; revert-to-base flagged; deletion flagged; a file outside the
+implementer's owned set never flagged; a new file added not flagged; the
+load-bearing round-0 snapshot test — a per-round HEAD misses a round-0 clobber
+while the pre-loop `impl_head_sha` catches it; empty-ref no-op), `_blob_sha`'s
+present/absent contract (the missing-path returns None, guarding the bare
+`git rev-parse <ref>:<path>` footgun), `rollback_conformer_commits` actually
+restoring clobbered implementer content and dropping the conformer commit
+(`TestRollbackRestoresClobber`), and source-coupling wiring guards that both
+`_run_conformance_phase` and `run_final_conformance` snapshot before the round
+loop and call the guard under `strict_conformer`.
+`tests/test_normalize_pip_installs.py` covers `_is_pip_install` /
+`_normalize_pip_installs` (adds `--break-system-packages` to
+`pip`/`pip3`/`python -m pip install` recipe entries): the incident recipe
+entries, `-e .`, `python -m pip`, idempotency (no double-add), non-pip and
+non-install entries untouched, other fields preserved, and a source-coupling
+guard that the normalization runs before `prov["recipe"] = recipe` in
+`phase_provision`. `tests/test_base_health_baseline.py` additionally covers
+`_runner_missing` (`command not found` / `No such file or directory`), the
+`measured` field on baseline axes (an unmeasurable axis is surfaced as "could
+not measure," folded into neither GREEN nor RED, by both
+`_format_baseline_section` and `_base_health_payload`), and pins that `measured`
+is a mandatory field with no legacy default (a `passed: False` axis missing
+`measured` is not surfaced RED).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

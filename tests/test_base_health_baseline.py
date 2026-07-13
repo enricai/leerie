@@ -34,9 +34,9 @@ def test_baseline_section_none_when_absent(leerie):
 
 def test_baseline_section_green(leerie):
     baseline = {"axes": {
-        "build": {"ran": True, "passed": True},
-        "lint": {"ran": False, "passed": None},
-        "tests": {"ran": True, "passed": True},
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": False, "measured": False, "passed": None},
+        "tests": {"ran": True, "measured": True, "passed": True},
     }}
     out = leerie._format_baseline_section(baseline)
     assert "BASELINE:" in out
@@ -47,10 +47,10 @@ def test_baseline_section_green(leerie):
 
 def test_baseline_section_red_lists_axes(leerie):
     baseline = {"axes": {
-        "build": {"ran": True, "passed": True},
-        "lint": {"ran": True, "passed": False,
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": True, "measured": True, "passed": False,
                  "summary": "eslint: 3 problems"},
-        "tests": {"ran": True, "passed": False,
+        "tests": {"ran": True, "measured": True, "passed": False,
                   "summary": "2 failed, 100 passed"},
     }}
     out = leerie._format_baseline_section(baseline)
@@ -62,6 +62,73 @@ def test_baseline_section_red_lists_axes(leerie):
     assert "2 failed, 100 passed" in out
 
 
+# --- _runner_missing ----------------------------------------------------
+
+def test_runner_missing_detects_command_not_found(leerie):
+    assert leerie._runner_missing("bash: line 1: pytest: command not found")
+    assert leerie._runner_missing("No such file or directory")
+    assert not leerie._runner_missing("2 failed, 100 passed")
+    assert not leerie._runner_missing("")
+
+
+# --- _format_baseline_section: unmeasurable axis -------------------------
+
+def test_baseline_section_unmeasurable_not_folded_into_green(leerie):
+    """An axis whose runner was missing (measured=False) must NOT read as
+    GREEN and must NOT read as RED — it is surfaced as 'could not measure'
+    so the conformer attributes failures itself instead of re-deriving the
+    base destructively."""
+    baseline = {"axes": {
+        "build": {"ran": False, "passed": None},
+        "lint": {"ran": False, "passed": None},
+        "tests": {"ran": True, "measured": False, "passed": None,
+                  "summary": "bash: line 1: pytest: command not found"},
+    }, "red_axes": []}
+    out = leerie._format_baseline_section(baseline)
+    assert "COULD NOT be measured" in out
+    assert "tests" in out
+    # It must not claim the base was RED on tests (no usable delta)...
+    assert "already RED" not in out
+    # ...must NOT falsely claim GREEN when nothing was actually measured
+    # (the /code-review finding — a vacuous all-clear is the exact framing
+    # this baseline exists to avoid)...
+    assert "GREEN" not in out
+    # ...and must steer the conformer away from the destructive re-derivation.
+    assert "check out or reset" in out
+
+
+def test_baseline_section_green_only_when_an_axis_actually_passed(leerie):
+    """GREEN is claimed only for a genuine measured pass. A mix of one
+    measured-green axis and one unmeasurable axis still says GREEN (for the
+    measured one) plus the 'could not measure' caveat; but all-unmeasurable
+    never says GREEN."""
+    mixed = {"axes": {
+        "build": {"ran": True, "measured": True, "passed": True},
+        "tests": {"ran": True, "measured": False, "passed": None},
+    }}
+    out = leerie._format_baseline_section(mixed)
+    assert "GREEN" in out and "COULD NOT be measured" in out
+
+    all_unmeasured = {"axes": {
+        "tests": {"ran": True, "measured": False, "passed": None},
+    }}
+    out2 = leerie._format_baseline_section(all_unmeasured)
+    assert "GREEN" not in out2
+
+
+def test_baseline_section_measured_is_mandatory_no_legacy_default(leerie):
+    """`measured` is a mandatory field (no legacy support): an axis dict
+    without it is NOT treated as a measured pass/fail. A `passed: False`
+    axis missing `measured` is therefore not surfaced as RED — every real
+    axis dict from capture_conformance_baseline always carries the field."""
+    baseline = {"axes": {
+        "tests": {"ran": True, "passed": False,
+                  "summary": "2 failed, 100 passed"},
+    }}
+    out = leerie._format_baseline_section(baseline)
+    assert "already RED" not in out
+
+
 # --- _base_health_payload -----------------------------------------------
 
 def test_base_health_payload_none_without_baseline(leerie, tmp_path):
@@ -71,9 +138,9 @@ def test_base_health_payload_none_without_baseline(leerie, tmp_path):
 
 def test_base_health_payload_green(leerie, tmp_path):
     st = _st(tmp_path, conformance={"_baseline": {"axes": {
-        "build": {"ran": True, "passed": True},
-        "lint": {"ran": True, "passed": True},
-        "tests": {"ran": True, "passed": True},
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": True, "measured": True, "passed": True},
+        "tests": {"ran": True, "measured": True, "passed": True},
     }}})
     out = leerie._base_health_payload(st)
     assert out["base_status"] == "green"
@@ -82,14 +149,31 @@ def test_base_health_payload_green(leerie, tmp_path):
 
 def test_base_health_payload_red(leerie, tmp_path):
     st = _st(tmp_path, conformance={"_baseline": {"axes": {
-        "build": {"ran": True, "passed": True},
-        "lint": {"ran": True, "passed": True},
-        "tests": {"ran": True, "passed": False},
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": True, "measured": True, "passed": True},
+        "tests": {"ran": True, "measured": True, "passed": False},
     }}})
     out = leerie._base_health_payload(st)
     assert out["base_status"] == "red"
     assert out["base_red_axes"] == ["tests"]
     assert out["axes"]["tests"]["passed"] is False
+
+
+def test_base_health_payload_unmeasurable_axis_not_red(leerie, tmp_path):
+    """Regression: an unmeasurable axis (runner missing) must NOT colour
+    base_status red — it carries no verdict. Mirrors the same measured-aware
+    rule in capture_conformance_baseline.red_axes and
+    _format_baseline_section, so the PR body doesn't show a false-RED base."""
+    st = _st(tmp_path, conformance={"_baseline": {"axes": {
+        "build": {"ran": False, "measured": False, "passed": None},
+        "lint": {"ran": False, "measured": False, "passed": None},
+        "tests": {"ran": True, "measured": False, "passed": None,
+                  "summary": "bash: line 1: pytest: command not found"},
+    }}})
+    out = leerie._base_health_payload(st)
+    assert out["base_status"] == "green"
+    assert out["base_red_axes"] == []
+    assert out["axes"]["tests"]["measured"] is False
 
 
 # --- _record_run_health -------------------------------------------------
