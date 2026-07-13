@@ -63,6 +63,16 @@ Current runtime deps:
 
 - `tenacity` — exponential backoff for transient `claude -p` envelope
   errors (auth / rate-limit). See §3 *Auth/quota backoff*.
+- `tree-sitter` — incremental parser core, required by the P6 repo-map
+  (`build_repo_map`). Deliberate exception to the stdlib-preferred
+  policy: tree-sitter's mtime-cached symbol/reference graph is the
+  structural foundation that prevents shallow planner splits
+  (DESIGN §18 *Future work* — P6 repo-map design pending). Ships a
+  prebuilt manylinux wheel; no C build needed.
+- `tree-sitter-language-pack` — prebuilt grammar collection (Python,
+  TypeScript, JavaScript, Ruby, Go, Rust, …) for `tree-sitter`. Paired
+  with the `tree-sitter` pin; the `cp310-abi3` ABI tag means one wheel
+  covers Python 3.10 through 3.13 (the container's Debian 13 Python).
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.

@@ -1,3 +1,5 @@
 # Leerie runtime dependencies. See docs/IMPLEMENTATION.md §0
 # "Python runtime — provisioned inside the container" for the policy.
 tenacity==9.1.4
+tree-sitter==0.26.0
+tree-sitter-language-pack==1.12.5
