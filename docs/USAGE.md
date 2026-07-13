@@ -349,7 +349,7 @@ local setup) because nerdctl can't reach Keychain. See
   `skip_repo_map = true` in `leerie.toml`. Precedence: `--skip-repo-map`
   → `LEERIE_SKIP_REPO_MAP` → `leerie.toml` → default `False`. See the
   full surface (resolver function, state field) in
-  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map----build_repo_map--rank_repo_map).
+  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map--build_repo_map--rank_repo_map).
 - **P1 recursive decompose caps** — four internal defaults that bound the
   fit-judge recursion (DESIGN §P1 *Recursive judge + splitter*). These are
   not user-tunable via CLI / env / `leerie.toml`; they are listed here so
