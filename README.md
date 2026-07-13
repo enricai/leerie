@@ -460,7 +460,7 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Leerie spawns nine kinds of `claude -p` worker. Each is a separate
+Leerie spawns eleven kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
 | Worker | Prompt source | Default model | Runs per task | Returns |
@@ -474,6 +474,8 @@ subprocess; there is no in-session agent nesting.
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
+| `fit_judge` | `prompts/fit_judge.md` | opus | 0 or more per subtask (P1 recursive decomposition — one per `recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §P1 |
+| `splitter` | `prompts/splitter.md` | opus | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §P1 |
 
 Additionally, two post-run workers run outside the main orchestrate loop and are not in `WORKER_TYPES`:
 
@@ -481,14 +483,14 @@ Additionally, two post-run workers run outside the main orchestrate loop and are
 - `dep_capture` (`prompts/dep_capture.md`, default opus) runs at finalize (and on `--recapture` / next-run backstop) — it reads worker logs, decides what the repo needs across all languages, and writes `setup_packages` / `language_installs` to `.leerie/config.toml`. Overridable via `LEERIE_MODEL_DEP_CAPTURE`. See DESIGN §6½.
 
 **Per-worker model defaults:** judgment workers (classifier, planner,
-reconciler, plan_overlap_judge, provision, integrator) default to Opus;
-the acting workers (implementer, conformer) and `satisfied_probe` default
-to Sonnet — their job is concrete subtask execution or lightweight
-per-subtask probing where throughput matters more than broad-context
-judgment. To revert to the
-all-Sonnet pattern of earlier versions, set `LEERIE_MODEL=sonnet` or
-pass `--model sonnet`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2
-*Model selection* for the full precedence table.
+reconciler, plan_overlap_judge, provision, integrator, fit_judge, splitter)
+default to Opus; the acting workers (implementer, conformer) and
+`satisfied_probe` default to Sonnet — their job is concrete subtask
+execution or lightweight per-subtask probing where throughput matters more
+than broad-context judgment. To revert to the all-Sonnet pattern of earlier
+versions, set `LEERIE_MODEL=sonnet` or pass `--model sonnet`. See
+[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2 *Model selection*
+for the full precedence table.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) §7 for the worker contract and
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §3 for the invocation
@@ -564,6 +566,8 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
 | `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
 | `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
+| `prompts/fit_judge.md` | System prompt: P1 Task-Context Fit scorer — judges whether a subtask's scope and context are co-minimized (DESIGN §P1); calibrated to 0.70 threshold |
+| `prompts/splitter.md` | System prompt: P1 structural splitter — labels pre-partitioned migration chunks or emits structural seams for the coupled-minority case (DESIGN §P1) |
 | `prompts/config_chat.md` | System prompt: interactive `leerie config --chat` session — reads the repo's CI config and manifests, generates `.leerie/config.toml` and optionally `.leerie/Dockerfile` |
 | `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
 | `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |
