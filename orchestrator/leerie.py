@@ -4893,13 +4893,6 @@ def _format_task_file_structure(items: list[str]) -> str:
 # neither tree-sitter package is guaranteed; a module-scope import would crash
 # before the fast-path guards can print their diagnostic.
 
-# TypedDict for the RepoMap return value.  Using a plain dict alias keeps the
-# implementation stdlib-only at module import time.
-# RepoMap = {
-#   "files": {str: [str]},   # file_path → [def_symbol, ...]
-#   "refs":  {str: set[str]} # def_symbol → {file_path, ...}  (files that ref it)
-# }
-
 
 def _repo_map_cache_key(path: Path) -> str:
     """Return a stable cache key: '<abs_path>@<mtime_ns>'.
@@ -5199,7 +5192,6 @@ def rank_repo_map(
         definer = def_to_file.get(sym)
         if definer is None:
             continue
-        # Edge: definer → each referencing file (definer is called by them)
         if definer not in graph:
             graph[definer] = set()
         for ref_file in referencing_files:
