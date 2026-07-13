@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -50,7 +51,7 @@ def _write_fixture(root: Path) -> None:
     )
 
 
-def _pkl_path(leerie_root: Path, abs_path: Path, leerie) -> Path:
+def _pkl_path(leerie_root: Path, abs_path: Path, leerie: types.ModuleType) -> Path:
     """Return the cache .pkl path for *abs_path*, mirroring build_repo_map internals."""
     digest = hashlib.sha256(str(abs_path).encode()).hexdigest()
     return leerie_root / leerie.REPO_MAP_CACHE_DIR / f"{digest}.pkl"
