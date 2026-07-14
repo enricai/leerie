@@ -107,7 +107,8 @@ def env(leerie, tmp_path):
     }
 
 
-def _stub_named_oom_handoff(leerie_mod, sid, run_dir, summary=_OOM_SUMMARY):
+def _stub_named_oom_handoff(leerie_mod, sid, run_dir, monkeypatch,
+                             summary=_OOM_SUMMARY):
     """Patch run_implementer to return the exact shape `run_implementer`'s
     `except WorkerError` arm synthesizes: status='incomplete-handoff'
     with a checkpoint_path that was never written (empty_handoff once
@@ -120,10 +121,10 @@ def _stub_named_oom_handoff(leerie_mod, sid, run_dir, summary=_OOM_SUMMARY):
             "checkpoint_path": str(run_dir / "checkpoints" / f"{sid_}.md"),
             "summary": summary,
         }
-    leerie_mod.run_implementer = _stub
+    monkeypatch.setattr(leerie_mod, "run_implementer", _stub)
 
 
-def _stub_healthy_no_op_handoff(leerie_mod):
+def _stub_healthy_no_op_handoff(leerie_mod, monkeypatch):
     """A session-limit no-op empty_handoff with NO named cause — mirrors
     the ordinary WorkerError message run_implementer synthesizes when
     _cgroup_stat's oom_kill was 0 (or containment was off), i.e. the
@@ -137,7 +138,7 @@ def _stub_healthy_no_op_handoff(leerie_mod):
             "summary": "worker produced no schema-valid result: "
                        "claude -p produced no result event (stderr: (empty))",
         }
-    leerie_mod.run_implementer = _stub
+    monkeypatch.setattr(leerie_mod, "run_implementer", _stub)
 
 
 # --- oom_kill > 0: the operator sees the named cause, not the cryptic ------
@@ -151,7 +152,7 @@ def test_no_commits_empty_handoff_surfaces_named_oom(env, monkeypatch):
     not validate_result's generic 'checkpoint_path ... does not exist'
     text, and must point the operator at the remediation flags."""
     c = env["leerie"]
-    _stub_named_oom_handoff(c, env["sid"], env["run_dir"])
+    _stub_named_oom_handoff(c, env["sid"], env["run_dir"], monkeypatch)
 
     res = asyncio.run(c.settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
@@ -175,7 +176,7 @@ def test_has_commits_empty_handoff_rescue_logs_named_oom(env, monkeypatch, capsy
     prefer the named-OOM summary over the generic checkpoint message —
     same operator-facing naming guarantee applies on this branch too."""
     c = env["leerie"]
-    _stub_named_oom_handoff(c, env["sid"], env["run_dir"])
+    _stub_named_oom_handoff(c, env["sid"], env["run_dir"], monkeypatch)
 
     # Give the subtask branch a commit ahead of the run branch, so
     # branch_has_commits_ahead is True and the rescue branch fires
@@ -207,7 +208,7 @@ def test_no_oom_empty_handoff_does_not_emit_oom_message(env, monkeypatch):
     OOM. settle_subtask falls back to the ordinary message; no
     'OOM-killed' text is fabricated."""
     c = env["leerie"]
-    _stub_healthy_no_op_handoff(c)
+    _stub_healthy_no_op_handoff(c, monkeypatch)
 
     res = asyncio.run(c.settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
