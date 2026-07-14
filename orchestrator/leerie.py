@@ -3483,10 +3483,20 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
 
     The goal: distribute the VM's RAM across `max_parallel + 1` slots
     so one slot remains for the orchestrator + system processes
-    (sshd, lima-guestagent, etc.) outside any worker cgroup. Capped at
-    4 GiB per worker — beyond that, a single tool subtree shouldn't
-    legitimately need more, and an uncapped 8+ GiB cgroup defeats
-    the containment purpose.
+    (sshd, lima-guestagent, etc.) outside any worker cgroup. Floored
+    at 8 GiB per worker — the worker cgroup holds the build/test
+    subprocess tree AND the resident `claude -p` process at the same
+    time (claude stays alive running the build via Bash and streaming
+    its output), and live in-container measurement showed a Next.js/
+    Turbopack build alone peaking at 4.16 GiB, build + resident claude
+    at ~6.3 GiB. The prior 4 GiB clamp was below that combined peak, so
+    no VM size could auto-derive enough for a build-running worker; an
+    8 GiB floor gives margin over the measured 6.3 GiB peak. The
+    aggregate `leerie.slice` memory.max (scripts/container-entry.sh) is
+    the real VM-OOM backstop, so this per-worker floor can be generous
+    — multi-worker waves stay bounded by that slice cap, not by this
+    per-worker number; build-heavy waves should pair a generous
+    per-worker cap with a lower --max-parallel.
 
     Falls back to 2 GiB if /proc/meminfo is unreadable (non-Linux,
     sandboxed test, etc.). The cgroup write itself will detect a
@@ -3503,7 +3513,7 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
     except (FileNotFoundError, PermissionError, ValueError):
         return 2 * 1024**3
     per_worker = total // (max_parallel + 1)
-    return min(per_worker, 4 * 1024**3)
+    return max(per_worker, 8 * 1024**3)
 
 
 def resolve_worker_memory_max(repo_root: Path,
@@ -18672,7 +18682,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # Resolve per-worker cgroup memory cap. Auto-derives from
     # /proc/meminfo when unset; resolver die()s on a bad size string.
     # Reads `caps["max_parallel"]` already resolved above so the auto-
-    # derived value is "VM ram split N+1 ways, capped at 4 GiB".
+    # derived value is "VM ram split N+1 ways, floored at 8 GiB" (a
+    # build-running worker's cgroup holds the build subprocess tree AND
+    # the resident claude -p process at once; measured build+claude peak
+    # is ~6.3 GiB — see _auto_worker_memory_max).
     caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
         Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max)
     # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the
