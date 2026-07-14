@@ -5,7 +5,8 @@ cgroup memory cap.
 Covers:
 - Memory-size parsing: K/M/G/T suffixes, bare bytes, garbage rejected.
 - Auto-derivation from /proc/meminfo (mocked) — splits VM ram across
-  max_parallel+1 slots, capped at 4 GiB.
+  max_parallel+1 slots, floored at 8 GiB (build + resident claude
+  measured peak ~6.3 GiB).
 - Resolution order: CLI > env > leerie.toml > auto.
 - die() paths for invalid env / file values.
 """
@@ -74,9 +75,30 @@ def test_parse_memory_size_fractional_rejected(leerie):
 # ---- _auto_worker_memory_max ---------------------------------------------
 
 def test_auto_splits_meminfo_across_slots(leerie, monkeypatch, tmp_path):
-    """Synthesize a /proc/meminfo with 16 GiB total. With max_parallel=4
-    the per-worker share is 16 / 5 = 3.2 GiB; that's below the 4 GiB
-    cap, so we expect ~3.2 GiB."""
+    """Synthesize a /proc/meminfo with 128 GiB total. With max_parallel=4
+    the per-worker share is 128 / 5 = 25.6 GiB; that's above the 8 GiB
+    floor, so the even split wins."""
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemTotal:       {128 * 1024 * 1024} kB\n")
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *a, **kw):
+        if str(path) == "/proc/meminfo":
+            return real_open(meminfo, *a, **kw)
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr("builtins.open", fake_open)
+    result = leerie._auto_worker_memory_max(max_parallel=4)
+    expected = (128 * 1024**3) // 5
+    assert result == expected
+
+
+def test_auto_floors_at_8gib(leerie, monkeypatch, tmp_path):
+    """With a 16 GiB VM / max_parallel=5, the even split (16 / 6 ≈
+    2.67 GiB) is well under the measured 6.3 GiB build+claude peak
+    (see docstring on _auto_worker_memory_max), so the 8 GiB floor
+    wins — the fix for build-running workers cgroup-OOMing under the
+    old 4 GiB clamp."""
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(f"MemTotal:       {16 * 1024 * 1024} kB\n")
     import builtins
@@ -87,25 +109,7 @@ def test_auto_splits_meminfo_across_slots(leerie, monkeypatch, tmp_path):
             return real_open(meminfo, *a, **kw)
         return real_open(path, *a, **kw)
     monkeypatch.setattr("builtins.open", fake_open)
-    result = leerie._auto_worker_memory_max(max_parallel=4)
-    expected = (16 * 1024**3) // 5
-    assert result == expected
-
-
-def test_auto_caps_at_4gib(leerie, monkeypatch, tmp_path):
-    """With a huge VM (64 GiB / 5 slots = 12.8 GiB), the per-worker
-    cap clamps to 4 GiB."""
-    meminfo = tmp_path / "meminfo"
-    meminfo.write_text(f"MemTotal:       {64 * 1024 * 1024} kB\n")
-    import builtins
-    real_open = builtins.open
-
-    def fake_open(path, *a, **kw):
-        if str(path) == "/proc/meminfo":
-            return real_open(meminfo, *a, **kw)
-        return real_open(path, *a, **kw)
-    monkeypatch.setattr("builtins.open", fake_open)
-    assert leerie._auto_worker_memory_max(max_parallel=4) == 4 * 1024**3
+    assert leerie._auto_worker_memory_max(max_parallel=5) == 8 * 1024**3
 
 
 def test_auto_fallback_when_meminfo_missing(leerie, monkeypatch):
