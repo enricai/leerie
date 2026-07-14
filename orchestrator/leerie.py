@@ -655,7 +655,8 @@ CAPTURE_DEPS_CONFIG = ".leerie/config.toml"
 # subtasks already met on the base tree. When set, every subtask
 # proceeds to schedule(); the mechanical `check_branch_has_commits`
 # backstop still catches an already-satisfied subtask post-execution
-# (as a retryable no-op). Resolution order: --skip-satisfied-check CLI
+# (settle_subtask re-probes the criteria against HEAD and settles complete
+# if met — see `probe_criteria_satisfied_on_head`). Resolution order: --skip-satisfied-check CLI
 # flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check in
 # leerie.toml → False.
 SKIP_SATISFIED_CHECK_ENV = "LEERIE_SKIP_SATISFIED_CHECK"
@@ -1508,12 +1509,15 @@ SCHEMAS: dict[str, dict] = {
     },
     "satisfied_probe": {
         # Output of the per-subtask satisfied-probe worker (DESIGN §8
-        # *Already-satisfied subtask elimination*). Spawned once per
-        # surviving subtask by `filter_satisfied_subtasks` in phase 3.
-        # The worker inspects ONLY the base tree (working tree + `git
-        # show HEAD:` — never other refs) and decides whether the
-        # subtask's success criteria are already fully met, such that an
-        # implementer would have nothing to commit.
+        # *Already-satisfied subtask elimination*). Spawned from two sites,
+        # both HEAD/working-tree-only (never other refs): (1) per surviving
+        # subtask by `filter_satisfied_subtasks` in phase 3 against the
+        # *base tree* at plan time; (2) per no-commits `complete` by
+        # `probe_criteria_satisfied_on_head` in `settle_subtask` against the
+        # *run-branch HEAD* post-execution (DESIGN §8 *The mid-run sibling
+        # case*). Both decide whether the subtask's success criteria are
+        # already fully met, such that an implementer would have nothing to
+        # commit — the only difference is which HEAD the probe is run against.
         #
         # `satisfied` is the load-bearing field: True → the subtask is
         # soft-dropped before scheduling. The prompt instructs the
@@ -3779,11 +3783,14 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     satisfied subtask elimination*) is suppressed: no `satisfied_probe`
     worker spawns and every subtask proceeds to `schedule()`. The
     mechanical `check_branch_has_commits` backstop still catches an
-    already-satisfied subtask post-execution (as a retryable no-op), so
-    this flag trades the cheap plan-time skip for the more expensive
-    post-execution one. Off by default; use when the operator knows the
-    base tree contains no already-merged overlap and wants to save the
-    per-subtask probe cost."""
+    already-satisfied subtask post-execution: on a no-commits `complete`,
+    `settle_subtask` re-probes the criteria against the run-branch HEAD
+    (`probe_criteria_satisfied_on_head`) and settles it `complete` if met
+    (a base-tree-satisfied subtask still has no commits, so the same rescue
+    fires), rather than burning the retry cap. This flag trades the cheap
+    plan-time skip for that more expensive post-execution one. Off by
+    default; use when the operator knows the base tree contains no
+    already-merged overlap and wants to save the per-subtask probe cost."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_SATISFIED_CHECK_ENV,
@@ -5843,6 +5850,73 @@ def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
+def warn_provider_subset_subtasks(plans: list[dict]) -> None:
+    """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
+    `files_likely_touched` surface is owned by an ordered predecessor it
+    depends on (via `depends_on` or a `requires`→`provides` tag match).
+
+    Such a subtask is at high risk of being a mid-run no-op: if the
+    predecessor commits the shared deliverable — common when a code subtask
+    bundles the matching test-file edit in its own commit and a later
+    test-only subtask's whole surface is that same file — the dependent
+    subtask reaches its worker with nothing left to commit. That case is
+    caught and settled `complete` at settle time by the mid-run satisfied
+    rescue (DESIGN §8 *The mid-run sibling case*); this warning surfaces the
+    same redundancy one phase earlier so the operator can re-frame the plan
+    before workers run.
+
+    Warning only, never a drop — a subtask may make a genuinely distinct edit
+    to a shared file, and dropping it would silently delete real work (the
+    same safe-direction reasoning as `filter_satisfied_subtasks`'s
+    conservative default). Pure function; mirrors
+    `warn_cross_planner_file_overlap`. Reuses `_build_predecessor_graph` so
+    the notion of "predecessor" cannot drift from the scheduler's.
+
+    Scope note: uses **direct** predecessors only (`preds[sid]` from
+    `_build_predecessor_graph`), not the transitive closure. A subtask whose
+    files are owned only by a *transitive* (indirect) predecessor is not
+    flagged here — deliberately, to keep this advisory signal specific and
+    low-noise; the mid-run satisfied rescue (DESIGN §8) still catches the
+    transitive case at settle time regardless."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+    if not subtasks:
+        return
+    preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
+
+    flagged: list[tuple[str, list[str], list[str]]] = []
+    for sid, s in subtasks.items():
+        own_files = {f for f in (s.get("files_likely_touched") or []) if f}
+        if not own_files:
+            continue  # nothing to be a subset of
+        pred_ids = preds.get(sid, set())
+        if not pred_ids:
+            continue
+        pred_files: set[str] = set()
+        for p in pred_ids:
+            pred_files.update(
+                f for f in (subtasks[p].get("files_likely_touched") or []) if f)
+        if own_files <= pred_files:
+            flagged.append((sid, sorted(pred_ids), sorted(own_files)))
+
+    if not flagged:
+        return
+    log(f"⚠  provider-subset subtask(s): {len(flagged)} subtask(s) whose "
+        "entire file surface is already owned by a predecessor they depend "
+        "on. If the predecessor commits the shared files, the dependent "
+        "subtask becomes a no-op (settled complete by the mid-run satisfied "
+        "rescue, DESIGN §8) — review whether it is redundant.")
+    for sid, pred_ids, files in sorted(flagged):
+        preds_str = ", ".join(pred_ids)
+        files_str = ", ".join(files)
+        log(f"     {sid}: files [{files_str}] ⊆ predecessor(s) "
+            f"[{preds_str}]")
+
+
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
@@ -6112,6 +6186,83 @@ async def filter_satisfied_subtasks(
             "all subtasks already satisfied on HEAD "
             "(satisfied-probe, DESIGN §8)")
     return no_work_map
+
+
+async def probe_criteria_satisfied_on_head(
+    subtask: dict, worktree: str, st: "State", caps: dict,
+    models: dict[str, str], efforts: dict[str, str | None],
+) -> dict | None:
+    """Post-execution analogue of `filter_satisfied_subtasks`'s per-subtask
+    probe (DESIGN §8 *The mid-run sibling case*). Runs one read-only
+    `satisfied_probe` against the subtask's `success_criteria_seed` on the
+    *current worktree HEAD* — the run branch's integration state, which may
+    now contain a sibling subtask's commit of this subtask's deliverable (or
+    already have satisfied it on the seeded base). The probe judges *whether*
+    the criteria are met, not *who* met them, so both cases resolve here — a
+    subtask whose criteria are met on HEAD is legitimately complete regardless
+    of provenance (DESIGN §8 *Scope*).
+
+    Returns a drop record (`{reason, evidence, checked}`) if the probe judges
+    the criteria already met, else None. Fails safe to None on any error or
+    uncertainty: this only *rescues* a no-op whose deliverable is already
+    present — it must never mask a real lazy/broken no-op, so a probe crash
+    keeps the subtask on the retryable path. §12-compliant: the mechanical
+    `check_branch_has_commits` gate still fires first and unchanged; the probe
+    only rescues, and "are the criteria semantically met on this tree?" is the
+    judgment §12's complementary half assigns to a worker.
+
+    Unlike the pre-schedule probe (base tree at plan time), this probes HEAD —
+    but still HEAD-only, never history-spanning git, via the same
+    `SATISFIED_PROBE_TOOLS` scope. HEAD here is the same ref the mechanical
+    commit-presence gate measures against, so the probe cannot false-positive
+    on code present only on an unrelated branch."""
+    sid = subtask.get("id", "?")
+    seed = (subtask.get("success_criteria_seed") or "").strip()
+    if not seed:
+        # No criterion to judge "already met" against — nothing to rescue.
+        return None
+    payload = {
+        "id": sid,
+        "title": subtask.get("title", ""),
+        "intent": subtask.get("intent", ""),
+        "success_criteria_seed": seed,
+        "files_likely_touched": list(
+            subtask.get("files_likely_touched", []) or []),
+    }
+    user_prompt = (
+        "SUBTASK:\n" + json.dumps(payload, indent=2) +
+        "\n\nReturn only the JSON object per your schema. Judge the "
+        "CURRENT working tree / HEAD only — never other branches or "
+        "history. Default satisfied=false on any uncertainty."
+    )
+    # bump_workers OUTSIDE the try, same as filter_satisfied_subtasks: a
+    # budget-exhaustion WorkerError must propagate to abort the run, not be
+    # swallowed into a silent no-rescue.
+    st.bump_workers(caps)
+    try:
+        out = await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=load_prompt("satisfied_probe"),
+            schema_key="satisfied_probe", cwd=worktree,
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
+            autonomous=False, caps=caps, st=st,
+            model=models["satisfied_probe"],
+            effort=efforts["satisfied_probe"],
+            sid=f"satisfied_probe-head-{sid}",
+        )
+    except WorkerError as e:
+        # A probe crash must NOT rescue the subtask — fail safe toward the
+        # existing retryable no-op path.
+        log(f"  satisfied-probe (HEAD) {sid}: crashed ({e}); not rescuing "
+            "(fail-safe — no-op stays retryable)")
+        return None
+    if out.get("satisfied") is True:
+        return {
+            "reason": "already_satisfied_mid_run",
+            "evidence": out.get("evidence", ""),
+            "checked": list(out.get("checked", []) or []),
+        }
+    return None
 
 
 # --- per-repo dependency provisioning ----------------------------------------
@@ -17004,6 +17155,48 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 sid, worktree, compute_run_branch(st.run_id))
             if commit_err and not has_artifacts:
                 kind, message = commit_err
+                # A no-commits `complete` is normally a retryable mistake, but
+                # one legitimate case is not a failure: a subtask whose entire
+                # deliverable a *sibling subtask* already committed to the run
+                # branch this run (DESIGN §8 *The mid-run sibling case*). The
+                # plan-time satisfied-probe judged the base tree and could not
+                # see the sibling's mid-run commit; re-probe the criteria
+                # against HEAD before failing. A retry would only reproduce the
+                # same no-op (the work exists on the branch it is measured
+                # against), exhaust the cap, and kill the wave — a deterministic
+                # loop across --resume. The probe fails safe to None, so a
+                # genuine lazy no-op still falls through to the retry path.
+                drop = await probe_criteria_satisfied_on_head(
+                    subtask, worktree, st, caps, models, efforts)
+                if drop is not None:
+                    log(f"  {sid}: no commits, but success criteria are "
+                        "already met on the run branch (deliverable already "
+                        "present — committed by a sibling subtask this run, "
+                        "or already on the base tree) — settling complete "
+                        f"instead of failing. {drop['evidence'][:160]}")
+                    st.data.setdefault("dropped_subtasks", {})[sid] = drop
+                    st.data.setdefault("subtask_status", {})[sid] = "complete"
+                    st.data.get("blocked", {}).pop(sid, None)
+                    # Write a conformance sentinel so `_get_progress` counts
+                    # this subtask as `done`, not perpetually `in_conformer`
+                    # (that classifier keys on a missing `conformance[sid]`).
+                    # The real conformer is correctly skipped — a zero-commit
+                    # subtask has no diff to conform.
+                    st.data.setdefault("conformance", {})[sid] = {
+                        "result": None,
+                        "warnings": ["settled complete via mid-run satisfied "
+                                     "rescue; no diff to conform"],
+                    }
+                    st.save()
+                    return {"subtask_id": sid, "status": "complete",
+                            "summary": (res.get("summary")
+                                        or "success criteria already satisfied "
+                                        "on the run branch (deliverable already "
+                                        "present — a sibling subtask committed "
+                                        "it this run, or it was already on the "
+                                        "base tree); no new commits required"),
+                            "criteria_results": res.get("criteria_results")
+                            or []}
                 log(f"  branch check failed for {sid}: {message}")
                 done = await fail(kind, message)
                 if done is not None:
@@ -18282,6 +18475,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # integrator design-conflict crashes downstream.
         warn_cross_planner_file_overlap(plans)
         warn_layer_gaps(plans)
+        # Flag a subtask whose entire file surface is owned by an ordered
+        # predecessor — at high risk of being a mid-run no-op if the
+        # predecessor commits the shared deliverable (DESIGN §5, §8 *The
+        # mid-run sibling case*). Warning only; the mid-run satisfied rescue
+        # in settle_subtask is the actual safety net.
+        warn_provider_subset_subtasks(plans)
         # Drop subtasks whose files_likely_touched leak into inspect-dir
         # mounts (read-only) or other off-tree paths. Soft drop so the
         # surviving subtasks proceed; the drop is recorded in
@@ -18531,7 +18730,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "§8 Already-satisfied subtask elimination). When set, "
                          "every subtask proceeds to scheduling; the mechanical "
                          "no-commits backstop still catches already-satisfied "
-                         "work post-execution (as a retryable no-op). "
+                         "work post-execution (settle_subtask re-probes the "
+                         "criteria against HEAD and settles complete if met). "
                          f"Also {SKIP_SATISFIED_CHECK_ENV} env or "
                          "skip_satisfied_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-budget-check", action="store_true",

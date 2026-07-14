@@ -5,6 +5,36 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A mid-run already-satisfied subtask no longer loops to a wave death.**
+  When a subtask's entire deliverable was already committed to the run
+  branch this run (e.g. a code subtask bundles the matching test-file edit
+  in its own commit, and a later test-only subtask's whole surface is that
+  same file), the subtask reaches its worker with nothing to commit. The
+  mechanical no-commits gate (`check_branch_has_commits`) then failed it,
+  the retry cap was exhausted, and the wave died — and `--resume`
+  reproduced the identical no-op, a deterministic loop. The plan-time
+  `satisfied_probe` could not catch it (it judges the base tree at plan
+  time; the overlap only appears mid-run). Now, on a no-commits `complete`,
+  `settle_subtask` re-probes the success criteria against the run-branch
+  HEAD (`probe_criteria_satisfied_on_head`) and settles the subtask
+  `complete` if they are met, instead of failing it (DESIGN §8 *The mid-run
+  sibling case*). Scope is provenance-agnostic — it also covers a subtask
+  already satisfied on the base tree. §12-compliant: the mechanical gate
+  still fires first and the probe only rescues, failing safe to
+  not-satisfied on any crash/uncertainty.
+
+### Added
+
+- **Plan-time provider-subset warning (`warn_provider_subset_subtasks`).**
+  An advisory warning (DESIGN §5) surfaced before scheduling when a
+  subtask's entire `files_likely_touched` is a subset of a direct ordered
+  predecessor's — flagging the redundancy one phase earlier than the
+  settle-time rescue above. Warning only, never a drop.
+
 ## [0.9.59]
 
 ### Fixed

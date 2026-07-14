@@ -544,6 +544,32 @@ This is enforced mechanically at two levels:
   gap). These are advisory `log()` warnings following the same pattern
   as `warn_cross_planner_file_overlap()`.
 
+### Provider-subset subtasks (advisory)
+
+A planner does not always know that a *sibling subtask* in the same plan
+will produce another subtask's entire deliverable. The common shape: a code
+subtask lists a test file in its `files_likely_touched` and commits that
+test edit in the same commit, while a separate test-only subtask — scheduled
+a wave later, `requires`-ing a tag the code subtask `provides`, and whose
+whole surface is that same test file — reaches its worker with nothing left
+to commit. The mechanical no-commits gate then fails it, and (before the
+mid-run satisfied rescue, §8) the run loops to a wave death.
+
+`warn_provider_subset_subtasks()` surfaces this one phase earlier. Reusing
+`_build_predecessor_graph` (so "predecessor" matches the scheduler exactly),
+it flags any subtask whose entire `files_likely_touched` set is a subset of
+the union of its **direct** ordered predecessors' files (predecessors via
+`depends_on` or a `requires`→`provides` tag match; direct edges only, not the
+transitive closure — a subtask owned only by an indirect predecessor is left
+unflagged to keep the signal specific, and the §8 rescue catches it anyway).
+It is **advisory only — never a drop**: a subtask may make a genuinely distinct edit to a shared file, and
+silently deleting it would be a strictly worse failure than an extra worker
+round (the same safe-direction reasoning as the satisfied-probe's
+conservative default). The actual safety net is the post-execution mid-run
+satisfied rescue (§8 *The mid-run sibling case*), which settles such a
+subtask `complete` when its criteria are already met on the run-branch HEAD;
+this warning just lets the operator re-frame the plan before workers run.
+
 ### Artifact passing between subtasks
 
 Some subtasks produce a structured deliverable that a downstream subtask
@@ -3116,6 +3142,60 @@ done" silently deletes real work — a strictly worse failure than a false
 "still needed" (which merely costs one implementer round the backstop already
 tolerates).
 
+**The mid-run sibling case (why the base-tree probe is not enough).** The
+pre-schedule probe judges the **base tree** — the checkout as it stood when the
+run began. That is the correct discipline for the cross-run case above, but it
+is *structurally blind* to a subtask that becomes satisfied **during this run**,
+because a sibling subtask in an earlier wave committed the shared deliverable.
+Concretely: a code subtask declares `files_likely_touched` that includes a test
+file and commits its matching test update in the same commit, while a separate
+test-only subtask — scheduled a wave later, whose entire deliverable is that
+same test file — `requires` a capability the code subtask `provides`. By the
+time the test subtask runs, its work is already on the run branch. It correctly
+reports `complete` with nothing to commit, and the no-commits backstop fails it.
+The base-tree probe never had a chance: the overlap did not exist at plan time.
+The retry then reproduces the identical no-op — the subtask cannot re-do work
+that already exists on the branch it is measured against — so the retry cap is
+exhausted and the wave dies. A `--resume` re-runs the same doomed subtask and
+dies the same way: a deterministic loop, not a transient failure.
+
+The resolution is the post-execution analogue of the pre-schedule probe: on a
+no-commits result, before failing, the orchestrator re-runs the satisfied-probe
+against the subtask's `success_criteria_seed` on the **run-branch HEAD** (the
+current integration state, which *does* contain the sibling's commit). If the
+criteria are already met there, the subtask is settled as satisfied — a
+legitimate terminal success, recorded in the same `dropped_subtasks` audit with
+reason `already_satisfied_mid_run` — rather than routed to the retry cap. If the
+probe is *not* satisfied (a genuine lazy/broken no-op, the case the backstop was
+built for), the existing retryable-failure path is unchanged. The same
+base-tree-only-vs-HEAD distinction is deliberate: the pre-schedule probe must
+not span history, but the post-execution probe measures against exactly the ref
+the commit-presence gate itself uses (`compute_run_branch`), so it cannot
+"find" the deliverable on an unrelated branch.
+
+**Scope: sibling-committed *or* base-tree-already-satisfied.** The probe judges
+*whether* the criteria are met on HEAD, not *who* met them — so this rescue also
+covers a subtask that was already satisfied on the seeded base (e.g. the
+pre-schedule probe was skipped via `--skip-satisfied-check`, or returned a false
+negative). That is intended, not a leak: a subtask whose criteria are genuinely
+met on the run branch is legitimately complete regardless of provenance, and it
+has no commits to make either way. The mid-run *sibling* case is the one that
+motivated the fix; the base-satisfied case is the same code path with the same
+correct outcome.
+
+**Why this is §12-compliant, not an LLM breaching a mechanical gate.** The
+guarantee "a lazy/broken worker that did nothing is caught" stays mechanical:
+`check_branch_has_commits` fires first and unchanged, and the probe can only
+*rescue* — it never turns a committed subtask into a failure, and it fails safe
+to *not satisfied* on any crash or uncertainty, so an unavailable/undecided probe
+leaves the mechanical no-commits failure intact. What the probe decides —
+"are these success criteria semantically met on this tree?" — is exactly the
+kind of judgment §12's *complementary half* assigns to a worker: it cannot be
+checked mechanically (it requires matching criteria prose against file content),
+which is precisely why the pre-schedule `filter_satisfied_subtasks` uses the same
+worker. This adds no new §12 carve-out; it is the outcome-checked-where-possible,
+judgment-left-to-the-worker split the principle already prescribes.
+
 The structural contract of these disciplines is mechanically enforced — the
 worker's output schema requires the falsification, reconciliation, and gap
 fields to be present, so a worker that skipped them fails its own JSON gate
@@ -3372,7 +3452,11 @@ Two further disciplines apply, and they sit at the §12 axis:
   work **before** running any verification step, precisely so that a reaped
   worker's diff is already committed and this code-enforced rescue has something
   to keep — the prompt reduces how often the rescue must fire, the code
-  guarantees the outcome when it does.
+  guarantees the outcome when it does. One class of "genuine no-op" is not a
+  failure at all: a subtask whose deliverable a *sibling subtask* already
+  committed to the run branch this run. That case is caught separately, on the
+  `complete`-path no-commits gate, by re-probing the success criteria against
+  the run-branch HEAD before failing — see §8 *The mid-run sibling case*.
 
 The phase is bounded by a separate cap from the evidence loop: the conformer
 gets a small number of orchestrator-level rounds (default 3) in which to
