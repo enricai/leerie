@@ -166,6 +166,21 @@ def _pids_events_max(path: str) -> int:
     return 0
 
 
+def _memory_events_oom(path: str) -> int:
+    # cgroup v2/v1 memory.events: newline-separated "<key> <count>" lines.
+    # The `oom_kill` key counts times the OOM killer fired inside this
+    # cgroup — the definitive memory-exhaustion signal (mirrors
+    # _pids_events_max above). Missing/unreadable file degrades to 0.
+    for line in _read(path).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "oom_kill":
+            try:
+                return int(parts[1])
+            except ValueError:
+                return 0
+    return 0
+
+
 # --- v2 paths --------------------------------------------------------------
 
 def _v2_dir(sid: str) -> str:
@@ -196,11 +211,12 @@ def _v2_destroy(sid: str) -> None:
         pass
 
 
-def _v2_stat(sid: str) -> tuple[int, int, int]:
+def _v2_stat(sid: str) -> tuple[int, int, int, int]:
     d = _v2_dir(sid)
     return (_pids_current(f"{d}/pids.current"),
             _pids_max(f"{d}/pids.max"),
-            _pids_events_max(f"{d}/pids.events"))
+            _pids_events_max(f"{d}/pids.events"),
+            _memory_events_oom(f"{d}/memory.events"))
 
 
 # --- v1 paths (split controllers) -----------------------------------------
@@ -239,16 +255,20 @@ def _v1_destroy(sid: str) -> None:
             pass
 
 
-def _v1_stat(sid: str) -> tuple[int, int, int]:
+def _v1_stat(sid: str) -> tuple[int, int, int, int]:
     # We do not read pids.events on v1 — always report events_max=0 and let
     # detection fall back to the current >= max comparison. (Newer kernels
     # do expose pids.events under the v1 pids controller, but skipping it
     # keeps v1 handling simple and portable across kernels that may or may
-    # not have it.)
-    pdir, _ = _v1_dirs(sid)
+    # not have it.) memory.events IS present under the v1 memory
+    # controller on modern kernels and carries the same oom_kill key, so
+    # we read it from mdir (mirrors the split-controller layout in
+    # _v1_dirs/_v1_create/_v1_enroll).
+    pdir, mdir = _v1_dirs(sid)
     return (_pids_current(f"{pdir}/pids.current"),
             _pids_max(f"{pdir}/pids.max"),
-            0)
+            0,
+            _memory_events_oom(f"{mdir}/memory.events"))
 
 
 # --- dispatch --------------------------------------------------------------
@@ -289,8 +309,8 @@ def _do(verb: str, args: list[str]) -> str:
         sid = args[0]
         if not _valid_sid(sid):
             return "ERR bad sid"
-        cur, mx, ev = stat(sid)
-        return f"OK {cur} {mx} {ev}"
+        cur, mx, ev, oom = stat(sid)
+        return f"OK {cur} {mx} {ev} {oom}"
     return f"ERR unknown verb {verb}"
 
 

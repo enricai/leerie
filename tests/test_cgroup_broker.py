@@ -129,19 +129,20 @@ def test_no_hierarchy_errors(broker, monkeypatch):
 
 # ---- stat verb (PID-exhaustion detection, DESIGN §6) ----------------------
 
-def _seed_pids_files(broker, sid, current, maxval, events_max):
-    """Write fake v2 pids.* controller files for `sid`."""
+def _seed_pids_files(broker, sid, current, maxval, events_max, oom_kill=0):
+    """Write fake v2 pids.* + memory.events controller files for `sid`."""
     d = Path(broker.V2_ROOT) / broker.SLICE / f"leerie-w-{sid}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "pids.current").write_text(str(current))
     (d / "pids.max").write_text(str(maxval))
     (d / "pids.events").write_text(f"max {events_max}\n")
+    (d / "memory.events").write_text(f"oom_kill {oom_kill}\n")
     return d
 
 
 def test_stat_reads_v2_counters(broker):
     _seed_pids_files(broker, "wsid", current=256, maxval=256, events_max=42)
-    assert broker._handle("stat wsid") == "OK 256 256 42"
+    assert broker._handle("stat wsid") == "OK 256 256 42 0"
 
 
 def test_stat_unlimited_max_reports_minus_one(broker):
@@ -152,13 +153,14 @@ def test_stat_unlimited_max_reports_minus_one(broker):
     (d / "pids.current").write_text("5")
     (d / "pids.max").write_text("max")
     (d / "pids.events").write_text("max 0\n")
-    assert broker._handle("stat wsid") == "OK 5 -1 0"
+    (d / "memory.events").write_text("oom_kill 0\n")
+    assert broker._handle("stat wsid") == "OK 5 -1 0 0"
 
 
 def test_stat_missing_cgroup_degrades_to_sentinels(broker):
     """No cgroup dir (containment off / raced with destroy) → safe
-    sentinels (current 0, max -1, events 0), never a raise."""
-    assert broker._handle("stat ghost") == "OK 0 -1 0"
+    sentinels (current 0, max -1, events 0, oom 0), never a raise."""
+    assert broker._handle("stat ghost") == "OK 0 -1 0 0"
 
 
 def test_stat_rejects_bad_sid(broker):
@@ -172,13 +174,30 @@ def test_stat_missing_sid_arg_errors(broker):
 
 def test_stat_v1_has_no_events(broker, monkeypatch, tmp_path):
     """v1's pids controller exposes current/max but no pids.events → the
-    events_max field is always 0 (detection falls back to current>=max)."""
+    events_max field is always 0 (detection falls back to current>=max).
+    v1's memory controller has no memory.events seeded here → oom
+    degrades to 0 (missing-file sentinel)."""
     monkeypatch.setattr(broker, "_HIER", "v1")
     pdir = (Path(broker.V2_ROOT) / "pids" / broker.SLICE / "leerie-w-wsid")
     pdir.mkdir(parents=True)
     (pdir / "pids.current").write_text("100")
     (pdir / "pids.max").write_text("100")
-    assert broker._handle("stat wsid") == "OK 100 100 0"
+    assert broker._handle("stat wsid") == "OK 100 100 0 0"
+
+
+def test_stat_v1_reads_memory_events_oom(broker, monkeypatch, tmp_path):
+    """v1's memory controller exposes memory.events with the same
+    oom_kill key on modern kernels → read it from the memory (not pids)
+    controller dir."""
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    pdir = (Path(broker.V2_ROOT) / "pids" / broker.SLICE / "leerie-w-wsid")
+    mdir = (Path(broker.V2_ROOT) / "memory" / broker.SLICE / "leerie-w-wsid")
+    pdir.mkdir(parents=True)
+    mdir.mkdir(parents=True)
+    (pdir / "pids.current").write_text("100")
+    (pdir / "pids.max").write_text("100")
+    (mdir / "memory.events").write_text("oom_kill 2\n")
+    assert broker._handle("stat wsid") == "OK 100 100 0 2"
 
 
 def test_stat_events_parser_ignores_unknown_keys(broker):
@@ -189,7 +208,42 @@ def test_stat_events_parser_ignores_unknown_keys(broker):
     (d / "pids.current").write_text("10")
     (d / "pids.max").write_text("64")
     (d / "pids.events").write_text("max.imposed 7\nmax 3\n")
-    assert broker._handle("stat wsid") == "OK 10 64 3"
+    (d / "memory.events").write_text("oom_kill 0\n")
+    assert broker._handle("stat wsid") == "OK 10 64 3 0"
+
+
+def test_stat_reads_v2_oom_kill(broker):
+    """memory.events' oom_kill counter surfaces as the 4th stat token —
+    the definitive OOM-kill signal (mirrors the pids.events 'max' key)."""
+    _seed_pids_files(broker, "wsid", current=10, maxval=64, events_max=0,
+                      oom_kill=5)
+    assert broker._handle("stat wsid") == "OK 10 64 0 5"
+
+
+def test_stat_memory_events_missing_file_degrades_to_zero(broker):
+    """No memory.events file (containment off / race with destroy) → oom
+    degrades to 0 rather than raising (mirrors the pids.* sentinel
+    convention)."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("10")
+    (d / "pids.max").write_text("64")
+    (d / "pids.events").write_text("max 0\n")
+    # memory.events intentionally not written.
+    assert broker._handle("stat wsid") == "OK 10 64 0 0"
+
+
+def test_memory_events_oom_parser_ignores_unknown_keys(broker):
+    """memory.events carries other keys (low, high, max, oom, oom_kill);
+    only the exact 'oom_kill' line counts."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("1")
+    (d / "pids.max").write_text("64")
+    (d / "pids.events").write_text("max 0\n")
+    (d / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 1\noom 2\noom_kill 7\n")
+    assert broker._handle("stat wsid") == "OK 1 64 0 7"
 
 
 # ---- probe round-trip -----------------------------------------------------
