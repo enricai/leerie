@@ -233,16 +233,16 @@ def test_gate_takes_state_and_flag(leerie):
     assert list(sig.parameters) == ["st", "allow_uncapped"]
 
 
-# ---- stat (PID-exhaustion probe, DESIGN §6) -------------------------------
+# ---- stat (PID-exhaustion + memory-OOM probe, DESIGN §6) ------------------
 
-def test_stat_parses_ok_triple(leerie, monkeypatch):
-    sent = _stub_broker(leerie, monkeypatch, "OK 256 256 42")
-    assert leerie._cgroup_stat("feat-001") == (256, 256, 42)
+def test_stat_parses_ok_quadruple(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK 256 256 42 3")
+    assert leerie._cgroup_stat("feat-001") == (256, 256, 42, 3)
     assert sent == ["stat feat-001"]
 
 
 def test_stat_none_sid_returns_none_without_calling(leerie, monkeypatch):
-    sent = _stub_broker(leerie, monkeypatch, "OK 1 2 3")
+    sent = _stub_broker(leerie, monkeypatch, "OK 1 2 3 4")
     assert leerie._cgroup_stat(None) is None
     assert sent == []  # short-circuits before the socket round-trip
 
@@ -258,15 +258,24 @@ def test_stat_broker_error_returns_none(leerie, monkeypatch):
 
 
 def test_stat_malformed_ok_returns_none(leerie, monkeypatch):
-    # Wrong arity or non-integer fields must not crash the caller.
-    _stub_broker(leerie, monkeypatch, "OK 256 256")
+    # Wrong arity (including the pre-widening 4-token response) or
+    # non-integer fields must not crash the caller.
+    _stub_broker(leerie, monkeypatch, "OK 256 256 42")
     assert leerie._cgroup_stat("feat-001") is None
-    _stub_broker(leerie, monkeypatch, "OK a b c")
+    _stub_broker(leerie, monkeypatch, "OK a b c d")
     assert leerie._cgroup_stat("feat-001") is None
 
 
 def test_stat_unlimited_max_passthrough(leerie, monkeypatch):
     # Broker reports -1 for an uncapped cgroup; the client passes it through
     # so the detector's `mx > 0` guard suppresses false exhaustion.
-    _stub_broker(leerie, monkeypatch, "OK 5 -1 0")
-    assert leerie._cgroup_stat("feat-001") == (5, -1, 0)
+    _stub_broker(leerie, monkeypatch, "OK 5 -1 0 0")
+    assert leerie._cgroup_stat("feat-001") == (5, -1, 0, 0)
+
+
+def test_stat_reports_oom_kill_count(leerie, monkeypatch):
+    # The 4th token is memory.events' oom_kill counter — the memory-OOM
+    # signal `_invoke`'s no-envelope path checks (DESIGN §6 *Detecting
+    # memory OOM*), mirroring pids.events.max's role for fork denial.
+    _stub_broker(leerie, monkeypatch, "OK 10 1024 0 2")
+    assert leerie._cgroup_stat("feat-001") == (10, 1024, 0, 2)

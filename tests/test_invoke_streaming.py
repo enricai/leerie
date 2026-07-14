@@ -700,13 +700,14 @@ def _ok_tool_result(text: str = "ok"):
          "tool_use_id": "tu"}]}})
 
 
-def _enable_fake_cgroup(leerie, monkeypatch, stat_triple):
+def _enable_fake_cgroup(leerie, monkeypatch, stat_quad):
     """Make _invoke believe a worker cgroup exists (so cgroup_sid is set)
-    and have _cgroup_stat report `stat_triple`."""
+    and have _cgroup_stat report `stat_quad`
+    (pids.current, pids.max, pids.events.max, oom_kill)."""
     monkeypatch.setattr(leerie, "_cgroup_create", lambda sid, mem, pids: sid)
     monkeypatch.setattr(leerie, "_cgroup_enroll", lambda sid, pid: True)
     monkeypatch.setattr(leerie, "_cgroup_destroy", lambda sid: None)
-    monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_triple)
+    monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_quad)
 
 
 def test_invoke_pid_exhaustion_realistic_interleaved_stream(
@@ -727,7 +728,7 @@ def test_invoke_pid_exhaustion_realistic_interleaved_stream(
     events.append(json.dumps({"type": "result", "subtype": "success",
                               "structured_output": {"ok": True},
                               "is_error": False}))
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))  # at cap
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0, 0))  # at cap
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     with pytest.raises(leerie.WorkerError) as ei:
@@ -751,7 +752,7 @@ def test_invoke_pid_exhaustion_raises_early(leerie, leerie_dir, monkeypatch):
         json.dumps({"type": "result", "subtype": "success",
                     "structured_output": {"ok": True}, "is_error": False}),
     ]
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0, 0))
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     with pytest.raises(leerie.WorkerError) as ei:
@@ -795,7 +796,7 @@ def test_invoke_pid_exhaustion_via_climbing_denials(leerie, leerie_dir,
     denials = [0]
     def _climbing_stat(sid):
         denials[0] += 1
-        return (200, 256, denials[0])
+        return (200, 256, denials[0], 0)
     _enable_fake_cgroup(leerie, monkeypatch, None)
     monkeypatch.setattr(leerie, "_cgroup_stat", _climbing_stat)
     monkeypatch.setattr("asyncio.create_subprocess_exec",
@@ -823,7 +824,7 @@ def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
         json.dumps({"type": "result", "subtype": "success",
                     "structured_output": {"ok": True}, "is_error": False}),
     ]
-    _enable_fake_cgroup(leerie, monkeypatch, (12, 256, 0))  # healthy
+    _enable_fake_cgroup(leerie, monkeypatch, (12, 256, 0, 0))  # healthy
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     result = asyncio.run(leerie._invoke(
@@ -851,7 +852,7 @@ def test_invoke_sparse_errors_below_window_threshold_do_not_trigger(
                               "is_error": False}))
     # Stat would confirm exhaustion IF probed — proving the window gate
     # (not the cgroup read) is what holds detection back here.
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99))
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99, 0))
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     result = asyncio.run(leerie._invoke(
