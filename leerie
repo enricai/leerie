@@ -6137,6 +6137,11 @@ else
     -v "$_cidfile:/run/leerie-cidfile:ro"
     -e LEERIE_INSPECT_DIRS=
     -e LEERIE_STATE_DIR=/leerie-state
+    # Basename only: the host path doesn't exist in the container (the repo
+    # is at /work), and log() takes Path(USER_REPO).name. Without this the
+    # orchestrator's cwd=/work falls back to basename "work" and every line
+    # reads [leerie] [work]. Mirrors the Fly path's child_env["USER_REPO"].
+    -e "USER_REPO=$(basename "$USER_REPO")"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host

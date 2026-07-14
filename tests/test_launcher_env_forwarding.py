@@ -93,6 +93,95 @@ def _forwarded_names(tokens: list[str]) -> set[str]:
     return names
 
 
+def _extract_run_argv() -> str:
+    """Pull the `_run_argv` array assignment verbatim from the launcher, same
+    reason as _extract_forwarding_loop: assert against real code, not a copy."""
+    src = LAUNCHER.read_text()
+    m = re.search(r"(  _run_argv=\(\n.*?\n  \)\n)", src, re.DOTALL)
+    assert m, "could not locate the _run_argv array in the launcher"
+    return m.group(1)
+
+
+_ARGV_HARNESS = r"""
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stub every var the array interpolates; USER_REPO is the one under test.
+USER_REPO=/Users/andres/src/enric/stackpulse
+LEERIE_REPO=/opt/leerie
+LEERIE_STATE_HOST_DIR=/tmp/state
+TTY_FLAGS=""
+_cidfile=/tmp/cid
+REPO_IMAGE_TAG=""
+IMAGE_TAG=leerie:test
+_leerie_env_args=()
+
+# ---- _run_argv, extracted verbatim from the launcher --------------------
+__RUN_ARGV__
+
+for a in "${_run_argv[@]}"; do printf '%s\n' "$a"; done
+"""
+
+
+def _run_argv_tokens() -> list[str]:
+    """Assemble the launcher's real _run_argv with stubbed vars; return tokens."""
+    harness = _ARGV_HARNESS.replace("__RUN_ARGV__", _extract_run_argv())
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return [t for t in result.stdout.splitlines() if t]
+
+
+def _env_pairs(tokens: list[str]) -> dict[str, str]:
+    """Explicit `-e NAME=VALUE` pairs. The forwarding loop's bare `-e NAME`
+    form is handled by _forwarded_names(); this is its NAME=VALUE sibling."""
+    pairs = {}
+    for i, tok in enumerate(tokens):
+        if tok == "-e" and i + 1 < len(tokens) and "=" in tokens[i + 1]:
+            name, _, value = tokens[i + 1].partition("=")
+            pairs[name] = value
+    return pairs
+
+
+def test_user_repo_delivered_to_container():
+    """The boundary guard this whole class of bug fell through.
+
+    `log()` renders `[leerie] [<repo>]` from USER_REPO, falling back to cwd —
+    which is /work inside the container. USER_REPO does not match `^LEERIE_`,
+    so the forwarding loop cannot carry it; it needs an explicit `-e`. Without
+    it every local run prints `[leerie] [work]` regardless of the repo.
+    """
+    pairs = _env_pairs(_run_argv_tokens())
+    assert "USER_REPO" in pairs, (
+        "USER_REPO is not passed to the container — log() will fall back to "
+        "cwd (/work) and every line will render [leerie] [work]"
+    )
+    assert pairs["USER_REPO"] == "stackpulse", (
+        f"expected the basename 'stackpulse', got {pairs['USER_REPO']!r} — "
+        "the host path does not exist inside the container (repo is at /work), "
+        "so a path value would be misleading to any future reader"
+    )
+
+
+def test_fly_path_also_delivers_user_repo():
+    """Both runtimes must deliver the tag, by independent mechanisms.
+
+    The Fly path has no `LEERIE_*` forwarding loop — it hand-picks keys into
+    `child_env` in the detached-launch heredoc. This bug existed because the
+    two mechanisms drifted: the fix landed on Fly (5f151c88) and not local.
+    Pin both so a future change to one surfaces the other.
+    """
+    src = LAUNCHER.read_text()
+    assert 'child_env["USER_REPO"] = "$(basename "$USER_REPO")"' in src, (
+        "the Fly detached-launch child_env no longer injects USER_REPO — "
+        "the remote orchestrator's log() will regress to [leerie] [work]"
+    )
+
+
 def test_worker_pids_max_forwarded():
     names = _forwarded_names(_run({"LEERIE_WORKER_PIDS_MAX": "1024"}))
     assert "LEERIE_WORKER_PIDS_MAX" in names

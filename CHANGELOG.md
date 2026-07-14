@@ -5,6 +5,28 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Local runs now log the repo name instead of `[work]`.** Every line from
+  a local (nerdctl) run rendered `[leerie] [work]` regardless of the repo:
+  `log()` derives its `[leerie] [<repo>]` tag from `USER_REPO`, falling back
+  to `Path(os.getcwd()).name` — and the container's cwd is `/work`. The
+  launcher's env-forwarding loop filters `^LEERIE_`, which `USER_REPO`
+  cannot match, so the value never crossed the container boundary. With
+  several concurrent runs (chains, groups, multiple repos) the tag is the
+  only thing distinguishing whose line is whose, so it was uniformly
+  useless. The Fly path already injected `USER_REPO` via `child_env`; the
+  local path is now brought in line with an explicit
+  `-e "USER_REPO=$(basename "$USER_REPO")"` on the `nerdctl run` argv, which
+  sidesteps the `LEERIE_*` filter without touching the forwarding loop or
+  its deny-list. The basename (never the host path) is passed: the host path
+  does not resolve inside the container, and `log()` — the only in-container
+  reader — takes `Path(...).name`. Two new boundary guards pin that *both*
+  runtimes deliver the tag; the two mechanisms are independent, which is why
+  the bug survived on one runtime while the other was fixed.
+
 ## [0.9.60]
 
 ### Fixed

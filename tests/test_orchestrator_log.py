@@ -8,9 +8,17 @@ mid-stream when the launcher starts tailing the remote orchestrator
 (observed: bash prints `[stackpulse]`, python prints `[work]` because
 cwd inside the Fly machine is /work).
 
-The critical property locked in here: USER_REPO wins over cwd, so the
-fix that injects USER_REPO into the remote orchestrator's env is
-sufficient to keep the prefix stable.
+The critical property locked in here: USER_REPO wins over cwd, so
+injecting USER_REPO into the orchestrator's env keeps the prefix stable.
+
+Scope note: these tests stub USER_REPO into the subprocess env directly,
+so they pin log()'s *precedence* and nothing about whether a launcher
+actually delivers the var across the container boundary. That seam is
+where the bug lives, and it is guarded separately — for both runtimes —
+by test_launcher_env_forwarding.py::test_user_repo_delivered_to_container
+(local `-e`) and ::test_fly_path_also_delivers_user_repo (Fly child_env).
+An earlier version of this docstring described the injection as done,
+which was true of Fly and false of local for months.
 """
 from __future__ import annotations
 

@@ -641,6 +641,26 @@ orchestrator-read override is deny-listed except four justified exceptions
 On the Fly path the equivalent forwarding is via `child_env` in the
 detached-launch heredoc, not this loop.
 
+**`USER_REPO` (non-`LEERIE_*`, both runtimes).** `log()` renders its
+`[leerie] [<repo>]` prefix from `Path(os.environ.get("USER_REPO") or
+os.getcwd()).name`. The container's cwd is `/work`, so without an injected
+`USER_REPO` the fallback fires and every line reads `[leerie] [work]`. Both
+runtimes therefore inject it, each outside the `LEERIE_*` loop (the name
+does not match `^LEERIE_`):
+
+- **Local:** an explicit `-e "USER_REPO=$(basename "$USER_REPO")"` in the
+  `_run_argv` array, next to the other explicit `-e` lines.
+- **Fly:** `child_env["USER_REPO"] = "$(basename "$USER_REPO")"` in the
+  detached-launch heredoc (reproduced verbatim under §"Worker auth +
+  config seeding", `seed-auth.sh`).
+
+Both pass the **basename**, never the host path: `$USER_REPO` is a host
+absolute path that does not resolve inside the container (the repo is at
+`/work`), and `Path(x).name` is identity for a bare name. `log()` is the
+only in-container reader, so nothing treats the value as a path. The two
+mechanisms are independent — a change to one that is not mirrored in the
+other regresses that runtime to `[work]`.
+
 ### `--inspect-dir` path translation
 
 Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo
