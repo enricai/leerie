@@ -1938,6 +1938,23 @@ reaps them roughly once a second, keeping `pids.current` flat (live processes
 only) instead of climbing. `prctl` is Linux-only and a logged no-op elsewhere
 (the orchestrator only runs for real inside the Linux container).
 
+**A second route to the same 255: an inherited `SIGCHLD=SIG_IGN`.** The
+disposition survives `exec`, so a parent the orchestrator does not control (an
+SSH daemon, a login shell, the Fly launch wrapper) can hand it down. Under
+`SIG_IGN` the *kernel* reaps exiting children itself, so their status is gone
+before asyncio can read it — `PidfdChildWatcher` then `waitpid`s a pid that no
+longer exists, catches `ChildProcessError`, and reports returncode 255 with
+empty output (it can also surface as a raised `ProcessLookupError`). Only the
+**first** subprocess is corrupted, which makes the symptom maximally
+misleading: whichever check happens to run first reports a bogus failure and
+every later one succeeds, so the blame lands on that check's subject rather
+than on the machinery. `main()` therefore calls `_restore_sigchld_default()`
+before anything spawns, and `preflight()` gates on `_sigchld_is_ignored()` —
+which reads the kernel's `SigIgn` mask from `/proc/self/status`, since
+`signal.getsignal()` does not reliably reflect an *inherited* disposition.
+This is distinct from the reaper race below: pidfds are immune to
+`waitpid(-1)` theft, but not to kernel auto-reaping.
+
 Crucially the reaper is **targeted, not `waitpid(-1)`**: a blanket
 `waitpid(-1, WNOHANG)` would race asyncio's own child watcher and steal the exit
 status of a live `claude -p` worker (asyncio spawns workers with

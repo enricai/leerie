@@ -225,6 +225,55 @@ def test_reparented_orphans_accepts_orchestrator_ppid(leerie, monkeypatch):
 
 
 @linux_only
+def test_run_proc_returns_true_rc_under_inherited_sigchld_ignore():
+    """An inherited `SIGCHLD=SIG_IGN` makes the *kernel* auto-reap our children,
+    so asyncio's PidfdChildWatcher `waitpid`s a pid that is already gone, gets
+    ChildProcessError, and invents **returncode 255 with empty stdout**.
+
+    That fake 255 is what made `preflight()`'s first check —
+    `git config user.email` — die with "git user.email is not configured" on a
+    machine whose identity was perfectly configured. Git was never involved: the
+    *first* subprocess of the process is the one that loses its exit status, and
+    the git check merely happened to be first.
+
+    `main()` must therefore reset SIGCHLD to SIG_DFL before spawning anything.
+    This test asserts the true exit code (7) survives, not 255.
+
+    Runs in a subprocess: SIG_IGN is process-wide and would poison the rest of
+    the pytest session (every later `subprocess.run` would lose its status).
+    """
+    script = """
+import asyncio, importlib.util, signal, sys
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)   # what a parent (ssh/hallpass) can leave us
+spec = importlib.util.spec_from_file_location("lp", sys.argv[1])
+lp = importlib.util.module_from_spec(spec); spec.loader.exec_module(lp)
+lp._restore_sigchld_default()                          # the fix under test
+async def m():
+    # Without the reset this does not merely return the wrong code: asyncio
+    # raises (ProcessLookupError / CancelledError) because the child is gone
+    # before it can be waited on. Report either failure shape as non-"7".
+    try:
+        r = await lp.run_proc(["sh", "-c", "exit 7"])
+        print(r.returncode)
+    except BaseException as e:
+        print(f"RAISED:{type(e).__name__}")
+asyncio.run(m())
+"""
+    target = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "orchestrator", "leerie.py")
+    out = subprocess.run([sys.executable, "-c", script, target],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, f"probe failed: {out.stderr[-2000:]}"
+    rc = out.stdout.strip().splitlines()[-1]
+    assert rc == "7", (
+        f"run_proc reported {rc!r}, expected '7' — the child's exit status was "
+        "lost to kernel auto-reaping (verified failure modes without the fix: "
+        "rc=255, or RAISED:ProcessLookupError). _restore_sigchld_default() must "
+        "restore SIGCHLD to SIG_DFL before any subprocess is spawned.")
+
+
+@linux_only
 def test_zombie_reaper_survives_no_children(leerie):
     """With no children to wait on, the reaper must not crash — it swallows
     ChildProcessError and keeps looping."""

@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.61]
+
 ### Fixed
+
+- **`--runtime fly` runs no longer die with a bogus "git user.email is not
+  configured".** The git identity was seeded correctly and readable the whole
+  time — the *return code was lying*. `SIGCHLD` set to `SIG_IGN` (inherited
+  across `exec`, so a parent we don't control can hand it to us) makes the
+  kernel auto-reap exiting children, so their exit status is gone before
+  anyone reads it. asyncio's `PidfdChildWatcher` then `waitpid`s a pid that no
+  longer exists, catches `ChildProcessError`, and invents **returncode 255
+  with empty stdout** (it can also surface as a raised `ProcessLookupError`).
+  Only the *first* subprocess of the process is affected; `preflight()`'s
+  `git config user.email` merely had the bad luck of being first, and its
+  `rc != 0 or not stdout` check dutifully blamed git. Reproduced in the
+  container image: with `SIG_IGN` a `sh -c "exit 7"` reports `rc=255`; with the
+  fix it reports `rc=7`. Three changes: `_restore_sigchld_default()` restores
+  `SIG_DFL` before anything spawns; `preflight()` now distinguishes "cannot
+  read the child's exit status" (rc=255 + empty stdout — git exits 1, never
+  255, for an unset key) from a genuinely unset identity, so the operator is
+  no longer sent to fix a config that is already correct; and a new
+  `_sigchld_is_ignored()` gate reads the kernel's `SigIgn` mask from
+  `/proc/self/status` (`signal.getsignal()` does not reliably reflect an
+  *inherited* disposition) and fails with an explicit environment diagnosis.
 
 - **Local runs now log the repo name instead of `[work]`.** Every line from
   a local (nerdctl) run rendered `[leerie] [work]` regardless of the repo:

@@ -4336,9 +4336,30 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
 
+    # 0. subprocess machinery must be able to report exit statuses at all.
+    # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
+    # asyncio result is rc=255/empty — indistinguishable from a genuinely
+    # failed command, which makes every check below report a false negative.
+    # main() resets the disposition; this gate catches one set afterwards.
+    if _sigchld_is_ignored():
+        die("SIGCHLD is set to SIG_IGN, so the kernel auto-reaps this "
+            "process's children and their exit statuses are unreadable. "
+            "Every subprocess would report a bogus failure. This is an "
+            "environment problem, not a leerie configuration problem.")
+
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
         r = await run_proc(["git", "config", key])
+        # rc=255 + empty stdout is asyncio's "could not read the child's exit
+        # status" sentinel, not git's verdict — git exits 1 for an unset key,
+        # never 255. Without this branch the check below misreports a broken
+        # subprocess as a misconfigured identity and sends the operator to
+        # "fix" a git config that is already correct.
+        if r.returncode == 255 and not r.stdout:
+            die(f"cannot read the exit status of `git config {key}` "
+                "(rc=255, no output) — the child process was reaped before "
+                "its status could be read. This is NOT a git configuration "
+                "problem; the subprocess machinery is broken.")
         if r.returncode != 0 or not r.stdout.strip():
             die(f"git {key} is not configured. "
                 f"Run: git config --global {key} \"<value>\"")
@@ -9206,6 +9227,53 @@ _PR_GET_CHILD_SUBREAPER = 37
 # zombie — indistinguishable by the reaper's /proc filter from a true orphan.
 # The registration set is what tells them apart, so the reaper must consult it.
 _ASYNCIO_MANAGED_PIDS: set[int] = set()
+
+
+def _restore_sigchld_default() -> None:
+    """Force SIGCHLD to SIG_DFL before this process spawns anything.
+
+    `SIG_IGN` on SIGCHLD tells the *kernel* to auto-reap exiting children, so
+    their exit status is gone before anyone can read it. asyncio's
+    `PidfdChildWatcher` then `waitpid`s a pid that no longer exists, catches
+    `ChildProcessError`, and invents **returncode 255 with empty stdout**
+    (CPython `asyncio/unix_events.py`). Every worker and every `run_proc` call
+    goes through asyncio, so an inherited SIG_IGN silently corrupts the first
+    subprocess's result.
+
+    Only the first subprocess is corrupted, which makes the symptom maximally
+    misleading: whichever check happens to run first reports a bogus failure
+    and every later one succeeds.
+
+    The disposition is inherited across `exec`, so a parent we do not control
+    (an SSH daemon, a shell, the launch wrapper) can hand it to us. Nothing in
+    leerie sets SIG_IGN — this is defensive, and cheap.
+    """
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    except (OSError, ValueError, AttributeError):
+        # Non-main thread, or a platform without SIGCHLD (Windows). asyncio's
+        # watcher is POSIX-only anyway; nothing to restore.
+        pass
+
+
+def _sigchld_is_ignored() -> bool | None:
+    """True if the kernel is auto-reaping our children (SIGCHLD ignored).
+
+    Reads `/proc/self/status`'s SigIgn mask rather than `signal.getsignal()`:
+    a disposition *inherited across exec* is not always visible to Python's
+    view, and the kernel mask is the ground truth. Returns None when it cannot
+    be determined (no /proc, i.e. non-Linux) — callers treat that as "unknown",
+    never as "ignored".
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("SigIgn:"):
+                    # Bit N-1 for signal N; SIGCHLD is 17 -> bit 16.
+                    return bool(int(line.split()[1], 16) & (1 << (signal.SIGCHLD - 1)))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+    return None
 
 
 def _become_subreaper() -> bool:
@@ -18542,6 +18610,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
 
 def main() -> None:
+    # Must precede every spawn — including _become_subreaper's descendants.
+    _restore_sigchld_default()
+
     # Install the child-subreaper role first thing, before any worker (or any
     # subprocess this process spawns) exists, so every descendant inherits the
     # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
