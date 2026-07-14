@@ -882,3 +882,57 @@ def test_invoke_stat_none_never_false_detects(leerie, leerie_dir, monkeypatch):
         verbosity="stream",
         worker_memory_max_bytes=1 << 30, worker_pids_max=256))
     assert result["structured_output"] == {"ok": True}
+
+
+# ---- memory-OOM naming (DESIGN §6 *Detecting memory OOM*) ----------------
+
+def test_invoke_names_memory_oom_on_no_envelope(leerie, leerie_dir,
+                                                 monkeypatch):
+    """A build/test worker whose stream truncates with no `result` event
+    AND whose cgroup's final oom_kill counter is >0 must raise a
+    WorkerError naming the OOM, the offending Bash command, and the
+    memory.max cap — not a bare 'no result event' message. This is the
+    bare-`Killed`-mid-build symptom from the bugfix-003 handoff doc."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "pnpm run build"}}]}}),
+        # Stream truncates — the kernel OOM-killed the cgroup mid-build,
+        # so claude -p was reaped with no result event.
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (0, 256, 0, 2))  # oom_kill=2
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=137))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+    msg = str(ei.value)
+    assert "OOM-killed" in msg
+    assert "pnpm run build" in msg
+    assert "8.0 GiB" in msg
+
+
+def test_invoke_no_oom_when_oom_kill_zero(leerie, leerie_dir, monkeypatch):
+    """A truncated stream with a healthy cgroup (oom_kill=0) must NOT be
+    misreported as an OOM — it falls through to the ordinary
+    no-result-event WorkerError."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "pnpm run build"}}]}}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (0, 256, 0, 0))  # oom_kill=0
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=1))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+    assert "OOM-killed" not in str(ei.value)

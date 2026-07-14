@@ -16904,11 +16904,16 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             if kind == "empty_handoff" and \
                     await branch_has_commits_ahead(
                         worktree, compute_run_branch(st.run_id)):
-                log(f"  {sid}: {message} — but the worktree has committed "
-                    "work; the worker likely ended its turn on an incomplete "
-                    "background task (e.g. an OOM-killed build). Keeping the "
-                    "committed diff and settling via advisory conformance "
-                    "instead of discarding it.")
+                # Prefer the named cause (e.g. a memory-OOM diagnostic from
+                # _invoke's no-envelope path, DESIGN §6 *Detecting memory
+                # OOM*) over the generic checkpoint message, same as the
+                # no-commits branch below.
+                rescue_reason = res.get("summary") or message
+                log(f"  {sid}: {rescue_reason} — but the worktree has "
+                    "committed work; the worker likely ended its turn on an "
+                    "incomplete background task (e.g. an OOM-killed build). "
+                    "Keeping the committed diff and settling via advisory "
+                    "conformance instead of discarding it.")
                 res = {"subtask_id": sid, "status": "complete",
                        "summary": (res.get("summary")
                                    or "worker ended its turn with committed "
