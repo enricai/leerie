@@ -1737,6 +1737,48 @@ retryable `incomplete-handoff` (a fresh worker restarts in a new worktree
 with a clean PID table, and the dead worker's leaked PIDs die with it),
 and a conformer's stays advisory (§9).
 
+**Detecting memory OOM — naming the cause instead of a cryptic checkpoint
+error.** A build/test command that overshoots the worker cgroup's
+`memory.max` is killed by the kernel with a bare `Killed` (exit 137, no
+error text of its own) — unlike PID exhaustion, this leaves no failing
+tool-result for `_read_stream`'s window detector to key on: `claude -p`
+is often reaped mid-turn, before it can emit any `result` event at all.
+That symptom lands in `_invoke`'s no-envelope path indistinguishable from
+a session-limit no-op or a `--max-turns` exhaustion; downstream,
+`validate_result` tags it `empty_handoff`, and once a run with no
+committed work burns the retry cap the operator sees only *"checkpoint
+... does not exist on disk"* — no mention of memory. On a real run this
+drove an operator through a default → 6G → 12G → 16G
+`LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual cause.
+
+The broker's `stat <sid>` verb (extended alongside the PID-exhaustion
+counters above) also returns `memory.events`' `oom_kill` counter — the
+kernel increments it once per OOM-kill inside the cgroup, mirroring
+`pids.events`' `max` counter's role for fork denial. `_cgroup_stat`'s
+client widens to a 4-tuple accordingly:
+`(pids.current, pids.max, pids.events.max, oom_kill)`. `_invoke` reads
+the cgroup's stat once more — in its `finally`, immediately before
+`_cgroup_destroy` tears the cgroup down (destroy `rmdir`s it, so this is
+the last point a read is possible) — and, in the no-envelope branch, if
+`oom_kill > 0` it raises a `WorkerError` naming the cause: the last Bash
+command the worker launched (tracked alongside the PID-exhaustion window,
+first line only) and the cgroup's `memory.max` cap, with the same
+actionable suggestion the operator's escalation ladder already
+discovered by hand — *"worker OOM-killed on `<cmd>` (memory.max=N GiB) —
+raise `--worker-memory-max` or lower `--max-parallel`."* That message
+threads through `run_implementer`'s existing `except WorkerError` handler
+into the synthesized `incomplete-handoff` envelope's `summary` field.
+
+`settle_subtask`'s `empty_handoff` handling already branches on whether
+the worktree holds committed work (see the rescue above): when it does,
+the named-OOM `summary` was already preserved verbatim. The remaining
+gap is the no-commits branch, which previously discarded the worker's
+`summary` in favor of `validate_result`'s generic checkpoint-missing
+`message` before calling `fail()`. That branch now prefers the worker's
+own `summary` when present — falling back to the generic message only
+when no worker output exists — so a genuinely OOM-killed build is named
+even when the retry cap is exhausted and the subtask terminates.
+
 The error signal is measured over a **sliding window of the last N
 tool-results**, NOT a run of *consecutive* ones. The stream never places
 two tool-results next to each other — a tool-result is always followed by

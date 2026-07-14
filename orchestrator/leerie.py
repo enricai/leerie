@@ -1948,7 +1948,7 @@ class _DescendantTracker:
                 if self._cgroup_sid is not None:
                     stat = _cgroup_stat(self._cgroup_sid)
                     if stat is not None:
-                        cur, mx, _ev = stat
+                        cur, mx, _ev, _oom = stat
                         if mx > 0 and cur / mx >= _PID_REAP_HIGH_WATER:
                             # Armed: pressure is high — reap oldest reparented
                             # orphans first, stopping once pressure drops.
@@ -1958,7 +1958,7 @@ class _DescendantTracker:
                                 recheck = _cgroup_stat(self._cgroup_sid)
                                 if recheck is None:
                                     break
-                                rc, rm, _ = recheck
+                                rc, rm, _, _ = recheck
                                 if rm <= 0 or rc / rm < _PID_REAP_LOW_WATER:
                                     break
                                 _signal_pids({pid}, signal.SIGKILL)
@@ -8365,18 +8365,22 @@ def _cgroup_destroy(sid: str | None) -> None:
         _cgroup_request(f"destroy {sid}")
 
 
-def _cgroup_stat(sid: str | None) -> tuple[int, int, int] | None:
-    """Read-only probe of a worker cgroup's PID counters via the broker's
-    `stat` verb. Returns `(pids.current, pids.max, pids.events.max)`, or
-    None when the sid is None, containment is off (no broker / uncapped
-    run), or the broker errors — callers must treat None as "cannot tell"
-    and NOT infer exhaustion. `pids.max` is -1 when the cgroup is
-    uncapped/unlimited; `pids.events.max` counts kernel fork denials (the
-    broker reports 0 on v1 — where it is not read — so v1 detection falls
-    back to current >= max).
+def _cgroup_stat(sid: str | None) -> tuple[int, int, int, int] | None:
+    """Read-only probe of a worker cgroup's PID + memory-OOM counters via
+    the broker's `stat` verb. Returns `(pids.current, pids.max,
+    pids.events.max, memory.events.oom_kill)`, or None when the sid is
+    None, containment is off (no broker / uncapped run), or the broker
+    errors — callers must treat None as "cannot tell" and NOT infer
+    exhaustion. `pids.max` is -1 when the cgroup is uncapped/unlimited;
+    `pids.events.max` counts kernel fork denials (the broker reports 0 on
+    v1 — where it is not read — so v1 detection falls back to current >=
+    max). `oom_kill` counts times the kernel OOM-killer fired inside this
+    cgroup (present on both v1 and v2 — DESIGN §6 *Detecting memory OOM*).
     Used by `_read_stream` to distinguish a PID-exhausted worker (whose
     every Bash call fails with EAGAIN) from a worker whose commands merely
-    fail (DESIGN §6 *Detecting PID exhaustion*)."""
+    fail (DESIGN §6 *Detecting PID exhaustion*), and by `_invoke`'s
+    no-envelope path to name a memory-OOM'd build instead of surfacing a
+    bare missing-checkpoint error."""
     if sid is None:
         return None
     try:
@@ -8384,9 +8388,9 @@ def _cgroup_stat(sid: str | None) -> tuple[int, int, int] | None:
     except OSError:
         return None
     parts = resp.split()
-    if len(parts) == 4 and parts[0] == "OK":
+    if len(parts) == 5 and parts[0] == "OK":
         try:
-            return (int(parts[1]), int(parts[2]), int(parts[3]))
+            return (int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]))
         except ValueError:
             return None
     return None
@@ -8587,10 +8591,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # Baseline pids.events.max at the first probe, so we can tell "the
     # counter is climbing" (fresh denials) from a stale nonzero value.
     pids_events_baseline: int | None = None
+    # Last Bash command the worker launched (first line only, mirroring
+    # _summarize_tool_use's truncation). Named in the memory-OOM diagnostic
+    # below — a bare `Killed` mid-build leaves no error text of its own, so
+    # this is the only way to tell the operator *what* was running when the
+    # kernel OOM-killed the cgroup (DESIGN §6 *Detecting memory OOM*).
+    last_bash_cmd: str | None = None
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
-        nonlocal pids_events_baseline
+        nonlocal pids_events_baseline, last_bash_cmd
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -8620,6 +8630,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     sub = event.get("subtype")
                     header = f"{t}/{sub}" if sub else t
                     log_file.write(f"[{now()}] {header}\n{line}\n\n")
+                    # Track the most recent Bash command the worker launched
+                    # (first line only). Named in the memory-OOM diagnostic in
+                    # _invoke's no-envelope path — a bare `Killed` mid-build
+                    # carries no error text of its own, so this is the only
+                    # way to say *what* was running when the cgroup OOM-
+                    # killed (DESIGN §6 *Detecting memory OOM*).
+                    if t == "assistant":
+                        for b in (event.get("message", {})
+                                  .get("content", []) or []):
+                            if (b.get("type") == "tool_use"
+                                    and b.get("name") == "Bash"):
+                                cmd_lines = (
+                                    (b.get("input", {}) or {})
+                                    .get("command") or "").splitlines()
+                                if cmd_lines:
+                                    last_bash_cmd = cmd_lines[0]
                     # Latch credit-exhaustion state (see `overage_blocked`
                     # declaration above for why this keys on
                     # `overageDisabledReason`, NOT `overageStatus`).
@@ -8666,7 +8692,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                 >= _PID_EXHAUSTION_ERROR_THRESHOLD):
                             stat = _cgroup_stat(cgroup_sid)
                             if stat is not None:
-                                cur, mx, ev_max = stat
+                                cur, mx, ev_max, _oom = stat
                                 if pids_events_baseline is None:
                                     pids_events_baseline = ev_max
                                 at_cap = mx > 0 and cur >= mx
@@ -8871,6 +8897,13 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
+        # Read the cgroup's final oom_kill counter BEFORE destroy tears the
+        # cgroup down — destroy rmdirs it, so this is the last point a stat
+        # read is possible. Feeds the no-envelope diagnostic below (DESIGN §6
+        # *Detecting memory OOM*); None when containment is off or the
+        # broker errors, same "cannot tell" contract as every other
+        # _cgroup_stat call site.
+        final_stat = _cgroup_stat(cgroup_sid)
         # cgroup teardown via the broker. The broker's destroy atomically
         # reaps any worker-tree process that survived _terminate_proc_tree /
         # descendant_tracker.stop_and_reap above (cgroup.kill on v2, move-to-
@@ -8912,6 +8945,24 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 raw_message=(
                     f"out of credits — claude -p ({sid}) terminated "
                     "mid-stream with no result event"))
+        # Memory-OOM naming (DESIGN §6 *Detecting memory OOM*): a worker
+        # whose tool subtree (a build/test command) overshoots memory.max
+        # is killed by the kernel mid-turn — bare `Killed`, no error text,
+        # no result event. That symptom is otherwise indistinguishable from
+        # a session-limit no-op or a --max-turns exhaustion, and lands
+        # downstream in settle_subtask as a cryptic "checkpoint does not
+        # exist" once the retry cap is hit. `final_stat` (read from the
+        # worker's cgroup just before destroy, above) is the authoritative
+        # signal — mirrors the PID-exhaustion probe's use of the same
+        # broker `stat` verb.
+        if final_stat is not None and final_stat[3] > 0:
+            cmd_desc = f"`{last_bash_cmd}`" if last_bash_cmd else "a command"
+            cap_gib = (f"{worker_memory_max_bytes / 1024**3:.1f} GiB"
+                       if worker_memory_max_bytes else "unknown")
+            raise WorkerError(
+                f"worker {sid} was OOM-killed on {cmd_desc} "
+                f"(memory.max={cap_gib}) — raise --worker-memory-max or "
+                f"lower --max-parallel")
         if proc.returncode and proc.returncode != 0:
             raise WorkerError(
                 f"claude -p exited {proc.returncode}: "
@@ -16853,11 +16904,16 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             if kind == "empty_handoff" and \
                     await branch_has_commits_ahead(
                         worktree, compute_run_branch(st.run_id)):
-                log(f"  {sid}: {message} — but the worktree has committed "
-                    "work; the worker likely ended its turn on an incomplete "
-                    "background task (e.g. an OOM-killed build). Keeping the "
-                    "committed diff and settling via advisory conformance "
-                    "instead of discarding it.")
+                # Prefer the named cause (e.g. a memory-OOM diagnostic from
+                # _invoke's no-envelope path, DESIGN §6 *Detecting memory
+                # OOM*) over the generic checkpoint message, same as the
+                # no-commits branch below.
+                rescue_reason = res.get("summary") or message
+                log(f"  {sid}: {rescue_reason} — but the worktree has "
+                    "committed work; the worker likely ended its turn on an "
+                    "incomplete background task (e.g. an OOM-killed build). "
+                    "Keeping the committed diff and settling via advisory "
+                    "conformance instead of discarding it.")
                 res = {"subtask_id": sid, "status": "complete",
                        "summary": (res.get("summary")
                                    or "worker ended its turn with committed "
@@ -16866,8 +16922,17 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                        "criteria_results": res.get("criteria_results") or []}
                 rescued_from_empty_handoff = True
             else:
-                log(f"  result invariant violated for {sid}: {message}")
-                done = await fail(kind, message)
+                # An `empty_handoff` with NO committed work still deserves a
+                # named cause when one is available: `_invoke`'s no-envelope
+                # path (DESIGN §6 *Detecting memory OOM*) names a cgroup
+                # memory-OOM in `res["summary"]` when it detects one, but
+                # `validate_result`'s `message` is the generic "checkpoint
+                # ... does not exist" text. Prefer the named cause so the
+                # operator sees "worker OOM-killed on <cmd> ..." instead of
+                # the cryptic checkpoint error once the retry cap is hit.
+                reason = res.get("summary") or message
+                log(f"  result invariant violated for {sid}: {reason}")
+                done = await fail(kind, reason)
                 if done is not None:
                     return done
                 continue

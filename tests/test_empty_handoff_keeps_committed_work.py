@@ -158,7 +158,7 @@ class TestSettleWiring:
         destroy the very commits the rescue keeps."""
         src = inspect.getsource(leerie.settle_subtask)
         rescue_idx = src.find('kind == "empty_handoff"')
-        fail_idx = src.find("done = await fail(kind, message)")
+        fail_idx = src.find("done = await fail(kind, reason)")
         assert rescue_idx != -1 and fail_idx != -1
         assert rescue_idx < fail_idx
 

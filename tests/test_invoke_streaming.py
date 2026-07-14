@@ -700,13 +700,14 @@ def _ok_tool_result(text: str = "ok"):
          "tool_use_id": "tu"}]}})
 
 
-def _enable_fake_cgroup(leerie, monkeypatch, stat_triple):
+def _enable_fake_cgroup(leerie, monkeypatch, stat_quad):
     """Make _invoke believe a worker cgroup exists (so cgroup_sid is set)
-    and have _cgroup_stat report `stat_triple`."""
+    and have _cgroup_stat report `stat_quad`
+    (pids.current, pids.max, pids.events.max, oom_kill)."""
     monkeypatch.setattr(leerie, "_cgroup_create", lambda sid, mem, pids: sid)
     monkeypatch.setattr(leerie, "_cgroup_enroll", lambda sid, pid: True)
     monkeypatch.setattr(leerie, "_cgroup_destroy", lambda sid: None)
-    monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_triple)
+    monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_quad)
 
 
 def test_invoke_pid_exhaustion_realistic_interleaved_stream(
@@ -727,7 +728,7 @@ def test_invoke_pid_exhaustion_realistic_interleaved_stream(
     events.append(json.dumps({"type": "result", "subtype": "success",
                               "structured_output": {"ok": True},
                               "is_error": False}))
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))  # at cap
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0, 0))  # at cap
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     with pytest.raises(leerie.WorkerError) as ei:
@@ -751,7 +752,7 @@ def test_invoke_pid_exhaustion_raises_early(leerie, leerie_dir, monkeypatch):
         json.dumps({"type": "result", "subtype": "success",
                     "structured_output": {"ok": True}, "is_error": False}),
     ]
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0, 0))
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     with pytest.raises(leerie.WorkerError) as ei:
@@ -795,7 +796,7 @@ def test_invoke_pid_exhaustion_via_climbing_denials(leerie, leerie_dir,
     denials = [0]
     def _climbing_stat(sid):
         denials[0] += 1
-        return (200, 256, denials[0])
+        return (200, 256, denials[0], 0)
     _enable_fake_cgroup(leerie, monkeypatch, None)
     monkeypatch.setattr(leerie, "_cgroup_stat", _climbing_stat)
     monkeypatch.setattr("asyncio.create_subprocess_exec",
@@ -823,7 +824,7 @@ def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
         json.dumps({"type": "result", "subtype": "success",
                     "structured_output": {"ok": True}, "is_error": False}),
     ]
-    _enable_fake_cgroup(leerie, monkeypatch, (12, 256, 0))  # healthy
+    _enable_fake_cgroup(leerie, monkeypatch, (12, 256, 0, 0))  # healthy
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     result = asyncio.run(leerie._invoke(
@@ -851,7 +852,7 @@ def test_invoke_sparse_errors_below_window_threshold_do_not_trigger(
                               "is_error": False}))
     # Stat would confirm exhaustion IF probed — proving the window gate
     # (not the cgroup read) is what holds detection back here.
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99))
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99, 0))
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     result = asyncio.run(leerie._invoke(
@@ -881,3 +882,57 @@ def test_invoke_stat_none_never_false_detects(leerie, leerie_dir, monkeypatch):
         verbosity="stream",
         worker_memory_max_bytes=1 << 30, worker_pids_max=256))
     assert result["structured_output"] == {"ok": True}
+
+
+# ---- memory-OOM naming (DESIGN §6 *Detecting memory OOM*) ----------------
+
+def test_invoke_names_memory_oom_on_no_envelope(leerie, leerie_dir,
+                                                 monkeypatch):
+    """A build/test worker whose stream truncates with no `result` event
+    AND whose cgroup's final oom_kill counter is >0 must raise a
+    WorkerError naming the OOM, the offending Bash command, and the
+    memory.max cap — not a bare 'no result event' message. This is the
+    bare-`Killed`-mid-build symptom from the bugfix-003 handoff doc."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "pnpm run build"}}]}}),
+        # Stream truncates — the kernel OOM-killed the cgroup mid-build,
+        # so claude -p was reaped with no result event.
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (0, 256, 0, 2))  # oom_kill=2
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=137))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+    msg = str(ei.value)
+    assert "OOM-killed" in msg
+    assert "pnpm run build" in msg
+    assert "8.0 GiB" in msg
+
+
+def test_invoke_no_oom_when_oom_kill_zero(leerie, leerie_dir, monkeypatch):
+    """A truncated stream with a healthy cgroup (oom_kill=0) must NOT be
+    misreported as an OOM — it falls through to the ordinary
+    no-result-event WorkerError."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "pnpm run build"}}]}}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (0, 256, 0, 0))  # oom_kill=0
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=1))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
+    assert "OOM-killed" not in str(ei.value)
