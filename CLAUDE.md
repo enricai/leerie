@@ -478,7 +478,17 @@ orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 the fail-closed `enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
 sid validation, and v1/v2 path selection — against
-a fake cgroupfs. Mid-run PID reaping (DESIGN §6 *Mid-run PID reaping*) is
+a fake cgroupfs. Memory-OOM naming (DESIGN §6 *Detecting memory OOM*) —
+the `empty_handoff` seam that prefers a worker's named OOM cause (offending
+command + `memory.max`) over `validate_result`'s generic "checkpoint ...
+does not exist" text — is pinned end-to-end through `settle_subtask` in
+`tests/test_oom_naming.py`: both empty_handoff branches (the no-commits
+`fail()` path and the has-commits rescue path that keeps the diff and
+logs instead of discarding it) surface the named cause when
+`run_implementer`'s synthesized `incomplete-handoff` envelope carries one,
+including the `--worker-memory-max` / `--max-parallel` remediation
+pointer; a healthy no-op empty_handoff (no named cause) does not
+fabricate an "OOM-killed" message. Mid-run PID reaping (DESIGN §6 *Mid-run PID reaping*) is
 tested in `tests/test_signal_cleanup.py`: `_reparented_orphans` selects only
 alive+ppid==1+old PIDs sorted oldest-first (stubbed ps); `_poll_loop` reaps
 only at ≥90% pressure and stops below 75% (hysteresis); below 90% is a
