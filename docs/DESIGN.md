@@ -1504,7 +1504,7 @@ processes sharing one memcg.
 Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
-`max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
+`max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
 to `caps["worker_pids_max"]` (default 1024, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
@@ -1513,6 +1513,33 @@ cgroup*; sibling workers, the orchestrator, and host-side services
 in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
+
+The per-worker cap must hold **both** the build/test subprocess tree
+*and* the resident `claude -p` process at the same time — `claude`
+stays alive running the build via Bash and streaming its output, so
+it shares the cgroup with whatever it launches. Live in-container
+`memory.peak` measurement on a Next.js/Turbopack build: build alone
+peaks at 4.16 GiB (identical whether the build's own concurrency is
+left at default or pinned to 2 cores — not a parallelism artifact),
+and build + resident claude peaks at 5.6–6.3 GiB. An earlier `4 GiB`
+clamp on the auto-derived value was *below* that combined peak, so no
+VM size could auto-derive a cap sufficient for a build-running
+worker — every such worker was cgroup-OOM-killed regardless of host
+RAM. The fix floors the auto-derive at 8 GiB (`max(even_split, 8
+GiB)`), giving margin over the measured 6.3 GiB peak, and drops the
+upper clamp entirely: the real backstop against a runaway per-worker
+cap is the *aggregate* `leerie.slice/memory.max` cap set by
+`scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
+bounds the whole worker fleet regardless of any individual worker's
+`memory.max`. Because that aggregate cap is the real VM-OOM backstop,
+the per-worker floor can be generous without risking host-level
+memory exhaustion — but it does mean **build-heavy waves need a lower
+`--max-parallel`**: five concurrent 8 GiB-capped workers (40 GiB
+aggregate) will not all fit under a ~13.6 GiB slice cap on a 16 GiB
+VM, so the slice cap will itself OOM-kill one of them first. Pair a
+generous per-worker cap with a reduced `--max-parallel` for waves
+expected to run builds, rather than relying on the per-worker cap
+alone to bound concurrency.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the
