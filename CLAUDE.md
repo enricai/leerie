@@ -220,10 +220,12 @@ export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
 
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers; `ec2`
-# accepts the enum value and resolves AWS credentials the same way the
-# AWS CLI/SDKs do (env vars > named profile > SSO cached token; see
-# scripts/remote/aws-credentials.sh) — EC2 machine provisioning itself
-# has not shipped yet.
+# resolves AWS credentials the same way the AWS CLI/SDKs do (env vars >
+# named profile > SSO cached token; see scripts/remote/aws-credentials.sh)
+# and runs `require_aws()` preflight, but instance provisioning itself
+# (the create/wait-ready/teardown dispatch) has not been wired into the
+# launcher yet — `--runtime ec2` dies with an actionable message right
+# after preflight passes.
 export LEERIE_RUNTIME=local              # or: fly, ec2
 export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally unique)
 ./leerie "task" --runtime fly
@@ -232,10 +234,33 @@ export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally 
 # ec2 runtime knobs (leerie-level knobs for which AWS region/profile
 # leerie itself uses when provisioning EC2 machines — distinct from the
 # AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain env vars, which
-# resolve independently via the standard AWS precedence order):
+# resolve independently via the standard AWS precedence order). CLI flag,
+# env var, or leerie.toml — same CLI > env > file precedence as --runtime:
 export LEERIE_AWS_REGION=us-east-1       # or: leerie.toml aws_region = us-east-1
 export LEERIE_AWS_PROFILE=my-aws-profile # or: leerie.toml aws_profile = my-aws-profile
+./leerie "task" --runtime ec2 --aws-region us-east-1 --aws-profile my-aws-profile
+
+# ec2 instance-shape vars (the RunInstances params provision_instance()
+# needs — AWS account resources leerie cannot default on your behalf, so
+# there is no fallback tier: CLI > env > leerie.toml > die() with setup
+# instructions):
+export LEERIE_EC2_AMI=ami-0abcdef1234567890
+export LEERIE_EC2_INSTANCE_TYPE=t3.large
+export LEERIE_EC2_KEY_NAME=my-ec2-keypair
+export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
 ./leerie "task" --runtime ec2
+# …or commit a leerie.toml at the repo root with:
+#   ec2_ami = ami-0abcdef1234567890
+#   ec2_instance_type = t3.large
+#   ec2_key_name = my-ec2-keypair
+#   ec2_security_group = sg-0123456789abcdef0
+#   ec2_subnet_id = subnet-0123456789abcdef0
+# …or pass them as CLI flags per run:
+./leerie "task" --runtime ec2 \
+  --ec2-ami ami-0abcdef1234567890 --ec2-instance-type t3.large \
+  --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
+  --ec2-subnet-id subnet-0123456789abcdef0
 
 # Choose the model. Without overrides: judgment workers (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator)
