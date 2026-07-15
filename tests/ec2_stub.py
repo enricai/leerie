@@ -13,7 +13,17 @@ State file format (JSON, written to `<dir>/state.json`):
 
     {
       "instances": {
-        "<instance-id>": {"state": "pending|running|stopped|terminated"}
+        "<instance-id>": {
+          "state": "pending|running|stopped|terminated",
+          "public_ip": "203.0.113.11",   # present once the instance has run;
+                                          # reassigned on every start-instances
+                                          # call, mirroring EC2's real behavior
+                                          # of handing out a new public IP on
+                                          # each stop/start cycle
+          "status_ok": true              # optional; describe-instance-status
+                                          # reports "initializing" instead of
+                                          # "ok" when explicitly set to false
+        }
       },
       "volumes": {
         "<volume-id>": {"state": "creating|available|in-use|deleting|deleted"}
@@ -111,10 +121,13 @@ def next_id(existing, prefix):
 
 
 def instance_doc(instance_id, rec):
-    return {
+    doc = {
         "InstanceId": instance_id,
         "State": {"Name": rec["state"]},
     }
+    if rec["state"] == "running":
+        doc["PublicIpAddress"] = rec.get("public_ip", "203.0.113.10")
+    return doc
 
 
 def volume_doc(volume_id, rec):
@@ -155,7 +168,7 @@ def main(argv):
         created = []
         for _ in range(count):
             iid = next_id(state["instances"], "i-")
-            state["instances"][iid] = {"state": "running"}
+            state["instances"][iid] = {"state": "running", "_ip_gen": 1, "public_ip": "203.0.113.11"}
             created.append(iid)
         save_state(state)
         print(json.dumps({
@@ -216,6 +229,12 @@ def main(argv):
             if rec is None:
                 continue
             rec["state"] = "running"
+            # EC2 assigns a new public IP on every stop/start cycle
+            # (unless an EIP is attached) — bump a counter so tests can
+            # assert that the resume path re-resolves it rather than
+            # reusing a stale cached address.
+            rec["_ip_gen"] = rec.get("_ip_gen", 0) + 1
+            rec["public_ip"] = f"203.0.113.{10 + rec['_ip_gen']}"
             changed.append(iid)
         save_state(state)
         print(json.dumps({
