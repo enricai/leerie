@@ -22,10 +22,10 @@
 #      $HOME (a pkg/msi installer, or /usr/local/bin via the bundled
 #      installer's sudo install step) and auto-installing anything that
 #      needs `sudo` from an unattended preflight is out of scope.
-#   2. Resolve the profile: --profile arg > LEERIE_AWS_PROFILE >
-#      AWS_PROFILE (unset means "no --profile flag" — let the CLI use its
-#      own default-profile resolution, matching bedrock_preflight's
-#      behavior of only passing --profile when one is actually configured).
+#   2. Resolve the profile: LEERIE_AWS_PROFILE > AWS_PROFILE (unset means
+#      "no --profile flag" — let the CLI use its own default-profile
+#      resolution, matching bedrock_preflight's behavior of only passing
+#      --profile when one is actually configured).
 #   3. `aws sts get-caller-identity` (with --profile when resolved). On
 #      failure, print the `aws sso login --profile <profile>` (or bare
 #      `aws sso login`) recovery hint and return 1.
