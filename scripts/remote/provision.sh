@@ -103,6 +103,38 @@ stop_machine() {
   # needs it to print the attach/resume commands.
 }
 
+# --- destroy volume ------------------------------------------------------
+# Reap LEERIE_VOLUME_ID, independent of whether a machine still exists.
+#
+# Deliberately NOT nested inside destroy_machine: Fly volumes outlive their
+# machines on a bare `machine destroy` ("a Machine can be destroyed without
+# destroying its volume" — Fly docs), so the machine being already gone is
+# exactly when a known volume still needs reaping. Gating this on a live
+# machine id leaked every volume whose machine died first.
+#
+# Callers must invoke this AFTER the machine is gone — Fly refuses to
+# destroy a volume that is still attached ("in use by machine X").
+#
+# Best-effort by design: a failure logs and returns 0. An orphan volume is a
+# billing issue; a teardown that aborts is a correctness issue.
+destroy_volume() {
+  if [ -z "$LEERIE_VOLUME_ID" ]; then
+    return 0
+  fi
+  remote_log "remote: destroying volume $LEERIE_VOLUME_ID ..."
+  if flyctl volumes destroy "$LEERIE_VOLUME_ID" \
+       --app "$FLY_APP" \
+       --yes \
+       2>/dev/null; then
+    remote_log "remote: volume $LEERIE_VOLUME_ID destroyed"
+  else
+    # The user can reap a straggler via
+    # `flyctl volumes list --app "$FLY_APP"` + manual destroy.
+    remote_log "warning: failed to destroy volume $LEERIE_VOLUME_ID (may already be gone or pinned)"
+  fi
+  LEERIE_VOLUME_ID=""
+}
+
 # --- destroy machine -----------------------------------------------------
 # Full reap. Idempotent: destroy is no-op if the machine is already gone.
 # When LEERIE_VOLUME_ID is set (FLY_VM_DISK_GB path), the volume is
@@ -112,6 +144,11 @@ stop_machine() {
 destroy_machine() {
   local mid="$LEERIE_MACHINE_ID"
   if [ -z "$mid" ]; then
+    # No machine, but a volume may still be known — the machine was already
+    # destroyed (by us, by Fly, or by hand) while its volume survived. That
+    # is the orphan shape, and it is precisely what this early return used
+    # to skip: the volume reap below was unreachable past here.
+    destroy_volume
     return 0
   fi
   remote_log "remote: destroying machine $mid ..."
@@ -127,25 +164,8 @@ destroy_machine() {
     flyctl machine destroy "$mid" --app "$FLY_APP" --force 2>/dev/null || true
     remote_log "remote: machine $mid stop+destroy attempted (may already be gone)"
   fi
-  # Destroy the attached volume if one was provisioned (FLY_VM_DISK_GB
-  # path). Fly volumes outlive their machines on a bare `machine destroy`
-  # — they have to be explicitly reaped or they orphan and continue to
-  # accrue per-GB-month charges.
-  if [ -n "$LEERIE_VOLUME_ID" ]; then
-    remote_log "remote: destroying volume $LEERIE_VOLUME_ID ..."
-    if flyctl volumes destroy "$LEERIE_VOLUME_ID" \
-         --app "$FLY_APP" \
-         --yes \
-         2>/dev/null; then
-      remote_log "remote: volume $LEERIE_VOLUME_ID destroyed"
-    else
-      # Best-effort: log and continue. An orphan volume is a billing
-      # issue, not a correctness issue; the user can reap it via
-      # `flyctl volumes list --app "$FLY_APP"` + manual destroy.
-      remote_log "warning: failed to destroy volume $LEERIE_VOLUME_ID (may already be gone or pinned)"
-    fi
-    LEERIE_VOLUME_ID=""
-  fi
+  # Machine is gone — now the volume can be reaped cleanly.
+  destroy_volume
   # Keep the PID-keyed attach pointer (remote/$$.json) after destroy.
   # The chain tagging loop reads it post-wait to discover the machine ID
   # and write chain_id + wave_idx into run.json. The resume auto-discovery

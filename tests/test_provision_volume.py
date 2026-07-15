@@ -92,6 +92,19 @@ def _make_recording_flyctl(tmp_path: Path) -> tuple[Path, Path]:
         '        echo "  State: started"\n'
         '        exit 0\n'
         '        ;;\n'
+        '      list)\n'
+        '        # Shape measured against a live Fly machine: config.mounts[]\n'
+        '        # carries the volume, and keeps carrying it while stopped.\n'
+        '        # $FLY_STUB_MOUNT_VOLUME lets a test emit a machine with no\n'
+        '        # mounts (the no-volume case).\n'
+        '        _mid="${FLY_STUB_MACHINE_ID:-machine-deadbeef1234}"\n'
+        '        if [ -n "${FLY_STUB_MOUNT_VOLUME:-}" ]; then\n'
+        '          printf \'[{"id":"%s","state":"stopped","config":{"mounts":[{"volume":"%s","name":"leerie_data_test","path":"/work","size_gb":1,"encrypted":true}]}}]\\n\' "$_mid" "$FLY_STUB_MOUNT_VOLUME"\n'
+        '        else\n'
+        '          printf \'[{"id":"%s","state":"stopped","config":{"mounts":[]}}]\\n\' "$_mid"\n'
+        '        fi\n'
+        '        exit 0\n'
+        '        ;;\n'
         '      status)\n'
         '        echo "started"\n'
         '        exit 0\n'
@@ -426,3 +439,196 @@ def test_orphan_volume_cleaned_on_machine_create_failure(tmp_path):
         f"expected volumes create < machine run < volumes destroy; "
         f"vc_idx={vc_idx} mr_idx={mr_idx} vd_idx={vd_idx}"
     )
+
+
+# --- orphan-volume reaping (the three gaps) ------------------------------
+#
+# Fly volumes outlive their machines by design ("a Machine can be destroyed
+# without destroying its volume" — Fly docs; the leftover is a documented
+# "unattached volume"). There is no platform-side lifecycle hook, so leerie
+# must reap the volume itself on every path that kills a machine. These
+# three tests pin the paths where it silently did not.
+
+
+def test_destroy_volume_reaps_without_a_machine_id(tmp_path):
+    """GAP 1: a known volume whose machine is already gone must still be
+    reaped.
+
+    `destroy_machine` early-returns on an empty LEERIE_MACHINE_ID, which
+    made its own volume-destroy block unreachable — so a volume whose
+    machine died first (the orphan shape) leaked forever. Reaping now lives
+    in `destroy_volume`, callable independently.
+    """
+    stub, log = _make_recording_flyctl(tmp_path)
+    env = {
+        "LEERIE_REPO": str(REPO_ROOT),
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "LEERIE_FLY_APP": "leerie",
+        "FLY_APP": "leerie",
+    }
+    result = _run_bash(
+        f"source {PROVISION_SH}\n"
+        'LEERIE_MACHINE_ID=""\n'          # machine already destroyed
+        'LEERIE_VOLUME_ID="vol_orphan99"\n'  # but we know the volume
+        "destroy_machine\n",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    calls = _read_calls(log)
+    volume_destroys = [c for c in calls if c[:2] == ["volumes", "destroy"]]
+    assert volume_destroys, (
+        f"a known volume must be reaped even with no machine id; calls={calls}")
+    assert "vol_orphan99" in volume_destroys[0], volume_destroys[0]
+
+
+def test_destroy_volume_is_a_noop_without_a_volume_id(tmp_path):
+    """`destroy_volume` must not call flyctl when there is no volume —
+    guards the no-FLY_VM_DISK_GB path from spurious calls."""
+    stub, log = _make_recording_flyctl(tmp_path)
+    env = {
+        "LEERIE_REPO": str(REPO_ROOT),
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "LEERIE_FLY_APP": "leerie",
+        "FLY_APP": "leerie",
+    }
+    result = _run_bash(
+        f"source {PROVISION_SH}\n"
+        'LEERIE_MACHINE_ID=""\n'
+        'LEERIE_VOLUME_ID=""\n'
+        "destroy_volume\n",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    calls = _read_calls(log)
+    assert not [c for c in calls if c[:2] == ["volumes", "destroy"]], calls
+
+
+def test_resolve_volume_id_falls_through_to_run_json(tmp_path):
+    """GAP 3: the resolver must keep looking when a file exists but carries
+    no volume_id.
+
+    It used to `return 0` on the first *existing* file, so a
+    fly-machine.json without volume_id blocked the fall-through to run.json
+    entirely — and provision.sh writes volume_id to fly-machine.json only
+    conditionally (`if vol_id:`) while always writing it to run.json. That
+    combination is a real leak path, not a hypothetical one.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    # fly-machine.json exists but has NO volume_id.
+    (run_dir / "fly-machine.json").write_text(json.dumps({
+        "fly_app": "leerie", "fly_machine_id": "m1", "run_id": None,
+    }))
+    # run.json is where the volume_id actually is.
+    (run_dir / "run.json").write_text(json.dumps({
+        "fly_machine_id": "m1", "volume_id": "vol_in_run_json",
+    }))
+    result = _run_bash(
+        # Extract just the resolver from the launcher and exercise it.
+        f'sed -n "/^_resolve_volume_id_from_run_dir()/,/^}}/p" '
+        f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
+        f'. "{tmp_path}/fn.sh"\n'
+        f'_resolve_volume_id_from_run_dir "{run_dir}"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "vol_in_run_json", (
+        f"resolver must fall through to run.json when fly-machine.json has "
+        f"no volume_id; got {result.stdout!r}")
+
+
+def test_resolve_volume_id_from_fly_reads_machine_mounts(tmp_path):
+    """GAP 2 (unit): the Fly lookup must find a machine's mounted volume.
+
+    Shape pinned against a live Fly machine: `machine list --json` carries
+    `.config.mounts[].volume`, and still does while `state=stopped` (the
+    --stop-then-kill path). `machine status` has no --json flag, so it is
+    deliberately not used.
+    """
+    stub, log = _make_recording_flyctl(tmp_path)
+    env = {
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "FLY_STUB_MACHINE_ID": "m-target",
+        "FLY_STUB_MOUNT_VOLUME": "vol_from_fly",
+    }
+    result = _run_bash(
+        f'sed -n "/^_resolve_volume_id_from_fly()/,/^}}/p" '
+        f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
+        f'. "{tmp_path}/fn.sh"\n'
+        '_resolve_volume_id_from_fly "m-target" "leerie"\n',
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "vol_from_fly", result.stdout
+    calls = _read_calls(log)
+    assert ["machine", "list", "--app", "leerie", "--json"] in calls, calls
+
+
+def test_resolve_volume_id_from_fly_empty_when_no_mounts(tmp_path):
+    """A machine with no volume must yield nothing — not a spurious reap."""
+    stub, log = _make_recording_flyctl(tmp_path)
+    env = {
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "FLY_STUB_MACHINE_ID": "m-target",
+        # FLY_STUB_MOUNT_VOLUME unset -> stub emits "mounts":[]
+    }
+    result = _run_bash(
+        f'sed -n "/^_resolve_volume_id_from_fly()/,/^}}/p" '
+        f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
+        f'. "{tmp_path}/fn.sh"\n'
+        '_resolve_volume_id_from_fly "m-target" "leerie"\n',
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_kill_with_machine_id_and_no_run_dir_reaps_volume(tmp_path):
+    """GAP 2 (end-to-end): `--kill --machine-id <id>` with no sidecar must
+    still reap the volume.
+
+    The launcher advertises this flag for "an orphan machine without a
+    sidecar", but volume resolution was gated on the run dir existing — so
+    the documented escape hatch for orphans was itself an orphan-maker:
+    machine destroyed, success reported, volume billing forever.
+
+    Also pins the load-bearing ordering: the Fly lookup must precede the
+    machine destroy (the volume->machine link vanishes with the machine),
+    and the volume destroy must follow it (Fly refuses to destroy an
+    attached volume).
+    """
+    stub, log = _make_recording_flyctl(tmp_path)
+    state = tmp_path / "state"
+    (state / "runs").mkdir(parents=True)  # NOTE: no runs/<id>/ -> no sidecar
+    env = {
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "LEERIE_STATE_DIR": str(state),   # NB: _STATE_DIR, not _STATE_HOST_DIR
+        "LEERIE_FORCE_KILL": "1",
+        "LEERIE_FLY_APP": "leerie",
+        "LEERIE_RUNTIME": "fly",
+        "FLY_STUB_MACHINE_ID": "m-orphan",
+        "FLY_STUB_MOUNT_VOLUME": "vol_leaked",
+    }
+    result = _run_bash(
+        f'"{REPO_ROOT / "leerie"}" --kill --machine-id m-orphan\n',
+        env=env,
+        cwd=REPO_ROOT,
+    )
+    calls = _read_calls(log)
+    volume_destroys = [c for c in calls if c[:2] == ["volumes", "destroy"]]
+    assert volume_destroys, (
+        f"--kill --machine-id must reap the volume via the Fly lookup; "
+        f"calls={calls} stderr={result.stderr}")
+    assert "vol_leaked" in volume_destroys[0], volume_destroys[0]
+
+    def _idx(pred):
+        return next((i for i, c in enumerate(calls) if pred(c)), -1)
+
+    list_idx = _idx(lambda c: c[:2] == ["machine", "list"])
+    md_idx = _idx(lambda c: c[:2] == ["machine", "destroy"])
+    vd_idx = _idx(lambda c: c[:2] == ["volumes", "destroy"])
+    assert list_idx < md_idx, (
+        f"the Fly lookup must precede machine destroy — the volume->machine "
+        f"link vanishes with the machine; calls={calls}")
+    assert md_idx < vd_idx, (
+        f"machine destroy must precede volume destroy — Fly refuses to "
+        f"destroy an attached volume; calls={calls}")

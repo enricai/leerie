@@ -366,9 +366,10 @@ PY
 _resolve_volume_id_from_run_dir() {
   local run_dir="$1"
   local candidate
+  local vid
   for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
     if [ -f "$candidate" ]; then
-      python3 -c '
+      vid="$(python3 -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -376,10 +377,60 @@ try:
     print(vid if vid else "")
 except Exception:
     pass
-' "$candidate"
-      return 0
+' "$candidate")"
+      # Keep looking when the file exists but carries no volume_id. Returning
+      # here on mere file existence skipped run.json entirely whenever
+      # fly-machine.json was present — and provision.sh writes volume_id to
+      # fly-machine.json only conditionally (`if vol_id:`) while always
+      # writing it to run.json, so the empty-but-present case is real.
+      if [ -n "$vid" ]; then
+        printf '%s' "$vid"
+        return 0
+      fi
     fi
   done
+  return 0
+}
+
+# --- _resolve_volume_id_from_fly ---------------------------------------
+# Ask Fly which volume a machine has mounted. The fallback for when no
+# sidecar exists (`--kill --machine-id <id>` on an orphan) — without this
+# the machine is destroyed and its volume leaks, billing forever.
+#
+# MUST be called BEFORE the machine is destroyed: Fly's volume→machine link
+# (`attached_machine_id`, and the machine's own `config.mounts`) disappears
+# the instant the machine is gone, taking the only remaining record of the
+# association with it.
+#
+# Uses `machine list --json` — verified against a live machine to carry
+# `.config.mounts[].volume`, and to keep carrying it while the machine is
+# `stopped` (the --stop-then-kill path). Note `machine status` has NO --json
+# flag (only -d/--display-config, which embeds JSON in prose), so it is not
+# usable here.
+#
+# Best-effort: any failure prints nothing and returns 0. --kill must still
+# destroy the machine even if the lookup fails — a leaked volume is a
+# billing issue, a machine that won't die is worse.
+_resolve_volume_id_from_fly() {
+  local mid="$1"
+  local app="$2"
+  [ -n "$mid" ] && [ -n "$app" ] || return 0
+  flyctl machine list --app "$app" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    mid = sys.argv[1]
+    for m in json.load(sys.stdin):
+        if m.get("id") != mid:
+            continue
+        for mount in ((m.get("config") or {}).get("mounts") or []):
+            vol = mount.get("volume")
+            if vol:
+                print(vol)
+                break
+        break
+except Exception:
+    pass
+' "$mid" 2>/dev/null || true
   return 0
 }
 
@@ -1722,8 +1773,20 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     export LEERIE_MACHINE_ID
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       LEERIE_VOLUME_ID="$(_resolve_volume_id_from_run_dir "$_kill_run_dir")"
-      export LEERIE_VOLUME_ID
     fi
+    # No sidecar (or a sidecar with no volume_id) — ask Fly directly. This
+    # is the `--kill --machine-id <id>` orphan path the usage hint above
+    # advertises; without the lookup it destroys the machine and leaks the
+    # volume. Must run BEFORE destroy_machine: the association lives only on
+    # Fly and vanishes with the machine.
+    if [ -z "$LEERIE_VOLUME_ID" ]; then
+      LEERIE_VOLUME_ID="$(_resolve_volume_id_from_fly \
+        "$_kill_machine_id" "$FLY_APP")"
+      if [ -n "$LEERIE_VOLUME_ID" ]; then
+        remote_log "--kill: resolved volume $LEERIE_VOLUME_ID from Fly (no sidecar)"
+      fi
+    fi
+    export LEERIE_VOLUME_ID
     remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then

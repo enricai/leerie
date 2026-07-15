@@ -464,7 +464,28 @@ retry-policy markers match the live check-function strings. The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
-stubbed `flyctl`. The local per-repo image surface —
+stubbed `flyctl`. Fly **volume** reaping is covered in
+`tests/test_provision_volume.py`: Fly volumes outlive their machines by
+design (no platform-side lifecycle hook — *"a Machine can be destroyed
+without destroying its volume"*), so every path that kills a machine must
+reap the volume itself, and three paths silently did not. The tests pin
+`destroy_volume` reaping with an **empty** `LEERIE_MACHINE_ID` (it must not
+live behind `destroy_machine`'s early return — that made the volume block
+unreachable exactly when the machine had already died);
+`_resolve_volume_id_from_run_dir` **falling through** a `fly-machine.json`
+that lacks `volume_id` to `run.json` (provision writes the former
+conditionally, the latter always); `_resolve_volume_id_from_fly` reading
+`config.mounts[].volume` out of `machine list --json` (the stub emits the
+shape measured against a live machine — `machine status` has no `--json`
+flag, so it is deliberately unused); and end-to-end that
+`--kill --machine-id <id>` with **no run dir** still reaps, with the
+load-bearing ordering asserted by call index: **Fly lookup → machine
+destroy → volume destroy** (the volume→machine link vanishes with the
+machine, but Fly refuses to destroy a still-attached volume, so the reap
+must sit between those two events). Harness note: the launcher's state-dir
+override is `LEERIE_STATE_DIR`, **not** `LEERIE_STATE_HOST_DIR` — setting
+the latter silently resolves to the real `~/.leerie/...` and the test
+asserts nothing. The local per-repo image surface —
 `resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image`, and
 `ensure_base_in_buildkit_ns` (copies the base into the `buildkit` containerd
 namespace before the derived build so `FROM $BASE_IMAGE` resolves locally under
