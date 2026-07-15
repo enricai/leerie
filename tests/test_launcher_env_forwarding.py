@@ -187,6 +187,18 @@ def test_worker_pids_max_forwarded():
     assert "LEERIE_WORKER_PIDS_MAX" in names
 
 
+def test_aws_region_profile_prefs_forwarded():
+    """LEERIE_AWS_REGION/LEERIE_AWS_PROFILE are orchestrator-read prefs
+    (mirroring LEERIE_PR_TEMPLATE) that boto3's credential chain inside the
+    container needs — unlike the EC2 instance-lifecycle vars, these must NOT
+    be deny-listed."""
+    names = _forwarded_names(_run({
+        "LEERIE_AWS_REGION": "us-east-1",
+        "LEERIE_AWS_PROFILE": "leerie-ci",
+    }))
+    assert {"LEERIE_AWS_REGION", "LEERIE_AWS_PROFILE"} <= names
+
+
 def test_dynamic_per_worker_var_forwarded():
     """LEERIE_MODEL_<WORKER> names are dynamic — the deny-list design must
     forward them without enumerating each one."""
@@ -216,6 +228,24 @@ def test_launcher_side_var_not_forwarded():
     """LEERIE_RUNTIME is consumed launcher-side; it must not be forwarded."""
     names = _forwarded_names(_run({"LEERIE_RUNTIME": "fly"}))
     assert "LEERIE_RUNTIME" not in names
+
+
+def test_ec2_launcher_side_vars_not_forwarded():
+    """The AWS/EC2 launcher-only vars (instance lifecycle, mirroring the Fly
+    LEERIE_FLY_APP/LEERIE_FLY_IMAGE/LEERIE_MACHINE_ID trio) must not leak into
+    the container — they are consumed by launcher-side provisioning only."""
+    names = _forwarded_names(_run({
+        "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
+        "LEERIE_EC2_AMI": "ami-0abcdef1234567890",
+        "LEERIE_EC2_INSTANCE_TYPE": "t3.large",
+        "LEERIE_EC2_KEY_NAME": "leerie-key",
+        "LEERIE_EC2_SECURITY_GROUP": "sg-0123456789abcdef0",
+        "LEERIE_EC2_SUBNET_ID": "subnet-0123456789abcdef0",
+    }))
+    assert names.isdisjoint({
+        "LEERIE_EC2_INSTANCE_ID", "LEERIE_EC2_AMI", "LEERIE_EC2_INSTANCE_TYPE",
+        "LEERIE_EC2_KEY_NAME", "LEERIE_EC2_SECURITY_GROUP", "LEERIE_EC2_SUBNET_ID",
+    })
 
 
 def test_unset_var_not_forwarded():

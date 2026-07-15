@@ -3379,7 +3379,7 @@ case "$LEERIE_TASK_ARG" in
 esac
 
 # --- runtime-mode knob ---------------------------------------------------
-# Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
+# Resolves RUNTIME=local|fly|ec2. Precedence: CLI --runtime > LEERIE_RUNTIME env
 # > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
 # resolve_runtime() (leerie.py) so the launcher routes correctly before the
 # container starts. --runtime is NOT consumed — it flows through
@@ -3395,19 +3395,19 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
                          print; exit
                        }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_runtime:-}" in
-    local|fly) RUNTIME="${toml_runtime}"; _RUNTIME_EXPLICIT=true ;;
+    local|fly|ec2) RUNTIME="${toml_runtime}"; _RUNTIME_EXPLICIT=true ;;
     "")        : ;;
     *)
-      remote_log "leerie.toml: runtime=${toml_runtime} is not one of local|fly"
+      remote_log "leerie.toml: runtime=${toml_runtime} is not one of local|fly|ec2"
       exit 1
       ;;
   esac
 fi
 case "${LEERIE_RUNTIME:-}" in
-  local|fly) RUNTIME="${LEERIE_RUNTIME}"; _RUNTIME_EXPLICIT=true ;;
+  local|fly|ec2) RUNTIME="${LEERIE_RUNTIME}"; _RUNTIME_EXPLICIT=true ;;
   "")        : ;;
   *)
-    remote_log "LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly"
+    remote_log "LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly|ec2"
     exit 1
     ;;
 esac
@@ -3416,8 +3416,9 @@ for arg in "$@"; do
   case "$arg" in
     --runtime=local)    RUNTIME=local; _RUNTIME_EXPLICIT=true ;;
     --runtime=fly)      RUNTIME=fly; _RUNTIME_EXPLICIT=true ;;
+    --runtime=ec2)      RUNTIME=ec2; _RUNTIME_EXPLICIT=true ;;
     --runtime=*)
-      remote_log "--runtime=${arg#--runtime=} is not one of local|fly"
+      remote_log "--runtime=${arg#--runtime=} is not one of local|fly|ec2"
       exit 1
       ;;
   esac
@@ -3427,9 +3428,9 @@ prev_was_runtime=false
 for arg in "$@"; do
   if $prev_was_runtime; then
     case "$arg" in
-      local|fly) RUNTIME="$arg"; _RUNTIME_EXPLICIT=true ;;
+      local|fly|ec2) RUNTIME="$arg"; _RUNTIME_EXPLICIT=true ;;
       *)
-        remote_log "--runtime $arg is not one of local|fly"
+        remote_log "--runtime $arg is not one of local|fly|ec2"
         exit 1
         ;;
     esac
@@ -6164,7 +6165,7 @@ else
   #     value would point at a host path meaningless inside the container.
   #   - LEERIE_HOME / LEERIE_REPO / LEERIE_STATE_HOST_DIR / LEERIE_SELF_CMD:
   #     launcher self-location + host paths.
-  #   - Fly/remote/chain/wave machinery: consumed launcher-side only.
+  #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
   #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
   #     the host does the push; forwarding it would be redundant/confusing.
   _leerie_env_denylist=" \
@@ -6177,7 +6178,9 @@ else
     LEERIE_RUN_ID LEERIE_VOLUME_ID LEERIE_SEED_DEPTH \
     LEERIE_SEED_SHALLOW_THRESHOLD_MB LEERIE_RE_SEED_FORCE \
     LEERIE_REMOTE_EXIT_RC LEERIE_REMOTE_RUN_ID LEERIE_CHAIN_ID \
-    LEERIE_WAVE_IDX LEERIE_TAIL_RUN_ID LEERIE_LIST_FLY_JSON "
+    LEERIE_WAVE_IDX LEERIE_TAIL_RUN_ID LEERIE_LIST_FLY_JSON \
+    LEERIE_EC2_INSTANCE_ID LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE \
+    LEERIE_EC2_KEY_NAME LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID "
   _leerie_env_args=()
   # `compgen -v` lists shell + env variable names; filter to LEERIE_* and skip
   # the deny-list and empty values. Bare `-e NAME` passes the host value.
