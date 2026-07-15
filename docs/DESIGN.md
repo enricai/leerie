@@ -2673,6 +2673,158 @@ rate-limit auto-resume case where no host edits happened. The
 trust model matches the spec: the user picks the moment (by typing
 `--resume`), so the seed is treated as authoritative.
 
+### EC2 runtime lifecycle
+
+`--runtime ec2` is accepted today as a resolvable enum value with a
+working credential chain (`scripts/remote/aws-credentials.sh`,
+`resolve_aws_region`/`resolve_aws_profile`, the `boto3`/`botocore` pin —
+see IMPLEMENTATION.md "Runtime mode" / "AWS region/profile prefs"), but
+instance provisioning itself has not shipped. This section is the
+canonical architecture that a provisioning subtask must implement
+against — the EC2 counterpart to everything above in this section for
+Fly. It reuses Fly's stage names and dispositions everywhere the two
+platforms agree, and calls out explicitly where EC2's platform
+semantics diverge and the design must not copy Fly's rule blindly.
+
+**Stage mapping.** The five Fly stages above (provision → wait-ready →
+seed → detached-orchestrate → teardown) carry over one-for-one:
+
+| Stage | Fly (shipped) | EC2 (this design) |
+|---|---|---|
+| Create | `flyctl machine run` | `ec2:RunInstances` via `boto3` (AMI, instance type, key pair, security group, subnet — the `LEERIE_EC2_*` vars already reserved in IMPLEMENTATION.md's env-forwarding deny-list) |
+| Wait-ready | poll `flyctl machine status` for `started`; hallpass warm-up probe | poll `describe_instances` for `state.Name == "running"`, then `instance-status-ok` + `system-status-ok` (`describe_instance_status`) — a `running` EC2 instance is not yet SSH/SSM-reachable, unlike a Fly Machine where `started` and hallpass-warm are close together |
+| Seed | `seed_auth` + `seed_repo_clone` over `flyctl ssh console` | same two steps, transport substituted (see below) |
+| Orchestrate | detached `Popen` via ssh-console wrapper, PID recorded, host tails via a second ssh-console session | same detached-`Popen` pattern, launched over the substituted transport; run-id-before-orchestrator-start constraint (line 2208) is unchanged — the launcher still generates the run-id host-side before create, since it needs the id to name `orchestrator.log`'s path ahead of the create call completing |
+| Teardown | classify exit code → stop / destroy / detach (the reclassified table above) | same table, `flyctl machine stop`/`destroy` → `ec2:StopInstances`/`TerminateInstances` |
+
+The pause-on-failure classification table (exit code → disposition) is
+runtime-agnostic by construction (§ above: "the orchestrator ... always
+exits with the same exit codes regardless of where it runs, and the
+launcher routes those exit codes through the runtime-appropriate
+teardown") — EC2 needs no new table, only a new teardown implementation
+of the same three dispositions (stop / destroy / leave-alone).
+
+**EBS volume lifecycle — the opposite default from Fly, not the same
+discipline.** Fly's "Remote disk policy" above establishes a manual reap
+obligation because a Fly volume has no platform-side destroy-on-exit
+hook: *"a Machine can be destroyed without destroying its volume."*
+Copying that discipline verbatim onto EC2 would be wrong, because EC2's
+default behavior is the mirror image. AWS's own root-volume default is
+`DeleteOnTermination=true`: the EBS root volume of an EC2 instance is
+deleted automatically when the instance is *terminated* (not merely
+stopped). This is a platform-enforced hook Fly simply does not have —
+the reap obligation Fly's design places on leerie's own code is, for the
+default EC2 shape, AWS's problem to solve, not leerie's.
+
+This collapses to three cases, and the design must pick one and state it
+plainly rather than default silently:
+
+1. **Root volume only, default `DeleteOnTermination=true`.** This is the
+   simple, recommended default for the EC2 runtime: `RunInstances` with
+   a single root EBS volume and no explicit block-device override. On
+   `TerminateInstances`, AWS reaps the volume itself — no leerie-side
+   reap code is needed, and no `test_provision_volume.py`-style
+   volume-orphan test surface exists to write, because there is no
+   orphan case to test. **This is the default this design adopts.**
+2. **Stop, don't terminate, on pause.** Exactly like Fly's `machine
+   stop` (preserves the volume, frees compute — EC2 continues to bill
+   for the attached EBS volume while stopped, mirroring Fly's per-GB
+   volume charge while a machine is stopped), `StopInstances` leaves the
+   root volume attached and never invokes `DeleteOnTermination` at all —
+   that attribute is termination-scoped, not stop-scoped. The
+   stop/start-preserves-filesystem contract that "Remote pause-on-
+   failure" establishes for Fly (`run.json` + the run branch are the
+   only durable record leerie relies on; the machine's own filesystem
+   is a bonus, not the contract) carries over unchanged: an EC2 pause
+   uses `StopInstances`, never `TerminateInstances`.
+3. **A future secondary EBS volume** (if a later subtask adds one, e.g.
+   to give `/work` a device independent of root-volume resizing) reintroduces
+   exactly Fly's problem: additional (non-root) EBS volumes default
+   `DeleteOnTermination=false`, so a leftover secondary volume *would*
+   need the same "every path that destroys the instance must also
+   reap the volume" discipline DESIGN's "Remote disk policy" section
+   pins for Fly, including the same ordering constraint (the
+   volume↔instance association is queryable while attached; detach/
+   reap must happen before or as part of termination, mirroring the
+   Fly ordering: look up, destroy machine, destroy volume). Since this
+   design does not introduce a secondary volume, that discipline is
+   deliberately **not** built now — it is flagged here so a future
+   subtask proposing a secondary volume does not silently assume EC2
+   is exempt from the discipline Fly needed.
+
+**Transport substitution for `flyctl ssh console`.** Two roles need a
+replacement: (a) piping the detached-orchestrator launch wrapper to the
+instance, and (b) opening a session for `--resume`/`--shell` attach and
+log tailing. AWS offers two candidate transports; this design picks SSM
+Session Manager over SSH and states why:
+
+- **SSM Session Manager** (`aws ssm start-session`,
+  `send_command`/`start_session` via `boto3`) needs no inbound security
+  group rule, no key-pair distribution, and no public IP — the SSM Agent
+  (preinstalled on Amazon Linux / most current AMIs) calls out to the
+  SSM service over HTTPS, the same "no sshd in the image, no key
+  management, no public exposure" property the Fly section calls out for
+  hallpass + WireGuard (line 2509-2511). Authentication and authorization
+  flow through the same AWS credential chain and IAM already established
+  for the rest of the EC2 runtime (`aws-credentials.sh`,
+  `resolve_aws_region`/`resolve_aws_profile`) rather than a
+  parallel key-pair-management surface — one credential model for the
+  whole EC2 runtime, matching the "reuses Fly's ... dispositions
+  everywhere the two platforms agree" framing above.
+- **SSH** (a managed key pair, `LEERIE_EC2_KEY_NAME`, inbound security
+  group rule on port 22) is the closer textual analog to `flyctl ssh
+  console`, but requires provisioning and rotating a key pair and
+  opening network ingress — exactly the surface SSM avoids. It remains
+  available as a fallback transport for operators whose account policy
+  disallows the SSM Agent or Session Manager IAM permissions, but is not
+  the default.
+
+`aws ssm start-session --target <instance-id> --document-name
+AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM
+analog of `flyctl ssh console --pty=false -C "python3 -"` for the
+detached-launch wrapper; the same analog with `command="tail -F
+orchestrator.log"` (or a bare interactive shell for `--shell`) serves
+the attach/tail role. The detached-`Popen` pattern itself — session
+leader inside the instance, independent host-side tail process, stream
+death does not touch the orchestrator — is transport-agnostic and
+carries over unchanged from the Fly design (lines 2185-2206 above).
+
+**Pause/resume semantics.** EC2 `stop`/`start` maps directly onto Fly's
+`machine stop`/`machine start`: `StopInstances` preserves the root EBS
+volume (case 1 above) and the instance's private/public IP may change
+on restart unless an Elastic IP or the instance is in a VPC with a
+persistent ENI — a detail the provisioning subtask must pin down
+(likely: don't rely on the public IP surviving a stop/start cycle;
+resolve the instance's current address via `describe_instances` on every
+resume rather than caching it, mirroring how Fly resolves machine
+state fresh on every `--resume` rather than trusting a cached IP).
+`TerminateInstances` is the `--kill` / clean-exit-after-sync-success
+counterpart to `flyctl machine destroy`. The existing sidecar fields
+(`paused_at`, `pause_reason`, `killed_at`, `sync_failed_at`,
+`sync_fail_reason`) are runtime-agnostic in shape — they describe
+*when* and *why*, not *how* — and the EC2 path reuses them verbatim; a
+new `ec2_instance_id` field (see below) plays the role `fly_machine_id`
+plays today, present whenever the corresponding EC2 sidecar state is
+set.
+
+**Run identifier.** DESIGN's "The run identifier" states the invariant
+plainly: `run_id` is "the container/machine ID assigned by the container
+runtime." An EC2 instance ID (`i-0123456789abcdef0`) fills exactly the
+same role — known at `RunInstances` time, before the orchestrator starts,
+with no deferred computation and no rename, satisfying the same
+constraint the run-id-before-orchestrator-start ordering above depends
+on. Two coupling points that hardcode the Fly-specific sidecar name will
+need generalizing when EC2 provisioning actually lands (out of scope for
+this subtask, flagged here so the next one doesn't have to rediscover
+it): `scripts/remote/provision.sh` writes `fly-machine.json` as the
+crash-recovery pointer, and `orchestrator/leerie.py`'s `discover_runs`
+(DESIGN §6 multi-run resume) looks for that exact filename to recognize
+a pre-`state.json` crash-recoverable orphan run.
+The natural generalization is a same-shaped `ec2-instance.json` sidecar
+(instance id, region, created-at) plus widening the orphan scan to check
+for either sidecar file — not renaming or repurposing
+`fly-machine.json`, which stays exactly as-is for Fly runs.
+
 ---
 
 ## 6½. Per-repo dependency provisioning

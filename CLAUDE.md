@@ -902,6 +902,147 @@ never references `tagcheck`, that `relcheck` exists and probes via
 `gh release view`, that `gh release create` carries `--verify-tag`, and that
 a final end-state step (gated on default `success()`, not `always()`) is the
 job's last step and asserts both artifacts exist.
+The resource-tracking `aws` stub state machine (`tests/ec2_stub.py`,
+distinct from `test_ec2_lib_sh.py`'s argv-only `_stub_aws`) models EC2 as
+a persistent state machine — `run-instances` creates a tracked instance
+that `stop-instances`/`start-instances`/`terminate-instances` transition
+through, and `create-volume`/`delete-volume` do the same for volumes —
+so downstream lifecycle tests can assert on resource *leaks* rather than
+merely inspecting argv. It exposes `_stub_aws(dir)` (writes the stub
+binary plus an empty `state.json`/`aws.log`), `read_state(dir)`,
+`read_log(dir)`, and `leaked_resources(state)` (non-terminated instances
+and non-deleted volumes). State persists to `<dir>/state.json`; every
+invocation's argv is appended to `<dir>/aws.log`. Self-tests in
+`tests/test_ec2_stub.py` pin the state transitions (run-instances →
+`running`; stop-instances → `stopped` without removing the record;
+terminate-instances → `terminated`), `leaked_resources()` on both a
+clean and an unclean teardown, multi-instance independence, the real
+`aws` CLI's `--instance-ids i-1 i-2` space-separated multi-value flag
+syntax (not a repeated flag), the log recording every invocation in
+order, and a structural guard that the stub source contains no
+networking imports (`socket`, `urllib`, `http.client`, `requests`,
+`boto3`) so no invocation can reach a real AWS endpoint. Pure test
+fixture — no dependency on `orchestrator/leerie.py` or
+`scripts/remote/ec2-lib.sh`, importable ahead of the EC2 dispatch branch
+landing. `ec2_stub.py` also implements `describe-instance-status`
+(returns `InstanceStatus`/`SystemStatus` both `"ok"` for a `running`
+instance, `"initializing"` when a test seeds `status_ok: False`),
+consumed by `wait_for_instance_ready()`'s poll-until-both-ok contract.
+`scripts/remote/ec2-provision.sh` (the `provision.sh` counterpart for
+the EC2 lifecycle — `provision_instance()`, `wait_for_instance_ready()`,
+`stop_instance()`/`terminate_instance()`, `decide_ec2_teardown()`; see
+the Files table above) is tested in `tests/test_ec2_provision.py`
+against the stateful `aws` stub: required-var validation (missing
+`LEERIE_EC2_AMI` / missing `aws` binary both fail closed before any
+call), instance-id export and `ec2-instance.json`/`run.json` sidecar
+writes on a successful create, id-parsing against real-shaped
+`run-instances` JSON output, a failed create leaking no resources and
+never registering the teardown trap, `terminate_instance`'s no-op-on-
+empty-id idempotency, and `decide_ec2_teardown`'s three-disposition
+classification (clean-exit terminates, sync-failure leaves the instance
+running, SIGINT detaches, unknown rc pauses) including that
+`_try_fetch_state_for_ec2_teardown` runs before `terminate_instance`
+(mirrors `provision.sh`'s fetch-before-destroy ordering) and that the
+teardown routine is idempotent under `LEERIE_TEARDOWN_DONE`.
+`tests/test_ec2_volume_reaping.py` pins the EBS-volume side of the same
+script: DESIGN §6 "EBS volume lifecycle" case 1 (root volume only,
+AWS's own implicit `DeleteOnTermination=true` default) means there is
+no Fly-style `destroy_volume()` reap path to test — instead this file
+pins the actual leak-prevention mechanism (`run-instances` invoked with
+no `--block-device-mapping`/`--block-device-mappings` override, at both
+the stub-argv level and via a source-level grep guard against
+`DeleteOnTermination` appearing in the call block), that
+`terminate_instance` (the sole reap path) is a true no-op making no AWS
+call on an empty instance id, a full provision→terminate cycle leaking
+neither instances nor volumes (with an explicit assertion that no
+`create-volume` call ever happens, so the leak-free result isn't
+vacuous), and a structural regression guard that no
+`destroy_volume`/`reap_volume`-shaped function exists anywhere in
+`ec2-lib.sh` or `ec2-provision.sh`.
+The EC2 counterpart to `scripts/remote/seed-repo.sh` — `scripts/remote/
+ec2-seed-repo.sh` (`ec2_seed_repo_clone`/`ec2_seed_repo_dirty`/
+`ec2_seed_repo`, transported over `ec2-lib.sh`'s `ec2_tar_pipe`/
+`ec2_remote_exec` instead of `flyctl ssh console`) is tested in two
+files, modeled directly on `tests/test_seed_repo_sh.py` +
+`tests/test_seed_repo_shallow_roundtrip.py`. `tests/test_ec2_seed_repo.py`
+covers the transport-level contract against a stubbed `aws` (decodes and
+locally executes `ec2_remote_exec`'s base64-wrapped SSM command,
+rewriting `/work`/`/tmp/leerie-*` paths into the test's `dest` dir — same
+technique as `test_ec2_transport.py`'s `_stub_aws_ssm`) and a stubbed
+`ssh` (drains `ec2_tar_pipe`'s one-entry gzipped-tar payload when invoked
+for bulk data, execs a real local `rsync --server` when invoked as
+rsync's `-e` transport): preflight failures (missing instance id / ssh
+target / `USER_REPO` / `aws` on PATH); a minimal repo round-trips to
+`/work`; both `aws` and `ssh` are exercised and `flyctl` never appears in
+the transport log; `.gitignore`-awareness plus `.claude/`
+force-inclusion via the rsync delta; the `.leerie/config.toml` /
+`.leerie/Dockerfile` / `.leerie/.leerie-setup.sh` whitelist (all other
+`.leerie/*` paths dropped); NFC-filename preservation through a
+submodule bundle; and a stalled `ssh` transport (real, unstubbed
+`timeout`) yielding a non-hanging failure. `tests/
+test_ec2_seed_repo_shallow.py` reproduces the shallow-path host/instance
+commands directly (coupled to the real script via `test_
+reconstruction_matches_source`, which asserts the exact clone/tar/
+checkout strings are still present) to pin: checkout parity between the
+shallow instance tree and the host tip, `.git/shallow` staying shallow,
+NFC-filename survival, a fetch-back-by-branch-name round-trip whose
+merge-base equals the host tip (PR-diff correctness), and
+`_seed_branch_shallow_safe`'s shell-injection gate (safe vs. unsafe
+branch names, including the live `__PARENT_MATERIALIZE__`/
+`__CLEANUP_TMP__` placeholder tokens) invoked against the real function
+rather than a reproduction of it.
+The EC2 instance lifecycle itself (`scripts/remote/ec2-provision.sh`'s
+`provision_instance()`/`wait_for_instance_ready()`/`stop_instance()`/
+`terminate_instance()`/`decide_ec2_teardown()`) is covered across two
+files. `tests/test_ec2_provision.py` (landed with the lifecycle
+implementation) covers the broader surface: instance creation, the
+running+ok readiness poll, stop/terminate idempotency on an empty
+instance id, and the sidecar writes. `tests/test_ec2_decide_teardown.py`
+is the dedicated, deeper pin for `decide_ec2_teardown()`'s
+`$LEERIE_REMOTE_EXIT_RC` classification table — the highest-consequence
+EC2 behavior, mirroring `tests/test_decide_teardown_auto_finalize.py`'s
+Fly coverage: each clean-exit rc (0/10/11/75) syncing state via
+`_try_fetch_state_for_ec2_teardown` before calling `terminate_instance`;
+a sync failure on any clean-exit rc leaving the instance `running` with
+no `terminate-instances`/`stop-instances` call ever reaching the `aws`
+stub's log (the one-way-ratchet invariant — destroy-then-fetch would
+make paid-for LLM work unrecoverable); rc=130/143 taking the detach-
+banner arm without pausing; any other non-zero rc stopping (never
+terminating) the instance and recording `pause_reason` in the run
+sidecar; the fetch-before-terminate ordering independently verified via
+a hook that asserts the instance is still `running` at the moment
+`_try_fetch_state_for_ec2_teardown` runs; and `LEERIE_TEARDOWN_DONE`
+idempotency surviving a double-fire (INT then EXIT) in both directions
+(clean-exit-then-pause and pause-then-clean-exit) even when
+`LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
+the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
+standalone rather than the `leerie` launcher's own dispatch — is
+covered in `tests/test_ec2_e2e_provision.py`: the branch is extracted
+verbatim from the launcher (mirroring `tests/test_launcher_env_forwarding.py`'s
+`_extract_forwarding_loop` approach, since sourcing `leerie` directly
+runs preflight + full CLI dispatch) and run against `tests/ec2_stub.py`'s
+resource-tracking `aws` stub. It pins that `require_aws`'s `sts
+get-caller-identity` call precedes any `ec2 run-instances` call by
+call index (mirroring `tests/test_provision_volume.py`'s ordering
+discipline), and that a failing credential probe aborts the launch
+non-zero, emits the `aws sso login --profile <p>` hint, and leaves
+zero tracked instances and volumes in the stub's state — both with
+provisioning wired in after the dispatch block and with the dispatch
+block alone, so the gate is pinned as the branch's own contract
+independent of what runs after it. The module also defines the shared
+bash harness (stub-on-PATH + launcher invocation helpers) that sibling
+EC2-dispatch test modules import. A dedicated
+`test_successful_provision_leaves_exactly_one_instance_and_no_orphaned_volume`
+pins the provision-success resource count against the stub's *tracked
+state* rather than argv/log line counts: exactly one instance (not
+zero — a no-op regression; not two — a double-provision regression,
+both falsified live against hand-broken harness variants during
+development) and zero tracked volumes, since `provision_instance()`
+never calls `create-volume` — root EBS is implicit via `run-instances`
+with AWS's own `DeleteOnTermination=true` default (DESIGN §6 "EBS
+volume lifecycle" case 1) — so any tracked volume on this path would by
+construction be an orphan.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
