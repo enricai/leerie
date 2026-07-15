@@ -5,6 +5,42 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A migration chunk no longer inherits `provides` tags its siblings earned.**
+  `_migration_child` handed every child — and the parent — *the same list
+  objects* for `depends_on`/`requires`/`provides` (`subtask.get("depends_on",
+  [])` with no copy). That is safe only while nobody mutates one in place, and
+  `_apply_overlap_drop` does: it unions the dropped subtask's tags into the
+  survivor with `surv_provides.append(tag)`. When the survivor is a migration
+  chunk, the tag lands on **every** sibling, and `_build_predecessor_graph`
+  turns each one into a real predecessor edge for every consumer that
+  `requires` it — subtasks silently gaining dependencies no op ever declared,
+  and waves serializing for reasons nothing in the plan explains. Reproduced
+  directly: dropping `feat-009` into `config-003-1` also tagged
+  `config-003-2`. This is the same class as DESIGN §5 *Id-vanishing
+  operations* — a graph edge materializing without any op declaring it — and
+  it is why the fix is structural rather than a note asking future callers to
+  rebind instead of mutate: the lists are now copied at construction
+  (`requires` deep-copied, since its entries are dicts). The existing
+  migration tests could not catch this because they assert by value; the new
+  ones assert by identity.
+
+### Changed
+
+- `_build_predecessor_graph`'s docstring named two callers and claimed the
+  function was pure. It has eight callers, and it gained a `log()` on an
+  unknown `depends_on` id in 0.9.62. Both are now stated accurately, including
+  why the phase 2¾ cycle *trials* stay silent (their `apply_fn` rewrites
+  inbound references before the trial graph is built, so a trial models a
+  fully-applied state). The stale text was load-bearing: it is what made a
+  reviewer conclude the new log would spam on every overlap run.
+- `_remap_vanished_deps`'s docstring now records the flatness invariant its
+  single pass depends on — no successor may itself be a vanished key — and why
+  both current callers satisfy it by construction.
+
 ## [0.9.62]
 
 ### Fixed

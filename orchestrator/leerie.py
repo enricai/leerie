@@ -4623,7 +4623,18 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
                      title: str, criteria: str) -> dict:
     """Build one migration-chunk child subtask from its (code-fixed) file
     partition plus a title + success_criteria_seed. Inherits the parent's
-    graph edges/intent; the files are the pre-computed chunk, never re-decided."""
+    graph edges/intent; the files are the pre-computed chunk, never re-decided.
+
+    The edge lists are *copied*, not aliased. Handing every child the parent's
+    list object is safe only while no one mutates one in place, and someone
+    does: `_apply_overlap_drop` unions the dropped subtask's tags into the
+    survivor with `surv_provides.append(tag)`. With a shared list that tag
+    lands on every sibling, and `_build_predecessor_graph` turns each into a
+    real predecessor edge for every consumer that `requires` it — a subtask
+    silently gaining dependencies it never declared. Copying here makes the
+    invariant structural instead of asking every future caller to remember to
+    rebind rather than mutate. `requires` entries are dicts, so the copy is
+    deep enough to give each child its own entry dicts too."""
     return {
         "id": cid,
         "title": title,
@@ -4631,9 +4642,9 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         "files_likely_touched": chunk,
         "intent": subtask.get("intent", ""),
         "scope_note": subtask.get("scope_note", ""),
-        "depends_on": subtask.get("depends_on", []),
-        "requires": subtask.get("requires", []),
-        "provides": subtask.get("provides", []),
+        "depends_on": list(subtask.get("depends_on", []) or []),
+        "requires": copy.deepcopy(subtask.get("requires", []) or []),
+        "provides": list(subtask.get("provides", []) or []),
         "size": "medium",
         "investigation_notes": subtask.get("investigation_notes", ""),
     }
@@ -4927,7 +4938,16 @@ def _remap_vanished_deps(subtasks: list[dict],
     Mirrors `_apply_overlap_merge`'s rewrite discipline: dedup after the rewrite
     (a subtask may already depend on one successor) and skip self-references.
     `mapping.get(dep, [dep])` routes an untouched dep through the same path, so
-    there is no separate branch to keep in sync."""
+    there is no separate branch to keep in sync.
+
+    Single pass, which requires `mapping` to be *flat*: no successor may itself
+    be a vanished key, or the substitution would leave a dangling id behind
+    (`{A: [B], B: [C]}` rewrites `A` to `B` and stops). Both callers satisfy
+    this by construction — `recursive_decompose` returns fully-flattened leaves,
+    so a generation's map only ever names terminal ids, and `phase_plan`'s map
+    is keyed by first-pass parent ids whose successors are suffixed leaf ids
+    that no other plan can name as a parent. A future caller that can build a
+    chained map must resolve it to a fixpoint before calling."""
     if not mapping:
         return
     for s in subtasks:
@@ -15129,10 +15149,19 @@ def _build_predecessor_graph(
       tag match. Used by the phase 2½ cycle gate's edge-attribution
       message and by future scheduler diagnostics.
 
-    Shared between the phase 2½ acyclicity gate (`phase_reconcile`) and
-    the phase 3 scheduler (`schedule`) so the two cannot drift in what
-    counts as an edge. Pure function — no logging, no side effects, no
-    `die()`. Callers handle empties and cycles themselves.
+    Shared by every consumer of the subtask DAG so none can drift in what
+    counts as an edge: the phase 2½ acyclicity gate (`phase_reconcile`), the
+    phase 2¾ per-resolution cycle trials (`_would_cycle_after`) and post-merge
+    backstop, the phase 3 scheduler (`schedule`),
+    `warn_provider_subset_subtasks`, and the implementer's upstream-artifact
+    lookup. Callers handle empties and cycles themselves — no side effects, no
+    `die()`.
+
+    Not quite pure: an unknown `depends_on` id is `log()`ged before being
+    dropped (DESIGN §5 *Id-vanishing operations*). That branch is unreachable
+    while every id-vanishing op rewrites its inbound references — including the
+    cycle trials, whose `apply_fn` rewrites before this runs, so a trial models
+    a fully-applied state and stays silent.
 
     `requires` entries are objects `{tag, extent, reason?}` (DESIGN §5
     `requires.extent`); only `extent: in_plan` entries become graph
