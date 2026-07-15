@@ -945,6 +945,30 @@ merge-base equals the host tip (PR-diff correctness), and
 branch names, including the live `__PARENT_MATERIALIZE__`/
 `__CLEANUP_TMP__` placeholder tokens) invoked against the real function
 rather than a reproduction of it.
+The EC2 instance lifecycle itself (`scripts/remote/ec2-provision.sh`'s
+`provision_instance()`/`wait_for_instance_ready()`/`stop_instance()`/
+`terminate_instance()`/`decide_ec2_teardown()`) is covered across two
+files. `tests/test_ec2_provision.py` (landed with the lifecycle
+implementation) covers the broader surface: instance creation, the
+running+ok readiness poll, stop/terminate idempotency on an empty
+instance id, and the sidecar writes. `tests/test_ec2_decide_teardown.py`
+is the dedicated, deeper pin for `decide_ec2_teardown()`'s
+`$LEERIE_REMOTE_EXIT_RC` classification table — the highest-consequence
+EC2 behavior, mirroring `tests/test_decide_teardown_auto_finalize.py`'s
+Fly coverage: each clean-exit rc (0/10/11/75) syncing state via
+`_try_fetch_state_for_ec2_teardown` before calling `terminate_instance`;
+a sync failure on any clean-exit rc leaving the instance `running` with
+no `terminate-instances`/`stop-instances` call ever reaching the `aws`
+stub's log (the one-way-ratchet invariant — destroy-then-fetch would
+make paid-for LLM work unrecoverable); rc=130/143 taking the detach-
+banner arm without pausing; any other non-zero rc stopping (never
+terminating) the instance and recording `pause_reason` in the run
+sidecar; the fetch-before-terminate ordering independently verified via
+a hook that asserts the instance is still `running` at the moment
+`_try_fetch_state_for_ec2_teardown` runs; and `LEERIE_TEARDOWN_DONE`
+idempotency surviving a double-fire (INT then EXIT) in both directions
+(clean-exit-then-pause and pause-then-clean-exit) even when
+`LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
