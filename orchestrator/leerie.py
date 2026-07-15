@@ -498,9 +498,20 @@ SOURCE_OF_TRUTH_FILE = "leerie.toml"
 # Runtime mode — see IMPLEMENTATION.md §2 "Runtime mode". Resolution order:
 # --runtime CLI flag → LEERIE_RUNTIME env var → per-repo leerie.toml → 'local'.
 # CLI/env are session knobs and outrank the committed file default.
-RUNTIME_VALUES = ("local", "fly")
+RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
+
+# AWS region/profile prefs for the ec2 runtime — leerie-level knobs (which
+# region/profile leerie itself uses when provisioning EC2 machines),
+# distinct from the AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain
+# env vars resolved by scripts/remote/aws-credentials.sh. Resolution order:
+# CLI flag → env var → per-repo leerie.toml → None (free-form strings, no
+# enum check — mirrors PR_TEMPLATE_ENV).
+AWS_REGION_ENV = "LEERIE_AWS_REGION"
+AWS_REGION_FILE = SOURCE_OF_TRUTH_FILE
+AWS_PROFILE_ENV = "LEERIE_AWS_PROFILE"
+AWS_PROFILE_FILE = SOURCE_OF_TRUTH_FILE
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -3354,6 +3365,32 @@ def resolve_pr_template(repo_root: Path,
         repo_root, cli_value,
         env_var=PR_TEMPLATE_ENV, file_key="pr_template",
         file_name=PR_TEMPLATE_FILE, default=None)
+
+
+def resolve_aws_region(repo_root: Path,
+                       cli_value: str | None = None) -> str | None:
+    """Resolve the AWS region leerie uses to provision ec2 runtime
+    machines. Order: cli_value (reserved for a future CLI flag) →
+    LEERIE_AWS_REGION env → leerie.toml → None. Free-form string, no enum
+    validation — distinct from the AWS SDK's own AWS_REGION credential-chain
+    env var, which scripts/remote/aws-credentials.sh resolves independently."""
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=AWS_REGION_ENV, file_key="aws_region",
+        file_name=AWS_REGION_FILE, default=None)
+
+
+def resolve_aws_profile(repo_root: Path,
+                        cli_value: str | None = None) -> str | None:
+    """Resolve the AWS profile leerie uses to provision ec2 runtime
+    machines. Order: cli_value (reserved for a future CLI flag) →
+    LEERIE_AWS_PROFILE env → leerie.toml → None. Free-form string, no enum
+    validation — distinct from the AWS SDK's own AWS_PROFILE credential-chain
+    env var, which scripts/remote/aws-credentials.sh resolves independently."""
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=AWS_PROFILE_ENV, file_key="aws_profile",
+        file_name=AWS_PROFILE_FILE, default=None)
 
 
 def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
