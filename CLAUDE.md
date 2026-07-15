@@ -501,15 +501,29 @@ reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
 against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`
 is a bool-returning no-op off Linux and (Linux-guarded) sets the flag verifiable
 via `prctl(PR_GET_CHILD_SUBREAPER)`; `_zombie_reaper` (Linux-guarded) reaps an
-orphaned exited child so it's no longer a zombie, survives having no children,
-and — the load-bearing race test — does NOT steal a live
-`create_subprocess_exec` child's exit status (asserts the true code, not 255)
-because it is targeted (`_orphan_zombie_children`: state==Z + ppid==getpid,
-minus `_ASYNCIO_MANAGED_PIDS`) rather than `waitpid(-1)`; plus a test that a
-registered worker pid is excluded from the reap set, a
+orphaned exited child so it's no longer a zombie and survives having no
+children. The load-bearing race test is
+`test_zombie_reaper_does_not_steal_unregistered_subprocess_status`: it spawns
+40 short-lived asyncio children with the reaper hot at 1ms and **registers
+nothing**, asserting every child reports its true code (7), not a fabricated
+255. Registering would defeat the test's purpose — the production failure is a
+pid that is unregistrable *by construction*, sitting in the window between
+`fork()` and asyncio's `os.pidfd_open()`. The old design (scan `/proc` for
+state==Z + ppid==getpid, minus `_ASYNCIO_MANAGED_PIDS`) passed a test that
+registered the pid *before* starting the reaper — a sequencing production never
+provides — while taking `preflight`'s own `git config` pid on 40/40 real runs.
+Safety now comes from `_REAPABLE_PIDS`, an allowlist populated by
+`_mark_reapable`. Paired with
+`test_zombie_reaper_still_reaps_a_recorded_orphan` (a reaper that reaps nothing
+is not a fix, it is a disabled reaper) and three source-coupling guards: the
+reaper's source contains no `/proc`/`listdir`/`_orphan_zombie_children`
+(docstring stripped via `ast` first, since it *describes* the forbidden scan),
+`_DescendantTracker._poll_loop` calls `_mark_reapable` (the fix is inert
+without the wiring), and `_mark_reapable` never admits an
+`_ASYNCIO_MANAGED_PIDS` member; plus a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
 that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
-`_zombie_reaper` (the fix is inert without the wiring). The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
+`_zombie_reaper`. The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
 stream-back (both files streamed when host has neither, never clobbers an

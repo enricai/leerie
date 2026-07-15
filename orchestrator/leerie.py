@@ -1948,6 +1948,13 @@ class _DescendantTracker:
             while not self._stopped:
                 descendants = _enumerate_descendants(self._leader_pid)
                 self._seen.update(descendants)
+                # Publish to the zombie reaper's allowlist (DESIGN §6 *Zombie
+                # reaping*). These PIDs are observed descendants of a worker
+                # we spawned — never asyncio's own children — so reaping them
+                # cannot steal a status asyncio's watcher owns. Without this
+                # the reaper has nothing to reap and orphans pile up against
+                # pids.max.
+                _mark_reapable(descendants)
                 # Pressure-gated mid-run reaping (DESIGN §6 *Mid-run PID
                 # reaping*). Only active when this tracker was constructed
                 # with a cgroup_sid; otherwise the branch is a no-op and
@@ -4371,16 +4378,24 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
         r = await run_proc(["git", "config", key])
-        # rc=255 + empty stdout is asyncio's "could not read the child's exit
-        # status" sentinel, not git's verdict — git exits 1 for an unset key,
-        # never 255. Without this branch the check below misreports a broken
+        # rc=255 is asyncio's "could not read the child's exit status"
+        # sentinel, not git's verdict — git exits 0 (set) or 1 (unset), never
+        # 255. Without this branch the check below misreports a broken
         # subprocess as a misconfigured identity and sends the operator to
         # "fix" a git config that is already correct.
-        if r.returncode == 255 and not r.stdout:
+        #
+        # Deliberately does NOT also require empty stdout: `git config <key>`
+        # succeeds and *prints the value*, and `communicate()` drains the pipe
+        # before the status is lost — so the real failure carries rc=255 WITH
+        # output. An earlier `and not r.stdout` conjunct here never fired and
+        # let this fall through to the "not configured" die() below.
+        if r.returncode == 255:
             die(f"cannot read the exit status of `git config {key}` "
-                "(rc=255, no output) — the child process was reaped before "
-                "its status could be read. This is NOT a git configuration "
-                "problem; the subprocess machinery is broken.")
+                "(rc=255) — the child process was reaped before its status "
+                "could be read. This is NOT a git configuration problem; the "
+                "subprocess machinery is broken. Most likely a stray reaper "
+                "`waitpid`ing asyncio's children (DESIGN §6 *Zombie "
+                "reaping*), or an inherited SIGCHLD disposition.")
         if r.returncode != 0 or not r.stdout.strip():
             die(f"git {key} is not configured. "
                 f"Run: git config --global {key} \"<value>\"")
@@ -9324,15 +9339,35 @@ _PR_GET_CHILD_SUBREAPER = 37
 
 # PIDs of the `claude -p` workers the orchestrator spawns via
 # `asyncio.create_subprocess_exec` and is actively awaiting (`proc.wait()` inside
-# a gather). asyncio's own child watcher owns these PIDs' exit statuses; the
-# zombie reaper MUST NOT `waitpid` them or it would steal the status out from
-# under asyncio (which then reports returncode 255 and logs a spurious warning).
+# a gather). asyncio's own child watcher owns these PIDs' exit statuses.
 # `_invoke` registers a worker here at spawn and discards it after the gather.
-# This is LOAD-BEARING, not just belt-and-suspenders: an asyncio child that has
-# exited but not yet been watcher-reaped is briefly a `state==Z, ppid==getpid()`
-# zombie — indistinguishable by the reaper's /proc filter from a true orphan.
-# The registration set is what tells them apart, so the reaper must consult it.
+#
+# NOTE: this set is NOT what keeps the zombie reaper off asyncio's children —
+# it cannot be. A child is unregistered between `fork()` and the watcher's
+# `os.pidfd_open()`, so an exclusion set always has a hole (DESIGN §6 *Zombie
+# reaping*; measured: excluding asyncio-known PIDs still corrupted 212/300).
+# Safety comes from `_REAPABLE_PIDS` being an allowlist instead. This set
+# remains for telemetry and for `_reparented_orphans`, which must not SIGKILL a
+# live worker.
 _ASYNCIO_MANAGED_PIDS: set[int] = set()
+
+# The zombie reaper's allowlist: PIDs leerie itself observed and recorded as
+# descendants of a worker it spawned (published by `_DescendantTracker`, which
+# already accumulates exactly this population for its own SIGKILL sweep).
+#
+# The reaper reaps ONLY these. It must never scan /proc for zombies to reap:
+# a PID in its fork→pidfd_open window is indistinguishable from a true orphan,
+# so any scanning reaper eventually steals an exit status asyncio needed and
+# CPython fabricates returncode 255 (`asyncio/unix_events.py` `_do_wait`:
+# "may happen if waitpid() is called elsewhere"). That fabricated 255 is what
+# made `preflight` report "git user.email is not configured" on machines whose
+# identity was correctly seeded — deterministically, 40/40 runs, because
+# preflight's `git config` is the first subprocess after the reaper starts.
+#
+# Correct by construction: a PID that was never recorded here can never be
+# taken. The cost is deliberate — an orphan leerie never observed is not
+# reaped, and the cgroup PID cap remains the backstop (DESIGN §6).
+_REAPABLE_PIDS: set[int] = set()
 
 
 def _restore_sigchld_default() -> None:
@@ -9418,44 +9453,15 @@ def _become_subreaper() -> bool:
         return False
 
 
-def _orphan_zombie_children() -> list[int]:
-    """Return PIDs of processes that are (a) zombies (`<defunct>`, state `Z`),
-    (b) direct children of this process (`PPid == os.getpid()`), and (c) NOT an
-    asyncio-managed worker. These are the orphaned descendants that reparented
-    to us after `_become_subreaper` and need `wait()`ing.
+def _mark_reapable(pids: set[int]) -> None:
+    """Record PIDs the zombie reaper is allowed to `waitpid`.
 
-    Reads `/proc/<pid>/stat` — field 3 is the state char, field 4 is PPid. The
-    comm field (field 2, parenthesized) can contain spaces/parens, so parse
-    from the LAST `)` to avoid mis-splitting. Non-Linux / no-`/proc` → empty
-    list (the reaper is a no-op there, matching `_become_subreaper`)."""
-    try:
-        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
-    except OSError:
-        return []
-    me = os.getpid()
-    out: list[int] = []
-    for pid in pids:
-        if pid in _ASYNCIO_MANAGED_PIDS:
-            continue  # asyncio owns this worker's exit status — never touch it
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                data = f.read()
-        except OSError:
-            continue  # exited between listdir and open, or not readable
-        rparen = data.rfind(")")
-        if rparen == -1:
-            continue
-        fields = data[rparen + 2:].split()  # skip ") " → state is fields[0]
-        if len(fields) < 2:
-            continue
-        state, ppid_s = fields[0], fields[1]
-        try:
-            ppid = int(ppid_s)
-        except ValueError:
-            continue
-        if state == "Z" and ppid == me:
-            out.append(pid)
-    return out
+    Called by `_DescendantTracker`, which already accumulates every PID it
+    observes in a worker's subtree. Only PIDs that pass through here are ever
+    reaped — see `_REAPABLE_PIDS` for why an allowlist is the only correct
+    shape. Never register a PID asyncio spawned directly: those belong to its
+    child watcher (`_ASYNCIO_MANAGED_PIDS`)."""
+    _REAPABLE_PIDS.update(pids - _ASYNCIO_MANAGED_PIDS)
 
 
 async def _zombie_reaper(interval_sec: float = 1.0) -> None:
@@ -9469,20 +9475,32 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
     is this loop. Distinct concerns: the tracker bounds live processes, this
     reaps dead ones.
 
-    Targeted, NOT `waitpid(-1)`: a blanket `waitpid(-1)` would race asyncio's
-    own child watcher and steal the exit status of a live `claude -p` worker
-    (asyncio then reports returncode 255 and logs a spurious warning). Instead
-    we `waitpid` only the specific PIDs `_orphan_zombie_children()` reports —
-    zombies that are our children and are not asyncio-managed workers — so we
-    never touch a PID asyncio is awaiting. Spawned as a background task by
+    Allowlist, NOT a /proc scan: this loop `waitpid`s only PIDs the tracker
+    recorded via `_mark_reapable`. It must never look for zombies to reap,
+    because a PID between `fork()` and asyncio's `os.pidfd_open()` is
+    indistinguishable from a true orphan — reaping one there makes CPython
+    fabricate returncode 255 for a subprocess that actually succeeded. That is
+    not hypothetical: the scanning design took `preflight`'s own
+    `git config user.email` PID on 40/40 runs, reporting a missing git identity
+    on machines that had one (DESIGN §6 *Zombie reaping*).
+
+    `WNOHANG` keeps this non-blocking: a recorded PID that is still alive is
+    skipped now and retried next tick. A PID that is gone (already reaped, or
+    never ours) raises and is dropped. Spawned as a background task by
     `orchestrate()` and cancelled in its `finally`, mirroring `_memory_sampler`."""
     while True:
         try:
-            for pid in _orphan_zombie_children():
+            for pid in list(_REAPABLE_PIDS):
+                if pid in _ASYNCIO_MANAGED_PIDS:
+                    continue  # became a live worker's PID — not ours to reap
                 try:
-                    os.waitpid(pid, os.WNOHANG)
+                    reaped, _status = os.waitpid(pid, os.WNOHANG)
+                    if reaped:
+                        _REAPABLE_PIDS.discard(pid)
                 except (ChildProcessError, OSError):
-                    pass  # asyncio already reaped it, or it vanished — fine
+                    # Not our child, or already reaped — either way it will
+                    # never be reapable, so stop tracking it.
+                    _REAPABLE_PIDS.discard(pid)
         except Exception:
             pass  # reaping must never crash the orchestrator
         await asyncio.sleep(interval_sec)

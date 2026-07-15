@@ -3373,14 +3373,22 @@ together close the leak.
    (`sys.platform`), a logged no-op elsewhere; returns `bool`. `_zombie_reaper()`
    is a background asyncio task spawned in `orchestrate()` next to `sampler_task`
    and cancelled in the same `finally` — mirroring `_memory_sampler`'s lifecycle.
-   It is **targeted, not `waitpid(-1)`**: `_orphan_zombie_children()` scans
-   `/proc` for this process's own zombie children (`state == Z`,
-   `PPid == getpid()`) not in `_ASYNCIO_MANAGED_PIDS`, and the reaper
-   `os.waitpid(pid, WNOHANG)`s each individually (~1 s; `ChildProcessError`/
-   `OSError` benign). A blanket `waitpid(-1)` would race asyncio's child watcher
-   and steal a live worker's exit status (→ returncode 255 + warning); the
-   targeted scan never touches an asyncio-awaited PID. `_invoke` adds `proc.pid`
-   to `_ASYNCIO_MANAGED_PIDS` at spawn and `discard`s it in its `finally`.
+   It is an **allowlist, never a `/proc` scan**: the reaper
+   `os.waitpid(pid, WNOHANG)`s only PIDs in `_REAPABLE_PIDS` (~1 s;
+   `ChildProcessError`/`OSError` benign → the PID is discarded, since it can
+   never become reapable). `_mark_reapable(pids)` populates that set, minus
+   anything in `_ASYNCIO_MANAGED_PIDS`, and is called from
+   `_DescendantTracker._poll_loop` with each `_enumerate_descendants` snapshot —
+   the worker subtrees leerie observed and therefore owns.
+   `_orphan_zombie_children()` **no longer exists**: any reaper that *discovers*
+   PIDs is wrong regardless of how it filters, because a PID between `fork()`
+   and asyncio's `os.pidfd_open()` is in no registry, so every exclusion has a
+   hole (DESIGN §6 *Zombie reaping*; the scanning design took `preflight`'s own
+   `git config` PID on 40/40 real runs → fabricated rc=255 → bogus "git
+   user.email is not configured"). `_invoke` still adds `proc.pid` to
+   `_ASYNCIO_MANAGED_PIDS` at spawn and `discard`s it in its `finally`, but that
+   set is **not** the reaper's safety mechanism — the allowlist is; it serves
+   telemetry and `_reparented_orphans` (which must not SIGKILL a live worker).
    `_signal_pids` deliberately does NOT `waitpid` (it only SIGKILLs); the central
    `_zombie_reaper` is the single reaping point. Because orphans now reparent to
    the orchestrator (not PID 1), `_reparented_orphans` accepts

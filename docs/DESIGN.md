@@ -2005,19 +2005,43 @@ than on the machinery. `main()` therefore calls `_restore_sigchld_default()`
 before anything spawns, and `preflight()` gates on `_sigchld_is_ignored()` —
 which reads the kernel's `SigIgn` mask from `/proc/self/status`, since
 `signal.getsignal()` does not reliably reflect an *inherited* disposition.
-This is distinct from the reaper race below: pidfds are immune to
-`waitpid(-1)` theft, but not to kernel auto-reaping.
+This is one of **two** independent routes to a fabricated 255; the reaper race
+below is the other, and `_restore_sigchld_default()` does nothing to prevent it.
 
-Crucially the reaper is **targeted, not `waitpid(-1)`**: a blanket
-`waitpid(-1, WNOHANG)` would race asyncio's own child watcher and steal the exit
-status of a live `claude -p` worker (asyncio spawns workers with
-`create_subprocess_exec` and awaits `proc.wait()`; a stolen status makes it
-report returncode 255 and log a spurious warning). Instead the reaper scans
-`/proc` for its own **zombie** children (`state == Z`, `PPid == getpid()`) that
-are not in `_ASYNCIO_MANAGED_PIDS` (the set of worker PIDs `_invoke` registers at
-spawn and discards after its await), and `os.waitpid(pid, WNOHANG)`s each one
-individually — so it only ever reaps PIDs that are already dead orphans, never a
-worker asyncio is still awaiting. Because the subreaper reparents orphans to the
+**The reaper must reap only what it created — an allowlist, never a `/proc`
+scan.** An earlier design had the reaper scan `/proc` for its own **zombie**
+children (`state == Z`, `PPid == getpid()`) that were not in
+`_ASYNCIO_MANAGED_PIDS`, on the theory that the exclusion set distinguished a
+true orphan from an asyncio child briefly awaiting its watcher. **Measurement
+disproved this.** CPython's `PidfdChildWatcher.add_child_handler` calls
+`os.pidfd_open(pid)` *after* the fork, and `_do_wait` calls `os.waitpid(pid, 0)`
+later still, reporting `returncode = 255` when the status is gone ("may happen
+if `waitpid()` is called elsewhere" — `asyncio/unix_events.py`). Between the
+`fork()` and `pidfd_open()` the child's PID exists in **no registry the reaper
+can consult** — not `_ASYNCIO_MANAGED_PIDS`, not the watcher's tables — so *no*
+exclusion, peek, or ordering trick in a scanning reaper can be correct. Reaping
+a stranger that is really an asyncio child in that window is indistinguishable,
+by construction, from reaping a true orphan.
+
+This was not theoretical: with the real `preflight()` and the real reaper on a
+Fly `performance-16x`, the reaper `waitpid`'d the exact PID asyncio had spawned
+for `git config user.email` — **40/40 runs**, every one dying with a fabricated
+255 that `preflight` misreported as "git user.email is not configured" on a
+machine whose identity was correctly seeded. `preflight`'s first `run_proc` is
+the first subprocess after the reaper starts, so the reaper's first tick lands
+on it: the failure is deterministic, not a rare race. Measured alternatives all
+failed — a `waitid(WNOWAIT)` peek made it *worse* (the peek is pure overhead;
+the race is the window, not the consume), and excluding asyncio-known PIDs still
+corrupted 212/300.
+
+The reaper therefore reaps **only PIDs leerie itself recorded** (`_REAPABLE_PIDS`,
+published by `_DescendantTracker` — the worker subtrees leerie spawns and already
+tracks). Correctness is by construction: a PID in its fork→`pidfd_open` window
+was never added, so it can never be taken. Measured 0/300 on the arm where the
+scanning design failed 246/300, while still reaping real orphans. The trade-off
+is deliberate: an orphan leerie never observed is not reaped, and the cgroup PID
+cap plus the container boundary remain the real backstop. Because the subreaper
+reparents orphans to the
 orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter accepts
 `ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected (it SIGKILLs by
 PID with no ppid filter). This is chosen over inserting a real init (e.g.

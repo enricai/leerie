@@ -14,10 +14,13 @@ The fix: the orchestrator calls `_become_subreaper()` early in `main()`
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import os
 import subprocess
+import textwrap
 import sys
 
 import pytest
@@ -123,81 +126,131 @@ def test_main_installs_subreaper(leerie):
 
 
 @linux_only
-def test_zombie_reaper_does_not_steal_asyncio_worker_status(leerie):
-    """The reaper must NOT `waitpid` an asyncio-managed worker — doing so steals
-    the exit status out from under asyncio's child watcher, which then reports
-    returncode 255 instead of the true code.
+def test_zombie_reaper_does_not_steal_unregistered_subprocess_status(leerie):
+    """THE regression test. The reaper must not steal the exit status of an
+    asyncio child that was NEVER registered anywhere.
 
-    The protection is `_ASYNCIO_MANAGED_PIDS`: `_invoke` registers each worker
-    pid there at spawn (and discards it after the await), and the reaper's
-    `_orphan_zombie_children` scan excludes any pid in that set. This is
-    LOAD-BEARING, not incidental — an asyncio child that has exited but not yet
-    been watcher-reaped is briefly a `state==Z, ppid==getpid()` zombie, exactly
-    what the reaper's own filter would otherwise select. Only the registration
-    set distinguishes it from a true orphan.
+    This is the production failure (DESIGN §6 *Zombie reaping*): `run_proc`
+    does not register its pids, and even `_invoke` cannot register during the
+    window between `fork()` and asyncio's `os.pidfd_open()`. A scanning reaper
+    took `preflight`'s own `git config user.email` pid on 40/40 real runs,
+    making CPython fabricate returncode 255, which `preflight` misreported as
+    "git user.email is not configured" on a correctly-seeded machine.
 
-    This test mirrors `_invoke`: register the child pid, run the reaper hot
-    across the child's exit, and assert `proc.wait()` returns the TRUE code (7),
-    not 255. Without registration this races (the reaper can win); with it, the
-    exclusion is deterministic. (`_invoke` always registers, so real workers are
-    always protected.)"""
-    async def _run() -> int:
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", "sleep 0.3; exit 7",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        leerie._ASYNCIO_MANAGED_PIDS.add(proc.pid)  # what _invoke does at spawn
-        # Run the reaper hot (20ms) across the whole child lifetime — with the
-        # pid registered, `_orphan_zombie_children` must never return it, so the
-        # reaper never competes with asyncio for its status.
-        reaper = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+    No registration here, deliberately — that is the whole point. Safety must
+    come from the reaper only reaping its `_REAPABLE_PIDS` allowlist. Run the
+    reaper hot (1ms) across many short-lived children: a scanning reaper fails
+    this in a handful of iterations (measured 246/300 on Fly); an allowlist
+    reaper cannot fail it at all."""
+    async def _run() -> list[int]:
+        reaper = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.001))
+        codes = []
         try:
-            rc = await proc.wait()
+            for _ in range(40):
+                proc = await asyncio.create_subprocess_exec(
+                    "sh", "-c", "exit 7",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                codes.append(await proc.wait())
         finally:
             reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reaper
-            leerie._ASYNCIO_MANAGED_PIDS.discard(proc.pid)
-        return rc
+        return codes
 
-    rc = asyncio.run(_run())
-    assert rc == 7, (
-        f"worker exit code was stolen by the reaper (got {rc}, expected 7) — "
-        "a registered asyncio worker pid must be excluded from reaping")
+    codes = asyncio.run(_run())
+    stolen = [c for c in codes if c != 7]
+    assert not stolen, (
+        f"{len(stolen)}/{len(codes)} exit codes were stolen by the reaper "
+        f"(got {sorted(set(stolen))}, expected 7) — the reaper must reap only "
+        "pids on its _REAPABLE_PIDS allowlist, never scan for zombies")
 
 
 @linux_only
-def test_zombie_reaper_excludes_registered_worker_pids(leerie, monkeypatch):
-    """Belt-and-suspenders: even if a registered worker PID were briefly a
-    zombie, `_orphan_zombie_children` must exclude anything in
-    `_ASYNCIO_MANAGED_PIDS`. Fork a zombie, register its pid, and assert the
-    scan omits it; then unregister and assert it appears."""
+def test_zombie_reaper_still_reaps_a_recorded_orphan(leerie):
+    """The reaper must still do its job. Guards against a "fix" that is clean
+    only because it reaps nothing (DESIGN §6: orphans pile up against
+    pids.max). A pid recorded via `_mark_reapable` must actually be reaped."""
     pid = os.fork()
     if pid == 0:
         os._exit(0)
+
+    async def _run() -> None:
+        leerie._mark_reapable({pid})
+        reaper = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.01))
+        try:
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if pid not in leerie._REAPABLE_PIDS:
+                    return
+        finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+
     try:
-        import time
-        for _ in range(50):
-            try:
-                with open(f"/proc/{pid}/stat") as f:
-                    if f.read().split(")")[-1].split()[0] == "Z":
-                        break
-            except OSError:
-                pass
-            time.sleep(0.02)
-        leerie._ASYNCIO_MANAGED_PIDS.add(pid)
-        assert pid not in leerie._orphan_zombie_children(), (
-            "registered worker pid must be excluded from the reap set")
-        leerie._ASYNCIO_MANAGED_PIDS.discard(pid)
-        assert pid in leerie._orphan_zombie_children(), (
-            "unregistered zombie child should be reapable")
+        asyncio.run(_run())
+        assert pid not in leerie._REAPABLE_PIDS, (
+            "reaper never reaped a recorded orphan — an allowlist reaper that "
+            "reaps nothing is not a fix, it is a disabled reaper")
     finally:
-        leerie._ASYNCIO_MANAGED_PIDS.discard(pid)
+        leerie._REAPABLE_PIDS.discard(pid)
         try:
             os.waitpid(pid, 0)
         except (ChildProcessError, OSError):
             pass
+
+
+def test_zombie_reaper_never_scans_proc_for_zombies(leerie):
+    """Source-coupling guard for the design invariant (DESIGN §6 *Zombie
+    reaping*). Behavior tests are timing-dependent; this one is not.
+
+    A reaper that discovers pids by scanning is wrong no matter how it filters:
+    a pid between `fork()` and asyncio's `pidfd_open()` is in no registry, so
+    every exclusion has a hole (measured: excluding asyncio-known pids still
+    corrupted 212/300). The reaper must only ever consult `_REAPABLE_PIDS`."""
+    # Strip the docstring: it *describes* the /proc scan this function must
+    # not do, so a naive substring check would match the prose, not the code.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._zombie_reaper)))
+    fn = tree.body[0]
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)
+            and isinstance(fn.body[0].value.value, str)):
+        fn.body = fn.body[1:]
+    code = ast.unparse(fn)
+
+    assert "_REAPABLE_PIDS" in code, (
+        "the reaper must reap from the _REAPABLE_PIDS allowlist")
+    for forbidden in ("/proc", "listdir", "_orphan_zombie_children"):
+        assert forbidden not in code, (
+            f"the reaper must not discover pids by scanning ({forbidden!r} "
+            "found in its source) — an allowlist is the only correct shape")
+
+
+def test_descendant_tracker_publishes_to_reaper_allowlist(leerie):
+    """The fix is inert without this wiring: if the tracker stops publishing,
+    `_REAPABLE_PIDS` stays empty and the reaper silently reaps nothing, so
+    orphans pile up against pids.max with no other signal."""
+    src = inspect.getsource(leerie._DescendantTracker._poll_loop)
+    assert "_mark_reapable" in src, (
+        "_DescendantTracker._poll_loop must publish observed descendants to "
+        "the reaper's allowlist via _mark_reapable")
+
+
+def test_mark_reapable_never_admits_an_asyncio_pid(leerie):
+    """`_mark_reapable` must drop anything asyncio owns, even if a caller
+    passes it in. Asyncio's watcher owns those exit statuses."""
+    leerie._REAPABLE_PIDS.clear()
+    leerie._ASYNCIO_MANAGED_PIDS.add(424242)
+    try:
+        leerie._mark_reapable({424242, 424243})
+        assert 424242 not in leerie._REAPABLE_PIDS, (
+            "an asyncio-managed pid must never enter the reap allowlist")
+        assert 424243 in leerie._REAPABLE_PIDS
+    finally:
+        leerie._ASYNCIO_MANAGED_PIDS.discard(424242)
+        leerie._REAPABLE_PIDS.clear()
 
 
 def test_reparented_orphans_accepts_orchestrator_ppid(leerie, monkeypatch):
