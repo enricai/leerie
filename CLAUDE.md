@@ -1040,6 +1040,25 @@ a hook that asserts the instance is still `running` at the moment
 idempotency surviving a double-fire (INT then EXIT) in both directions
 (clean-exit-then-pause and pause-then-clean-exit) even when
 `LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+The EC2 stream-back counterpart to `fetch-branch.sh` —
+`scripts/remote/ec2-fetch-branch.sh`'s `fetch_state_ec2()` — is tested in
+`tests/test_ec2_fetch_branch.py`, modeled on `tests/test_fetch_branch_sh.py`
++ `tests/test_fetch_branch_leerie_streamback.py` and using
+`tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh` transport
+harness (`aws` decodes and locally executes `ec2_remote_exec`'s
+base64-wrapped command; `ssh` streams the private download helper
+`_ec2_fetch_ssh`'s raw remote-command stdout straight back, since
+`ec2_tar_pipe` itself is upload-only): a branch committed on the
+instance round-trips to the host as a fetchable bundle whose tip matches
+the instance-side tip; the run-state tar extracts under
+`LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default) and the
+`no_push` mechanism flag is stripped only on the branch-present path
+(preserved as intent on the cleared-but-empty terminal-state path, same
+conditional as `fetch-branch.sh`); `.leerie/config.toml` and
+`.leerie/Dockerfile` stream back when the host has neither, are never
+clobbered when the host already has one, and are non-fatal when absent
+on the instance; and both `aws` and `ssh` appear in the transport log
+while `flyctl` never does.
 The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
 the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
 standalone rather than the `leerie` launcher's own dispatch — is
