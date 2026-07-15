@@ -6272,19 +6272,24 @@ lifecycle tiers) completes in roughly a minute end to end. The table
 above lists a representative subset; the live count under `tests/`
 is the authoritative inventory.
 
-**CI surface.** GitHub Actions runs three independent workflows on every
-pull request to `main` (and on pushes to `main`):
+**CI surface.** GitHub Actions runs four independent workflows: three on
+every pull request to `main` (and on pushes to `main`), plus `release.yml`
+on pushes to `main` only:
 
 | Workflow | What it does |
 |----------|--------------|
 | `.github/workflows/test.yml` | `pytest tests/ -ra` across Python 3.10 / 3.11 / 3.12, with `pytest-cov` reporting line coverage to the job summary (no gate per CLAUDE.md). Coverage XML is uploaded as a 7-day artifact from the 3.12 job. Dev dependencies (`pytest`, `pytest-cov`) installed inline per CLAUDE.md's "pytest is the only dev dependency" stance. |
 | `.github/workflows/syntax.yml` | The AST parse from CLAUDE.md's task-completion checklist, plus the same parse over every file under `tests/`. Path-filtered to `orchestrator/**/*.py` and `tests/**/*.py` for fast feedback ahead of the full pytest matrix. |
 | `.github/workflows/shellcheck.yml` | `shellcheck -x scripts/*.sh` — the worktree mechanics scripts are load-bearing (DESIGN §6). Path-filtered to `scripts/**/*.sh`. |
+| `.github/workflows/release.yml` | On a `chore(release): X.Y.Z` commit subject landing on `main`, creates the `vX.Y.Z` tag and a matching GitHub Release, or fails loudly (`::error::` + exit 1) if either is missing at job end. Both idempotency checks (tag-exists, release-exists) gate independently so a pre-existing tag or release never silently skips the other. |
 
-Each workflow has a `concurrency:` block keyed on `github.ref` with
-`cancel-in-progress: true`, so a force-push or rapid pushes do not
-leave superseded jobs in flight. Dependabot (`.github/dependabot.yml`)
-tracks the GitHub-Actions ecosystem on a weekly cadence.
+Most workflows have a `concurrency:` block keyed on `github.ref` with
+`cancel-in-progress: true`, so a force-push or rapid pushes do not leave
+superseded jobs in flight; `release.yml` is the exception —
+`cancel-in-progress: false`, since cancelling a release mid-flight (after
+the tag push but before the release is created) is worse than letting it
+finish. Dependabot (`.github/dependabot.yml`) tracks the GitHub-Actions
+ecosystem on a weekly cadence.
 
 **Not tested.** No worker has run against a live `claude -p`. The flag
 contract in §3 is from CLI documentation, not from observed runs. The

@@ -41,11 +41,18 @@ jobs:
           set -euo pipefail
           subject="$(git log -1 --pretty=%s)"
           echo "subject=$subject"
-          # Match exactly `chore(release): X.Y.Z` (semver, three numeric
-          # components). Trailing whitespace is tolerated; anything else
-          # in the subject is not — this prevents accidental matches
-          # from "chore(release): 0.3.15 plus follow-up" etc.
-          if [[ "$subject" =~ ^chore\(release\):[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$ ]]; then
+          # Match `chore(release): X.Y.Z` (semver, three numeric
+          # components), optionally followed by the squash-merge PR-title
+          # suffix `(#N)` that GitHub appends because this repo sets
+          # squash_merge_commit_title: COMMIT_OR_PR_TITLE. Without the
+          # optional group, every PR-merged release commit (the default
+          # path) fails to match — v0.9.62 was released this way and has
+          # no tag or release to this day. The space before `(#` inside
+          # the group is required, so "0.9.62(#62)" (no space) still
+          # fails; anything else in the subject is also rejected — this
+          # prevents accidental matches from "chore(release): 0.3.15 plus
+          # follow-up" etc.
+          if [[ "$subject" =~ ^chore\(release\):[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)([[:space:]]+\(#[0-9]+\))?[[:space:]]*$ ]]; then
             version="${BASH_REMATCH[1]}"
             echo "version=$version" >> "$GITHUB_OUTPUT"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
@@ -82,7 +89,7 @@ jobs:
           print(f"version OK: {plugin}")
           PY
 
-      - name: Skip if tag already exists (idempotent)
+      - name: Check whether the tag exists (idempotent)
         if: steps.parse.outputs.is_release == 'true'
         id: tagcheck
         env:
@@ -90,15 +97,34 @@ jobs:
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
-            echo "Tag $tag already exists on origin — nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          # Unanchored `grep -q "$tag"` would match "v0.9.6" inside
+          # "v0.9.64"; require ls-remote to return a non-empty line for
+          # the exact ref instead.
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "Tag $tag already exists on origin."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check whether the release exists (idempotent)
+        if: steps.parse.outputs.is_release == 'true'
+        id: relcheck
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create and push annotated tag
-        if: steps.parse.outputs.is_release == 'true' && steps.tagcheck.outputs.skip != 'true'
+        if: steps.parse.outputs.is_release == 'true' && steps.tagcheck.outputs.exists != 'true'
         env:
           VERSION: ${{ steps.parse.outputs.version }}
         run: |
@@ -110,7 +136,7 @@ jobs:
           git push origin "$tag"
 
       - name: Create GitHub Release
-        if: steps.parse.outputs.is_release == 'true' && steps.tagcheck.outputs.skip != 'true'
+        if: steps.parse.outputs.is_release == 'true' && steps.relcheck.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.parse.outputs.version }}
@@ -120,4 +146,27 @@ jobs:
           # --generate-notes pulls PRs/commits since the prior tag.
           # First-ever release (v0.3.15) will include all repo history
           # in its notes — one-time noise; the operator can hand-edit.
-          gh release create "$tag" --title "$tag" --generate-notes
+          # --verify-tag refuses to invent a tag from the wrong commitish
+          # if the tag push above silently failed.
+          gh release create "$tag" --title "$tag" --generate-notes --verify-tag
+
+      - name: Verify both tag and release exist
+        if: steps.parse.outputs.is_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          missing=()
+          if [ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            missing+=("tag")
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            missing+=("release")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Release $tag ended in a half-broken state — missing: ${missing[*]}"
+            exit 1
+          fi
+          echo "End state OK: $tag has both a tag and a release."
