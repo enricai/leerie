@@ -633,8 +633,12 @@ Deny-listed vars are the launcher/host-only ones: `LEERIE_STATE_DIR` and
 `-e LEERIE_STATE_DIR=/leerie-state`, `-e LEERIE_INSPECT_DIRS=`), `LEERIE_HOME`
 / `LEERIE_REPO` / `LEERIE_STATE_HOST_DIR` / `LEERIE_SELF_CMD` (self-location +
 host paths), `LEERIE_NO_PUSH` (orchestrator always gets `--no-push`; host does
-the push), `LEERIE_RUNTIME` (decided launcher-side before launch), and the
-Fly/remote/chain/wave machinery. `tests/test_launcher_env_forwarding.py`
+the push), `LEERIE_RUNTIME` (decided launcher-side before launch), the
+Fly/EC2/remote/chain/wave machinery — including the EC2 instance-lifecycle
+vars `LEERIE_EC2_INSTANCE_ID` / `LEERIE_EC2_AMI` / `LEERIE_EC2_INSTANCE_TYPE`
+/ `LEERIE_EC2_KEY_NAME` / `LEERIE_EC2_SECURITY_GROUP` / `LEERIE_EC2_SUBNET_ID`,
+launcher-only like their Fly counterparts (`LEERIE_FLY_APP` /
+`LEERIE_FLY_IMAGE` / `LEERIE_MACHINE_ID`). `tests/test_launcher_env_forwarding.py`
 extracts the loop verbatim and includes a coupling guard asserting no
 orchestrator-read override is deny-listed except four justified exceptions
 (`LEERIE_STATE_DIR`, `LEERIE_INSPECT_DIRS`, `LEERIE_NO_PUSH`, `LEERIE_RUNTIME`).
@@ -4478,15 +4482,18 @@ run all hooks).
 execution to Fly.io Machines instead of the local `nerdctl run`. The
 Colima/containerd preflight block is gated on `RUNTIME=local` and skipped
 entirely when `RUNTIME=fly`. `--runtime` flows through `REWRITTEN_ARGS`
-to the orchestrator's argparse.
+to the orchestrator's argparse. The launcher's bash-side resolution block
+also accepts `ec2` so `--runtime ec2` is not rejected by the launcher
+before a container/instance starts; EC2 provisioning itself, and the
+orchestrator-side argparse enum, are out of this launcher knob's scope.
 
 Resolution order (highest priority first):
 
-1. **`--runtime local|fly`** CLI flag. Passed through to the
+1. **`--runtime local|fly|ec2`** CLI flag. Passed through to the
    orchestrator so both the launcher and the orchestrator share the same
    resolved value.
-2. **`LEERIE_RUNTIME`** environment variable, values `local` | `fly`.
-3. **`leerie.toml`** at the repo root, `runtime = local|fly`.
+2. **`LEERIE_RUNTIME`** environment variable, values `local` | `fly` | `ec2`.
+3. **`leerie.toml`** at the repo root, `runtime = local|fly|ec2`.
 4. **Default `local`** — local `nerdctl run` is used when unset.
 
 Invalid values in env or TOML are rejected immediately with an error
