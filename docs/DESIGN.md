@@ -2227,8 +2227,10 @@ branch).
 
 The compromise: classify the orchestrator's exit code on the host side
 and route to either *stop* (preserves volume, frees compute), *destroy*
-(full reap), or *leave alone* (the user merely detached the local
-stream — the orchestrator on the machine is still working). With the
+(full reap — machine **and** its volume; see *Volume lifecycle* below,
+since Fly reaps neither for us), or *leave alone* (the user merely
+detached the local stream — the orchestrator on the machine is still
+working). With the
 detached orchestrator above, the classification is no longer "how did
 the orchestrator's run exit?" but "what just happened on the host
 side?" — because the launcher process now exits when the *tail*
@@ -2316,6 +2318,46 @@ treat the spillover as a rootfs problem to solve separately. The
 rootfs's throughput cap (2,000 IOPS / 8 MiB/s) compounds disk
 pressure by slowing spillover; the volume accelerates it as a
 side-effect since per-machine tiers run 4k–32k IOPS.
+
+**Volume lifecycle — leerie owns the reap, because Fly does not.** A Fly
+volume is an independent resource with its own lifetime: *"a Machine can
+be destroyed without destroying its volume"*, and what survives is a
+documented **"unattached volume"** that keeps accruing per-GB-month
+charges indefinitely. There is no platform-side lifecycle hook to lean
+on — the Machines API's `auto_destroy` destroys the *machine* when its
+work completes, and says nothing about that machine's volumes; `mounts`
+has no ephemeral or destroy-on-exit mode. Since `FLY_VM_DISK_GB`
+defaults to `8`, **every** Fly run creates a volume, so an unreaped one
+is not an edge case — it is the default outcome of any teardown path
+that forgets. The obligation is therefore structural: *every* path that
+destroys a machine must also destroy its volume, and "the machine is
+already gone" is precisely when a known volume still needs reaping — not
+a reason to skip it. Gating the reap behind a live-machine check inverts
+the requirement, and did: it silently leaked the volume of every run
+whose machine died first.
+
+Two platform facts fix the ordering, and they pull in opposite
+directions. The volume→machine association lives **only** on Fly (the
+volume's `attached_machine_id`, and the machine's own `config.mounts`)
+and it vanishes the instant the machine is destroyed — so anything that
+needs to *learn* a volume from its machine must do so **before** the
+destroy. But Fly refuses to destroy a volume that is still attached
+("in use by machine X") — so the reap itself must come **after**. The
+reap is thus pinned between the two: look up, destroy machine, destroy
+volume. (A *stopped* machine keeps its attachment, which is what makes
+the pause/resume contract above compatible with this: a paused run's
+volume is still owned, still attached, and must not be reaped.)
+
+One residue is irreducible and deliberately unsolved. If a machine is
+destroyed **and** the launcher dies before reaping the volume (SIGKILL,
+crash), the association is gone from both sides — Fly no longer links
+them, and the host sidecar may never have recorded it. Such a volume
+cannot be attributed to its run by any mechanism, since volume names are
+random and encode nothing. leerie does not guess: there is no
+reconciliation sweep, because "unattached" alone cannot distinguish a
+true orphan from a volume whose machine is seconds away from attaching.
+The operator reaps these by hand (`flyctl volumes list` + `destroy`),
+and the code says so where it gives up.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 
