@@ -5973,6 +5973,31 @@ $_tail_script"
     # (DESIGN §6 Remote pause-on-failure.)
     export LEERIE_REMOTE_EXIT_RC="$container_rc"
   fi
+elif [ "$RUNTIME" = "ec2" ]; then
+  # --- remote execution path (AWS EC2) -----------------------------------
+  # ec2-lib.sh's require_aws() is the AWS-CLI counterpart to
+  # require_flyctl() above: binary-present? -> authenticated? (`aws sts
+  # get-caller-identity`). It must run — and succeed — before any `aws
+  # ec2 ...` call, mirroring the fly branch's `require_flyctl || exit 1`
+  # sequencing (leerie:5364-5366). ec2-provision.sh's provision_instance()
+  # itself calls require_aws again internally as a defense-in-depth
+  # first line, but the launcher gates here too so a missing/expired AWS
+  # session fails fast with the `aws sso login` hint before this branch
+  # sources any further remote script.
+  remote_log "remote: starting AWS EC2 instance (--runtime ec2 / LEERIE_RUNTIME=ec2 / leerie.toml runtime=ec2)"
+  # shellcheck disable=SC1091
+  . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+  if ! require_aws; then
+    exit 1
+  fi
+  # Instance provisioning/seed/orchestrate/teardown wiring (DESIGN §6 "EC2
+  # runtime lifecycle") lands in a later subtask — ec2-provision.sh /
+  # ec2-seed-repo.sh are source-and-call-ready but nothing past the
+  # preflight above sources them yet (docs/IMPLEMENTATION.md "Runtime
+  # mode"). Abort explicitly rather than silently falling through to the
+  # local nerdctl path below.
+  remote_log "error: --runtime ec2 preflight passed, but instance provisioning is not yet wired into the launcher"
+  container_rc=1
 else
   # --- local container execution path ----------------------------------
   # --rm: container is removed on exit. Worktrees persist on the host via
