@@ -1741,8 +1741,7 @@ not `resolve_runtime`.
 
 Resolution order (highest priority first), identical for both knobs:
 
-1. **CLI value** — reserved for a future `--aws-region` / `--aws-profile`
-   flag; no argparse flag exists yet, so this is always `None` today.
+1. **CLI value** — `--aws-region` / `--aws-profile` flag.
 2. **`LEERIE_AWS_REGION`** / **`LEERIE_AWS_PROFILE`** environment variable.
 3. **`leerie.toml`** at the repo root, keys `aws_region` / `aws_profile`.
 4. **Default `None`.** Unset knobs leave region/profile selection to the
@@ -1751,7 +1750,8 @@ Resolution order (highest priority first), identical for both knobs:
 Code counterparts: `resolve_aws_region()` / `resolve_aws_profile()` in
 `leerie.py`, both built on the same `_resolve_str_pref` helper as
 `resolve_pr_template`. Constants: `AWS_REGION_ENV`, `AWS_REGION_FILE`,
-`AWS_PROFILE_ENV`, `AWS_PROFILE_FILE`.
+`AWS_PROFILE_ENV`, `AWS_PROFILE_FILE`. Argparse flags: `--aws-region`,
+`--aws-profile` (both free-form strings, no `choices=`).
 
 ### EC2 instance-lifecycle vars (spec — not yet implemented)
 
