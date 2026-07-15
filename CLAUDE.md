@@ -1168,6 +1168,40 @@ anywhere. Only the pattern half escapes. (Do not "fix" the resulting
 `SyntaxWarning` by making that f-string raw — the surrounding bash relies
 on Python collapsing `\\` to `\`, and `rf"""` silently breaks the stub.)
 
+The launcher's credential-resolution wiring within that same `RUNTIME=ec2`
+branch — sourcing `aws-credentials.sh`, calling `resolve_aws_credentials`,
+and `eval`ing its `export` lines before `require_aws` runs — is pinned in
+`tests/test_ec2_e2e_provision.py` (call-index ordering: an SSO-configured
+profile with explicit env-var credentials layered on top resolves via the
+env vars and `require_aws`'s `sts get-caller-identity` is the first `aws`
+CLI call observed, proving credential resolution ran first without
+invoking the `aws` binary itself; explicit env credentials winning over a
+fully-configured SSO profile; `LEERIE_AWS_PROFILE` selecting a named
+profile's static credentials over `[default]`; an expired SSO cached
+token aborting non-zero with `aws-credentials.sh`'s own
+`aws sso login --profile <p>` hint and zero `aws ec2 ...`/`sts
+get-caller-identity` calls) and in the dedicated
+`tests/test_ec2_launcher_credentials.py`, which closes the one part of
+the seam neither that file nor `tests/test_aws_credentials.py` (internal
+precedence, standalone) nor `tests/test_ec2_lib_sh.py` (`require_aws`'s
+own profile precedence, standalone) exercises: region. `require_aws`'s
+`sts get-caller-identity` call never passes a `--region` flag — the
+resolved region reaches it only through the `AWS_REGION` env var the
+dispatch block `eval`s from `resolve_aws_credentials`'s `export` lines —
+so this file's stub records the *effective `AWS_REGION` env value* seen
+at call time (not argv) to pin: `LEERIE_AWS_REGION` (leerie's own knob,
+CLAUDE.md-distinguished from the SDK's `AWS_REGION` credential-chain var)
+winning over an ambient `AWS_REGION`; the ambient `AWS_REGION` reaching
+`require_aws` unchanged when `LEERIE_AWS_REGION` is unset; and an
+unresolvable region (no `AWS_REGION`, no `AWS_DEFAULT_REGION`, no profile
+`region` key) aborting non-zero via `resolve_aws_credentials`'s own
+die-with-hint before `require_aws`'s probe ever runs, with zero `sts
+get-caller-identity` calls reaching the stub's log. It also adds a direct
+argv assertion for the profile seam (`--profile <resolved>` present when
+`LEERIE_AWS_PROFILE` is set, absent entirely when neither var is set) and
+a harness-sanity check that it imports and exercises the same
+verbatim-extracted dispatch block as `tests/test_ec2_e2e_provision.py`
+rather than a hand-copied reproduction.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
