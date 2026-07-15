@@ -38,12 +38,21 @@ leerie "<task>"
    ├─ Phase 1  Classify into 1..9 categories                    → 1 claude -p
    │             ↓ derive run_id (category + slug + start-hex)
    │           • Clarify — intent-only questions (optional; skipped for fully-specified tasks)
-   ├─ Phase 2  Plan — one planner per category (parallel)        → N claude -p
+   ├─ Phase 2  Plan — one planner per category (parallel)        → N×3 claude -p (multi-sampled)
+   │           • Decompose — repo-map-grounded recursive split into
+   │             right-sized leaf subtasks (P6 + P1)             → fit_judge / splitter
    │           • Reconcile — cross-domain capability-tag bridging (0 or 1 claude -p, when needed)
-   ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
+   │           • Overlap-judge — cross-planner surface collisions (multi-planner runs only)
+   ├─ Phase 3  Schedule — global dependency graph → topo waves   (topo-sort pure Python;
+   │             a satisfied-probe drops already-done criterion-bearing subtasks → 1 claude -p each)
    ├─ Phase 4  Create leerie/runs/<run-id> branch + worktree (per-run unique)
-   ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → claude -p each
-   │           integrate into the run branch; validate the run branch
+   ├─ Phase 5  Per wave:
+   │   ├─ Implement each subtask (parallel, isolated worktrees)  → claude -p each
+   │   │     • self-gates on evidence-anchored confidence — the only hard gate
+   │   │     • Conform — post-work doc/test/lint/build pass (advisory) → 1 conformer claude -p
+   │   ├─ Integrate the wave into the run branch; on conflict    → 1 integrator claude -p
+   │   └─ Validate the integrated run branch (conflict-marker scan)
+   │         (after the final wave: one more conformer pass on the whole tree)
    └─ Phase 6  Push run branch; open PR against working branch; cleanup
                (working branch not modified locally)
 ```
