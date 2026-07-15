@@ -372,7 +372,7 @@ local setup) because nerdctl can't reach Keychain. See
   surviving questions are dropped, and the implementer makes a
   documented best-effort decision. Also `LEERIE_CLARIFY` env var
   and `clarify = true` in `leerie.toml`.
-- `--runtime local|fly` — execution backend for per-subtask worker
+- `--runtime local|fly|ec2` — execution backend for per-subtask worker
   containers. Default: `local` (nerdctl on the local container
   runtime). `fly` routes each worker through Fly.io Machines instead
   — requires only `flyctl` logged in (`flyctl auth login`). The
@@ -381,10 +381,13 @@ local setup) because nerdctl can't reach Keychain. See
   tag is missing; opt out with `--no-auto-publish`. Opt into local
   build with `--local-build` / `LEERIE_LOCAL_BUILD=1` (requires
   working Docker daemon authenticated to `registry.fly.io`; see
-  INSTALL.md). Also `LEERIE_RUNTIME` env var or `runtime = fly` in
-  `leerie.toml` (committed per-repo default; outranked by env and
-  CLI). Precedence: `--runtime` → `LEERIE_RUNTIME` → `leerie.toml` →
-  default `local`.
+  INSTALL.md). `ec2` is accepted as a runtime value and resolves AWS
+  credentials the same way the AWS CLI/SDKs do (see
+  `scripts/remote/aws-credentials.sh`), but EC2 machine provisioning
+  itself has not shipped yet. Also `LEERIE_RUNTIME` env var or
+  `runtime = fly` in `leerie.toml` (committed per-repo default;
+  outranked by env and CLI). Precedence: `--runtime` →
+  `LEERIE_RUNTIME` → `leerie.toml` → default `local`.
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` — lower auto-compaction threshold
   for worker processes.
 

@@ -1651,13 +1651,17 @@ dir. See §0.5 *Bind-mount table* for the full mount specification.
 
 Controls which execution backend runs the per-subtask worker containers.
 `local` uses the local nerdctl/containerd runtime (the existing behavior);
-`fly` routes each worker through Fly.io machines. Default is `local` so
-existing behavior is unchanged for users who have not opted in.
+`fly` routes each worker through Fly.io machines. `ec2` is accepted as a
+resolvable enum value (AWS credentials resolve the same way the AWS
+CLI/SDKs do — see `scripts/remote/aws-credentials.sh` and `ec2-lib.sh`'s
+`require_aws()` preflight) but EC2 machine provisioning itself has not
+shipped yet. Default is `local` so existing behavior is unchanged for
+users who have not opted in.
 
 Resolution order (highest priority first):
 
-1. **`--runtime`** CLI flag, values `local` | `fly`. Argparse rejects
-   anything else before the orchestrator runs.
+1. **`--runtime`** CLI flag, values `local` | `fly` | `ec2`. Argparse
+   rejects anything else before the orchestrator runs.
 
 2. **`LEERIE_RUNTIME`** environment variable, same value set.
 
@@ -1674,7 +1678,7 @@ Resolution order (highest priority first):
 
 An invalid value in env or file is rejected at startup via `die()` — bad
 config is caught before any worker spawns. Valid values are
-`{local, fly}`.
+`{local, fly, ec2}`.
 
 > The CLI/env > file order reflects the same session-scoped vs.
 > committed-default split as `--source-of-truth`: the CLI flag and env
@@ -1683,7 +1687,7 @@ config is caught before any worker spawns. Valid values are
 Maps to: `resolve_source_of_truth` resolution pattern in `leerie.py`
 (`_read_toml_key` + env + CLI precedence). The code counterpart is
 `resolve_runtime()` in `leerie.py`; constants are `RUNTIME_VALUES`,
-`RUNTIME_ENV`, `RUNTIME_FILE`; argparse flag is `--runtime {local,fly}`.
+`RUNTIME_ENV`, `RUNTIME_FILE`; argparse flag is `--runtime {local,fly,ec2}`.
 
 ### Fly app name
 
