@@ -5517,17 +5517,20 @@ Changes:
   local-sidecar list when `flyctl` is missing or auth fails. Plain
   `--list` (no `--runtime fly`) is unchanged.
 
-Verbs `--stop`, `--kill`, `--finalize` accept an optional `--runtime`
-flag. The flag itself is validated against the full `RUNTIME_VALUES`
-enum (`local|fly|ec2` — see "Remote execution mode" below), but only
-`local` and `fly` have verb-level behavior implemented: Fly runs route
-to `flyctl machine stop`/`flyctl machine destroy`; local runs route to
+Verbs `--stop`, `--kill`, `--finalize` accept an optional
+`--runtime <local|fly>` flag — validated by the launcher (bash)
+against only `local`/`fly`, rejecting any other value (including
+`ec2`) with an error; this is narrower than the `RUNTIME_VALUES`
+enum (`local|fly|ec2` — see "Remote execution mode" below) that
+gates the top-level `--runtime` flag for launching a new run.
+`ec2` machine lifecycle (the `--stop`/`--kill --runtime ec2`
+counterpart) has not shipped — EC2 provisioning itself is out of
+scope for the work landed so far (RUNTIME_VALUES enum acceptance,
+AWS credential resolution, AWS SDK dependency). `--stop` and
+`--kill` support both `local`/`fly`: Fly runs route to `flyctl
+machine stop`/`flyctl machine destroy`; local runs route to
 `nerdctl stop`/`nerdctl kill` via the `_is_local_container` probe
-(`nerdctl inspect <run-id>`). `ec2` machine lifecycle (the
-`--stop`/`--kill --runtime ec2` counterpart) has not shipped —
-EC2 provisioning itself is out of scope for the work landed so far
-(RUNTIME_VALUES enum acceptance, AWS credential resolution, AWS SDK
-dependency). `--stop`
+(`nerdctl inspect <run-id>`). `--stop`
 uses `nerdctl stop` (SIGTERM first, allowing graceful state save);
 `--kill` uses `nerdctl kill` (immediate SIGKILL). `--finalize
 --runtime local` still errors — local finalization is inline. Without
