@@ -51,6 +51,27 @@ def test_missing_txt_file_dies(leerie, tmp_path):
         leerie.resolve_task_argument(str(missing))
 
 
+def test_embedded_nul_dies_does_not_crash(leerie):
+    # stat() rejects an embedded NUL with ValueError — not OSError — before the
+    # path reaches the kernel. Such a path can never name a file, so it must
+    # die() like any other missing task file rather than escape as an unhandled
+    # traceback.
+    with pytest.raises(SystemExit):
+        leerie.resolve_task_argument("bad\0name.md")
+
+
+def test_file_parent_dies_not_treated_as_literal(leerie, tmp_path):
+    # A path whose parent is a regular file fails stat() with ENOTDIR, not
+    # ENOENT — but it is equally definite: the target cannot exist. It must
+    # still die() as a missing task file, NOT fall through to the literal-task
+    # path reserved for errnos that mean "the filesystem could not answer"
+    # (ENAMETOOLONG et al).
+    parent = tmp_path / "notadir"
+    parent.write_text("i am a file")
+    with pytest.raises(SystemExit):
+        leerie.resolve_task_argument(str(parent / "task.md"))
+
+
 def test_very_long_literal_string_treated_as_literal(leerie, tmp_path,
                                                      monkeypatch):
     # A task string longer than NAME_MAX (255 bytes on macOS/Linux)

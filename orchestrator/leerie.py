@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import copy
 import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -32,6 +33,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -3196,6 +3198,13 @@ def _read_toml_key(path: Path, key: str) -> str | None:
 
 TASK_FILE_SUFFIXES = (".txt", ".md")
 
+# stat() failures that are a definite "no such file": the path was resolvable
+# and the answer is no. ENOTDIR belongs here with ENOENT — a component of the
+# path is a regular file, so the target cannot exist. Every other errno
+# (ENAMETOOLONG, ELOOP, EACCES, …) means the filesystem could not answer at
+# all, which is not the same as "no" — see resolve_task_argument.
+_DEFINITE_ABSENCE = frozenset({errno.ENOENT, errno.ENOTDIR})
+
 
 def resolve_task_argument(raw: str) -> str:
     """Resolve the positional `task` argument to the task string.
@@ -3206,18 +3215,29 @@ def resolve_task_argument(raw: str) -> str:
     unchanged.
     """
     p = Path(raw)
-    # A long literal task is one path component over NAME_MAX (255 bytes
-    # on macOS/Linux), which makes stat() raise ENAMETOOLONG instead of
-    # returning a "not found" result that is_file() would surface as
-    # False. Any stat failure means we cannot confirm a file, so treat
-    # `raw` as the literal task.
+    # A long literal task is one path component over NAME_MAX (255 bytes on
+    # macOS/Linux), so the filesystem cannot answer "is this a file?" at all —
+    # stat() fails with ENAMETOOLONG. That is indeterminate, not a "no", so
+    # `raw` falls through as the literal task instead of dying as a missing
+    # file. Hence stat_ok: it separates "the answer is no" from "there is no
+    # answer", which the caller's die() below depends on.
+    #
+    # stat(), not is_file(): Path.is_file() swallows OSError and returns False
+    # on Python 3.14+ (it propagated through 3.13), which silently defeats the
+    # whole guard — the errors it exists to catch never surface.
     stat_ok = True
     try:
-        is_task_file = (p.is_file()
+        is_task_file = (stat.S_ISREG(p.stat().st_mode)
                         and p.suffix.lower() in TASK_FILE_SUFFIXES)
-    except OSError:
+    except ValueError:
+        # Not an OSError: stat() rejects an embedded NUL before it reaches the
+        # kernel. Such a path can never name a file, so it is a definite "no"
+        # and belongs with _DEFINITE_ABSENCE, not with "could not answer".
         is_task_file = False
-        stat_ok = False
+    except OSError as e:
+        is_task_file = False
+        if e.errno not in _DEFINITE_ABSENCE:
+            stat_ok = False
     if is_task_file:
         contents = p.read_text().strip()
         if not contents:

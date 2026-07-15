@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`resolve_task_argument`'s ENAMETOOLONG guard no longer depends on the
+  interpreter version.** A long literal task (300+ chars ending in `.md`/`.txt`)
+  exceeds NAME_MAX, so the filesystem cannot answer "is this a file?" — the
+  guard treats that as indeterminate and falls through to the literal task
+  rather than dying as a missing file. It caught the error from `Path.is_file()`,
+  but `is_file()` swallows `OSError` and returns `False` on Python 3.14+ (it
+  propagated through 3.13), so the guard silently stopped firing and every such
+  task died with a bogus `task file not found: fix the login bug…` — telling the
+  operator to fix a file that was never meant to be one. Invisible today (the
+  container runs 3.13) and would have surfaced whenever Debian bumps. Now calls
+  `stat()` directly — which raises on both versions, and is what the code's own
+  comment always claimed it called. The `except` arm keys on **errno**, not
+  exception type: `_DEFINITE_ABSENCE = {ENOENT, ENOTDIR}` is the set that means
+  "the path resolved and the answer is no" and must still reach the `die()`,
+  while every other errno means the filesystem could not answer and `raw` falls
+  through as a literal task. `ENOTDIR` belongs there with `ENOENT` — catching
+  only `FileNotFoundError` would make `leerie notadir/task.md` run its own path
+  as the task text. `ValueError` gets its own arm: `stat()` rejects an embedded
+  NUL before the path reaches the kernel, and that is not an `OSError` — without
+  the arm it escapes as an unhandled traceback where the old code exited
+  cleanly. Behaviour is byte-identical to the old code across all 9 probed cases
+  (real file, symlink, dangling symlink, dir named `*.md`, ENOTDIR,
+  ENAMETOOLONG, literal, missing, embedded NUL) on 3.13, and differs on 3.14
+  only for the ENAMETOOLONG case being fixed. Adds ENOTDIR and NUL regression
+  tests — the coverage gap that let this class of mistake through.
+
 - **A plan whose parent subtask got split no longer dies at `validate_plan`,
   discarding the entire planning spend.** A run died at `phase 3: scheduling`
   with `config-004: depends_on 'config-003' which does not exist` after hours
