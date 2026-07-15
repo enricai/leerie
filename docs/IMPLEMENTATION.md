@@ -1683,12 +1683,18 @@ resolvable enum value (AWS credentials resolve the same way the AWS
 CLI/SDKs do — see `scripts/remote/aws-credentials.sh` and `ec2-lib.sh`'s
 `require_aws()` preflight); the instance create/wait-ready/teardown
 lifecycle itself has shipped (`scripts/remote/ec2-provision.sh` — see
-the Files table above), but the launcher's `RUNTIME=ec2` branch does not
-yet source it or dispatch to it, and the SSM/SSH transport
+the Files table above). The launcher's `RUNTIME=ec2` branch now exists
+and sources `ec2-lib.sh`, gating on `require_aws()` before anything
+else — mirroring the `RUNTIME=fly` branch's `require_flyctl` sequencing
+(`tests/test_ec2_e2e_provision.py` pins the ordering: `require_aws`'s
+`sts get-caller-identity` precedes any `ec2 run-instances` call, and a
+failing credential probe aborts before any AWS resource is created) —
+but the branch does not yet dispatch to `ec2-provision.sh`'s
+`provision_instance()`/instance lifecycle, and the SSM/SSH transport
 (`ec2-ssm.sh`, for seeding and detached-orchestrate) has not shipped —
 DESIGN §6 *EC2 runtime lifecycle* is the canonical architecture, and
 "EC2 instance-lifecycle vars" below is the code-surface spec the
-launcher-dispatch subtask implements against. Default is `local` so
+provisioning-wiring subtask implements against. Default is `local` so
 existing behavior is unchanged for users who have not opted in.
 
 Resolution order (highest priority first):
