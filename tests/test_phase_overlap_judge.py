@@ -10,7 +10,10 @@ the helpers and is easier to test directly.
 
 Mirrors the test style of test_reconciler_schema.py +
 test_apply_reconciler_output_*.py: extract the schema / call the pure
-helper / reason over the result.
+helper / reason over the result. The schema tests use a HAS_JSONSCHEMA gate
+with a manual structural fallback (as test_dep_capture_schema.py /
+test_fit_judge_schema.py do) so CI without jsonschema installed still
+catches drift — it is not a declared dependency.
 """
 from __future__ import annotations
 
@@ -18,6 +21,12 @@ import asyncio
 import copy
 
 import pytest
+
+try:
+    import jsonschema  # type: ignore
+    HAS_JSONSCHEMA = True
+except ImportError:
+    HAS_JSONSCHEMA = False
 
 
 # --------------------------------------------------------------------- #
@@ -66,6 +75,33 @@ def _valid_collision_unresolvable() -> dict:
     }
 
 
+def _validate(leerie, instance: dict) -> None:
+    """Validate using jsonschema when available; otherwise fall back to
+    structural assertions that mirror what the schema declares. Tests must
+    pass in both modes so CI without jsonschema installed still catches
+    drift."""
+    schema = leerie.SCHEMAS["plan_overlap_judge"]
+    if HAS_JSONSCHEMA:
+        jsonschema.validate(instance, schema)
+        return
+    for k in schema["required"]:
+        assert k in instance, f"missing required field {k!r}"
+    assert isinstance(instance["collisions"], list)
+    item = schema["properties"]["collisions"]["items"]
+    allowed = set(item["properties"])
+    for c in instance["collisions"]:
+        assert isinstance(c, dict)
+        for k in item["required"]:
+            assert k in c, f"collision missing required field {k!r}"
+        assert not set(c) - allowed, f"collision has unknown keys: {set(c) - allowed}"
+        assert c["resolution"] in item["properties"]["resolution"]["enum"]
+    conf_schema = schema["properties"]["confidence"]
+    conf = instance["confidence"]
+    assert isinstance(conf, dict)
+    for k in conf_schema["required"]:
+        assert k in conf, f"confidence missing required field {k!r}"
+
+
 def test_schema_exists(leerie):
     assert "plan_overlap_judge" in leerie.SCHEMAS
 
@@ -73,24 +109,20 @@ def test_schema_exists(leerie):
 def test_schema_empty_collisions_valid(leerie):
     """The no-collision case is the common one — the judge must be able
     to return {collisions: []}."""
-    import jsonschema
-    jsonschema.validate({"collisions": [], "confidence": _stub_confidence()},
-                        leerie.SCHEMAS["plan_overlap_judge"])
+    _validate(leerie, {"collisions": [], "confidence": _stub_confidence()})
 
 
 def test_schema_full_payload_valid(leerie):
-    import jsonschema
-    jsonschema.validate(
-        {"collisions": [
-            _valid_collision_merge(),
-            _valid_collision_drop_a(),
-            _valid_collision_unresolvable(),
-        ], "confidence": _stub_confidence()},
-        leerie.SCHEMAS["plan_overlap_judge"])
+    _validate(leerie, {"collisions": [
+        _valid_collision_merge(),
+        _valid_collision_drop_a(),
+        _valid_collision_unresolvable(),
+    ], "confidence": _stub_confidence()})
 
 
 def test_schema_rejects_unknown_resolution(leerie):
-    import jsonschema
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; enum check requires it")
     bad = _valid_collision_drop_a()
     bad["resolution"] = "merge_or_split"
     with pytest.raises(jsonschema.ValidationError):
@@ -100,7 +132,8 @@ def test_schema_rejects_unknown_resolution(leerie):
 
 
 def test_schema_rejects_extra_top_level_keys(leerie):
-    import jsonschema
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; additionalProperties requires it")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"collisions": [], "confidence": _stub_confidence(),
@@ -109,7 +142,8 @@ def test_schema_rejects_extra_top_level_keys(leerie):
 
 
 def test_schema_requires_core_fields(leerie):
-    import jsonschema
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; required check requires it")
     incomplete = {"a_sid": "feat-001", "b_sid": "refactor-001",
                   "resolution": "merge"}
     with pytest.raises(jsonschema.ValidationError):

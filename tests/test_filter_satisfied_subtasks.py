@@ -14,6 +14,11 @@ Covers:
   - a subtask with no success_criteria_seed is never probed (survives)
   - a probe crash (WorkerError) fails safe — subtask survives, no drop
   - SCHEMAS["satisfied_probe"] validates good / rejects malformed payloads
+
+The schema tests use a HAS_JSONSCHEMA gate with a manual structural fallback
+(mirroring test_dep_capture_schema.py / test_fit_judge_schema.py) so CI
+without jsonschema installed still catches drift — it is not a declared
+dependency.
 """
 from __future__ import annotations
 
@@ -22,6 +27,12 @@ import json
 from pathlib import Path
 
 import pytest
+
+try:
+    import jsonschema  # type: ignore
+    HAS_JSONSCHEMA = True
+except ImportError:
+    HAS_JSONSCHEMA = False
 
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
@@ -237,18 +248,35 @@ def test_budget_exhaustion_propagates_not_swallowed(leerie, tmp_path,
 # schema
 # ---------------------------------------------------------------------------
 
-def test_schema_accepts_good_payload(leerie):
-    import jsonschema
+def _validate(leerie, instance: dict) -> None:
+    """Validate using jsonschema when available; otherwise fall back to
+    structural assertions that mirror what the schema declares. Tests must
+    pass in both modes so CI without jsonschema installed still catches
+    drift."""
     schema = leerie.SCHEMAS["satisfied_probe"]
-    jsonschema.validate(
-        {"satisfied": True, "evidence": "cited", "checked": ["a.py"]},
-        schema)
+    if HAS_JSONSCHEMA:
+        jsonschema.validate(instance, schema)
+        return
+    for k in schema["required"]:
+        assert k in instance, f"missing required field {k!r}"
+    assert isinstance(instance["satisfied"], bool)
+    assert isinstance(instance["evidence"], str)
+    if "checked" in instance:
+        assert isinstance(instance["checked"], list)
+        for path in instance["checked"]:
+            assert isinstance(path, str)
+
+
+def test_schema_accepts_good_payload(leerie):
+    _validate(leerie, {"satisfied": True, "evidence": "cited",
+                       "checked": ["a.py"]})
     # checked is optional
-    jsonschema.validate({"satisfied": False, "evidence": "missing"}, schema)
+    _validate(leerie, {"satisfied": False, "evidence": "missing"})
 
 
 def test_schema_rejects_malformed(leerie):
-    import jsonschema
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; rejection requires a validator")
     schema = leerie.SCHEMAS["satisfied_probe"]
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({"evidence": "no satisfied field"}, schema)
