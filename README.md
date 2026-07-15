@@ -314,7 +314,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `LEERIE_SOURCE_OF_TRUTH` and `leerie.toml`. |
-| `--runtime VALUE` | `local` | `local` / `fly`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. |
+| `--runtime VALUE` | `local` | `local` / `fly` / `ec2`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. |
 | `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
@@ -392,7 +392,7 @@ details and sub-flags.
 |---------|---------------------|-------------|
 | `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
-| `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
+| `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
 | `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`. Unset → `implementer`, `conformer`, and `satisfied_probe` → `sonnet`; everything else → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `high`, acting workers inherit Claude default. |
