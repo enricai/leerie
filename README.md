@@ -505,8 +505,10 @@ wave execution, run-branch review, and merge; and for chain orchestration
 
 ## Documentation
 
-Every Leerie document is reachable from this README. Architecture and code
-surface:
+Every Leerie document is reachable from this README (the auto-generated
+`docs/ANALYSIS.md` is a derived build artifact, not a doc to read —
+regenerate it with the tool named in [`CLAUDE.md`](CLAUDE.md), don't
+navigate to it). Architecture and code surface:
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, constraints, phase
   flow, the evidence-gated loop, deterministic enforcement
@@ -591,6 +593,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. Not yet wired into the launcher's EC2 runtime path (that lands in a separate subtask). |
 | `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Today provides only `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning, modeled on `require_flyctl()`'s two-stage shape (binary present? → authenticated?) — checks `command -v aws` (actionable install hint if missing, no auto-install) and probes `aws sts get-caller-identity` (with a resolved `--profile`), reusing `bedrock_preflight()`'s exact `aws sso login --profile <profile>` recovery-hint vocabulary on failure. Provisioning/seed/teardown helpers land in later subtasks. |
 | `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
+| `commands/chain.md` | Thin plugin skill — reachable as `/chain` from Claude Code; relays the multi-run chain verbs (submit/status/list/kill/stop/resume/finalize/attach) to `leerie --chain` and the ID-dispatched verbs (DESIGN §19) |
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
 | `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
 | `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |

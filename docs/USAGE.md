@@ -576,6 +576,12 @@ sequencer; there is no Fly coordinator machine.
 GitHub credentials are touched only by the laptop, via the existing
 `host_finalize` mechanism per per-job run. Workers never see them.
 
+From inside Claude Code the same chain verbs are available as the
+`/chain` plugin skill at [`commands/chain.md`](../commands/chain.md)
+(submit/status/list/kill/stop/resume/finalize/attach) — the skill
+relays them to the `leerie --chain` / ID-dispatched verbs described
+below.
+
 ### Step 1 — Write your prompt files
 
 Prepare one prompt file per task. Plain text or Markdown, exactly as

@@ -1321,6 +1321,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Documentation drift against `orchestrator/leerie.py` corrected, and
+  `commands/chain.md` made reachable from the README.** An audit of the
+  DESIGN and IMPLEMENTATION layers against the code fixed seven doc-layer
+  defects (code unchanged): DESIGN §14 said "nine worker types" and asserted
+  "no gap" while `WORKER_TYPES` has eleven (`fit_judge`/`splitter` were
+  missing), and named `heal` in the post-run-worker list where the actual
+  `schema_key`/`call_type` is `patch_generator`; IMPLEMENTATION §9 understated
+  `confidence` as absent/optional for the classifier, implementer, and
+  integrator schemas (it is required in all three); IMPLEMENTATION §1 claimed
+  the launcher's `RUNTIME=ec2` branch calls `require_aws()` when no such branch
+  exists yet (`--runtime ec2` is enum-accepted but falls through to the local
+  path); and IMPLEMENTATION §5½ said `_confidence_schema` is used by "all 10
+  worker schemas (including `splitter`)" when it is nine and `splitter` carries
+  no confidence axis. Separately, the orphaned `/chain` plugin skill
+  (`commands/chain.md`) is now linked from `docs/USAGE.md` and the README Files
+  table, and the README's "Every Leerie document is reachable" claim now
+  excludes the auto-generated `docs/ANALYSIS.md` build artifact.
+
 - **Fly `fetch_branch` no longer fails after orchestrator `die()` exits.**
   `die()` raises `SystemExit`; the `except SystemExit` handler in
   `main()` now writes `finished_at` to both `state.json` and `run.json`
