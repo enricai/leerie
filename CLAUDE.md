@@ -219,11 +219,23 @@ export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
 # …or commit a leerie.toml at the repo root with: source_of_truth = codebase
 
 # Select the execution runtime (default: local). `fly` routes each worker
-# through Fly.io machines instead of local nerdctl containers.
-export LEERIE_RUNTIME=local              # or: fly
+# through Fly.io machines instead of local nerdctl containers; `ec2`
+# accepts the enum value and resolves AWS credentials the same way the
+# AWS CLI/SDKs do (env vars > named profile > SSO cached token; see
+# scripts/remote/aws-credentials.sh) — EC2 machine provisioning itself
+# has not shipped yet.
+export LEERIE_RUNTIME=local              # or: fly, ec2
 export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally unique)
 ./leerie "task" --runtime fly
 # …or commit a leerie.toml at the repo root with: runtime = fly
+
+# ec2 runtime knobs (leerie-level knobs for which AWS region/profile
+# leerie itself uses when provisioning EC2 machines — distinct from the
+# AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain env vars, which
+# resolve independently via the standard AWS precedence order):
+export LEERIE_AWS_REGION=us-east-1       # or: leerie.toml aws_region = us-east-1
+export LEERIE_AWS_PROFILE=my-aws-profile # or: leerie.toml aws_profile = my-aws-profile
+./leerie "task" --runtime ec2
 
 # Choose the model. Without overrides: judgment workers (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator)
