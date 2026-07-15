@@ -240,3 +240,32 @@ ec2_tar_pipe() {
     "$ssh_target" \
     "sh -c 'mkdir -p '\''$extract_dir'\'' && tar -xzC '\''$extract_dir'\'''"
 }
+
+# --- resolve_* (LEERIE_EC2_* required-var reads) ---------------------------
+# One thin helper per RunInstances parameter (IMPLEMENTATION.md "EC2
+# instance-lifecycle vars"). Each prints the var's value on success; on an
+# unset/empty var, prints an actionable error naming the missing var to
+# stderr and returns 1 rather than letting `${VAR:?}` under `set -u` kill
+# the whole sourcing shell with bash's generic "parameter null or not set"
+# message. No defaults exist for any of these — DESIGN §6 / IMPLEMENTATION.md
+# are explicit that there is no sensible AMI/instance-type/key-pair/
+# security-group/subnet leerie can pick on the operator's behalf.
+#
+# Shared here (not in ec2-provision.sh) because ec2-ssm.sh's SSH-fallback
+# transport also needs resolve_key_name/resolve_security_group.
+_resolve_ec2_var() {
+  local var_name="$1"
+  local value="${!var_name:-}"
+  if [ -z "$value" ]; then
+    remote_log "error: $var_name is not set — required for --runtime ec2."
+    echo "  Set $var_name and re-run. See docs/IMPLEMENTATION.md \"EC2 instance-lifecycle vars\"." >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+resolve_ami() { _resolve_ec2_var LEERIE_EC2_AMI; }
+resolve_instance_type() { _resolve_ec2_var LEERIE_EC2_INSTANCE_TYPE; }
+resolve_key_name() { _resolve_ec2_var LEERIE_EC2_KEY_NAME; }
+resolve_security_group() { _resolve_ec2_var LEERIE_EC2_SECURITY_GROUP; }
+resolve_subnet_id() { _resolve_ec2_var LEERIE_EC2_SUBNET_ID; }
