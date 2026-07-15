@@ -2,12 +2,19 @@
 
 DESIGN §6 *EC2 runtime lifecycle* + IMPLEMENTATION.md "Runtime mode"
 establish require_aws() (scripts/remote/ec2-lib.sh) as the host-side
-preflight that must run — and succeed — before any `aws ec2 ...` call.
-tests/test_ec2_lib_sh.py already pins require_aws() as a standalone
-function; this module pins the seam a unit test cannot see: that the
-`leerie` launcher's `RUNTIME=ec2` branch actually calls it, in the right
-order, before any resource is created, and that a failing credential
-probe leaves zero AWS resources behind.
+preflight that must run — and succeed — before any `aws ec2 ...` call,
+and scripts/remote/aws-credentials.sh's resolve_aws_credentials() as
+the credential-resolution step that must run — and succeed — before
+require_aws's own `sts get-caller-identity` probe, so the resolved
+identity (explicit env vars > named profile via
+LEERIE_AWS_PROFILE/AWS_PROFILE > SSO cached token) is what every
+subsequent `aws ec2 ...` call inherits. tests/test_ec2_lib_sh.py
+already pins require_aws() and tests/test_aws_credentials.py already
+pins resolve_aws_credentials() as standalone functions; this module
+pins the seam a unit test cannot see: that the `leerie` launcher's
+`RUNTIME=ec2` branch actually calls both, in the right order, before
+any resource is created, and that a failing credential probe leaves
+zero AWS resources behind.
 
 Harness: this module extracts the launcher's `elif [ "$RUNTIME" = "ec2"
 ]` block verbatim (mirroring tests/test_launcher_env_forwarding.py's
@@ -26,12 +33,21 @@ rather than an empty, vacuously-true log.
 The stub `aws` is tests/ec2_stub.py's resource-tracking state machine
 (not the argv-only stub in test_ec2_lib_sh.py) so the credential-
 failure case can assert zero tracked instances/volumes, not just which
-commands were invoked.
+commands were invoked. Credential resolution itself is pure file I/O
+against a fixture `$HOME/.aws` tree (resolve_aws_credentials never
+calls the `aws` binary), so `stub_aws_env` also points `HOME` at a
+fresh per-test directory and callers populate `home/.aws/...` as
+needed — tests that don't care about credential precedence get a
+minimal env-var-credentials fixture so require_aws's own `sts
+get-caller-identity` call is reached.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
@@ -49,6 +65,25 @@ REQUIRED_PROVISION_ENV = {
     "LEERIE_EC2_SECURITY_GROUP": "sg-0123456789abcdef0",
     "LEERIE_EC2_SUBNET_ID": "subnet-0123456789abcdef0",
 }
+
+SSO_START_URL = "https://my-sso-portal.awsapps.com/start"
+
+
+def _write_sso_cache(home: Path, start_url: str, *, expires_delta: timedelta,
+                      token: str = "FAKE_TOKEN") -> None:
+    cache_dir = home / ".aws" / "sso" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(start_url.encode()).hexdigest()
+    expires_at = (datetime.now(timezone.utc) + expires_delta).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    payload = {
+        "startUrl": start_url,
+        "region": "us-east-1",
+        "accessToken": token,
+        "expiresAt": expires_at,
+    }
+    (cache_dir / f"{digest}.json").write_text(json.dumps(payload))
 
 
 # ---------------------------------------------------------------------------
@@ -70,19 +105,38 @@ def extract_ec2_dispatch_block() -> str:
 
 
 def stub_aws_env(aws_dir: Path, *, identity_succeeds: bool = True,
-                  extra: dict | None = None) -> dict:
+                  extra: dict | None = None, home: Path | None = None) -> dict:
     """Write the resource-tracking `aws` stub into aws_dir and build the
     env dict that runs it. When identity_succeeds is False, `sts
     get-caller-identity` is made to fail without disturbing the stub's
-    state-machine behavior for any other subcommand."""
+    state-machine behavior for any other subcommand.
+
+    `resolve_aws_credentials` (scripts/remote/aws-credentials.sh) now
+    runs before require_aws's own `sts get-caller-identity` call, and
+    it is pure file I/O against `$HOME/.aws` — never the `aws` binary
+    — so this always points HOME at a fresh, isolated directory. When
+    the caller doesn't pass `home` (i.e. doesn't care about credential
+    precedence), a minimal explicit-env-var-credentials fixture is
+    used so credential resolution succeeds and require_aws's own probe
+    is actually reached; ambient AWS_* env vars and the real user's
+    $HOME are always excluded so no test can accidentally depend on
+    (or leak into) the host's real AWS config."""
     _stub_aws(aws_dir)
     if not identity_succeeds:
         _break_sts_get_caller_identity(aws_dir)
-    env = {k: v for k, v in os.environ.items()}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("AWS_") and k not in ("LEERIE_AWS_PROFILE", "LEERIE_AWS_REGION")}
     env["PATH"] = f"{aws_dir}:{env.get('PATH', '')}"
     env["USER_REPO"] = str(aws_dir)
     env["LEERIE_REPO"] = str(REPO_ROOT)
     env.pop("LEERIE_STATE_DIR", None)
+    if home is None:
+        home = aws_dir.parent / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["AWS_ACCESS_KEY_ID"] = "AKIASTUBFIXTURE"
+        env["AWS_SECRET_ACCESS_KEY"] = "stubfixturesecret"
+        env["AWS_REGION"] = "us-east-1"
+    env["HOME"] = str(home)
     if extra:
         env.update(extra)
     return env
@@ -274,5 +328,179 @@ def test_failing_preflight_does_not_source_provisioning_helpers(tmp_path):
     assert result.returncode != 0
     combined = result.stdout + result.stderr
     assert "aws sso login" in combined, combined
+    state = read_state(aws_dir)
+    assert state == {"instances": {}, "volumes": {}}
+
+
+def test_dispatch_block_sources_aws_credentials_sh():
+    """The extracted arm must source aws-credentials.sh and call
+    resolve_aws_credentials — the wiring this subtask adds."""
+    block = extract_ec2_dispatch_block()
+    assert "aws-credentials.sh" in block
+    assert "resolve_aws_credentials" in block
+
+
+def test_credential_resolution_precedes_require_aws_by_call_index(tmp_path):
+    """resolve_aws_credentials is pure file I/O against $HOME/.aws — it
+    never calls the `aws` binary — so this asserts ordering indirectly:
+    a profile with BOTH a valid SSO cache AND explicit env-var
+    credentials must resolve via the env vars (proving
+    resolve_aws_credentials ran and won), and the very first `aws` CLI
+    invocation observed in the log must be require_aws's own `sts
+    get-caller-identity` call — proving credential resolution completed
+    (env-var branch, no aws-CLI calls of its own) strictly before
+    require_aws's first CLI call."""
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".aws").mkdir()
+    (home / ".aws" / "config").write_text(
+        "[profile dev]\n"
+        "region = us-west-2\n"
+        "sso_session = my-sso\n"
+        "\n"
+        "[sso-session my-sso]\n"
+        "sso_region = us-east-1\n"
+        f"sso_start_url = {SSO_START_URL}\n"
+    )
+    _write_sso_cache(home, SSO_START_URL, expires_delta=timedelta(hours=1))
+
+    env = stub_aws_env(
+        aws_dir, identity_succeeds=True, home=home,
+        extra={
+            **REQUIRED_PROVISION_ENV,
+            "AWS_PROFILE": "dev",
+            "AWS_ACCESS_KEY_ID": "AKIAENVWINS",
+            "AWS_SECRET_ACCESS_KEY": "envsecretwins",
+        },
+    )
+
+    result = run_ec2_dispatch(env)
+    assert result.returncode == 0, result.stderr
+
+    log = read_log(aws_dir)
+    assert log, "expected at least one aws CLI call"
+    assert log[0].startswith("sts get-caller-identity"), (
+        f"require_aws's sts get-caller-identity must be the first aws CLI "
+        f"call — resolve_aws_credentials must not invoke the aws binary "
+        f"and must complete before require_aws runs; log={log}"
+    )
+
+
+def test_explicit_env_credentials_win_over_sso_profile_in_dispatch(tmp_path):
+    """DESIGN precedence: explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+    win over a fully-configured SSO profile with a valid cached token,
+    exercised through the real launcher dispatch block (not just the
+    standalone aws-credentials.sh unit tests)."""
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".aws").mkdir()
+    (home / ".aws" / "config").write_text(
+        "[profile dev]\n"
+        "region = us-west-2\n"
+        "sso_session = my-sso\n"
+        "\n"
+        "[sso-session my-sso]\n"
+        "sso_region = us-east-1\n"
+        f"sso_start_url = {SSO_START_URL}\n"
+    )
+    _write_sso_cache(home, SSO_START_URL, expires_delta=timedelta(hours=1))
+
+    env = stub_aws_env(
+        aws_dir, identity_succeeds=True, home=home,
+        extra={
+            **REQUIRED_PROVISION_ENV,
+            "AWS_PROFILE": "dev",
+            "AWS_ACCESS_KEY_ID": "AKIAENVWINS",
+            "AWS_SECRET_ACCESS_KEY": "envsecretwins",
+        },
+    )
+
+    result = run_ec2_dispatch(env)
+
+    assert result.returncode == 0, result.stderr
+    state = read_state(aws_dir)
+    assert len(state["instances"]) == 1
+
+
+def test_leerie_aws_profile_selects_named_profile_over_default(tmp_path):
+    """LEERIE_AWS_PROFILE selects a named profile's static credentials
+    over [default], through the real launcher dispatch block."""
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".aws").mkdir()
+    (home / ".aws" / "config").write_text(
+        "[default]\n"
+        "region = us-east-1\n"
+        "\n"
+        "[profile dev]\n"
+        "region = us-west-2\n"
+    )
+    (home / ".aws" / "credentials").write_text(
+        "[default]\n"
+        "aws_access_key_id = AKIADEFAULT\n"
+        "aws_secret_access_key = defaultsecret\n"
+        "\n"
+        "[dev]\n"
+        "aws_access_key_id = AKIADEV\n"
+        "aws_secret_access_key = devsecret\n"
+    )
+
+    env = stub_aws_env(
+        aws_dir, identity_succeeds=True, home=home,
+        extra={**REQUIRED_PROVISION_ENV, "LEERIE_AWS_PROFILE": "dev"},
+    )
+
+    result = run_ec2_dispatch(env)
+
+    assert result.returncode == 0, result.stderr
+    state = read_state(aws_dir)
+    assert len(state["instances"]) == 1
+
+
+def test_expired_sso_token_aborts_with_hint_and_zero_ec2_calls(tmp_path):
+    """An expired SSO cached token must abort non-zero, emit the `aws
+    sso login --profile <p>` hint (aws-credentials.sh's own hint, not
+    require_aws's — resolve_aws_credentials must fail closed before
+    require_aws even runs), and issue zero `aws ec2 ...` calls."""
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".aws").mkdir()
+    (home / ".aws" / "config").write_text(
+        "[profile dev]\n"
+        "region = us-west-2\n"
+        "sso_session = my-sso\n"
+        "\n"
+        "[sso-session my-sso]\n"
+        "sso_region = us-east-1\n"
+        f"sso_start_url = {SSO_START_URL}\n"
+    )
+    _write_sso_cache(
+        home, SSO_START_URL, expires_delta=timedelta(hours=-1), token="EXPIRED"
+    )
+
+    env = stub_aws_env(
+        aws_dir, identity_succeeds=True, home=home,
+        extra={**REQUIRED_PROVISION_ENV, "LEERIE_AWS_PROFILE": "dev"},
+    )
+
+    result = run_ec2_dispatch(env, run_provision=False)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "aws sso login --profile dev" in combined, combined
+
+    log = read_log(aws_dir)
+    ec2_calls = [l for l in log if l.startswith("ec2 ")]
+    assert not ec2_calls, f"no aws ec2 call should happen when credential resolution fails; log={log}"
+    identity_calls = [l for l in log if l.startswith("sts get-caller-identity")]
+    assert not identity_calls, (
+        f"require_aws's sts get-caller-identity must not run when "
+        f"resolve_aws_credentials already failed closed; log={log}"
+    )
+
     state = read_state(aws_dir)
     assert state == {"instances": {}, "volumes": {}}

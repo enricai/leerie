@@ -6063,18 +6063,36 @@ $_tail_script"
   fi
 elif [ "$RUNTIME" = "ec2" ]; then
   # --- remote execution path (AWS EC2) -----------------------------------
-  # ec2-lib.sh's require_aws() is the AWS-CLI counterpart to
-  # require_flyctl() above: binary-present? -> authenticated? (`aws sts
-  # get-caller-identity`). It must run — and succeed — before any `aws
-  # ec2 ...` call, mirroring the fly branch's `require_flyctl || exit 1`
-  # sequencing (leerie:5364-5366). ec2-provision.sh's provision_instance()
-  # itself calls require_aws again internally as a defense-in-depth
-  # first line, but the launcher gates here too so a missing/expired AWS
-  # session fails fast with the `aws sso login` hint before this branch
-  # sources any further remote script.
+  # aws-credentials.sh's resolve_aws_credentials() implements the
+  # documented AWS SDK/CLI credential precedence (explicit env vars >
+  # named profile via LEERIE_AWS_PROFILE/AWS_PROFILE > SSO cached token).
+  # It must run — and succeed — before require_aws()'s `sts
+  # get-caller-identity` probe, so the resolved identity is the one
+  # every subsequent `aws ec2 ...` call inherits, not whatever the
+  # ambient shell happened to have. ec2-lib.sh's require_aws() is the
+  # AWS-CLI counterpart to require_flyctl() above: binary-present? ->
+  # authenticated?, mirroring the fly branch's
+  # `require_flyctl || exit 1` sequencing (leerie:5364-5366).
+  # ec2-provision.sh's provision_instance() itself calls require_aws
+  # again internally as a defense-in-depth first line, but the launcher
+  # gates here too so a missing/expired AWS session fails fast with the
+  # `aws sso login` hint before this branch sources any further remote
+  # script.
   remote_log "remote: starting AWS EC2 instance (--runtime ec2 / LEERIE_RUNTIME=ec2 / leerie.toml runtime=ec2)"
   # shellcheck disable=SC1091
+  . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+  # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+  _leerie_aws_creds_args=()
+  [ -n "${LEERIE_AWS_PROFILE:-}" ] && _leerie_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+  [ -n "${LEERIE_AWS_REGION:-}" ] && _leerie_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+  _leerie_aws_creds_exports="$(resolve_aws_credentials "${_leerie_aws_creds_args[@]}")"
+  _leerie_aws_creds_rc=$?
+  if [ "$_leerie_aws_creds_rc" -ne 0 ]; then
+    exit 1
+  fi
+  eval "$_leerie_aws_creds_exports"
+  unset _leerie_aws_creds_args _leerie_aws_creds_exports _leerie_aws_creds_rc
   if ! require_aws; then
     exit 1
   fi
