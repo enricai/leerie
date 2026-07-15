@@ -174,6 +174,22 @@ def main(argv):
         print(json.dumps({"Reservations": reservations}))
         return 0
 
+    if action == "describe-instance-status":
+        ids = get_flag_all(argv, "--instance-ids") or list(state["instances"].keys())
+        statuses = []
+        for iid in ids:
+            rec = state["instances"].get(iid)
+            if rec is None or rec["state"] != "running":
+                continue
+            ok = "ok" if rec.get("status_ok", True) else "initializing"
+            statuses.append({
+                "InstanceId": iid,
+                "InstanceStatus": {"Status": ok},
+                "SystemStatus": {"Status": ok},
+            })
+        print(json.dumps({"InstanceStatuses": statuses}))
+        return 0
+
     if action == "stop-instances":
         ids = get_flag_all(argv, "--instance-ids")
         changed = []
