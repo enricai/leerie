@@ -74,6 +74,19 @@ Current runtime deps:
   TypeScript, JavaScript, Ruby, Go, Rust, …) for `tree-sitter`. Paired
   with the `tree-sitter` pin; the `cp310-abi3` ABI tag means one wheel
   covers Python 3.10 through 3.13 (the container's Debian 13 Python).
+- `boto3` / `botocore` — the maintained AWS SDK for Python. Deliberate
+  exception to the stdlib-preferred policy: EC2 provisioning
+  (the `--runtime aws` counterpart to the existing Fly.io runtime)
+  needs AWS's own credential-resolution chain (env vars → shared
+  config/credentials files → SSO → EC2 instance profile/IMDS →
+  container credentials), which is maintained upstream as AWS's
+  auth surface evolves; hand-parsing `aws` CLI output would mean
+  reimplementing and re-chasing that chain. `botocore` is pinned
+  explicitly alongside `boto3` (rather than left as an implicit
+  transitive resolve) to match how `tree-sitter-language-pack` is
+  pinned alongside `tree-sitter` — an exact pin on both the
+  high-level SDK and the library that actually implements
+  credential/region resolution and request signing.
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.
