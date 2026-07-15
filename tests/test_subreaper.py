@@ -61,12 +61,19 @@ def test_zombie_reaper_reaps_an_orphaned_child(leerie):
     slot. This is the exact mechanism that was filling the cgroup pids.max.
 
     We fork a direct child (so this test process is its parent and thus the
-    one obligated to wait) that exits immediately, confirm it is a zombie,
-    then run the reaper and confirm it is gone.
+    one obligated to wait) that exits immediately, register it the way
+    `_DescendantTracker._poll_loop` registers an observed descendant, then run
+    the reaper and confirm it is gone.
+
+    The registration is mandatory, not incidental: the reaper reaps only its
+    `_REAPABLE_PIDS` allowlist and never discovers pids by scanning /proc
+    (DESIGN §6 *Zombie reaping*). An unregistered zombie is invisible to it by
+    design — that is what keeps it off asyncio's children.
     """
     pid = os.fork()
     if pid == 0:  # child
         os._exit(0)
+    leerie._mark_reapable({pid})  # what _DescendantTracker does in production
 
     # Give the child a moment to exit and become a zombie.
     def _is_zombie(p: int) -> bool:
@@ -93,11 +100,14 @@ def test_zombie_reaper_reaps_an_orphaned_child(leerie):
         except asyncio.CancelledError:
             pass
 
-    asyncio.run(_one_tick())
+    try:
+        asyncio.run(_one_tick())
 
-    # After reaping, the pid must no longer exist at all (zombie cleared).
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+        # After reaping, the pid must no longer exist at all (zombie cleared).
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        leerie._REAPABLE_PIDS.discard(pid)
 
 
 def test_reaper_is_wired_into_orchestrate(leerie):
