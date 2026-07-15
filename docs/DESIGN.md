@@ -900,10 +900,31 @@ is not an implementation nicety; it is the invariant the resume guarantee
 depends on.
 
 When more than one run is in flight in the same repository, `--resume`
-needs to know *which* run to resume. The orchestrator auto-picks when
-exactly one run exists, and requires an explicit run-id otherwise; the
-discovery scans `<state-root>/runs/*/state.json`. Resume never guesses across
-multiple runs.
+needs to know *which* run to resume; the discovery scans
+`<state-root>/runs/*/state.json`. An explicit run-id always wins and must
+match exactly (an unknown id fails closed — resume never falls back to a
+guess when the user named a run). Without one, the orchestrator considers
+only the runs that are actually resumable — those whose derived status is
+`in-progress`, `paused`, or `incomplete` — and picks the most recent. A
+run that has finished (`done`, `done-pushed-pr`) has nothing to resume, and
+one that needs operator attention first (`seed-failed`, `sync-failed`) is
+never auto-picked: both are listed, not chosen. When no run is resumable,
+or the newest cannot be identified, `--resume` lists the candidates and
+requires an explicit id.
+
+Recency is read from `started_at`, falling back to the state file's mtime
+when that field is absent — a run missing a timestamp must never sort above
+a real one and win the auto-pick by accident.
+
+Auto-picking a run that is still running is not an error: the run
+directory's `flock` (see *Single owner per run dir*) rejects the second
+orchestrator, so the outcome is a clear "already running", not a
+double-drive.
+
+The resumable-status narrowing belongs to `--resume` alone. The read-only
+verbs that share the same run-selection logic (`--report`, `--phase`) skip
+it: they act on a run's *records*, not its remaining work, and a finished
+run is the ordinary thing to report on.
 
 ### Single owner per run dir
 

@@ -1043,13 +1043,57 @@ never calls `create-volume` — root EBS is implicit via `run-instances`
 with AWS's own `DeleteOnTermination=true` default (DESIGN §6 "EBS
 volume lifecycle" case 1) — so any tracked volume on this path would by
 construction be an orphan.
+The no-result-event retry (DESIGN §6, `claude -p` exits 0 having streamed a
+full session but never emits its terminal `result` event — upstream
+anthropics/claude-code #8126/#1920/#74761, unresolved) is pinned in
+`tests/test_no_result_event_retry.py`: `_invoke` returns a synthetic
+`_leerie_synthetic: "no_result_event"` envelope rather than raising, so
+`claude_p`'s existing 2-attempt loop absorbs it (a raised WorkerError
+propagated past that loop and die()d the run non-resumably). The
+load-bearing test is
+`test_synthetic_envelope_is_not_an_auth_or_quota_failure`: it extracts the
+**real** message from `_invoke`'s source via `ast` rather than asserting
+against a copied fixture — `_is_auth_or_quota_failure` falls back to text
+markers (`rate limit` / `invalid authentication`) on `result`, so a
+hand-copied fixture passes happily while the shipping message silently
+diverts every no-result retry into the tenacity backoff and burns the whole
+`auth_retry_max_sec` budget (verified: the copied-fixture version of this
+test does **not** fail when the landmine is introduced; the ast-extracted
+one does). Paired with a source-coupling guard that the synthetic return is
+the **last** arm of the no-envelope block — every arm above it (overage,
+OOM, nonzero rc) is a named non-retryable condition that still raises, and
+the nonzero-rc arm in particular covers leerie's own deliberate
+SIGTERM/SIGKILLs, which must never be retried.
+`tests/test_warnings_before_die.py` pins the ordering that made that bug
+undiagnosable in the first place: all four judgment phases (classifier,
+provision, reconciler, plan_overlap_judge) log their `_run_checked_loop`
+warnings — which carry the underlying exception text — **before** `die()`,
+since `die()` calls `sys.exit()` and any loop after it is unreachable
+(falsified live: reverting one site fails the guard).
+`tests/test_resolve_run_id_autopick.py` covers bare `--resume` auto-picking
+the newest resumable run (`in-progress`/`paused`/`incomplete`), including
+the two traps found by running the design against a real 58-run state dir:
+`seed-failed` rows carry no `started_at` and sorted to the *top* of a naive
+newest-first sort (they are now list-only, never auto-picked), and a
+missing `started_at` must never outrank a real timestamp. An explicit
+run-id stays exempt from the filter (so `--resume <seed-failed-id>` still
+works) and an unknown one still fails closed.
+`tests/test_container_entry_run_id.py` covers `container-entry.sh` skipping
+its cidfile `--run-id` injection when `--resume` is present — a resume
+container is a *new* container whose id matches no run on disk, which is
+what made bare `--resume` die naming an id the user never typed. The
+injection block is extracted from the real script at test time (the
+`_extract_config_arm` pattern) so it cannot drift.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
-The worker invocation path (`claude_p`) is not unit-tested; meaningful
-testing requires a stub or live `claude` binary and lives in a separate
-end-to-end tier.
+The worker invocation path is unit-tested only at the `claude_p` layer, via
+a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin
+the retry/envelope contract. `_invoke` itself (process spawn, stream
+parsing, cgroup enrollment) still needs a stub or live `claude` binary and
+lives in a separate end-to-end tier.
 
 ## Task completion checklist
 

@@ -1239,7 +1239,8 @@ leerie "task"
 #   and write verdict files to <run-dir>/<judge-dir>/.
 # --phase heal: read the judge index for failing call_types and run the
 #   self-heal loop for each; if no judge index exists yet, runs judge first.
-# Use --run-id to select a run when multiple exist; auto-picks when only one.
+# Use --run-id to select a specific run; otherwise auto-picks the most
+# recent resumable one.
 leerie --phase judge --run-id bugfix-login-timeout-bug-b81e90
 leerie --phase heal  --run-id bugfix-login-timeout-bug-b81e90
 # Combine with heal-loop knobs:
@@ -2889,6 +2890,32 @@ wrapper that resolves the script path and forwards to `run_proc`.
 The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
+
+#### No result event
+
+`claude -p` intermittently exits 0 having streamed a full session but never
+emitting its terminal `result` event (anthropics/claude-code #8126, #1920,
+#74761 — upstream, unresolved, no public repro). `_invoke()` returns a
+synthetic envelope for that case — `is_error: True`,
+`structured_output: None`, `_leerie_synthetic: "no_result_event"` — rather
+than raising, so the failure routes into the 2-attempt corrective loop above
+and the worker gets one fresh session. The attempt-2 nudge names the
+`StructuredOutput` tool explicitly (the session-level variant of the
+schema-violation nudge). Two failures raise `WorkerError` as before, so the
+worst case is unchanged.
+
+The synthetic `result` text must not contain `Invalid authentication` /
+`rate limit` / `rate-limit`: `_is_auth_or_quota_failure()` falls back to
+those text markers, and a false match would divert the retry into the
+auth backoff below and burn the whole `auth_retry_max_sec` budget.
+Pinned by `tests/test_no_result_event_retry.py`.
+
+This is the **last** arm of `_invoke()`'s no-envelope block, and
+deliberately so: every arm above it (out-of-credits, OOM, nonzero exit
+code) is a named, non-retryable condition and still raises. The nonzero-rc
+arm in particular covers leerie's own deliberate kills (SIGTERM/SIGKILL),
+which must never be retried — and the worker-timeout path raises
+`subprocess.TimeoutExpired` before the block is reached at all.
 
 #### Auth/quota backoff
 
@@ -5615,7 +5642,10 @@ typically because `seed_auth` aborted before `phase_classify`).
 corrupt-sidecar check). `resolve_run_id()` accepts orphan ids
 transitively (no special-casing needed once `discover_runs` returns
 them), so `./leerie --resume <orphan-id> --runtime fly` works against a
-seed-failed run.
+seed-failed run. An **explicit** id is exempt from the resumable-status
+filter below, so this keeps working; `seed-failed` is excluded from the
+bare-`--resume` *auto-pick* only (it needs an operator decision first,
+and its rows carry no `started_at` to rank by).
 
 **EC2 counterpart (spec — `discover_runs()` widening not yet
 implemented).** DESIGN §6 *EC2 runtime lifecycle* ("Run identifier")
@@ -6250,8 +6280,10 @@ read it as a post-run harvest.
 
 `leerie --report [RUN_ID]` is a read-only telemetry report for a single run;
 like `--list` it exits without running orchestrate. Run selection reuses
-`resolve_run_id` (exact-match a passed id, else auto-pick the sole run, else
-die with the available list). It prints:
+`resolve_run_id` (exact-match a passed id, else auto-pick the most recent
+run, else die with the available list). `--report` deliberately does **not**
+pass `resumable_only=True` — unlike `--resume` it is read-only, and
+reporting on a *finished* run is the normal case. It prints:
 
 - a header (status, duration, and the `state.json` `telemetry` aggregate —
   calls, `$cost`, in/out tokens);

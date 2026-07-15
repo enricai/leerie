@@ -2732,18 +2732,75 @@ def discover_runs(leerie_root: Path) -> list[dict]:
     return out
 
 
-def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
-    """Pick the run_id to operate on. Used by `--resume`.
+# Derived statuses (see `_derive_run_status`) that bare `--resume` may
+# auto-pick: the run has work left and no operator action is owed first.
+# `seed-failed` / `sync-failed` are resumable but deliberately excluded —
+# both need a human decision, so they are listed rather than chosen.
+# Terminal statuses (`done`, `done-pushed-pr`, `killed`, …) have nothing
+# to resume. See DESIGN §6 *The run branch is the resume contract*.
+_AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
+
+
+def _run_status_for(run: dict, leerie_root: Path) -> str:
+    """Derived status for a `discover_runs` row.
+
+    Reads the run.json sidecar (same source `leerie --list` consults) and
+    hands it to `_derive_run_status` alongside the state.json dict the
+    discovery already parsed. Falls back to state.json alone when the
+    sidecar is missing or unreadable — status is best-effort UX here, not
+    a correctness boundary."""
+    run_json: dict | None = None
+    sidecar = leerie_root / "runs" / run["run_id"] / "run.json"
+    if sidecar.is_file():
+        try:
+            parsed = json.loads(sidecar.read_text())
+            if isinstance(parsed, dict):
+                run_json = parsed
+        except (OSError, ValueError):
+            pass
+    return _derive_run_status(run_json, run)
+
+
+def _run_recency_key(run: dict, leerie_root: Path) -> tuple[int, str]:
+    """Sort key for picking the most recent run, newest last.
+
+    `started_at` is authoritative, but it is not guaranteed present (an
+    orphaned run dir has no state.json to read it from). A missing value
+    must never sort *above* a real timestamp and win the auto-pick, so
+    those rows fall back to the state file's mtime and are ranked below
+    every run that has a real `started_at` (the leading 0/1 flag)."""
+    started = run.get("started_at")
+    if started:
+        return (1, str(started))
+    sidecar = leerie_root / "runs" / run["run_id"] / "state.json"
+    try:
+        return (0, str(sidecar.stat().st_mtime))
+    except OSError:
+        return (0, "")
+
+
+def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
+                   resumable_only: bool = False) -> str:
+    """Pick the run_id to operate on.
 
     Policy (DESIGN §6 "the run branch is the resume contract"):
     - If `cli_run_id` is given, it must exactly match an existing run.
-      Otherwise die with the available list (fails closed).
-    - Elif exactly one run exists, use it. Preserves the common case
-      where there's only one run in flight.
-    - Else die: multiple runs and no `--run-id` is ambiguous.
+      Otherwise die with the available list (fails closed) — when the user
+      names a run, never silently act on a different one.
+    - Else auto-pick the most recent run, and die with the candidate list
+      when the choice is empty.
 
-    Never guesses across multiple runs. `--resume` against an ambiguous
-    repo is a hard error, not a heuristic."""
+    `resumable_only` narrows the auto-pick to runs that actually have work
+    left (`_AUTO_RESUMABLE_STATUSES`). `--resume` passes it: a finished run
+    has nothing to resume, and `seed-failed` / `sync-failed` need operator
+    attention first, so both are listed rather than chosen. Read-only
+    consumers (`--report`, `--phase`) do NOT pass it — reporting on a
+    completed run is the normal case, and filtering it out would break
+    `leerie --report` on a repo whose only run has finished.
+
+    Auto-picking a live run is safe for `--resume`: the run dir's flock
+    rejects a second orchestrator (DESIGN §6 *Single owner per run dir*),
+    surfacing as "already running" rather than a double-drive."""
     runs = discover_runs(leerie_root)
     if cli_run_id is not None:
         for r in runs:
@@ -2759,14 +2816,29 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
             f"no runs found under {leerie_root}/runs/. Start a new run with "
             "`./leerie \"<task>\"`."
         )
-    if len(runs) == 1:
-        return runs[0]["run_id"]
-    available = "\n  ".join(_format_run_for_disambiguation(r, leerie_root)
-                            for r in runs)
-    die(
-        "multiple runs present; pass the run-id to disambiguate:\n  "
-        f"{available}\nUse `leerie --list` to see full details."
-    )
+    candidates = runs
+    if resumable_only:
+        candidates = [r for r in runs
+                      if _run_status_for(r, leerie_root)
+                      in _AUTO_RESUMABLE_STATUSES]
+    if not candidates:
+        available = "\n  ".join(_format_run_for_disambiguation(r, leerie_root)
+                                for r in runs)
+        die(
+            "no resumable run found (every run is finished, killed, or needs "
+            "attention first). Pass an explicit run-id to force one:\n  "
+            f"{available}\nUse `leerie --list` to see full details."
+        )
+    candidates.sort(key=lambda r: _run_recency_key(r, leerie_root))
+    picked = candidates[-1]
+    if len(candidates) > 1:
+        kind = "resumable " if resumable_only else ""
+        log(f"auto-picked the most recent {kind}run {picked['run_id']} "
+            f"({_run_status_for(picked, leerie_root)}, started "
+            f"{picked.get('started_at') or '?'}); {len(candidates) - 1} "
+            f"other {kind}run(s) present — pass a run-id to choose a "
+            f"different one.")
+    return picked["run_id"]
 
 
 def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
@@ -2781,19 +2853,7 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
     a correctness boundary."""
     run_id = run["run_id"]
     started = run.get("started_at") or "?"
-    # Derived status — uses run.json sidecar if present, falls back to
-    # state.json fields. Same pattern as list_runs().
-    run_dir = leerie_root / "runs" / run_id
-    run_json: dict | None = None
-    sidecar = run_dir / "run.json"
-    if sidecar.is_file():
-        try:
-            parsed = json.loads(sidecar.read_text())
-            if isinstance(parsed, dict):
-                run_json = parsed
-        except (OSError, ValueError):
-            pass
-    status = _derive_run_status(run_json, run)
+    status = _run_status_for(run, leerie_root)
     # Last-activity: mtime of the run's sidecar (state.json for normal
     # runs, fly-machine.json for `seed-failed` orphans), formatted as
     # the elapsed duration from now. A live run shows seconds-to-
@@ -9297,9 +9357,34 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             raise WorkerError(
                 f"claude -p exited {proc.returncode}: "
                 f"{stderr_txt or '(no stderr)'}")
-        raise WorkerError(
-            "claude -p produced no result event "
-            f"(stderr: {stderr_txt or '(empty)'})")
+        # `claude -p` exited on its own (rc 0) having streamed a full
+        # session but never emitting the terminal `result` event — a known
+        # upstream CLI failure (anthropics/claude-code #8126, #1920, #74761;
+        # all closed "not planned" or open). It is intermittent and leerie
+        # cannot prevent it, so the orchestrator must *survive* it: return a
+        # synthetic error envelope instead of raising, which routes into
+        # claude_p's existing 2-attempt corrective loop and gives the worker
+        # one fresh session. A raised WorkerError would instead propagate
+        # past that loop and die() the run non-resumably (the same reasoning
+        # that makes the overage branch above raise RateLimitedExit).
+        #
+        # Deliberately the LAST branch: every arm above (overage, OOM,
+        # nonzero rc) is a named, non-retryable condition and keeps raising.
+        # In particular a nonzero rc covers leerie's own deliberate kills
+        # (SIGTERM/SIGKILL), which must never be retried. Leerie's timeout
+        # path raises TimeoutExpired before reaching this block at all.
+        #
+        # The message must not contain "rate limit" / "rate-limit" /
+        # "invalid authentication": `_is_auth_or_quota_failure` falls back to
+        # text markers on `result`, and a false match would burn the entire
+        # auth_retry_max_sec backoff budget on a non-auth failure.
+        return {
+            "is_error": True,
+            "result": ("claude -p produced no result event "
+                       f"(stderr: {stderr_txt or '(empty)'})"),
+            "structured_output": None,
+            "_leerie_synthetic": "no_result_event",
+        }
     return envelope
 
 
@@ -9778,10 +9863,25 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     auth_retry_max_sec = caps.get(
         "auth_retry_max_sec", DEFAULT_CAPS["auth_retry_max_sec"])
     last_problem = ""
+    # Set when the prior attempt ended with no result event at all (the
+    # synthetic envelope from _invoke). That failure is upstream and
+    # session-level, not a schema mistake, so the nudge names the
+    # finalizer tool explicitly rather than talking about the schema.
+    last_was_no_result = False
     for attempt in (1, 2):
-        retry_note = ("" if attempt == 1 else
-                      f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
-                      "Return output that conforms exactly to the required schema.")
+        if attempt == 1:
+            retry_note = ""
+        elif last_was_no_result:
+            retry_note = (
+                f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
+                "The session ended without producing a final result. You "
+                "MUST finish by calling the StructuredOutput tool with your "
+                "answer — describing the answer in prose is not enough, the "
+                "run has no result until that tool call is made.")
+        else:
+            retry_note = (
+                f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
+                "Return output that conforms exactly to the required schema.")
         envelope = await _spawn(retry_note)
 
         # Auth/quota backoff: 401/429/529/auth-message envelopes need
@@ -9856,7 +9956,14 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         if envelope.get("is_error"):
             last_problem = str(envelope.get("api_error_status")
                                or envelope.get("result") or "worker reported an error")
+            last_was_no_result = (
+                envelope.get("_leerie_synthetic") == "no_result_event")
+            if last_was_no_result:
+                log(f"  [{sid}] worker produced no result event "
+                    f"(attempt {attempt} of 2) — retrying with a fresh "
+                    f"session")
             continue
+        last_was_no_result = False
         structured = envelope.get("structured_output")
         if structured is None:
             last_problem = ("the run produced no structured_output — the final "
@@ -11365,10 +11472,14 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_feedback,
     )
-    if result is None:
-        die("classifier crashed and produced no result")
+    # Log the check-loop warnings BEFORE any die(): they carry the only
+    # record of *why* the worker failed (`_run_checked_loop` stores the
+    # underlying exception text there). die() calls sys.exit(), so a
+    # warnings loop placed after it is unreachable and the cause is lost.
     for w in gate_warnings:
         log(f"  classifier: {w}")
+    if result is None:
+        die("classifier crashed and produced no result")
     cats = [c for c in result.get("categories", []) if c in CATEGORIES]
     if not cats:
         die("classifier returned no recognized categories")
@@ -11703,10 +11814,12 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_prov_fb,
         )
-        if result is None:
-            die("provision worker crashed and produced no result")
+        # Warnings before die() — they hold the failure cause; die()
+        # exits immediately (see phase_classify for the full rationale).
         for w in prov_warnings:
             log(f"  provision: {w}")
+        if result is None:
+            die("provision worker crashed and produced no result")
         recipe = result.get("recipe") or []
         prov["source"] = "llm"
 
@@ -12777,10 +12890,12 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_recon_fb,
     )
-    if output is None:
-        die("reconciler crashed and produced no result")
+    # Warnings before die() — they hold the failure cause; die() exits
+    # immediately (see phase_classify for the full rationale).
     for w in recon_warnings:
         log(f"  reconciler: {w}")
+    if output is None:
+        die("reconciler crashed and produced no result")
     # Dead-subtask elimination (DESIGN §5): prune fully-speculative
     # subtasks before _check_unresolvable can die(). A subtask is
     # fully speculative when every one of its in_plan requires tags
@@ -15085,10 +15200,12 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_oj_fb,
     )
-    if output is None:
-        die("plan overlap judge crashed and produced no result")
+    # Warnings before die() — they hold the failure cause; die() exits
+    # immediately (see phase_classify for the full rationale).
     for w in oj_warnings:
         log(f"  overlap-judge: {w}")
+    if output is None:
+        die("plan overlap judge crashed and produced no result")
 
     # Persist the raw judge output for audit, even before applying —
     # if a later die() fires (unresolvable, or _validate_overlap_judge_output),
@@ -18857,8 +18974,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help="the task to execute (literal string, or path to "
                          "a .txt/.md file whose contents are the task)")
     ap.add_argument("--resume", action="store_true",
-                    help="resume an interrupted run (auto-picks if exactly "
-                         "one run exists under <state-root>/runs/). "
+                    help="resume an interrupted run (auto-picks the most "
+                         "recent resumable run under <state-root>/runs/; "
+                         "pass a run-id to choose a specific one). "
                          "Default: off (start a new run)")
     ap.add_argument("--run-id", metavar="ID",
                     help="select a specific run by id (for --resume when "
@@ -19253,7 +19371,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:
-        run_id = resolve_run_id(leerie_root, args.run_id)
+        run_id = resolve_run_id(leerie_root, args.run_id, resumable_only=True)
     elif args.run_id:
         run_id = args.run_id
     else:

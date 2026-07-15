@@ -205,12 +205,29 @@ fi
 # orchestrator uses it as its run_id. The launcher wrote a cidfile
 # at /run/leerie-cidfile via nerdctl --cidfile; nerdctl writes it
 # before PID 1 starts, so it's available here.
-if [ -f /run/leerie-cidfile ]; then
+#
+# NOT on --resume: a resume container is a *new* container with a new id,
+# but the run being resumed already has one (the id of the container that
+# first ran it). Injecting here would hand the orchestrator an id matching
+# no run on disk, and resolve_run_id fails closed on an unknown explicit
+# id — so bare `--resume` died instead of auto-picking. An explicit
+# `--resume <id>` survived only because the launcher rewrites it to
+# `--run-id <id>` and argparse takes the last occurrence; skipping the
+# injection entirely makes both forms correct by construction.
+_is_resume=false
+for _a in "$@"; do
+  if [ "$_a" = "--resume" ]; then
+    _is_resume=true
+    break
+  fi
+done
+if [ -f /run/leerie-cidfile ] && [ "$_is_resume" = "false" ]; then
   _cid="$(cat /run/leerie-cidfile)"
   if [ -n "$_cid" ]; then
     set -- --run-id "$_cid" "$@"
   fi
 fi
+unset _is_resume _a
 
 # Drop to leerie before the orchestrator. We pass HOME/USER/LOGNAME
 # explicitly rather than using `runuser --login` — the login form would

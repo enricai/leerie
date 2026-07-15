@@ -666,7 +666,7 @@ for an audit cleanup across every past run).
 
 - **Run interrupted (Ctrl-C, SIGTERM, SIGHUP, CI cancel, terminal close, reboot)** —
   worktrees are torn down but state.json + branches are preserved.
-  Resume with `./leerie --resume` (auto-picks if exactly one in-flight
+  Resume with `./leerie --resume` (auto-picks the most recent resumable
   run) or `./leerie --resume <id>`. Run `leerie --list` to see
   what's in flight. The explicit "throw this away" command is
   `scripts/cleanup.sh --run-id <id> --branches` — Ctrl-C alone is
