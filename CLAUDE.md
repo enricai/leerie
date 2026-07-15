@@ -1003,6 +1003,24 @@ a hook that asserts the instance is still `running` at the moment
 idempotency surviving a double-fire (INT then EXIT) in both directions
 (clean-exit-then-pause and pause-then-clean-exit) even when
 `LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
+the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
+standalone rather than the `leerie` launcher's own dispatch — is
+covered in `tests/test_ec2_e2e_provision.py`: the branch is extracted
+verbatim from the launcher (mirroring `tests/test_launcher_env_forwarding.py`'s
+`_extract_forwarding_loop` approach, since sourcing `leerie` directly
+runs preflight + full CLI dispatch) and run against `tests/ec2_stub.py`'s
+resource-tracking `aws` stub. It pins that `require_aws`'s `sts
+get-caller-identity` call precedes any `ec2 run-instances` call by
+call index (mirroring `tests/test_provision_volume.py`'s ordering
+discipline), and that a failing credential probe aborts the launch
+non-zero, emits the `aws sso login --profile <p>` hint, and leaves
+zero tracked instances and volumes in the stub's state — both with
+provisioning wired in after the dispatch block and with the dispatch
+block alone, so the gate is pinned as the branch's own contract
+independent of what runs after it. The module also defines the shared
+bash harness (stub-on-PATH + launcher invocation helpers) that sibling
+EC2-dispatch test modules import.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
