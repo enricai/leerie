@@ -913,6 +913,38 @@ networking imports (`socket`, `urllib`, `http.client`, `requests`,
 fixture — no dependency on `orchestrator/leerie.py` or
 `scripts/remote/ec2-lib.sh`, importable ahead of the EC2 dispatch branch
 landing.
+The EC2 counterpart to `scripts/remote/seed-repo.sh` — `scripts/remote/
+ec2-seed-repo.sh` (`ec2_seed_repo_clone`/`ec2_seed_repo_dirty`/
+`ec2_seed_repo`, transported over `ec2-lib.sh`'s `ec2_tar_pipe`/
+`ec2_remote_exec` instead of `flyctl ssh console`) is tested in two
+files, modeled directly on `tests/test_seed_repo_sh.py` +
+`tests/test_seed_repo_shallow_roundtrip.py`. `tests/test_ec2_seed_repo.py`
+covers the transport-level contract against a stubbed `aws` (decodes and
+locally executes `ec2_remote_exec`'s base64-wrapped SSM command,
+rewriting `/work`/`/tmp/leerie-*` paths into the test's `dest` dir — same
+technique as `test_ec2_transport.py`'s `_stub_aws_ssm`) and a stubbed
+`ssh` (drains `ec2_tar_pipe`'s one-entry gzipped-tar payload when invoked
+for bulk data, execs a real local `rsync --server` when invoked as
+rsync's `-e` transport): preflight failures (missing instance id / ssh
+target / `USER_REPO` / `aws` on PATH); a minimal repo round-trips to
+`/work`; both `aws` and `ssh` are exercised and `flyctl` never appears in
+the transport log; `.gitignore`-awareness plus `.claude/`
+force-inclusion via the rsync delta; the `.leerie/config.toml` /
+`.leerie/Dockerfile` / `.leerie/.leerie-setup.sh` whitelist (all other
+`.leerie/*` paths dropped); NFC-filename preservation through a
+submodule bundle; and a stalled `ssh` transport (real, unstubbed
+`timeout`) yielding a non-hanging failure. `tests/
+test_ec2_seed_repo_shallow.py` reproduces the shallow-path host/instance
+commands directly (coupled to the real script via `test_
+reconstruction_matches_source`, which asserts the exact clone/tar/
+checkout strings are still present) to pin: checkout parity between the
+shallow instance tree and the host tip, `.git/shallow` staying shallow,
+NFC-filename survival, a fetch-back-by-branch-name round-trip whose
+merge-base equals the host tip (PR-diff correctness), and
+`_seed_branch_shallow_safe`'s shell-injection gate (safe vs. unsafe
+branch names, including the live `__PARENT_MATERIALIZE__`/
+`__CLEANUP_TMP__` placeholder tokens) invoked against the real function
+rather than a reproduction of it.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
