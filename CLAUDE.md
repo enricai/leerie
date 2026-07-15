@@ -890,6 +890,18 @@ unresolvable; profile resolution precedence (`--profile` passthrough,
 in both the `aws sts get-caller-identity` call and the sso-login hint. Not
 yet wired into the launcher's `RUNTIME=ec2` dispatch branch (that lands in a
 separate subtask); this test file covers only the standalone helper.
+The release workflow's previously-untested embedded shell
+(`.github/workflows/release.yml`) is covered in `tests/test_release_workflow.py`,
+which works against the raw YAML text (no pyyaml dependency) using the
+extract-the-real-text-at-test-time pattern from `tests/test_config_verb.py`'s
+`_extract_config_arm`: a regex table (including the v0.9.62 squash-merge
+subject and every historical `chore(release):` subject on `main`, run live
+rather than pinned to a stale count) and structural pins that the tag and
+release steps gate on different `if:` conditions, that the release step
+never references `tagcheck`, that `relcheck` exists and probes via
+`gh release view`, that `gh release create` carries `--verify-tag`, and that
+a final end-state step (gated on default `success()`, not `always()`) is the
+job's last step and asserts both artifacts exist.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
