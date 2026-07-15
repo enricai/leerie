@@ -147,29 +147,30 @@ terminate_instance() {
 
 # --- _try_fetch_state_for_ec2_teardown --------------------------------------
 # Sync the run branch + state dir from the instance to the host BEFORE
-# teardown. Overridable by tests and by ec2-ssm.sh once its transport
-# lands — DESIGN §6 "Transport substitution for `flyctl ssh console`"
-# scopes the SSM/SSH transport to a separate file (ec2-ssm.sh, not yet
-# implemented) rather than this provisioning-only subtask.
+# teardown. Overridable by tests. DESIGN §6 "Transport substitution for
+# `flyctl ssh console`" scopes the actual sync mechanics to a separate
+# file, ec2-fetch-branch.sh (the EC2 counterpart to fetch-branch.sh),
+# rather than this provisioning-only subtask.
 #
-# Sources ec2-ssm.sh (if present) and calls its fetch_state_ec2 function.
-# Until ec2-ssm.sh ships, this fails closed (returns 1) — the safe
-# default per the ordering rule below is "leave the instance running,
-# do not destroy possibly-unrecovered work."
+# Sources ec2-fetch-branch.sh (if present) and calls its fetch_state_ec2
+# function. If ec2-fetch-branch.sh is absent (an older checkout), this
+# fails closed (returns 1) — the safe default per the ordering rule below
+# is "leave the instance running, do not destroy possibly-unrecovered
+# work."
 #
-# Requires: LEERIE_EC2_INSTANCE_ID, USER_REPO in scope (already set by
-# the time decide_ec2_teardown runs, since provision_instance populates
-# them).
+# Requires: LEERIE_EC2_INSTANCE_ID, LEERIE_EC2_SSH_TARGET, USER_REPO in
+# scope (already set by the time decide_ec2_teardown runs, since
+# provision_instance populates them).
 _try_fetch_state_for_ec2_teardown() {
   local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
-  if [ ! -f "$_leerie_dir/scripts/remote/ec2-ssm.sh" ]; then
-    remote_log "_try_fetch_state_for_ec2_teardown: ec2-ssm.sh not available yet — cannot sync"
+  if [ ! -f "$_leerie_dir/scripts/remote/ec2-fetch-branch.sh" ]; then
+    remote_log "_try_fetch_state_for_ec2_teardown: ec2-fetch-branch.sh not available yet — cannot sync"
     return 1
   fi
   # shellcheck disable=SC1091
-  . "$_leerie_dir/scripts/remote/ec2-ssm.sh"
+  . "$_leerie_dir/scripts/remote/ec2-fetch-branch.sh"
   if ! command -v fetch_state_ec2 >/dev/null 2>&1; then
-    remote_log "_try_fetch_state_for_ec2_teardown: ec2-ssm.sh loaded but fetch_state_ec2 is not defined"
+    remote_log "_try_fetch_state_for_ec2_teardown: ec2-fetch-branch.sh loaded but fetch_state_ec2 is not defined"
     return 1
   fi
   if ! fetch_state_ec2; then
