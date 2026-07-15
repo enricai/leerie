@@ -912,7 +912,41 @@ networking imports (`socket`, `urllib`, `http.client`, `requests`,
 `boto3`) so no invocation can reach a real AWS endpoint. Pure test
 fixture — no dependency on `orchestrator/leerie.py` or
 `scripts/remote/ec2-lib.sh`, importable ahead of the EC2 dispatch branch
-landing.
+landing. `ec2_stub.py` also implements `describe-instance-status`
+(returns `InstanceStatus`/`SystemStatus` both `"ok"` for a `running`
+instance, `"initializing"` when a test seeds `status_ok: False`),
+consumed by `wait_for_instance_ready()`'s poll-until-both-ok contract.
+`scripts/remote/ec2-provision.sh` (the `provision.sh` counterpart for
+the EC2 lifecycle — `provision_instance()`, `wait_for_instance_ready()`,
+`stop_instance()`/`terminate_instance()`, `decide_ec2_teardown()`; see
+the Files table above) is tested in `tests/test_ec2_provision.py`
+against the stateful `aws` stub: required-var validation (missing
+`LEERIE_EC2_AMI` / missing `aws` binary both fail closed before any
+call), instance-id export and `ec2-instance.json`/`run.json` sidecar
+writes on a successful create, id-parsing against real-shaped
+`run-instances` JSON output, a failed create leaking no resources and
+never registering the teardown trap, `terminate_instance`'s no-op-on-
+empty-id idempotency, and `decide_ec2_teardown`'s three-disposition
+classification (clean-exit terminates, sync-failure leaves the instance
+running, SIGINT detaches, unknown rc pauses) including that
+`_try_fetch_state_for_ec2_teardown` runs before `terminate_instance`
+(mirrors `provision.sh`'s fetch-before-destroy ordering) and that the
+teardown routine is idempotent under `LEERIE_TEARDOWN_DONE`.
+`tests/test_ec2_volume_reaping.py` pins the EBS-volume side of the same
+script: DESIGN §6 "EBS volume lifecycle" case 1 (root volume only,
+AWS's own implicit `DeleteOnTermination=true` default) means there is
+no Fly-style `destroy_volume()` reap path to test — instead this file
+pins the actual leak-prevention mechanism (`run-instances` invoked with
+no `--block-device-mapping`/`--block-device-mappings` override, at both
+the stub-argv level and via a source-level grep guard against
+`DeleteOnTermination` appearing in the call block), that
+`terminate_instance` (the sole reap path) is a true no-op making no AWS
+call on an empty instance id, a full provision→terminate cycle leaking
+neither instances nor volumes (with an explicit assertion that no
+`create-volume` call ever happens, so the leak-free result isn't
+vacuous), and a structural regression guard that no
+`destroy_volume`/`reap_volume`-shaped function exists anywhere in
+`ec2-lib.sh` or `ec2-provision.sh`.
 The EC2 counterpart to `scripts/remote/seed-repo.sh` — `scripts/remote/
 ec2-seed-repo.sh` (`ec2_seed_repo_clone`/`ec2_seed_repo_dirty`/
 `ec2_seed_repo`, transported over `ec2-lib.sh`'s `ec2_tar_pipe`/
