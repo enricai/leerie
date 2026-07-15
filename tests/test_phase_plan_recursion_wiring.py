@@ -321,3 +321,92 @@ class TestWellFitPassThrough:
             "recursive_decompose should not be called for a plan with no subtasks"
         )
         assert plans[0].get("subtasks", []) == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-subtask depends_on remap after expansion
+# (DESIGN §5 *Id-vanishing operations*)
+# ---------------------------------------------------------------------------
+
+class TestExpansionRemapsDependsOn:
+    """Expansion vanishes the parent's id; a sibling that named it must be
+    rewritten to name every leaf the parent became. Without this the edge
+    dangles and validate_plan die()s the run after the full planner spend.
+    """
+
+    def _drive(self, leerie, planner_resp, fake_decompose):
+        st = _make_state(leerie)
+        caps = _make_caps(leerie)
+        models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
+        efforts = {k: None for k in leerie.WORKER_TYPES}
+        with (
+            patch.object(leerie, "load_prompt", return_value="sys"),
+            patch.object(leerie, "extract_task_file_structure", return_value=[]),
+            patch.object(leerie, "build_repo_map",
+                         side_effect=RuntimeError("no tree-sitter")),
+            patch.object(leerie, "claude_p",
+                         new=AsyncMock(return_value=planner_resp)),
+            patch.object(leerie, "check_planner_output", return_value=[]),
+            patch.object(leerie, "check_task_file_coverage", return_value=[]),
+            patch.object(leerie, "recursive_decompose",
+                         new=AsyncMock(side_effect=fake_decompose)),
+        ):
+            return _run(leerie.phase_plan("task", st, caps, models, efforts))
+
+    def test_sibling_dep_on_expanded_parent_fans_out(self, leerie):
+        """The reported crash: feat-002 depends_on feat-001, which expands."""
+        parent = {**_OVERSIZED_SUBTASK, "id": "feat-001"}
+        sibling = {**_OVERSIZED_SUBTASK, "id": "feat-002",
+                   "depends_on": ["feat-001"]}
+        planner_resp = json.loads(json.dumps(
+            {**_PLANNER_RESPONSE, "subtasks": [parent, sibling]}))
+
+        async def fake_decompose(subtask, depth, *a, **kw):
+            if subtask["id"] == "feat-001":
+                return [_LEAF_A, _LEAF_B]
+            return [subtask]
+
+        plans = self._drive(leerie, planner_resp, fake_decompose)
+        subtasks = plans[0]["subtasks"]
+        ids = {s["id"] for s in subtasks}
+        assert "feat-001" not in ids
+
+        sib = next(s for s in subtasks if s["id"] == "feat-002")
+        assert sib["depends_on"] == ["feat-001-1", "feat-001-2"]
+        # No dangling edge — the exact validate_plan gate that killed the run.
+        assert not [d for s in subtasks
+                    for d in (s.get("depends_on") or []) if d not in ids]
+
+    def test_dep_on_unexpanded_subtask_untouched(self, leerie):
+        """Guards against over-eager rewriting: a parent that stays a leaf
+        keeps its id, so dependents must be left exactly as they were."""
+        parent = {**_OVERSIZED_SUBTASK, "id": "feat-001"}
+        sibling = {**_OVERSIZED_SUBTASK, "id": "feat-002",
+                   "depends_on": ["feat-001"]}
+        planner_resp = json.loads(json.dumps(
+            {**_PLANNER_RESPONSE, "subtasks": [parent, sibling]}))
+
+        async def fake_decompose(subtask, depth, *a, **kw):
+            return [subtask]      # nothing expands
+
+        plans = self._drive(leerie, planner_resp, fake_decompose)
+        sib = next(s for s in plans[0]["subtasks"] if s["id"] == "feat-002")
+        assert sib["depends_on"] == ["feat-001"]
+
+    def test_dedup_when_sibling_already_names_a_leaf(self, leerie):
+        """A dep list naming both the parent and one of its leaves must not
+        end up with that leaf twice (mirrors _apply_overlap_merge's dedup)."""
+        parent = {**_OVERSIZED_SUBTASK, "id": "feat-001"}
+        sibling = {**_OVERSIZED_SUBTASK, "id": "feat-002",
+                   "depends_on": ["feat-001", "feat-001-1"]}
+        planner_resp = json.loads(json.dumps(
+            {**_PLANNER_RESPONSE, "subtasks": [parent, sibling]}))
+
+        async def fake_decompose(subtask, depth, *a, **kw):
+            if subtask["id"] == "feat-001":
+                return [_LEAF_A, _LEAF_B]
+            return [subtask]
+
+        plans = self._drive(leerie, planner_resp, fake_decompose)
+        sib = next(s for s in plans[0]["subtasks"] if s["id"] == "feat-002")
+        assert sib["depends_on"] == ["feat-001-1", "feat-001-2"]

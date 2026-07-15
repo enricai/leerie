@@ -17,6 +17,7 @@ import asyncio
 import importlib.util
 import json
 import math
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -568,3 +569,112 @@ def test_recursive_decompose_no_repo_map_when_none(leerie):
 
     assert "RANKED REPO-MAP" not in prompts_seen.get("fit_judge", "")
     assert "RANKED REPO-MAP" not in prompts_seen.get("splitter", "")
+
+
+# ---------------------------------------------------------------------------
+# recursive_decompose — intra-generation depends_on remap
+# (DESIGN §5 *Id-vanishing operations*)
+# ---------------------------------------------------------------------------
+
+def test_recursive_decompose_remaps_sibling_dep_on_split_sibling(leerie):
+    """A splitter child may depend on a *sibling* child (prompts/splitter.md).
+    When that sibling then splits, its id vanishes mid-tree — visible only to
+    this frame, never to phase_plan, which sees fully-flattened leaves. The
+    surviving sibling must be rewritten to depend on the terminal ids.
+
+    Without the intra-generation remap this is the reported crash class:
+    validate_plan die()s on the dangling edge after the full planner spend.
+    """
+    parent = {"id": "config-003", "title": "parent",
+              "success_criteria_seed": "crit",
+              "files_likely_touched": ["a.py", "b.py"]}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    # config-003 and config-003-1 split; everything else is a leaf.
+    splitting = {"config-003", "config-003-1"}
+
+    def _which(user_prompt: str) -> str:
+        for sid in ("config-003-1", "config-003"):
+            if f'"id": "{sid}"' in user_prompt:
+                return sid
+        return "?"
+
+    async def fake_claude_p(*args, schema_key, user_prompt="", **kwargs):
+        who = _which(user_prompt)
+        if schema_key == "fit_judge":
+            return _fit_response(0.30 if who in splitting else 0.95)
+        # Child -2 depends on sibling -1 — the documented splitter contract.
+        return {"children": [
+            {"id": f"{who}-1", "title": "first",
+             "success_criteria_seed": "c", "files_likely_touched": ["a.py"],
+             "depends_on": []},
+            {"id": f"{who}-2", "title": "second",
+             "success_criteria_seed": "c", "files_likely_touched": ["b.py"],
+             "depends_on": [f"{who}-1"]},
+        ]}
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+    ids = {leaf["id"] for leaf in leaves}
+    assert ids == {"config-003-1-1", "config-003-1-2", "config-003-2"}
+
+    # The vanished intermediate is referenced nowhere.
+    all_deps = [d for leaf in leaves for d in (leaf.get("depends_on") or [])]
+    assert "config-003-1" not in all_deps
+
+    # The surviving sibling fans out to every terminal leaf of the vanished one.
+    sib = next(leaf for leaf in leaves if leaf["id"] == "config-003-2")
+    assert sib["depends_on"] == ["config-003-1-1", "config-003-1-2"]
+
+    # No dangling edge survives — this is the exact gate that killed the run.
+    assert not [d for d in all_deps if d not in ids]
+
+
+def test_recursive_decompose_migration_remap_is_a_noop(leerie):
+    """On the migration path children are built by `_migration_child` from the
+    parent, so none can name a sibling and the intra-generation map is always
+    empty. Guards the ~84% path against the remap perturbing it: every child
+    keeps the parent's `depends_on`/`provides` verbatim.
+    """
+    files = [f"f{i}.py" for i in range(20)]      # > 8 -> migration path
+    parent = {"id": "config-003", "title": "parent",
+              "success_criteria_seed": "crit", "files_likely_touched": files,
+              "depends_on": ["config-002"], "provides": ["cfg"],
+              "requires": [], "intent": "i", "scope_note": "s"}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, user_prompt="", **kwargs):
+        if schema_key == "fit_judge":
+            # Only the depth-0 parent splits; the chunks are leaves.
+            return _fit_response(0.30 if '"id": "config-003"' in user_prompt
+                                 and "config-003-" not in user_prompt
+                                 else 0.95)
+        # A hostile label-only worker: tries to inject sibling deps. The
+        # label path must discard everything but title/criteria.
+        ids = re.findall(r'"id": "(config-003-\d+)"', user_prompt)
+        return {"children": [
+            {"id": i, "title": f"title {i}", "success_criteria_seed": "c",
+             "files_likely_touched": ["x.py"], "depends_on": ["config-003-1"]}
+            for i in ids
+        ]}
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, Path("/tmp")))
+
+    assert len(leaves) == 3
+    ids = {leaf["id"] for leaf in leaves}
+    for leaf in leaves:
+        # Worker-injected sibling deps discarded; parent's edges preserved.
+        assert leaf["depends_on"] == ["config-002"]
+        assert leaf["provides"] == ["cfg"]
+        # No child names a sibling, so nothing to remap.
+        assert not [d for d in leaf["depends_on"] if d in ids]

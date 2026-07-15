@@ -235,6 +235,7 @@ DEFAULT_CAPS = {
 STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
+    "plan_snapshot",
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "answers",
@@ -4864,6 +4865,13 @@ async def recursive_decompose(
 
     # --- recurse into children -----------------------------------------------
     leaves: list[dict] = []
+    # A child that splits further vanishes its own id mid-tree. The splitter is
+    # allowed to give a child `depends_on` on a *sibling* child, so that edge
+    # would dangle — and this is the only frame that can see it: phase_plan
+    # receives fully-flattened leaves and never learns the intermediate id
+    # existed. Empty on the migration path (code-built children can't name a
+    # sibling), so the remap below is a no-op there.
+    expansion: dict[str, list[str]] = {}
     for child in children:
         child_leaves = await recursive_decompose(
             child, depth + 1, st, caps, models, efforts, repo_root,
@@ -4871,8 +4879,48 @@ async def recursive_decompose(
             _parent_score=score,
             _noprogress_count=new_noprogress,
         )
+        cid = child.get("id")
+        leaf_ids = [c.get("id") for c in child_leaves if c.get("id")]
+        if cid and cid not in leaf_ids:
+            expansion[cid] = leaf_ids
         leaves.extend(child_leaves)
+    _remap_vanished_deps(leaves, expansion)
     return leaves
+
+
+def _remap_vanished_deps(subtasks: list[dict],
+                         mapping: dict[str, list[str]]) -> None:
+    """In-place: rewrite `depends_on` refs to ids that vanished from the plan.
+
+    DESIGN §5 *Id-vanishing operations*. `mapping` is
+    `{vanished_id: [successor_ids]}`; fan-out (expansion — a parent becomes N
+    leaves) and prune (a drop — id maps to `[]`) are the same operation over it.
+
+    Fan-out targets *every* successor, not a representative one: the tag channel
+    already behaves this way (each leaf inherits `provides`, and
+    `_build_predecessor_graph` resolves a tag to every provider), so the id
+    channel matching it keeps scheduling independent of whether the planner
+    expressed the edge by id or by tag. It costs no extra waves when the
+    successors are mutually independent — they occupy the wave the parent would
+    have.
+
+    Mirrors `_apply_overlap_merge`'s rewrite discipline: dedup after the rewrite
+    (a subtask may already depend on one successor) and skip self-references.
+    `mapping.get(dep, [dep])` routes an untouched dep through the same path, so
+    there is no separate branch to keep in sync."""
+    if not mapping:
+        return
+    for s in subtasks:
+        sid = s.get("id")
+        deps = s.get("depends_on") or []
+        if not any(d in mapping for d in deps):
+            continue
+        new_deps: list[str] = []
+        for dep in deps:
+            for repl in mapping.get(dep, [dep]):
+                if repl not in new_deps and repl != sid:
+                    new_deps.append(repl)
+        s["depends_on"] = new_deps
 
 
 def check_planner_output(
@@ -5774,8 +5822,11 @@ def validate_plan(subtasks: dict) -> None:
                           "implementer has no starting point for criteria")
         for dep in s.get("depends_on", []):
             if dep not in all_ids:
-                errors.append(f"{sid}: depends_on '{dep}' which does not exist "
-                              "— scheduler will silently drop this edge")
+                errors.append(
+                    f"{sid}: depends_on '{dep}' which does not exist — an "
+                    "id vanished from the plan without its inbound "
+                    "references being rewritten (DESIGN §5 *Id-vanishing "
+                    "operations*); schedule() already dropped this edge")
         for entry in s.get("requires", []):
             # Defensive: the JSON schema rejects bare strings before this
             # function runs, but the planner output gets mutated downstream
@@ -6049,6 +6100,13 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
         plan["subtasks"] = survivors
     if not dropped:
         return
+    # A dropped id can no longer satisfy any dependent, so prune every inbound
+    # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
+    # Without this the edge dangles: schedule() drops it silently and
+    # validate_plan then die()s the run.
+    pruned = {sid: [] for sid in dropped}
+    for plan in plans:
+        _remap_vanished_deps(plan.get("subtasks", []), pruned)
     log(f"⚠  filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
         "with off-tree files_likely_touched:")
     for sid, info in sorted(dropped.items()):
@@ -6180,6 +6238,14 @@ async def filter_satisfied_subtasks(
             s for s in (plan.get("subtasks", []) or [])
             if s.get("id") not in dropped
         ]
+
+    # A dropped id can no longer satisfy any dependent, so prune every inbound
+    # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
+    # Without this the edge dangles: schedule() drops it silently and
+    # validate_plan then die()s the run — after the full planner spend.
+    pruned = {sid: [] for sid in dropped}
+    for plan in plans:
+        _remap_vanished_deps(plan.get("subtasks", []), pruned)
 
     log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
         "already-satisfied subtask(s):")
@@ -11757,6 +11823,12 @@ async def phase_plan(task: str, st: State, caps: dict,
     # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
     # counts from the planner level, not from inside recursive_decompose itself.
     log("  expanding subtasks via recursive_decompose (P1 Layer C)")
+    # Expansion vanishes each split parent's id, so a first-pass sibling that
+    # declared `depends_on: [parent]` must be rewritten to depend on every leaf
+    # the parent became (DESIGN §5 *Id-vanishing operations*). Accumulated
+    # across every plan and applied once below: the dependent may live in a
+    # different category's plan than the parent it names.
+    expansion: dict[str, list[str]] = {}
     for plan in plans:
         first_pass = plan.get("subtasks", [])
         if not first_pass:
@@ -11766,8 +11838,14 @@ async def phase_plan(task: str, st: State, caps: dict,
             expanded = await recursive_decompose(
                 subtask, 0, st, caps, models, efforts, repo_root,
                 repo_map=repo_map)
+            pid = subtask.get("id")
+            leaf_ids = [c.get("id") for c in expanded if c.get("id")]
+            if pid and pid not in leaf_ids:
+                expansion[pid] = leaf_ids
             leaves.extend(expanded)
         plan["subtasks"] = leaves
+    for plan in plans:
+        _remap_vanished_deps(plan.get("subtasks", []), expansion)
 
     for category, plan in zip(cats, plans):
         n = len(plan.get("subtasks", []))
@@ -15056,6 +15134,16 @@ def _build_predecessor_graph(
                 # the same edge — the planner explicitly declared it, so
                 # diagnostics should name that as the source.
                 edge_sources[(dep, sid)] = "depends_on"
+            else:
+                # Unreachable once every id-vanishing op rewrites its
+                # inbound refs (DESIGN §5). Log rather than drop in
+                # silence: this runs before validate_plan, so it is the
+                # earliest observation point for an edge going missing,
+                # and the canary if a new id-vanishing op forgets the
+                # rewrite. validate_plan stays the single enforcement
+                # point — never die() here.
+                log(f"schedule: {sid} depends_on unknown id {dep!r} "
+                    "— edge dropped")
         for entry in s.get("requires", []):
             if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
                 continue
@@ -18571,6 +18659,18 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["current_phase"] = "phase 3: scheduling"
         st.save()
         subtasks, waves = schedule(plans)
+        # Diagnostic snapshot BEFORE the two gates that can die() below.
+        # Both are terminal, and the planner/fit_judge/splitter spend that
+        # produced this plan is the most expensive thing in the run — without
+        # this, a die() here leaves state.json with no plan at all and the
+        # whole spend is unrecoverable. Deliberately not write_plan(): that
+        # also emits per-subtask spec files and seeds the execution
+        # scaffolding, which would make a failed run look half-executable
+        # (and the budget preflight above exists precisely to avoid writing
+        # those for a run that cannot win). Inspection only — nothing reads
+        # this back; --resume rehydration is separate work.
+        st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
+        st.save()
         # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
         # fail fast at the cheapest moment*). Runs after schedule() so we
         # have the real wave count, before validate_plan / write_plan so

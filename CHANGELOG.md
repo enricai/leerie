@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A plan whose parent subtask got split no longer dies at `validate_plan`,
+  discarding the entire planning spend.** A run died at `phase 3: scheduling`
+  with `config-004: depends_on 'config-003' which does not exist` after hours
+  of planner/fit_judge/splitter work. `recursive_decompose` expands an
+  oversized parent (`config-003`) into suffixed leaves, so the parent id exists
+  nowhere afterward — but siblings that declared `depends_on: [parent]` were
+  never rewritten. The plan is only persisted by `write_plan`, which runs
+  *after* the gate, so the failed run's `state.json` had no plan key at all and
+  `--resume` had nothing to resume. This is a class, not a bug: an AST sweep of
+  every write to `plan["subtasks"]` found 9 sites, partitioned 6/3 — every
+  reconciler-layer op already rewrote or pruned inbound references, while
+  `phase_plan`'s expansion and both phase-3 soft-drop filters
+  (`filter_offtree_subtasks`, `filter_satisfied_subtasks`) did not. All three
+  failed identically; the satisfied-probe filter reproduced two of the three
+  reported errors verbatim on its own. It hid for so long because the two
+  dependency channels do not fail alike — every leaf inherits the parent's
+  `provides` and `_build_predecessor_graph` resolves a tag to *every* provider,
+  so tag-expressed edges survive an id vanishing intact and only the
+  id-expressed `depends_on` channel dangles. DESIGN §5 already stated the
+  rewrite contract for merge/drop and named the failure it prevents "the same
+  silent-data-loss class"; it simply never generalized it. Now it does, and one
+  `_remap_vanished_deps` helper serves all four call sites — fan-out (parent →
+  N leaves, matching what the tag channel already does, measured to cost no
+  extra waves) and prune (drop → `[]`) are the same operation. The remap runs
+  both inside `recursive_decompose` and in `phase_plan`: the splitter may give
+  a child `depends_on` on a sibling, and when that sibling splits its id
+  vanishes mid-tree, visible only to the recursion. `validate_plan`'s message
+  no longer blames the scheduler (which runs first and already dropped the
+  edge), `_build_predecessor_graph` logs rather than silently discarding a
+  declared edge, and a new `plan_snapshot` state field captures the scheduled
+  plan before the gates that `die()` so a future failure leaves it inspectable.
+
 ## [0.9.61]
 
 ### Fixed

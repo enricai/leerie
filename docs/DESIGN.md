@@ -496,6 +496,32 @@ files_likely_touched: none`). This affects both `merge` and `drop_*`
 resolutions, because `_apply_overlap_drop` likewise unions the dropped subtask's
 `provides` into the survivor and rewrites downstream `depends_on`.
 
+**Id-vanishing operations must rewrite inbound references.** The rewriting above is
+not a merge-specific courtesy; it is an invariant every operation that removes a
+subtask id from the plan owes. Merge, drop, the phase-3 soft-drop filters
+(`filter_offtree_subtasks`, `filter_satisfied_subtasks`), and P1 recursive expansion
+all vanish an id. Each owes the plan two things: the vanishing subtask's
+`provides`/`requires`/`depends_on` must be carried by its successor(s), *and* every
+subtask referencing the vanishing id via `depends_on` must be rewritten to reference
+those successor(s).
+
+The second half is easy to forget because the two dependency channels do not fail
+alike. The tag channel self-heals: `provides` is inherited by successors and
+`_build_predecessor_graph` resolves a `requires` tag to *every* provider, so a
+tag-expressed edge survives an id vanishing untouched. Only the id-expressed
+`depends_on` channel dangles — silently at `schedule()`, which drops an unknown
+predecessor without a word, and then fatally at `validate_plan`. An operation that
+gets this wrong therefore looks correct under tag-based plans and dies only when a
+planner happens to express the same intent by id.
+
+Where an id vanishes into **several** successors (expansion), the rewrite fans out to
+all of them — matching what the tag channel already does, and costing no additional
+waves when the successors are mutually independent (they occupy the wave the parent
+would have). Where an id vanishes with **no** successor (a drop), the reference is
+pruned. Fanning out to a single "representative" successor, or dropping the id edge
+on the theory that a tag will cover it, is the same silent-data-loss class named
+above: a parent with no `provides` has no tag edge to fall back on.
+
 The orchestrator handles this with **per-resolution cycle avoidance** rather than
 an all-or-nothing post-hoc gate. Before applying each collision it tentatively
 applies the resolution to a throwaway copy and runs Tarjan's SCC; if the
@@ -727,6 +753,33 @@ self-report: the independent `fit_judge` is now the authoritative
 decomposition-quality gate (removing the self-grading bias BAGEN documents).
 The axis remains in the planner schema as a signal, but `check_planner_output`
 no longer escalates on it — only `task_understanding` gates the planner.
+
+**Expansion vanishes the parent's id, so it owes the inbound-reference rewrite**
+(§5 *Id-vanishing operations*). A first-pass sibling that declared
+`depends_on: [parent]` must come out depending on every leaf the parent became;
+otherwise the edge dangles and `validate_plan` kills the run after the full
+planner/fit_judge/splitter spend. The rewrite happens at **two** levels, because
+neither alone sees every vanished id:
+
+- **Intra-generation, inside `recursive_decompose`.** The splitter is told it may
+  give a child `depends_on` on a *sibling* child. When that sibling then recurses
+  and splits again, its id vanishes mid-tree — visible only to the frame that
+  created it, never to `phase_plan`, which sees fully-flattened leaves and so never
+  learns the intermediate existed. Each generation therefore remaps its own
+  children's sibling edges before returning. On the migration path this is provably
+  a no-op: `_migration_child` builds children in code and no child can name a
+  sibling.
+- **Cross-subtask, in `phase_plan`.** `recursive_decompose` takes a single subtask
+  and has no access to its siblings — the same structural reason the merge rewrite
+  lives in the plan-level apply and not inside a per-pair helper. `phase_plan` holds
+  every plan, so it records parent → leaf-ids across the expansion loop and applies
+  one pass afterward. The pass must run over **all** plans after **all** expand:
+  the dependent may live in another category's plan than the parent.
+
+Both levels use the same rewrite as merge/drop, with the same dedup discipline. The
+`fit_judge`/`splitter` workers are never asked to preserve the graph — per §12 the
+edges are code-enforced, and the splitter's id convention is a prompt example, not a
+guarantee the remap may rely on.
 
 The runtime truncation backstop (`_record_run_health` surfacing
 `truncated_worker_count`) is retained: truncation is now rare, but the signal

@@ -285,3 +285,81 @@ def test_schema_rejects_malformed(leerie):
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"satisfied": True, "evidence": "x", "extra": 1}, schema)
+
+
+# ---------------------------------------------------------------------------
+# dropped ids must not leave dangling depends_on
+# (DESIGN §5 *Id-vanishing operations*)
+# ---------------------------------------------------------------------------
+
+def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
+    """A dropped id can no longer satisfy any dependent, so inbound
+    `depends_on` references to it must be pruned.
+
+    Without the prune this is a live crash: schedule() drops the edge
+    silently and validate_plan then die()s the run — the reported failure,
+    reachable via this filter independently of the recursion.
+    """
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "feature-implementation", "status": "ready",
+              "subtasks": [
+                  _sub("feat-001"),
+                  _sub("feat-002", depends_on=["feat-001"]),
+                  _sub("feat-003", depends_on=["feat-001", "feat-002"]),
+              ]}]
+    _patch_probe(leerie, monkeypatch, {
+        "feat-001": {"satisfied": True, "evidence": "merged by sibling PR",
+                     "checked": ["a.py"]},
+    })
+    res = _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+    assert res is None
+
+    surv = plans[0]["subtasks"]
+    ids = {s["id"] for s in surv}
+    assert ids == {"feat-002", "feat-003"}
+
+    by_id = {s["id"]: s for s in surv}
+    assert by_id["feat-002"]["depends_on"] == []
+    # The non-dropped dep survives; only the dropped id is removed.
+    assert by_id["feat-003"]["depends_on"] == ["feat-002"]
+
+    # No dangling edge survives to validate_plan.
+    assert not [d for s in surv
+                for d in (s.get("depends_on") or []) if d not in ids]
+
+
+def test_validate_plan_survives_a_satisfied_drop(leerie, tmp_path, monkeypatch):
+    """End-to-end pin: the surviving plan passes the exact gate that killed
+    the reported run."""
+    st = _make_state(leerie, tmp_path / "run")
+    full = dict(size="small", files_likely_touched=["orchestrator/leerie.py"],
+                provides=[], requires=[])
+    plans = [{"domain": "feature-implementation", "status": "ready",
+              "subtasks": [
+                  _sub("feat-001", **full),
+                  _sub("feat-002", depends_on=["feat-001"], **full),
+              ]}]
+    _patch_probe(leerie, monkeypatch, {
+        "feat-001": {"satisfied": True, "evidence": "done", "checked": []},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+
+    surv = plans[0]["subtasks"]
+    leerie.validate_plan({s["id"]: s for s in surv})   # must not die()
+
+
+def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
+    """Nothing satisfied → no mapping → depends_on byte-identical."""
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "feature-implementation", "status": "ready",
+              "subtasks": [_sub("feat-001"),
+                           _sub("feat-002", depends_on=["feat-001"])]}]
+    _patch_probe(leerie, monkeypatch, {})     # all unsatisfied
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+
+    surv = plans[0]["subtasks"]
+    assert [s["id"] for s in surv] == ["feat-001", "feat-002"]
+    assert surv[1]["depends_on"] == ["feat-001"]

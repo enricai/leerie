@@ -743,6 +743,40 @@ expansion loop precedes final logging); integration — one oversized subtask (s
 first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
 empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
+The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
+that removes a subtask id owes the plan a rewrite of inbound references; the tag
+channel self-heals via inherited `provides`, so only the id channel dangles) is tested
+across five files. `tests/test_remap_vanished_deps.py` is the unit surface for
+`_remap_vanished_deps`: fan-out (a vanished parent → every leaf, mirroring the tag
+channel's list-of-providers), prune (`id → []`, the drop case), empty-mapping no-op,
+dep-absent-from-mapping pass-through (guards over-eager rewriting), dedup-after-rewrite
+and two-vanished-ids-sharing-a-successor (mirrors `_apply_overlap_merge`), and the
+`repl != sid` self-reference guard — pinned but documented as **currently dead code**:
+it is unreachable because `schedule()` already die()s on a planner self-edge
+(`feat-a → feat-a`) before recursion runs, and it is retained only to match
+`_apply_overlap_merge`'s discipline for future callers.
+`tests/test_recursive_decompose.py` covers the intra-generation remap — the seam
+`phase_plan` cannot see: a splitter child declaring `depends_on` on a *sibling*
+(`prompts/splitter.md`) whose id then vanishes when that sibling splits again, asserting
+the survivor fans out to the terminal ids and the intermediate appears in no
+`depends_on`; plus the migration-path no-op, which drives a **hostile** label-only
+worker injecting sibling deps and proves `_migration_child` discards them (children keep
+the parent's `depends_on`/`provides` verbatim, so the map stays empty on the ~84% path).
+`tests/test_phase_plan_recursion_wiring.py` covers the cross-subtask remap: the reported
+regression (a sibling of an expanded parent fans out to all leaves and `validate_plan`
+no longer die()s — the exact gate that killed a real run after full planner spend),
+a dep on an unexpanded subtask left untouched, and dedup when a sibling already names a
+leaf. `tests/test_filter_satisfied_subtasks.py` and
+`tests/test_filter_offtree_subtasks.py` cover the two phase-3 soft-drop filters, which
+vanish ids the same way: a dropped id's inbound refs pruned (non-dropped deps survive),
+`validate_plan` survives the drop end-to-end, and a no-drop run leaves `depends_on`
+byte-identical. `tests/test_plan_snapshot_wiring.py` pins the `plan_snapshot` capture by
+source inspection (mirroring `test_dep_capture_wiring.py`): the assignment is followed
+by `st.save()`, follows `schedule()`, and precedes **both** `check_budget_feasibility`
+and `validate_plan` — the ordering *is* the feature, since a die() at either gate
+otherwise discards the whole planning spend (`write_plan` never runs); plus that it is
+deliberately not `write_plan` (which would seed execution scaffolding for a run that
+cannot start) and that the payload round-trips through a real `State.save()`.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:

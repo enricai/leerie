@@ -204,3 +204,60 @@ def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkey
     subtasks, _ = leerie.schedule(plans)
     with pytest.raises(SystemExit):
         leerie.validate_plan(subtasks)
+
+
+# ---------------------------------------------------------------------------
+# dropped ids must not leave dangling depends_on
+# (DESIGN §5 *Id-vanishing operations*)
+# ---------------------------------------------------------------------------
+
+def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
+    """A dropped id can no longer satisfy any dependent, so inbound
+    `depends_on` references to it must be pruned — otherwise schedule()
+    drops the edge silently and validate_plan die()s the run."""
+    _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+
+    plans = [{"domain": "feat", "subtasks": [
+        {"id": "feat-001", "files_likely_touched": ["/etc/passwd"],
+         "depends_on": []},
+        {"id": "feat-002", "files_likely_touched": ["src/b.py"],
+         "depends_on": ["feat-001"]},
+        {"id": "feat-003", "files_likely_touched": ["src/c.py"],
+         "depends_on": ["feat-001", "feat-002"]},
+    ]}]
+
+    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+
+    surv = plans[0]["subtasks"]
+    ids = {s["id"] for s in surv}
+    assert ids == {"feat-002", "feat-003"}
+
+    by_id = {s["id"]: s for s in surv}
+    assert by_id["feat-002"]["depends_on"] == []
+    assert by_id["feat-003"]["depends_on"] == ["feat-002"]
+    assert not [d for s in surv
+                for d in (s.get("depends_on") or []) if d not in ids]
+
+
+def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
+    """Nothing dropped → no mapping → depends_on byte-identical."""
+    _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+
+    plans = [{"domain": "feat", "subtasks": [
+        {"id": "feat-001", "files_likely_touched": ["src/a.py"],
+         "depends_on": []},
+        {"id": "feat-002", "files_likely_touched": ["src/b.py"],
+         "depends_on": ["feat-001"]},
+    ]}]
+
+    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+
+    surv = plans[0]["subtasks"]
+    assert [s["id"] for s in surv] == ["feat-001", "feat-002"]
+    assert surv[1]["depends_on"] == ["feat-001"]
