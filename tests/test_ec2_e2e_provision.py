@@ -190,6 +190,49 @@ def test_preflight_precedes_run_instances_by_call_index(tmp_path):
     assert rec["state"] == "running"
 
 
+def test_successful_provision_leaves_exactly_one_instance_and_no_orphaned_volume(tmp_path):
+    """DESIGN §6 "EBS volume lifecycle" case 1: provision_instance() never
+    calls `aws ec2 create-volume` — the root EBS volume is created
+    implicitly by run-instances with AWS's own DeleteOnTermination=true
+    default. So on a clean happy-path launch the stub's tracked state
+    must show exactly one instance (not zero — a no-op regression; not
+    two — a double-provision regression) and zero tracked volumes (an
+    owning-instance-less volume would be an orphan). Assertions read the
+    stub's tracked state, not argv/log line counts, so a call that is
+    retried but converges on one tracked instance can never misread as
+    two provisions."""
+    aws_dir = tmp_path / "bin"
+    env = stub_aws_env(aws_dir, identity_succeeds=True,
+                        extra=REQUIRED_PROVISION_ENV)
+
+    result = run_ec2_dispatch(env)
+    assert result.returncode == 0, result.stderr
+
+    state = read_state(aws_dir)
+    assert len(state["instances"]) == 1, (
+        f"expected exactly one tracked instance after a happy-path "
+        f"provision; state={state}"
+    )
+    assert state["volumes"] == {}, (
+        f"no volume should be tracked independently of the instance "
+        f"that owns it (root EBS is implicit via run-instances, "
+        f"DeleteOnTermination=true); state={state}"
+    )
+    assert leaked_resources(state) == {
+        "instances": state["instances"],
+        "volumes": {},
+    }, (
+        "the single tracked instance is expected (still running, not "
+        "torn down on this happy-path provision-only run); no volume "
+        "should ever appear as a leak"
+    )
+
+    log = read_log(aws_dir)
+    assert not [l for l in log if l.startswith("ec2 create-volume")], (
+        f"provision_instance must never call create-volume directly; log={log}"
+    )
+
+
 def test_failing_preflight_aborts_before_any_ec2_call(tmp_path):
     aws_dir = tmp_path / "bin"
     env = stub_aws_env(aws_dir, identity_succeeds=False,

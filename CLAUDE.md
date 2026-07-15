@@ -1032,7 +1032,17 @@ provisioning wired in after the dispatch block and with the dispatch
 block alone, so the gate is pinned as the branch's own contract
 independent of what runs after it. The module also defines the shared
 bash harness (stub-on-PATH + launcher invocation helpers) that sibling
-EC2-dispatch test modules import.
+EC2-dispatch test modules import. A dedicated
+`test_successful_provision_leaves_exactly_one_instance_and_no_orphaned_volume`
+pins the provision-success resource count against the stub's *tracked
+state* rather than argv/log line counts: exactly one instance (not
+zero — a no-op regression; not two — a double-provision regression,
+both falsified live against hand-broken harness variants during
+development) and zero tracked volumes, since `provision_instance()`
+never calls `create-volume` — root EBS is implicit via `run-instances`
+with AWS's own `DeleteOnTermination=true` default (DESIGN §6 "EBS
+volume lifecycle" case 1) — so any tracked volume on this path would by
+construction be an orphan.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
