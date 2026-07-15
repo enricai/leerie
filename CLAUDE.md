@@ -857,6 +857,19 @@ overriding their env-var equivalents. Pure file I/O — no network, no `aws`
 binary, no boto3. Not yet wired into the launcher's EC2 runtime path (that
 lands in a separate subtask); this test file covers only the standalone
 helper.
+The EC2 runtime's host-side preflight (`scripts/remote/ec2-lib.sh`'s
+`require_aws()`, modeled on `require_flyctl()` in `scripts/remote/lib.sh`) is
+tested in `tests/test_ec2_lib_sh.py` by sourcing the real script against a
+stubbed `aws` binary on PATH (mirroring `tests/test_ensure_image.py`'s
+stubbed-flyctl pattern): success when `aws` is present and `aws sts
+get-caller-identity` succeeds; an actionable AWS CLI v2 install hint when
+`aws` is absent from PATH; the `aws sso login --profile <profile>` recovery
+hint (reusing `bedrock_preflight()`'s exact vocabulary) when credentials are
+unresolvable; profile resolution precedence (`--profile` passthrough,
+`LEERIE_AWS_PROFILE` over `AWS_PROFILE`, `AWS_PROFILE` as fallback) reflected
+in both the `aws sts get-caller-identity` call and the sso-login hint. Not
+yet wired into the launcher's `RUNTIME=ec2` dispatch branch (that lands in a
+separate subtask); this test file covers only the standalone helper.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
