@@ -3640,6 +3640,74 @@ case "$LEERIE_SEED_SHALLOW_THRESHOLD_MB" in
 esac
 export LEERIE_SEED_DEPTH LEERIE_SEED_SHALLOW_THRESHOLD_MB
 
+# --- EC2 instance-shape vars (LEERIE_EC2_AMI / _INSTANCE_TYPE / _KEY_NAME /
+# _SECURITY_GROUP / _SUBNET_ID) --------------------------------------------
+# Brings the five RunInstances-shape params up to the same CLI > env >
+# leerie.toml > (no default) precedence every other leerie knob already has
+# (FLY_VM_DISK_GB / the seed knobs above). Resolution mirrors
+# _resolve_seed_knob exactly, minus a default — there is no sensible
+# AMI/instance-type/key-pair/security-group/subnet leerie can pick on the
+# operator's behalf (docs/IMPLEMENTATION.md "EC2 instance-lifecycle vars"),
+# so an all-unset var stays empty here and _resolve_ec2_var in ec2-lib.sh
+# (sourced later, host-side, in the RUNTIME=ec2 branch) still raises its
+# existing actionable "not set — required for --runtime ec2" error.
+#
+# _resolve_ec2_knob <cli-value> <env-var-name> <toml-key> — prints the
+# resolved value, or nothing if none of the three tiers has one.
+_resolve_ec2_knob() {
+  local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval
+  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
+  eval "_envval=\"\${$_envname:-}\""
+  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
+  if [ -f "$USER_REPO/leerie.toml" ]; then
+    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
+                        "$USER_REPO/leerie.toml" 2>/dev/null \
+                      | head -1 \
+                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
+    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
+  fi
+}
+_cli_ec2_ami=""
+_cli_ec2_instance_type=""
+_cli_ec2_key_name=""
+_cli_ec2_security_group=""
+_cli_ec2_subnet_id=""
+_prev_ec2_arg=""
+for arg in "$@"; do
+  if [ -n "$_prev_ec2_arg" ]; then
+    case "$_prev_ec2_arg" in
+      ami)             _cli_ec2_ami="$arg" ;;
+      instance-type)   _cli_ec2_instance_type="$arg" ;;
+      key-name)        _cli_ec2_key_name="$arg" ;;
+      security-group)  _cli_ec2_security_group="$arg" ;;
+      subnet-id)       _cli_ec2_subnet_id="$arg" ;;
+    esac
+    _prev_ec2_arg=""
+    continue
+  fi
+  case "$arg" in
+    --ec2-ami=*)             _cli_ec2_ami="${arg#--ec2-ami=}" ;;
+    --ec2-ami)               _prev_ec2_arg="ami" ;;
+    --ec2-instance-type=*)   _cli_ec2_instance_type="${arg#--ec2-instance-type=}" ;;
+    --ec2-instance-type)     _prev_ec2_arg="instance-type" ;;
+    --ec2-key-name=*)        _cli_ec2_key_name="${arg#--ec2-key-name=}" ;;
+    --ec2-key-name)          _prev_ec2_arg="key-name" ;;
+    --ec2-security-group=*)  _cli_ec2_security_group="${arg#--ec2-security-group=}" ;;
+    --ec2-security-group)    _prev_ec2_arg="security-group" ;;
+    --ec2-subnet-id=*)       _cli_ec2_subnet_id="${arg#--ec2-subnet-id=}" ;;
+    --ec2-subnet-id)         _prev_ec2_arg="subnet-id" ;;
+  esac
+done
+LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI ec2_ami)"
+LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_EC2_INSTANCE_TYPE ec2_instance_type)"
+LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME ec2_key_name)"
+LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP ec2_security_group)"
+LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID ec2_subnet_id)"
+unset _cli_ec2_ami _cli_ec2_instance_type _cli_ec2_key_name \
+      _cli_ec2_security_group _cli_ec2_subnet_id _prev_ec2_arg
+export LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE LEERIE_EC2_KEY_NAME \
+       LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID
+
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
 DRY_RUN=false
@@ -4603,6 +4671,7 @@ _prev_was_chain_id=false
 _prev_was_fly_app_rewrite=false
 _prev_was_state_dir_rewrite=false
 _prev_was_seed_knob=false
+_prev_was_ec2_knob=false
 for arg in "$@"; do
   if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
     _prev_was_state_dir_rewrite=false
@@ -4615,6 +4684,12 @@ for arg in "$@"; do
   if [ "$_prev_was_seed_knob" = "true" ]; then
     # Consume the value of --seed-depth / --seed-shallow-threshold-mb.
     _prev_was_seed_knob=false
+    continue
+  fi
+  if [ "$_prev_was_ec2_knob" = "true" ]; then
+    # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
+    # --ec2-security-group / --ec2-subnet-id.
+    _prev_was_ec2_knob=false
     continue
   fi
   if $prev_was_inspect; then
@@ -4686,6 +4761,18 @@ for arg in "$@"; do
       _prev_was_seed_knob=true
       ;;
     --seed-depth=*|--seed-shallow-threshold-mb=*)
+      # =form; consumed above.
+      ;;
+    --ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id)
+      # Launcher-only flags (EC2 instance-shape CLI tier); resolved into
+      # LEERIE_EC2_AMI / LEERIE_EC2_INSTANCE_TYPE / LEERIE_EC2_KEY_NAME /
+      # LEERIE_EC2_SECURITY_GROUP / LEERIE_EC2_SUBNET_ID above and consumed
+      # by ec2-lib.sh's resolve_*() functions. The orchestrator's argparse
+      # doesn't know them — strip both the flag and its value so they don't
+      # leak to parse_args() (which is strict, not parse_known_args).
+      _prev_was_ec2_knob=true
+      ;;
+    --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*)
       # =form; consumed above.
       ;;
     --no-re-seed)

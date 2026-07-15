@@ -248,13 +248,17 @@ ec2_tar_pipe() {
 
 # --- resolve_* (LEERIE_EC2_* required-var reads) ---------------------------
 # One thin helper per RunInstances parameter (IMPLEMENTATION.md "EC2
-# instance-lifecycle vars"). Each prints the var's value on success; on an
-# unset/empty var, prints an actionable error naming the missing var to
-# stderr and returns 1 rather than letting `${VAR:?}` under `set -u` kill
-# the whole sourcing shell with bash's generic "parameter null or not set"
-# message. No defaults exist for any of these — DESIGN §6 / IMPLEMENTATION.md
-# are explicit that there is no sensible AMI/instance-type/key-pair/
-# security-group/subnet leerie can pick on the operator's behalf.
+# instance-lifecycle vars"). By the time this is sourced, the `leerie`
+# launcher has already resolved each LEERIE_EC2_* var through its own
+# CLI > env > leerie.toml tier (mirroring FLY_VM_DISK_GB / the seed knobs)
+# and exported the result — this helper is just the final required-var
+# read against whatever that ladder produced. Each prints the var's value
+# on success; on an unset/empty var (all three tiers missed — no defaults
+# exist for any of these, since there is no sensible AMI/instance-type/
+# key-pair/security-group/subnet leerie can pick on the operator's behalf),
+# prints an actionable error naming the missing var to stderr and returns 1
+# rather than letting `${VAR:?}` under `set -u` kill the whole sourcing
+# shell with bash's generic "parameter null or not set" message.
 #
 # Shared here (not in ec2-provision.sh) because ec2-ssm.sh's SSH-fallback
 # transport also needs resolve_key_name/resolve_security_group.
