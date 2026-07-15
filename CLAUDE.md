@@ -839,6 +839,24 @@ not measure," folded into neither GREEN nor RED, by both
 `_format_baseline_section` and `_base_health_payload`), and pins that `measured`
 is a mandatory field with no legacy default (a `passed: False` axis missing
 `measured` is not surfaced RED).
+The standalone AWS credential/profile/region resolution helper
+(`scripts/remote/aws-credentials.sh`, EC2 runtime) is tested in
+`tests/test_aws_credentials.py` by sourcing the real script against a fake
+`$HOME` with fixture `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/`
+files (mirroring `tests/test_fetch_branch_sh.py`'s source-and-call pattern):
+explicit env-var credentials winning over a fully-configured SSO profile
+with a valid cached token; `AWS_PROFILE` selecting a named profile over
+`[default]`; region precedence (`AWS_REGION` > `AWS_DEFAULT_REGION` >
+profile `region` > die-with-hint); static credentials in
+`~/.aws/credentials`; both `sso_session`-reference and legacy inline SSO
+config; an expired SSO cache token and a never-logged-in profile both
+producing the `aws sso login --profile <p>` hint rather than a silent
+fallthrough; no `~/.aws` directory at all; `AWS_PROFILE=nonexistent` not
+falling back to `[default]`; and `--profile`/`--region` CLI flags
+overriding their env-var equivalents. Pure file I/O — no network, no `aws`
+binary, no boto3. Not yet wired into the launcher's EC2 runtime path (that
+lands in a separate subtask); this test file covers only the standalone
+helper.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
