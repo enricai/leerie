@@ -24,6 +24,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history: tests/test_release_workflow.py walks every
+          # `chore(release):` subject on the repo. The default fetch-depth: 1
+          # (shallow, detached HEAD, no `main` ref) makes that test fail — do
+          # not shrink this back without updating that test.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6

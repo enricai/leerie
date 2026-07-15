@@ -107,14 +107,27 @@ def test_regex_matches_every_historical_release_subject_on_main():
     subject ever merged to main must match the widened regex. This is the
     131/131 (measured) claim — run live rather than pinned to a stale
     count, so it keeps holding as new releases land."""
-    result = subprocess.run(
-        ["git", "log", "main", "--pretty=%s"],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    # Resolve a ref that carries full history in whichever environment we run:
+    # `origin/main` exists in a full-history PR checkout (detached HEAD, but the
+    # remote-tracking ref is present), `main` in a normal local clone, and
+    # `HEAD` is the universal fallback — a PR branch descended from main still
+    # contains every historical `chore(release):` subject. (CI's default
+    # fetch-depth: 1 has no `main` ref at all; test.yml sets fetch-depth: 0.)
+    subjects = None
+    for ref in ("origin/main", "main", "HEAD"):
+        result = subprocess.run(
+            ["git", "log", ref, "--pretty=%s"],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            subjects = [
+                line for line in result.stdout.splitlines()
+                if line.startswith("chore(release):")
+            ]
+            break
+    assert subjects is not None, (
+        "no release-history ref resolved (origin/main, main, HEAD)"
     )
-    subjects = [
-        line for line in result.stdout.splitlines()
-        if line.startswith("chore(release):")
-    ]
     assert len(subjects) > 100, (
         "expected the repo's real release history (100+ commits); got "
         f"{len(subjects)} — is this running against a shallow clone?"
