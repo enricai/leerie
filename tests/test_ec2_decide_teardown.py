@@ -22,7 +22,8 @@ test below:
 Stubs _try_fetch_state_for_ec2_teardown directly (mirroring how
 test_decide_teardown_auto_finalize.py stubs _try_fetch_branch_for_teardown)
 so each test isolates decide_ec2_teardown's dispatch logic from the
-real (not-yet-shipped) ec2-ssm.sh transport. All AWS calls go through
+real ec2-fetch-branch.sh transport (see tests/test_ec2_fetch_branch.py
+for that file's own coverage). All AWS calls go through
 the stateful stub in tests/ec2_stub.py — no real AWS API call is made.
 """
 from __future__ import annotations
