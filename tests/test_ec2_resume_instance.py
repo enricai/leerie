@@ -227,6 +227,156 @@ def test_provision_stop_resume_round_trip_leaves_one_running_instance(tmp_path):
     assert leaked_resources(state)["volumes"] == {}
 
 
+def test_provision_stop_resume_terminate_round_trip_leaves_no_leaks(tmp_path):
+    """The full cycle: provision -> stop -> resume -> terminate. Resume
+    re-arms decide_ec2_teardown's EXIT trap (mirroring resume_machine.sh
+    for the Fly path), so a subsequent clean exit must still tear the
+    instance down cleanly — leaked_resources(state) empty on both
+    instances and volumes, not just the volumes side the round-trip-
+    without-terminate test above covers."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir)
+
+    result = _run_bash(
+        f"( source {EC2_PROVISION_SH}; "
+        "_try_fetch_state_for_ec2_teardown() { return 0; }; "
+        "provision_instance; "
+        "iid=\"$LEERIE_EC2_INSTANCE_ID\"; "
+        "stop_instance; "
+        "trap - EXIT INT TERM; "
+        "echo \"iid=$iid\" )",
+        env=env,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    iid = result.stdout.strip().split("iid=")[-1]
+
+    state = read_state(aws_dir)
+    assert state["instances"][iid]["state"] == "stopped"
+
+    # resume_instance re-arms decide_ec2_teardown on EXIT/INT/TERM; a
+    # clean exit (rc=0, the subshell's own default) fires it here.
+    # ec2-resume-instance.sh re-sources ec2-provision.sh internally, which
+    # would clobber a fetch stub defined before that source line — define
+    # it after both sources instead.
+    result2 = _run_bash(
+        f"( source {EC2_PROVISION_SH}; "
+        f"source {EC2_RESUME_SH}; "
+        "_try_fetch_state_for_ec2_teardown() { return 0; }; "
+        f"resume_instance {iid}; "
+        "export LEERIE_REMOTE_EXIT_RC=0 )",
+        env=env,
+    )
+    assert result2.returncode == 0, f"stderr: {result2.stderr}"
+
+    state = read_state(aws_dir)
+    leaked = leaked_resources(state)
+    assert leaked["instances"] == {}, leaked
+    assert leaked["volumes"] == {}, leaked
+    (only_iid, rec), = state["instances"].items()
+    assert only_iid == iid
+    assert rec["state"] == "terminated"
+
+
+# --- resume_instance: re-armed teardown honors the one-way ratchet -------
+
+
+def test_resume_then_clean_exit_syncs_state_before_terminating(tmp_path):
+    """The load-bearing ordering this file owns (test_ec2_decide_teardown.py
+    pins decide_ec2_teardown's fetch-before-terminate ordering in
+    isolation, never through resume_instance): once resume_instance has
+    re-armed the EXIT trap, a subsequent clean exit must still sync state
+    to the host BEFORE terminating the instance — the one-way-ratchet
+    invariant must survive the resume path, not just the original
+    provision path.
+
+    Stubs _try_fetch_state_for_ec2_teardown to make its own `aws sts
+    get-caller-identity` call (mirroring
+    test_ec2_decide_teardown.py::test_fetch_happens_before_terminate_ordering's
+    marker technique, but using an `sts` call rather than `describe-
+    instances` as the marker — resume_instance's own ssh-target
+    re-resolution already makes several describe-instances calls of its
+    own, which would make a describe-instances-shaped marker ambiguous;
+    `sts get-caller-identity` is called exactly once elsewhere, by
+    require_aws at the very start, so a second occurrence is
+    unambiguously the fetch stub) so the fetch is independently visible
+    in the stub's call log, then asserts by call index — not just log
+    presence — that the fetch-marker call precedes terminate-instances.
+    """
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    env = _stub_env(aws_dir)
+
+    # ec2-resume-instance.sh re-sources ec2-provision.sh internally, which
+    # would clobber a fetch stub defined before that source line — define
+    # it after both sources instead.
+    script = f"""
+( source {EC2_PROVISION_SH}
+source {EC2_RESUME_SH}
+_try_fetch_state_for_ec2_teardown() {{
+  aws sts get-caller-identity >/dev/null 2>&1
+  return 0
+}}
+resume_instance {iid}
+export LEERIE_REMOTE_EXIT_RC=0 )
+"""
+    result = _run_bash(script, env=env)
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    state = read_state(aws_dir)
+    (only_iid, rec), = state["instances"].items()
+    assert only_iid == iid
+    assert rec["state"] == "terminated"
+
+    log = read_log(aws_dir)
+    terminate_calls = [i for i, l in enumerate(log) if l.startswith("ec2 terminate-instances")]
+    sts_calls = [i for i, l in enumerate(log) if l.startswith("sts get-caller-identity")]
+    assert terminate_calls, log
+    # require_aws's own preflight call plus the fetch stub's marker call.
+    assert len(sts_calls) == 2, log
+    fetch_marker_idx = sts_calls[-1]
+    assert fetch_marker_idx < terminate_calls[0], (
+        f"state sync must precede the destructive terminate-instances call; "
+        f"fetch_marker_idx={fetch_marker_idx} terminate_idx={terminate_calls[0]}"
+    )
+
+
+def test_resume_then_sync_failure_leaves_instance_running_not_terminated(tmp_path):
+    """The failure-path counterpart: if the re-armed teardown's state
+    sync fails after resume, the one-way ratchet must leave the instance
+    running rather than destroy possibly-unrecovered work — mirroring
+    test_ec2_decide_teardown.py's sync-failure coverage, but through the
+    resume path specifically."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    env = _stub_env(aws_dir)
+
+    # Fetch stub defined after both sources (ec2-resume-instance.sh
+    # re-sources ec2-provision.sh internally, which would otherwise
+    # clobber a stub defined earlier — see the ordering test above).
+    script = f"""
+( source {EC2_PROVISION_SH}
+source {EC2_RESUME_SH}
+_try_fetch_state_for_ec2_teardown() {{ return 1; }}
+resume_instance {iid}
+export LEERIE_REMOTE_EXIT_RC=0 )
+"""
+    result = _run_bash(script, env=env)
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    state = read_state(aws_dir)
+    (only_iid, rec), = state["instances"].items()
+    assert only_iid == iid
+    assert rec["state"] == "running", (
+        "a failed state sync after resume must not escalate to termination"
+    )
+
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 terminate-instances") for l in log)
+
+
 # --- resume_instance: idempotent no-op on an already-running instance ----
 
 
