@@ -7,7 +7,7 @@
 # Pure file I/O + bash/python3 stdlib — no `aws` binary and no boto3/
 # botocore dependency (mirrors the existing Bedrock-mode precedent:
 # `detect_bedrock_mode()`/`bedrock_preflight()` in the `leerie` launcher,
-# and IMPLEMENTATION.md:600's documented fact that the AWS SDK resolves
+# and IMPLEMENTATION.md:621's documented fact that the AWS SDK resolves
 # credentials via pure file I/O against ~/.aws/config and
 # ~/.aws/sso/cache/*.json). This keeps the helper testable against
 # fixtures with no network and no dependency on config-005 (the AWS SDK

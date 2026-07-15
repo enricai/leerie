@@ -1689,6 +1689,30 @@ Maps to: `resolve_source_of_truth` resolution pattern in `leerie.py`
 `resolve_runtime()` in `leerie.py`; constants are `RUNTIME_VALUES`,
 `RUNTIME_ENV`, `RUNTIME_FILE`; argparse flag is `--runtime {local,fly,ec2}`.
 
+### AWS region/profile prefs
+
+Leerie-level knobs for which AWS region/profile leerie itself uses when
+provisioning `--runtime ec2` machines — distinct from the AWS SDK's own
+`AWS_REGION`/`AWS_PROFILE` credential-chain env vars, which
+`scripts/remote/aws-credentials.sh` resolves independently via the
+standard AWS precedence order (see that file's row in the Files table
+above). Free-form strings, no enum validation — mirrors `resolve_pr_template`,
+not `resolve_runtime`.
+
+Resolution order (highest priority first), identical for both knobs:
+
+1. **CLI value** — reserved for a future `--aws-region` / `--aws-profile`
+   flag; no argparse flag exists yet, so this is always `None` today.
+2. **`LEERIE_AWS_REGION`** / **`LEERIE_AWS_PROFILE`** environment variable.
+3. **`leerie.toml`** at the repo root, keys `aws_region` / `aws_profile`.
+4. **Default `None`.** Unset knobs leave region/profile selection to the
+   AWS credential chain `aws-credentials.sh` resolves independently.
+
+Code counterparts: `resolve_aws_region()` / `resolve_aws_profile()` in
+`leerie.py`, both built on the same `_resolve_str_pref` helper as
+`resolve_pr_template`. Constants: `AWS_REGION_ENV`, `AWS_REGION_FILE`,
+`AWS_PROFILE_ENV`, `AWS_PROFILE_FILE`.
+
 ### Fly app name
 
 Fly.io app names are globally unique. `LEERIE_FLY_APP` is required when

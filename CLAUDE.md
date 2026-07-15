@@ -467,12 +467,20 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
-`resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
+`resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,
+`gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
 `resolve_blt`)
 including a coupling test that the
-retry-policy markers match the live check-function strings. The
+retry-policy markers match the live check-function strings.
+`resolve_aws_region`/`resolve_aws_profile` (the `LEERIE_AWS_REGION`/
+`LEERIE_AWS_PROFILE`/`leerie.toml` knobs for which region/profile leerie
+itself uses when provisioning `--runtime ec2` machines, distinct from the
+AWS SDK's own credential-chain env vars) are covered in
+`tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
+CLI/env/file precedence structure but for the unvalidated free-form-string
+`_resolve_str_pref` machinery (no enum, no `die()` path). The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
