@@ -863,7 +863,7 @@ def _confidence_schema(axes: list[str]) -> dict:
 
     Every worker that self-gates on confidence uses the same structural
     discipline (DESIGN §8 / §12): numeric score axes, basis, falsifiers,
-    contradictions, gap-to-close.  This helper DRYs the seven occurrences
+    contradictions, gap-to-close.  This helper DRYs the nine occurrences
     across SCHEMAS."""
     return {
         "type": "object",
@@ -9642,9 +9642,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # Drift guard: typos in `schema_key` would write orphan rows into
     # calls.ndjson (judge/heal filter by call_type, so an orphan is
     # silently dropped). Fail fast at the call site instead. The
-    # allowed set is WORKER_TYPES plus the two post-run skill schemas
-    # (`judge`, `patch_generator`) that are not main-loop workers but
-    # do invoke claude_p with their own schema.
+    # allowed set is WORKER_TYPES plus the four post-run / finalize
+    # schemas (`judge`, `patch_generator`, `pr_writer`, `dep_capture`)
+    # that are not main-loop workers but do invoke claude_p with their
+    # own schema.
     _allowed_schema_keys = set(WORKER_TYPES) | {
         "judge", "patch_generator", "pr_writer", "dep_capture"}
     if schema_key not in _allowed_schema_keys:
