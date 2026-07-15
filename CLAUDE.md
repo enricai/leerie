@@ -1202,6 +1202,31 @@ argv assertion for the profile seam (`--profile <resolved>` present when
 a harness-sanity check that it imports and exercises the same
 verbatim-extracted dispatch block as `tests/test_ec2_e2e_provision.py`
 rather than a hand-copied reproduction.
+The EC2 resume path — `scripts/remote/ec2-resume-instance.sh`'s
+`resume_instance()`, the EC2 counterpart to `resume-machine.sh` — is
+tested in `tests/test_ec2_resume_instance.py` against the same
+resource-tracking `aws` stub: starting a `stopped` instance drives it
+to `running` via a single `start-instances` call; the readiness poll
+does not return early when a seeded `status_ok: False` keeps
+`describe-instance-status` reporting "initializing" (and does return
+promptly once `status_ok: True`); `LEERIE_EC2_SSH_TARGET` is
+re-resolved to the instance's current `PublicIpAddress` rather than
+any address cached from provision time (EC2 assigns a new public IP on
+every stop/start cycle absent an attached Elastic IP); a full
+provision → stop → resume round trip leaves exactly one `running`
+instance with no leaked volumes; resuming an already-`running`
+instance is an idempotent no-op that issues no `start-instances` call;
+resuming an unknown/terminated instance fails with the "no longer
+recoverable" hint and issues no `start-instances` call; the run.json
+sidecar's `paused_at`/`pause_reason` fields are cleared on success; and
+the one-way-ratchet invariant (never `terminate-instances` or
+`delete-volume`) holds both on the success path and the failure path
+(instance never becomes ready), backed by a source-level grep guard on
+the script file. `tests/ec2_stub.py` was extended to model a
+per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
+on every `start-instances` call, and an optional `status_ok` flag so
+`describe-instance-status` can report "initializing" instead of "ok"
+without an infinite/slow poll in tests.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
