@@ -5,6 +5,9 @@
 # scripts/remote/lib.sh is sourced by the RUNTIME=fly branch. Today this
 # file provides only the host-side preflight (`require_aws`); the
 # provisioning/seed/teardown helpers land in later subtasks.
+#
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_log.sh"
 
 # --- require_aws -----------------------------------------------------------
 # Ensure the AWS CLI is on PATH and credentials resolve, before the EC2
