@@ -890,6 +890,29 @@ unresolvable; profile resolution precedence (`--profile` passthrough,
 in both the `aws sts get-caller-identity` call and the sso-login hint. Not
 yet wired into the launcher's `RUNTIME=ec2` dispatch branch (that lands in a
 separate subtask); this test file covers only the standalone helper.
+The resource-tracking `aws` stub state machine (`tests/ec2_stub.py`,
+distinct from `test_ec2_lib_sh.py`'s argv-only `_stub_aws`) models EC2 as
+a persistent state machine — `run-instances` creates a tracked instance
+that `stop-instances`/`start-instances`/`terminate-instances` transition
+through, and `create-volume`/`delete-volume` do the same for volumes —
+so downstream lifecycle tests can assert on resource *leaks* rather than
+merely inspecting argv. It exposes `_stub_aws(dir)` (writes the stub
+binary plus an empty `state.json`/`aws.log`), `read_state(dir)`,
+`read_log(dir)`, and `leaked_resources(state)` (non-terminated instances
+and non-deleted volumes). State persists to `<dir>/state.json`; every
+invocation's argv is appended to `<dir>/aws.log`. Self-tests in
+`tests/test_ec2_stub.py` pin the state transitions (run-instances →
+`running`; stop-instances → `stopped` without removing the record;
+terminate-instances → `terminated`), `leaked_resources()` on both a
+clean and an unclean teardown, multi-instance independence, the real
+`aws` CLI's `--instance-ids i-1 i-2` space-separated multi-value flag
+syntax (not a repeated flag), the log recording every invocation in
+order, and a structural guard that the stub source contains no
+networking imports (`socket`, `urllib`, `http.client`, `requests`,
+`boto3`) so no invocation can reach a real AWS endpoint. Pure test
+fixture — no dependency on `orchestrator/leerie.py` or
+`scripts/remote/ec2-lib.sh`, importable ahead of the EC2 dispatch branch
+landing.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
