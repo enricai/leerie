@@ -1024,6 +1024,32 @@ merge-base equals the host tip (PR-diff correctness), and
 branch names, including the live `__PARENT_MATERIALIZE__`/
 `__CLEANUP_TMP__` placeholder tokens) invoked against the real function
 rather than a reproduction of it.
+The EC2 counterpart to `scripts/remote/seed-auth.sh` —
+`scripts/remote/ec2-seed-auth.sh`'s `ec2_seed_auth()` — is tested in
+`tests/test_ec2_seed_auth.py`, modeled on `tests/test_seed_auth_sh.py`
+and reusing `tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh`
+transport harness (the `aws` stub decodes and locally executes
+`ec2_remote_exec`'s base64-wrapped SSM command, rewriting `/home/leerie`
+into the test's `dest` dir; the `ssh` stub drains `ec2_tar_pipe`'s
+gzipped-tar-of-`$STAGE` payload into the same rewritten dest): a
+`$STAGE` dir containing `.claude/`, `.claude.json`, and `.gitconfig`
+round-trips to the instance's home dir with ownership fixed to
+`leerie:` (asserted via a `chown_log` sink so the test observes the real
+script issuing the call, not just its source text); the
+`CLAUDE_CODE_OAUTH_TOKEN` fallback writing a valid single-token
+`.credentials.json` when `$STAGE` has none; `plugins/cache` and
+`plugins/marketplaces` excluded from the tar (both a positive check that
+the exclude list matches `seed-auth.sh`'s original and a check that
+files outside those dirs are not swept up by the same exclusion);
+preflight failing closed on missing `LEERIE_EC2_INSTANCE_ID` /
+`LEERIE_EC2_SSH_TARGET` / `STAGE` / `aws` on PATH / credentials-or-token
+/ git identity; git identity written to `/home/leerie/.gitconfig`;
+`flyctl` never appearing in the transport log while `aws`/`ssh` both do;
+and a stalled transport (the process-group-killing `_stub_timeout`
+imported from `tests/test_ec2_transport.py` — the local no-op passthrough
+stub would hang for the full sleep, per the CLAUDE.md test-harness trap
+documented above) yielding rc 124/137 rather than hanging, bounded by
+`LEERIE_SEED_TIMEOUT_S`.
 The EC2 instance lifecycle itself (`scripts/remote/ec2-provision.sh`'s
 `provision_instance()`/`wait_for_instance_ready()`/`stop_instance()`/
 `terminate_instance()`/`decide_ec2_teardown()`) is covered across two
