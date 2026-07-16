@@ -69,10 +69,11 @@ _resolve_resume_sidecar() {
 # record).
 _describe_instance_state() {
   local iid="$1"
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
   local describe_out
-  describe_out="$(aws ec2 describe-instances --instance-ids "$iid" "${aws_args[@]}" --output json 2>/dev/null || true)"
+  describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
   printf '%s' "$describe_out" | python3 -c '
 import json, sys
 try:
@@ -90,10 +91,11 @@ except (ValueError, KeyError, IndexError):
 # re-resolved on every resume rather than reused from provision time.
 _resolve_ssh_target_from_instance() {
   local iid="$1"
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
   local describe_out ip
-  describe_out="$(aws ec2 describe-instances --instance-ids "$iid" "${aws_args[@]}" --output json 2>/dev/null || true)"
+  describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
   ip="$(printf '%s' "$describe_out" | python3 -c '
 import json, sys
 try:
@@ -133,9 +135,10 @@ resume_instance() {
       remote_log "remote: instance $iid is already running"
       ;;
     stopped|stopping|pending)
-      local aws_args=()
-      _aws_region_profile_args aws_args
-      if ! aws ec2 start-instances --instance-ids "$iid" "${aws_args[@]}" >/dev/null 2>&1; then
+      local aws_args=() _a
+      while IFS= read -r _a; do aws_args+=("$_a"); done \
+        < <(_aws_region_profile_args)
+      if ! aws ec2 start-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} >/dev/null 2>&1; then
         remote_log "error: failed to start instance $iid"
         return 1
       fi
