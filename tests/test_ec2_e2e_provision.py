@@ -105,7 +105,8 @@ def extract_ec2_dispatch_block() -> str:
 
 
 def stub_aws_env(aws_dir: Path, *, identity_succeeds: bool = True,
-                  extra: dict | None = None, home: Path | None = None) -> dict:
+                  extra: dict | None = None, home: Path | None = None,
+                  stub_transport: bool = True) -> dict:
     """Write the resource-tracking `aws` stub into aws_dir and build the
     env dict that runs it. When identity_succeeds is False, `sts
     get-caller-identity` is made to fail without disturbing the stub's
@@ -120,7 +121,16 @@ def stub_aws_env(aws_dir: Path, *, identity_succeeds: bool = True,
     used so credential resolution succeeds and require_aws's own probe
     is actually reached; ambient AWS_* env vars and the real user's
     $HOME are always excluded so no test can accidentally depend on
-    (or leak into) the host's real AWS config."""
+    (or leak into) the host's real AWS config.
+
+    `stub_transport=True` (the default) points `LEERIE_REPO` at
+    `_build_stub_transport_repo`'s throwaway copy of scripts/remote/
+    with ec2-seed-auth.sh/ec2-seed-repo.sh/ec2-ssm.sh replaced by no-op
+    stubs, so a full run_ec2_dispatch(run_provision=True) call exercises
+    provision_instance()/credential-ordering/resource-bookkeeping without
+    needing a real ssh/ssm transport to a nonexistent instance. Pass
+    False only for tests that supply their own LEERIE_REPO (e.g. via
+    `extra`) or that never reach the seed stage (run_provision=False)."""
     _stub_aws(aws_dir)
     if not identity_succeeds:
         _break_sts_get_caller_identity(aws_dir)
@@ -128,7 +138,10 @@ def stub_aws_env(aws_dir: Path, *, identity_succeeds: bool = True,
            if not k.startswith("AWS_") and k not in ("LEERIE_AWS_PROFILE", "LEERIE_AWS_REGION")}
     env["PATH"] = f"{aws_dir}:{env.get('PATH', '')}"
     env["USER_REPO"] = str(aws_dir)
-    env["LEERIE_REPO"] = str(REPO_ROOT)
+    if stub_transport:
+        env["LEERIE_REPO"] = str(_build_stub_transport_repo(aws_dir.parent / "stub-repo"))
+    else:
+        env["LEERIE_REPO"] = str(REPO_ROOT)
     env.pop("LEERIE_STATE_DIR", None)
     if home is None:
         home = aws_dir.parent / "home"
@@ -163,21 +176,80 @@ def _break_sts_get_caller_identity(aws_dir: Path) -> None:
     real_stub.chmod(0o755)
 
 
-def run_ec2_dispatch(env: dict, *, run_provision: bool = True) -> subprocess.CompletedProcess:
+def run_ec2_dispatch(env: dict, *, run_provision: bool = True,
+                      extra_preamble: str = "",
+                      extra_trailer: str = "") -> subprocess.CompletedProcess:
     """Run the launcher's real ec2-dispatch block (extracted verbatim)
-    against `env`. When run_provision is True (the happy-path shape),
-    also sources ec2-provision.sh and calls provision_instance() right
-    after the dispatch block, mirroring the "Create" stage that
-    immediately follows the preflight per DESIGN §6's stage-mapping
-    table — exercising a real `run-instances` call so the ordering
-    assertion is non-vacuous even though the launcher itself does not
-    yet wire provisioning in (that lands in a later subtask)."""
+    against `env`. The dispatch block now performs the FULL create ->
+    seed -> launch -> tail/attach cycle itself (feat-003), so the
+    launcher-global scaffolding it reads from the caller's scope in the
+    real launcher (REWRITTEN_ARGS, IS_RESUME, LEERIE_RUN_ID, NO_PUSH,
+    container_rc, LEERIE_STATE_HOST_DIR) is always defined here,
+    regardless of `run_provision` — ec2-provision.sh (sourced
+    unconditionally by the dispatch block) sets `set -euo pipefail` and
+    stays sourced for the rest of the script, so ANY unbound reference
+    below that point aborts the whole harness, even on a
+    credential-failure test that expects the block's own `exit 1` to
+    fire first.
+
+    `run_provision=True` (the default) additionally appends the real
+    launcher's own final line (leerie:6689, `exit "$container_rc"` —
+    outside the extracted block) so `result.returncode` reflects the
+    dispatch block's disposition (e.g. the rc=75 -> 130 detach pivot)
+    rather than bash's own default exit code. `run_provision=False`
+    omits it for tests whose dispatch is expected to `exit 1` via
+    require_aws/resolve_aws_credentials before ever reaching that line.
+
+    `extra_preamble` is inserted after the scaffolding and before the
+    dispatch block itself — tests use it to override plain shell
+    variables the dispatch block reads before sourcing (e.g.
+    EC2_SEED_AUTH_SCRIPT-style path variables) so the block sources a
+    stub file instead of the real transport script; see
+    `_build_stub_transport_repo` for the higher-level equivalent
+    (rewriting `LEERIE_REPO` itself rather than individual path vars).
+
+    `extra_trailer` is inserted after the dispatch block runs but
+    before the script's own process exit fires ec2-provision.sh's EXIT
+    trap (`decide_ec2_teardown`) — the only point where a function
+    override (e.g. a `_try_fetch_state_for_ec2_teardown` stub,
+    mirroring tests/test_ec2_decide_teardown.py's pattern) survives
+    past ec2-provision.sh unconditionally (re)defining that function at
+    source time.
+    """
     dispatch_block = extract_ec2_dispatch_block()
     script_lines = [
         "#!/usr/bin/env bash",
         f"RUNTIME=ec2",
-        f"LEERIE_REPO={REPO_ROOT}",
+        # Honor a caller-supplied LEERIE_REPO (e.g. stub_aws_env's
+        # stub-transport repo) — only fall back to the real REPO_ROOT
+        # when the env doesn't set one. A hardcoded assignment here
+        # would silently clobber env["LEERIE_REPO"] and route every
+        # test back through the real (unstubbed) transport scripts.
+        f'LEERIE_REPO="${{LEERIE_REPO:-{REPO_ROOT}}}"',
         f". {LOG_SH}",
+        # The real launcher (leerie:3302 etc.) always defines these
+        # before RUNTIME dispatch runs, regardless of which runtime arm
+        # is taken. ec2-provision.sh sets `set -euo pipefail` at source
+        # time and stays sourced for the rest of the script, so ANY
+        # unbound reference below this point — even one gated behind a
+        # `run_provision=False` credential-failure test that expects to
+        # never reach it — now aborts the whole harness with "unbound
+        # variable" the moment the real code path reaches further than
+        # expected. Scaffold unconditionally so tests are exercising the
+        # dispatch block's actual logic, not accidentally passing/failing
+        # on undefined-variable noise.
+        "REWRITTEN_ARGS=()",
+        "IS_RESUME=${IS_RESUME:-false}",
+        "LEERIE_RUN_ID=${LEERIE_RUN_ID:-}",
+        "NO_PUSH=${NO_PUSH:-false}",
+        "LEERIE_TASK_ARG=${LEERIE_TASK_ARG:-}",
+        "USER_REPO=${USER_REPO:-$PWD}",
+        'LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-$USER_REPO}"',
+        "container_rc=0",
+    ]
+    if extra_preamble:
+        script_lines.append(extra_preamble)
+    script_lines += [
         # The real launcher's block is one `elif` arm of a larger
         # if/elif/elif/else chain (RUNTIME=fly / RUNTIME=ec2 / local).
         # Wrap it in a throwaway `if false; then :; ` prefix so the
@@ -186,12 +258,24 @@ def run_ec2_dispatch(env: dict, *, run_provision: bool = True) -> subprocess.Com
         "if false; then\n  :\n" + dispatch_block,
         "fi",
     ]
+    if extra_trailer:
+        # Placed AFTER the dispatch block runs but BEFORE the script's
+        # own process exit fires ec2-provision.sh's `trap ...
+        # decide_ec2_teardown EXIT`. ec2-provision.sh (sourced inside
+        # the dispatch block) unconditionally (re)defines
+        # _try_fetch_state_for_ec2_teardown at source time, so an
+        # override placed in extra_preamble would be clobbered before
+        # the trap ever fires — this trailer hook is the only point
+        # where a function override actually survives to the trap.
+        script_lines.append(extra_trailer)
     if run_provision:
-        # Reached only when the dispatch block above did not `exit 1`
-        # (i.e. require_aws succeeded) — a failing preflight aborts the
-        # whole script before this line via the block's own `exit 1`.
-        script_lines.append(f". {EC2_PROVISION_SH}")
-        script_lines.append("provision_instance")
+        # The real launcher's own final line (leerie:6689) is
+        # `exit "$container_rc"` — outside the extracted dispatch
+        # block. Reproduce it so a caller can assert on
+        # result.returncode reflecting the dispatch block's
+        # disposition (e.g. the rc=75 -> 130 detach pivot), not just
+        # bash's own default (0-unless-something-errored) exit code.
+        script_lines.append('exit "$container_rc"')
     script = "\n".join(script_lines)
     return subprocess.run(
         ["bash", "-c", script],
@@ -199,6 +283,54 @@ def run_ec2_dispatch(env: dict, *, run_provision: bool = True) -> subprocess.Com
         capture_output=True,
         text=True,
     )
+
+
+def _build_stub_transport_repo(dest: Path) -> Path:
+    """Build a throwaway copy of `scripts/remote/` with ec2-seed-auth.sh,
+    ec2-seed-repo.sh, and ec2-ssm.sh replaced by tiny stubs, so a test can
+    point `LEERIE_REPO` at `dest` and have the dispatch block's own `.
+    "$LEERIE_REPO/scripts/remote/ec2-seed-auth.sh"` (etc.) line source the
+    stub instead of the real transport — no override hook needed in the
+    launcher itself, and no risk of the dispatch block's own unconditional
+    `EC2_SEED_AUTH_SCRIPT="$LEERIE_REPO/..."` assignment clobbering a
+    preamble-defined path variable.
+
+    Every OTHER script (ec2-lib.sh, ec2-provision.sh,
+    ec2-resume-instance.sh, ec2-fetch-branch.sh, _log.sh) is a real copy —
+    only the three transport-heavy scripts are swapped, so
+    provision_instance()/resume_instance()/decide_ec2_teardown() and the
+    credential-ordering assertions all still exercise the genuine code.
+    `_resolve_ssh_target_from_instance` (ec2-resume-instance.sh) is left
+    real — it reads PublicIpAddress from the resource-tracking `aws` stub,
+    which already populates that field (ec2_stub.py's `instance_doc`), so
+    no override is needed there.
+
+    Returns `dest` (the new scripts/remote/ dir's parent, suitable for
+    LEERIE_REPO).
+    """
+    real_remote_dir = REPO_ROOT / "scripts" / "remote"
+    dest_remote_dir = dest / "scripts" / "remote"
+    dest_remote_dir.mkdir(parents=True, exist_ok=True)
+    for src in real_remote_dir.glob("*.sh"):
+        (dest_remote_dir / src.name).write_text(src.read_text())
+        (dest_remote_dir / src.name).chmod(0o755)
+    (dest_remote_dir / "ec2-seed-auth.sh").write_text(
+        "ec2_seed_auth() { remote_log \"stub: ec2_seed_auth\"; return 0; }\n"
+    )
+    (dest_remote_dir / "ec2-seed-repo.sh").write_text(
+        "ec2_seed_repo() { remote_log \"stub: ec2_seed_repo\"; return 0; }\n"
+    )
+    (dest_remote_dir / "ec2-ssm.sh").write_text(
+        "if ! command -v ec2_remote_exec >/dev/null 2>&1; then\n"
+        f'  . "{dest_remote_dir}/ec2-lib.sh"\n'
+        "fi\n"
+        "ec2_launch_detached() { cat >/dev/null; remote_log \"stub: ec2_launch_detached\"; "
+        "return \"${LEERIE_TEST_LAUNCH_RC:-0}\"; }\n"
+        "ec2_attach() { cat >/dev/null; remote_log \"stub: ec2_attach\"; return 0; }\n"
+        "_attach_to_live_orchestrator_ec2() { remote_log \"stub: attach to live orchestrator\"; "
+        "container_rc=130; }\n"
+    )
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +364,13 @@ def test_preflight_precedes_run_instances_by_call_index(tmp_path):
     ]
     assert identity_calls, f"expected an sts get-caller-identity call; log={log}"
     assert run_instances_calls, f"expected an ec2 run-instances call; log={log}"
-    assert max(identity_calls) < min(run_instances_calls), (
+    # min-to-min, not max-to-min: the full lifecycle now runs a *second*
+    # sts get-caller-identity call as part of decide_ec2_teardown's
+    # clean-exit fetch_state_ec2 -> require_aws preflight (teardown-time
+    # state sync), which legitimately happens AFTER run-instances. What
+    # must hold is that the require_aws preflight gating provisioning
+    # itself precedes the first run-instances call.
+    assert min(identity_calls) < min(run_instances_calls), (
         f"require_aws's sts get-caller-identity must precede any "
         f"ec2 run-instances call; log={log}"
     )
@@ -504,3 +642,94 @@ def test_expired_sso_token_aborts_with_hint_and_zero_ec2_calls(tmp_path):
 
     state = read_state(aws_dir)
     assert state == {"instances": {}, "volumes": {}}
+
+
+# ---------------------------------------------------------------------------
+# Full lifecycle: create -> seed -> launch -> teardown (feat-003)
+# ---------------------------------------------------------------------------
+
+
+def test_not_yet_wired_die_string_is_gone():
+    """The old 'instance provisioning is not yet wired into the launcher'
+    die from before feat-003 must no longer exist anywhere in the
+    launcher — dispatch is live now."""
+    src = LAUNCHER.read_text()
+    assert "is not yet wired into the launcher" not in src
+    assert "not yet wired" not in src
+
+
+def test_full_lifecycle_terminates_instance_with_no_leaked_volume(tmp_path):
+    """A full create -> seed -> launch -> attach -> clean-exit cycle,
+    with _try_fetch_state_for_ec2_teardown stubbed to succeed (mirroring
+    tests/test_ec2_decide_teardown.py's fetch_ok=True pattern — the sync
+    step itself is unit-tested there, not re-proven here), must leave
+    exactly one TERMINATED instance and zero leaked volumes: the
+    dispatch branch's own container_rc=0 default on a clean tail exit
+    drives decide_ec2_teardown's EXIT trap into the rc=0 clean-exit ->
+    sync-ok -> terminate_instance arm."""
+    aws_dir = tmp_path / "bin"
+    env = stub_aws_env(aws_dir, identity_succeeds=True,
+                        extra=REQUIRED_PROVISION_ENV)
+
+    result = run_ec2_dispatch(
+        env,
+        extra_trailer="_try_fetch_state_for_ec2_teardown() { return 0; }",
+    )
+    assert result.returncode == 0, result.stderr
+
+    state = read_state(aws_dir)
+    assert len(state["instances"]) == 1, (
+        f"expected exactly one tracked instance; state={state}"
+    )
+    (_iid, rec), = state["instances"].items()
+    assert rec["state"] == "terminated", (
+        f"a clean exit with a successful state sync must terminate the "
+        f"instance (one-way-ratchet: sync-then-terminate); state={state}"
+    )
+    assert state["volumes"] == {}, (
+        f"root EBS is implicit via run-instances' own "
+        f"DeleteOnTermination=true default — no volume should ever be "
+        f"tracked independently; state={state}"
+    )
+    assert leaked_resources(state) == {"instances": {}, "volumes": {}}, (
+        f"a terminated instance with no tracked volume is not a leak; "
+        f"state={state}"
+    )
+
+
+def test_rc75_flock_loser_pivots_to_attach_without_duplicate_provision(tmp_path):
+    """When ec2_launch_detached returns 75 (an orchestrator is already
+    running for this run_id on the instance — the flock-loser smart-
+    resume pivot), the dispatch block must call
+    _attach_to_live_orchestrator_ec2 instead of provisioning a second
+    instance, and must route container_rc=130 (not 1, not 75) so
+    decide_ec2_teardown's detach arm leaves the live instance alone
+    rather than pausing or terminating it."""
+    aws_dir = tmp_path / "bin"
+    env = stub_aws_env(aws_dir, identity_succeeds=True,
+                        extra={**REQUIRED_PROVISION_ENV,
+                               "LEERIE_TEST_LAUNCH_RC": "75"})
+
+    result = run_ec2_dispatch(env)
+    assert result.returncode == 130, (
+        f"rc=75 from ec2_launch_detached must route container_rc=130 "
+        f"(the detach disposition), not the launch failure/pause path; "
+        f"stdout={result.stdout} stderr={result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "stub: attach to live orchestrator" in combined, combined
+
+    log = read_log(aws_dir)
+    run_instances_calls = [l for l in log if l.startswith("ec2 run-instances")]
+    assert len(run_instances_calls) == 1, (
+        f"exactly one run-instances call — the smart-resume pivot must "
+        f"not provision a second, duplicate instance; log={log}"
+    )
+
+    state = read_state(aws_dir)
+    assert len(state["instances"]) == 1
+    (_iid, rec), = state["instances"].items()
+    assert rec["state"] == "running", (
+        f"the detach disposition must leave the live instance running, "
+        f"not stop or terminate it; state={state}"
+    )

@@ -2696,16 +2696,16 @@ trust model matches the spec: the user picks the moment (by typing
 
 ### EC2 runtime lifecycle
 
-`--runtime ec2` is accepted today as a resolvable enum value with a
-working credential chain (`scripts/remote/aws-credentials.sh`,
-`resolve_aws_region`/`resolve_aws_profile`, the `boto3`/`botocore` pin —
-see IMPLEMENTATION.md "Runtime mode" / "AWS region/profile prefs"), but
-instance provisioning itself has not shipped. This section is the
-canonical architecture that a provisioning subtask must implement
-against — the EC2 counterpart to everything above in this section for
-Fly. It reuses Fly's stage names and dispositions everywhere the two
-platforms agree, and calls out explicitly where EC2's platform
-semantics diverge and the design must not copy Fly's rule blindly.
+`--runtime ec2` provisions and runs the orchestrator on an AWS EC2
+instance (`scripts/remote/aws-credentials.sh`,
+`resolve_aws_region`/`resolve_aws_profile`, the `boto3`/`botocore` pin,
+and the launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md
+"Runtime mode" / "AWS region/profile prefs"). This section is the
+canonical architecture the shipped dispatch implements against — the
+EC2 counterpart to everything above in this section for Fly. It reuses
+Fly's stage names and dispositions everywhere the two platforms agree,
+and calls out explicitly where EC2's platform semantics diverge and the
+design must not copy Fly's rule blindly.
 
 **Stage mapping.** The five Fly stages above (provision → wait-ready →
 seed → detached-orchestrate → teardown) carry over one-for-one:

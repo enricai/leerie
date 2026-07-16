@@ -338,16 +338,20 @@ entirely; use `--local-build` only if you have a specific reason
 (e.g. you need to build an image variant the remote builder can't
 produce, or you're testing the build pipeline locally).
 
-## EC2 runtime (configuration only — provisioning not yet wired)
+## EC2 runtime
 
-> **Current limitation:** `--runtime ec2` runs AWS credential/config
-> preflight and then exits with an actionable error —
-> "instance provisioning is not yet wired into the launcher". The
-> create/wait-ready/teardown dispatch that would actually launch an
-> EC2 instance and run a worker on it has not landed yet. This section
-> documents how to configure the runtime's credentials and instance
-> shape today, so that setup is already correct once provisioning
-> ships. Do not expect an end-to-end `--runtime ec2` run to work yet.
+`--runtime ec2` provisions an AWS EC2 instance, seeds it, runs the
+orchestrator on it (detached), and tears it down on exit — the EC2
+counterpart to `--runtime fly`. This section documents credential
+resolution and the required instance-shape vars.
+
+> **AMI prerequisite:** `LEERIE_EC2_AMI` must name an AMI with the
+> leerie orchestrator source already baked in at `/opt/leerie-image/`
+> (DESIGN §6 *EC2 runtime lifecycle*, "Image delivery" — the adopted
+> default is bake-into-AMI, the same artifact shape
+> `scripts/remote/build-push.sh` produces for Fly, not a stock AMI).
+> Building that AMI is an operator-owned, out-of-band step (Packer /
+> EC2 Image Builder); leerie does not build or publish one for you.
 
 Passing `--runtime ec2` (or setting `LEERIE_RUNTIME=ec2` or
 `runtime = ec2` in `leerie.toml`) selects the EC2 execution backend as
@@ -416,7 +420,7 @@ leerie "task" --runtime ec2 --aws-region us-east-1 --aws-profile my-aws-profile
 ### Required instance-shape vars
 
 Five `LEERIE_EC2_*` vars name the AWS `RunInstances` parameters the
-(not-yet-wired) provisioning step needs. Unlike Fly, where
+provisioning step needs. Unlike Fly, where
 `FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults, these describe
 AWS account resources leerie cannot choose on your behalf — there is
 no default tier. `--runtime ec2` without all five resolved fails the
