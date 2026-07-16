@@ -1061,13 +1061,17 @@ def test_poll_loop_reaps_above_high_water(leerie, monkeypatch):
 
     call_count = [0]
 
+    # 4-tuple: _cgroup_stat returns (current, max, events_max, oom_kill) and
+    # _poll_loop unpacks all four. A 3-tuple stub raises ValueError inside the
+    # loop, silently skipping the whole reaping branch — the test then passes
+    # while proving nothing.
     def fake_cgroup_stat(sid):
         call_count[0] += 1
         if call_count[0] == 1:
-            return (92, 100, 0)   # armed: 92% >= 90%
+            return (92, 100, 0, 0)   # armed: 92% >= 90%
         if call_count[0] == 2:
-            return (91, 100, 0)   # still above low-water after 1 kill
-        return (70, 100, 0)       # below low-water: stop
+            return (91, 100, 0, 0)   # still above low-water after 1 kill
+        return (70, 100, 0, 0)       # below low-water: stop
 
     monkeypatch.setattr(leerie, "_cgroup_stat", fake_cgroup_stat)
     monkeypatch.setattr(leerie, "_signal_pids",
@@ -1078,10 +1082,17 @@ def test_poll_loop_reaps_above_high_water(leerie, monkeypatch):
         tracker._seen = {500, 501}
         tracker.start()
         await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        # Snapshot BEFORE stop_and_reap: that path SIGKILLs everything in
+        # `_seen` unconditionally, so asserting after it would pass even if
+        # the mid-run reap never fired. The mid-run kill is the contract
+        # under test.
+        mid_run = list(killed)
         await tracker.stop_and_reap()
+        return mid_run
 
-    asyncio.run(_run())
-    assert len(killed) >= 1, f"Expected at least one kill above high-water; got {killed}"
+    mid_run = asyncio.run(_run())
+    assert len(mid_run) >= 1, (
+        f"Expected at least one MID-RUN kill above high-water; got {mid_run}")
 
 
 def test_poll_loop_below_high_water_kills_nothing(leerie, monkeypatch):
@@ -1106,7 +1117,7 @@ def test_poll_loop_below_high_water_kills_nothing(leerie, monkeypatch):
                         lambda pid: set(range(400, 450)))
     # 58% — below 90% high-water
     monkeypatch.setattr(leerie, "_cgroup_stat",
-                        lambda sid: (58, 100, 0))
+                        lambda sid: (58, 100, 0, 0))
 
     def track_kills(pids, s):
         mid_run_killed.extend(pids)
@@ -1130,8 +1141,18 @@ def test_poll_loop_below_high_water_kills_nothing(leerie, monkeypatch):
 
 
 def test_poll_loop_young_orphan_not_reaped(leerie, monkeypatch):
-    """A reparented PID younger than _PID_REAP_MIN_AGE_SEC must never be
-    reaped — even when pressure is above high-water."""
+    """A reparented PID younger than _PID_REAP_MIN_AGE_SEC must not be reaped
+    in the NORMAL tier — armed (>= high-water) but below critical water.
+
+    Scope note: this test formerly stubbed pressure at 95%, which is at or
+    above _PID_REAP_CRITICAL_WATER, where the critical tier deliberately
+    lowers the floor to _PID_REAP_CRITICAL_AGE_SEC and *does* reap a young
+    orphan (DESIGN §6 *the critical tier*). It passed anyway only because its
+    3-tuple _cgroup_stat stub raised ValueError inside _poll_loop and skipped
+    the reaping branch entirely. With the stub corrected, the pressure is
+    pinned between high-water and critical-water so the assertion tests the
+    normal-tier floor it names. The critical-tier behavior is covered by
+    test_poll_loop_young_orphan_reaped_at_critical_pressure."""
     import asyncio
 
     killed: list[int] = []
@@ -1139,7 +1160,7 @@ def test_poll_loop_young_orphan_not_reaped(leerie, monkeypatch):
 
     fake_ps_out = (
         "  PID  PPID ELAPSED\n"
-        f"  700     1 {min_age - 1}\n"  # too young
+        f"  700     1 {min_age - 1}\n"  # too young for the normal floor
     )
 
     def fake_run(cmd, **kwargs):
@@ -1150,8 +1171,11 @@ def test_poll_loop_young_orphan_not_reaped(leerie, monkeypatch):
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
     monkeypatch.setattr(leerie, "_enumerate_descendants",
                         lambda pid: {700})
+    # Armed but below critical: force a gap so this tier is reachable even
+    # though the shipped constants are equal (0.90 == 0.90).
+    monkeypatch.setattr(leerie, "_PID_REAP_CRITICAL_WATER", 0.98)
     monkeypatch.setattr(leerie, "_cgroup_stat",
-                        lambda sid: (95, 100, 0))  # above high-water
+                        lambda sid: (95, 100, 0, 0))  # >= high, < critical
     monkeypatch.setattr(leerie, "_signal_pids",
                         lambda pids, s: killed.extend(pids))
 
@@ -1192,7 +1216,7 @@ def test_poll_loop_attached_pid_not_reaped(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_enumerate_descendants",
                         lambda pid: {800})
     monkeypatch.setattr(leerie, "_cgroup_stat",
-                        lambda sid: (95, 100, 0))  # above high-water
+                        lambda sid: (95, 100, 0, 0))  # above high-water
     monkeypatch.setattr(leerie, "_signal_pids",
                         lambda pids, s: killed.extend(pids))
 
@@ -1208,6 +1232,97 @@ def test_poll_loop_attached_pid_not_reaped(leerie, monkeypatch):
 
     asyncio.run(_run())
     assert 800 not in killed, f"Attached PID 800 must not be reaped; killed={killed}"
+
+
+# --- critical-pressure tier (DESIGN §6 *the critical tier*) -------------------
+# Regression pins for the measured root cause of run 879defae's wave-2
+# integrator death: a burst of leaked `run_in_background` trees saturates
+# pids.max in seconds, so every orphan in it is younger than the 60 s normal
+# floor. The reaper armed at 90% and found an empty candidate list — reaping
+# nothing is not safety, it is a disabled reducer. Reproduced against the real
+# `_reparented_orphans` with 20 abandoned setsid trees in a --pids-limit 1024
+# container: 0 candidates at age < 60 s, all 20 at 65 s.
+
+def test_poll_loop_young_orphan_reaped_at_critical_pressure(leerie, monkeypatch):
+    """At >= _PID_REAP_CRITICAL_WATER, a young reparented orphan IS reaped:
+    the floor drops to _PID_REAP_CRITICAL_AGE_SEC. This is the fix for the
+    burst case — without it the candidate list is empty exactly when the
+    worker is about to die of EAGAIN."""
+    import asyncio
+
+    killed: list[int] = []
+    # Young by the normal floor, old enough for the critical floor.
+    age = leerie._PID_REAP_MIN_AGE_SEC - 1
+    assert age > leerie._PID_REAP_CRITICAL_AGE_SEC, (
+        "fixture assumes the critical floor is well below the normal floor")
+
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        f"  900     1 {age}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie, "_enumerate_descendants",
+                        lambda pid: {900})
+    # 95% >= critical water (0.90): the critical tier arms.
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: (95, 100, 0, 0))
+    monkeypatch.setattr(leerie, "_signal_pids",
+                        lambda pids, s: killed.extend(pids))
+
+    async def _run():
+        tracker = leerie._DescendantTracker(99999, cgroup_sid="cg-crit")
+        tracker._seen = {900}
+        tracker.start()
+        await asyncio.sleep(leerie._DESCENDANT_POLL_SEC * 2)
+        # Assert BEFORE stop_and_reap — that path kills `_seen` wholesale and
+        # would mask a mid-run reap that never happened.
+        tracker._stopped = True
+        if tracker._task:
+            tracker._task.cancel()
+            tracker._task = None
+
+    asyncio.run(_run())
+    assert 900 in killed, (
+        "A young orphan at critical pressure must be reaped (floor drops to "
+        f"_PID_REAP_CRITICAL_AGE_SEC); killed={killed}")
+
+
+def test_reparented_orphans_min_age_is_parameterized(leerie, monkeypatch):
+    """`_reparented_orphans` must honor an explicit `min_age`, and default to
+    the normal floor when omitted (so existing callers are unchanged)."""
+    age = 10
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        f"  901     1 {age}\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    # Default floor (60) excludes a 10s orphan.
+    assert leerie._reparented_orphans({901}) == []
+    # Critical floor (5) includes it.
+    assert leerie._reparented_orphans(
+        {901}, leerie._PID_REAP_CRITICAL_AGE_SEC) == [901]
+
+
+def test_critical_tier_constants_are_sane(leerie):
+    """The critical floor must be well below the normal floor, and the
+    critical water must be at or above high-water (never reap younger
+    processes at LOWER pressure)."""
+    assert leerie._PID_REAP_CRITICAL_AGE_SEC < leerie._PID_REAP_MIN_AGE_SEC
+    assert leerie._PID_REAP_CRITICAL_WATER >= leerie._PID_REAP_HIGH_WATER
+    assert 0 < leerie._PID_REAP_CRITICAL_AGE_SEC
 
 
 # --- cgroup_sid=None default — constructor compatibility guard ----------------

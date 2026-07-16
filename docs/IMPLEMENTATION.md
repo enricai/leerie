@@ -3569,17 +3569,35 @@ together close the leak.
    `_cgroup_stat(cgroup_sid)` and computes the pressure ratio
    `pids.current / pids.max`. Reaping is armed only when that ratio reaches
    or exceeds `_PID_REAP_HIGH_WATER = 0.90`; when armed, it calls
-   `_reparented_orphans(self._seen)` to obtain the killable set and sends
-   `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
+   `_reparented_orphans(self._seen, min_age)` to obtain the killable set and
+   sends `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
    soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
    are pruned from `_seen`; the exit-time `stop_and_reap` path is unchanged.
-   `_reparented_orphans(seen: set[int]) -> list[int]` runs one
-   `ps -eo pid,ppid,etimes` snapshot and returns, sorted oldest-first, the
-   PIDs from `seen` that are simultaneously alive, reparented to init
-   (`ppid == 1`), and at least `_PID_REAP_MIN_AGE_SEC = 60` seconds old.
+   `_reparented_orphans(seen: set[int], min_age: int = _PID_REAP_MIN_AGE_SEC)
+   -> list[int]` runs one `ps -eo pid,ppid,etimes` snapshot and returns,
+   sorted oldest-first, the PIDs from `seen` that are simultaneously alive,
+   reparented to init (`ppid == 1`, or to the orchestrator itself once
+   `_become_subreaper` has run), and at least `min_age` seconds old. The
+   `min_age` parameter defaults to the normal-tier floor, so any existing
+   caller's behavior is unchanged.
+
+   **Two-tier age floor (DESIGN §6 *Why a single 60 s floor is not enough*).**
+   `_poll_loop` selects the floor from the same pressure ratio it already
+   computed: at or above `_PID_REAP_CRITICAL_WATER = 0.90` it passes
+   `_PID_REAP_CRITICAL_AGE_SEC = 5`; below it, `_PID_REAP_MIN_AGE_SEC = 60`.
+   The rationale is measured, not assumed: leerie's own full suite peaks at
+   **33** concurrent PIDs, so a worker at 90% of a 1024 cap is leaking rather
+   than testing, and its young orphans are leaked too. Without the critical
+   tier the reaper arms at 90% and finds an empty candidate list — every
+   orphan in a fresh burst is younger than 60 s — which is a disabled
+   reducer, not a safe one. `_PID_REAP_CRITICAL_WATER` is deliberately equal
+   to `_PID_REAP_HIGH_WATER` (both 0.90) and kept as a separate named
+   constant: the arming threshold and the floor-escalation threshold answer
+   different questions and may diverge.
    Module-level constants (placed next to `_DESCENDANT_POLL_SEC` /
    `_PID_EXHAUSTION_WINDOW`): `_PID_REAP_HIGH_WATER = 0.90`,
-   `_PID_REAP_LOW_WATER = 0.75`, `_PID_REAP_MIN_AGE_SEC = 60`.
+   `_PID_REAP_LOW_WATER = 0.75`, `_PID_REAP_MIN_AGE_SEC = 60`,
+   `_PID_REAP_CRITICAL_WATER = 0.90`, `_PID_REAP_CRITICAL_AGE_SEC = 5`.
 
 4. **Zombie reaping (`_become_subreaper` + `_zombie_reaper`).** The reaper
    above handles *live* leaked processes; **zombies** (`<defunct>` tasks not

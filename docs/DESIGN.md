@@ -1953,12 +1953,39 @@ so `ppid == 1` alone cannot protect it. But it is *young*, so the 60 s floor
 does. A leaked, forgotten orphan is *old*. Oldest-first + stop-at-low-water
 kills the fewest, oldest PIDs needed to relieve pressure.
 
+*Why a single 60 s floor is not enough — the critical tier.* The floor above
+protects young orphans unconditionally, and that is precisely wrong at the
+top of the range. A burst of leaked `run_in_background` trees saturates the
+cap in **seconds** — faster than the 60 s floor lets any of them become
+eligible — so the reaper arms at 90%, finds an empty candidate list, and
+watches the worker die. This is not hypothetical: it is the measured cause
+of the wave-2 integrator death in run `879defae`. Reproduced against the
+real `_reparented_orphans` with 20 abandoned `setsid` trees in a
+`--pids-limit 1024` container: all 20 reparent to init and all 20 are
+tracked in `_seen`, yet the candidate list is **empty** at age < 60 s and
+holds all 20 at 65 s. Detection was never the gap; *eligibility* was.
+
+The resolution is a second tier rather than a lower floor. Measurement
+supplies the discriminator: leerie's own full suite — 3762 tests, 251 files,
+117 of them spawning subprocesses — peaks at **33** concurrent PIDs (median
+7, P99 29, sampled at 20 Hz against the kernel's own `pids.current`). A
+worker sitting at 90% of a 1024 cap therefore holds ~920 PIDs to do work
+that costs 33. There is no legitimate reading of that state: it is a leak,
+and the young orphans in it are leaked too. So at
+`_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
+`_PID_REAP_CRITICAL_AGE_SEC` (5 s); below that ratio the 60 s floor stands
+unchanged. The normal tier keeps its protection; the critical tier trades it
+for the worker's life.
+
 *Accepted bounded regression.* Above the 90% gate it is possible that a
-live background process older than 60 s is killed. This is strictly better
-than the alternative — a guaranteed total-worker-death-then-full-retry from
-the detector. The gate is what makes the tradeoff acceptable: the imperfect
+live background process is killed — older than 60 s in the normal tier, or
+older than 5 s once the critical tier arms. This is strictly better than the
+alternative — a guaranteed total-worker-death-then-full-retry from the
+detector. The gate is what makes the tradeoff acceptable: the imperfect
 reap is only ever attempted when the worker is already near EAGAIN death and
-the backstop would otherwise fire regardless.
+the backstop would otherwise fire regardless. The critical tier does not
+widen this regression so much as make it *effective*: without it the reap is
+attempted and reaps nothing, which is not safety but a disabled reducer.
 
 *Reducer-under-backstop composition.* Both the mid-run reaper and the 0.9.38
 window detector read `_cgroup_stat(sid)` — one authoritative exhaustion
@@ -3323,7 +3350,7 @@ worker communicate through a strict contract:
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
 so its failure is converted into a handoff: a fresh implementer can continue.
-The **classifier, planner, reconciler, plan_overlap_judge, provision, and integrator** have no partial-progress
+The **classifier, planner, reconciler, plan_overlap_judge, and provision** have no partial-progress
 artifact to hand off — there is nothing for a successor to continue from — so
 their hard failure aborts the run with state saved for `--resume`. The
 **conformer** has commits but its phase is advisory, so a hard failure surfaces
@@ -3331,6 +3358,27 @@ as a warning, not an abort. The rule is general: salvage if there is something
 to salvage; abort cleanly otherwise. When `planner_samples > 1`, a crashed
 sample is dropped and the surviving samples for that domain proceed to
 selection; the abort fires only when all samples for a domain fail.
+
+The **integrator** is the case where that rule and the code disagreed. Its
+partial progress is the *resolved staging worktree* — files whose conflict
+markers are gone and whose hunks carry real merge judgment — and that is an
+artifact in exactly the sense the implementer's branch is. It is also the
+most expensive artifact in the run to recreate, because reproducing it means
+re-deriving every side's intent from the subtask specs. Crucially, the work
+need not be committed to be real: a crashed integrator typically dies
+*mid-resolution*, with the resolution in the working tree and no merge commit
+(this is what run `879defae`'s wave-2 integrator did). Preservation therefore
+cannot be conditioned on `check_merge_committed` — that predicate is false in
+precisely the case worth salvaging.
+
+This distinction is between a *crash* and a *verdict*, and only the first is
+new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
+says nothing about whether the resolution was any good; the run rescues the
+work and pauses for `--resume`. A `design-conflict` or `failed` **verdict** is
+the integrator's considered judgment that the merge should not stand, and
+still aborts and discards, exactly as *When integration cannot succeed*
+describes. Salvaging a crash does not weaken that: a verdict is a fact about
+the work, a crash is a fact about the machine.
 
 ---
 
@@ -4186,7 +4234,10 @@ code-enforced. The orchestrator runs deterministic structural checks on
 each worker's output and re-invokes with the results as external
 feedback (§8 *Mechanical-feedback loops*). Escalation on exhaustion is
 worker-specific: planners proceed with the best result + warnings,
-the classifier dies, the integrator aborts the merge.
+the classifier dies, the integrator aborts the merge. (That last is the
+*check-exhaustion* path — the integrator kept returning output the
+mechanical checks rejected, which is a verdict about the work. A worker
+**crash** mid-resolution takes the salvage path in §12 instead.)
 
 The multi-sample cap (`planner_samples`) controls independent parallel
 invocations. Selection among samples is mechanical (fewest issues,

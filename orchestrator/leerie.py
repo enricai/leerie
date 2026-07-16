@@ -1842,10 +1842,30 @@ def _signal_pids(pids: set[int], sig: int) -> None:
             pass
 
 
-def _reparented_orphans(seen: set[int]) -> list[int]:
+# Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
+# High-water: arm reaping when pids.current/pids.max reaches this ratio.
+# Low-water: stop killing once pressure drops below this ratio (hysteresis).
+# Min-age: only orphans older than this many seconds are eligible — protects
+# recently-launched background tasks the worker may still be waiting on.
+# Critical-water / critical-age: above this pressure the min-age floor drops
+# (DESIGN §6 *Why a single 60 s floor is not enough — the critical tier*).
+# Measured: leerie's own full suite peaks at 33 concurrent PIDs, so a worker
+# at 90% of a 1024 cap is leaking, not testing — and the young orphans in
+# that state are leaked too. Held as a constant distinct from
+# _PID_REAP_HIGH_WATER despite the equal value: "when do we arm" and "when
+# do we stop trusting youth" are different questions.
+_PID_REAP_HIGH_WATER = 0.90
+_PID_REAP_LOW_WATER = 0.75
+_PID_REAP_MIN_AGE_SEC = 60
+_PID_REAP_CRITICAL_WATER = 0.90
+_PID_REAP_CRITICAL_AGE_SEC = 5
+
+
+def _reparented_orphans(seen: set[int],
+                        min_age: int = _PID_REAP_MIN_AGE_SEC) -> list[int]:
     """Return PIDs from `seen` that are currently alive, reparented to
-    init (ppid==1), and older than _PID_REAP_MIN_AGE_SEC seconds —
-    sorted oldest-first (longest-running first, safest to kill first).
+    init (ppid==1), and older than `min_age` seconds — sorted oldest-first
+    (longest-running first, safest to kill first).
 
     These are the leaked background subprocesses that have finished their
     immediate work and been orphaned; unlike a recently-launched background
@@ -1853,6 +1873,13 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
     that the age floor distinguishes them. Uses `ps -eo pid,ppid,etimes`
     where `etimes` is a bare elapsed-seconds integer (POSIX extension,
     verified present in the container image).
+
+    `min_age` defaults to the normal-tier floor. `_poll_loop` lowers it to
+    `_PID_REAP_CRITICAL_AGE_SEC` once pressure reaches
+    `_PID_REAP_CRITICAL_WATER`, because a burst of leaked orphans saturates
+    the cap faster than the 60 s floor lets any of them become eligible —
+    the reaper would otherwise arm and find nothing to kill (DESIGN §6
+    *Why a single 60 s floor is not enough — the critical tier*).
 
     Returns an empty list on any `ps` failure — same empty-set fallback
     as `_enumerate_descendants`."""
@@ -1876,7 +1903,7 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
         # init, but after `_become_subreaper` it reparents to the orchestrator
         # itself — accept both so the mid-run reaper still recognizes orphans.
         if (pid in seen and ppid in (1, os.getpid())
-                and etimes >= _PID_REAP_MIN_AGE_SEC):
+                and etimes >= min_age):
             candidates.append((etimes, pid))
     # Oldest-first: killing the longest-running orphans first frees the most
     # slots while touching the fewest recently-launched background processes.
@@ -1885,15 +1912,6 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
 
 
 _DESCENDANT_POLL_SEC = 0.5
-
-# Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
-# High-water: arm reaping when pids.current/pids.max reaches this ratio.
-# Low-water: stop killing once pressure drops below this ratio (hysteresis).
-# Min-age: only orphans older than this many seconds are eligible — protects
-# recently-launched background tasks the worker may still be waiting on.
-_PID_REAP_HIGH_WATER = 0.90
-_PID_REAP_LOW_WATER = 0.75
-_PID_REAP_MIN_AGE_SEC = 60
 
 # `_invoke`'s PID-exhaustion detector probes the cgroup once the last
 # _PID_EXHAUSTION_WINDOW tool-results hold ≥_PID_EXHAUSTION_ERROR_THRESHOLD
@@ -1977,7 +1995,18 @@ class _DescendantTracker:
                         if mx > 0 and cur / mx >= _PID_REAP_HIGH_WATER:
                             # Armed: pressure is high — reap oldest reparented
                             # orphans first, stopping once pressure drops.
-                            candidates = _reparented_orphans(self._seen)
+                            # At critical pressure the age floor drops: a leak
+                            # burst saturates the cap in seconds, so every
+                            # orphan in it is younger than the normal 60 s
+                            # floor and the candidate list would be empty
+                            # exactly when it matters most (DESIGN §6 *the
+                            # critical tier*).
+                            min_age = (
+                                _PID_REAP_CRITICAL_AGE_SEC
+                                if cur / mx >= _PID_REAP_CRITICAL_WATER
+                                else _PID_REAP_MIN_AGE_SEC)
+                            candidates = _reparented_orphans(
+                                self._seen, min_age)
                             killed: set[int] = set()
                             for pid in candidates:
                                 recheck = _cgroup_stat(self._cgroup_sid)
