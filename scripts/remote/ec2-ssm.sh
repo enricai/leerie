@@ -181,3 +181,40 @@ ec2_launch_detached() {
 ec2_attach() {
   _ec2_ssm_session "sh -s"
 }
+
+# --- _attach_to_live_orchestrator_ec2 ---------------------------------------
+# EC2 counterpart of lib.sh's _attach_to_live_orchestrator: attach to an
+# already-running orchestrator on the instance — either open a bash shell
+# at /work (RESUME_SHELL=true) or tail the live log stream via
+# render_tail_wrapper (lib.sh) + ec2_attach.
+#
+# Call sites (leerie launcher's RUNTIME=ec2 branch):
+#   - The early flock probe (resume path, before seed_auth).
+#   - The launch-wrapper rc=75 pivot (after seed_auth, belt-and-suspenders).
+#
+# Reads from caller's scope: RESUME_SHELL, LEERIE_RUN_ID,
+# LEERIE_EC2_INSTANCE_ID.
+#
+# No auto-finalize plumbing here (unlike lib.sh's
+# tail_with_optional_autofinalize) — EC2 auto-finalize integration is
+# deferred to a later subtask, mirroring decide_ec2_teardown's own "no
+# auto-finalize integration yet" scope note.
+#
+# Side-effect: sets container_rc=130 in the caller's scope so
+# decide_ec2_teardown leaves the instance alone (DESIGN §6 "Smart resume
+# in remote mode").
+_attach_to_live_orchestrator_ec2() {
+  if [ "${RESUME_SHELL:-false}" = "true" ]; then
+    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+    local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
+    printf '%s' "$_shell_payload" | ec2_attach || true
+  else
+    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+    local _tail_script _tail_invocation
+    _tail_script="$(render_tail_wrapper)"
+    _tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID
+$_tail_script"
+    printf '%s' "$_tail_invocation" | ec2_attach || true
+  fi
+  container_rc=130
+}
