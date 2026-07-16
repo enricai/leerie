@@ -1742,9 +1742,10 @@ Not yet wired for EC2 (documented gaps, not required for an end-to-end
 run): bare `--resume` PID-record auto-discovery (an explicit `--run-id`
 is required to resume), mid-run re-seed (`--re-seed`/auto-re-seed on
 `--resume`), `--inspect-dir` seeding, chain-wave tagging, and
-auto-finalize token plumbing on the tail/attach path. `--stop`/`--kill`/
-`--finalize --runtime ec2` are also not yet wired — those verbs remain
-Fly-only today. DESIGN §6 *EC2 runtime lifecycle* is the canonical
+auto-finalize token plumbing on the tail/attach path. `--kill`/
+`--finalize --runtime ec2` are also not yet wired — those two verbs
+remain Fly-only today; `--stop --runtime ec2` *is* wired (see "Explicit
+pause and destroy verbs" above). DESIGN §6 *EC2 runtime lifecycle* is the canonical
 architecture. Default is `local` so existing behavior is unchanged for
 users who have not opted in.
 
@@ -5603,17 +5604,44 @@ Two new launcher flags, routed at the top of `leerie` alongside
 
 - **`leerie --stop <run-id>`** — clean pause. Runtime detection:
   (1) `_auto_detect_fly_runtime` checks for `fly-machine.json` →
-  Fly path; (2) `_is_local_container` probes `nerdctl inspect
-  <run-id>` → local path; (3) neither → error.
+  Fly path; (2) `_auto_detect_ec2_runtime` checks for
+  `ec2-instance.json` → EC2 path; (3) `_is_local_container` probes
+  `nerdctl inspect <run-id>` → local path; (4) none of the above →
+  error. `--runtime` accepts `local`/`fly`/`ec2` explicitly, validated
+  by the launcher (bash).
   - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
     and `FLY_APP`, calls `stop_machine()`.
+  - **EC2 path:** sources `aws-credentials.sh` + `ec2-lib.sh` +
+    `ec2-provision.sh`, resolves AWS credentials via
+    `resolve_aws_credentials()` and gates on `require_aws()` (same
+    ordering as the `RUNTIME=ec2` dispatch branch — see "Remote
+    execution mode"), resolves `LEERIE_EC2_INSTANCE_ID` from the run's
+    sidecar via `_resolve_ec2_instance_id_from_run_dir` (checks
+    `ec2-instance.json` first, then `run.json` — mirrors
+    `_resolve_volume_id_from_run_dir`'s fallback order), then calls
+    `stop_instance()`. `StopInstances` preserves the root EBS volume
+    (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2
+    — stop-scoped, never `DeleteOnTermination`). Fails closed with an
+    actionable message if no `ec2_instance_id` is found in the
+    sidecar, and via `require_aws`'s existing `aws sso login` hint if
+    credentials don't resolve — before any `aws ec2 ...` call is made.
   - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`
     (SIGTERM first — the orchestrator's `InterruptedBySignal` handler
     saves state before exit — then SIGKILL after grace period; `--rm`
     on the original `nerdctl run` auto-removes the container).
-  - Both paths call `update_run_json` to set `paused_at = <iso_now>`
-    and `pause_reason = "user-requested"` on the sidecar. The run is
-    resumable via `leerie --resume <id>`.
+  - All three paths call `update_run_json` to set `paused_at =
+    <iso_now>` and `pause_reason = "user-requested"` on the sidecar
+    (the EC2 path also writes `ec2_instance_id`, mirroring how the Fly
+    path writes `fly_machine_id`). The run is resumable via `leerie
+    --resume <id>` (the EC2 counterpart of `--resume` itself has not
+    shipped yet — see "Unified `leerie --list`" below).
+  - **Test coverage:** `tests/test_ec2_launcher_stop.py` — EC2
+    autodetect and explicit `--runtime ec2`, `stop-instances` called
+    and never `terminate-instances`, missing-instance-id and
+    credential-failure fail-closed paths (asserting zero `aws ec2`
+    calls reach the stub), and a regression pin that the local/Fly
+    fallthrough error text still fires unchanged when no sidecar of
+    any kind is present.
 - **`leerie --kill <run-id> [--force]`** — destroy. Same runtime
   detection as `--stop`. Prompts the user to type the run-id to
   confirm (unless `--force` / `LEERIE_FORCE_KILL=1`).
@@ -5806,32 +5834,36 @@ Changes:
   local-sidecar list when `flyctl` is missing or auth fails. Plain
   `--list` (no `--runtime fly`) is unchanged.
 
-Verbs `--stop`, `--kill`, `--finalize` accept an optional
+Verbs `--kill` and `--finalize` accept an optional
 `--runtime <local|fly>` flag — validated by the launcher (bash)
 against only `local`/`fly`, rejecting any other value (including
 `ec2`) with an error; this is narrower than the `RUNTIME_VALUES`
 enum (`local|fly|ec2` — see "Remote execution mode" below) that
 gates the top-level `--runtime` flag for launching a new run.
-`ec2` machine lifecycle (the `--stop`/`--kill --runtime ec2`
-counterpart) has not shipped — `stop_instance()`/`terminate_instance()`
-exist in `ec2-provision.sh` (see the Files table above) and the
-launcher's `RUNTIME=ec2` branch now dispatches the full create → seed →
-launch → teardown cycle for *launching* a run (see "Runtime mode"
-above), but the separate `--stop`/`--kill`/`--finalize` verbs still
-validate `--runtime` against only `local`/`fly` and do not yet dispatch
-to `stop_instance()`/`terminate_instance()` for an existing EC2 run;
-DESIGN §6 *EC2 runtime lifecycle*'s teardown row (`decide_ec2_teardown()`,
-shipped — see the Files table above) is the intended `--stop`/`--kill`
-counterpart once that separate verb-dispatch subtask lands. `--stop` and
-`--kill` support both `local`/`fly`: Fly runs route to `flyctl
-machine stop`/`flyctl machine destroy`; local runs route to
+`--stop` is the exception: it accepts `local`/`fly`/`ec2` (see
+"Explicit pause and destroy verbs" above for the full EC2 path).
+
+The launcher's `RUNTIME=ec2` branch dispatches the full create → seed
+→ launch → teardown cycle for *launching* a run (see "Runtime mode"
+above), and `--stop --runtime ec2` routes to `stop_instance()` for
+pausing one. `--kill --runtime ec2` and `--finalize --runtime ec2`
+have not shipped — `terminate_instance()` exists in `ec2-provision.sh`
+(see the Files table above) but the launcher's `--kill` verb does not
+yet dispatch to it. DESIGN §6 *EC2 runtime lifecycle*'s teardown row
+(`decide_ec2_teardown()`, shipped — see the Files table above) is the
+intended `--kill` counterpart once that separate verb-dispatch subtask
+lands. Fly runs route to `flyctl machine stop`/`flyctl machine
+destroy`; EC2 runs route to `aws ec2 stop-instances` (via
+`stop_instance()`) for `--stop`; local runs route to
 `nerdctl stop`/`nerdctl kill` via the `_is_local_container` probe
 (`nerdctl inspect <run-id>`). `--stop`
-uses `nerdctl stop` (SIGTERM first, allowing graceful state save);
-`--kill` uses `nerdctl kill` (immediate SIGKILL). `--finalize
+uses `nerdctl stop` (SIGTERM first, allowing graceful state save) or
+`aws ec2 stop-instances`; `--kill` uses `nerdctl kill` (immediate
+SIGKILL). `--finalize
 --runtime local` still errors — local finalization is inline. Without
 the flag, the verbs infer the runtime from the sidecar
-(`fly-machine.json` presence for Fly, `nerdctl inspect` for local).
+(`fly-machine.json` presence for Fly, `ec2-instance.json` presence for
+EC2, `nerdctl inspect` for local — in that probe order).
 `--resume` accepts `--runtime` directly (the smart router branches by
 runtime: fly takes the smart-attach path, local takes the inline
 re-exec path).

@@ -2477,12 +2477,20 @@ this terminal-side activity") and destruction needs its own verb.
 `--stop`, `--kill`, or `--finalize` targets a run whose state
 directory contains a `fly-machine.json` sidecar and no explicit
 `--runtime` was given, the launcher auto-promotes to `fly` via the
-shared `_auto_detect_fly_runtime` helper. When no `fly-machine.json`
-exists, `--stop` and `--kill` probe for a live local nerdctl container
+shared `_auto_detect_fly_runtime` helper. `--stop` additionally checks
+for an `ec2-instance.json` sidecar via the parallel
+`_auto_detect_ec2_runtime` helper (same shape, checked after Fly and
+before the local-container probe) and auto-promotes to `ec2` — the
+EC2 counterpart of `fly-machine.json` (see "EC2 runtime lifecycle",
+"Run identifier"). When neither remote sidecar exists, `--stop` and
+`--kill` probe for a live local nerdctl container
 via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
 `nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
-signal handler can save state before exit; `--kill` uses `nerdctl kill`
-(immediate SIGKILL) since the run is terminal. `--finalize` on a local
+signal handler can save state before exit, or `aws ec2 stop-instances`
+on the EC2 path (same stop-preserves-volume semantics as Fly's
+`machine stop`); `--kill` uses `nerdctl kill`
+(immediate SIGKILL) since the run is terminal — `--kill`'s EC2
+counterpart has not shipped. `--finalize` on a local
 run is inline (no separate verb needed). If the user explicitly sets
 `--runtime local` on a Fly-originated run, `--resume` warns but
 respects the choice.
