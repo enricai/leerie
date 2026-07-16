@@ -55,7 +55,12 @@ require_aws() {
   local aws_args=()
   [ -n "$profile" ] && aws_args+=(--profile "$profile")
 
-  if ! aws sts get-caller-identity "${aws_args[@]}" >/dev/null 2>&1; then
+  # Use ${arr[@]+"${arr[@]}"} so an empty array expands to nothing under
+  # `set -u` (bash 3.2, the macOS system default, otherwise errors with
+  # "aws_args[@]: unbound variable"). Same idiom and rationale as the
+  # launcher's nerdctl argv assembly. `aws_args` is empty whenever no
+  # profile is set, which is the common case.
+  if ! aws sts get-caller-identity ${aws_args[@]+"${aws_args[@]}"} >/dev/null 2>&1; then
     remote_log "error: AWS credentials are expired or missing."
     if [ -n "$profile" ]; then
       echo "  Run: aws sso login --profile $profile" >&2

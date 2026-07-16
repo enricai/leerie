@@ -25,6 +25,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   particular covers leerie's own deliberate SIGTERM/SIGKILLs, which must
   never be retried. The conformer already survived this failure class by
   degrading to advisory; judgment workers now get the same treatment.
+- **The EC2 runtime's shell surface now runs on macOS.** `ec2-lib.sh` /
+  `ec2-provision.sh` used two bash-4-only constructs, so every EC2 code
+  path failed immediately on a macOS host (`/bin/bash` is 3.2 — Apple has
+  not shipped a newer one since the GPLv3 relicense). CI is
+  `ubuntu-latest` (bash 5.x) and structurally could not catch either:
+  (a) `"${arr[@]}"` on a possibly-empty array is an `unbound variable`
+  error under `set -u` on bash 3.2 — 6 sites now use the repo's existing
+  `${arr[@]+"${arr[@]}"}` idiom (the same one the launcher's nerdctl argv
+  assembly documents); (b) `_aws_region_profile_args()` used a `local -n`
+  nameref (bash 4.3+, `local: -n: invalid option` on 3.2) — it now emits
+  its tokens one per line, which also keeps profile names containing
+  spaces intact. Both arrays are empty exactly when no AWS region/profile
+  is configured, i.e. the default path. Pinned by
+  `tests/test_ec2_bash32_portability.py`, which runs the real scripts
+  under a real bash 3.2 and skips on hosts that only have bash ≥ 4.3.
+- **The macOS test suite no longer hangs for ~19 minutes.** Two EC2 stall
+  tests asserted that a timeout fires, but pinned `PATH` to
+  `/usr/bin:/bin` — where macOS has no GNU `timeout`, so
+  `_seed_timeout_prefix` correctly no-ops and the stubs' `sleep 600` ran
+  unbounded. With killing `timeout` stubs in place the full suite drops
+  from ~23 min to ~4m40s on macOS.
+- **Worker stderr can no longer trip the auth/quota backoff.** The
+  no-result envelope above interpolates the worker's raw stderr into
+  `result`, and `_is_auth_or_quota_failure` text-matches that field for
+  `Invalid authentication` / `rate limit` / `rate-limit`. A worker whose
+  stderr merely *mentions* auth or rate limiting — without the request
+  ever having been auth-rejected — would divert its retry into the
+  backoff loop and burn the entire `auth_retry_max_sec` budget on a
+  non-auth failure. Envelopes carrying `_leerie_synthetic` are now exempt
+  from the text markers; the numeric `api_error_status` check still runs
+  first and still wins, so a genuine 401/429/529 backs off as before. The
+  markers exist to sniff a *gateway* message out of an envelope of unknown
+  provenance — leerie knows what its own envelopes mean.
 - **Judgment phases no longer destroy the diagnostic that explains why
   they died.** All four (`classifier`, `provision`, `reconciler`,
   `plan_overlap_judge`) logged their `_run_checked_loop` warnings — which
@@ -56,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still fails closed. The read-only verbs that share the same selection
   logic (`--report`, `--phase`) opt out of the resumable filter, since
   reporting on a finished run is the ordinary case.
+
+  **Behavior change with a UX cost:** bare `--resume` previously
+  auto-picked a *lone* `seed-failed` orphan; it now dies and asks for the
+  explicit id. A seed-failed run aborted before `phase_classify` and needs
+  an operator decision (re-seed vs. kill) — resuming blind can re-trigger
+  the same seed failure. The error names the run, its status, and the
+  explicit-id escape hatch, which remains the documented recovery path
+  (`./leerie --resume <seed-failed-id>` is unchanged).
 
 ## [0.9.65]
 

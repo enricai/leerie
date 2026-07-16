@@ -8184,11 +8184,23 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
     on its own correct output — the orchestrator then burns the full
     backoff budget re-running an already-successful worker and can
     eventually raise a false "subscription capped" WorkerError.
+
+    Synthetic envelopes are exempt from the text markers for the same
+    reason. The markers exist to sniff a *gateway* message out of an
+    envelope whose provenance is unknown; leerie synthesizes its own
+    envelopes (`_leerie_synthetic`) and knows exactly what they mean, so
+    text-matching them is wrong by construction. The no-result envelope
+    interpolates the worker's raw stderr into `result` — stderr that can
+    legitimately contain "invalid authentication" or "rate limit" without
+    the request having been auth-rejected — which would otherwise divert
+    the retry into the backoff loop and burn the whole budget.
     """
     if not envelope.get("is_error"):
         return False
     if _api_error_category(envelope.get("api_error_status")) is not None:
         return True
+    if envelope.get("_leerie_synthetic"):
+        return False
     # No numeric status matched — fall back to text markers on the result
     # body. This path is specific to the retry classifier (not shared with
     # `_classify_failure_kind`, which reads only the numeric status).

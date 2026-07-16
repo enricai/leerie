@@ -155,10 +155,18 @@ def test_invoke_ignores_task_notification_result_event(leerie, leerie_dir,
     assert "origin" not in result
 
 
-def test_invoke_raises_when_no_result_event(leerie, leerie_dir, monkeypatch):
-    """A worker that exits without emitting any result event (e.g. the
-    process died mid-stream) raises WorkerError — same error class
-    leerie's existing retry path already handles."""
+def test_invoke_returns_synthetic_envelope_when_no_result_event(
+        leerie, leerie_dir, monkeypatch):
+    """A worker that exits 0 without emitting any result event returns a
+    synthetic error envelope — it does NOT raise.
+
+    This used to raise WorkerError on the theory that it was "the same
+    error class leerie's existing retry path already handles". It wasn't:
+    a raise propagates *past* claude_p's 2-attempt corrective loop (which
+    only re-attempts on a returned failing envelope) and die()s the run
+    non-resumably — discarding a worker's completed reasoning over a
+    transient upstream fault (anthropics/claude-code #8126/#1920/#74761).
+    Returning routes it into that loop for one fresh session instead."""
     events = [
         json.dumps({"type": "system", "subtype": "init",
                     "model": "x"}),
@@ -166,11 +174,13 @@ def test_invoke_raises_when_no_result_event(leerie, leerie_dir, monkeypatch):
     ]
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
-    with pytest.raises(leerie.WorkerError):
-        asyncio.run(leerie._invoke(
-            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
-            timeout=60, sid="t2", leerie_dir=leerie_dir,
-            verbosity="stream"))
+    envelope = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t2", leerie_dir=leerie_dir,
+        verbosity="stream"))
+    assert envelope["is_error"] is True
+    assert envelope["structured_output"] is None
+    assert envelope["_leerie_synthetic"] == "no_result_event"
 
 
 # ----- out-of-credits truncation → pause-and-surface -----------------------

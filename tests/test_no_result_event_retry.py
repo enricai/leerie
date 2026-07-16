@@ -158,6 +158,57 @@ def test_synthetic_message_contains_no_auth_text_markers(leerie):
             f"synthetic no-result message must not contain {marker!r}")
 
 
+@pytest.mark.parametrize("stderr", [
+    "Error: Invalid authentication credentials",
+    "warning: approaching rate limit",
+    "connection reset (rate-limit proxy)",
+])
+def test_worker_stderr_cannot_trip_the_auth_classifier(leerie, stderr):
+    """The no-result envelope interpolates the worker's **raw stderr** into
+    `result`, and `_is_auth_or_quota_failure` text-matches that field. So a
+    worker whose stderr merely mentions auth or rate limiting — without the
+    request ever having been auth-rejected — would divert its retry into
+    the tenacity backoff and burn the entire auth_retry_max_sec budget.
+
+    Controlling leerie's own message is not enough: stderr is attacker-,
+    or rather upstream-, controlled text. `_is_auth_or_quota_failure`
+    exempts `_leerie_synthetic` envelopes from the text markers entirely —
+    the markers exist to sniff a *gateway* message out of an envelope of
+    unknown provenance, and leerie knows what its own envelopes mean.
+    """
+    envelope = {
+        "is_error": True,
+        "result": f"claude -p produced no result event (stderr: {stderr})",
+        "structured_output": None,
+        "_leerie_synthetic": "no_result_event",
+    }
+    assert leerie._is_auth_or_quota_failure(envelope) is False, (
+        f"worker stderr {stderr!r} tripped the auth/quota classifier — the "
+        f"retry would burn the full backoff budget on a non-auth failure")
+
+
+def test_synthetic_with_a_real_api_status_still_backs_off(leerie):
+    """The exemption must not swallow a genuine gateway rejection: the
+    numeric `api_error_status` check runs before it."""
+    envelope = {
+        "is_error": True,
+        "api_error_status": 401,
+        "result": "claude -p produced no result event (stderr: (empty))",
+        "structured_output": None,
+        "_leerie_synthetic": "no_result_event",
+    }
+    assert leerie._is_auth_or_quota_failure(envelope) is True
+
+
+def test_real_envelopes_still_match_the_text_markers(leerie):
+    """The exemption is scoped to synthetic envelopes only — a real
+    gateway envelope with no numeric status still matches on text."""
+    assert leerie._is_auth_or_quota_failure(
+        {"is_error": True, "result": "Invalid authentication"}) is True
+    assert leerie._is_auth_or_quota_failure(
+        {"is_error": True, "result": "you hit a rate limit"}) is True
+
+
 def test_auth_classifier_still_matches_real_auth_failures(leerie):
     """Guard the negative above against over-correction."""
     assert leerie._is_auth_or_quota_failure(

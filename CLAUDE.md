@@ -1059,7 +1059,16 @@ hand-copied fixture passes happily while the shipping message silently
 diverts every no-result retry into the tenacity backoff and burns the whole
 `auth_retry_max_sec` budget (verified: the copied-fixture version of this
 test does **not** fail when the landmine is introduced; the ast-extracted
-one does). Paired with a source-coupling guard that the synthetic return is
+one does). Controlling leerie's own message is **not sufficient**, and
+assuming it was is how the bug shipped: the envelope interpolates the
+worker's **raw stderr** into `result`, so a worker whose stderr merely
+mentions auth or rate limiting trips the same markers. The fix is an
+exemption in `_is_auth_or_quota_failure` for `_leerie_synthetic` envelopes
+(the numeric `api_error_status` check still runs first and still wins);
+`test_worker_stderr_cannot_trip_the_auth_classifier` pins it against three
+realistic stderr payloads, and
+`test_real_envelopes_still_match_the_text_markers` guards the exemption
+from over-reaching. Paired with a source-coupling guard that the synthetic return is
 the **last** arm of the no-envelope block — every arm above it (overage,
 OOM, nonzero rc) is a named non-retryable condition that still raises, and
 the nonzero-rc arm in particular covers leerie's own deliberate
@@ -1077,13 +1086,62 @@ the two traps found by running the design against a real 58-run state dir:
 newest-first sort (they are now list-only, never auto-picked), and a
 missing `started_at` must never outrank a real timestamp. An explicit
 run-id stays exempt from the filter (so `--resume <seed-failed-id>` still
-works) and an unknown one still fails closed.
+works) and an unknown one still fails closed. The `seed-failed` exclusion
+is a deliberate behavior change with a UX cost, pinned by
+`test_resolve_run_id.py::test_resolve_lone_orphan_is_not_auto_resumed`:
+bare `--resume` used to auto-pick a *lone* orphan, and now dies instead —
+a seed-failed run aborted before `phase_classify` and needs an operator
+decision (re-seed vs. kill), since resuming blind can re-trigger the same
+seed failure. The die is therefore required to stay actionable (names the
+run, its `status=seed-failed`, and the explicit-id escape hatch), because
+that escape hatch is the documented recovery path for the 2026-06-04
+hangs. `--report`/`--phase` still auto-pick a lone orphan — they are
+read-only.
 `tests/test_container_entry_run_id.py` covers `container-entry.sh` skipping
 its cidfile `--run-id` injection when `--resume` is present — a resume
 container is a *new* container whose id matches no run on disk, which is
 what made bare `--resume` die naming an id the user never typed. The
 injection block is extracted from the real script at test time (the
 `_extract_config_arm` pattern) so it cannot drift.
+
+**The EC2 shell surface must run on bash 3.2** — macOS's `/bin/bash`, and
+the shell the EC2 tests actually get (they pin `PATH` to
+`{stub_dir}:/usr/bin:/bin` to isolate their stubbed `aws`, which excludes
+Homebrew's bash 5). CI is `ubuntu-latest`, so it **structurally cannot**
+catch a bash-4-only construct; two of them lived in `ec2-lib.sh` /
+`ec2-provision.sh` and showed up only as 33 failing tests on a
+developer's Mac. `tests/test_ec2_bash32_portability.py` is the guard: it
+sources each EC2 script under a real `/bin/bash` with `set -u` and no
+`LEERIE_AWS_*`/`AWS_*` (the default config, which leaves every
+optional-arg array empty), **and calls the functions that expand those
+arrays** — sourcing alone is not enough, since an unguarded
+`"${arr[@]}"` sits inside a function body the shell never evaluates until
+called (verified: the source-only version of this test passes with the
+bug reintroduced). It skips cleanly on hosts whose `/bin/bash` is ≥ 4.3,
+so it is a macOS-developer guard, never a CI flake. Paired with a
+source-level `local -n` / `declare -n` ban (namerefs are bash 4.3+;
+echo the tokens instead — see `_aws_region_profile_args`).
+
+Three test-side traps in the same area, all of which made a test pass or
+hang while proving nothing:
+`tests/test_ec2_transport.py::_stub_timeout` must **kill the process
+group**, not just the direct child — macOS ships no `/usr/bin/timeout`,
+so `_seed_timeout_prefix` correctly no-ops on the stubbed PATH and a
+stall test's `sleep 600` runs unbounded (a 10-minute hang, not a
+failure); and killing only the child leaves its grandchildren holding the
+captured stdout, so a `$(...)` capture blocks until every writer closes
+the pipe. Real GNU `timeout` kills the group for exactly this reason.
+`tests/test_ec2_seed_repo.py` imports that killing stub for its stall
+test rather than its own local `_make_stub_timeout`, which is a no-op
+passthrough (fine for tests that just need the binary to exist, useless
+for one asserting the cap fires). And its `_make_stub_ssh` rewrite used
+`${{a/\/work/$DEST\/work}}` — the replacement half of `${{var/pat/repl}}`
+is not a regex and needs no escaping, so the `\/` was a **literal
+backslash**: the transfer landed in a directory named `<dest>\`, rsync
+exited 0, and the test failed with "untracked.txt missing" and no error
+anywhere. Only the pattern half escapes. (Do not "fix" the resulting
+`SyntaxWarning` by making that f-string raw — the surrounding bash relies
+on Python collapsing `\\` to `\`, and `rf"""` silently breaks the stub.)
 
 No coverage
 target is set — the suite was introduced from scratch and a number

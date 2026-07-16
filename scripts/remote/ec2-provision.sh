@@ -78,21 +78,31 @@ INSTANCE_START_TIMEOUT="${LEERIE_INSTANCE_START_TIMEOUT:-300}"
 LEERIE_EC2_INSTANCE_ID=""
 
 # --- _aws_region_profile_args ---------------------------------------------
-# Emit (into the caller's array variable, by nameref) the --region/
-# --profile flags to append to every `aws ec2`/`aws sts` invocation in
-# this file. Empty when unset — lets the aws CLI's own credential chain
-# resolve region/profile, matching require_aws()'s existing
-# profile-optional pattern in ec2-lib.sh.
+# Emit, one token per line, the --region/--profile flags to append to
+# every `aws ec2`/`aws sts` invocation in this file. Emits nothing when
+# both are unset — lets the aws CLI's own credential chain resolve
+# region/profile, matching require_aws()'s existing profile-optional
+# pattern in ec2-lib.sh.
+#
+# One-token-per-line (not a bare string) so values containing spaces
+# survive: a named profile may legitimately contain them, and word
+# splitting would shred it. Callers read it back with the `while read`
+# idiom below rather than a nameref (`local -n`), which is bash 4.3+ and
+# fails outright on macOS's /bin/bash 3.2 with "local: -n: invalid
+# option".
+#
+# Usage:
+#   local aws_args=()
+#   while IFS= read -r _a; do aws_args+=("$_a"); done \
+#     < <(_aws_region_profile_args)
 _aws_region_profile_args() {
-  local -n _out="$1"
-  _out=()
   local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
   local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
   if [ -n "$region" ]; then
-    _out+=(--region "$region")
+    printf '%s\n%s\n' --region "$region"
   fi
   if [ -n "$profile" ]; then
-    _out+=(--profile "$profile")
+    printf '%s\n%s\n' --profile "$profile"
   fi
   return 0
 }
@@ -107,10 +117,11 @@ stop_instance() {
   if [ -z "$iid" ]; then
     return 0
   fi
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
   remote_log "remote: stopping instance $iid (paused)..."
-  aws ec2 stop-instances --instance-ids "$iid" "${aws_args[@]}" >/dev/null 2>&1 || true
+  aws ec2 stop-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} >/dev/null 2>&1 || true
   # Don't clear LEERIE_EC2_INSTANCE_ID — the launcher's notification block
   # needs it to print the attach/resume commands.
 }
@@ -122,10 +133,11 @@ terminate_instance() {
   if [ -z "$iid" ]; then
     return 0
   fi
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
   remote_log "remote: terminating instance $iid ..."
-  if aws ec2 terminate-instances --instance-ids "$iid" "${aws_args[@]}" >/dev/null 2>&1; then
+  if aws ec2 terminate-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} >/dev/null 2>&1; then
     remote_log "remote: instance $iid terminated"
   else
     remote_log "remote: instance $iid terminate attempted (may already be gone)"
@@ -301,8 +313,9 @@ decide_ec2_teardown() {
 # hallpass-warm are close together" — running alone is insufficient.
 wait_for_instance_ready() {
   local iid="$1"
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
   local deadline=$(( $(date +%s) + INSTANCE_START_TIMEOUT ))
   remote_log "remote: waiting for instance $iid to become ready (timeout: ${INSTANCE_START_TIMEOUT}s)..."
 
@@ -311,7 +324,7 @@ wait_for_instance_ready() {
   # both the real aws CLI's JSON output and the test stub's plain JSON.
   while true; do
     local describe_out state
-    describe_out="$(aws ec2 describe-instances --instance-ids "$iid" "${aws_args[@]}" --output json 2>/dev/null || true)"
+    describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
     state="$(printf '%s' "$describe_out" | python3 -c '
 import json, sys
 try:
@@ -339,7 +352,7 @@ except (ValueError, KeyError, IndexError):
   # Phase 2: wait for both status checks to pass.
   while true; do
     local status_out instance_status system_status statuses
-    status_out="$(aws ec2 describe-instance-status --instance-ids "$iid" "${aws_args[@]}" --output json 2>/dev/null || true)"
+    status_out="$(aws ec2 describe-instance-status --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
     statuses="$(printf '%s' "$status_out" | python3 -c '
 import json, sys
 try:
@@ -379,8 +392,9 @@ provision_instance() {
   security_group="$(resolve_security_group)" || return 1
   subnet_id="$(resolve_subnet_id)" || return 1
 
-  local aws_args=()
-  _aws_region_profile_args aws_args
+  local aws_args=() _a
+  while IFS= read -r _a; do aws_args+=("$_a"); done \
+    < <(_aws_region_profile_args)
 
   remote_log "remote: creating instance (ami=$ami type=$instance_type)..."
 
@@ -399,7 +413,7 @@ provision_instance() {
        --security-group-ids "$security_group" \
        --subnet-id "$subnet_id" \
        --count 1 \
-       "${aws_args[@]}" \
+       ${aws_args[@]+"${aws_args[@]}"} \
        --output json \
        2>&1)"; then
     instance_id="$(printf '%s' "$create_output" \

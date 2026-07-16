@@ -698,26 +698,28 @@ def test_stderr_activity_resets_idle_watchdog(leerie, leerie_dir,
         + out)
 
 
-def test_stderr_chunks_preserved_for_exit_error(leerie, leerie_dir,
-                                                 monkeypatch):
-    """The exit-time WorkerError path (leerie.py ~line 4195) decodes the
-    full `stderr_chunks` buffer and includes it in the error message.
-    Live streaming must NOT consume the buffer — it has to keep
-    appending so the existing error path still works."""
-    # No `result` event → triggers WorkerError-on-no-envelope path.
+def test_stderr_chunks_preserved_for_no_result_envelope(leerie, leerie_dir,
+                                                         monkeypatch):
+    """The exit-time no-envelope path decodes the full `stderr_chunks`
+    buffer and includes it in the message it surfaces. Live streaming
+    must NOT consume the buffer — it has to keep appending so the
+    operator still sees why the worker died.
+
+    The carrier changed (this path now returns a synthetic envelope
+    rather than raising WorkerError, so claude_p's retry loop can see
+    it), but the property under test is unchanged: stderr survives."""
     stderr_payload = b"FATAL: authentication failed for tenant Z"
 
     async def fake(*cmd, **kwargs):
         return _DelayedProc([], stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    with pytest.raises(leerie.WorkerError) as excinfo:
-        asyncio.run(leerie._invoke(
-            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
-            timeout=60, sid="t-stderr-exiterr", leerie_dir=leerie_dir,
-            verbosity="quiet"))
-    msg = str(excinfo.value)
+    envelope = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-stderr-exiterr", leerie_dir=leerie_dir,
+        verbosity="quiet"))
+    msg = str(envelope.get("result"))
     assert "authentication failed for tenant Z" in msg, (
-        "exit-time WorkerError must still surface the full stderr "
+        "the no-result envelope must still surface the full stderr "
         f"content (stderr_chunks not consumed by live streaming); "
         f"got: {msg!r}")

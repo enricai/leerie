@@ -2926,7 +2926,19 @@ contains `Invalid authentication` / `rate limit` / `rate-limit`. These
 need *backoff*, not the immediate corrective retry above — the gateway
 has already rejected the request and a fresh request will be rejected too
 until the user's rolling usage window clears (401/429) or the overload
-(529) subsides. On budget exhaustion the raised `WorkerError` names the
+(529) subsides.
+
+The text markers are skipped for envelopes carrying `_leerie_synthetic`
+(the numeric `api_error_status` check still applies, and still wins). They
+exist to sniff a gateway message out of an envelope whose provenance is
+unknown; leerie synthesizes its own envelopes and knows what they mean, so
+text-matching them is wrong by construction. Concretely: the no-result
+envelope interpolates the worker's **raw stderr** into `result`, and
+stderr can legitimately contain `Invalid authentication` or `rate limit`
+without the request having been auth-rejected — which would divert the
+retry into this loop and burn the whole `auth_retry_max_sec` budget on a
+non-auth failure. Pinned by
+`tests/test_no_result_event_retry.py::test_worker_stderr_cannot_trip_the_auth_classifier`. On budget exhaustion the raised `WorkerError` names the
 subscription cap for 401/429/auth-text and the transient overload for
 529, so the user isn't told to wait for a usage window that isn't the
 actual cause.
