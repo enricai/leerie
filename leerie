@@ -1414,7 +1414,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       _ab_aws_creds_args=()
       [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ab_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
       [ -n "${LEERIE_AWS_REGION:-}" ] && _ab_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
-      _ab_aws_creds_exports="$(resolve_aws_credentials "${_ab_aws_creds_args[@]}")" || exit 1
+      _ab_aws_creds_exports="$(resolve_aws_credentials ${_ab_aws_creds_args[@]+"${_ab_aws_creds_args[@]}"})" || exit 1
       eval "$_ab_aws_creds_exports"
       unset _ab_aws_creds_args _ab_aws_creds_exports
       require_aws || exit 1
@@ -1747,7 +1747,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       _stop_aws_creds_args=()
       [ -n "${LEERIE_AWS_PROFILE:-}" ] && _stop_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
       [ -n "${LEERIE_AWS_REGION:-}" ] && _stop_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
-      _stop_aws_creds_exports="$(resolve_aws_credentials "${_stop_aws_creds_args[@]}")" || exit 1
+      _stop_aws_creds_exports="$(resolve_aws_credentials ${_stop_aws_creds_args[@]+"${_stop_aws_creds_args[@]}"})" || exit 1
       eval "$_stop_aws_creds_exports"
       unset _stop_aws_creds_args _stop_aws_creds_exports
       require_aws || exit 1
@@ -1970,7 +1970,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       _kill_ec2_creds_args=()
       [ -n "${LEERIE_AWS_PROFILE:-}" ] && _kill_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
       [ -n "${LEERIE_AWS_REGION:-}" ] && _kill_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
-      _kill_ec2_creds_exports="$(resolve_aws_credentials "${_kill_ec2_creds_args[@]}")"
+      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})"
       _kill_ec2_creds_rc=$?
       if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
         exit 1
@@ -6394,7 +6394,7 @@ elif [ "$RUNTIME" = "ec2" ]; then
   _leerie_aws_creds_args=()
   [ -n "${LEERIE_AWS_PROFILE:-}" ] && _leerie_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
   [ -n "${LEERIE_AWS_REGION:-}" ] && _leerie_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
-  _leerie_aws_creds_exports="$(resolve_aws_credentials "${_leerie_aws_creds_args[@]}")"
+  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})"
   _leerie_aws_creds_rc=$?
   if [ "$_leerie_aws_creds_rc" -ne 0 ]; then
     exit 1

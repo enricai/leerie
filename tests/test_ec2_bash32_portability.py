@@ -20,18 +20,36 @@ array empty) and asserts the shell does not complain. A new
 `"${arr[@]}"` added tomorrow fails here rather than silently breaking
 macOS.
 
+Every EC2 launcher arm wired after this guard was first written
+(test-001..test-005: `--stop`, `--kill`, `--accept-blocked`, `--resume`,
+and the full `RUNTIME=ec2` dispatch) builds its own `LEERIE_AWS_PROFILE`/
+`LEERIE_AWS_REGION`-derived optional-arg array
+(`_ab_aws_creds_args`/`_stop_aws_creds_args`/`_kill_ec2_creds_args`/
+`_leerie_aws_creds_args` in `leerie` itself) and expands it into
+`resolve_aws_credentials`. Each of those call sites is new bash on the
+same surface this module already guards, so this module extends the
+"call the function, don't just source the script" discipline to the
+`leerie` launcher binary itself, not only to `scripts/remote/ec2-*.sh`.
+(This surfaced a real instance of the class during this extension: all
+four call sites used a bare `"${arr[@]}"` rather than the
+`${arr[@]+"${arr[@]}"}` guard; fixed alongside these tests.)
+
 Skips cleanly where there is no bash 3.2 to test against (Linux CI), so
 it is a macOS-developer guard, never a CI flake.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from tests.ec2_stub import _stub_aws, read_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts" / "remote"
+LAUNCHER = REPO_ROOT / "leerie"
 
 # The system bash on macOS is 3.2 (Apple has not shipped a newer one
 # since the GPLv3 relicense). Homebrew's 5.x lives elsewhere, so this
@@ -66,10 +84,17 @@ def _requires_bash32():
 
 # Every EC2 shell file that the runtime sources. `ec2-lib.sh` is sourced
 # by the others, so it is covered transitively as well as directly.
+# `ec2-resume-instance.sh` is sourced by the launcher's `--stop`/`--kill`/
+# `--accept-blocked`/`--resume` arms (all wired by test-001..test-005);
+# `ec2-fetch-branch.sh` and `ec2-seed-auth.sh` are sourced by the full
+# `RUNTIME=ec2` dispatch path.
 _EC2_SCRIPTS = [
     "ec2-lib.sh",
     "ec2-provision.sh",
+    "ec2-resume-instance.sh",
     "ec2-seed-repo.sh",
+    "ec2-seed-auth.sh",
+    "ec2-fetch-branch.sh",
     "ec2-ssm.sh",
 ]
 
@@ -118,6 +143,10 @@ _EXPANSION_CALLSITES = [
     ("ec2-lib.sh", "require_aws", True),
     ("ec2-provision.sh", "stop_instance", True),
     ("ec2-provision.sh", "terminate_instance", True),
+    # resume_instance calls _describe_instance_state first (two guarded
+    # array expansions in ec2-resume-instance.sh), which is reached
+    # regardless of how the stubbed `aws` responds.
+    ("ec2-resume-instance.sh", "resume_instance i-0123456789abcdef0", True),
 ]
 
 
@@ -186,3 +215,138 @@ def test_no_namerefs_in_ec2_scripts():
                 f"'local: -n: invalid option'. Echo the values instead — "
                 f"see _aws_region_profile_args in ec2-provision.sh."
             )
+
+
+def test_no_namerefs_in_launcher():
+    """Same nameref ban, extended to the `leerie` launcher binary itself.
+
+    test-001..test-005 wired real bash into `leerie` (not just
+    scripts/remote/ec2-*.sh) for the EC2 arms below; a nameref there
+    would be just as fatal on macOS.
+    """
+    text = LAUNCHER.read_text()
+    for decl in ("local -n ", "declare -n "):
+        assert decl not in text, (
+            f"leerie uses `{decl.strip()}` (a bash 4.3+ nameref); "
+            f"macOS's /bin/bash is 3.2 and fails with "
+            f"'local: -n: invalid option'. Echo the values instead."
+        )
+
+
+# --- Launcher-arm coverage --------------------------------------------------
+#
+# test-001..test-005 wired real bash directly into the `leerie` launcher
+# for the EC2 arms (`--stop`, `--kill`, `--accept-blocked`, and the full
+# `RUNTIME=ec2` dispatch), each building its own optional-arg array from
+# LEERIE_AWS_PROFILE/LEERIE_AWS_REGION and expanding it into
+# resolve_aws_credentials. That is new bash on the same class of surface
+# this module already guards for scripts/remote/ec2-*.sh — sourcing
+# `leerie` proves nothing (it runs full CLI dispatch on invocation, not
+# passive sourcing), so these tests invoke the real launcher binary end
+# to end via `bash <launcher> <args>`, swapping in bash 3.2 as the
+# interpreter, with LEERIE_AWS_PROFILE/LEERIE_AWS_REGION left unset (the
+# default — the condition that leaves each array empty). A minimal
+# stubbed `aws` and `tests/ec2_stub.py`'s resource-tracking state machine
+# stand in for AWS so each arm can reach its own credential-array
+# expansion without a real account.
+#
+# (Found live during this extension: all four call sites in `leerie`
+# used a bare `"${arr[@]}"` instead of the `${arr[@]+"${arr[@]}"}` guard
+# — the exact class this module exists to catch. Fixed alongside these
+# tests.)
+
+RUN_ID = "ec2-run-bash32"
+
+
+def _launcher_env(tmp_path: Path, aws_dir: Path) -> tuple[dict, Path]:
+    """Minimal env to run a `leerie` EC2 verb end to end against a
+    stubbed `aws`. Deliberately omits LEERIE_AWS_PROFILE/LEERIE_AWS_REGION
+    — the default config — so every creds-args array stays empty. Sets
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION (the SDK
+    credential-chain vars, distinct from LEERIE_AWS_*) so
+    resolve_aws_credentials succeeds and each arm runs past the
+    credential-resolution step it is here to exercise.
+    """
+    state_dir = tmp_path / ".leerie" / "myrepo"
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": f"{aws_dir}:/usr/bin:/bin",
+        "USER_REPO": str(tmp_path),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(home),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "LEERIE_STATE_DIR": str(state_dir),
+        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
+        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
+        "AWS_REGION": "us-east-1",
+    }
+    return env, state_dir
+
+
+def _seed_running_instance(aws_dir: Path) -> str:
+    state = read_state(aws_dir)
+    iid = "i-" + format(len(state["instances"]), "017x")
+    state["instances"][iid] = {"state": "running", "public_ip": "203.0.113.20",
+                                "status_ok": True}
+    (aws_dir / "state.json").write_text(json.dumps(state))
+    return iid
+
+
+def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ec2-instance.json").write_text(json.dumps({
+        "ec2_instance_id": instance_id,
+        "region": "us-east-1",
+        "started_at": "2026-07-01T00:00:00+00:00",
+        "run_id": run_id,
+        "launcher_pid": 12345,
+    }))
+    (run_dir / "run.json").write_text(json.dumps({
+        "run_id": run_id,
+        "branch": f"leerie/runs/{run_id}",
+        "ec2_instance_id": instance_id,
+    }))
+
+
+def _run_launcher_under_bash32(args: list[str], env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(SYSTEM_BASH), str(LAUNCHER)] + args,
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+
+@pytest.mark.parametrize("verb_args", [
+    pytest.param(["--stop", RUN_ID], id="stop"),
+    pytest.param(["--kill", RUN_ID, "--force"], id="kill"),
+    pytest.param(["--accept-blocked", RUN_ID, "feat-001"], id="accept-blocked"),
+])
+def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
+    """Run each newly wired EC2 launcher verb end to end under bash 3.2.
+
+    LEERIE_AWS_PROFILE/LEERIE_AWS_REGION unset is the common case (let
+    the aws CLI's own credential chain resolve region/profile) and the
+    one that leaves each verb's creds-args array empty — exactly the
+    condition under which the bare `"${arr[@]}"` bug fires.
+    """
+    _requires_bash32()
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    iid = _seed_running_instance(aws_dir)
+
+    env, state_dir = _launcher_env(tmp_path, aws_dir)
+    run_dir = state_dir / "runs" / RUN_ID
+    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+
+    result = _run_launcher_under_bash32(verb_args, env)
+    combined = result.stdout + result.stderr
+    assert "unbound variable" not in combined, (
+        f"leerie {' '.join(verb_args)} expands a possibly-empty "
+        f"creds-args array without the ${{arr[@]+\"${{arr[@]}}\"}} guard "
+        f"— breaks under `set -u` on bash 3.2 (macOS default) whenever "
+        f"LEERIE_AWS_PROFILE/LEERIE_AWS_REGION are unset:\n{combined}"
+    )
+    assert "invalid option" not in combined, (
+        f"leerie {' '.join(verb_args)} uses a bash-4-only builtin:\n{combined}"
+    )
