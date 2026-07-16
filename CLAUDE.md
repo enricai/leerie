@@ -1174,6 +1174,34 @@ so it is a macOS-developer guard, never a CI flake. Paired with a
 source-level `local -n` / `declare -n` ban (namerefs are bash 4.3+;
 echo the tokens instead — see `_aws_region_profile_args`).
 
+**Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
+mirroring the `HAS_TREESITTER` pattern). Four modules —
+`test_host_finalize_sh.py` (19 tests), `test_decide_teardown_auto_finalize.py`
+(2), `test_launcher_finalize_no_work.py` (1), `test_launcher_no_push_skips.py`
+(1) — source bash the **host** owns: `scripts/host-finalize.sh`,
+`provision.sh`'s `decide_teardown`, and the launcher's `--finalize` /
+`no_push` paths. All parse `run.json` with real `jq`. The harnesses stub
+`git` and `gh` onto PATH but not `jq`, so jq is silently inherited from
+whichever machine runs pytest — it passes on a dev host and in CI (both ship
+jq) and failed only inside the leerie image, which deliberately omits it.
+That is the host/container split: host bash uses `jq` (the launcher
+hard-fails at preflight without it — "jq not found on PATH", `brew install
+jq`), while code running *inside* the container uses python3, exactly as
+`scripts/remote/seed-auth.sh` documents ("python3 over jq because jq isn't in
+the leerie image (see Dockerfile)"). `gh` **is** in the image for the mirror
+reason: Python inside the container preflights for it.
+**Do not "fix" a skip here by adding `jq` to the Dockerfile.** Per DESIGN §6
+*Finalization* those scripts can never succeed in-container anyway (gh auth,
+ssh-agent, and Keychain are host-side), so installing jq buys a green tick,
+not working code, and erodes the boundary. Note a `grep jq` does **not**
+reproduce the gated list — two of the four never mention jq and fail only
+because the script under test shells out to it; the list is measured from a
+real in-container run. `tests/test_jq_gate_wiring.py` is the guard-the-guard
+(conftest exposes a module-level `HAS_JQ` bool derived from a live
+`shutil.which` probe; each of the four both imports it and carries a
+`skipif` referencing it) — dropping one file's skipif fails it, which is the
+same silent regression the `HAS_TREESITTER` gate exists to prevent.
+
 Three test-side traps in the same area, all of which made a test pass or
 hang while proving nothing:
 `tests/test_ec2_transport.py::_stub_timeout` must **kill the process

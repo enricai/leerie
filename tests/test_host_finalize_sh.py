@@ -22,6 +22,23 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import HAS_JQ
+
+# host-finalize.sh is host-owned by design (DESIGN §6 *Finalization*: gh auth,
+# ssh-agent, and Keychain are host-side, so the container cannot push). It
+# parses run.json with real `jq`, which this harness stubs neither — unlike
+# `git`/`gh`, jq is inherited from whatever machine runs pytest. A dev host and
+# CI both ship it; the leerie image deliberately does not. See
+# `tests/conftest.py`'s HAS_JQ for why installing jq into the image is the
+# wrong fix.
+pytestmark = pytest.mark.skipif(
+    not HAS_JQ,
+    reason="host-only script: needs real `jq`, which the launcher guarantees "
+           "on the host and the leerie image deliberately omits",
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
 

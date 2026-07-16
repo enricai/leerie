@@ -17,6 +17,19 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import HAS_JQ
+
+# decide_teardown runs in the launcher's own host shell (an EXIT/INT/TERM
+# trap), and reads run.json's finished_at with real `jq`. Host-only by
+# construction; see `tests/conftest.py`'s HAS_JQ.
+pytestmark = pytest.mark.skipif(
+    not HAS_JQ,
+    reason="host-only script: needs real `jq`, which the launcher guarantees "
+           "on the host and the leerie image deliberately omits",
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 

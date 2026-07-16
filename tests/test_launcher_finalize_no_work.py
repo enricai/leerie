@@ -28,6 +28,19 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import HAS_JQ
+
+# Exercises the launcher's own `--finalize` path, which is host-side and reads
+# run.json with real `jq` — the launcher in fact hard-fails at preflight when
+# jq is missing. See `tests/conftest.py`'s HAS_JQ.
+pytestmark = pytest.mark.skipif(
+    not HAS_JQ,
+    reason="host-only script: needs real `jq`, which the launcher guarantees "
+           "on the host and the leerie image deliberately omits",
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE = REPO_ROOT / "leerie"
 

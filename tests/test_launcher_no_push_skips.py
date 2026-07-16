@@ -20,6 +20,19 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import HAS_JQ
+
+# The harness below mirrors a host-side launcher block that reads run.json
+# with real `jq` (see the _HARNESS comment). Host-only; see
+# `tests/conftest.py`'s HAS_JQ.
+pytestmark = pytest.mark.skipif(
+    not HAS_JQ,
+    reason="host-only script: needs real `jq`, which the launcher guarantees "
+           "on the host and the leerie image deliberately omits",
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Minimal bash harness mirroring the `leerie:1207-1216` block. The
