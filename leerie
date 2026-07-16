@@ -392,6 +392,36 @@ except Exception:
   return 0
 }
 
+# --- _resolve_ec2_instance_id_from_run_dir ------------------------------
+# Read ec2_instance_id from a run's host-side sidecar. ec2-provision.sh
+# persists ec2_instance_id into both ec2-instance.json (unconditional,
+# crash-recovery pointer) and run.json (conditional on LEERIE_RUN_ID being
+# set at provision time). Unlike Fly, the run-id is NOT the instance id
+# for EC2 runs, so --kill/--stop/--resume must read it from a sidecar
+# rather than assuming identity.
+_resolve_ec2_instance_id_from_run_dir() {
+  local run_dir="$1"
+  local candidate iid
+  for candidate in "$run_dir/ec2-instance.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      iid="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    iid = d.get("ec2_instance_id")
+    print(iid if iid else "")
+except Exception:
+    pass
+' "$candidate")"
+      if [ -n "$iid" ]; then
+        printf '%s' "$iid"
+        return 0
+      fi
+    fi
+  done
+  return 0
+}
+
 # --- _resolve_volume_id_from_fly ---------------------------------------
 # Ask Fly which volume a machine has mounted. The fallback for when no
 # sidecar exists (`--kill --machine-id <id>` on an orphan) — without this
@@ -435,9 +465,9 @@ except Exception:
 }
 
 # --- _ensure_run_json --------------------------------------------------
-# If run_dir has fly-machine.json but no run.json, bootstrap a minimal
-# run.json so subsequent `update_run_json` writes (paused_at,
-# killed_at, etc.) have a file to merge into. Idempotent.
+# If run_dir has fly-machine.json or ec2-instance.json but no run.json,
+# bootstrap a minimal run.json so subsequent `update_run_json` writes
+# (paused_at, killed_at, etc.) have a file to merge into. Idempotent.
 _ensure_run_json() {
   local run_dir="$1"
   local sidecar="$run_dir/run.json"
@@ -445,10 +475,9 @@ _ensure_run_json() {
     return 0
   fi
   local fmj="$run_dir/fly-machine.json"
-  if [ ! -f "$fmj" ]; then
-    return 1
-  fi
-  python3 -c '
+  local eij="$run_dir/ec2-instance.json"
+  if [ -f "$fmj" ]; then
+    python3 -c '
 import json, sys
 fmj = sys.argv[1]
 sidecar = sys.argv[2]
@@ -463,6 +492,27 @@ with open(sidecar, "w") as f:
     json.dump(out, f, indent=2)
     f.write("\n")
 ' "$fmj" "$sidecar"
+    return 0
+  fi
+  if [ -f "$eij" ]; then
+    python3 -c '
+import json, sys
+eij = sys.argv[1]
+sidecar = sys.argv[2]
+try:
+    d = json.load(open(eij))
+except Exception:
+    d = {}
+out = {
+    "ec2_instance_id": d.get("ec2_instance_id"),
+}
+with open(sidecar, "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+' "$eij" "$sidecar"
+    return 0
+  fi
+  return 1
 }
 
 # --- _auto_detect_run_runtime ---------------------------------------------
@@ -1773,11 +1823,100 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # --- EC2 instance kill path ---
     # An EC2 instance id must never fall through to the Fly kill path below:
     # flyctl would silently no-op against a nonexistent Fly machine and
-    # --kill would report "destroyed" while the instance keeps billing
-    # (feat-006 wires the real terminate_instance() action).
+    # --kill would report "destroyed" while the instance keeps billing.
+    #
+    # Fetch-before-terminate ordering (DESIGN §6 one-way-ratchet
+    # invariant, mirroring decide_ec2_teardown's clean-exit branch in
+    # ec2-provision.sh): sync the run branch + state dir from the
+    # instance to the host BEFORE calling terminate_instance. Destroy-
+    # then-fetch would make paid-for LLM work unrecoverable.
     if [ "$_kill_runtime" = "ec2" ]; then
-      remote_log "--kill: run ${_kill_run_id:-unknown} is an EC2 run; --kill does not support EC2 runs yet"
-      exit 1
+      if [ -z "$_kill_run_id" ]; then
+        remote_log "--kill: no run-id for EC2 instance"
+        exit 1
+      fi
+      _kill_ec2_instance_id=""
+      if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+        _kill_ec2_instance_id="$(_resolve_ec2_instance_id_from_run_dir "$_kill_run_dir")"
+      fi
+      if [ -z "$_kill_ec2_instance_id" ]; then
+        remote_log "--kill: no ec2_instance_id found in $_kill_run_dir (ec2-instance.json / run.json)"
+        exit 1
+      fi
+      if [ "$_kill_force" != "1" ]; then
+        printf "This will terminate EC2 instance %s (run %s). Type the run-id to confirm: " \
+          "$_kill_ec2_instance_id" "$_kill_run_id" >&2
+        read -r _kill_confirm
+        if [ "$_kill_confirm" != "$_kill_run_id" ]; then
+          remote_log "--kill: confirmation mismatch; aborted."
+          exit 1
+        fi
+      fi
+      remote_log "--kill: resolving AWS credentials for instance $_kill_ec2_instance_id"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _kill_ec2_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _kill_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _kill_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _kill_ec2_creds_exports="$(resolve_aws_credentials "${_kill_ec2_creds_args[@]}")"
+      _kill_ec2_creds_rc=$?
+      if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
+        exit 1
+      fi
+      eval "$_kill_ec2_creds_exports"
+      unset _kill_ec2_creds_args _kill_ec2_creds_exports _kill_ec2_creds_rc
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$_kill_ec2_instance_id"
+      export LEERIE_EC2_INSTANCE_ID
+      USER_REPO="${USER_REPO:-$PWD}"
+      export USER_REPO
+      LEERIE_RUN_ID="$_kill_run_id"
+      export LEERIE_RUN_ID
+      # Re-resolve the SSH target from the instance's current public IP —
+      # EC2 hands out a new address on every stop/start cycle, so any
+      # address cached from provision time cannot be trusted (mirrors
+      # ec2-resume-instance.sh's own re-resolution for the same reason).
+      # _try_fetch_state_for_ec2_teardown (ec2-provision.sh) needs
+      # LEERIE_EC2_SSH_TARGET in scope; a failed re-resolution still falls
+      # through to it so the "cannot sync" fail-closed message is uniform
+      # regardless of which step actually failed.
+      if _kill_ec2_ssh_target="$(_resolve_ssh_target_from_instance "$_kill_ec2_instance_id")"; then
+        LEERIE_EC2_SSH_TARGET="$_kill_ec2_ssh_target"
+        export LEERIE_EC2_SSH_TARGET
+      fi
+      # Fetch-before-terminate ordering (DESIGN §6 one-way-ratchet
+      # invariant): reuses decide_ec2_teardown's own hook rather than
+      # duplicating its "source ec2-fetch-branch.sh if present, fail
+      # closed if absent" logic. Must run — and succeed — BEFORE
+      # terminate_instance below.
+      remote_log "--kill: syncing run branch + state from instance $_kill_ec2_instance_id before terminating"
+      if _try_fetch_state_for_ec2_teardown; then
+        remote_log "--kill: run branch + state synced to host"
+      else
+        remote_log "--kill: sync from instance to host FAILED — instance LEFT RUNNING so work is not lost"
+        echo "  Recover manually, then re-run: leerie --kill $_kill_run_id --force" >&2
+        echo "  Instance: $_kill_ec2_instance_id (still running on EC2)" >&2
+        exit 1
+      fi
+      remote_log "--kill: terminating instance $_kill_ec2_instance_id"
+      terminate_instance
+      if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+        _ensure_run_json "$_kill_run_dir" || true
+        _kill_sidecar="$_kill_run_dir/run.json"
+        if [ -f "$_kill_sidecar" ]; then
+          update_run_json "$_kill_sidecar" \
+            killed_at "$(iso_now)" \
+            ec2_instance_id "$_kill_ec2_instance_id" || true
+        fi
+      fi
+      remote_log "--kill: destroyed. Run is no longer resumable."
+      exit 0
     fi
     # --- Fly machine kill path ---
     if [ -z "$_kill_machine_id" ]; then

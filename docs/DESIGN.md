@@ -2479,14 +2479,25 @@ whose state directory contains a `fly-machine.json` or `ec2-instance.json`
 sidecar and no explicit `--runtime` was given, the launcher auto-promotes
 to `fly` or `ec2` respectively via the shared `_auto_detect_run_runtime`
 helper (`_auto_detect_fly_runtime` remains as a thin Fly-only wrapper for
-call sites not yet migrated). An EC2 detection currently fails closed with
-a "does not support EC2 runs yet" message on every verb but `--resume`,
-which fails closed the same way rather than falling into the launcher's
-fresh-provision `RUNTIME=ec2` branch — none of the five verbs wire an EC2
-*action* yet. When no sidecar of either kind exists, `--stop` and
-`--kill` probe for a live local nerdctl container
-via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
-`nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
+call sites not yet migrated). An EC2 detection still fails closed with a
+"does not support EC2 runs yet" message on `--stop`, `--accept-blocked`,
+and `--finalize` (none of those three wire an EC2 *action* yet — separate
+subtasks), and `--resume` fails closed the same way rather than falling
+into the launcher's fresh-provision `RUNTIME=ec2` branch. `--kill` is the
+one verb with a real EC2 action wired: it resolves the run's
+`ec2_instance_id` from `ec2-instance.json`/`run.json`, resolves AWS
+credentials, re-resolves the instance's current SSH target (its public IP
+changes on every stop/start cycle), and calls
+`_try_fetch_state_for_ec2_teardown` — the same hook
+`decide_ec2_teardown`'s clean-exit branch uses — to sync the run branch
+and state dir back to the host BEFORE calling `terminate_instance()` (the
+one-way-ratchet invariant: destroy-then-fetch would make paid-for LLM
+work unrecoverable). A failed sync leaves the instance running rather
+than terminating it, mirroring `decide_ec2_teardown`'s own sync-failure
+behavior; `flyctl` is never invoked for an EC2 run. When no sidecar of
+either kind exists, `--stop` and `--kill` probe for a live local nerdctl
+container via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop`
+uses `nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
 signal handler can save state before exit; `--kill` uses `nerdctl kill`
 (immediate SIGKILL) since the run is terminal. `--finalize` on a local
 run is inline (no separate verb needed). If the user explicitly sets

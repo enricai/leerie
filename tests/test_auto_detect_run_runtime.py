@@ -274,21 +274,34 @@ def test_stop_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):
     assert "LEERIE_FLY_APP is required" in r.stderr
 
 
-def test_kill_accepts_explicit_ec2_enum_but_fails_closed(tmp_path):
+def test_kill_accepts_explicit_ec2_enum_but_needs_a_sidecar(tmp_path):
+    """feat-006 wires --kill's EC2 action (terminate_instance with
+    fetch-before-terminate ordering — tests/test_ec2_launcher_kill.py),
+    so --runtime ec2 no longer fails closed with "does not support EC2
+    runs yet" — it now requires an ec2_instance_id to act on, which this
+    run dir (no ec2-instance.json / run.json ec2_instance_id) does not
+    have."""
     state_dir = tmp_path / "state"
     _make_e2e_run(state_dir, "r1")
     r = _run_launcher(["--kill", "r1", "--runtime", "ec2", "--force"], state_dir)
     assert r.returncode != 0
-    assert "does not support EC2 runs yet" in r.stderr
+    assert "does not support EC2 runs yet" not in r.stderr
+    assert "no ec2_instance_id found" in r.stderr
 
 
-def test_kill_autodetects_ec2_sidecar_and_fails_closed(tmp_path):
+def test_kill_autodetects_ec2_sidecar_and_proceeds_past_detection(tmp_path):
+    """feat-006 wires --kill's EC2 action, so an auto-detected EC2 run no
+    longer fails closed at the detection gate — it proceeds to resolve
+    AWS credentials (which fails here since no `aws` binary / credentials
+    are set up in this test's env, unrelated to detection). The full
+    fetch-before-terminate happy path is covered end-to-end in
+    tests/test_ec2_launcher_kill.py against a stubbed `aws`."""
     state_dir = tmp_path / "state"
     _make_e2e_run(state_dir, "r1", ec2=True)
     r = _run_launcher(["--kill", "r1", "--force"], state_dir)
     assert r.returncode != 0
     assert "auto-detected ec2 run" in r.stderr
-    assert "does not support EC2 runs yet" in r.stderr
+    assert "does not support EC2 runs yet" not in r.stderr
 
 
 def test_accept_blocked_rejects_bogus_runtime_value(tmp_path):
