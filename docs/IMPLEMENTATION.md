@@ -4718,14 +4718,34 @@ Invalid values in env or TOML are rejected immediately with an error
 message and exit 1 before any preflight runs.
 
 **Runtime auto-detection on run-id-bearing verbs:** the shared
-`_auto_detect_fly_runtime(run_id, explicit_runtime)` helper checks for
-`$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json`. If
-present and `explicit_runtime` is empty, it returns 0 and the caller
-promotes the local runtime variable to `fly`. Applied to `--resume` (which
-also appends `--runtime fly` to `REWRITTEN_ARGS` and tracks the
-`_RUNTIME_EXPLICIT` flag), `--stop`, `--kill`, and `--finalize`. When the
-user explicitly passes `--runtime local` on a Fly-originated run, `--resume`
-warns but respects the choice; the fast-path verbs reject it as before.
+`_auto_detect_run_runtime(run_id, explicit_runtime)` helper checks
+`$LEERIE_STATE_HOST_DIR/runs/$run_id/` for `fly-machine.json` (Fly) then
+`ec2-instance.json` (EC2 — the sidecar `ec2-provision.sh`'s
+`provision_instance()` writes unconditionally on a successful create). If
+`explicit_runtime` is empty and either sidecar is present, it echoes the
+detected runtime (`"fly"` or `"ec2"`) to stdout and returns 0; the caller
+promotes its local runtime variable to that value. `_auto_detect_fly_runtime`
+remains as a thin Fly-only wrapper (returns 0 only when the detected runtime
+is `"fly"`) for call sites not yet migrated to EC2 handling.
+Applied to `--stop`, `--kill`, `--accept-blocked`, and `--finalize` (all four
+now accept `ec2` in their `--runtime` enum validation, alongside `local` and
+`fly`), and to `--resume` (which also appends `--runtime fly` to
+`REWRITTEN_ARGS` and tracks the `_RUNTIME_EXPLICIT` flag). When the user
+explicitly passes `--runtime local` on a Fly-originated run, `--resume` warns
+but respects the choice; the fast-path verbs reject it as before.
+
+None of the five verbs wire an EC2 *action* yet (that is feat-005..feat-008 —
+`--stop`/`--kill`/`--resume` each get a dedicated ec2-provision.sh/
+ec2-resume-instance.sh call site, and `--accept-blocked`/`--list` get EC2
+sidecar awareness). Until then, detecting or being explicitly passed
+`--runtime ec2` on `--stop`, `--kill`, `--accept-blocked`, or `--finalize`
+fails closed with an explicit "does not support EC2 runs yet" message rather
+than silently falling through to the Fly path (which would misdirect an EC2
+instance id to `flyctl`) or defaulting to `local` (which would silently
+mislabel the run). `--resume` fails closed the same way rather than
+promoting `RUNTIME=ec2`, since that would fall into the launcher's
+fresh-provision `RUNTIME=ec2` branch and die with an unrelated "not yet
+wired" message instead of a resume-specific one.
 
 When `RUNTIME=fly`, the launcher skips the per-OS nerdctl preflight, the
 image-build check, the auth/cache mount assembly, and the `nerdctl run`
@@ -5526,9 +5546,11 @@ Two new launcher flags, routed at the top of `leerie` alongside
 `--resume` (line ~63):
 
 - **`leerie --stop <run-id>`** — clean pause. Runtime detection:
-  (1) `_auto_detect_fly_runtime` checks for `fly-machine.json` →
-  Fly path; (2) `_is_local_container` probes `nerdctl inspect
-  <run-id>` → local path; (3) neither → error.
+  (1) `_auto_detect_run_runtime` checks for `fly-machine.json` then
+  `ec2-instance.json` → Fly/EC2 path; (2) `_is_local_container` probes
+  `nerdctl inspect <run-id>` → local path; (3) neither → error. The EC2
+  path currently fails closed with a "does not support EC2 runs yet"
+  message (see "Runtime auto-detection on run-id-bearing verbs" above).
   - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
     and `FLY_APP`, calls `stop_machine()`.
   - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`

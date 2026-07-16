@@ -2474,11 +2474,17 @@ coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `--resume`,
-`--stop`, `--kill`, or `--finalize` targets a run whose state
-directory contains a `fly-machine.json` sidecar and no explicit
-`--runtime` was given, the launcher auto-promotes to `fly` via the
-shared `_auto_detect_fly_runtime` helper. When no `fly-machine.json`
-exists, `--stop` and `--kill` probe for a live local nerdctl container
+`--stop`, `--kill`, `--accept-blocked`, or `--finalize` targets a run
+whose state directory contains a `fly-machine.json` or `ec2-instance.json`
+sidecar and no explicit `--runtime` was given, the launcher auto-promotes
+to `fly` or `ec2` respectively via the shared `_auto_detect_run_runtime`
+helper (`_auto_detect_fly_runtime` remains as a thin Fly-only wrapper for
+call sites not yet migrated). An EC2 detection currently fails closed with
+a "does not support EC2 runs yet" message on every verb but `--resume`,
+which fails closed the same way rather than falling into the launcher's
+fresh-provision `RUNTIME=ec2` branch — none of the five verbs wire an EC2
+*action* yet. When no sidecar of either kind exists, `--stop` and
+`--kill` probe for a live local nerdctl container
 via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
 `nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
 signal handler can save state before exit; `--kill` uses `nerdctl kill`
