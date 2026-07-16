@@ -1225,6 +1225,23 @@ bug reintroduced). It skips cleanly on hosts whose `/bin/bash` is ≥ 4.3,
 so it is a macOS-developer guard, never a CI flake. Paired with a
 source-level `local -n` / `declare -n` ban (namerefs are bash 4.3+;
 echo the tokens instead — see `_aws_region_profile_args`).
+The guard was extended (test-006) to cover every EC2 launcher arm wired
+by test-001..test-005: `_EC2_SCRIPTS` gained `ec2-resume-instance.sh`,
+`ec2-seed-auth.sh`, and `ec2-fetch-branch.sh` (all sourced by the
+launcher's EC2 arms but previously untested here); `_EXPANSION_CALLSITES`
+gained `resume_instance`; and a new
+`test_ec2_launcher_verb_runs_cleanly_under_bash32` runs the real `leerie`
+binary itself (not just `scripts/remote/ec2-*.sh`) under bash 3.2 for
+`--stop`/`--kill`/`--accept-blocked` with `LEERIE_AWS_PROFILE`/
+`LEERIE_AWS_REGION` unset, since each of those arms builds its own
+optional-arg array from those two vars directly in `leerie` before
+calling `resolve_aws_credentials`. This surfaced a real, previously
+unguarded instance of the class: all four call sites
+(`--accept-blocked`, `--stop`, `--kill`, and the main `RUNTIME=ec2`
+dispatch) expanded their creds-args array as a bare `"${arr[@]}"`
+instead of `${arr[@]+"${arr[@]}"}` — fixed in the same change. The
+nameref ban was likewise extended to `leerie` itself
+(`test_no_namerefs_in_launcher`).
 
 Three test-side traps in the same area, all of which made a test pass or
 hang while proving nothing:
