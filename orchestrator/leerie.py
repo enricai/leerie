@@ -3018,17 +3018,21 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
 
 def _collect_run_rows(
     leerie_root: Path,
-) -> list[tuple[str, str, str, str, bool, str]]:
-    """Build (run_id, started_at, status, branch, is_fly, cost) rows for
-    every run under `leerie_root/runs/`. Pure data-gathering; rendering is
-    the caller's concern. `is_fly` is True when the run has Fly runtime
-    artifacts (fly_machine_id in run.json or fly-machine.json present).
+) -> list[tuple[str, str, str, str, bool, str, bool]]:
+    """Build (run_id, started_at, status, branch, is_fly, cost, is_ec2)
+    rows for every run under `leerie_root/runs/`. Pure data-gathering;
+    rendering is the caller's concern. `is_fly` is True when the run has
+    Fly runtime artifacts (fly_machine_id in run.json or fly-machine.json
+    present); `is_ec2` is True when the run has EC2 runtime artifacts
+    (ec2_instance_id in run.json or ec2-instance.json present — mirrors
+    `_auto_detect_ec2_runtime`'s sidecar probe in the launcher).
     `cost` is the run's aggregate `$X.XX` from `state.json`'s telemetry
     block, or `—` when telemetry is absent (e.g. pre-classify orphans).
-    `is_fly` stays second-to-last as the filter-only field so the existing
-    `r[2]` status / `r[4]` runtime filters in `list_runs` are unaffected."""
+    `is_fly` stays at r[4] as a filter-only field so the existing `r[2]`
+    status filter in `list_runs` is unaffected; `is_ec2` is appended at
+    r[6] (after `cost`) for the same reason."""
     runs = discover_runs(leerie_root)
-    rows: list[tuple[str, str, str, str, bool, str]] = []
+    rows: list[tuple[str, str, str, str, bool, str, bool]] = []
     for state in runs:
         run_id = state["run_id"]
         run_dir = leerie_root / "runs" / run_id
@@ -3046,22 +3050,25 @@ def _collect_run_rows(
         branch = (run_json or {}).get("branch") or compute_run_branch(run_id)
         is_fly = bool((run_json or {}).get("fly_machine_id")
                       or (run_dir / "fly-machine.json").is_file())
+        is_ec2 = bool((run_json or {}).get("ec2_instance_id")
+                      or (run_dir / "ec2-instance.json").is_file())
         # Telemetry rides along in the state summary (discover_runs passes the
         # whole state.json through), so no extra disk read. Orphans have no
         # state.json and thus no telemetry → render "—".
         tel = state.get("telemetry") or {}
         cost = f"${tel['cost_usd']:,.2f}" if tel.get("cost_usd") is not None \
             else "—"
-        rows.append((run_id, started_at, status, branch, is_fly, cost))
+        rows.append((run_id, started_at, status, branch, is_fly, cost, is_ec2))
     return rows
 
 
 def _render_run_table(
-    rows: list[tuple[str, str, str, str, bool, str]],
+    rows: list[tuple[str, str, str, str, bool, str, bool]],
 ) -> None:
     """Print rows as a columnar table with auto-sized columns. Column
     order is run_id, started_at, status, cost, branch (the filter-only
-    `is_fly` at r[4] is not rendered; cost is at r[5])."""
+    `is_fly` at r[4] and `is_ec2` at r[6] are not rendered; cost is at
+    r[5])."""
     w_id = max(len("run_id"), *(len(r[0]) for r in rows))
     w_st = max(len("started_at"), *(len(r[1]) for r in rows))
     w_status = max(len("status"), *(len(r[2]) for r in rows))
@@ -3090,16 +3097,20 @@ def list_runs(
       `status_filter` restricts to rows whose derived status matches.
       `runtime_filter` restricts to rows by execution backend: 'fly'
       means rows with Fly runtime artifacts (fly_machine_id in run.json
-      or fly-machine.json present); 'local' means rows without. Both
-      are validated against argparse `choices=` before
-      this is called; unknown values render an empty table."""
+      or fly-machine.json present); 'ec2' means rows with EC2 runtime
+      artifacts (ec2_instance_id in run.json or ec2-instance.json
+      present); 'local' means rows with neither. All three are
+      validated against argparse `choices=` before this is called;
+      unknown values render an empty table."""
     rows = _collect_run_rows(leerie_root)
     if status_filter is not None:
         rows = [r for r in rows if r[2] == status_filter]
     if runtime_filter == "fly":
         rows = [r for r in rows if r[4]]
+    elif runtime_filter == "ec2":
+        rows = [r for r in rows if r[6]]
     elif runtime_filter == "local":
-        rows = [r for r in rows if not r[4]]
+        rows = [r for r in rows if not r[4] and not r[6]]
     if not rows:
         msg = "no runs"
         if status_filter is not None:
