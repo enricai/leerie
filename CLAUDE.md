@@ -1346,6 +1346,37 @@ covers); and a failing credential probe still aborts non-zero with the
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+The two read-mostly verbs that still assumed a two-runtime world —
+`--accept-blocked` (validated `--runtime` against only `fly`/`local` and
+defaulted anything non-fly to `local`, silently mislabeling an EC2 run)
+and `--list` (keyed its runtime-aware view on `fly-machine.json`/
+`LEERIE_FLY_APP`, so an EC2 run rendered empty columns) — are pinned in
+`tests/test_ec2_launcher_readonly_verbs.py`. `--accept-blocked` now
+auto-detects EC2 the same way `--stop` already does
+(`_auto_detect_ec2_runtime`), accepts an explicit `--runtime ec2` (with
+a control that a genuinely bogus value is still rejected), and —
+mirroring the Fly path's wake-mutate-pause dance — wakes a stopped
+instance, mutates state.json over SSM (`ec2_remote_exec`), mirrors the
+mutation onto the host copy if one exists, and re-pauses the instance
+only if this verb woke it (plus an already-running control that proves
+no pause fires when the instance was already up), and fails closed on a
+missing `ec2_instance_id`. The `--accept-blocked` tests invoke the real
+`leerie` launcher binary against a stubbed `aws` that composes
+`tests/ec2_stub.py`'s stateful EC2 instance tracking with an `ssm
+start-session` handler that decodes `ec2_remote_exec`'s base64-wrapped
+command and executes it with the invoking process's stdin drained
+through — the same mechanism the launcher's EC2 branch relies on to
+pipe the multi-line state-mutation Python program to the remote
+`python3 -`. `_collect_run_rows`/`list_runs` in `orchestrator/leerie.py`
+now track an `is_ec2` axis (`ec2_instance_id` in `run.json` or
+`ec2-instance.json` present) alongside the existing `is_fly`, so
+`--list --runtime ec2` filters correctly, `--list --runtime local`
+excludes both Fly and EC2 runs, a plain `--list` renders an EC2 run's
+status column without requiring `LEERIE_FLY_APP`, and an EC2 run is
+still detected via the `ec2-instance.json` sidecar alone when
+`run.json` doesn't exist yet. These `--list` tests exercise
+`list_runs()` directly (no launcher subprocess, no AWS stub), mirroring
+`tests/test_list_runs.py`'s pattern.
 
 The worker invocation path is unit-tested only at the `claude_p` layer, via
 a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin

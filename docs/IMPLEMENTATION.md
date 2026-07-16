@@ -5721,12 +5721,15 @@ blocks again indefinitely. The `--accept-blocked` verb lets the
 operator acknowledge the external block so `--resume` skips that
 subtask.
 
-- **`leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]`**
+- **`leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2]`**
   — sets `subtask_status[sid]` to `"complete"` in state.json and removes
   the sid from the `blocked` dict (if present). On `--resume`,
   `phase_execute`'s wave-skip filters subtasks whose `subtask_status` is
-  `"complete"`, so the accepted subtask never re-dispatches.
-  - **Input validation (both runtimes):** both positionals are checked
+  `"complete"`, so the accepted subtask never re-dispatches. Without an
+  explicit `--runtime`, the verb auto-detects via `_auto_detect_fly_runtime`
+  then `_auto_detect_ec2_runtime` (the same sidecar-probe order `--stop`
+  uses), falling back to `local` only when neither sidecar is present.
+  - **Input validation (all runtimes):** both positionals are checked
     against `^[A-Za-z0-9._-]+$` immediately after parsing, before they
     reach any filesystem path or remote shell. The run-id is interpolated
     into the host state-dir path (traversal risk) and, on Fly, into the
@@ -5754,6 +5757,20 @@ subtask.
     paused again (with `paused_at`/`pause_reason`/`fly_machine_id`
     re-written via `update_run_json`) only if this verb woke a stopped
     machine — a machine that was already running is left running.
+  - **EC2 path:** resolves credentials (`resolve_aws_credentials`,
+    `require_aws`) and the instance id via
+    `_resolve_ec2_instance_id_from_run_dir`, failing closed with an
+    actionable message if `ec2_instance_id` is absent from the sidecar.
+    Inspects instance state via `_describe_instance_state`; refuses on
+    `terminated`/`shutting-down`/missing; if not `running`, wakes it
+    (`resume_instance`, fatal on failure) and records that it did so.
+    Pipes the same mutation program over **stdin** to `python3 -` on the
+    instance via `ec2_remote_exec` (SSM — no ssh keypair or hallpass wait
+    needed, unlike Fly) and greps the same `ACCEPTED:`/`NOOP:`/`ERROR:`
+    sentinel. The host-side copy is mirrored best-effort. Teardown is
+    **conditional** the same way as Fly: `stop_instance` +
+    `paused_at`/`pause_reason`/`ec2_instance_id` re-written via
+    `update_run_json`, only if this verb woke a stopped instance.
   - The mutation program validates that the subtask's current status is
     `"blocked"` or `"failed"` before mutating (atomic temp-file +
     `os.replace`). No-ops with a `NOOP:` sentinel if already `"complete"`.
@@ -5762,7 +5779,13 @@ subtask.
     with a stubbed `flyctl` that parses both `-C` positionals and routes
     the stdin-piped `python3 -` to a local fixture, and injection-rejection
     tests asserting a metacharacter-bearing run-id/sid is refused with a
-    nonzero exit and no mutation.
+    nonzero exit and no mutation. `tests/test_ec2_launcher_readonly_verbs.py`
+    covers the EC2 path: runtime auto-detection over the pre-fix silent
+    `local` default, the widened `fly|local|ec2` validator (with a control
+    that a genuinely bogus value is still rejected), the accept-record
+    mutation landing on both the remote (SSM) state.json and the mirrored
+    host copy, the wake/re-pause discipline (and its already-running
+    no-op counterpart), and the missing-`ec2_instance_id` fail-closed path.
 
 Maps to `DESIGN.md`: §5 *`requires.extent` — in-graph vs. external
 prerequisites*, *Accepting external-blocked subtasks*.
@@ -5793,36 +5816,46 @@ filter below, so this keeps working; `seed-failed` is excluded from the
 bare-`--resume` *auto-pick* only (it needs an operator decision first,
 and its rows carry no `started_at` to rank by).
 
-**EC2 counterpart (spec — `discover_runs()` widening not yet
-implemented).** DESIGN §6 *EC2 runtime lifecycle* ("Run identifier")
-flags that `discover_runs()`'s orphan scan is hardcoded to the literal
-filename `fly-machine.json` and will need widening to also check for
-`ec2-instance.json` (the sidecar `ec2-provision.sh`'s
-`provision_instance()` now writes unconditionally — see the Files-table
-row above; this part has shipped) so a crashed pre-`state.json` EC2 run
-is discoverable the same way a crashed Fly run is today. DESIGN §6 is
-explicit that this widening is out of scope for the provisioning
-subtask itself and should not repurpose or rename `fly-machine.json`,
-which stays exactly as-is for Fly runs — a future subtask adds the
-additional `ec2-instance.json` check alongside it, not instead of it.
+**EC2 counterpart (`--list`'s Python-layer view, not `discover_runs()`'s
+orphan scan).** `_collect_run_rows()` (below) now tracks an `is_ec2`
+axis the same way it tracks `is_fly`, so `--runtime ec2`/`--runtime
+local` filter EC2 runs correctly and a plain `--list` renders an EC2
+run's status column without `LEERIE_FLY_APP` set. This is distinct from
+`discover_runs()`'s orphan scan (DESIGN §6 *EC2 runtime lifecycle*, "Run
+identifier"), which is still hardcoded to the literal filename
+`fly-machine.json` and has not yet been widened to also check
+`ec2-instance.json` for pre-`state.json` orphan discovery — that
+remains a separate, not-yet-landed piece of work, and should not
+repurpose or rename `fly-machine.json`, which stays exactly as-is for
+Fly runs.
 
 Changes:
 
-- `_collect_run_rows()` returns a per-run tuple
-  `(run_id, started_at, status, branch, is_fly, cost)`. `is_fly` is a
-  bool derived from `fly_machine_id` in `run.json` or a present
-  `fly-machine.json` — it is **filter-only** (consumed by the
-  `--runtime` filter), never rendered as a column. `cost` is the run's
-  aggregate `$X.XX` from `state.json`'s `telemetry.cost_usd` (present
-  in the state summary `discover_runs` passes through — no extra disk
-  read), or `—` when telemetry is absent (orphans / pre-classify runs).
+- `_collect_run_rows()` returns a per-run tuple `(run_id, started_at,
+  status, branch, is_fly, cost, is_ec2)`. `is_fly` is a bool derived
+  from `fly_machine_id` in `run.json` or a present `fly-machine.json`;
+  `is_ec2` is a bool derived from `ec2_instance_id` in `run.json` or a
+  present `ec2-instance.json` (mirrors `_auto_detect_ec2_runtime`'s
+  sidecar probe in the launcher). Both are **filter-only** (consumed by
+  the `--runtime` filter), never rendered as columns. `is_fly` stays at
+  index 4 so existing `r[4]` consumers are unaffected; `is_ec2` is
+  appended at index 6, after `cost`. `cost` is the run's aggregate
+  `$X.XX` from `state.json`'s `telemetry.cost_usd` (present in the state
+  summary `discover_runs` passes through — no extra disk read), or `—`
+  when telemetry is absent (orphans / pre-classify runs).
 - `_render_run_table()` renders columns in the order `run_id,
-  started_at, status, cost, branch` (the filter-only `is_fly` is not a
-  column). The `cost` column is right-aligned; widths auto-size.
+  started_at, status, cost, branch` (the filter-only `is_fly`/`is_ec2`
+  are not columns). The `cost` column is right-aligned; widths
+  auto-size.
 - `--status <state>` argparse flag on `--list` filters rows to only
   those whose derived status matches. `<state>` accepts any value in
   `RUN_STATUSES` (see list above). Invalid values produce an
   argparse error listing the allowed set.
+- `--runtime` on `--list` accepts `local`/`fly`/`ec2` (the
+  `RUNTIME_VALUES` enum, validated by argparse `choices=`). `fly`
+  restricts to rows with Fly artifacts; `ec2` restricts to rows with EC2
+  artifacts; `local` restricts to rows with **neither** (not just
+  "not fly").
 - `--list --runtime fly` is intercepted by the launcher (bash) before
   the orchestrator dispatch and queries Fly directly via `flyctl
   machines list --app <FLY_APP> --json`. Renders a `machine_id |
@@ -5831,8 +5864,10 @@ Changes:
   `run_id` is best-effort filled by scanning `<state-root>/runs/*/{fly-
   machine.json,run.json}` for the current repo; machines launched from
   another repo show `run_id=?`. Falls back to the orchestrator-side
-  local-sidecar list when `flyctl` is missing or auth fails. Plain
-  `--list` (no `--runtime fly`) is unchanged.
+  local-sidecar list when `flyctl` is missing or auth fails. Any other
+  `--list --runtime` value (including `ec2`) falls through unchanged
+  into the orchestrator's argparse dispatch above. Plain `--list` (no
+  `--runtime fly`) is unchanged.
 
 Verbs `--kill` and `--finalize` accept an optional
 `--runtime <local|fly>` flag — validated by the launcher (bash)
@@ -5840,8 +5875,9 @@ against only `local`/`fly`, rejecting any other value (including
 `ec2`) with an error; this is narrower than the `RUNTIME_VALUES`
 enum (`local|fly|ec2` — see "Remote execution mode" below) that
 gates the top-level `--runtime` flag for launching a new run.
-`--stop` is the exception: it accepts `local`/`fly`/`ec2` (see
-"Explicit pause and destroy verbs" above for the full EC2 path).
+`--stop` and `--accept-blocked` are the exceptions: both accept
+`local`/`fly`/`ec2` (see "Explicit pause and destroy verbs" above and
+"Accept-blocked verb" above for their respective EC2 paths).
 
 The launcher's `RUNTIME=ec2` branch dispatches the full create → seed
 → launch → teardown cycle for *launching* a run (see "Runtime mode"

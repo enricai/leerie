@@ -2474,16 +2474,16 @@ coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `--resume`,
-`--stop`, `--kill`, or `--finalize` targets a run whose state
-directory contains a `fly-machine.json` sidecar and no explicit
-`--runtime` was given, the launcher auto-promotes to `fly` via the
-shared `_auto_detect_fly_runtime` helper. `--stop` additionally checks
-for an `ec2-instance.json` sidecar via the parallel
-`_auto_detect_ec2_runtime` helper (same shape, checked after Fly and
-before the local-container probe) and auto-promotes to `ec2` — the
-EC2 counterpart of `fly-machine.json` (see "EC2 runtime lifecycle",
-"Run identifier"). When neither remote sidecar exists, `--stop` and
-`--kill` probe for a live local nerdctl container
+`--stop`, `--kill`, `--finalize`, or `--accept-blocked` targets a run
+whose state directory contains a `fly-machine.json` sidecar and no
+explicit `--runtime` was given, the launcher auto-promotes to `fly` via
+the shared `_auto_detect_fly_runtime` helper. `--stop` and
+`--accept-blocked` additionally check for an `ec2-instance.json`
+sidecar via the parallel `_auto_detect_ec2_runtime` helper (same shape,
+checked after Fly and before the local-container probe) and
+auto-promote to `ec2` — the EC2 counterpart of `fly-machine.json` (see
+"EC2 runtime lifecycle", "Run identifier"). When neither remote sidecar
+exists, `--stop` and `--kill` probe for a live local nerdctl container
 via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
 `nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
 signal handler can save state before exit, or `aws ec2 stop-instances`
