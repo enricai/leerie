@@ -17901,10 +17901,23 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     cherry-pick); resolve conflicts with an integrator worker. Returns the
     list of integrated ids.
 
-    If an integrator cannot resolve a conflict (status other than 'resolved'),
-    the in-progress merge is aborted so the staging worktree is left clean, and
-    the run is terminated with the integrator's diagnosis — an unresolved
-    conflict must not silently proceed onto a corrupt staging tree."""
+    An integrator that does not produce a resolved merge ends the run either
+    way — an unresolved conflict must not silently proceed onto a corrupt
+    staging tree — but *how* depends on whether it reached a verdict or died
+    (DESIGN §12; a verdict is a fact about the work, a crash is a fact about
+    the machine):
+
+    - **Verdict** (`design-conflict` / `failed`): the integrator judged the
+      merge unfit. The in-progress merge is aborted, leaving the staging
+      worktree clean, and the run terminates with its diagnosis. Its partial
+      work is deliberately discarded — it said so itself.
+    - **Crash** (every round raised, so there is no status and no diagnosis):
+      infrastructure, not judgment. `rescue_integrator_work` captures the
+      in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` *before*
+      the abort — `git merge --abort` destroys it otherwise, and it is the
+      most expensive artifact in the run to recreate. `blocked[sid]` is
+      recorded and the die message names the ref and its recovery command;
+      `--resume` retries the integration."""
     integrated, integrated_so_far = [], []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:

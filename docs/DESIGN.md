@@ -4233,7 +4233,7 @@ principle applied to caps.
 ### Code-enforced caps
 
 Some caps are counted by the orchestrator: the number of subtask continuations
-for a subtask, the number of corrective retries, re-validation rounds per wave,
+for a subtask, the number of mechanical-feedback rounds for a judgment worker,
 the total number of workers a whole run may spawn, the parallelism within a
 wave, and a per-worker time and turn limit. These are real counters in real
 code. When one is hit, the orchestrator takes a defined action — block the

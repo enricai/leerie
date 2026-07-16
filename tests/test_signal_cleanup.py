@@ -1091,8 +1091,21 @@ def test_poll_loop_reaps_above_high_water(leerie, monkeypatch):
         return mid_run
 
     mid_run = asyncio.run(_run())
-    assert len(mid_run) >= 1, (
-        f"Expected at least one MID-RUN kill above high-water; got {mid_run}")
+    # Exact list, not `len(...) >= 1`. The fixture's 92% -> 91% -> 70% ramp
+    # encodes the stop-at-low-water contract, so a loose threshold lets the
+    # whole hysteresis mechanism be deleted without failing: real code kills
+    # only 500 (oldest first, then the 70% recheck breaks), while a reaper
+    # with no low-water break kills 501 too — and `>= 1` accepts both.
+    # Verified by mutation: deleting the `rc / rm < _PID_REAP_LOW_WATER`
+    # break at the `_poll_loop` call site left all 43 tests in this file
+    # passing. Hysteresis is the *safety* half of the reducer (it is what
+    # stops an armed reaper from killing every orphan in `_seen`), so it
+    # needs the strictest pin here, not the loosest. Asserting the exact
+    # list also pins oldest-first ordering: 500 is the older PID.
+    assert mid_run == [500], (
+        "Expected exactly one MID-RUN kill — the oldest orphan (500) — with "
+        "the reaper then stopping at low-water; killing 501 too means the "
+        f"hysteresis break is gone. got {mid_run}")
 
 
 def test_poll_loop_below_high_water_kills_nothing(leerie, monkeypatch):
