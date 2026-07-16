@@ -338,6 +338,122 @@ entirely; use `--local-build` only if you have a specific reason
 (e.g. you need to build an image variant the remote builder can't
 produce, or you're testing the build pipeline locally).
 
+## EC2 runtime (configuration only — provisioning not yet wired)
+
+> **Current limitation:** `--runtime ec2` runs AWS credential/config
+> preflight and then exits with an actionable error —
+> "instance provisioning is not yet wired into the launcher". The
+> create/wait-ready/teardown dispatch that would actually launch an
+> EC2 instance and run a worker on it has not landed yet. This section
+> documents how to configure the runtime's credentials and instance
+> shape today, so that setup is already correct once provisioning
+> ships. Do not expect an end-to-end `--runtime ec2` run to work yet.
+
+Passing `--runtime ec2` (or setting `LEERIE_RUNTIME=ec2` or
+`runtime = ec2` in `leerie.toml`) selects the EC2 execution backend as
+an alternative to the default `local` runtime and to `--runtime fly`
+above.
+
+### Prerequisites
+
+1. **AWS CLI v2 installed.** Unlike the Fly runtime, leerie does not
+   auto-install this — the official installers commonly need `sudo`,
+   which is out of scope for an unattended preflight. Install from
+   https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+   or `brew install awscli` on macOS.
+2. **AWS credentials that resolve successfully**, checked via `aws sts
+   get-caller-identity`. If credentials are expired or missing, the
+   preflight prints `aws sso login --profile <profile>` (or bare `aws
+   sso login` when no profile is set) and exits.
+
+### Credential resolution order
+
+Leerie resolves AWS credentials/region using the same precedence order
+the AWS CLI and SDKs use, so the EC2 runtime authenticates as the
+identity you already expect from `aws` commands run in the same shell:
+
+1. **`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`** (+ optional
+   `AWS_SESSION_TOKEN`) environment variables — always wins when set.
+2. **Named profile** (`AWS_PROFILE`, else `default`) in
+   `~/.aws/config` / `~/.aws/credentials`:
+   - Static `aws_access_key_id`/`aws_secret_access_key` in
+     `~/.aws/credentials`, or
+   - SSO (`sso_session` reference or legacy inline `sso_start_url`),
+     resolved via the cached token in `~/.aws/sso/cache/*.json`. An
+     expired or never-logged-in SSO session produces the
+     `aws sso login --profile <profile>` hint above.
+3. **EC2 instance role via IMDS** — only meaningful once code is
+   running *on* an EC2 instance. On your host (the only place this
+   preflight runs today) there is no instance role, so the chain ends
+   here with an actionable error rather than silently failing.
+
+Region resolves separately: `AWS_REGION` > `AWS_DEFAULT_REGION` >
+the profile's `region` key in `~/.aws/config` > an actionable error.
+
+### `LEERIE_AWS_REGION` / `LEERIE_AWS_PROFILE` vs. `AWS_REGION` / `AWS_PROFILE`
+
+These are two distinct things — leerie does not collapse them:
+
+- **`LEERIE_AWS_REGION`** / **`LEERIE_AWS_PROFILE`** (also
+  `--aws-region` / `--aws-profile`, or `aws_region` / `aws_profile` in
+  `leerie.toml`) are **leerie's own knobs** for which AWS region/profile
+  *leerie itself* uses when provisioning `--runtime ec2` machines.
+  Free-form strings, no validation. Unset by default — leaving
+  region/profile selection entirely to the credential chain above.
+- **`AWS_REGION`** / **`AWS_PROFILE`** are the **AWS SDK's own
+  credential-chain env vars**, resolved independently by the standard
+  AWS precedence order described above.
+
+```bash
+export LEERIE_AWS_REGION=us-east-1
+export LEERIE_AWS_PROFILE=my-aws-profile
+leerie "task" --runtime ec2 --aws-region us-east-1 --aws-profile my-aws-profile
+# …or commit a leerie.toml at the repo root with:
+#   aws_region = us-east-1
+#   aws_profile = my-aws-profile
+```
+
+### Required instance-shape vars
+
+Five `LEERIE_EC2_*` vars name the AWS `RunInstances` parameters the
+(not-yet-wired) provisioning step needs. Unlike Fly, where
+`FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults, these describe
+AWS account resources leerie cannot choose on your behalf — there is
+no default tier. `--runtime ec2` without all five resolved fails the
+same way `--runtime fly` without `LEERIE_FLY_APP` fails: an actionable
+`die()` naming the missing var, before any AWS API call.
+
+Each resolves via the same **CLI flag > env var > `leerie.toml` key**
+precedence as every other leerie knob:
+
+```bash
+export LEERIE_EC2_AMI=ami-0abcdef1234567890
+export LEERIE_EC2_INSTANCE_TYPE=t3.large
+export LEERIE_EC2_KEY_NAME=my-ec2-keypair
+export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
+leerie "task" --runtime ec2
+# …or commit a leerie.toml at the repo root with:
+#   ec2_ami = ami-0abcdef1234567890
+#   ec2_instance_type = t3.large
+#   ec2_key_name = my-ec2-keypair
+#   ec2_security_group = sg-0123456789abcdef0
+#   ec2_subnet_id = subnet-0123456789abcdef0
+# …or pass them as CLI flags per run:
+leerie "task" --runtime ec2 \
+  --ec2-ami ami-0abcdef1234567890 --ec2-instance-type t3.large \
+  --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
+  --ec2-subnet-id subnet-0123456789abcdef0
+```
+
+| Var | CLI flag | `leerie.toml` key | Meaning |
+|---|---|---|---|
+| `LEERIE_EC2_AMI` | `--ec2-ami` | `ec2_ami` | AMI id to launch. |
+| `LEERIE_EC2_INSTANCE_TYPE` | `--ec2-instance-type` | `ec2_instance_type` | EC2 instance type (e.g. `t3.large`). |
+| `LEERIE_EC2_KEY_NAME` | `--ec2-key-name` | `ec2_key_name` | EC2 key-pair name for SSH access. |
+| `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | `ec2_security_group` | Security group id to attach. |
+| `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | `ec2_subnet_id` | Subnet id to launch into. |
+
 ## What leerie mounts into the container
 
 When the container starts, the launcher mounts the following:
