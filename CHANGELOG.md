@@ -40,12 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is configured, i.e. the default path. Pinned by
   `tests/test_ec2_bash32_portability.py`, which runs the real scripts
   under a real bash 3.2 and skips on hosts that only have bash ≥ 4.3.
-- **The macOS test suite no longer hangs for ~19 minutes.** Two EC2 stall
-  tests asserted that a timeout fires, but pinned `PATH` to
-  `/usr/bin:/bin` — where macOS has no GNU `timeout`, so
-  `_seed_timeout_prefix` correctly no-ops and the stubs' `sleep 600` ran
-  unbounded. With killing `timeout` stubs in place the full suite drops
-  from ~23 min to ~4m40s on macOS.
 - **Worker stderr can no longer trip the auth/quota backoff.** The
   no-result envelope above interpolates the worker's raw stderr into
   `result`, and `_is_auth_or_quota_failure` text-matches that field for
