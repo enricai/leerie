@@ -465,19 +465,43 @@ with open(sidecar, "w") as f:
 ' "$fmj" "$sidecar"
 }
 
-# --- _auto_detect_fly_runtime --------------------------------------------
-# When a run-id-bearing verb is invoked without an explicit --runtime and
-# the run directory contains fly-machine.json, the run originated on Fly.
-# Returns 0 (auto-detected) or 1 (not detected / explicit runtime given).
-_auto_detect_fly_runtime() {
+# --- _auto_detect_run_runtime ---------------------------------------------
+# When a run-id-bearing verb is invoked without an explicit --runtime, probe
+# the run directory's crash-recovery sidecars to find which runtime actually
+# owns the run: fly-machine.json (Fly) or ec2-instance.json (EC2) — DESIGN §6
+# "Run identifier" ("a same-shaped ec2-instance.json sidecar ... plus
+# widening the orphan scan to check for either sidecar file"). Fly is probed
+# first, matching the historical behavior when both happened to be present
+# (never expected in practice — a run has exactly one runtime — but Fly wins
+# ties for backward compatibility with the pre-EC2 helper).
+#
+# On a match, echoes the detected runtime ("fly" or "ec2") to stdout and
+# returns 0. Returns 1 (nothing echoed) when an explicit runtime was given,
+# no run_id was given, or neither sidecar is present.
+_auto_detect_run_runtime() {
   local run_id="$1" explicit_runtime="$2"
   if [ -n "$explicit_runtime" ]; then return 1; fi
   if [ -z "$run_id" ]; then return 1; fi
-  local sidecar="$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json"
-  if [ -f "$sidecar" ]; then
+  local run_dir="$LEERIE_STATE_HOST_DIR/runs/$run_id"
+  if [ -f "$run_dir/fly-machine.json" ]; then
+    echo "fly"
+    return 0
+  fi
+  if [ -f "$run_dir/ec2-instance.json" ]; then
+    echo "ec2"
     return 0
   fi
   return 1
+}
+
+# --- _auto_detect_fly_runtime ----------------------------------------------
+# Back-compat Fly-only wrapper around _auto_detect_run_runtime, for call
+# sites that only branch on "is this a Fly run?" and have no ec2 handling
+# yet. Returns 0 only when the detected runtime is "fly".
+_auto_detect_fly_runtime() {
+  local _detected
+  _detected="$(_auto_detect_run_runtime "$1" "$2")" || return 1
+  [ "$_detected" = "fly" ]
 }
 
 # --- _is_local_container --------------------------------------------------
@@ -1220,7 +1244,7 @@ PY
     ;;
   --accept-blocked)
     # Mark a blocked/failed subtask as complete so --resume skips it.
-    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]
+    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]
     #
     # For local runs: modifies $LEERIE_STATE_HOST_DIR/runs/<id>/state.json
     # directly (bind-mounted into the container).
@@ -1247,7 +1271,7 @@ PY
     done
     if [ -z "$_ab_run_id" ] || [ -z "$_ab_sid" ]; then
       remote_log "--accept-blocked requires <run-id> <subtask-id>"
-      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]" >&2
+      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
     # Validate both positional args against a strict allowlist BEFORE they
@@ -1268,14 +1292,19 @@ PY
         remote_log "--accept-blocked: invalid subtask-id '$_ab_sid' (allowed chars: A-Za-z0-9._-)"
         exit 1 ;;
     esac
-    if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ]; then
-      remote_log "--accept-blocked: --runtime must be 'local' or 'fly' (got '$_ab_runtime')"
+    if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ] && [ "$_ab_runtime" != "ec2" ]; then
+      remote_log "--accept-blocked: --runtime must be 'local', 'fly', or 'ec2' (got '$_ab_runtime')"
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_ab_run_id" "$_ab_runtime"; then
-      _ab_runtime="fly"
-    elif [ "$_ab_runtime" != "fly" ]; then
+    _ab_detected="$(_auto_detect_run_runtime "$_ab_run_id" "$_ab_runtime")" || _ab_detected=""
+    if [ -n "$_ab_detected" ]; then
+      _ab_runtime="$_ab_detected"
+    elif [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "ec2" ]; then
       _ab_runtime="local"
+    fi
+    if [ "$_ab_runtime" = "ec2" ]; then
+      remote_log "--accept-blocked: run $_ab_run_id is an EC2 run; --accept-blocked does not support EC2 runs yet"
+      exit 1
     fi
     _ab_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ab_run_id"
     if [ ! -d "$_ab_state_dir" ]; then
@@ -1539,19 +1568,20 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           ;;
       esac
     done
-    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ]; then
-      remote_log "--stop: --runtime must be 'local' or 'fly' (got '$_stop_runtime')"
+    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ] && [ "$_stop_runtime" != "ec2" ]; then
+      remote_log "--stop: --runtime must be 'local', 'fly', or 'ec2' (got '$_stop_runtime')"
       exit 1
     fi
     if [ -z "$_stop_run_id" ]; then
       remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id> [--runtime fly|local]" >&2
+      echo "  Usage: leerie --stop <run-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_stop_run_id" "$_stop_runtime"; then
-      remote_log "--stop: auto-detected Fly run; promoting --runtime to fly"
-      _stop_runtime="fly"
-    elif [ "$_stop_runtime" != "fly" ] && _is_local_container "$_stop_run_id"; then
+    _stop_detected="$(_auto_detect_run_runtime "$_stop_run_id" "$_stop_runtime")" || _stop_detected=""
+    if [ -n "$_stop_detected" ]; then
+      remote_log "--stop: auto-detected ${_stop_detected} run; promoting --runtime to ${_stop_detected}"
+      _stop_runtime="$_stop_detected"
+    elif [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "ec2" ] && _is_local_container "$_stop_run_id"; then
       _stop_runtime="local"
     fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
@@ -1576,6 +1606,10 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         pause_reason "user-requested" || true
       remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
       exit 0
+    fi
+    if [ "$_stop_runtime" = "ec2" ]; then
+      remote_log "--stop: run $LEERIE_RUN_ID is an EC2 run; --stop does not support EC2 runs yet"
+      exit 1
     fi
     if [ "$_stop_runtime" != "fly" ]; then
       remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine or local container"
@@ -1680,14 +1714,15 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           ;;
       esac
     done
-    if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ]; then
-      remote_log "--kill: --runtime must be 'local' or 'fly' (got '$_kill_runtime')"
+    if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ] && [ "$_kill_runtime" != "ec2" ]; then
+      remote_log "--kill: --runtime must be 'local', 'fly', or 'ec2' (got '$_kill_runtime')"
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_kill_run_id" "$_kill_runtime"; then
-      remote_log "--kill: auto-detected Fly run; promoting --runtime to fly"
-      _kill_runtime="fly"
-    elif [ "$_kill_runtime" != "fly" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
+    _kill_detected="$(_auto_detect_run_runtime "$_kill_run_id" "$_kill_runtime")" || _kill_detected=""
+    if [ -n "$_kill_detected" ]; then
+      remote_log "--kill: auto-detected ${_kill_detected} run; promoting --runtime to ${_kill_detected}"
+      _kill_runtime="$_kill_detected"
+    elif [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "ec2" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
       _kill_runtime="local"
     fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
@@ -1734,6 +1769,15 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       fi
       remote_log "--kill: destroyed. Run is no longer resumable."
       exit 0
+    fi
+    # --- EC2 instance kill path ---
+    # An EC2 instance id must never fall through to the Fly kill path below:
+    # flyctl would silently no-op against a nonexistent Fly machine and
+    # --kill would report "destroyed" while the instance keeps billing
+    # (feat-006 wires the real terminate_instance() action).
+    if [ "$_kill_runtime" = "ec2" ]; then
+      remote_log "--kill: run ${_kill_run_id:-unknown} is an EC2 run; --kill does not support EC2 runs yet"
+      exit 1
     fi
     # --- Fly machine kill path ---
     if [ -z "$_kill_machine_id" ]; then
@@ -1901,15 +1945,24 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
-    if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ]; then
-      remote_log "--finalize: --runtime must be 'local' or 'fly' (got '$_fin_runtime')"
+    if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ] && [ "$_fin_runtime" != "ec2" ]; then
+      remote_log "--finalize: --runtime must be 'local', 'fly', or 'ec2' (got '$_fin_runtime')"
       exit 1
     fi
     if [ "$_fin_runtime" = "local" ]; then
       remote_log "--finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_fin_run_id" "$_fin_runtime"; then
+    if [ "$_fin_runtime" = "ec2" ]; then
+      remote_log "--finalize --runtime ec2: --finalize does not support EC2 runs yet"
+      exit 1
+    fi
+    _fin_detected="$(_auto_detect_run_runtime "$_fin_run_id" "$_fin_runtime")" || _fin_detected=""
+    if [ "$_fin_detected" = "ec2" ]; then
+      remote_log "--finalize: run $_fin_run_id is an EC2 run; --finalize does not support EC2 runs yet"
+      exit 1
+    fi
+    if [ "$_fin_detected" = "fly" ]; then
       remote_log "--finalize: auto-detected Fly run; promoting --runtime to fly"
       _fin_runtime="fly"
     fi
@@ -3443,17 +3496,26 @@ for arg in "$@"; do
   fi
 done
 
-# --- auto-detect Fly runtime on --resume ---------------------------------
-# Uses the shared _auto_detect_fly_runtime helper. The --resume path
+# --- auto-detect runtime on --resume --------------------------------------
+# Uses the shared _auto_detect_run_runtime helper. The --resume path
 # differs from the fast-path verbs: it sets REWRITTEN_ARGS (forwarded to
 # the orchestrator) and uses _RUNTIME_EXPLICIT to distinguish default
-# from user-set.
+# from user-set. EC2 detection is surfaced here so a paused EC2 run gets
+# an accurate message instead of silently defaulting to local — but
+# resuming an EC2 instance is not wired yet (a later subtask), so it
+# fails closed rather than promoting RUNTIME=ec2, which would otherwise
+# fall into the fresh-provision branch below and die with an unrelated
+# "not yet wired" message.
 if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
    [ "$_RUNTIME_EXPLICIT" = "false" ]; then
-  if _auto_detect_fly_runtime "$LEERIE_RUN_ID" ""; then
+  _resume_detected="$(_auto_detect_run_runtime "$LEERIE_RUN_ID" "")" || _resume_detected=""
+  if [ "$_resume_detected" = "fly" ]; then
     remote_log "--resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
     RUNTIME=fly
     REWRITTEN_ARGS+=("--runtime" "fly")
+  elif [ "$_resume_detected" = "ec2" ]; then
+    remote_log "--resume: run $LEERIE_RUN_ID is an EC2 run (ec2-instance.json present); --resume does not support EC2 runs yet"
+    exit 1
   fi
 fi
 # When the user explicitly set --runtime local on a Fly-originated run,

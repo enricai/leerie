@@ -1254,6 +1254,36 @@ per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
 on every `start-instances` call, and an optional `status_ok` flag so
 `describe-instance-status` can report "initializing" instead of "ok"
 without an infinite/slow poll in tests.
+The generalized run-dir sidecar autodetection — `_auto_detect_run_runtime`
+(checks `fly-machine.json` then `ec2-instance.json`, echoing the detected
+runtime) and the `_auto_detect_fly_runtime` back-compat Fly-only wrapper
+built on top of it — is tested in `tests/test_auto_detect_run_runtime.py`.
+The first half extracts both functions verbatim from the launcher (mirroring
+`tests/test_oom_wedge_prevention.py`'s `_reaper_fn_source` approach) and
+exercises them against fixture run dirs: an ec2-instance.json-only run dir
+detects as `ec2`; a fly-machine.json-only run dir still detects as `fly` (no
+regression); neither sidecar present returns nonzero with nothing echoed; an
+explicit runtime short-circuits detection even when a sidecar for a
+different runtime is present; Fly wins when (never expected in practice)
+both sidecars co-exist; and the Fly-only wrapper returns nonzero for an EC2
+run. The second half invokes the real launcher end to end (mirroring
+`tests/test_accept_blocked.py`'s local-path pattern) across `--stop`,
+`--kill`, `--accept-blocked`, and `--finalize`: each now accepts `ec2`
+alongside `local`/`fly` in its `--runtime` enum validation (rejects other
+bogus values with the updated three-way message) and fails closed with an
+explicit "does not support EC2 runs yet" message — rather than silently
+falling through to the Fly path or defaulting to `local` — whether `ec2` was
+passed explicitly or auto-detected via the sidecar; the Fly auto-detect
+regression path (no sidecar override, `LEERIE_FLY_APP` unset) still reaches
+the pre-existing Fly-specific error, proving detection promoted to `fly` and
+reached the Fly branch. `--resume` is covered separately: an
+`ec2-instance.json` sidecar fails closed with a resume-specific message
+instead of promoting `RUNTIME=ec2` (which would otherwise fall into the
+launcher's fresh-provision `RUNTIME=ec2` branch and die with an unrelated
+"not yet wired" message), while a `fly-machine.json` sidecar still promotes
+to `fly` as before. None of these tests wire an EC2 verb *action* — that is
+feat-005..feat-008; this subtask's scope is the detection helper and the
+`--runtime` enum validation it feeds.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
