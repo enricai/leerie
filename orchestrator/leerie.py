@@ -4275,7 +4275,9 @@ def resolve_heal_success_threshold(repo_root: Path,
 
 
 async def run_proc(cmd: list[str], *, cwd: str | None = None,
-                   timeout: float | None = None) -> subprocess.CompletedProcess:
+                   timeout: float | None = None,
+                   env: dict[str, str] | None = None,
+                   ) -> subprocess.CompletedProcess:
     """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
     On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
     semantics callers already handle. One helper everywhere keeps the asyncio
@@ -4285,10 +4287,16 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     session/process group, distinct from leerie's own. This is what lets
     `_terminate_proc_tree` send `os.killpg(proc.pid, ...)` on the
     cleanup path without accidentally signaling the orchestrator's own
-    group. The flag is a no-op on Windows."""
+    group. The flag is a no-op on Windows.
+
+    `env` defaults to None, which inherits the orchestrator's environment
+    (asyncio's own default) — so every existing call site is unchanged.
+    Callers pass it to scope a variable to one command, e.g.
+    `rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -15286,12 +15294,13 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             "artifact with structurally incompatible APIs (DESIGN §5 "
             "*Cross-domain surface overlap*). Auto-merging would produce "
             "a frankenstein implementer spec the judge correctly "
-            "refused. To unblock:\n"
-            "  • Refine the task description to disambiguate the "
-            "disputed surface (name which API survives, or split it into "
-            "two distinct artifacts), and re-run.\n"
-            "  • Or manually delete one of the colliding subtask specs "
-            "in <state-root>/runs/<run-id>/subtasks/ and `--resume`."
+            "refused. To unblock, refine the task description and re-run "
+            "(this run cannot be resumed — see below):\n"
+            "  • Disambiguate the disputed surface: name which API "
+            "survives, or split it into two distinct artifacts.\n"
+            "  • Or narrow the task so a single planner owns the "
+            "surface. Each category the classifier selects spawns its "
+            "own planner, and only multi-planner runs can collide here."
         )
 
     # Apply merges and drops in input order via the pure helper.
@@ -16541,7 +16550,28 @@ async def _run_checked_loop(
     for rnd in range(max_rounds):
         try:
             last_res = await invoke()
+        except WorkerError as exc:
+            # Infrastructure failure (PID exhaustion, OOM, a killed session),
+            # not a judgment about the work — so spend a round on a fresh
+            # `claude -p` session rather than abandoning the loop. This is the
+            # case the docstring above calls out: "the re-invocation alone, as
+            # a fresh claude -p session, is the value". A PID-exhausted worker
+            # in particular dies with a saturated cgroup that the next
+            # invocation does not inherit.
+            #
+            # Bounded by `max_rounds` (judgment_check_rounds = 3), and each
+            # attempt is already billed via the caller's `st.bump_workers`.
+            # Falling through to `continue` (rather than `break`) is what
+            # makes `_read_stream`'s own PID-cap message honest — it promises
+            # "a fresh worker retries with a clean PID table", which was true
+            # for implementers and false here.
+            warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
+            last_res = None
+            continue
         except Exception as exc:
+            # Anything else is a bug in leerie itself, not a flaky worker:
+            # retrying re-runs the same defect and burns the budget. Keep the
+            # original abandon-the-loop behavior.
             warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
             break
 
@@ -17790,6 +17820,79 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         return res
 
 
+async def rescue_integrator_work(staging: Path, sid: str,
+                                 run_id: str) -> str | None:
+    """Capture a crashed integrator's in-progress resolution before the merge
+    is aborted. Returns the rescue ref name, or None if there was nothing to
+    save (or the capture failed).
+
+    `git merge --abort` discards the working tree unconditionally — verified:
+    a resolved-but-uncommitted file reverts to its pre-merge content, leaving
+    no stash and no reachable object. That work is the most expensive artifact
+    in the run to recreate (it encodes the integrator's reading of every
+    side's intent), so it is captured to a ref before the abort.
+
+    Deliberately NOT gated on `check_merge_committed`: a crashed integrator
+    typically dies mid-resolution with no merge commit at all, which is
+    precisely the case worth rescuing (DESIGN §12).
+
+    Mechanism: a throwaway index (`GIT_INDEX_FILE`) seeded from HEAD, then
+    `git add -A` + `write-tree` + `commit-tree`. Both `git stash push` AND
+    `git stash create` refuse a conflicted tree ("Cannot save the current
+    index state") because the real index still holds unmerged entries — the
+    exact state an integrator crash leaves behind. Staging into a *separate*
+    index sidesteps that: the resolved working-tree content is captured, the
+    real index and working tree are never touched, and untracked files the
+    integrator created come along.
+
+    Best-effort by contract: a rescue failure must never mask the underlying
+    crash, so every git failure degrades to None."""
+    rescue_index = staging / ".git" / f"leerie-rescue-index-{sid}"
+    env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
+    try:
+        seed = await run_proc(["git", "read-tree", "HEAD"],
+                              cwd=str(staging), env=env)
+        if seed.returncode != 0:
+            return None
+        staged = await run_proc(["git", "add", "-A"],
+                                cwd=str(staging), env=env)
+        if staged.returncode != 0:
+            return None
+        tree = await run_proc(["git", "write-tree"], cwd=str(staging), env=env)
+        if tree.returncode != 0 or not tree.stdout.strip():
+            return None
+        tree_sha = tree.stdout.strip()
+        # Nothing to rescue if the captured tree is identical to HEAD's: the
+        # integrator crashed before changing anything. Returning a ref here
+        # would be a lie the caller repeats to the operator ("resolution
+        # rescued to ...") while pointing at an empty diff.
+        head_tree = await run_proc(["git", "rev-parse", "HEAD^{tree}"],
+                                   cwd=str(staging))
+        if (head_tree.returncode == 0
+                and head_tree.stdout.strip() == tree_sha):
+            return None
+        commit = await run_proc(
+            ["git", "commit-tree", tree_sha, "-p", "HEAD",
+             "-m", f"leerie: rescued {sid} integrator resolution"],
+            cwd=str(staging), env=env)
+        if commit.returncode != 0 or not commit.stdout.strip():
+            return None
+        ref = f"refs/leerie/rescue/{run_id}/{sid}"
+        # update-ref deliberately runs WITHOUT the throwaway index env: refs
+        # live in the repo, not the index, and the temp file is about to go.
+        stored = await run_proc(
+            ["git", "update-ref", ref, commit.stdout.strip(),
+             "-m", f"leerie: rescued {sid} integrator resolution"],
+            cwd=str(staging))
+        if stored.returncode != 0:
+            return None
+        return ref
+    except Exception:
+        return None
+    finally:
+        rescue_index.unlink(missing_ok=True)
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -17864,8 +17967,34 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             make_feedback_prompt=_on_integrator_fb,
         )
         if ires is None:
+            # The integrator crashed every round (infrastructure: PID
+            # exhaustion, OOM, a killed session) — NOT a verdict about the
+            # work. Its in-progress resolution is the most expensive artifact
+            # in the run to recreate, and `git merge --abort` destroys it
+            # unconditionally, so capture it first (DESIGN §12 *salvage if
+            # there is something to salvage*). Not gated on a merge commit:
+            # a crashed integrator typically dies mid-resolution having
+            # committed nothing, which is exactly the case worth rescuing.
+            for w in int_warnings:
+                log(f"  integrator-{sid}: {w}")
+            rescue_ref = await rescue_integrator_work(staging, sid, st.run_id)
             await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-            die(f"integrator for {sid} crashed; merge aborted")
+            # Record the block before dying (local convention — see the
+            # neighboring die() site above, which this path used to skip).
+            st.data.setdefault("blocked", {})[sid] = (
+                f"integrator crashed; resolution rescued to {rescue_ref}"
+                if rescue_ref else "integrator crashed before resolving anything")
+            st.save()
+            hint = (f"\nIts in-progress resolution was rescued to {rescue_ref} — "
+                    f"inspect with:\n"
+                    f"  git -C {staging} show {rescue_ref}\n"
+                    f"and apply with:\n"
+                    f"  git -C {staging} cherry-pick --no-commit {rescue_ref}"
+                    if rescue_ref else
+                    "\nIt crashed before resolving anything; there was nothing "
+                    "to rescue.")
+            die(f"integrator for {sid} crashed; merge aborted.{hint}\n"
+                f"Re-run with --resume to retry the integration.")
         for w in int_warnings:
             log(f"  integrator-{sid}: {w}")
         if ires.get("status") == "resolved":

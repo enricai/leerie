@@ -140,6 +140,8 @@ def test_loop_exhausts_rounds(leerie):
 
 
 def test_loop_crash_breaks(leerie):
+    """A non-WorkerError crash is a bug in leerie itself, not a flaky worker:
+    retrying re-runs the same defect, so the loop still abandons immediately."""
     async def invoke():
         raise RuntimeError("boom")
 
@@ -148,6 +150,73 @@ def test_loop_crash_breaks(leerie):
     assert result is None
     assert len(warnings) == 1
     assert "crashed" in warnings[0]
+
+
+# --- WorkerError crash retry (DESIGN §12 *salvage if there is something to
+# salvage*) -------------------------------------------------------------------
+# A PID-exhausted / OOM-killed worker is an infrastructure failure, not a
+# verdict about the work. `_read_stream`'s own PID-cap message promises "a
+# fresh worker retries with a clean PID table" — true for implementers, and
+# false for every `_run_checked_loop` caller until this retry existed. Run
+# 879defae's wave-2 integrator died exactly here.
+
+def test_loop_worker_error_retries_then_succeeds(leerie):
+    """A WorkerError consumes a round and re-invokes; a later clean round wins."""
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        if len(calls) == 1:
+            raise leerie.WorkerError("worker x exhausted its PID cgroup")
+        return {"ok": True}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="test", max_rounds=3))
+    assert result == {"ok": True}, (
+        "a WorkerError must not abandon the loop — the next round is a fresh "
+        "claude -p session with a clean PID table")
+    assert len(calls) == 2, f"expected a retry after the crash; got {calls}"
+    assert any("crashed" in w for w in warnings), (
+        "the crash must still be surfaced as a warning, not swallowed")
+
+
+def test_loop_worker_error_every_round_returns_none(leerie):
+    """When every round crashes, the loop still returns None (callers'
+    `is None` escalation path is unchanged) and bounds itself by max_rounds."""
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        raise leerie.WorkerError("worker x exhausted its PID cgroup")
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="test", max_rounds=3))
+    assert result is None
+    assert len(calls) == 3, (
+        f"must retry exactly max_rounds times, no more: {len(calls)}")
+    assert len(warnings) == 3
+
+
+def test_loop_worker_error_does_not_leak_stale_result(leerie):
+    """A crash after a successful-but-dirty round must not return that stale
+    result as if it were the crashed round's output."""
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        if len(calls) == 1:
+            return {"stale": True}          # dirty: check() flags it
+        raise leerie.WorkerError("boom")    # then crash for every later round
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke,
+        check=lambda r: ["ISSUE: dirty"],
+        name="test",
+        max_rounds=3,
+    ))
+    assert result is None, (
+        "the crashed round must clear last_res; returning {'stale': True} "
+        "would let a caller act on output no round actually produced")
 
 
 def test_loop_none_result_breaks(leerie):

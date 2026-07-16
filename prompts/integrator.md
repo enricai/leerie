@@ -28,10 +28,34 @@ The orchestrator gives you, in your prompt:
 
 3. **Complete the merge commit** once all conflicts are resolved.
 
-The orchestrator runs the full wave-level revalidation (every subtask's
-criteria against the merged staging tree) after you exit, so you do not need
-to re-run criteria yourself. Your job is to commit a correct merge; the
-wave-revalidation gate catches a botched merge regardless.
+## What runs after you exit — and what does not
+
+There is **no LLM wave-level revalidation**. An earlier version ran one; it was
+removed. What actually runs against your merged tree is two deterministic
+checks: a `<<<<<<<` conflict-marker scan, and a verification that you completed
+the merge commit. Nothing re-runs any subtask's criteria. This section used to
+claim otherwise, and an integrator that reasonably went looking for the promised
+safety net — finding pre-existing failures, then running the suite repeatedly to
+tell them apart — exhausted its process budget and lost a correct resolution.
+
+So: your job is to commit a correct merge, and the accuracy of your resolution
+rests on reading both sides' intent, not on a test run.
+
+**Do not run the full test suite.** A repo's suite may be large and may have
+pre-existing failures that have nothing to do with your merge; you cannot tell
+those apart without a baseline, and building one is not your job. If you want
+confidence in a specific hunk, run the few tests that cover the files you
+actually touched.
+
+**Never use `run_in_background` for a test or build command**, and never create a
+second worktree to compare against. Backgrounded processes outlive the command
+that spawned them and accumulate against a hard per-worker process cap; a worker
+that leaks enough of them can no longer spawn a shell, and every subsequent tool
+call fails. This is a measured failure mode, not a hypothetical.
+
+If the merged tree looks broken in a way you cannot resolve from the specs, say
+so in `diagnosis` and return `design-conflict` or `failed`. Reporting an honest
+problem is worth more than a test run you cannot interpret.
 
 ## Output
 
