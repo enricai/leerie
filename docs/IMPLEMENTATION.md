@@ -1742,12 +1742,12 @@ Not yet wired for EC2 (documented gaps, not required for an end-to-end
 run): bare `--resume` PID-record auto-discovery (an explicit `--run-id`
 is required to resume), mid-run re-seed (`--re-seed`/auto-re-seed on
 `--resume`), `--inspect-dir` seeding, chain-wave tagging, and
-auto-finalize token plumbing on the tail/attach path. `--kill`/
-`--finalize --runtime ec2` are also not yet wired — those two verbs
-remain Fly-only today; `--stop --runtime ec2` *is* wired (see "Explicit
-pause and destroy verbs" above). DESIGN §6 *EC2 runtime lifecycle* is the canonical
-architecture. Default is `local` so existing behavior is unchanged for
-users who have not opted in.
+auto-finalize token plumbing on the tail/attach path. `--finalize
+--runtime ec2` is also not yet wired — that verb remains Fly-only
+today; `--stop --runtime ec2` and `--kill --runtime ec2` *are* both
+wired (see "Explicit pause and destroy verbs" above). DESIGN §6 *EC2
+runtime lifecycle* is the canonical architecture. Default is `local`
+so existing behavior is unchanged for users who have not opted in.
 
 Resolution order (highest priority first):
 
