@@ -1306,6 +1306,23 @@ per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
 on every `start-instances` call, and an optional `status_ok` flag so
 `describe-instance-status` can report "initializing" instead of "ok"
 without an infinite/slow poll in tests.
+The launcher's `--stop` verb EC2 dispatch — the counterpart to
+`_auto_detect_fly_runtime` for EC2 runs, DESIGN §6 "Run identifier" —
+is tested in `tests/test_ec2_launcher_stop.py` by invoking the real
+`leerie` binary (not an extracted block, since `--stop` is an early
+fast-path verb dispatched before container preflight) against the
+same resource-tracking `aws` stub: an `ec2-instance.json` sidecar
+auto-detects the EC2 runtime and `--stop <run-id>` drives the
+stub-tracked instance to `stopped` (never `terminate-instances`) and
+writes `paused_at`/`pause_reason`/`ec2_instance_id` onto `run.json`;
+explicit `--runtime ec2` works without autodetection; the local/Fly
+fallthrough error text is unchanged when no sidecar of any kind is
+present; `--runtime bogus` is still rejected, now with the
+`'local', 'fly', or 'ec2'` wording; a sidecar present but missing
+`ec2_instance_id` fails closed with an actionable error rather than
+silently no-op'ing; and a failing AWS credential probe aborts before
+any `aws ec2 ...` call reaches the stub, leaving the instance
+`running`.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
