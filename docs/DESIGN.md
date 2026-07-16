@@ -1825,27 +1825,34 @@ once the cap is reached, every subsequent `fork()`/`clone()` in the
 subtree returns `EAGAIN`, so **every shell the worker's Bash tool tries
 to launch fails** — while in-process tools (`Read`/`Grep`/`Glob`) keep
 working. Observed live: a worker leaked `run_in_background` subprocesses
-(reparented to init, so `_DescendantTracker` reaps them only at worker
-*exit*), saturated `pids.max`, and then spent the rest of the run in a
-spiral where even `echo`/`true`/`pwd` returned a bare "Exit code 1". The
-worker cannot diagnose this — the CLI surfaces only a generic tool error,
-and the kernel's `EAGAIN` string usually does not survive into the
+(reparented to init, so they escape the descendant walk and are reaped
+either by the mid-run pressure-gated reaper below or, failing that, at
+worker *exit*), saturated `pids.max`, and then spent the rest of the run
+in a spiral where even `echo`/`true`/`pwd` returned a bare "Exit code 1".
+The worker cannot diagnose this — the CLI surfaces only a generic tool
+error, and the kernel's `EAGAIN` string usually does not survive into the
 tool-result text for trivial commands — so it mis-attributes the failure
 and burns its whole turn budget without recovering.
 
 Detection is a backstop, not a substitute for a cap sized to the
-workload. A *legitimate* heavy run can saturate a too-low cap in a burst
-that no reaper can catch in time: the conformer phase runs the full,
-un-scoped `TEST_CMD`, and for a repo whose suite fans out across many
-subprocesses (leerie's own ~193-module suite is the canonical example)
-that burst hits the cap in seconds — faster than the mid-run reaper's
-60-second min-age gate allows any PID to become eligible. There is no
-reliable way to *detect and refuse* "a full test suite run" (the command
-space — `pytest`, `make test`, `tox`, wrapper scripts — is open-ended,
-and a misfiring guard is worse than none), so the cap value itself is the
-enforcement surface: the default is set generous enough (1024) to admit a
-real conformance run, and it is overridable per-repo for suites heavier
-still. A runaway fork-bomb (thousands of PIDs) still trips the cap.
+workload. There is no reliable way to *detect and refuse* "a full test
+suite run" (the command space — `pytest`, `make test`, `tox`, wrapper
+scripts — is open-ended, and a misfiring guard is worse than none), so
+the cap value itself is the enforcement surface for *legitimate* load:
+the default is set generous enough (1024) to admit a real conformance
+run, and it is overridable per-repo for suites heavier still. A runaway
+fork-bomb (thousands of PIDs) still trips the cap.
+
+How generous 1024 is, is a measured question rather than a guessed one.
+Leerie's own suite — the canonical heavy example, 3762 tests across 251
+modules, 117 of them fanning out into stubbed-binary subprocesses — peaks
+at **33** concurrent PIDs (median 7, P99 29, sampled at 20 Hz against the
+kernel's own `pids.current` in the release image). So the cap sits ~30×
+above the workload it was sized for, and a worker approaching it is
+almost never doing legitimate work: it is leaking. That measurement is
+what lets the mid-run reaper act on pressure at all — see *Mid-run PID
+reaping* below, whose critical tier closes the burst case this paragraph
+used to call uncatchable.
 
 Per §12 (*prompts are advisory, code enforces*), the orchestrator detects
 this mechanically rather than leaving it to the model. The broker gains a
@@ -1958,21 +1965,35 @@ protects young orphans unconditionally, and that is precisely wrong at the
 top of the range. A burst of leaked `run_in_background` trees saturates the
 cap in **seconds** — faster than the 60 s floor lets any of them become
 eligible — so the reaper arms at 90%, finds an empty candidate list, and
-watches the worker die. This is not hypothetical: it is the measured cause
-of the wave-2 integrator death in run `879defae`. Reproduced against the
-real `_reparented_orphans` with 20 abandoned `setsid` trees in a
-`--pids-limit 1024` container: all 20 reparent to init and all 20 are
-tracked in `_seen`, yet the candidate list is **empty** at age < 60 s and
-holds all 20 at 65 s. Detection was never the gap; *eligibility* was.
+watches the worker die. Reaping nothing is not safety; it is a disabled
+reducer. This is not hypothetical: it is the measured cause of the wave-2
+integrator death in run `879defae` (`pids.current=1024/1024`, fork denials
+213), which discarded a correct merge resolution and killed a 13.5-hour run.
 
-The resolution is a second tier rather than a lower floor. Measurement
-supplies the discriminator: leerie's own full suite — 3762 tests, 251 files,
-117 of them spawning subprocesses — peaks at **33** concurrent PIDs (median
-7, P99 29, sampled at 20 Hz against the kernel's own `pids.current`). A
-worker sitting at 90% of a 1024 cap therefore holds ~920 PIDs to do work
-that costs 33. There is no legitimate reading of that state: it is a leak,
-and the young orphans in it are leaked too. So at
-`_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
+Reproduced against the real `_reparented_orphans` in a `--pids-limit 1024`
+release-image container: 20 leaked trees, each spawned by a wrapper that
+lives ~1 s and then exits (`bash -c 'sleep 300 & sleep 1'`) so the orphans
+reparent to init exactly as the real `run_in_background` path leaves them.
+All 20 are tracked in `_seen`, and at t=8 s the 60 s floor yields **0**
+candidates while a 5 s floor yields all of them. Detection was never the
+gap; *eligibility* was.
+
+The wrapper's lifetime is load-bearing in that reproduction, not incidental.
+`_DescendantTracker` can only record a PID while the PPID chain is still
+intact — a wrapper that detaches instantly (`setsid …`, tried first) is gone
+before the 0.5 s poll, so its children never enter `_seen` and no age floor
+is reachable. That models a leak the tracker cannot see, which is a
+different bug; the production `run_in_background` wrapper does survive long
+enough to be caught, which is why run `879defae` reaped 5856 orphans across
+20 workers at exit. `_seen` demonstrably populates in production, so the
+floor — not the tracking — is what stood between the reaper and the leak.
+
+The resolution is a second tier rather than a lower floor. The cap's own
+sizing measurement (see *Detecting PID exhaustion* above: the suite peaks at
+33 concurrent PIDs) supplies the discriminator. A worker sitting at 90% of a
+1024 cap holds ~920 PIDs to do work that costs 33; there is no legitimate
+reading of that state. It is a leak, and the young orphans in it are leaked
+too. So at `_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
 `_PID_REAP_CRITICAL_AGE_SEC` (5 s); below that ratio the 60 s floor stands
 unchanged. The normal tier keeps its protection; the critical tier trades it
 for the worker's life.

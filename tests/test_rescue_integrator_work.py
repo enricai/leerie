@@ -150,13 +150,57 @@ def test_rescue_returns_none_when_nothing_to_save(leerie, tmp_path):
     assert ref is None
 
 
-def test_rescue_is_non_fatal_on_a_broken_repo(leerie, tmp_path):
-    """A rescue failure must never mask the underlying crash: it degrades to
-    None rather than raising."""
+def test_rescue_returns_none_outside_a_git_repo(leerie, tmp_path):
+    """A non-repo degrades to None via the returncode branch (git exits 128
+    rather than raising), not via the exception handler."""
     not_a_repo = tmp_path / "nope"
     not_a_repo.mkdir()
     ref = _run(leerie.rescue_integrator_work(not_a_repo, "feat-006", "run1"))
     assert ref is None
+
+
+def test_rescue_swallows_an_exception(leerie, conflicted_repo, monkeypatch):
+    """The bare `except` is a deliberate crash-path guarantee: this function
+    runs *because* a worker already died, so a rescue failure must degrade to
+    None rather than raise a second error over the first.
+
+    Pinned separately from the non-repo case above, which never reaches the
+    handler: `git read-tree` on a non-repo returns rc 128 instead of raising,
+    so that test exits via the returncode branch. The realistic raising
+    failure is `git` missing from PATH, which surfaces as FileNotFoundError
+    out of asyncio's create_subprocess_exec."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+
+    async def boom(*a, **kw):
+        raise FileNotFoundError("git: command not found")
+
+    monkeypatch.setattr(leerie, "run_proc", boom)
+    ref = _run(leerie.rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None, "a raising git must degrade to None, not propagate"
+
+
+def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
+                                                         conflicted_repo,
+                                                         monkeypatch):
+    """The `finally` must hold on the exception path too — otherwise a crashed
+    rescue leaves a stale index in .git/ for the next attempt to trip over."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    calls = []
+
+    async def boom_after_seed(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 1:          # let read-tree create the index file
+            return await real(cmd, **kw)
+        raise FileNotFoundError("git vanished mid-rescue")
+
+    monkeypatch.setattr(leerie, "run_proc", boom_after_seed)
+    ref = _run(leerie.rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+    leftovers = list((conflicted_repo / ".git").glob("leerie-rescue-index-*"))
+    assert leftovers == [], f"temp index survived an exception: {leftovers}"
 
 
 def test_rescue_ref_is_namespaced_by_run_and_subtask(leerie, conflicted_repo):

@@ -17983,16 +17983,18 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # neighboring die() site above, which this path used to skip).
             st.data.setdefault("blocked", {})[sid] = (
                 f"integrator crashed; resolution rescued to {rescue_ref}"
-                if rescue_ref else "integrator crashed before resolving anything")
+                if rescue_ref
+                else "integrator crashed before resolving anything")
             st.save()
-            hint = (f"\nIts in-progress resolution was rescued to {rescue_ref} — "
-                    f"inspect with:\n"
-                    f"  git -C {staging} show {rescue_ref}\n"
-                    f"and apply with:\n"
-                    f"  git -C {staging} cherry-pick --no-commit {rescue_ref}"
-                    if rescue_ref else
-                    "\nIt crashed before resolving anything; there was nothing "
-                    "to rescue.")
+            hint = (
+                f"\nIts in-progress resolution was rescued to "
+                f"{rescue_ref} — inspect with:\n"
+                f"  git -C {staging} show {rescue_ref}\n"
+                f"and apply with:\n"
+                f"  git -C {staging} cherry-pick --no-commit {rescue_ref}"
+                if rescue_ref else
+                "\nIt crashed before resolving anything; there was "
+                "nothing to rescue.")
             die(f"integrator for {sid} crashed; merge aborted.{hint}\n"
                 f"Re-run with --resume to retry the integration.")
         for w in int_warnings:

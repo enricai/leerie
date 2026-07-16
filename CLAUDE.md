@@ -566,10 +566,30 @@ fabricate an "OOM-killed" message. Mid-run PID reaping (DESIGN §6 *Mid-run PID 
 tested in `tests/test_signal_cleanup.py`: `_reparented_orphans` selects only
 alive+ppid==1+old PIDs sorted oldest-first (stubbed ps); `_poll_loop` reaps
 only at ≥90% pressure and stops below 75% (hysteresis); below 90% is a
-byte-identical no-op; young (<60s) and attached (ppid!=1) PIDs are never
-reaped; and a structural guard pins `cgroup_sid: str | None = None` on
+byte-identical no-op; attached (ppid!=1) PIDs are never reaped; and a
+structural guard pins `cgroup_sid: str | None = None` on
 `_DescendantTracker.__init__` so the 3 pre-existing direct-constructor call
-sites remain compatible after the parameter was added. Zombie reaping (DESIGN
+sites remain compatible after the parameter was added. The age floor is
+**two-tier** (DESIGN §6 *the critical tier*), so "young PIDs are never
+reaped" holds only in the normal tier: below `_PID_REAP_CRITICAL_WATER` a
+young orphan is protected by the 60 s floor
+(`test_poll_loop_young_orphan_not_reaped`, which monkeypatches the critical
+water *up* so that tier is reachable at all — the shipped constants are
+equal at 0.90), and at or above it the floor drops to
+`_PID_REAP_CRITICAL_AGE_SEC` (5 s) and the same orphan **is** reaped
+(`test_poll_loop_young_orphan_reaped_at_critical_pressure`). The critical
+tier is the fix for the measured burst case: a leak saturates `pids.max`
+faster than the 60 s floor lets anything become eligible, so the reaper
+armed, found an empty candidate list, and watched the worker die (run
+879defae, wave 2). Reverting the tier fails that test with `assert 900 in
+[]` — the empty list *is* the production bug. Note four of these tests were
+previously **vacuous**: they stubbed `_cgroup_stat` with a 3-tuple while
+`_poll_loop` unpacks 4, so the `ValueError` skipped the entire reaping
+branch and they passed against code that never ran — including
+`test_poll_loop_reaps_above_high_water`, which additionally asserted only
+after `stop_and_reap()` (that path SIGKILLs `_seen` wholesale, so it passed
+without any mid-run reap firing). Both traps are fixed and pinned; snapshot
+`killed` *before* `stop_and_reap` in any new test here. Zombie reaping (DESIGN
 §6 *Zombie reaping* — the container PID 1 is `runuser`/idle `sleep`, not a
 reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
 against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`
@@ -1131,6 +1151,39 @@ provision, reconciler, plan_overlap_judge) log their `_run_checked_loop`
 warnings — which carry the underlying exception text — **before** `die()`,
 since `die()` calls `sys.exit()` and any loop after it is unreachable
 (falsified live: reverting one site fails the guard).
+`_run_checked_loop`'s crash policy is pinned in `tests/test_checked_loop.py`:
+a `WorkerError` (infrastructure — PID exhaustion, OOM, a killed session) is
+**retried** against the same `judgment_check_rounds` budget, because the
+re-invocation is a fresh `claude -p` session with a clean PID table — which
+is what `_read_stream`'s own PID-cap message already promised ("a fresh
+worker retries") and what was true for implementers but false for every
+`_run_checked_loop` caller until the retry existed. Any *other* exception is
+a leerie bug rather than a flaky worker, so it still abandons the loop
+immediately (`test_loop_crash_breaks`, which uses `RuntimeError` precisely to
+pin that split). Also pinned: all-rounds-crash still returns `None` so the
+callers' `is None` escalation is unchanged, the retry is bounded at exactly
+`max_rounds`, and a crash must clear `last_res` so a stale earlier result is
+never returned as the crashed round's output.
+The integrator-crash salvage path (DESIGN §12 *salvage if there is something
+to salvage*) is tested in `tests/test_rescue_integrator_work.py` against real
+temp git repos left mid-merge. `rescue_integrator_work` captures a crashed
+integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>`
+before `git merge --abort` destroys it (verified: abort reverts a resolved
+file to its pre-merge content, leaving no stash and no reachable object). The
+load-bearing pin is `test_rescue_does_not_require_a_merge_commit`: the rescue
+must **not** be gated on `check_merge_committed`, because a crashed
+integrator typically dies mid-resolution having committed nothing —
+`integrator-feat-006` never ran `git commit` while `integrator-feat-005` did
+— so a commit-gated rescue declines exactly the case worth saving.
+Introducing that gate fails 4 tests. The mechanism is a throwaway
+`GIT_INDEX_FILE` seeded from HEAD, because both `git stash push` **and** `git
+stash create` refuse a conflicted tree ("Cannot save the current index
+state") — an unmerged index is precisely what an integrator crash leaves
+behind. Also pinned: untracked files are captured, the real index/worktree
+and `MERGE_HEAD` are untouched, the temp index is cleaned up, refs are
+namespaced per run+subtask so two crashes cannot clobber each other, and a
+tree identical to `HEAD^{tree}` returns `None` rather than a ref naming an
+empty diff.
 `tests/test_resolve_run_id_autopick.py` covers bare `--resume` auto-picking
 the newest resumable run (`in-progress`/`paused`/`incomplete`), including
 the two traps found by running the design against a real 58-run state dir:
