@@ -2712,11 +2712,11 @@ seed → detached-orchestrate → teardown) carry over one-for-one:
 
 | Stage | Fly (shipped) | EC2 (this design) |
 |---|---|---|
-| Create | `flyctl machine run` | `ec2:RunInstances` via `boto3` (AMI, instance type, key pair, security group, subnet — the `LEERIE_EC2_*` vars already reserved in IMPLEMENTATION.md's env-forwarding deny-list) |
-| Wait-ready | poll `flyctl machine status` for `started`; hallpass warm-up probe | poll `describe_instances` for `state.Name == "running"`, then `instance-status-ok` + `system-status-ok` (`describe_instance_status`) — a `running` EC2 instance is not yet SSH/SSM-reachable, unlike a Fly Machine where `started` and hallpass-warm are close together |
+| Create | `flyctl machine run` | `aws ec2 run-instances` (the `aws` CLI, not `boto3` — see "boto3 usage boundary" in IMPLEMENTATION.md: the host has no pip surface, so every host-side EC2 call shells out the same way `flyctl` does for Fly) (AMI, instance type, key pair, security group, subnet — the `LEERIE_EC2_*` vars already reserved in IMPLEMENTATION.md's env-forwarding deny-list) |
+| Wait-ready | poll `flyctl machine status` for `started`; hallpass warm-up probe | poll `describe-instances` for `State.Name == "running"`, then `instance-status-ok` + `system-status-ok` (`describe-instance-status`) — a `running` EC2 instance is not yet SSH/SSM-reachable, unlike a Fly Machine where `started` and hallpass-warm are close together |
 | Seed | `seed_auth` + `seed_repo_clone` over `flyctl ssh console` | same two steps, transport substituted (see below) |
 | Orchestrate | detached `Popen` via ssh-console wrapper, PID recorded, host tails via a second ssh-console session | same detached-`Popen` pattern, launched over the substituted transport; run-id-before-orchestrator-start constraint (line 2208) is unchanged — the launcher still generates the run-id host-side before create, since it needs the id to name `orchestrator.log`'s path ahead of the create call completing |
-| Teardown | classify exit code → stop / destroy / detach (the reclassified table above) | same table, `flyctl machine stop`/`destroy` → `ec2:StopInstances`/`TerminateInstances` |
+| Teardown | classify exit code → stop / destroy / detach (the reclassified table above) | same table, `flyctl machine stop`/`destroy` → `aws ec2 stop-instances`/`terminate-instances` |
 
 The pause-on-failure classification table (exit code → disposition) is
 runtime-agnostic by construction (§ above: "the orchestrator ... always
@@ -2724,6 +2724,97 @@ exits with the same exit codes regardless of where it runs, and the
 launcher routes those exit codes through the runtime-appropriate
 teardown") — EC2 needs no new table, only a new teardown implementation
 of the same three dispositions (stop / destroy / leave-alone).
+
+**Image delivery — how the leerie image reaches the instance.** The Fly
+path has a shipped, working answer: `ensure_image()` pushes a
+self-contained image (orchestrator source baked at `/opt/leerie-image/`
+via the Dockerfile's `COPY`) to `registry.fly.io/$APP:$VERSION[-$HASH]`,
+and `flyctl machine run <tag>` pulls it. EC2's `RunInstances` has no
+registry-pull equivalent for an *instance* the way `machine run` does for
+a *container* — an EC2 instance boots from an AMI (a full disk-image
+snapshot), not a per-run pulled artifact — so "what image runs" cannot be
+answered by copying the Fly mechanism verbatim. Three strategies exist,
+mirroring the shape of the EBS-volume decision above: name each, state
+its cost, and pick one plainly.
+
+1. **Bake into the AMI.** The operator builds (once, ahead of time, out
+   of the run's critical path) a custom AMI that already has the
+   orchestrator source, Python 3.10+, and every OS-level dependency
+   `.leerie-setup.sh` would otherwise need root for. `RunInstances`
+   boots straight into a ready-to-seed instance; `LEERIE_EC2_AMI` names
+   it. No push, no pull, no build step inside the per-run critical path —
+   the instance is ready to accept `ec2_seed_repo`/`ec2_remote_exec`
+   calls the moment `wait_for_instance_ready()` returns. Cost is paid
+   once, by whoever maintains the AMI (a Packer/EC2 Image Builder
+   pipeline, out of scope for leerie itself), not per run. **This is the
+   default this design adopts.**
+2. **Push to a registry (ECR), pull at boot.** The direct analog of Fly's
+   mechanism: build a leerie image, push it to a private ECR repository,
+   and have the instance's user-data script pull and run it via a
+   container runtime (Docker/containerd) installed on a generic AMI.
+   Rejected as the default: it reintroduces the exact registry-auth
+   surface Fly already pays for (`flyctl auth docker`, token refresh) but
+   for a second, AWS-specific mechanism (`aws ecr get-login-password`),
+   requires a container runtime to exist *inside* the EC2 instance —
+   layering a container-in-a-VM model where a VM alone would do — and
+   adds a per-provision pull latency this design has no evidence is
+   necessary. It would earn reconsideration if leerie ever needs the same
+   image artifact shared verbatim across EC2 and a containerized runtime,
+   but no such requirement exists today.
+3. **User-data pull-and-build.** The instance's EC2 user-data script
+   clones the leerie repo (or downloads a release tarball) and installs
+   dependencies fresh on every boot, off a generic stock AMI (no custom
+   image maintenance at all). Rejected as the default: it pays a
+   multi-minute build/install cost on *every* `RunInstances` call (worse
+   than Fly's already-solved once-per-version cost), requires outbound
+   internet egress from the instance at boot for package installs (a
+   security-group / NAT surface the SSM-only transport decision below
+   otherwise avoids needing), and turns transient package-registry
+   flakiness into a per-run provisioning failure mode. It remains a
+   reasonable *bootstrap* path for an operator who has not yet built a
+   custom AMI — `LEERIE_EC2_AMI` could point at a stock AMI plus a
+   documented user-data script as a manual fallback — but is not the
+   default this design ships.
+
+**IAM actions the chosen strategy requires.** Baking into the AMI moves
+the build-time IAM surface (EC2 Image Builder or Packer's own
+`ec2:CreateImage`/`RegisterImage`/`ec2:RunInstances` for the build
+instance) outside leerie's own run-time credential path entirely — the
+AMI-build pipeline is a separate, operator-owned process with its own
+IAM role, not something leerie's per-run credentials touch. The run-time
+IAM policy leerie's own AWS identity needs is exactly the stage-mapping
+table above and nothing more:
+
+- `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`
+  (create, wait-ready)
+- `ec2:StopInstances`, `ec2:StartInstances`, `ec2:TerminateInstances`
+  (teardown, pause/resume)
+- `ec2:CreateTags` (tagging the instance with the run id for
+  `discover_runs`-style orphan recovery, mirroring how Fly machine
+  metadata carries the run id)
+- `ssm:StartSession`, `ssm:SendCommand`, `ssm:TerminateSession`,
+  `ssm:DescribeSessions`, plus the SSM Agent's own instance-side role
+  (`AmazonSSMManagedInstanceCore` attached to the instance profile
+  named by a future `LEERIE_EC2_INSTANCE_PROFILE`-shaped knob, not to
+  leerie's caller identity) for the transport-substitution stage below
+- No `ecr:*` actions and no `iam:PassRole` beyond the SSM instance
+  profile attachment implied above — bake-into-AMI needs neither a
+  registry pull permission nor a user-data role broad enough to install
+  arbitrary packages at boot, which is itself a security argument for
+  strategy 1 over strategies 2 and 3: the run-time IAM surface stays
+  minimal and auditable.
+
+**New `LEERIE_EC2_*` knobs implied.** None beyond what IMPLEMENTATION.md
+already reserves. `LEERIE_EC2_AMI` (already spec'd) is sufficient to name
+the chosen artifact under all three strategies — it names a custom AMI
+under strategy 1 (the default) or a stock AMI under strategy 3 (the
+documented fallback); strategy 2 is rejected and introduces no knob.
+This design does not add an `LEERIE_EC2_INSTANCE_PROFILE` var now — the
+instance profile is a provisioning-subtask-level `RunInstances` parameter
+alongside the five already-reserved shape vars, not an image-delivery
+decision — but flags it here so the provisioning subtask that wires
+`IamInstanceProfile` into `run-instances` does not have to rediscover
+that SSM's instance-side role must be supplied from *somewhere*.
 
 **EBS volume lifecycle — the opposite default from Fly, not the same
 discipline.** Fly's "Remote disk policy" above establishes a manual reap
