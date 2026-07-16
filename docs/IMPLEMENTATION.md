@@ -5542,9 +5542,11 @@ Two new launcher flags, routed at the top of `leerie` alongside
 `--resume` (line ~63):
 
 - **`leerie --stop <run-id>`** — clean pause. Runtime detection:
-  (1) `_auto_detect_fly_runtime` checks for `fly-machine.json` →
-  Fly path; (2) `_is_local_container` probes `nerdctl inspect
-  <run-id>` → local path; (3) neither → error.
+  (1) `_auto_detect_run_runtime` checks for `fly-machine.json` then
+  `ec2-instance.json` → Fly/EC2 path; (2) `_is_local_container` probes
+  `nerdctl inspect <run-id>` → local path; (3) neither → error. The EC2
+  path currently fails closed with a "does not support EC2 runs yet"
+  message (see "Runtime auto-detection on run-id-bearing verbs" above).
   - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
     and `FLY_APP`, calls `stop_machine()`.
   - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`
