@@ -3589,13 +3589,19 @@ together close the leak.
    sends `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
    soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
    are pruned from `_seen`; the exit-time `stop_and_reap` path is unchanged.
-   `_reparented_orphans(seen: set[int], min_age: int = _PID_REAP_MIN_AGE_SEC)
-   -> list[int]` runs one `ps -eo pid,ppid,etimes` snapshot and returns,
-   sorted oldest-first, the PIDs from `seen` that are simultaneously alive,
-   reparented to init (`ppid == 1`, or to the orchestrator itself once
-   `_become_subreaper` has run), and at least `min_age` seconds old. The
-   `min_age` parameter defaults to the normal-tier floor, so any existing
-   caller's behavior is unchanged.
+   `_reparented_orphans(seen: set[int], min_age: int | None = None)
+   -> list[int]` runs one `ps -eo pid,ppid,etimes` snapshot (with
+   `check=True`, so a failing `ps` raises into the `except` and returns `[]`
+   through the documented path rather than silently parsing unusable output)
+   and returns, sorted oldest-first, the PIDs from `seen` that are
+   simultaneously alive, reparented to init (`ppid == 1`, or to the
+   orchestrator itself once `_become_subreaper` has run), and at least
+   `min_age` seconds old. `min_age` is a **sentinel default**: `None`
+   resolves to `_PID_REAP_MIN_AGE_SEC` *at call time*, so a caller omitting
+   it gets the normal-tier floor and monkeypatching the constant moves the
+   floor. A literal `min_age: int = _PID_REAP_MIN_AGE_SEC` default would bind
+   once at def time, silently pinning 60 regardless of the constant — a trap
+   for any future test that patches it and calls this bare.
 
    **Two-tier age floor (DESIGN §6 *Why a single 60 s floor is not enough*).**
    `_poll_loop` selects the floor from the same pressure ratio it already

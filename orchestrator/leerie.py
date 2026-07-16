@@ -1862,7 +1862,7 @@ _PID_REAP_CRITICAL_AGE_SEC = 5
 
 
 def _reparented_orphans(seen: set[int],
-                        min_age: int = _PID_REAP_MIN_AGE_SEC) -> list[int]:
+                        min_age: int | None = None) -> list[int]:
     """Return PIDs from `seen` that are currently alive, reparented to
     init (ppid==1), and older than `min_age` seconds — sorted oldest-first
     (longest-running first, safest to kill first).
@@ -1874,15 +1874,28 @@ def _reparented_orphans(seen: set[int],
     where `etimes` is a bare elapsed-seconds integer (POSIX extension,
     verified present in the container image).
 
-    `min_age` defaults to the normal-tier floor. `_poll_loop` lowers it to
-    `_PID_REAP_CRITICAL_AGE_SEC` once pressure reaches
-    `_PID_REAP_CRITICAL_WATER`, because a burst of leaked orphans saturates
-    the cap faster than the 60 s floor lets any of them become eligible —
-    the reaper would otherwise arm and find nothing to kill (DESIGN §6
-    *Why a single 60 s floor is not enough — the critical tier*).
+    `min_age=None` resolves to the normal-tier floor. It is a sentinel
+    rather than a literal `min_age: int = _PID_REAP_MIN_AGE_SEC` default
+    because a default expression binds once at *def* time: patching the
+    constant would then leave the default pinned at its import-time value,
+    so a future test that monkeypatches the floor and calls this bare would
+    silently exercise 60 s and pass for the wrong reason. Reading the global
+    here keeps the two in sync.
+
+    `_poll_loop` lowers it to `_PID_REAP_CRITICAL_AGE_SEC` once pressure
+    reaches `_PID_REAP_CRITICAL_WATER`, because a burst of leaked orphans
+    saturates the cap faster than the 60 s floor lets any of them become
+    eligible — the reaper would otherwise arm and find nothing to kill
+    (DESIGN §6 *Why a single 60 s floor is not enough — the critical tier*).
 
     Returns an empty list on any `ps` failure — same empty-set fallback
-    as `_enumerate_descendants`."""
+    as `_enumerate_descendants`. `check=True` is load-bearing for *how*
+    that happens: without it a failing `ps` returns nonzero with unusable
+    stdout that parses to the same `[]`, indistinguishable from "no orphans
+    to reap"; with it the failure raises into the `except` below and takes
+    the documented path."""
+    if min_age is None:
+        min_age = _PID_REAP_MIN_AGE_SEC
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,ppid,etimes"],

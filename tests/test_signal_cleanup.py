@@ -1329,6 +1329,89 @@ def test_reparented_orphans_min_age_is_parameterized(leerie, monkeypatch):
         {901}, leerie._PID_REAP_CRITICAL_AGE_SEC) == [901]
 
 
+def test_reparented_orphans_default_floor_follows_the_constant(leerie,
+                                                               monkeypatch):
+    """`min_age` must be a *sentinel* default resolved at call time, not a
+    literal `= _PID_REAP_MIN_AGE_SEC` bound at def time.
+
+    Python evaluates a default expression once, when the `def` executes. With
+    a literal default, monkeypatching `_PID_REAP_MIN_AGE_SEC` leaves the
+    signature pinned at its import-time 60 — so a future test that patches
+    the floor and calls this bare would silently exercise 60 and pass for the
+    wrong reason. That is the same vacuous-pass class as the 3-tuple
+    `_cgroup_stat` stubs this file already had to fix, so pin it directly."""
+    fake_ps_out = (
+        "  PID  PPID ELAPSED\n"
+        "  910     1 100\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps_out
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    # Shipped floor is 60; a 100s orphan clears it.
+    assert leerie._reparented_orphans({910}) == [910]
+
+    # Raise the floor above the orphan's age. A def-time default ignores this.
+    monkeypatch.setattr(leerie, "_PID_REAP_MIN_AGE_SEC", 999)
+    assert leerie._reparented_orphans({910}) == [], (
+        "the bare-call default must follow _PID_REAP_MIN_AGE_SEC at call "
+        "time; it is still bound to the import-time value")
+
+
+def test_reparented_orphans_ps_call_uses_check_true(leerie, monkeypatch):
+    """The `ps` snapshot must pass `check=True`.
+
+    Both paths happen to return `[]`, so the *outcome* cannot distinguish
+    them — which is exactly why this needs a mechanism pin. Without
+    `check=True` a failing `ps` returns nonzero with unusable stdout that
+    parses to `[]`, silently indistinguishable from "no orphans to reap";
+    with it, the failure raises into the `except` and takes the documented
+    fallback. Verified by mutation: dropping `check=True` left all 43 tests
+    in this file passing, because every stub here takes `**kwargs` and
+    ignores it. `test_reparented_orphans_empty_on_ps_failure` raises
+    `SubprocessError` by hand — it proves the handler exists, never that the
+    real call can reach it."""
+    seen_kwargs = {}
+
+    def fake_run(cmd, **kwargs):
+        seen_kwargs.update(kwargs)
+
+        class R:
+            stdout = "  PID  PPID ELAPSED\n"
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    leerie._reparented_orphans({1})
+    assert seen_kwargs.get("check") is True, (
+        "_reparented_orphans' ps call must pass check=True so a failing ps "
+        "raises into the except clause instead of parsing garbage to an "
+        f"empty list; got check={seen_kwargs.get('check')!r}")
+
+
+def test_reparented_orphans_empty_on_real_ps_failure(leerie):
+    """Integration companion to the mechanism pin above: a genuinely failing
+    `ps` (real subprocess, no stub) must yield `[]` rather than raise.
+
+    `ps -eo <bogus>` exits nonzero on both macOS and Linux, so this exercises
+    the real `check=True` -> `CalledProcessError` -> `except SubprocessError`
+    path end to end."""
+    real = leerie.subprocess.run
+
+    def failing_ps(cmd, **kwargs):
+        return real(["ps", "-eo", "leerie_bogus_column_xyz"], **kwargs)
+
+    orig = leerie.subprocess.run
+    leerie.subprocess.run = failing_ps
+    try:
+        assert leerie._reparented_orphans({1, 2, 3}) == []
+    finally:
+        leerie.subprocess.run = orig
+
+
 def test_critical_tier_constants_are_sane(leerie):
     """The critical floor must be well below the normal floor, and the
     critical water must be at or above high-water (never reap younger
