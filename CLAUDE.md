@@ -1428,6 +1428,29 @@ No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
+`--resume` routing a paused EC2 run through `resume_instance()` — the
+launcher-level seam distinct from `resume_instance()`'s own standalone
+coverage in `tests/test_ec2_resume_instance.py` — is pinned in
+`tests/test_ec2_launcher_resume.py`, reusing
+`tests/test_ec2_e2e_provision.py`'s `extract_ec2_dispatch_block`/
+`run_ec2_dispatch`/`stub_aws_env` harness and `tests/ec2_stub.py`'s
+resource-tracking `aws` stub (mirroring
+`tests/test_ec2_launcher_dispatch_e2e.py`'s import convention), since
+`--resume` for EC2 lives inside the deep `RUNTIME=ec2` elif dispatch
+block rather than the early fast-path verb dispatch `--stop` uses. It
+pins: a stopped instance named by an `ec2-instance.json` sidecar issues
+exactly one `start-instances` call and reaches `running`, with no
+duplicate `run-instances` provisioning a second instance; the
+load-bearing IP-reassignment case — `LEERIE_EC2_SSH_TARGET` is
+re-resolved to the instance's NEW `PublicIpAddress` after resume, not
+the stale provision-time address, since EC2 hands out a new public IP
+on every stop/start cycle absent an attached Elastic IP; `run.json`'s
+`paused_at`/`pause_reason` are cleared and `ec2_instance_id` is
+preserved; an already-`running` instance is an idempotent no-op with
+zero `start-instances` calls; and neither `terminate-instances` nor
+`delete-volume` is ever called, on both the success path and the
+never-ready (`status_ok=False` timeout) failure path.
+
 The worker invocation path is unit-tested only at the `claude_p` layer, via
 a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin
 the retry/envelope contract. `_invoke` itself (process spawn, stream
