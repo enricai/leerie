@@ -2474,26 +2474,42 @@ coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `--resume`,
-`--stop`, `--kill`, or `--finalize` targets a run whose state
-directory contains a `fly-machine.json` sidecar and no explicit
-`--runtime` was given, the launcher auto-promotes to `fly` via the
-shared `_auto_detect_fly_runtime` helper. `--stop` additionally checks
-for an `ec2-instance.json` sidecar via the parallel
-`_auto_detect_ec2_runtime` helper (same shape, checked after Fly and
-before the local-container probe) and auto-promotes to `ec2` — the
-EC2 counterpart of `fly-machine.json` (see "EC2 runtime lifecycle",
-"Run identifier"). When neither remote sidecar exists, `--stop` and
-`--kill` probe for a live local nerdctl container
-via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
-`nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
-signal handler can save state before exit, or `aws ec2 stop-instances`
-on the EC2 path (same stop-preserves-volume semantics as Fly's
-`machine stop`); `--kill` uses `nerdctl kill`
-(immediate SIGKILL) since the run is terminal — `--kill`'s EC2
-counterpart has not shipped. `--finalize` on a local
-run is inline (no separate verb needed). If the user explicitly sets
-`--runtime local` on a Fly-originated run, `--resume` warns but
-respects the choice.
+`--stop`, `--kill`, `--accept-blocked`, or `--finalize` targets a run
+whose state directory contains a `fly-machine.json` or
+`ec2-instance.json` sidecar and no explicit `--runtime` was given, the
+launcher auto-promotes to `fly` or `ec2` respectively via the shared
+`_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
+as a thin Fly-only wrapper for call sites not yet migrated). `--stop`
+and `--kill` both wire real EC2 actions; `--accept-blocked` and
+`--finalize` still fail closed with a "does not support EC2 runs yet"
+message (separate subtasks), and `--resume` fails closed the same way
+rather than falling into the launcher's fresh-provision `RUNTIME=ec2`
+branch. `--stop`'s EC2 action sources `aws-credentials.sh` +
+`ec2-lib.sh` + `ec2-provision.sh`, resolves AWS credentials and gates
+on `require_aws()`, resolves `LEERIE_EC2_INSTANCE_ID` from the run's
+sidecar, and calls `stop_instance()` (`aws ec2 stop-instances` —
+stop-scoped, preserves the root EBS volume, same semantics as Fly's
+`machine stop`). `--kill`'s EC2 action resolves the run's
+`ec2_instance_id` from `ec2-instance.json`/`run.json`, resolves AWS
+credentials, re-resolves the instance's current SSH target (its public
+IP changes on every stop/start cycle), and calls
+`_try_fetch_state_for_ec2_teardown` — the same hook
+`decide_ec2_teardown`'s clean-exit branch uses — to sync the run branch
+and state dir back to the host BEFORE calling `terminate_instance()`
+(the one-way-ratchet invariant: destroy-then-fetch would make paid-for
+LLM work unrecoverable). A failed sync leaves the instance running
+rather than terminating it, mirroring `decide_ec2_teardown`'s own
+sync-failure behavior; `flyctl` is never invoked for an EC2 run. When
+no sidecar of either kind exists, `--stop` and `--kill` probe for a
+live local nerdctl container via `_is_local_container` (`nerdctl
+inspect <run-id>`). `--stop` uses `nerdctl stop` (SIGTERM → grace →
+SIGKILL) so the orchestrator's signal handler can save state before
+exit, or `aws ec2 stop-instances` on the EC2 path; `--kill` uses
+`nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
+(after the fetch-before-terminate sync) since the run is terminal.
+`--finalize` on a local run is inline (no separate verb needed). If
+the user explicitly sets `--runtime local` on a Fly-originated run,
+`--resume` warns but respects the choice.
 
 **Smart resume in remote mode.** `--resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.
