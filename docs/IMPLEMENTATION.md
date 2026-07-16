@@ -111,7 +111,7 @@ Current runtime deps:
   constraint that puts `flyctl machine run` in the bash launcher rather
   than a Fly Go-SDK import. Since the host cannot run boto3, the code
   surface that actually implements DESIGN §6's stage table
-  (`scripts/remote/ec2-provision.sh` / `ec2-ssm.sh`, spec'd in the Files
+  (`scripts/remote/ec2-provision.sh` / `ec2-ssm.sh`, per the Files
   table above) shells out to the **`aws` CLI** for every host-side EC2 API
   call — mirroring how the Fly path shells out to the `flyctl` binary
   rather than importing a Go SDK, and reusing `require_aws()`'s existing
@@ -120,9 +120,10 @@ Current runtime deps:
   invariant. `boto3`/`botocore` remain reserved for future in-container
   orchestrator-side AWS calls (none exist yet); this pin and the
   credential helper (`aws-credentials.sh`) are the currently-landed
-  pieces, and `scripts/remote/ec2-provision.sh` / `ec2-ssm.sh` are the
-  next ones a provisioning subtask must build per the Files-table spec
-  above.
+  pieces, alongside `scripts/remote/ec2-provision.sh` and
+  `ec2-ssm.sh` (both standalone-shipped per the Files-table spec
+  above) — the launcher's `RUNTIME=ec2` dispatch wiring to them is the
+  next piece a separate subtask must build.
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.
@@ -1699,13 +1700,15 @@ run-instances` call; a failing credential probe — including an
 unresolvable chain caught by `resolve_aws_credentials` itself, e.g. an
 expired SSO token — aborts with the `aws sso login --profile <p>`
 hint before any AWS resource is created) — but the branch does not yet
-dispatch to `ec2-provision.sh`'s
-`provision_instance()`/instance lifecycle, and the SSM/SSH transport
-(`ec2-ssm.sh`, for seeding and detached-orchestrate) has not shipped —
-DESIGN §6 *EC2 runtime lifecycle* is the canonical architecture, and
-"EC2 instance-lifecycle vars" below is the code-surface spec the
-provisioning-wiring subtask implements against. Default is `local` so
-existing behavior is unchanged for users who have not opted in.
+dispatch to `ec2-provision.sh`'s `provision_instance()`/instance
+lifecycle or to `ec2-ssm.sh`'s launch/attach transport (both ship as
+standalone, independently-tested files — see their Files-table rows
+above — but neither is sourced or called from the launcher's
+`RUNTIME=ec2` branch yet). DESIGN §6 *EC2 runtime lifecycle* is the
+canonical architecture, and "EC2 instance-lifecycle vars" below is the
+code-surface spec the provisioning-wiring subtask implements against.
+Default is `local` so existing behavior is unchanged for users who have
+not opted in.
 
 Resolution order (highest priority first):
 

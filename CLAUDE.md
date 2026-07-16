@@ -1067,6 +1067,32 @@ conditional as `fetch-branch.sh`); `.leerie/config.toml` and
 clobbered when the host already has one, and are non-fatal when absent
 on the instance; and both `aws` and `ssh` appear in the transport log
 while `flyctl` never does.
+The launch/attach counterpart to `flyctl ssh console` — `scripts/remote/
+ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — is tested in
+`tests/test_ec2_ssm.py` against a stubbed `aws` binary that models
+`ssm start-session`'s two defining quirks: it always exits 0 itself
+regardless of the wrapped remote command's real exit status (the
+documented session-manager-plugin limitation both `ec2_remote_exec` and
+this file work around via an rc-sentinel), and it is a genuinely
+interactive session that drains its own stdin and execs it as the
+bootstrap interpreter's program — unlike `test_ec2_transport.py`'s
+`_stub_aws_ssm`, which only ever inspects the `--parameters` value and
+never touches stdin. Pinned: both functions issue `aws ssm start-session
+--target <id> --document-name AWS-StartInteractiveCommand`; rc=75 (the
+flock-loser smart-resume pivot) and other nonzero remote rcs survive the
+round trip uncorrupted; both fail closed (rc 1, actionable stderr, no
+`aws` call) on an empty `LEERIE_EC2_INSTANCE_ID`; a stalled session
+yields 124/137 via the same `_seed_timeout_prefix` convention
+`ec2_remote_exec` uses; `--profile`/`--region` passthrough; a payload
+well over SSM's ~4 KB `--parameters` ceiling still round-trips cleanly
+since only the interpreter name (`python3 -` / `sh -s`) goes in
+`--parameters` and the real payload travels over the session's stdin;
+`ec2_attach`'s `sh -s` bootstrap is verified by decoding the
+base64-wrapped `command=[...]` value rather than asserting on plaintext
+no longer in the log; and double-sourcing is idempotent and does not
+clobber `ec2_remote_exec`. `flyctl` never appears in the transport log.
+Also added to `tests/test_ec2_bash32_portability.py`'s `_EC2_SCRIPTS`
+list for bash 3.2 sourcing coverage.
 The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
 the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
 standalone rather than the `leerie` launcher's own dispatch — is
