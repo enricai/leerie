@@ -1352,10 +1352,6 @@ PY
     elif [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "ec2" ]; then
       _ab_runtime="local"
     fi
-    if [ "$_ab_runtime" = "ec2" ]; then
-      remote_log "--accept-blocked: run $_ab_run_id is an EC2 run; --accept-blocked does not support EC2 runs yet"
-      exit 1
-    fi
     _ab_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ab_run_id"
     if [ ! -d "$_ab_state_dir" ]; then
       remote_log "--accept-blocked: no run dir at $_ab_state_dir"
@@ -1401,6 +1397,86 @@ with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=F
 os.replace(tmp_path, path)
 print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
 '
+    if [ "$_ab_runtime" = "ec2" ]; then
+      # EC2 counterpart of the Fly branch below: wake the instance if it
+      # is stopped, mutate state.json over SSM (ec2_remote_exec — no ssh
+      # keypair / hallpass wait needed, unlike Fly), mirror the mutation
+      # onto the host copy if one exists, then pause the instance again
+      # only if we were the ones who woke it.
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _ab_aws_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ab_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _ab_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _ab_aws_creds_exports="$(resolve_aws_credentials "${_ab_aws_creds_args[@]}")" || exit 1
+      eval "$_ab_aws_creds_exports"
+      unset _ab_aws_creds_args _ab_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_ab_state_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "--accept-blocked: no ec2_instance_id found for run $_ab_run_id"
+        exit 1
+      fi
+      export LEERIE_RUN_ID="$_ab_run_id"
+      _ab_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
+      case "$_ab_ec2_state" in
+        terminated|shutting-down|"")
+          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ab_started_instance=false
+      if [ "$_ab_ec2_state" != "running" ]; then
+        remote_log "--accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
+          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          exit 1
+        fi
+        _ab_started_instance=true
+      fi
+      _ab_teardown_ec2() {
+        if [ "$_ab_started_instance" = true ]; then
+          stop_instance
+          _ensure_run_json "$_ab_state_dir" || true
+          update_run_json "$_ab_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+        fi
+      }
+      _ab_remote_state="/work/.leerie/runs/$_ab_run_id/state.json"
+      _ab_out="$(printf '%s' "$_ab_mutate" \
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ab_remote_state' '$_ab_sid'" 2>&1 || true)"
+      _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ab_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "--accept-blocked: $_ab_sentinel"
+          ;;
+        *)
+          remote_log "--accept-blocked: failed to modify state on instance"
+          [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
+          _ab_teardown_ec2
+          exit 1
+          ;;
+      esac
+      # Mirror the mutation onto the host copy so --list / audits stay
+      # consistent (best-effort; host copy is optional — EC2 state.json
+      # normally lives only on the instance until fetch-back).
+      if [ -f "$_ab_state_file" ]; then
+        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
+      fi
+      _ab_teardown_ec2
+      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+      exit 0
+    fi
     if [ "$_ab_runtime" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
         remote_log "--accept-blocked: LEERIE_FLY_APP is required for Fly runs"

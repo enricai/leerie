@@ -2479,12 +2479,19 @@ whose state directory contains a `fly-machine.json` or
 `ec2-instance.json` sidecar and no explicit `--runtime` was given, the
 launcher auto-promotes to `fly` or `ec2` respectively via the shared
 `_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
-as a thin Fly-only wrapper for call sites not yet migrated). `--stop`
-and `--kill` both wire real EC2 actions; `--accept-blocked` and
-`--finalize` still fail closed with a "does not support EC2 runs yet"
-message (separate subtasks), and `--resume` fails closed the same way
+as a thin Fly-only wrapper for call sites not yet migrated). `--stop`,
+`--kill`, and `--accept-blocked` all wire real EC2 actions;
+`--finalize` still fails closed with a "does not support EC2 runs yet"
+message (a separate subtask), and `--resume` fails closed the same way
 rather than falling into the launcher's fresh-provision `RUNTIME=ec2`
-branch. `--stop`'s EC2 action sources `aws-credentials.sh` +
+branch. `--accept-blocked`'s EC2 action mirrors the Fly path's
+wake-mutate-pause dance: it resolves AWS credentials, wakes the
+instance via `resume_instance()` if it is stopped, mutates
+`state.json` on the instance over SSM (`ec2_remote_exec` — no ssh
+keypair or hallpass wait needed, unlike Fly), mirrors the mutation
+onto the host copy when one exists, and re-pauses the instance only
+if this verb was the one that woke it. `--stop`'s EC2 action sources
+`aws-credentials.sh` +
 `ec2-lib.sh` + `ec2-provision.sh`, resolves AWS credentials and gates
 on `require_aws()`, resolves `LEERIE_EC2_INSTANCE_ID` from the run's
 sidecar, and calls `stop_instance()` (`aws ec2 stop-instances` —

@@ -328,7 +328,14 @@ def test_accept_blocked_rejects_bogus_runtime_value(tmp_path):
     assert "must be 'local', 'fly', or 'ec2'" in r.stderr
 
 
-def test_accept_blocked_autodetects_ec2_sidecar_and_fails_closed(tmp_path):
+def test_accept_blocked_autodetects_ec2_sidecar(tmp_path):
+    # --accept-blocked's EC2 action is wired (see
+    # tests/test_ec2_launcher_readonly_verbs.py for its end-to-end
+    # coverage against a stubbed aws), so detection no longer fails
+    # closed. As with the --stop/--kill cases above, this env has no aws
+    # binary or credentials: reaching AWS credential resolution is the
+    # proof that detection promoted to ec2 and entered the EC2 branch
+    # rather than silently defaulting to local.
     state_dir = tmp_path / "state"
     run_dir = _make_e2e_run(state_dir, "r1", ec2=True)
     (run_dir / "state.json").write_text(
@@ -336,8 +343,10 @@ def test_accept_blocked_autodetects_ec2_sidecar_and_fails_closed(tmp_path):
     )
     r = _run_launcher(["--accept-blocked", "r1", "s1"], state_dir)
     assert r.returncode != 0
-    assert "does not support EC2 runs yet" in r.stderr
-    # The mutation never happened.
+    assert "does not support EC2 runs yet" not in r.stderr
+    assert "aws" in r.stderr.lower()
+    # The local-path mutation never happened — the EC2 branch mutates
+    # state.json on the instance over SSM, not the host copy directly.
     st = json.loads((run_dir / "state.json").read_text())
     assert st["subtask_status"]["s1"] == "blocked"
 
