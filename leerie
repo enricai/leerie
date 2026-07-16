@@ -489,6 +489,56 @@ _is_local_container() {
   [ -n "$run_id" ] && nerdctl inspect "$run_id" >/dev/null 2>&1
 }
 
+# --- _auto_detect_ec2_runtime ----------------------------------------------
+# EC2 counterpart to _auto_detect_fly_runtime. When a run-id-bearing verb is
+# invoked without an explicit --runtime and the run directory contains
+# ec2-instance.json, the run originated on EC2 (DESIGN §6 *EC2 runtime
+# lifecycle*, "Run identifier": ec2-instance.json is the same-shaped
+# crash-recovery pointer fly-machine.json plays for Fly runs — not a
+# rename, a parallel sidecar checked alongside it). Returns 0
+# (auto-detected) or 1 (not detected / explicit runtime given).
+_auto_detect_ec2_runtime() {
+  local run_id="$1" explicit_runtime="$2"
+  if [ -n "$explicit_runtime" ]; then return 1; fi
+  if [ -z "$run_id" ]; then return 1; fi
+  local sidecar="$LEERIE_STATE_HOST_DIR/runs/$run_id/ec2-instance.json"
+  if [ -f "$sidecar" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# --- _resolve_ec2_instance_id_from_run_dir ----------------------------------
+# Read ec2_instance_id from a run's host-side sidecar. ec2-provision.sh
+# writes it to both ec2-instance.json (unconditionally, at create time) and
+# run.json (when LEERIE_RUN_ID is set) — mirrors
+# _resolve_volume_id_from_run_dir's fly-machine.json-then-run.json fallback
+# order, checking the EC2-specific sidecar first since it is written
+# earliest and unconditionally.
+_resolve_ec2_instance_id_from_run_dir() {
+  local run_dir="$1"
+  local candidate
+  local iid
+  for candidate in "$run_dir/ec2-instance.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      iid="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    iid = d.get("ec2_instance_id")
+    print(iid if iid else "")
+except Exception:
+    pass
+' "$candidate")"
+      if [ -n "$iid" ]; then
+        printf '%s' "$iid"
+        return 0
+      fi
+    fi
+  done
+  return 0
+}
+
 # --- _reap_orphaned_container ---------------------------------------------
 # Fix E (DESIGN §6 *container boundary's hidden precondition*). Before a
 # local --resume spawns a fresh container, kill any container for this run
@@ -1539,19 +1589,22 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           ;;
       esac
     done
-    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ]; then
-      remote_log "--stop: --runtime must be 'local' or 'fly' (got '$_stop_runtime')"
+    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ] && [ "$_stop_runtime" != "ec2" ]; then
+      remote_log "--stop: --runtime must be 'local', 'fly', or 'ec2' (got '$_stop_runtime')"
       exit 1
     fi
     if [ -z "$_stop_run_id" ]; then
       remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id> [--runtime fly|local]" >&2
+      echo "  Usage: leerie --stop <run-id> [--runtime fly|local|ec2]" >&2
       exit 1
     fi
     if _auto_detect_fly_runtime "$_stop_run_id" "$_stop_runtime"; then
       remote_log "--stop: auto-detected Fly run; promoting --runtime to fly"
       _stop_runtime="fly"
-    elif [ "$_stop_runtime" != "fly" ] && _is_local_container "$_stop_run_id"; then
+    elif _auto_detect_ec2_runtime "$_stop_run_id" "$_stop_runtime"; then
+      remote_log "--stop: auto-detected EC2 run; promoting --runtime to ec2"
+      _stop_runtime="ec2"
+    elif [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "ec2" ] && _is_local_container "$_stop_run_id"; then
       _stop_runtime="local"
     fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
@@ -1577,8 +1630,42 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
       exit 0
     fi
+    if [ "$_stop_runtime" = "ec2" ]; then
+      # EC2 instance: stop_instance() preserves the root EBS volume
+      # (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2 —
+      # StopInstances is stop-scoped, never DeleteOnTermination). Resumable
+      # via leerie --resume (once the EC2 --resume path lands).
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      _stop_aws_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _stop_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _stop_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _stop_aws_creds_exports="$(resolve_aws_credentials "${_stop_aws_creds_args[@]}")" || exit 1
+      eval "$_stop_aws_creds_exports"
+      unset _stop_aws_creds_args _stop_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_stop_run_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "--stop: no ec2_instance_id found for run $LEERIE_RUN_ID"
+        exit 1
+      fi
+      _ensure_run_json "$_stop_run_dir" || true
+      remote_log "--stop: pausing instance $LEERIE_EC2_INSTANCE_ID (run $LEERIE_RUN_ID)"
+      stop_instance
+      update_run_json "$_stop_sidecar" \
+        paused_at "$(iso_now)" \
+        pause_reason "user-requested" \
+        ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+      remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+      exit 0
+    fi
     if [ "$_stop_runtime" != "fly" ]; then
-      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine or local container"
+      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine, local container, or EC2 instance"
       echo "  If the container already exited, there is nothing to stop." >&2
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
