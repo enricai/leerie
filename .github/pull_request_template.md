@@ -11,7 +11,7 @@
 - [ ] `orchestrator/leerie.py` (code)
 - [ ] docs (`README.md`, `docs/USAGE.md`, `CONTRIBUTING.md`, etc.)
 - [ ] tests (`tests/`)
-- [ ] CI / repo meta (`.github/`, `CHANGELOG.md`)
+- [ ] CI / repo meta (`.github/`)
 
 If multiple, has the change propagated **top-down** per the three-layer rule
 (DESIGN → IMPLEMENTATION → code)?
@@ -27,7 +27,6 @@ If multiple, has the change propagated **top-down** per the three-layer rule
 - [ ] `docs/DESIGN.md` updated if architecture changed
 - [ ] `pytest tests/` passes
 - [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"` passes
-- [ ] `CHANGELOG.md` `[Unreleased]` updated
 - [ ] `git diff --stat` reviewed for scope (no collateral edits)
 
 ## Testing notes

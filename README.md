@@ -24,7 +24,7 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 [![tests](https://github.com/enricai/leerie/actions/workflows/test.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/test.yml)
 [![syntax](https://github.com/enricai/leerie/actions/workflows/syntax.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/syntax.yml)
 [![shellcheck](https://github.com/enricai/leerie/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/shellcheck.yml)
-[![Version](https://img.shields.io/github/v/release/enricai/leerie?color=orange&label=version)](CHANGELOG.md)
+[![Version](https://img.shields.io/github/v/release/enricai/leerie?color=orange&label=version)](https://github.com/enricai/leerie/releases)
 
 ## How it works
 
@@ -514,10 +514,8 @@ wave execution, run-branch review, and merge; and for chain orchestration
 
 ## Documentation
 
-Every Leerie document is reachable from this README (the auto-generated
-`docs/ANALYSIS.md` is a derived build artifact, not a doc to read —
-regenerate it with the tool named in [`CLAUDE.md`](CLAUDE.md), don't
-navigate to it). Architecture and code surface:
+Every Leerie document is reachable from this README. Architecture and code
+surface:
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, constraints, phase
   flow, the evidence-gated loop, deterministic enforcement
@@ -534,7 +532,6 @@ Policy and process:
   repo-local guidance for Claude Code)
 - [`SECURITY.md`](SECURITY.md) — threat model and vulnerability reporting
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant
-- [`CHANGELOG.md`](CHANGELOG.md) — release notes
 
 Post-run analysis skills (invoked via Claude Code, not the orchestrator
 itself):
@@ -616,7 +613,6 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant Code of Conduct |
-| `CHANGELOG.md` | Release notes (Keep a Changelog format, SemVer) |
 | `docs/DESIGN.md` | Full design document and rationale (theory) |
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
@@ -768,7 +764,7 @@ MIT — see [`LICENSE`](LICENSE).
 
 ## Status
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the current release. The orchestrator's phase flow, wave scheduling, cross-domain dependency
+See [GitHub Releases](https://github.com/enricai/leerie/releases) for the current release. The orchestrator's phase flow, wave scheduling, cross-domain dependency
 resolution, and git worktree mechanics are all tested. First contact with a live
 `claude -p` session is the remaining verification step. Limitations and planned
 work are in [`docs/DESIGN.md`](docs/DESIGN.md).

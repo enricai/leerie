@@ -155,9 +155,6 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
-docs/ANALYSIS.md            Derived compiler-frontend analysis (non-canonical; regenerate
-                            via `python3 docs/tools/leerie_extract.py orchestrator/leerie.py`)
-docs/tools/                 Standalone extraction tools (stdlib only)
 chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
                             N parallel `leerie --runtime fly` invocations per wave,
                             sequenced by the launcher's `--chain` arm. `chain/git_ops.py`
@@ -1274,8 +1271,6 @@ Before marking a change complete:
 - [ ] Update `IMPLEMENTATION.md` if the change affected code surface
       described there.
 - [ ] Update `DESIGN.md` only if the architecture itself changed.
-- [ ] Regenerate `docs/ANALYSIS.md` if `orchestrator/leerie.py` changed
-      (`python3 docs/tools/leerie_extract.py orchestrator/leerie.py`).
 - [ ] `pytest tests/` — all pass.
 - [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"`
       as a static check.

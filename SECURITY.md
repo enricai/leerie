@@ -32,8 +32,8 @@ What to expect:
 - **Acknowledgment within 7 days** of receipt
 - A coordinated disclosure timeline negotiated with the reporter, typically
   30–90 days depending on severity and the fix's complexity
-- Credit in `CHANGELOG.md` on release of the fix, unless you ask to remain
-  anonymous
+- Credit in the [GitHub Release](https://github.com/enricai/leerie/releases)
+  notes for the release containing the fix, unless you ask to remain anonymous
 
 ## Threat model context
 
