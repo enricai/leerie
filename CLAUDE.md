@@ -1323,6 +1323,26 @@ present; `--runtime bogus` is still rejected, now with the
 silently no-op'ing; and a failing AWS credential probe aborts before
 any `aws ec2 ...` call reaches the stub, leaving the instance
 `running`.
+The `RUNTIME=ec2` dispatch branch continuing past preflight into the
+full create -> seed -> orchestrate -> teardown lifecycle (the old
+`--runtime ec2 preflight passed, but instance provisioning is not yet
+wired` abort is gone) is pinned in
+`tests/test_ec2_launcher_dispatch_e2e.py`, which reuses (rather than
+reimplements) `tests/test_ec2_e2e_provision.py`'s
+`extract_ec2_dispatch_block`/`run_ec2_dispatch`/`stub_aws_env` harness
+and `tests/ec2_stub.py`'s resource-tracking `aws` stub — mirroring
+`tests/test_ec2_launcher_credentials.py`'s harness-sanity convention.
+It pins: a full launch with valid credentials provisions exactly one
+instance, reaches the stubbed `ec2_seed_repo`, and terminates cleanly
+at `decide_ec2_teardown`'s clean-exit arm, leaving zero leaked
+instances and zero leaked volumes; a grep guard that neither `"not yet
+wired"` nor the more specific historical string `"instance
+provisioning is not yet wired"` appears anywhere in `leerie`;
+`require_aws`'s `sts get-caller-identity` still precedes any `ec2
+run-instances` call by call index across the *full* lifecycle path
+(not just the provision-only path `test_ec2_e2e_provision.py` already
+covers); and a failing credential probe still aborts non-zero with the
+`aws sso login --profile <p>` hint and zero tracked resources.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
