@@ -5633,8 +5633,10 @@ Two new launcher flags, routed at the top of `leerie` alongside
     <iso_now>` and `pause_reason = "user-requested"` on the sidecar
     (the EC2 path also writes `ec2_instance_id`, mirroring how the Fly
     path writes `fly_machine_id`). The run is resumable via `leerie
-    --resume <id>` (the EC2 counterpart of `--resume` itself has not
-    shipped yet — see "Unified `leerie --list`" below).
+    --resume <id>` — the `RUNTIME=ec2` dispatch branch resolves a
+    paused instance id from the sidecar and calls `resume_instance()`
+    (see the `scripts/remote/ec2-resume-instance.sh` row above and
+    `tests/test_ec2_launcher_resume.py`).
   - **Test coverage:** `tests/test_ec2_launcher_stop.py` — EC2
     autodetect and explicit `--runtime ec2`, `stop-instances` called
     and never `terminate-instances`, missing-instance-id and
