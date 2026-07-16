@@ -65,11 +65,12 @@ def _requires_bash32():
 
 
 # Every EC2 shell file that the runtime sources. `ec2-lib.sh` is sourced
-# by the other two, so it is covered transitively as well as directly.
+# by the others, so it is covered transitively as well as directly.
 _EC2_SCRIPTS = [
     "ec2-lib.sh",
     "ec2-provision.sh",
     "ec2-seed-repo.sh",
+    "ec2-ssm.sh",
 ]
 
 
