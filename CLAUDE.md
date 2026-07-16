@@ -505,7 +505,18 @@ itself uses when provisioning `--runtime ec2` machines, distinct from the
 AWS SDK's own credential-chain env vars) are covered in
 `tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
 CLI/env/file precedence structure but for the unvalidated free-form-string
-`_resolve_str_pref` machinery (no enum, no `die()` path). The
+`_resolve_str_pref` machinery (no enum, no `die()` path). The launcher-side
+EC2 instance-shape vars (`LEERIE_EC2_AMI`/`_INSTANCE_TYPE`/`_KEY_NAME`/
+`_SECURITY_GROUP`/`_SUBNET_ID` — the five `RunInstances` params, distinct
+from the region/profile prefs above) are covered in
+`tests/test_resolve_ec2_vars.py`: the bash `_resolve_ec2_knob` CLI > env >
+`leerie.toml` > (no default) ladder reproduced and pinned against the real
+launcher source (`test_block_present_in_launcher`), per-var isolation,
+`=`-form CLI flags, the env-forwarding denylist guard (these vars must
+never leak into the container), and `ec2-lib.sh`'s `_resolve_ec2_var`
+required-var-read contract (prints on success, actionable
+"not set — required for --runtime ec2" error + rc 1 on an unresolved var,
+never a bare `${VAR:?}`). The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
