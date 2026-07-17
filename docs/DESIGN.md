@@ -2191,8 +2191,10 @@ container. The `--max-workers` budget persists across the re-exec
 rate-limit still respects the cap and can never run away. Cleanup runs before
 the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
-dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate
-(`setup-run.sh`'s staging-worktree re-creation can't hit a stale-dir conflict).
+dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate.
+That is a convenience, not the guarantee: cleanup cannot run when the process is
+SIGKILLed (Fly `machine stop`), so `setup-run.sh` reclaims a stale staging
+directory itself rather than relying on a predecessor having tidied up.
 Ctrl-C during the sleep drops to a manual `--resume` (exit 130); a
 SIGTERM/SIGHUP during the sleep drops to a manual `--resume` with the
 signal's exit code (128 + signum → 143 / 129), matching main()'s

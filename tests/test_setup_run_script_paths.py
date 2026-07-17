@@ -76,6 +76,70 @@ def test_setup_run_no_git_exclude():
     assert '".leerie/"' not in src
 
 
+def test_setup_run_idempotency_check_uses_fixed_string():
+    """The already-present check must use -xF (fixed-string, whole-line).
+
+    Mirrors test_new_worktree_idempotency_check_uses_fixed_string: the old
+    pattern `grep -q "worktree .*/${STAGING_WT}$"` expands to a double slash
+    when $STAGING_WT is absolute — `worktree .*/` + `/leerie-state/...` — which
+    `git worktree list` never emits. The guard never matched, so `git worktree
+    add` ran unconditionally and every --resume over a stale staging dir died
+    with "fatal: '...' already exists". Measured: the old pattern scores 0
+    matches against real porcelain output where -xF scores 1.
+
+    The old pattern is quoted in an explanatory comment in the script, so the
+    absence check runs against executable lines only — same technique as
+    test_finalize_references_per_run_branch below.
+    """
+    src = _script("setup-run.sh")
+    assert 'grep -qxF "worktree $STAGING_WT"' in src
+    non_comment = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert 'grep -q "worktree .*/' not in non_comment, (
+        "setup-run.sh still has the double-slash-prone regex guard in an "
+        "executable line — it must use `grep -qxF` instead."
+    )
+
+
+def test_setup_run_canonicalizes_staging_wt_to_absolute():
+    """$STAGING_WT must be resolved to an absolute path before the reuse grep.
+
+    git worktree list --porcelain outputs absolute, symlink-resolved paths.
+    When LEERIE_STATE_DIR is unset $STAGING_WT is relative, and git resolves
+    symlinks that a relative path does not. Mirrors
+    test_new_worktree_canonicalizes_wt_to_absolute.
+    """
+    src = _script("setup-run.sh")
+    assert 'case "$STAGING_WT" in' in src
+    assert 'STAGING_WT="$(pwd -P)/$STAGING_WT"' in src
+
+
+def test_setup_run_reclaims_orphaned_staging_dir():
+    """An unregistered-but-present staging dir must be removed before `add`.
+
+    Neither `git worktree prune` (only drops entries whose dir is *gone*) nor
+    `--force` (overrides branch-checked-out and path-*missing*, not
+    path-present) recovers this — both measured against a real repo. Removing
+    the directory is the only remedy. The `&&` guard is load-bearing: it must
+    never fire on a still-registered worktree.
+
+    Asserted against executable lines only: the script *explains* prune's
+    limits in a comment, so a whole-file `in src` check passes even when the
+    executable `git worktree prune` is deleted (verified by mutation).
+    """
+    src = _script("setup-run.sh")
+    non_comment = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert 'rm -rf "$STAGING_WT"' in non_comment
+    assert '[ -d "$STAGING_WT" ]' in non_comment
+    assert 'git worktree prune' in non_comment, (
+        "setup-run.sh must run `git worktree prune` in an executable line — "
+        "the comment explaining prune's limits does not satisfy this."
+    )
+
+
 def test_setup_run_checks_external_leerie_branch():
     """setup-run.sh must check for a pre-existing 'leerie' branch.
     This is defense-in-depth for the --resume path, which skips

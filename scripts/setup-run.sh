@@ -26,6 +26,14 @@ LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 BRANCH="leerie/runs/${RUN_ID}"
 STAGING_WT="${RUN_DIR}/worktrees/staging"
+# git worktree list --porcelain outputs absolute, symlink-resolved paths.
+# $STAGING_WT must match that shape before the reuse grep below: when
+# LEERIE_STATE_DIR is unset it is relative, and git resolves symlinks a
+# relative path does not. pwd -P produces the form git prints.
+case "$STAGING_WT" in
+  /*) ;;
+  *)  STAGING_WT="$(pwd -P)/$STAGING_WT" ;;
+esac
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -61,8 +69,31 @@ else
   echo "run-branch: ${BRANCH} (created at HEAD)"
 fi
 
-# Add the run-branch worktree if it is not already present.
-if ! git worktree list --porcelain | grep -q "worktree .*/${STAGING_WT}$"; then
+# Drop an orphaned staging directory that git no longer knows about. On Fly,
+# `machine stop` SIGKILLs the orchestrator, so `_cleanup_on_abnormal_exit`
+# never runs and the directory outlives its admin entry on the volume.
+# `worktree add` then refuses with "fatal: '<path>' already exists" and every
+# --resume dies in phase 4 — the first one only appears to recover because its
+# own die() unwinds into the cleanup that removes this directory.
+#
+# `git worktree prune` does NOT cover this: it only drops admin entries whose
+# directory is *gone*. `--force` does not either: it overrides
+# branch-already-checked-out and path-assigned-but-missing, not a path that
+# simply exists. Removing the directory is the only remedy, and it is safe —
+# the run branch (and every integration commit on it) is untouched, so the
+# resume re-attaches to the waves already completed.
+if ! git worktree list --porcelain | grep -qxF "worktree $STAGING_WT" && [ -d "$STAGING_WT" ]; then
+  rm -rf "$STAGING_WT"
+fi
+# Clear stale admin entries whose directory is gone, so the reuse check below
+# sees post-cleanup truth.
+git worktree prune
+
+# Add the run-branch worktree if it is not already present. The check must use
+# -xF (fixed-string, whole-line): the old `grep -q "worktree .*/${STAGING_WT}$"`
+# expanded to a double slash for an absolute $STAGING_WT (`/leerie-state` in the
+# container), so it never matched and this add ran unconditionally.
+if ! git worktree list --porcelain | grep -qxF "worktree $STAGING_WT"; then
   git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 fi
 

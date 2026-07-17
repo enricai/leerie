@@ -2312,8 +2312,9 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
 
     Cleanup runs BEFORE the sleep so the re-exec'd `--resume` finds a clean
     slate — `_cleanup_on_abnormal_exit` removes every worktree (git-registered
-    AND orphaned dirs, then `git worktree prune`), so `setup-run.sh`'s staging
-    worktree re-creation can't hit a stale-dir conflict. A consequence: the
+    AND orphaned dirs, then `git worktree prune`). That is a convenience, not
+    the guarantee: cleanup cannot run when the process is SIGKILLed, so
+    `setup-run.sh` reclaims a stale staging dir itself. A consequence: the
     sleep is measured from AFTER cleanup, so for a parsed reset time the wait
     under-counts by the cleanup duration. That is harmless and self-correcting:
     if it wakes early the re-exec'd run immediately re-hits `RateLimitedExit`,
