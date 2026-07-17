@@ -172,11 +172,14 @@ def test_schedule_after_filter_has_no_dropped_sid(leerie, tmp_path, monkeypatch)
 
 
 def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkeypatch):
-    """Cross-subtask interaction: when a dropped subtask provides a tag
-    a survivor requires, the existing validate_plan check fires die() with
-    'requires X but nothing provides it'. This locks in the diagnostic
-    chain: user sees both the drop warning and the missing-tag error."""
-    import pytest
+    """Cross-subtask interaction: when a dropped subtask provides a tag a
+    survivor requires, the drop must prune that inbound `requires` (the tag
+    channel), so the survivor does NOT dangle and validate_plan survives.
+
+    Previously this die()d with 'requires X but nothing provides it' — the
+    id channel was pruned but the tag channel was not (DESIGN §5 *Id-vanishing
+    operations*, the drop half). The tag prune closes that gap: a tag whose
+    only provider was dropped is removed from every survivor's `requires`."""
     _capture_logs(leerie, monkeypatch)
     st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
@@ -201,9 +204,11 @@ def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkey
     ]}]
 
     leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    # the orphaned requires-tag is pruned from the survivor
+    surv = {s["id"]: s for s in plans[0]["subtasks"]}
+    assert surv["feat-002"]["requires"] == []
     subtasks, _ = leerie.schedule(plans)
-    with pytest.raises(SystemExit):
-        leerie.validate_plan(subtasks)
+    leerie.validate_plan(subtasks)   # must NOT die() now
 
 
 # ---------------------------------------------------------------------------

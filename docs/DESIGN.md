@@ -506,21 +506,38 @@ subtask referencing the vanishing id via `depends_on` must be rewritten to refer
 those successor(s).
 
 The second half is easy to forget because the two dependency channels do not fail
-alike. The tag channel self-heals: `provides` is inherited by successors and
-`_build_predecessor_graph` resolves a `requires` tag to *every* provider, so a
-tag-expressed edge survives an id vanishing untouched. Only the id-expressed
-`depends_on` channel dangles — silently at `schedule()`, which drops an unknown
-predecessor without a word, and then fatally at `validate_plan`. An operation that
-gets this wrong therefore looks correct under tag-based plans and dies only when a
+alike *under expansion*. On **expansion** the tag channel self-heals: `provides` is
+inherited by successors and `_build_predecessor_graph` resolves a `requires` tag to
+*every* provider, so a tag-expressed edge survives an id vanishing untouched. Only the
+id-expressed `depends_on` channel dangles — silently at `schedule()`, which drops an
+unknown predecessor without a word, and then fatally at `validate_plan`. An operation
+that gets this wrong therefore looks correct under tag-based plans and dies only when a
 planner happens to express the same intent by id.
+
+**A drop is not symmetric with an expansion on the tag channel.** The self-healing
+above holds only because a successor inherits the vanishing subtask's `provides`. A
+**drop** has no successor, so its `provides` are simply gone — nothing inherits them,
+and any surviving subtask whose `requires` names a tag *only* the dropped subtask
+provided is now orphaned. That orphan dies at `validate_plan` exactly like a dangling
+`depends_on` (`requires 'X' but nothing provides it`). Therefore a drop owes the plan a
+prune of **both** channels: the inbound `depends_on` (id) references, *and* the inbound
+`requires` (tag) references whose only provider was dropped. The prune is gated on the
+dropped subtasks' `provides`: a tag still provided by a *surviving* subtask is kept, and
+a tag no subtask ever provided is left intact so `validate_plan` still surfaces it as a
+genuine planner error rather than having it silently masked. "Surviving" is evaluated
+**across the whole merged plan, not per-domain** — capability tags are cross-domain
+(§*Cross-domain capability tags*), so a `requires` in one domain's plan may be satisfied
+by a `provides` in another; the prune must see every plan at once, matching how
+`validate_plan` checks provider-existence globally.
 
 Where an id vanishes into **several** successors (expansion), the rewrite fans out to
 all of them — matching what the tag channel already does, and costing no additional
 waves when the successors are mutually independent (they occupy the wave the parent
-would have). Where an id vanishes with **no** successor (a drop), the reference is
-pruned. Fanning out to a single "representative" successor, or dropping the id edge
-on the theory that a tag will cover it, is the same silent-data-loss class named
-above: a parent with no `provides` has no tag edge to fall back on.
+would have). Where an id vanishes with **no** successor (a drop), both the id reference
+and the now-orphaned tag reference are pruned (per the paragraph above). Fanning out to
+a single "representative" successor, or dropping the id edge on the theory that a tag
+will cover it, is the same silent-data-loss class named above: a parent with no
+`provides` has no tag edge to fall back on.
 
 The orchestrator handles this with **per-resolution cycle avoidance** rather than
 an all-or-nothing post-hoc gate. Before applying each collision it tentatively

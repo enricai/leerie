@@ -5137,6 +5137,50 @@ def _remap_vanished_deps(subtasks: list[dict],
         s["depends_on"] = new_deps
 
 
+def _prune_orphaned_requires(plans: list[dict],
+                             dropped_provides: set[str]) -> None:
+    """In-place: drop `requires` tags whose only provider was a dropped subtask.
+
+    DESIGN §5 *Id-vanishing operations* — the drop half. `_remap_vanished_deps`
+    handles the id (`depends_on`) channel; this handles the tag channel. A drop
+    is *not* symmetric with an expansion here: an expansion's successors inherit
+    the vanishing subtask's `provides`, so a tag edge self-heals; a drop has no
+    successor, so its `provides` are gone and any survivor whose `requires` names
+    a tag only the dropped subtask provided is now orphaned — which dies at
+    `validate_plan` (`requires 'X' but nothing provides it`) after the full
+    planner spend.
+
+    Operates over **all plans at once**, not per-plan, because capability tags
+    are cross-domain: `requires` in one domain's plan is resolved by a `provides`
+    that may live in another domain's plan (DESIGN §5 *Cross-domain capability
+    tags*), and `validate_plan` computes provider-existence globally over the
+    merged plan. A per-plan prune would wrongly drop a tag a surviving subtask in
+    a *different* plan still provides.
+
+    The prune set is gated on `dropped_provides` (the union of the dropped
+    subtasks' `provides`, captured *before* the survivor-filter removed them): a
+    tag still provided by a surviving subtask (in any plan) is kept, and a tag no
+    subtask ever provided is left intact so `validate_plan` still surfaces it as a
+    genuine planner error rather than silently masking it. Pruning "any
+    requires-tag not in surviving provides" would swallow that never-provided
+    case — hence the `dropped_provides` gate.
+    """
+    surviving_provides: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            surviving_provides.update(s.get("provides") or [])
+    orphaned = dropped_provides - surviving_provides
+    if not orphaned:
+        return
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            req = s.get("requires") or []
+            s["requires"] = [
+                r for r in req
+                if not (isinstance(r, dict) and r.get("tag") in orphaned)
+            ]
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:
@@ -6310,7 +6354,10 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
                     reasons.append(
                         f"{f!r} does not resolve under repo root "
                         f"{str(repo_root)!r}")
-            dropped[sid] = {"reasons": reasons, "files": offtree_paths}
+            # Capture provides here, before the survivor-filter below drops
+            # the subtask object — needed to prune the tag channel (DESIGN §5).
+            dropped[sid] = {"reasons": reasons, "files": offtree_paths,
+                            "provides": list(s.get("provides") or [])}
         plan["subtasks"] = survivors
     if not dropped:
         return
@@ -6319,8 +6366,16 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     # Without this the edge dangles: schedule() drops it silently and
     # validate_plan then die()s the run.
     pruned = {sid: [] for sid in dropped}
+    dropped_provides = {t for info in dropped.values()
+                        for t in info.get("provides", [])}
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), pruned)
+    # A drop also orphans the tag channel — the dropped subtasks' provides are
+    # gone, so prune any inbound `requires` naming a tag only they provided
+    # (DESIGN §5 *Id-vanishing operations*, the drop half). Called once over all
+    # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
+    # by a surviving subtask in another plan must not be pruned.
+    _prune_orphaned_requires(plans, dropped_provides)
     log(f"⚠  filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
         "with off-tree files_likely_touched:")
     for sid, info in sorted(dropped.items()):
@@ -6439,6 +6494,9 @@ async def filter_satisfied_subtasks(
                 "reason": "already_satisfied",
                 "evidence": out.get("evidence", ""),
                 "checked": list(out.get("checked", []) or []),
+                # Capture provides now, before the survivor-filter below drops
+                # the subtask object — needed to prune the tag channel.
+                "provides": list(s.get("provides") or []),
             }
 
     await gather_or_cancel(*(probe_one(s) for s in probeable))
@@ -6458,8 +6516,16 @@ async def filter_satisfied_subtasks(
     # Without this the edge dangles: schedule() drops it silently and
     # validate_plan then die()s the run — after the full planner spend.
     pruned = {sid: [] for sid in dropped}
+    dropped_provides = {t for info in dropped.values()
+                        for t in info.get("provides", [])}
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), pruned)
+    # A drop also orphans the tag channel — the dropped subtasks' provides are
+    # gone, so prune any inbound `requires` naming a tag only they provided
+    # (DESIGN §5 *Id-vanishing operations*, the drop half). Called once over all
+    # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
+    # by a surviving subtask in another plan must not be pruned.
+    _prune_orphaned_requires(plans, dropped_provides)
 
     log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
         "already-satisfied subtask(s):")

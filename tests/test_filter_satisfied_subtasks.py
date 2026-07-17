@@ -350,6 +350,132 @@ def test_validate_plan_survives_a_satisfied_drop(leerie, tmp_path, monkeypatch):
     leerie.validate_plan({s["id"]: s for s in surv})   # must not die()
 
 
+def _req(*tags):
+    return [{"tag": t, "extent": "in_plan"} for t in tags]
+
+
+def test_dropped_provider_orphans_requires_tag_is_pruned(
+        leerie, tmp_path, monkeypatch):
+    """Regression: the navegando 2026-07-17 failure. A consolidation subtask
+    `requires` a tag provided ONLY by a dropped subtask; the drop must prune
+    that inbound `requires` (the tag channel), not just `depends_on` (the id
+    channel). Without the tag prune validate_plan die()s with
+    `requires 'X' but nothing provides it` — after the full planner spend.
+    """
+    st = _make_state(leerie, tmp_path / "run")
+    full = dict(files_likely_touched=["docs/audit-findings.md"])
+    plans = [{"domain": "documentation", "status": "ready", "subtasks": [
+        _sub("docs-001", provides=["a1"], requires=[], **full),
+        _sub("docs-002", provides=["a2"], requires=[], **full),   # dropped
+        _sub("docs-010", provides=["artifact"],
+             requires=_req("a1", "a2"),
+             depends_on=["docs-001", "docs-002"], **full),
+    ]}]
+    _patch_probe(leerie, monkeypatch, {
+        "docs-002": {"satisfied": True, "evidence": "section already on disk",
+                     "checked": ["docs/audit-findings.md"]},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+
+    surv = plans[0]["subtasks"]
+    by_id = {s["id"]: s for s in surv}
+    # id channel pruned (existing behavior)
+    assert by_id["docs-010"]["depends_on"] == ["docs-001"]
+    # tag channel pruned (the fix): the orphaned 'a2' is gone, 'a1' kept
+    tags = [r["tag"] for r in by_id["docs-010"]["requires"]]
+    assert tags == ["a1"], tags
+    # end-to-end: the gate that killed the run must now pass
+    leerie.validate_plan({s["id"]: s for s in surv})
+
+
+def test_requires_tag_with_surviving_provider_is_kept(
+        leerie, tmp_path, monkeypatch):
+    """A required tag also provided by a SURVIVING subtask must NOT be pruned
+    just because a dropped subtask happened to provide it too."""
+    st = _make_state(leerie, tmp_path / "run")
+    full = dict(files_likely_touched=["docs/audit-findings.md"])
+    plans = [{"domain": "documentation", "status": "ready", "subtasks": [
+        _sub("docs-001", provides=["shared"], requires=[], **full),  # survives, provides 'shared'
+        _sub("docs-002", provides=["shared"], requires=[], **full),  # dropped, also provides 'shared'
+        _sub("docs-010", provides=["artifact"], requires=_req("shared"), **full),
+    ]}]
+    _patch_probe(leerie, monkeypatch, {
+        "docs-002": {"satisfied": True, "evidence": "dup", "checked": []},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+    by_id = {s["id"]: s for s in plans[0]["subtasks"]}
+    assert [r["tag"] for r in by_id["docs-010"]["requires"]] == ["shared"]
+    leerie.validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
+
+
+def test_never_provided_requires_tag_is_not_masked(
+        leerie, tmp_path, monkeypatch):
+    """A `requires` tag no subtask ever provided is a genuine planner error;
+    the drop's tag-prune must NOT swallow it — validate_plan must still die()
+    on it. Guards against a naive 'prune any requires-tag not in surviving
+    provides' implementation."""
+    st = _make_state(leerie, tmp_path / "run")
+    full = dict(files_likely_touched=["docs/audit-findings.md"])
+    plans = [{"domain": "documentation", "status": "ready", "subtasks": [
+        _sub("docs-001", provides=["a1"], requires=[], **full),
+        _sub("docs-002", provides=["a2"], requires=[], **full),   # dropped
+        _sub("docs-010", provides=["artifact"],
+             requires=_req("a1", "never-provided-by-anyone"), **full),
+    ]}]
+    _patch_probe(leerie, monkeypatch, {
+        "docs-002": {"satisfied": True, "evidence": "x", "checked": []},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+    by_id = {s["id"]: s for s in plans[0]["subtasks"]}
+    # the never-provided tag is preserved (a1 kept too — it has a surviving provider)
+    tags = sorted(r["tag"] for r in by_id["docs-010"]["requires"])
+    assert tags == ["a1", "never-provided-by-anyone"], tags
+    # and validate_plan STILL flags the genuine error
+    with pytest.raises(SystemExit):
+        leerie.validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
+
+
+def test_cross_plan_surviving_provider_keeps_requires_tag(
+        leerie, tmp_path, monkeypatch):
+    """Cross-domain regression: a required tag provided by a SURVIVING subtask
+    in a DIFFERENT plan must NOT be pruned when a same-tag provider is dropped
+    from another plan.
+
+    Capability tags are cross-domain (DESIGN §5): `requires` in plan A can be
+    satisfied by `provides` in plan B, and validate_plan checks provider
+    existence globally over the merged plan. A per-plan prune would wrongly drop
+    the tag because it only sees plan A's provides. The prune must operate over
+    all plans at once.
+    """
+    st = _make_state(leerie, tmp_path / "run")
+    full = dict(files_likely_touched=["x"])
+    # Plan A: bugfix-001 provides 'shared' (DROPPED); bugfix-002 requires 'shared'.
+    plan_a = {"domain": "bug-fixing", "status": "ready", "subtasks": [
+        _sub("bugfix-001", provides=["shared"], requires=[], **full),
+        _sub("bugfix-002", provides=[], requires=_req("shared"), **full),
+    ]}
+    # Plan B: feat-001 also provides 'shared' and SURVIVES.
+    plan_b = {"domain": "feature-implementation", "status": "ready", "subtasks": [
+        _sub("feat-001", provides=["shared"], requires=[], **full),
+    ]}
+    plans = [plan_a, plan_b]
+    _patch_probe(leerie, monkeypatch, {
+        "bugfix-001": {"satisfied": True, "evidence": "dup provider", "checked": []},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    # 'shared' still provided by feat-001 (plan B) → must be KEPT on bugfix-002
+    assert [r["tag"] for r in by_id["bugfix-002"]["requires"]] == ["shared"]
+    # end-to-end over the merged plan
+    merged = {s["id"]: s for p in plans for s in p["subtasks"]}
+    leerie.validate_plan(merged)   # must not die()
+
+
 def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
     """Nothing satisfied → no mapping → depends_on byte-identical."""
     st = _make_state(leerie, tmp_path / "run")
