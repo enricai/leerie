@@ -8,8 +8,12 @@ the leerie launcher so it's callable from any verb arm.
 We test by sourcing the launcher in a sub-bash with --version short-
 circuit so only the function definitions and pre-dispatch code load,
 then invoking the function with a controlled HOME and PATH so the
-fallback chain (Keychain → ~/.claude/.credentials.json → env var) is
-exercised deterministically.
+fallback chain (env var → Keychain → ~/.claude/.credentials.json) is
+exercised deterministically. The long-lived CLAUDE_CODE_OAUTH_TOKEN
+wins outright when set (D0a): a container holds a snapshot of the
+subscription OAuth credential that it can never refresh, so the token
+designed for headless/CI use takes precedence over Keychain and the
+on-disk file, which remain the fallback chain when it's unset.
 """
 from __future__ import annotations
 
@@ -130,14 +134,31 @@ def test_falls_back_to_credentials_file(tmp_path: Path) -> None:
     assert out == blob
 
 
-def test_falls_back_to_env_var(tmp_path: Path) -> None:
-    """No Keychain, no file → synthesize JSON from CLAUDE_CODE_OAUTH_TOKEN."""
+def test_env_var_wins_over_keychain_and_file(tmp_path: Path) -> None:
+    """CLAUDE_CODE_OAUTH_TOKEN (the long-lived, refreshable-by-nobody-but-
+    that's-fine token) wins outright over both a present Keychain blob and
+    a present on-disk file — D0a's inverted precedence.
+
+    A container holds a snapshot of the subscription OAuth credential that
+    it can never refresh (no interactive host session, and refresh rotates
+    the host's token out from under it), so the long-lived env-var token
+    must be preferred whenever it's set, regardless of platform. No
+    skipif(darwin) here: this must hold both when the Keychain branch is
+    exercised (Darwin, stubbed to return a blob) and when it's structurally
+    absent (Linux) — D0a's `[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]` check runs
+    before the `uname -s = Darwin` gate, so the win must be observable on
+    both platforms this suite runs on.
+    """
     rc, out = _invoke_helper(
         tmp_path,
         env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-env"},
+        credentials_file='{"claudeAiOauth":{"accessToken":"sk-stale-disk"}}',
+        stub_security_returns='{"claudeAiOauth":{"accessToken":"sk-fresh-keychain"}}',
     )
     assert rc == 0
     assert out == '{"claudeAiOauth":{"accessToken":"sk-env"}}'
+    assert "sk-stale-disk" not in out
+    assert "sk-fresh-keychain" not in out
 
 
 def test_returns_nonzero_when_no_creds_available(tmp_path: Path) -> None:
@@ -157,8 +178,8 @@ def test_returns_nonzero_when_no_creds_available(tmp_path: Path) -> None:
     reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
 )
 def test_keychain_wins_over_file_on_darwin(tmp_path: Path) -> None:
-    """The Keychain path is the macOS canonical source; prefer it over
-    a stale on-disk file."""
+    """When CLAUDE_CODE_OAUTH_TOKEN is unset, Keychain is the macOS
+    canonical source; prefer it over a stale on-disk file."""
     rc, out = _invoke_helper(
         tmp_path, env={},
         credentials_file='{"claudeAiOauth":{"accessToken":"sk-stale-disk"}}',
