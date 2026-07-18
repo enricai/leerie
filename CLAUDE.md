@@ -885,6 +885,19 @@ and `validate_plan` — the ordering *is* the feature, since a die() at either g
 otherwise discards the whole planning spend (`write_plan` never runs); plus that it is
 deliberately not `write_plan` (which would seed execution scaffolding for a run that
 cannot start) and that the payload round-trips through a real `State.save()`.
+`tests/test_decompose_snapshot.py` is `plan_snapshot`'s sibling for the D3 crash
+barrier: a `WorkerError` from `recursive_decompose`'s `fit_judge` call degrades the
+node to a leaf (`[subtask]` unchanged, not dropped, not propagated) rather than
+discarding sibling subtasks' already-completed fit/split decisions; `phase_plan`'s
+expansion loop persists `st.data["decompose_snapshot"]` after each top-level subtask
+finishes, so a later subtask's crash still leaves the earlier ones' completed leaves
+in the snapshot, round-tripped through a real `State.save()`; a normal run's final
+leaf count matches `plan["subtasks"]` (nothing silently dropped); and, mirroring
+`test_plan_snapshot_wiring.py`'s `TestSnapshotPrecedesTheDieGates`,
+`test_decompose_snapshot_precedes_the_die_gates` pins that `_run_phases` calls
+`phase_plan` (which writes the snapshot) strictly before `check_budget_feasibility`
+and `validate_plan` — the two gates that die() and would otherwise make a discarded
+decomposition unrecoverable.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
