@@ -1598,6 +1598,27 @@ a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin
 the retry/envelope contract. `_invoke` itself (process spawn, stream
 parsing, cgroup enrollment) still needs a stub or live `claude` binary and
 lives in a separate end-to-end tier.
+The `claude_p`/`main()` routing seam for terminal auth failures (DESIGN §6
+credential strategy) — distinct from the classifier-only coverage of
+`_is_terminal_auth_failure` itself — is tested in
+`tests/test_terminal_auth_routing.py` using the same stubbed-`_invoke`
+harness as `test_no_result_event_retry.py`: the terminal-auth envelope
+(`Failed to authenticate: OAuth session expired and could not be
+refreshed`) causes exactly one `_invoke` call and completes in well under
+a second, proving the 300s auth/quota tenacity budget is never entered;
+the raised exception is `TerminalAuthFailure`, not `WorkerError`, and its
+message never blames schema validation; `main()`'s `except
+TerminalAuthFailure` handler is checked by source-coupling
+(`inspect.getsource(leerie.main)`, mirroring `test_signal_cleanup.py`'s
+`_main_body` approach) to set `exit_code = EXIT_LOCKED`, call
+`_cleanup_on_abnormal_exit(st, full_purge=False)`, set `abnormal = False`,
+and surface a `--resume` hint; a control case pins that 401/429/529
+envelopes whose auth/quota backoff budget exhausts still raise
+`WorkerError`, not `TerminalAuthFailure` — the doc-conformant behavior per
+`docs/IMPLEMENTATION.md` §3 "Auth/quota backoff" after commit `2652319`
+reverted an over-application of the terminal-auth reroute to that
+transient case; and a source-coupling check that `_is_terminal_auth_failure`
+is consulted before `_is_auth_or_quota_failure` inside `claude_p`.
 
 ## Task completion checklist
 
