@@ -150,6 +150,12 @@ try:
     expires_at = float(expires_at_ms) / 1000.0
 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     sys.exit(0)
+# A negative epoch predates 1970 -- no real OAuth token has ever
+# carried one, so this is garbage data, not a genuinely-expired
+# credential. Treat it the same as absent/non-numeric: proceed
+# silently rather than refusing on an obviously-bogus timestamp.
+if expires_at_ms < 0:
+    sys.exit(0)
 
 remaining = expires_at - time.time()
 if remaining <= 0:

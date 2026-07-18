@@ -169,6 +169,17 @@ def test_missing_claude_ai_oauth_key_proceeds_silently(tmp_path: Path) -> None:
     assert err == ""
 
 
+def test_negative_expires_at_proceeds_silently(tmp_path: Path) -> None:
+    """A negative epoch-ms predates 1970 -- no real OAuth token has ever
+    carried one, so it's garbage data, not a genuinely-expired
+    credential. Must not be treated as "expired" (which would refuse
+    to launch on bogus input)."""
+    rc, out, err = _run_ttl_check(tmp_path, _blob(-1000))
+    assert rc == 0
+    assert out == ""
+    assert err == ""
+
+
 # ---------------------------------------------------------------------------
 # The threshold is a local, named constant (never a hard-coded 8h)
 # ---------------------------------------------------------------------------
