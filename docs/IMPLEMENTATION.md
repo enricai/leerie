@@ -643,7 +643,7 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$LEERIE_HOME` (leerie install dir) | `/opt/leerie-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
 | `$STAGE/.claude.json` (per-run host scratch) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with the `projects[]` block stripped. The host file is never directly mounted into a container: the shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226 — all open) that hangs workers in a recovery loop with no backoff. Each container writes only its private copy. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + sibling JSON, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/` and `plugins/marketplaces/` are rebuilt on the remote in the fly runtime; see `scripts/remote/seed-auth.sh` step 4 (`# --- 4. Rebuild plugin cache`). |
-| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher's `_extract_claude_credentials_json` helper resolves "where do Claude OAuth credentials live on this host" via a single fallback chain — Keychain (service `Claude Code-credentials`, via `security find-generic-password -w`, macOS only), then `$HOME/.claude/.credentials.json` on disk, then `$CLAUDE_CODE_OAUTH_TOKEN` synthesized into the same JSON shape — and writes it to the staged path with mode 600. The Linux CLI reads exactly that path, so both platforms use the same file-based auth flow inside the container. Single source of truth: the same helper is called from the `--chain` arm to populate `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` key (base64-encoded), so chain workers receive identical credentials without a separate Keychain probe. |
+| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher's `_extract_claude_credentials_json` helper resolves "which Claude OAuth credential should this run use" via a fallback chain **inverted** from its historical order (see DESIGN §6 *Credential strategy* for the rationale — a container cannot refresh a copied token, and refreshing would rotate the host's own refresh token out from under it): `$CLAUDE_CODE_OAUTH_TOKEN` (the long-lived `claude setup-token` token) **first** when set, synthesized into `{"claudeAiOauth":{"accessToken":…}}`; then Keychain (service `Claude Code-credentials`, via `security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json` on disk. All three branches write the same JSON shape to the staged path with mode 600, matching what `seed-auth.sh` stages on the Fly.io path — the emitted shape is unaffected by which branch resolved the credential. The Linux CLI reads exactly that path, so both platforms use the same file-based auth flow inside the container. A user who sets nothing is unaffected: resolution falls through to Keychain then the file exactly as before the inversion. Single source of truth: the same helper is called from the `--chain` arm to populate `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` key (base64-encoded), so chain workers receive identical credentials without a separate Keychain probe. |
 | `$STAGE/.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc` (per-run host scratch) | `/home/leerie/.<same>` | rw | Per-container copies of each present host `~/.git*` sibling and `~/.netrc`. Worker can `git config --local` / mutate freely without affecting host state. |
 | `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` | rw | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
 | `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` | rw | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
@@ -1506,7 +1506,14 @@ orchestrator already owns. Two code-surface elements implement this:
   signal, not an error. Caller-side handlers print a
   `leerie --resume <run-id>` hint via `log()` before exiting (the
   launcher's smart-router will then attach to the live stream
-  rather than spawn a duplicate).
+  rather than spawn a duplicate). Originally reachable only from
+  this section's own-instance-already-running refusal (a
+  should-never-happen case under normal operation); the out-of-credits
+  pause (§3 above) and, as of `_is_terminal_auth_failure`, an
+  expired-session/not-logged-in auth failure are newly reachable
+  sources — both are routine, not should-never-happen, and both share
+  the same worktree-only-cleanup + `--resume`-picks-back-up contract.
+  See §3 *Terminal auth failure* and DESIGN §6 *Credential strategy*.
 - `StateLockedError` exception in `orchestrator/leerie.py`. Raised
   by `State.__init__` when `fcntl.flock(LOCK_EX | LOCK_NB)` on the
   run-directory fd fails with `BlockingIOError`. The exception
@@ -3115,6 +3122,46 @@ The classifier and the budget constant (`auth_retry_max_sec`) live in
 `leerie.py`; the budget is in §6 *Code-enforced caps*. The non-auth
 `is_error` path is unchanged — schema parse failures stay immediate.
 
+#### Terminal auth failure
+
+`_is_terminal_auth_failure(envelope)` is checked in `claude_p()` **before**
+`_is_auth_or_quota_failure` — an expired or revoked session is a
+different failure class from a rejected-but-recoverable request, and
+must never enter the tenacity backoff loop above at all (see DESIGN §6
+*Credential strategy* / *Cleanup on abnormal exit*'s transient-vs-terminal
+split for the rationale: Claude Code sends no further request once it
+detects an expired session, so retrying is guaranteed to fail
+identically every time and only burns the `auth_retry_max_sec` budget).
+
+It mirrors `_is_auth_or_quota_failure`'s gating discipline: `False` unless
+`envelope["is_error"]` is truthy; `False` for any envelope carrying
+`_leerie_synthetic` (worker prose can never reach `result` on those —
+only the no-result-event synthetic path can, and that is handled
+separately above; text-matching a leerie-authored envelope for a
+gateway-shaped message is wrong by construction, same reasoning as the
+auth/quota classifier). On a genuine (non-synthetic) `is_error`
+envelope, it lowercases `result` and matches any of four substrings:
+`"failed to authenticate"`, `"oauth session expired"`, `"session expired
+and could not be refreshed"`, `"not logged in"`. Measured against 611
+historical `is_error` envelopes: these four markers matched 215 true
+positives and 0 false positives. The second marker is intentionally the
+full phrase `"oauth session expired"` rather than the shorter `"oauth"`
+— that shorter substring appears 2919 times across worker `tool_result`
+blocks in the same corpus and would misclassify ordinary worker output
+discussing OAuth.
+
+A match raises immediately (never entering `_is_auth_or_quota_failure`'s
+tenacity loop) into the same resumable-pause arm out-of-credits already
+uses: `main()` runs `_cleanup_on_abnormal_exit(st, full_purge=False)`
+(worktree-only cleanup, state and branches preserved), logs a `leerie
+--resume <id>` hint, and exits `EXIT_LOCKED` (75) rather than `WorkerError`
+→ exit 1. This also replaces the prior behavior at the auth-exhaustion
+exit point (§3 above, `claude_p()`'s budget-exhausted `WorkerError`):
+that path previously surfaced as "worker failed schema-valid output
+twice," misattributing an auth failure to a schema problem, and exited
+non-resumably. `_is_terminal_auth_failure` and the budget constant live
+alongside `_is_auth_or_quota_failure` in `leerie.py`.
+
 `WorkerError` handling by worker type — per DESIGN §7's salvage rule
 ("salvage if there is something to salvage; abort cleanly otherwise"):
 - **implementer** — `run_implementer()` catches it, converts to an
@@ -3891,6 +3938,13 @@ The old `reset_at=None → exit 75 manual-resume` behavior is gone for
 rate-limits (they auto-resume), but out-of-credits deliberately
 preserves the surface-and-pause semantics for the reason above.
 
+A terminal auth failure (`_is_terminal_auth_failure`, §3 *Terminal auth
+failure*) copies this exact arm verbatim: `_cleanup_on_abnormal_exit(st,
+full_purge=False)`, a `--resume` hint, `exit_code = EXIT_LOCKED`,
+`abnormal = False`. Like out-of-credits, an expired session has no
+clock-based reset, so it takes the surface-and-pause disposition rather
+than `_sleep_then_reexec`'s auto-resume path.
+
 **Auto-resume override persistence.** The re-exec passes only
 `--resume <id>` as argv — any CLI overrides on the original
 launch (`--model`, `--max-workers`, `--max-parallel`, `--confidence-rounds`,
@@ -4076,7 +4130,8 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` via `_auto_worker_memory_max` (VM RAM split across `max_parallel + 1` slots, **floored** at 8 GiB — no upper clamp; the prior 4 GiB clamp sat below the measured ~6.3 GiB build+resident-claude peak, so no VM size could auto-derive enough for a build-running worker, see DESIGN §6 *Memory containment*), or `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml`. Suffixes K/M/G/T accepted. The aggregate `leerie.slice/memory.max` cap (row below) is the real VM-OOM backstop, so this per-worker floor can be generous — but build-heavy waves should pair it with a lower `--max-parallel` so concurrent capped workers don't collectively exceed the slice cap | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Enforcement goes through the **cgroup broker** (`scripts/cgroup-broker.py`), which the dropped-privilege orchestrator drives over a Unix socket — worker enrollment and limit-setting cannot be done from the orchestrator's own identity (a subtree merely `chown`ed after creation keeps its controller limit files root-owned; cross-scope migration needs common-ancestor write; both reproduced). The broker creates `<V2_ROOT>/leerie.slice/leerie-w-<sid>` (cgroup **v2** — `V2_ROOT` is the literal `/sys/fs/cgroup` rootful/Fly, or the systemd-delegated user slice under rootless containerd via `LEERIE_CGROUP_V2_ROOT`, DESIGN §6 *Rootless exception*) or the split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT` (cgroup **v1/hybrid**, e.g. some Fly VMs, never rootless) and sets its `memory.max`. Local nerdctl needs the launcher's cgroup bind-mount — `bind-propagation=rshared` rootful, a plain bind (no propagation flag) rootless — + `--cgroupns=host` (default `--cgroupns=private` + `nsdelegate` blocks migration even for the broker); Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy — the true test of the worker path — and `enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 1024, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees while still admitting a legitimate heavy conformance run. Sized against measurement (DESIGN §6 *Detecting PID exhaustion*): leerie's own suite peaks at 33 concurrent PIDs, so 1024 sits ~30× above the workload and a worker near it is leaking rather than testing — which is what the mid-run reaper's critical tier acts on. Raise it per-repo for suites heavier than the 1024 default. |
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. **Intentional provenance deviation:** unlike the per-worker cap, there is *no* CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint *before* the Python orchestrator (and its resolver machinery) starts, so a Python-side resolver could not set it in time; the env var is the single override knob. Best-effort: any read/write failure leaves the slice uncapped (prior behavior). Sets `memory.max` (RAM) only, not `memory.swap.max` — a capped slice may swap before the cgroup OOM fires, which still contains the pressure to the slice (no global OOM); bounding total RAM+swap via `memory.swap.max` is a possible future refinement. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container* (per-worker `-998` protection is only relative within the slice), instead of a VM-wide *global* OOM that would kill unprotected host-session processes — the `nerdctl` client especially — and orphan the container (wedging the run-dir flock). See DESIGN §6 *container boundary's hidden precondition*. |
-| auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. |
+| auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. Terminal auth failures (`_is_terminal_auth_failure`, below) never reach this loop. |
+| credential near-expiry warning threshold (`credential_expiry_warn_sec`, proposed 90 min) | 5400 s (90 min) | Launcher-side preflight (`leerie:5351`, staging block) run only when the resolved credential is a *subscription* token — the long-lived `$CLAUDE_CODE_OAUTH_TOKEN` has no `expiresAt` and is exempt. Parses `claudeAiOauth.expiresAt` (ms epoch) from the resolved JSON and compares to now, reusing the pattern at `scripts/remote/aws-credentials.sh:183-196`. Already expired → refuse to launch, print `claude /login`. Inside the threshold → warn with the exact expiry and point at `claude setup-token`, but still launch. `expiresAt` absent or malformed → proceed silently — this is a best-effort diagnostic, never a hard gate, since the 1-year token legitimately has no `expiresAt` at all. See DESIGN §6 *Credential strategy*. Never hard-code a TTL duration (community reports for the subscription token range 2–15h); `expiresAt` is the sole source of truth. |
 | mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator. The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings. CRITIC pattern (ICLR 2024). A round that raises `WorkerError` (infrastructure: PID exhaustion, OOM, a killed session) is retried against the same budget — the re-invocation is a fresh `claude -p` session with a clean PID table — and only returns `None` if every round crashes. Any other exception is a leerie bug, not a flaky worker, and still abandons the loop immediately. |
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
 | implementer confidence retries (`implementer_confidence_retries`) | 2 | Separate from `subtask_continuations`. Orchestrator checks confidence scores + scope drift + unmet criteria on complete results and re-invokes as a continuation if issues found. |
@@ -6316,6 +6371,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `started_at` | ISO-8601 str | wall-clock time at run start |
 | `finished_at` | ISO-8601 str | wall-clock time at successful finalize |
 | `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `schedule()` returns and **before** `check_budget_feasibility` / `validate_plan` — both of which `die()`. Without it a plan that fails either gate is lost entirely (`write_plan` never runs), discarding the planner/fit_judge/splitter spend that produced it. Diagnostic/audit only: no orchestrator code reads it back, and it is deliberately *not* `write_plan`, which would also emit per-subtask spec files and seed the execution scaffolding for a run that cannot start. |
+| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `recursive_decompose`, so a mid-decomposition `WorkerError` (a `fit_judge` call, an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Same diagnostic-only caveat as `plan_snapshot`: nothing reads it back in this change; wiring `--resume` to rehydrate mid-decomposition progress from it is separate, not-yet-shipped work. |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
