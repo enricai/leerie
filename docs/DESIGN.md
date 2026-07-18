@@ -744,6 +744,8 @@ split mechanism therefore separates by structural type:
 
 ```
 conf = fit_judge(subtask)                         # P1 confidence, measured discriminating
+                                                  # WorkerError on the judge call → degrade
+                                                  # to leaf, same as the two guards below
 if conf >= 0.70 or depth >= MAX_DEPTH(5):
     return [subtask]                              # leaf
 children = split(subtask)                         # code-partition (migration) or
@@ -758,6 +760,20 @@ Bounds: `DEFAULT_CAPS["decompose_max_depth"] = 5`,
 `DEFAULT_CAPS["decompose_fit_threshold"] = 0.70` (measured),
 `DEFAULT_CAPS["decompose_noprogress_rounds"] = 2`. Every judge/split call
 passes through `st.bump_workers` — a runaway tree hits the worker-cap backstop.
+
+**A `fit_judge` `WorkerError` degrades to leaf**, the same disposition the
+depth cap and the no-progress guard above already reach when they cannot
+establish a confident split: an infrastructure failure mid-judgment (an
+auth failure, a killed session, PID exhaustion) is uncertainty about
+*this* node, not a reason to discard every fit/split decision the run
+has already paid for elsewhere in the tree. See *Credential strategy*
+in §6 for why this crash barrier matters in practice — decomposition
+routinely accounts for a large share of a run's total planning spend, so
+losing it to a single transient worker failure is expensive. `phase_plan`
+snapshots decomposition progress into state as each top-level subtask
+finishes expanding, mirroring how `plan_snapshot` already persists the
+plan after `schedule()`; like `plan_snapshot`, this is diagnostic only —
+nothing reads it back on `--resume` in this change.
 
 ### Wire-in to `phase_plan`
 
@@ -1425,6 +1441,135 @@ checkpoints) is also kept as an audit trail. A user who wants to
 completely scrub a finished run can do so with
 `scripts/cleanup.sh --run-id <id> --branches`.
 
+### Credential strategy
+
+**A containerized headless run must prefer the long-lived token.** The
+host's interactive Claude Code session authenticates with a short-lived
+subscription OAuth token — corroborated at roughly 8h, though the exact
+TTL is undocumented and community reports range 2–15h, so leerie never
+hard-codes a duration; it reads the credential's own `expiresAt` field,
+which is authoritative per-token. That token is refreshable, but only by
+the interactive host session that owns it: Claude Code renews it
+silently in the background while the user is logged in.
+
+A leerie container cannot participate in that renewal. Per *Finalization*
+above, Keychain and `~/.claude/.credentials.json` never traverse the
+Lima VM boundary directly — the launcher instead copies whatever
+credential it resolves into a fresh `mktemp -d` staging directory and
+bind-mounts that staging dir read-through into the container. What the
+container holds is therefore a **snapshot**, not a live view: it cannot
+refresh a token whose refresh state lives in the host's Keychain, and
+Anthropic's refresh flow **rotates the refresh token on every use** — so
+even if a container-side refresh somehow succeeded, it would silently
+invalidate the host's own copy out from under the still-running
+interactive session. Copied subscription credentials are documented
+upstream as not refreshing at all once removed from their original
+context (anthropics/claude-code#21765). Container-side token refresh is
+therefore **architecturally impossible**, not merely unimplemented, and
+is explicitly out of scope for any fix here.
+
+The credential Anthropic's own docs prescribe for exactly this situation
+is the **long-lived OAuth token** minted by `claude setup-token` — a
+token that lasts roughly a year, is meant for CI/automation contexts
+where interactive login isn't available, and — critically — **still
+authenticates against the user's Claude subscription rather than the
+API**, so it preserves leerie's no-API-key constraint (the run continues
+to bill against the subscription plan, not pay-per-token API usage).
+Anthropic's own error reference states that sessions authenticated via
+`CLAUDE_CODE_OAUTH_TOKEN` (or an API key, or a third-party provider)
+never see the "OAuth session expired" failure at all, because they never
+depend on the saved, host-refreshed login. A container invoked with
+`$CLAUDE_CODE_OAUTH_TOKEN` set is therefore immune to the mid-run
+expiry class of failure by construction, not by any retry or backoff
+leerie adds on top.
+
+Consequently, credential resolution takes `$CLAUDE_CODE_OAUTH_TOKEN`
+**first**, ahead of Keychain and the credentials file. This is an
+inversion of the historical precedence (which resolved Keychain, then
+the file, then the env var) — the historical order silently preferred
+the 8h token even when a user had gone to the trouble of minting a
+durable one. A user who has set nothing is unaffected: resolution falls
+back to Keychain, then the file, exactly as before. The emitted JSON
+shape is unchanged regardless of which branch resolved the credential
+(`{"claudeAiOauth":{"accessToken":…}}`), matching what `seed-auth.sh`
+already stages into the container's `~/.claude/.credentials.json`.
+
+**The expiry preflight is best-effort, not a hard gate.** Before staging
+a resolved *subscription* credential (the long-lived token has no
+`expiresAt` and is exempt from this check entirely), leerie parses
+`claudeAiOauth.expiresAt` and compares it to the current time, mirroring
+the pattern already proven for AWS SSO token freshness in
+`scripts/remote/aws-credentials.sh`:
+
+- **Already expired** → refuse to launch and print `claude /login` as
+  the fix, rather than starting a run doomed to fail at worker #1.
+- **Inside a near-expiry threshold** (proposed 90 minutes — long enough
+  to cover realistic run durations without false-alarming on every
+  launch) → warn with the credential's exact expiry time and point at
+  `claude setup-token` as the durable fix, but still launch. A short run
+  may well finish before the token dies.
+- **`expiresAt` absent or malformed** → proceed silently. The 1-year
+  token has no `expiresAt` field at all, and a best-effort freshness
+  check must never harden into a hard requirement for a field that
+  legitimately may not be present — doing so would turn a diagnostic
+  aid into a new way to break the exact non-expiring credential this
+  whole strategy exists to prefer.
+
+**Auth failures split into two classes with different remedies.**
+`_is_auth_or_quota_failure` (see *Cleanup on abnormal exit* below for
+the full rate-limit/quota taxonomy) already treats numeric 401/429/529
+statuses as **transient**: the gateway rejected one request, but a
+retry after backoff has a real chance of succeeding once the rolling
+usage window clears or gateway overload subsides. An expired or revoked
+*session* is categorically different — Claude Code's own error handling
+clears the saved credential locally and, per Anthropic's docs, **sends
+no further request at all** once it detects that state. Backing off and
+retrying against a session that will never renew itself burns the full
+`auth_retry_max_sec` budget on requests that are guaranteed to fail
+identically to the first — this is precisely the `b57027d3…` incident's
+D2 defect: two retries fired 1.2s apart, both against the same dead
+session, before the run gave up with a schema-error message that
+misattributed an auth failure to something else entirely.
+
+The fix is a **terminal** auth-failure class, checked before the
+transient classifier ever runs: envelope text carrying "failed to
+authenticate," "oauth session expired," "session expired and could not
+be refreshed," or "not logged in" (measured against 611 historical
+`is_error` envelopes: these markers matched 215 true positives and 0
+false positives) never enters the backoff loop. It raises immediately
+into the same **resumable pause** leerie already uses for
+out-of-credits (`EXIT_LOCKED`, exit 75) — worktree-only cleanup, no
+purge of state or branches, a `leerie --resume <id>` hint logged. This
+is the correct disposition for exactly the same reason out-of-credits
+is: like a billing shortfall, an expired session does not resolve on a
+clock, so auto-resume would spin uselessly; unlike a `die()` for a
+genuine configuration error, the run's completed work (78 successful
+workers, in the incident that motivated this) is fully preserved and
+picked back up on `--resume` once the operator runs `claude /login` or
+sets `CLAUDE_CODE_OAUTH_TOKEN` — the same long-lived-token launch this
+section already recommends structurally avoids the failure in the first
+place.
+
+**Decomposition needs the same discipline against the loss of
+in-progress spend.** §5½ (P1)'s `fit_judge` call has no crash barrier
+today: a single `WorkerError` mid-decomposition (an auth failure, a
+transient gateway error, a PID exhaustion) discards every fit/split
+judgment already paid for on that planning pass, not just the one node
+being judged — this is the same class of loss D3 measured in the
+motivating incident, where decomposition was 27.8% of the run's total
+spend. The remedy mirrors two disciplines `recursive_decompose` already
+applies: a `fit_judge` `WorkerError` degrades that node to a **leaf**,
+exactly as the existing depth-cap and no-progress-guard cases already
+resolve uncertainty by accepting the node as-is rather than raising; and
+`phase_plan` snapshots decomposition progress into state as each
+top-level subtask finishes expanding, the same way `plan_snapshot`
+already persists the post-`schedule()` plan. Like `plan_snapshot`, this
+decomposition snapshot is **diagnostic only** in this change — nothing
+reads it back, and wiring `--resume` to rehydrate mid-decomposition
+progress from it is a separate, not-yet-shipped capability. Overclaiming
+resumability this change does not implement would be worse than not
+documenting the snapshot at all.
+
 ### Cleanup on abnormal exit
 
 A run can end abnormally four ways: the user hits Ctrl-C, an external
@@ -1435,6 +1580,25 @@ orchestrator runs a cleanup pass before exiting, and the cleanup
 *scope* is uniformly conservative — **state and branches are always
 preserved**; only worktrees are torn down. The run is always
 resumable via `--resume <id>` after any abnormal exit.
+
+**Auth failures split into transient and terminal, and only one of
+them benefits from backoff.** 401/429/529 — a rejected request against
+a still-valid session, whether from the rolling subscription cap or
+transient gateway overload — is **transient**: the session itself is
+fine, so retrying after backoff has a real chance of success once the
+window clears, and that case is handled by the existing auth/quota
+retry loop (`_is_auth_or_quota_failure`, see the rate-limit taxonomy
+below). An expired or revoked session — "OAuth session expired,"
+"failed to authenticate," "not logged in" — is **terminal**: per
+Anthropic's docs, once Claude Code detects this state it clears the
+saved credential and sends no further request at all, so every retry
+against it fails identically to the first and backoff only burns the
+`auth_retry_max_sec` budget for no benefit (see *Credential strategy*
+above). Terminal auth failures are therefore checked *before* the
+transient classifier and routed straight to the same resumable pause
+(`EXIT_LOCKED`, exit 75) used for out-of-credits below — worktree-only
+cleanup, state and branches preserved, `--resume` picks back up once
+the operator re-authenticates.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
