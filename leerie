@@ -67,12 +67,23 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 
 # Extract the host's Claude OAuth credentials JSON for forwarding to
 # a worker. Single source of truth for "where do creds live on this
-# host": macOS Keychain (service "Claude Code-credentials") first;
-# Linux / Keychain-miss fall back to ~/.claude/.credentials.json on
-# disk; final fall back is the $CLAUDE_CODE_OAUTH_TOKEN env var, in
-# which case we synthesize the minimal {claudeAiOauth.accessToken}
-# JSON shape that the CLI reads on Linux (same shape seed-auth.sh
-# constructs in its fallback path).
+# host": $CLAUDE_CODE_OAUTH_TOKEN env var first — a long-lived (1-year)
+# token minted by `claude setup-token`, in which case we synthesize the
+# minimal {claudeAiOauth.accessToken} JSON shape that the CLI reads on
+# Linux (same shape seed-auth.sh constructs in its fallback path); then
+# macOS Keychain (service "Claude Code-credentials"); final fall back is
+# ~/.claude/.credentials.json on disk.
+#
+# This precedence matches the authentication docs
+# (https://code.claude.com/docs/en/authentication), which rank
+# CLAUDE_CODE_OAUTH_TOKEN (#5) above subscription OAuth credentials
+# (#6) for exactly this case: a container holds a snapshot of the
+# subscription token that it cannot refresh (no interactive host
+# session, and refreshing rotates the host's copy out from under it),
+# while the env-var token is long-lived and was designed for headless
+# automation. Preferring it here removes the failure mode rather than
+# handling it — see docs/DESIGN.md §6. Users who set nothing are
+# unaffected: Keychain/file resolution below is unchanged.
 #
 # Used by:
 #   - the STAGE-assembly block (sources $STAGE/.claude/.credentials.json
@@ -86,21 +97,91 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # Prints the JSON to stdout. Returns 0 if creds were found, 1 otherwise.
 _extract_claude_credentials_json() {
   local creds=""
-  if [ "$(uname -s)" = "Darwin" ]; then
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    creds="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
+                    "$CLAUDE_CODE_OAUTH_TOKEN")"
+  fi
+  if [ -z "$creds" ] && [ "$(uname -s)" = "Darwin" ]; then
     creds="$(security find-generic-password -s "Claude Code-credentials" \
                 -w 2>/dev/null || true)"
   fi
   if [ -z "$creds" ] && [ -s "$HOME/.claude/.credentials.json" ]; then
     creds="$(cat "$HOME/.claude/.credentials.json")"
   fi
-  if [ -z "$creds" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    creds="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
-                    "$CLAUDE_CODE_OAUTH_TOKEN")"
-  fi
   if [ -z "$creds" ]; then
     return 1
   fi
   printf '%s' "$creds"
+}
+
+# Preflight the TTL of a resolved Claude credentials JSON blob (as
+# returned by _extract_claude_credentials_json) before staging it into
+# a container that cannot refresh it. Only the subscription OAuth
+# token carries an expiry (claudeAiOauth.expiresAt, ms-epoch); the
+# long-lived CLAUDE_CODE_OAUTH_TOKEN synthesizes no such field, so this
+# is a no-op for the now-preferred path. Never hard-code a TTL —
+# community reports for the subscription token range 2-15h; expiresAt
+# is the only authoritative value.
+#
+# Reuses the epoch-comparison pattern proven at
+# scripts/remote/aws-credentials.sh:183-196, adapted for ms-epoch
+# (claudeAiOauth.expiresAt) instead of ISO-8601
+# (AWS SSO cache's expiresAt).
+#
+# Args: $1 = credentials JSON blob.
+# Behavior:
+#   - expiresAt in the past: refuse (rc 1), print `claude /login`.
+#   - expiresAt within _CLAUDE_TTL_WARN_THRESHOLD_SEC: warn (rc 0),
+#     naming the exact expiry and `claude setup-token` as the durable
+#     fix.
+#   - expiresAt absent/malformed, or healthy: silent (rc 0). Never
+#     harden this best-effort path into a hard gate on missing data.
+_CLAUDE_TTL_WARN_THRESHOLD_SEC=$((90 * 60))
+_check_claude_credential_ttl() {
+  local creds="$1" status
+  status="$(python3 - "$creds" "$_CLAUDE_TTL_WARN_THRESHOLD_SEC" <<'PY'
+import json
+import sys
+import time
+
+blob, threshold_sec = sys.argv[1], int(sys.argv[2])
+try:
+    expires_at_ms = json.loads(blob)["claudeAiOauth"]["expiresAt"]
+    expires_at = float(expires_at_ms) / 1000.0
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+remaining = expires_at - time.time()
+if remaining <= 0:
+    print("expired")
+elif remaining <= threshold_sec:
+    print(f"warn:{expires_at_ms}")
+PY
+  )"
+  case "$status" in
+    expired)
+      echo "leerie: error: the resolved Claude credential has expired." >&2
+      echo "  A container cannot refresh a host subscription OAuth token — run" >&2
+      echo "  'claude /login' on the host to renew it, or export a long-lived" >&2
+      echo "  CLAUDE_CODE_OAUTH_TOKEN (see 'claude setup-token')." >&2
+      return 1
+      ;;
+    warn:*)
+      local expires_at_ms="${status#warn:}"
+      local expiry_human
+      expiry_human="$(python3 -c \
+        "import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) / 1000.0, datetime.timezone.utc).isoformat())" \
+        "$expires_at_ms" 2>/dev/null || echo "$expires_at_ms")"
+      echo "leerie: warning: the resolved Claude credential expires soon ($expiry_human)." >&2
+      echo "  A container cannot refresh a host subscription OAuth token. For" >&2
+      echo "  long headless runs, generate a durable one-year token with" >&2
+      echo "  'claude setup-token' and export it as CLAUDE_CODE_OAUTH_TOKEN." >&2
+      return 0
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 # Read stdin and emit a base64-encoded string (no newlines). Used by
@@ -5350,6 +5431,7 @@ fi
 # CLAUDE_CODE_OAUTH_TOKEN env-var bridge so workers still authenticate.
 if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
    && [ -n "$_CLAUDE_CREDS_JSON" ]; then
+  _check_claude_credential_ttl "$_CLAUDE_CREDS_JSON" || exit 1
   printf '%s' "$_CLAUDE_CREDS_JSON" >"$STAGE/.claude/.credentials.json"
   chmod 600 "$STAGE/.claude/.credentials.json"
   unset _CLAUDE_CREDS_JSON
