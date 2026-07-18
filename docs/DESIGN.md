@@ -4476,12 +4476,32 @@ unknown that determines how much budget the rest of the run will
 consume is resolved: the final subtask count is fixed, the wave count
 is computed (deterministically, by Kahn's algorithm over the
 dependency graph — no LLM call), the planner-domain count is settled,
-and the upstream phases (classify, provision, plan, reconcile,
-overlap-judge) have already been billed into `worker_count`. A
+and every upstream phase has already been billed into `worker_count`
+— classify, provision, plan, reconcile, overlap-judge, *and* the
+per-subtask phases that are easy to forget: the P1 decomposition
+(`fit_judge` / `splitter`) and the phase-3 `satisfied_probe`. Those
+two are often the *majority* of upstream spend: one measured run
+billed 10 `fit_judge` + 10 `satisfied_probe` calls out of 25 total. A
 feasibility check at this point can estimate the remaining cost
 (implementer + conformer per subtask, integrator per wave, finalize)
 with no free variables beyond the per-subtask call multiplier, which
 is well-bounded empirically.
+
+**Why the gate cannot move earlier, even though the satisfied-probe
+spends first.** The probe runs before `schedule()`, so its per-subtask
+calls are billed before this gate can fire — which reads oddly against
+"cheapest moment". Moving the gate earlier, or adding a pre-probe
+guard, was measured and rejected: the probe *drops* subtasks, and
+`schedule()` merges the post-drop plans, so anything running before it
+sees a **pre-drop** count. Measured across real runs, drops shrink a
+plan by a median ~32% (up to 50%), so a pre-probe guard systematically
+over-estimates and would abort runs the real gate passes — a sweep
+found 29 such configurations. A guard conservative enough to be safe
+(assume every subtask is dropped) only fires when upstream spend alone
+nearly exhausts the cap, which is almost never. The ordering is
+therefore deliberate: the gate accepts the probe's spend as the price
+of an accurate post-drop estimate. The `WorkerError` backstop still
+bounds the run either way.
 
 The principle is the same one §12 enumerates: any guarantee that
 matters and can be checked mechanically lives in code. The runtime

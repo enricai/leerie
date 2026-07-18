@@ -106,6 +106,33 @@ def test_summarizer_scenario_dies(leerie, capsys):
     assert "--skip-budget-check" in err
 
 
+def test_die_message_names_the_per_subtask_upstream_phases(leerie, capsys):
+    """The `already spent` attribution must name `fit_judge`/`splitter` and
+    `satisfied_probe`, not just the once-per-run phases.
+
+    Both are per-subtask and routinely dominate upstream spend. Measured on a
+    real failed run (navegando, 2026-07-18): of 25 upstream calls, fit_judge
+    was 10 and satisfied_probe was 10 — the message's original list
+    (classifier / planner / reconciler / overlap-judge / provision)
+    accounted for only the remaining 5, sending the operator to look in
+    entirely the wrong place for their budget.
+    """
+    st = _FakeState(worker_count=8)
+    caps = _default_caps(leerie)
+    with pytest.raises(SystemExit):
+        leerie.check_budget_feasibility(st, caps,
+                                        _make_subtasks(63), _make_waves(10))
+    err = capsys.readouterr().err
+    assert "satisfied_probe" in err, (
+        "die message must name satisfied_probe — it is per-subtask and often "
+        "a large share of already-spent calls"
+    )
+    assert "fit_judge" in err, (
+        "die message must name fit_judge/splitter (P1 decomposition) — also "
+        "per-subtask upstream spend"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Edge: at the boundary, just below the boundary
 # ---------------------------------------------------------------------------

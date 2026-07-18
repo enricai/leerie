@@ -81,6 +81,32 @@ def test_inspect_tools_excludes_bare_bash(leerie):
     )
 
 
+def test_inspect_tools_verbs_all_carry_wildcard(leerie):
+    """Every Bash verb pattern carries `:*` except argument-less `Bash(pwd)`.
+
+    Distinct from test_inspect_tools_excludes_bare_bash above: that guards a
+    bare `Bash` *entry* (the whole tool, unrestricted). This guards a bare
+    `Bash(verb)` *pattern*, which the Claude Code permission docs define as an
+    EXACT-STRING match ("Bash(npm run build) matches the exact command npm run
+    build") — so it permits only the literal zero-argument form and denies
+    every real invocation.
+
+    INSPECT_TOOLS shipped `Bash(git status)` this way: every sibling git verb
+    (`git log:*`, `git show:*`, `git diff:*`, `git branch:*`, `git ls-files:*`)
+    already had the suffix, so `git status` was the lone outlier, silently
+    denying `git status --porcelain` etc. for the classifier, planner,
+    reconciler, overlap-judge, and provision workers.
+    """
+    import re
+    bare = [p for p in re.findall(r"Bash\([^)]*\)", leerie.INSPECT_TOOLS)
+            if ":*" not in p]
+    assert bare == ["Bash(pwd)"], (
+        f"unexpected bare (exact-match) Bash patterns in INSPECT_TOOLS: "
+        f"{bare} — every verb that takes arguments needs the `:*` "
+        "trailing wildcard"
+    )
+
+
 def test_inspect_tools_includes_read_tools(leerie):
     """Read/Grep/Glob still need to be in the bucket — they're the
     primary tools and the Bash patterns are a fallback for cross-cwd

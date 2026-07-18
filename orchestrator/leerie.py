@@ -408,7 +408,7 @@ INSPECT_TOOLS = (
     "Bash(wc:*),Bash(grep:*),Bash(rg:*),Bash(file:*),Bash(stat:*),"
     "Bash(tree:*),Bash(pwd),Bash(echo:*),"
     "Bash(git log:*),Bash(git show:*),Bash(git diff:*),"
-    "Bash(git status),Bash(git branch:*),Bash(git ls-files:*)"
+    "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
 )
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 
@@ -424,11 +424,22 @@ ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 # Only `git show HEAD:<path>`, `git diff`, and `git status` on the current
 # checkout are allowed; the prompt reinforces the same rule (§12: the code
 # constraint is the guarantee, the prompt is documentation).
+#
+# Every verb carries the `:*` trailing-wildcard suffix. A bare `Bash(verb)`
+# is an EXACT-STRING match per the Claude Code permission docs ("Bash(npm run
+# build) matches the exact command npm run build"), so `Bash(git status)`
+# would permit only the literal zero-argument `git status` and deny every
+# real invocation (`git status --porcelain=v1`, `--short`, …). The probe then
+# burns its `claude -p` call, gets "requires approval", and reasons from
+# partial evidence. `Bash(pwd)` is the one deliberate exception: it takes no
+# arguments. (`git -C <dir> status` and compound `a && b` commands remain
+# denied by design — the pattern is prefix-anchored and each subcommand of a
+# compound must match independently.)
 SATISFIED_PROBE_TOOLS = (
     f"{_READ_BASE},"
     "Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*),Bash(grep:*),"
     "Bash(rg:*),Bash(file:*),Bash(stat:*),Bash(pwd),Bash(echo:*),"
-    "Bash(git show HEAD:*),Bash(git diff:*),Bash(git status)"
+    "Bash(git show HEAD:*),Bash(git diff:*),Bash(git status:*)"
 )
 
 # DISALLOWED_TOOLS is the hard-deny list passed via --disallowedTools to
@@ -15668,9 +15679,11 @@ def check_budget_feasibility(st: State, caps: dict,
     The estimate adds the *remaining* call count to the
     *already-spent* `worker_count` (which reflects every upstream
     phase: classifier, provision, planners, reconciler, overlap
-    judge), so the only free variable is the per-subtask multiplier
-    — calibrated empirically and documented at
-    `DEFAULT_CAPS["subtask_call_estimate"]`."""
+    judge, the P1 decomposition's `fit_judge`/`splitter`, and the
+    phase-3 `satisfied_probe` — the last two are per-subtask and are
+    routinely the majority of upstream spend), so the only free
+    variable is the per-subtask multiplier — calibrated empirically
+    and documented at `DEFAULT_CAPS["subtask_call_estimate"]`."""
     if st.data.get("skip_budget_check"):
         return
     cap = caps["max_total_workers"]
@@ -15700,7 +15713,9 @@ def check_budget_feasibility(st: State, caps: dict,
             f"budget infeasible: planner produced {n_subtasks} subtask(s) "
             f"across {n_waves} wave(s); {already_spent} `claude -p` "
             f"call(s) already spent on upstream phases (classifier / "
-            f"planner / reconciler / overlap-judge / provision); "
+            f"planner / reconciler / overlap-judge / provision / "
+            f"fit_judge+splitter / satisfied_probe — the last two are "
+            f"per-subtask and are often most of this total); "
             f"estimated {remaining_estimate:g} more needed "
             f"(implementers + conformers + integrators + pr_writer). "
             f"Total estimate {total_estimate:g} × safety margin {margin} "
