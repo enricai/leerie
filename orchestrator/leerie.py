@@ -177,9 +177,8 @@ DEFAULT_CAPS = {
     # whose `api_error_status` is 401/429/529 or whose result message
     # names an auth/rate-limit failure, `claude_p()` retries with tenacity's
     # `wait_exponential_jitter(initial=15, max=120, jitter=5)` until
-    # this many cumulative seconds have elapsed, then bails naming the
-    # Claude Code subscription cap (a resumable TerminalAuthFailure for
-    # 401/429 exhaustion; a WorkerError for 529, transient overload). 300 s
+    # this many cumulative seconds have elapsed, then bails with a
+    # WorkerError that names the Claude Code subscription cap. 300 s
     # (~4 retries: 15 + 30 + 60 + 120 = 225 s plus jitter) is enough
     # to ride out a brief gateway hiccup but small enough that a real
     # 5-hour subscription cap surfaces to the user quickly rather than
@@ -10160,10 +10159,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             except RetryError as e:
                 # Budget exhausted with the envelope still auth/quota.
                 # Surface the last attempt's envelope so the
-                # subscription-cap TerminalAuthFailure/WorkerError below
-                # fires with accurate context. retry_if_result only
-                # filters results (not exceptions), so last_attempt holds
-                # a result Future — .result() returns the envelope.
+                # subscription-cap WorkerError below fires with
+                # accurate context. retry_if_result only filters
+                # results (not exceptions), so last_attempt holds a
+                # result Future — .result() returns the envelope.
                 envelope = e.last_attempt.result()
 
             if _is_auth_or_quota_failure(envelope):
@@ -10176,14 +10175,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                         f"after ~{auth_retry_max_sec}s of retries — the "
                         "Anthropic gateway is under transient load. Run "
                         "--resume to retry.")
-                # 401/429 exhaustion: waiting longer within this process
-                # will not help — the subscription's rolling usage cap
-                # clears on its own clock, not by retrying harder. Raise
-                # TerminalAuthFailure (not WorkerError) so main() routes
-                # this to the resumable EXIT_LOCKED pause instead of
-                # exit(1); the message here already advised --resume, but
-                # exit(1) never honored that hint.
-                raise TerminalAuthFailure(
+                raise WorkerError(
                     "Claude API returned auth/quota error after "
                     f"~{auth_retry_max_sec}s of retries — your Claude "
                     "Code subscription likely hit its rolling usage "
@@ -20045,10 +20037,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_message = str(e)
         exit_code = 1
     except TerminalAuthFailure as e:
-        # Expired/absent OAuth session (`claude /login` required) or an
-        # exhausted 401/429 auth/quota backoff — neither recovers by
-        # waiting or retrying, so this is a resumable pause, not a hard
-        # failure. Copied verbatim from the RateLimitedExit
+        # Expired/absent OAuth session (`claude /login` required) —
+        # unlike the transient 401/429/529 case, Claude Code sends no
+        # further request once it detects this state, so no amount of
+        # waiting or retrying recovers it. This is a resumable pause, not
+        # a hard failure. Copied verbatim from the RateLimitedExit
         # out_of_credits=True arm just below: worktree-only cleanup
         # (state + run branch preserved), a --resume hint, and
         # EXIT_LOCKED — the launcher's preserve-state pause pivot.

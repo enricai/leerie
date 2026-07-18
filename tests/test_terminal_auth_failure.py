@@ -27,10 +27,10 @@ Covers:
     twice" WorkerError)
   - main()'s TerminalAuthFailure handler exits EXIT_LOCKED (75), not 1
   - 401/429/529 envelopes still route to the existing backoff loop
-    unchanged
-  - the auth/quota backoff-exhaustion path (401/429) now raises
-    TerminalAuthFailure too, routing through the same resumable pause
-    instead of exit(1)
+    unchanged, and still raise WorkerError -> exit 1 on budget
+    exhaustion (IMPLEMENTATION.md §3 "Auth/quota backoff" — unchanged
+    by this fix; only the terminal classifier match routes to
+    EXIT_LOCKED)
 """
 from __future__ import annotations
 
@@ -304,8 +304,12 @@ def test_numeric_gateway_status_still_enters_backoff(
             sid="fit-judge-numeric",
         )
 
-    with pytest.raises(leerie.TerminalAuthFailure if status != 529
-                        else leerie.WorkerError):
+    # Budget exhaustion still raises WorkerError (unchanged by this fix —
+    # see IMPLEMENTATION.md §3 "Auth/quota backoff"): only the terminal
+    # classifier match (checked before this loop) routes to
+    # TerminalAuthFailure / EXIT_LOCKED. 401/429/529 is the transient
+    # case; a retry has a real chance of success once the window clears.
+    with pytest.raises(leerie.WorkerError):
         asyncio.run(run())
     # The backoff loop must have actually retried (more than the single
     # initial _spawn) before exhausting — proving it entered tenacity's
