@@ -330,3 +330,33 @@ class TestSnapshotSourceCoupling:
             "the fit_judge claude_p call must be followed by "
             "except WorkerError: that degrades to leaf"
         )
+
+    def test_decompose_snapshot_precedes_the_die_gates(self, leerie):
+        """Cross-function ordering, mirroring
+        tests/test_plan_snapshot_wiring.py: decompose_snapshot is written
+        inside phase_plan's expansion loop, and _run_phases calls phase_plan
+        strictly before it calls check_budget_feasibility / validate_plan —
+        the two gates that die() and would otherwise make a discarded
+        decomposition unrecoverable. This is what actually matters for the
+        subtask's intent: the snapshot must exist on disk before either gate
+        can terminate the run, not merely be well-ordered within phase_plan
+        itself."""
+        run_phases_src = inspect.getsource(leerie._run_phases)
+        plan_call = run_phases_src.find("phase_plan(task, st, caps, models, efforts)")
+        budget_gate = run_phases_src.find("check_budget_feasibility(")
+        validate_gate = run_phases_src.find("validate_plan(subtasks)")
+        assert plan_call != -1, "_run_phases must call phase_plan(...)"
+        assert budget_gate != -1, "_run_phases must call check_budget_feasibility"
+        assert validate_gate != -1, "_run_phases must call validate_plan(subtasks)"
+        assert plan_call < budget_gate, (
+            "phase_plan (which writes decompose_snapshot) must be called "
+            "before check_budget_feasibility — that gate die()s, and the "
+            "snapshot must already be on disk for the decomposition spend "
+            "to be recoverable."
+        )
+        assert plan_call < validate_gate, (
+            "phase_plan (which writes decompose_snapshot) must be called "
+            "before validate_plan — that gate die()s, and the snapshot must "
+            "already be on disk for the decomposition spend to be "
+            "recoverable."
+        )
