@@ -332,8 +332,30 @@ RUN mkdir -p /home/leerie/.local/share/mise \
 # /tmp/.cache/mise/ (via XDG_CACHE_HOME=/tmp/.cache) owned by root:root.
 # On Fly Machines the rootfs preserves this ownership; the leerie user
 # then gets EACCES when `mise install` tries to write its download cache.
-# On local nerdctl runs /tmp is an ephemeral overlay so this is never seen.
-RUN chown -R leerie: /tmp/.cache
+#
+# Chowning to leerie is not enough on its own, and is actively wrong under
+# rootless containerd: container-entry.sh's privilege drop there is
+# `unshare --user --map-user=$(id -u leerie) ...`, which remaps only
+# outer UID 0 -> inner leerie. A directory explicitly chowned to leerie's
+# own (non-zero) UID is NOT covered by that remap, so it appears owned by
+# nobody/65534 to the remapped process — traversable via its mode-755
+# "other" bits (read/execute), but not writable (no write bit for
+# "other"). That silently breaks every OTHER tool that tries to create
+# its own subdir under XDG_CACHE_HOME here (observed for corepack —
+# see COREPACK_HOME below — and for tree-sitter-language-pack's
+# download-cache lock). Chasing each offender down with its own
+# dedicated, separately-mounted cache dir doesn't scale.
+#
+# Fix it once, generally: make /tmp/.cache itself world-writable with the
+# sticky bit — the same posture /tmp itself already has (`drwxrwxrwt`) —
+# so any UID, real or remapped, can create new entries under it
+# regardless of who "owns" the directory. This container is single-tenant
+# (leerie's own processes only), so there is no security cost to the
+# permissive mode; the chown is kept alongside it for the plain
+# rootful/Fly path where UIDs aren't remapped at all.
+RUN chown -R leerie: /tmp/.cache \
+    && chmod -R a+rwX /tmp/.cache \
+    && chmod 1777 /tmp/.cache
 
 # Bake the orchestrator source into the image at /opt/leerie-image/ so the
 # image is self-contained on Fly.io Machines (no host bind mount available).

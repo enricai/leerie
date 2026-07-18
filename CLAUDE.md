@@ -800,6 +800,30 @@ installed-but-incompatible language-pack version lacking `process()`) and
 host-independent and always run, since they are the load-bearing proof
 that the probe fails closed regardless of the local tree-sitter install
 state.
+A related production failure surfaced the root cause for the `/tmp/.cache`
+fix below: `RuntimeError: Download cache lock error: create cache dir
+/tmp/.cache/tree-sitter-language-pack/v1.12.5: Permission denied (os error
+13)`. Root cause (verified live against both the pre-fix and fixed image
+via the real `unshare --user --map-user=$(id -u leerie)` mechanism
+container-entry.sh uses under rootless containerd): that unshare remaps
+only outer UID 0 -> inner leerie, so a directory explicitly chowned to
+leerie's own (non-zero) UID is NOT covered by the remap and
+appears owned by nobody/65534 to the privilege-dropped process: traversable
+via mode-755 "other" bits, but not writable. This is the same bug class
+already hit for corepack (`COREPACK_HOME` above, worked around with its own
+dedicated bind-mounted cache dir rather than fixed at the source) — chasing
+each offending tool down individually doesn't scale, so the fix instead
+makes `/tmp/.cache` itself world-writable with the sticky bit (mirroring
+`/tmp`'s own `drwxrwxrwt`) at both the Dockerfile (build time, the layer
+rootless runs rely on exclusively) and `container-entry.sh` (a runtime
+safety net for the rootful/Fly path, mirroring the existing `chown`
+pattern there). `tests/test_tmp_cache_writable.py` pins both sites
+source-coupled (mirroring `test_rootless_host_uid.py`'s extraction style):
+the Dockerfile's build RUN step and `container-entry.sh`'s rootful-guard
+block both carry `chmod -R a+rwX /tmp/.cache` + `chmod 1777 /tmp/.cache`
+after the existing `chown`, and the runtime chmod specifically lives
+*inside* the `ROOTLESS != true` guard (rootless has no runtime fixup path
+and relies on the image's baked-in mode alone).
 The gate *wiring* itself — as opposed to the probe's own runtime
 contract — is pinned in `tests/test_repo_map_gate_wiring.py` via
 source-coupling assertions (mirroring `test_dep_capture_wiring.py`):

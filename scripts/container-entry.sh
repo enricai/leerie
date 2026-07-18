@@ -178,8 +178,15 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an
   # ephemeral overlay so this is never seen; on Fly the rootfs preserves
   # root ownership and `mise install` fails with EACCES when a repo pins
-  # a runtime version not pre-baked in the image.
+  # a runtime version not pre-baked in the image. Re-applied here (not
+  # just at image build time) as a runtime safety net for whatever state
+  # a persisted Fly rootfs carries in. chmod 1777 mirrors /tmp's own
+  # posture so any tool that creates a new XDG_CACHE_HOME subdir here
+  # just works, without a one-off dedicated cache dir per tool (see the
+  # Dockerfile's fuller explanation next to the matching build-time fix).
   chown -R leerie: /tmp/.cache 2>/dev/null || true
+  chmod -R a+rwX /tmp/.cache 2>/dev/null || true
+  chmod 1777 /tmp/.cache 2>/dev/null || true
 fi
 
 # Fly path: idle as PID 1 so the machine stays up. The orchestrator is
