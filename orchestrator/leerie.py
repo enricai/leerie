@@ -238,6 +238,7 @@ STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
     "plan_snapshot",
+    "decompose_snapshot",
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "answers",
@@ -5015,20 +5016,31 @@ async def recursive_decompose(
         f"{json.dumps(subtask, indent=2)}\n\n"
         "Score this subtask's P1 Task-Context Fit (0–1) and return your verdict."
     )
-    judge_result = await claude_p(
-        system_prompt=sys_prompt,
-        user_prompt=user_prompt,
-        schema_key="fit_judge",
-        cwd=str(repo_root),
-        allowed_tools=INSPECT_TOOLS,
-        max_turns=30,
-        autonomous=False,
-        caps=caps,
-        st=st,
-        model=models.get("fit_judge", MODEL_DEFAULT),
-        effort=efforts.get("fit_judge"),
-        sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
-    )
+    try:
+        judge_result = await claude_p(
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+            schema_key="fit_judge",
+            cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            autonomous=False,
+            caps=caps,
+            st=st,
+            model=models.get("fit_judge", MODEL_DEFAULT),
+            effort=efforts.get("fit_judge"),
+            sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
+        )
+    except WorkerError:
+        # Worker crashed mid-judgment (auth failure, killed session, PID
+        # exhaustion) — degrade to leaf, the same disposition the depth cap
+        # and no-progress guard below already reach when they cannot
+        # establish a confident split. Without this, one WorkerError here
+        # would propagate and discard every fit/split decision already paid
+        # for elsewhere in the tree (DESIGN §6 *Credential strategy*).
+        log(f"recursive_decompose: fit_judge crashed for "
+            f"{subtask.get('id', '?')}; accepting as leaf")
+        return [subtask]
     score: float = judge_result.get("score", 0.0)
 
     # --- leaf check ----------------------------------------------------------
@@ -12280,6 +12292,13 @@ async def phase_plan(task: str, st: State, caps: dict,
             if pid and pid not in leaf_ids:
                 expansion[pid] = leaf_ids
             leaves.extend(expanded)
+            # Diagnostic snapshot after each top-level subtask finishes
+            # expanding — mirrors plan_snapshot's ordering (DESIGN §5½ (P1),
+            # §6 *Credential strategy*). A WorkerError from a later subtask's
+            # fit_judge/splitter call no longer discards the fit/split
+            # decisions already paid for on subtasks that finished first.
+            st.data["decompose_snapshot"] = {"leaves": leaves}
+            st.save()
         plan["subtasks"] = leaves
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), expansion)
