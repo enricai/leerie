@@ -324,13 +324,29 @@ def test_numeric_gateway_status_still_enters_backoff(
 def test_terminal_auth_failure_maps_to_exit_locked(leerie):
     """Source-coupling guard: main()'s except TerminalAuthFailure arm sets
     exit_code = EXIT_LOCKED, mirroring the RateLimitedExit
-    out_of_credits=True arm it was copied from."""
+    out_of_credits=True arm it was copied from.
+
+    Matches the real assignment statement (`exit_code = EXIT_LOCKED`) via
+    AST rather than a bare substring check on the block text — a bare
+    `"EXIT_LOCKED" in block` check is satisfied by this arm's own
+    comments/docstrings (which reference EXIT_LOCKED by name) even if
+    the actual assignment were mutated to a different value, so it
+    would not catch that regression."""
+    import ast
     import inspect
-    src = inspect.getsource(leerie.main)
-    block_start = src.index("except TerminalAuthFailure as e:")
-    block_end = src.index("except RateLimitedExit as e:")
-    block = src[block_start:block_end]
-    assert "EXIT_LOCKED" in block
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(leerie.main))
+    tree = ast.parse(src)
+    handler = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            name = getattr(node.type, "id", None)
+            if name == "TerminalAuthFailure":
+                handler = node
+                break
+    assert handler is not None, "no except TerminalAuthFailure handler found"
+    block = ast.unparse(handler)
+    assert "exit_code = EXIT_LOCKED" in block
     assert "exit_code = 1" not in block
     assert "--resume" in block
 
