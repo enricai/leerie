@@ -85,6 +85,14 @@ def test_terminal_auth_strings_classify_true(leerie, msg):
         {"is_error": True, "result": msg}) is True
 
 
+@pytest.mark.parametrize("msg", [s.upper() for s in _AUTH_STRINGS])
+def test_terminal_auth_strings_classify_true_mixed_case(leerie, msg):
+    """All four markers must match regardless of case — the classifier
+    lowercases the result message before comparing."""
+    assert leerie._is_terminal_auth_failure(
+        {"is_error": True, "result": msg}) is True
+
+
 @pytest.mark.parametrize("msg", _API_ERROR_STRINGS)
 def test_api_error_strings_do_not_classify(leerie, msg):
     assert leerie._is_terminal_auth_failure(
