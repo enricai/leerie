@@ -1598,6 +1598,79 @@ a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin
 the retry/envelope contract. `_invoke` itself (process spawn, stream
 parsing, cgroup enrollment) still needs a stub or live `claude` binary and
 lives in a separate end-to-end tier.
+The inverted credential-resolution precedence in the launcher's
+`_extract_claude_credentials_json` (DESIGN §6 *Credential strategy* —
+`$CLAUDE_CODE_OAUTH_TOKEN`, the long-lived `claude setup-token` token,
+now resolves ahead of Keychain and the on-disk credentials file, since a
+container cannot refresh a copied subscription token) is tested in
+`tests/test_credential_precedence.py` by reusing `_invoke_helper` from
+`tests/test_chain_credential_transport.py` (which already extracts
+`_extract_claude_credentials_json` out of the launcher via `awk` and
+sources it in a sub-bash with a controlled `HOME`/`PATH`): the env var
+wins over both a Keychain entry and an on-disk file (Darwin-gated, since
+the Keychain branch is `uname -s = Darwin`-only), wins over the file
+alone on non-Darwin, the emitted JSON shape matches what `seed-auth.sh`
+independently constructs for a bare `CLAUDE_CODE_OAUTH_TOKEN` (the printf
+format string is extracted from `seed-auth.sh` at test time via regex
+rather than hand-copied, so the two sites can't silently diverge — same
+discipline as `test_no_result_event_retry.py`), Keychain still wins over
+the file when the env var is unset (the pre-inversion fallback order is
+unchanged), and no credential anywhere yields a clean rc 1. The paired
+best-effort expiry preflight, `_check_claude_credential_ttl` (staged
+before writing a resolved *subscription* credential into the container;
+a no-op for the exempt long-lived-token path, which carries no
+`expiresAt`), is tested in `tests/test_credential_ttl_preflight.py` by
+extracting the function plus its `_CLAUDE_TTL_WARN_THRESHOLD_SEC`
+constant out of the launcher via `awk` into a standalone sourceable
+file: an already-expired `expiresAt` refuses (rc != 0) and names `claude
+/login`; inside the 90-minute threshold warns (rc 0) naming both the
+exact ISO-8601 expiry and `claude setup-token` as the durable fix,
+including a regression case replaying the b57027d3 incident's
+expiry shape; a healthy TTL is silent; absent `expiresAt`, malformed
+JSON, a non-numeric `expiresAt`, a missing `claudeAiOauth` key, and a
+negative `expiresAt` (pre-1970 garbage, not a genuine expiry) all
+proceed silently rather than hardening the best-effort check into a
+hard gate on missing/bogus data; and two constant pins confirm the
+threshold is exactly 90 minutes and that the launcher never hard-codes
+an 8-hour TTL assumption anywhere (the community-reported 2–15h range
+is why `expiresAt` must be read, never assumed).
+The terminal auth-failure classifier and its full routing path — the
+`b57027d3…` incident this run's credential-strategy work responds to,
+where a container's expired OAuth session surfaced as "worker failed
+schema-valid output twice" instead of a resumable pause — is tested in
+`tests/test_terminal_auth_failure.py`: `_is_terminal_auth_failure` is
+table-driven over the measured corpus (4 real terminal-auth strings
+positive, including mixed-case variants, proving the classifier
+lowercases before comparing; the 8-string "API Error: …" corpus plus an
+empty string negative; the verbatim incident envelope classifies true);
+gating guards mirror `_is_auth_or_quota_failure`'s discipline (`False`
+when `is_error` is `False` or absent entirely; `False` for a
+`_leerie_synthetic` envelope whose interpolated stderr merely mentions
+these markers; `False` for a *successful* envelope that legitimately
+discusses OAuth in its own correct output; `False` for a bare "oauth"
+substring that isn't the fuller marker phrase — guarding the 2919-count
+false-positive risk noted in the classifier's own docstring; `False` for
+a non-string `result`); 401/429/529 numeric-status envelopes classify
+false here while still classifying true under
+`_is_auth_or_quota_failure`, proving the two classifiers partition
+cleanly. The `claude_p()` routing tests replay the verbatim incident
+envelope through a stubbed `_invoke` (mirroring
+`test_no_result_event_retry.py`'s harness): the call completes in under 5
+seconds rather than entering the ~300s auth/quota tenacity loop, raises
+`TerminalAuthFailure` (not `WorkerError`, and not the generic "worker
+failed schema-valid output twice" message), while a control case with
+401/429/529 envelopes still enters and exhausts the real backoff loop
+(asserted via `invoke_calls` recording more than one `_invoke` call)
+before raising `WorkerError` unchanged. Three source-coupling guards
+close the loop: an AST-based check (not a bare substring match, which
+would be satisfied by the handler's own explanatory comments even if the
+real assignment regressed) that `main()`'s `except TerminalAuthFailure`
+arm sets `exit_code = EXIT_LOCKED` and never `1`, and mentions
+`--resume`; `EXIT_LOCKED == 75`; `_is_terminal_auth_failure` is checked
+before `_is_auth_or_quota_failure` inside `claude_p`'s source; and
+`TerminalAuthFailure` subclasses `BaseException` (so it propagates
+through `asyncio.gather` and broad `except Exception` handlers, same as
+`RateLimitedExit`) but not `WorkerError`.
 The `claude_p`/`main()` routing seam for terminal auth failures (DESIGN §6
 credential strategy) — distinct from the classifier-only coverage of
 `_is_terminal_auth_failure` itself — is tested in

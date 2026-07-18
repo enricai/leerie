@@ -5421,11 +5421,13 @@ fi
 # -- Extract OAuth credentials for the staged $STAGE/.claude/. --
 # On macOS the CLI stores its OAuth token in the Keychain (service
 # `Claude Code-credentials`), not in a file. The Linux CLI reads the
-# same JSON from ~/.claude/.credentials.json, so writing whatever the
-# host has (Keychain blob, on-disk file, or $CLAUDE_CODE_OAUTH_TOKEN
-# bridged to the same JSON shape) to that path inside the container's
-# staged .claude/ makes the Linux file-based code path work
-# transparently on both platforms.
+# same JSON from ~/.claude/.credentials.json, so writing whatever
+# _extract_claude_credentials_json resolves ($CLAUDE_CODE_OAUTH_TOKEN
+# bridged to the same JSON shape, else a Keychain blob, else the
+# on-disk file — see that function's docstring for the precedence and
+# why it's inverted) to that path inside the container's staged
+# .claude/ makes the Linux file-based code path work transparently on
+# both platforms.
 #
 # MUST run AFTER the .claude/ copy above, otherwise the rsync would
 # overwrite the credentials file.
