@@ -230,6 +230,14 @@ socket (`unix:///run/user/$UID/containerd/containerd.sock`). Leerie's
 launcher uses whatever context nerdctl resolves to, so once rootless is
 set up no extra flags are needed.
 
+Also install BuildKit's containerd-worker variant (needed for repos
+with a custom `.leerie/Dockerfile` or `setup_packages`; see
+`IMPLEMENTATION.md`'s `ensure_base_in_buildkit_ns`):
+
+```bash
+containerd-rootless-setuptool.sh install-buildkit-containerd
+```
+
 ## Verifying the runtime
 
 Before running leerie, confirm the runtime works:
