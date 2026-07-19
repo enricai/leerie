@@ -749,7 +749,9 @@ conf = fit_judge(subtask)                         # P1 confidence, measured disc
 if conf >= 0.70 or depth >= MAX_DEPTH(5):
     return [subtask]                              # leaf
 children = split(subtask)                         # code-partition (migration) or
-                                                  # LLM-splitter (coupled)
+                                                  # LLM-splitter (coupled);
+                                                  # WorkerError on the coupled-minority
+                                                  # splitter call → degrade to leaf too
 for each child: recurse(child, depth + 1)
 # no-progress guard: 2 consecutive rounds where no child's conf rises above
 # the parent's → accept parent as leaf + emit warning
@@ -761,19 +763,24 @@ Bounds: `DEFAULT_CAPS["decompose_max_depth"] = 5`,
 `DEFAULT_CAPS["decompose_noprogress_rounds"] = 2`. Every judge/split call
 passes through `st.bump_workers` — a runaway tree hits the worker-cap backstop.
 
-**A `fit_judge` `WorkerError` degrades to leaf**, the same disposition the
+**A `WorkerError` from either the `fit_judge` call or the coupled-minority
+`splitter` call degrades that node to leaf**, the same disposition the
 depth cap and the no-progress guard above already reach when they cannot
-establish a confident split: an infrastructure failure mid-judgment (an
-auth failure, a killed session, PID exhaustion) is uncertainty about
+establish a confident split: an infrastructure failure mid-decomposition
+(an auth failure, a killed session, PID exhaustion) is uncertainty about
 *this* node, not a reason to discard every fit/split decision the run
-has already paid for elsewhere in the tree. See *Credential strategy*
-in §6 for why this crash barrier matters in practice — decomposition
-routinely accounts for a large share of a run's total planning spend, so
-losing it to a single transient worker failure is expensive. `phase_plan`
-snapshots decomposition progress into state as each top-level subtask
-finishes expanding, mirroring how `plan_snapshot` already persists the
-plan after `schedule()`; like `plan_snapshot`, this is diagnostic only —
-nothing reads it back on `--resume` in this change.
+has already paid for elsewhere in the tree. The migration-path splitter
+(label-only mode, invoked from `_label_migration_chunks`) already carried
+this guard — a crash there keeps the code-computed file partition and
+falls back to deterministic per-chunk labels, since `partition_files`
+already owns the split and the splitter is only titling it. See
+*Credential strategy* in §6 for why this crash barrier matters in
+practice — decomposition routinely accounts for a large share of a run's
+total planning spend, so losing it to a single transient worker failure
+is expensive. `phase_plan` snapshots decomposition progress into state as
+each top-level subtask finishes expanding, mirroring how `plan_snapshot`
+already persists the plan after `schedule()`; like `plan_snapshot`, this
+is diagnostic only — nothing reads it back on `--resume` in this change.
 
 ### Wire-in to `phase_plan`
 
@@ -1551,18 +1558,23 @@ section already recommends structurally avoids the failure in the first
 place.
 
 **Decomposition needs the same discipline against the loss of
-in-progress spend.** §5½ (P1)'s `fit_judge` call has no crash barrier
-today: a single `WorkerError` mid-decomposition (an auth failure, a
-transient gateway error, a PID exhaustion) discards every fit/split
-judgment already paid for on that planning pass, not just the one node
-being judged — this is the same class of loss D3 measured in the
-motivating incident, where decomposition was 27.8% of the run's total
-spend. The remedy mirrors two disciplines `recursive_decompose` already
-applies: a `fit_judge` `WorkerError` degrades that node to a **leaf**,
-exactly as the existing depth-cap and no-progress-guard cases already
-resolve uncertainty by accepting the node as-is rather than raising; and
-`phase_plan` snapshots decomposition progress into state as each
-top-level subtask finishes expanding, the same way `plan_snapshot`
+in-progress spend.** §5½ (P1)'s `fit_judge` and coupled-minority
+`splitter` calls have no crash barrier today: a single `WorkerError`
+mid-decomposition (an auth failure, a transient gateway error, a PID
+exhaustion) discards every fit/split judgment already paid for on that
+planning pass, not just the one node being judged — this is the same
+class of loss D3 measured in the motivating incident, where
+decomposition was 27.8% of the run's total spend. The remedy mirrors
+two disciplines `recursive_decompose` already applies: a `WorkerError`
+from either call degrades that node to a **leaf**, exactly as the
+existing depth-cap and no-progress-guard cases already resolve
+uncertainty by accepting the node as-is rather than raising (the
+migration-path splitter, invoked in label-only mode from
+`_label_migration_chunks`, already carried this guard — it falls back
+to deterministic per-chunk labels since the file partition itself is
+code-computed and unaffected by a labeling crash); and `phase_plan`
+snapshots decomposition progress into state as each top-level subtask
+finishes expanding, the same way `plan_snapshot`
 already persists the post-`schedule()` plan. Like `plan_snapshot`, this
 decomposition snapshot is **diagnostic only** in this change — nothing
 reads it back, and wiring `--resume` to rehydrate mid-decomposition
