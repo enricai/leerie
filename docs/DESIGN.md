@@ -467,29 +467,35 @@ different artifacts — e.g. one subtask creates a new config file
 different sibling's narrower piece. The judge's protocol stays
 pairwise; the orchestrator walks the pairs into a coherent cluster
 decision via the **anchor-survivor rule**: when one subtask sid
-*survives* two or more non-`unresolvable` collisions — as a merge
-endpoint, or as the kept side of a `drop_*` — it is the *anchor* of
-that cluster and survives every merge it participates in. The anchor
-is by construction the subtask whose surface overlaps with each of
-its partners, so absorbing each partner *into* the anchor matches
-what the judge described. Without this override the default
-lex-smaller survivor rule (a determinism device with no semantic
-content) would silently keep an arbitrary narrower subtask and
-discard the spec the judge actually identified as broader.
+appears in two or more non-`unresolvable` collisions, it is the
+*anchor* of that cluster and survives every merge it participates
+in. The anchor is by construction the subtask whose surface overlaps
+with each of its partners, so absorbing each partner *into* the
+anchor matches what the judge described. Without this override the
+default lex-smaller survivor rule (a determinism device with no
+semantic content) would silently keep an arbitrary narrower subtask
+and discard the spec the judge actually identified as broader.
 
-Anchor membership is defined by *survivorship*, not by bare
-appearance count. The distinction is load-bearing, and conflating
-the two is a defect: a sid that is the **dropped** side of two
-collisions is not an anchor at all — no collision claims it absorbs
-anything — yet an appearance-count definition sweeps it in and
-`die()`s a run whose judge output was coherent. See *Multi-drop*
-below.
+Appearance is the right membership test *for this rule*: a subtask
+overlapping several partners should win each of its merges regardless
+of which side of the pairs the judge happened to write it on.
 
-The orchestrator enforces one genuinely pathological pattern in this
-neighbourhood: a `drop_*` whose dropped sid is an *anchor* of another
-collision contradicts itself (asking to delete the subtask another
-collision claims absorbs it — X must both survive a merge and vanish)
-and `die()`s at plan time with both pairs surfaced.
+There is a second, narrower predicate in this neighbourhood, and
+keeping the two apart is load-bearing. The orchestrator rejects one
+genuinely pathological emission: a `drop_*` whose dropped sid
+*survives* another collision — kept as a merge endpoint, or as the
+non-dropped side of another `drop_*`. One claim deletes the subtask,
+another keeps it; X must both survive and vanish, and no apply order
+satisfies both. That contradiction `die()`s at plan time with both
+pairs surfaced.
+
+The condition is *survives-somewhere ∧ dropped-somewhere*, **not**
+anchor membership. Gating the `die()` on the anchor set instead was
+a real defect: a sid dropped by several collisions is an anchor by
+appearance, but nothing claims it survives, so every claim agrees it
+goes away. That is the multi-drop shape below — coherent output the
+judge prompt explicitly instructs — and the appearance-based gate
+killed those runs after the full planning spend, unrecoverably.
 
 **Multi-drop.** A single sid may legitimately be the dropped side of
 several collisions at once: the judge found its surface jointly

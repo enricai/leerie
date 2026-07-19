@@ -1540,6 +1540,46 @@ with "no ec2_instance_id found" without ever calling `terminate-instances`
 or `flyctl`; and the confirmation prompt (bypassed by `--force`, same
 convention as the Fly/local `--kill` paths) rejects a wrong confirmation
 and proceeds on the correct one.
+The phase 2¾ plan-overlap judge (DESIGN §5 *Cross-domain surface overlap*)
+is tested in `tests/test_phase_overlap_judge.py`. Beyond the schema and
+merge-feasibility backstop, it pins the **multi-drop cluster** contract
+(DESIGN §5 *Multi-drop*): one sid dropped by 2+ collisions is coherent
+judge output — the prompt explicitly instructs it — and must not `die()`.
+The load-bearing pin is `test_apply_multi_drop_preserves_both_survivors`:
+replaying such a cluster pairwise through the apply loop's transitive
+`survivor_of` rewrite silently deletes a **live** subtask the judge never
+named (pair 2's `_resolve` maps the already-dropped endpoint onto pair 1's
+survivor), fabricating a supersedure claim between two subtasks never
+compared; `_apply_overlap_drop` discards title/intent/success_criteria by
+design, so the loss is unrecoverable and compounds —
+`test_apply_multi_drop_three_way` pins that the pre-fix loop destroys
+three of four subtasks. Chasing `survivor_of` is safe for a `merge`
+(intent carries forward) and never safe for a `drop`. Also pinned: the
+three-tier cycle ladder (`multi_drop_fanout` →
+`multi_drop_degraded_single` → `skipped_would_cycle`), since the fan-out
+*adds* graph edges and can close a cycle no individual pair would;
+sorted-survivor determinism at both the cluster-collection and
+`_apply_multidrop` layers (`schedule()` is documented deterministic, so
+the plan must not depend on judge emission order); that a *legitimate*
+transitive chain still applies both drops (the guard must not
+over-suppress); and — previously **entirely unpinned**, the
+highest-severity silent-disable in the phase —
+`test_phase_overlap_judge_dies_on_unresolvable`, without which two
+implementers ship incompatible APIs against one artifact and it surfaces
+at integration with no trace back to phase 2¾. Two mutants in this
+region are **equivalent** and deliberately left unkilled, documented in
+the tests that would otherwise appear to cover them: `_resolve`'s `while`
+vs `if` (path compression flattens the map before the second hop) and
+`_apply_multidrop`'s `s != dropped_sid` filter (the removal loop runs
+before anything reads survivors). Do not "strengthen" those tests
+chasing a mutant that cannot be killed. `PHANTOM_ARTIFACT` resolves a
+collision's artifact against the plan's `files_likely_touched` as well as
+the working tree — two planners that both *create* the same file is the
+judge's canonical collision, so a tree-only existence test rejects the
+primary case — via a shared `_normalize_artifact_path` that
+`NO_FILE_OVERLAP` also uses (both sides are planner-authored strings, so
+`./x` and `x` must not read as disjoint; no case folding, since container
+checkouts are case-sensitive).
 
 No coverage
 target is set — the suite was introduced from scratch and a number
