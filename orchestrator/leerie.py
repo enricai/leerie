@@ -9129,8 +9129,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   | None = None,
                   idle_warn_sec: float | None = None,
                   worker_memory_max_bytes: int | None = None,
-                  worker_pids_max: int | None = None) -> dict:
+                  worker_pids_max: int | None = None,
+                  stdin_data: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
+
+    `stdin_data`, when given, is fed to the child's stdin by a concurrent
+    feeder task and stdin is closed afterward — this is how `claude_p`
+    hands the worker its (potentially 100KB+) prompt without putting it
+    on argv, where a single element over Linux's MAX_ARG_STRLEN (131,071
+    bytes, not raisable) raises `OSError: [Errno 7] Argument list too
+    long` at exec time. When `stdin_data` is None (e.g. the smoke-test
+    caller, whose prompt is a fixed short string), stdin is closed
+    immediately via DEVNULL — unchanged from the prior behavior.
 
     The CLI is invoked with `--output-format stream-json --verbose`; each
     line of stdout is one JSON event. The final `type: "result"` event
@@ -9174,14 +9184,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
-        # stdin=DEVNULL: workers receive their full prompt + schema via
-        # argv and never read terminal input. Without this the worker
-        # inherits the orchestrator's stdin, which inside a `nerdctl run
-        # -it` container is /dev/pts/0 — a real TTY. A CLI that branches
-        # on isatty() (e.g. to prompt for permission) would hang
-        # invisibly waiting for input that never arrives. Closing stdin
-        # eliminates that whole class of hang.
-        stdin=asyncio.subprocess.DEVNULL,
+        # stdin=PIPE when the caller has a prompt to feed (the normal
+        # `claude_p` path — the user prompt no longer travels on argv,
+        # see `build()`'s comment); DEVNULL otherwise. Either way the
+        # worker never inherits the orchestrator's stdin, which inside a
+        # `nerdctl run -it` container is /dev/pts/0 — a real TTY. A CLI
+        # that branches on isatty() (e.g. to prompt for permission)
+        # would hang invisibly waiting for input that never arrives.
+        # The PIPE is fed by `_feed_stdin` below and closed once the
+        # write completes, so it is just as terminal-free as DEVNULL —
+        # the worker still never sees a live TTY.
+        stdin=(asyncio.subprocess.PIPE if stdin_data is not None
+               else asyncio.subprocess.DEVNULL),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=10 * 1024 * 1024,
@@ -9480,6 +9494,34 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     "claude -p stderr emitted a line exceeding the "
                     f"10 MiB buffer limit: {e}") from e
 
+    async def _feed_stdin():
+        # Writes `stdin_data` to the child's stdin, then closes it so the
+        # CLI sees EOF and starts processing rather than blocking for
+        # more input. Runs concurrently with `_read_stream`/`_drain_stderr`
+        # rather than write-then-await — the incident's live measurement
+        # showed a 150KB write completing at t=0.26s with the child's
+        # first stdout event at t=0.69s (write-then-read is safe on that
+        # CLI version), but a concurrent feeder costs nothing and removes
+        # the dependency on that ordering holding on future CLI versions.
+        # No-op (proc.stdin is None) when `stdin_data` is None — the
+        # DEVNULL branch above never gives the child a writable stdin.
+        if stdin_data is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin_data.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The child closed its read end before consuming the whole
+            # payload (e.g. it exited early, or errored before reading
+            # stdin at all). That is a fact about the worker's exit, not
+            # this feeder's — `_read_stream`/`proc.wait()` already
+            # surface the worker's actual outcome, so swallow rather
+            # than let this coroutine's exception blow up the gather and
+            # mask that outcome.
+            pass
+        finally:
+            proc.stdin.close()
+
     async def _idle_watchdog():
         # Observation-only stall detector. Wakes every `warn_sec` seconds
         # and warns if the worker has emitted no stdout bytes for that
@@ -9533,7 +9575,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         try:
             await asyncio.wait_for(
                 asyncio.gather(_read_stream(), _drain_stderr(),
-                               proc.wait()),
+                               _feed_stdin(), proc.wait()),
                 timeout=timeout)
         except asyncio.TimeoutError:
             # Cancel the watchdog BEFORE the termination awaits so it
@@ -10026,8 +10068,17 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
     def build(extra_user: str = "") -> list[str]:
+        # No positional prompt after `-p`: the prompt is fed over stdin
+        # by `_invoke` instead (see its `stdin_data` param). A single
+        # argv element cannot exceed Linux's per-argument MAX_ARG_STRLEN
+        # (131,071 bytes, PAGE_SIZE*32, not raisable) regardless of the
+        # aggregate ARG_MAX — task+subtask_views payloads routinely
+        # exceed that on their own (measured: 150,063 bytes crashed the
+        # reconciler with a raw execve E2BIG). A positional prompt would
+        # also silently win over stdin with no error, so it must be
+        # absent, not merely redundant.
         cmd = [
-            "claude", "-p", user_prompt + extra_user,
+            "claude", "-p",
             "--append-system-prompt", system_prompt,
             "--output-format", "stream-json",
             "--verbose",
@@ -10069,6 +10120,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         _t0 = time.monotonic()
         envelope = await _invoke(build(retry_note), cwd, timeout,
                                  sid, leerie_dir, verbosity,
+                                 stdin_data=user_prompt + retry_note,
                                  progress=lambda: _get_progress(st),
                                  idle_warn_sec=caps.get(
                                      "worker_idle_warn_sec",

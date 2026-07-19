@@ -55,8 +55,8 @@ def _stub_invoke(leerie, monkeypatch, envelope=_GOOD_ENVELOPE):
     captured = []
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
-                          progress=None, **_kw):
-        captured.append({"cmd": cmd, "cwd": cwd})
+                          progress=None, stdin_data=None, **_kw):
+        captured.append({"cmd": cmd, "cwd": cwd, "stdin_data": stdin_data})
         return envelope
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
@@ -71,10 +71,12 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
     """replay_capture passes system_prompt, user_content, call_type→schema_key,
     and model from the capture record through to claude_p / _invoke."""
     collected_cmd: list[list[str]] = []
+    collected_stdin: list[str | None] = []
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
-                          progress=None, **_kw):
+                          progress=None, stdin_data=None, **_kw):
         collected_cmd.append(list(cmd))
+        collected_stdin.append(stdin_data)
         return _GOOD_ENVELOPE
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
@@ -84,12 +86,17 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
     assert collected_cmd, "fake_invoke was never called"
     cmd = collected_cmd[0]
 
-    # user_content is the -p argument (second element after 'claude -p')
+    # user_content is fed over stdin, not argv (see build()'s comment on
+    # why the prompt was moved off a positional argv element).
     assert cmd[0] == "claude"
     assert cmd[1] == "-p"
-    user_arg = cmd[2]
+    assert "--append-system-prompt" == cmd[2], (
+        "no positional prompt element should follow -p; got: "
+        f"{cmd[:4]!r}")
+    user_arg = collected_stdin[0]
+    assert user_arg is not None
     assert "Fix the login bug" in user_arg, (
-        f"user_content not in -p arg: {user_arg!r}")
+        f"user_content not in stdin_data: {user_arg!r}")
 
     # system_prompt is passed via --append-system-prompt
     assert "--append-system-prompt" in cmd

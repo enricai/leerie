@@ -71,9 +71,10 @@ def _call_claude_p(leerie, monkeypatch, envelopes, tmp_path):
     seq = list(envelopes)
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
-                          **kwargs):
-        # The user prompt is the argv token after `-p`.
-        prompts.append(cmd[cmd.index("-p") + 1] if "-p" in cmd else "")
+                          stdin_data=None, **kwargs):
+        # The user prompt is fed over stdin, not argv (see build()'s
+        # comment in claude_p — argv can't carry a >131KB prompt).
+        prompts.append(stdin_data or "")
         return seq.pop(0)
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
