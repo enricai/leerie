@@ -27,6 +27,12 @@ the full per-OS setup walkthrough see
 [README "Install"](../README.md#install), and
 [README "Requirements"](../README.md#requirements) for the full list.
 
+If your run is going to last more than a few hours, export a
+long-lived `claude setup-token` token as `CLAUDE_CODE_OAUTH_TOKEN`
+before launching — a plain interactive login can expire mid-run inside
+the container. See [README "Requirements"](../README.md#requirements)
+for how to mint one and why.
+
 ## The example task
 
 We will walk through one run on this concrete task:
@@ -221,6 +227,17 @@ branches yourself, resolve, and resume.
 `./leerie --resume` from the same directory. The resume cursor is
 `state['completed_waves']`; finished waves are not re-run. The full state
 schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
+
+**The worker session's credential expires mid-run.** A container can't
+refresh a copied subscription OAuth token, so a run started with only
+an interactive login can outlive it — you'll see "Failed to
+authenticate: OAuth session expired" (or "not logged in") on stderr.
+Leerie does worktree-only cleanup, state and branches survive, and it
+exits non-zero without touching finalize. Re-authenticate (`claude
+/login`, or better, export a `claude setup-token` token — see
+[README "Requirements"](../README.md#requirements)) and run `./leerie
+--resume`. See [`DESIGN.md`](DESIGN.md) §6 *Credential strategy* for
+why this happens and why the container can't self-heal it.
 
 ## Walking away from a remote run (`--runtime fly`)
 
