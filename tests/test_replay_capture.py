@@ -69,7 +69,16 @@ def _stub_invoke(leerie, monkeypatch, envelope=_GOOD_ENVELOPE):
 
 def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
     """replay_capture passes system_prompt, user_content, call_type→schema_key,
-    and model from the capture record through to claude_p / _invoke."""
+    and model from the capture record through to claude_p / _invoke.
+
+    The appended-system-prompt flag (--append-system-prompt vs. the
+    probe-gated --append-system-prompt-file, see
+    tests/test_append_system_prompt_file.py) is pinned to the inline
+    form here via monkeypatch, so this test's assertions are independent
+    of whether the live `claude` CLI on the test host happens to support
+    the undocumented file flag."""
+    monkeypatch.setattr(
+        leerie, "_append_system_prompt_file_supported", lambda: False)
     collected_cmd: list[list[str]] = []
     collected_stdin: list[str | None] = []
 
@@ -124,7 +133,11 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
 
 def test_override_system_prompt(leerie, tmp_path, monkeypatch):
     """When override_system_prompt is supplied, it replaces the captured
-    system_prompt in the invocation."""
+    system_prompt in the invocation. Pinned to the inline
+    --append-system-prompt flag (see test_args_match_capture_fields'
+    docstring for why)."""
+    monkeypatch.setattr(
+        leerie, "_append_system_prompt_file_supported", lambda: False)
     collected_cmd: list[list[str]] = []
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,

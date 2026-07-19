@@ -1210,6 +1210,31 @@ single pipe buffer and the single-argv ceiling this fix routes around.
 were updated in the same change to assert against `stdin_data` instead of
 an argv element, since both stub `_invoke` to inspect what `claude_p`
 constructs.
+The appended system prompt (docs/IMPLEMENTATION.md §3 "Appended system
+prompt transport — file, with a probe + inline fallback" — the second
+large argv element that compounds with the user prompt toward the same
+`MAX_ARG_STRLEN` ceiling, worst-case on the overlap judge) is pinned in
+`tests/test_append_system_prompt_file.py`: `_append_system_prompt_file_supported()`'s
+supported/unsupported classification (by stderr text — `"unknown
+option"` means unsupported, since both outcomes exit non-zero and only
+the message distinguishes them), fail-closed behavior on a missing
+`claude` binary or a probe timeout, once-per-process memoization (a
+second call makes no further `claude` invocation), and its own
+throwaway probe file being cleaned up; `build()`'s branch on the probe
+result (`--append-system-prompt-file <path>` with the temp file holding
+`system_prompt` verbatim when supported, the inline
+`--append-system-prompt` when not); the temp file being removed once
+`claude_p()` returns, on both the success path and an exception path
+(a `TerminalAuthFailure` raised from inside the try/finally-wrapped
+retry loop — the schema-key drift guard itself runs before the temp
+file is created, so it needs no cleanup); and the retry loop reusing
+the same temp file across both attempts rather than recreating it, since
+`system_prompt` is fixed for the whole `claude_p()` call.
+`tests/test_replay_capture.py`'s two system-prompt-plumbing tests
+(`test_args_match_capture_fields`, `test_override_system_prompt`) pin the
+probe to unsupported via monkeypatch so their argv assertions don't
+depend on whether the live `claude` CLI on the test host happens to
+support the undocumented file flag.
 
 The no-result-event retry (DESIGN §6, `claude -p` exits 0 having streamed a
 full session but never emits its terminal `result` event — upstream
