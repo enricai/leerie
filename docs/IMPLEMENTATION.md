@@ -3006,6 +3006,31 @@ The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
 
+#### User prompt transport — stdin, not argv
+
+`build()` emits `["claude", "-p", "--append-system-prompt", ...]` with **no
+positional argument after `-p`** — the user prompt (task + subtask_views +
+any retry note) is fed to the child's stdin instead, via `_invoke()`'s
+`stdin_data` param and a concurrent `_feed_stdin` task that writes the
+payload and closes stdin so the CLI sees EOF. `_invoke()` passes
+`stdin=PIPE` when `stdin_data` is given and `stdin=DEVNULL` otherwise
+(callers with no prompt to feed, e.g. the preflight smoke test, are
+unaffected).
+
+This exists because a single argv element cannot exceed Linux's
+`MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`, not raisable) —
+independent of the larger aggregate `ARG_MAX` — and reconciler/
+plan_overlap_judge payloads routinely exceed that on their own (measured:
+a 150,063-byte reconciler prompt raised `OSError: [Errno 7] Argument list
+too long` at `execve` time). A positional prompt after `-p` silently wins
+over stdin with no error, so it must be absent, not merely supplemented.
+Pinned by `tests/test_prompt_over_stdin.py`: the argv-length property (no
+`build()`-constructed argv element exceeds `MAX_ARG_STRLEN` for a 150KB+
+prompt), the absent positional, the retry path routing `retry_note`
+through stdin too, `_invoke`'s PIPE-vs-DEVNULL branch, and a real
+subprocess/real-pipe round trip for a 150,063-byte payload proving no
+deadlock between the concurrent feeder and the stdout/stderr readers.
+
 #### No result event
 
 `claude -p` intermittently exits 0 having streamed a full session but never

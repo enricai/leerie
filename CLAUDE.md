@@ -1186,6 +1186,31 @@ never calls `create-volume` — root EBS is implicit via `run-instances`
 with AWS's own `DeleteOnTermination=true` default (DESIGN §6 "EBS
 volume lifecycle" case 1) — so any tracked volume on this path would by
 construction be an orphan.
+The worker-prompt-over-stdin transport (docs/IMPLEMENTATION.md §3 "User
+prompt transport — stdin, not argv" — a single argv element cannot exceed
+Linux's `MAX_ARG_STRLEN`, 131,071 bytes, and reconciler/plan_overlap_judge
+payloads routinely exceed that on their own, crashing with a raw execve
+`OSError: [Errno 7] Argument list too long`) is pinned in
+`tests/test_prompt_over_stdin.py`: `build()` emits no positional argument
+after `-p` at any payload size, so no argv element it constructs can carry
+the prompt (the argv-length property is true by construction, not merely
+measured for one size); a positional prompt would silently win over stdin
+with no error, so `test_no_positional_prompt_after_dash_p` pins the
+element immediately after `-p` is always a flag; the retry path
+(`build(retry_note)`) routes the concatenated retry text through
+`stdin_data` too, not argv; `_invoke` passes `stdin=PIPE` when
+`stdin_data` is given and `stdin=DEVNULL` otherwise (direct-cmd callers
+with no prompt to feed, e.g. the preflight smoke test, are unaffected);
+and `test_real_subprocess_150kb_stdin_no_deadlock` spawns a real `python3`
+child and feeds it a real 150,063-byte payload over a real OS pipe via
+`_invoke`'s concurrent `_feed_stdin` task, proving no deadlock between the
+feeder and `_read_stream`/`_drain_stderr` for a payload well over both a
+single pipe buffer and the single-argv ceiling this fix routes around.
+`tests/test_replay_capture.py` and `tests/test_no_result_event_retry.py`
+were updated in the same change to assert against `stdin_data` instead of
+an argv element, since both stub `_invoke` to inspect what `claude_p`
+constructs.
+
 The no-result-event retry (DESIGN §6, `claude -p` exits 0 having streamed a
 full session but never emits its terminal `result` event — upstream
 anthropics/claude-code #8126/#1920/#74761, unresolved) is pinned in
