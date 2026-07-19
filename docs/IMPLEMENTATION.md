@@ -3006,6 +3006,83 @@ The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
 
+#### User prompt transport — stdin, not argv
+
+`build()` emits `["claude", "-p", ...]` with **no positional argument
+after `-p`** — the user prompt (task + subtask_views + any retry note)
+is fed to the child's stdin instead, via `_invoke()`'s `stdin_data`
+param and a concurrent `_feed_stdin` task that writes the payload and
+closes stdin so the CLI sees EOF. `_invoke()` passes `stdin=PIPE` when
+`stdin_data` is given and `stdin=DEVNULL` otherwise (callers with no
+prompt to feed, e.g. the preflight smoke test, are unaffected).
+
+This exists because a single argv element cannot exceed Linux's
+`MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`, not raisable) —
+independent of the larger aggregate `ARG_MAX` — and reconciler/
+plan_overlap_judge payloads routinely exceed that on their own (measured:
+a 150,063-byte reconciler prompt raised `OSError: [Errno 7] Argument list
+too long` at `execve` time). A positional prompt after `-p` silently wins
+over stdin with no error, so it must be absent, not merely supplemented.
+Pinned by `tests/test_prompt_over_stdin.py`: the argv-length property (no
+`build()`-constructed argv element exceeds `MAX_ARG_STRLEN` for a 150KB+
+prompt), the absent positional, the retry path routing `retry_note`
+through stdin too, `_invoke`'s PIPE-vs-DEVNULL branch, and a real
+subprocess/real-pipe round trip for a 150,063-byte payload proving no
+deadlock between the concurrent feeder and the stdout/stderr readers.
+
+#### Appended system prompt transport — file, with a probe + inline fallback
+
+The appended system prompt (`system_prompt`, e.g. `reconciler.md` at
+~25KB) is the *second* large argv element, and on the overlap judge it
+compounds with the (now stdin-routed) user prompt toward the same
+`MAX_ARG_STRLEN` ceiling above. `claude_p()` writes `system_prompt` to a
+throwaway temp file once per call (not per retry attempt — the value is
+fixed for the whole call) and passes it via `--append-system-prompt-file
+<path>` instead of the inline `--append-system-prompt <text>`, removing
+it from argv the same way the user prompt was removed.
+
+`--append-system-prompt-file` is **undocumented** — it has no entry of
+its own in `claude --help`, appearing only inside `--bare`'s help text
+("Explicitly provide context via: --system-prompt[-file],
+--append-system-prompt[-file], ..."). Because an undocumented flag may
+be renamed or removed in a future CLI release without notice, its use
+is gated behind `_append_system_prompt_file_supported()` — a
+once-per-process probe memoized in the module-level
+`_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED` global (same pattern as
+`_cgroup_probe()`'s `_CGROUP_PROBE_RESULT`) — with an unconditional
+fallback to the inline flag when the probe reports unsupported.
+
+The probe invokes `claude -p --append-system-prompt-file <throwaway
+file>` with stdin closed and no `--output-format`/model dispatch
+requested. Commander.js validates every flag before `-p` reaches "no
+prompt given": an unrecognized flag fails immediately with `error:
+unknown option '--append-system-prompt-file'`, while a recognized flag
+instead reaches the CLI's own "Input must be provided either through
+stdin or as a prompt argument" error. Both exit non-zero, cost nothing
+(no auth, no model call), and return in well under a second — the probe
+distinguishes them by the stderr text (`"unknown option"` means
+unsupported), not by exit code alone, since both paths exit non-zero.
+
+`claude_p()`'s temp file is created before `build()`'s first call, and
+`build()` through the end of the retry loop runs inside a `try/finally`
+that removes it once `claude_p()` returns — on both the success path and
+every exception path out of that block (the terminal-auth raise, either
+auth/quota-exhaustion raise, the final "worker failed schema-valid output
+twice" raise). The schema-key drift guard runs before the temp file is
+created at all, so it never needs cleanup. The retry loop (`_spawn`
+re-invoked with a `retry_note`) reuses the same file across both attempts
+rather than rewriting it, since `system_prompt` never changes between
+retries.
+
+Pinned by `tests/test_append_system_prompt_file.py`: the probe's
+supported/unsupported/fail-closed-on-OSError-or-timeout branches, once-
+per-process memoization, its own throwaway-file cleanup,
+`build()`'s file-flag-vs-inline-flag branch and the temp file's
+contents matching `system_prompt`, the temp file being removed after
+`claude_p()` returns on both the success and exception paths, the retry
+path reusing rather than recreating the file, and a live (unmocked)
+sanity check against the installed `claude` CLI (skipped if absent).
+
 #### No result event
 
 `claude -p` intermittently exits 0 having streamed a full session but never

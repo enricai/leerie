@@ -9129,8 +9129,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   | None = None,
                   idle_warn_sec: float | None = None,
                   worker_memory_max_bytes: int | None = None,
-                  worker_pids_max: int | None = None) -> dict:
+                  worker_pids_max: int | None = None,
+                  stdin_data: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
+
+    `stdin_data`, when given, is fed to the child's stdin by a concurrent
+    feeder task and stdin is closed afterward — this is how `claude_p`
+    hands the worker its (potentially 100KB+) prompt without putting it
+    on argv, where a single element over Linux's MAX_ARG_STRLEN (131,071
+    bytes, not raisable) raises `OSError: [Errno 7] Argument list too
+    long` at exec time. When `stdin_data` is None (e.g. the smoke-test
+    caller, whose prompt is a fixed short string), stdin is closed
+    immediately via DEVNULL — unchanged from the prior behavior.
 
     The CLI is invoked with `--output-format stream-json --verbose`; each
     line of stdout is one JSON event. The final `type: "result"` event
@@ -9174,14 +9184,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
-        # stdin=DEVNULL: workers receive their full prompt + schema via
-        # argv and never read terminal input. Without this the worker
-        # inherits the orchestrator's stdin, which inside a `nerdctl run
-        # -it` container is /dev/pts/0 — a real TTY. A CLI that branches
-        # on isatty() (e.g. to prompt for permission) would hang
-        # invisibly waiting for input that never arrives. Closing stdin
-        # eliminates that whole class of hang.
-        stdin=asyncio.subprocess.DEVNULL,
+        # stdin=PIPE when the caller has a prompt to feed (the normal
+        # `claude_p` path — the user prompt no longer travels on argv,
+        # see `build()`'s comment); DEVNULL otherwise. Either way the
+        # worker never inherits the orchestrator's stdin, which inside a
+        # `nerdctl run -it` container is /dev/pts/0 — a real TTY. A CLI
+        # that branches on isatty() (e.g. to prompt for permission)
+        # would hang invisibly waiting for input that never arrives.
+        # The PIPE is fed by `_feed_stdin` below and closed once the
+        # write completes, so it is just as terminal-free as DEVNULL —
+        # the worker still never sees a live TTY.
+        stdin=(asyncio.subprocess.PIPE if stdin_data is not None
+               else asyncio.subprocess.DEVNULL),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=10 * 1024 * 1024,
@@ -9480,6 +9494,34 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     "claude -p stderr emitted a line exceeding the "
                     f"10 MiB buffer limit: {e}") from e
 
+    async def _feed_stdin():
+        # Writes `stdin_data` to the child's stdin, then closes it so the
+        # CLI sees EOF and starts processing rather than blocking for
+        # more input. Runs concurrently with `_read_stream`/`_drain_stderr`
+        # rather than write-then-await — the incident's live measurement
+        # showed a 150KB write completing at t=0.26s with the child's
+        # first stdout event at t=0.69s (write-then-read is safe on that
+        # CLI version), but a concurrent feeder costs nothing and removes
+        # the dependency on that ordering holding on future CLI versions.
+        # No-op (proc.stdin is None) when `stdin_data` is None — the
+        # DEVNULL branch above never gives the child a writable stdin.
+        if stdin_data is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin_data.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The child closed its read end before consuming the whole
+            # payload (e.g. it exited early, or errored before reading
+            # stdin at all). That is a fact about the worker's exit, not
+            # this feeder's — `_read_stream`/`proc.wait()` already
+            # surface the worker's actual outcome, so swallow rather
+            # than let this coroutine's exception blow up the gather and
+            # mask that outcome.
+            pass
+        finally:
+            proc.stdin.close()
+
     async def _idle_watchdog():
         # Observation-only stall detector. Wakes every `warn_sec` seconds
         # and warns if the worker has emitted no stdout bytes for that
@@ -9533,7 +9575,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         try:
             await asyncio.wait_for(
                 asyncio.gather(_read_stream(), _drain_stderr(),
-                               proc.wait()),
+                               _feed_stdin(), proc.wait()),
                 timeout=timeout)
         except asyncio.TimeoutError:
             # Cancel the watchdog BEFORE the termination awaits so it
@@ -9956,6 +9998,59 @@ async def _memory_sampler(st: "State",
             raise
 
 
+_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED: bool | None = None
+
+
+def _append_system_prompt_file_supported() -> bool:
+    """Once-per-process probe, memoized in
+    `_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED`: does this `claude` CLI accept
+    `--append-system-prompt-file`? The flag is UNDOCUMENTED — it appears
+    only inside `--bare`'s help text ("Explicitly provide context via:
+    --system-prompt[-file], --append-system-prompt[-file], ...") and has
+    no entry of its own in `--help` output, so it may be renamed or
+    removed in a future CLI release without notice. `claude_p` gates its
+    use behind this probe with an unconditional fallback to the inline
+    `--append-system-prompt` (IMPLEMENTATION.md §3).
+
+    The probe passes the flag together with a throwaway temp file and a
+    closed stdin, with no `--output-format`/model dispatch requested.
+    Commander.js validates every flag before `-p` reaches "no prompt
+    given" — an unrecognized flag fails with `error: unknown option
+    '--append-system-prompt-file'` (checked BEFORE stdin is read), while
+    a recognized flag reaches the CLI's own "Input must be provided
+    either through stdin or as a prompt argument" error instead. Both
+    exit non-zero and cost nothing (no auth, no model call, sub-second).
+    Distinguishing them via the different stderr text is what makes the
+    probe accurate rather than a bare non-zero-exit check, which would
+    read as "supported" either way.
+    """
+    global _APPEND_SYSTEM_PROMPT_FILE_SUPPORTED
+    if _APPEND_SYSTEM_PROMPT_FILE_SUPPORTED is not None:
+        return _APPEND_SYSTEM_PROMPT_FILE_SUPPORTED
+    import tempfile  # noqa: PLC0415
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False) as f:
+            f.write("leerie capability probe")
+            probe_path = f.name
+        try:
+            r = subprocess.run(
+                ["claude", "-p", "--append-system-prompt-file", probe_path],
+                input="", capture_output=True, text=True, timeout=15,
+                check=False,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(probe_path)
+    except (OSError, subprocess.TimeoutExpired):
+        # Can't tell either way — fail closed to the documented flag.
+        _APPEND_SYSTEM_PROMPT_FILE_SUPPORTED = False
+        return False
+    supported = "unknown option" not in (r.stderr or "")
+    _APPEND_SYSTEM_PROMPT_FILE_SUPPORTED = supported
+    return supported
+
+
 async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
                    caps: dict, st: "State", model: str, sid: str,
@@ -10025,247 +10120,282 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     leerie_dir = st.path.parent
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
-    def build(extra_user: str = "") -> list[str]:
-        cmd = [
-            "claude", "-p", user_prompt + extra_user,
-            "--append-system-prompt", system_prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--json-schema", schema,
-            "--allowedTools", allowed_tools,
-            "--disallowedTools", DISALLOWED_TOOLS,
-            "--max-turns", str(max_turns),
-            "--model", model,
-        ]
-        # IMPLEMENTATION.md §2 "Effort selection". When effort is None
-        # (unset for this worker, the default for acting workers) the
-        # CLI invocation is byte-identical to the pre-feature behavior;
-        # only opted-in workers carry the flag.
-        if effort is not None:
-            cmd.extend(["--effort", effort])
-        for d in (add_dirs or ()):
-            cmd.extend(["--add-dir", d])
-        skip_perms = autonomous or bool(
-            st.data.get("dangerously_skip_permissions", False))
-        if skip_perms:
-            # Acting workers (autonomous=True) run inside an isolated
-            # worktree; skipping prompts is what makes the run unattended,
-            # blast radius bounded by the worktree. When the user passes
-            # the top-level --dangerously-skip-permissions escape hatch
-            # (DESIGN §12 last paragraph), judgment workers in the real
-            # repo cwd also get the flag — §12 mechanical enforcement
-            # waived, trust shifts onto the prompts.
-            cmd.append("--dangerously-skip-permissions")
-        return cmd
+    # The appended system prompt is a second large argv element (reconciler.md
+    # is ~25KB) that compounds with the user prompt toward MAX_ARG_STRLEN —
+    # see the incident note above `_append_system_prompt_file_supported`.
+    # Written once per claude_p call (not per retry — system_prompt is fixed
+    # for the whole call) and cleaned up in the `finally` below regardless of
+    # how this function exits. `--append-system-prompt-file` is undocumented,
+    # so its use is gated behind the memoized probe with an unconditional
+    # fallback to the inline flag.
+    use_file_flag = _append_system_prompt_file_supported()
+    system_prompt_file: str | None = None
+    if use_file_flag:
+        import tempfile  # noqa: PLC0415
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False) as f:
+            f.write(system_prompt)
+            system_prompt_file = f.name
 
-    timeout = caps["worker_timeout_sec"]
+    try:
+        def build(extra_user: str = "") -> list[str]:
+            # No positional prompt after `-p`: the prompt is fed over stdin
+            # by `_invoke` instead (see its `stdin_data` param). A single
+            # argv element cannot exceed Linux's per-argument MAX_ARG_STRLEN
+            # (131,071 bytes, PAGE_SIZE*32, not raisable) regardless of the
+            # aggregate ARG_MAX — task+subtask_views payloads routinely
+            # exceed that on their own (measured: 150,063 bytes crashed the
+            # reconciler with a raw execve E2BIG). A positional prompt would
+            # also silently win over stdin with no error, so it must be
+            # absent, not merely redundant.
+            cmd = ["claude", "-p"]
+            if system_prompt_file is not None:
+                cmd.extend(["--append-system-prompt-file", system_prompt_file])
+            else:
+                cmd.extend(["--append-system-prompt", system_prompt])
+            cmd.extend([
+                "--output-format", "stream-json",
+                "--verbose",
+                "--json-schema", schema,
+                "--allowedTools", allowed_tools,
+                "--disallowedTools", DISALLOWED_TOOLS,
+                "--max-turns", str(max_turns),
+                "--model", model,
+            ])
+            # IMPLEMENTATION.md §2 "Effort selection". When effort is None
+            # (unset for this worker, the default for acting workers) the
+            # CLI invocation is byte-identical to the pre-feature behavior;
+            # only opted-in workers carry the flag.
+            if effort is not None:
+                cmd.extend(["--effort", effort])
+            for d in (add_dirs or ()):
+                cmd.extend(["--add-dir", d])
+            skip_perms = autonomous or bool(
+                st.data.get("dangerously_skip_permissions", False))
+            if skip_perms:
+                # Acting workers (autonomous=True) run inside an isolated
+                # worktree; skipping prompts is what makes the run unattended,
+                # blast radius bounded by the worktree. When the user passes
+                # the top-level --dangerously-skip-permissions escape hatch
+                # (DESIGN §12 last paragraph), judgment workers in the real
+                # repo cwd also get the flag — §12 mechanical enforcement
+                # waived, trust shifts onto the prompts.
+                cmd.append("--dangerously-skip-permissions")
+            return cmd
 
-    async def _spawn(retry_note: str) -> dict:
-        """One `_invoke` + telemetry + NDJSON capture + non-clean-exit
-        warnings. Factored out so the auth/quota backoff loop below can
-        re-invoke the worker without duplicating the capture/telemetry
-        bookkeeping — every retry, success or failure, still produces
-        one calls.ndjson row so the audit trail is complete."""
-        _t0 = time.monotonic()
-        envelope = await _invoke(build(retry_note), cwd, timeout,
-                                 sid, leerie_dir, verbosity,
-                                 progress=lambda: _get_progress(st),
-                                 idle_warn_sec=caps.get(
-                                     "worker_idle_warn_sec",
-                                     DEFAULT_CAPS["worker_idle_warn_sec"]),
-                                 worker_memory_max_bytes=caps.get(
-                                     "worker_memory_max_bytes"),
-                                 worker_pids_max=caps.get(
-                                     "worker_pids_max",
-                                     DEFAULT_CAPS["worker_pids_max"]))
-        _latency_ms = int((time.monotonic() - _t0) * 1000)
+        timeout = caps["worker_timeout_sec"]
 
-        # record run-weight telemetry
-        st.add_telemetry(envelope)
+        async def _spawn(retry_note: str) -> dict:
+            """One `_invoke` + telemetry + NDJSON capture + non-clean-exit
+            warnings. Factored out so the auth/quota backoff loop below can
+            re-invoke the worker without duplicating the capture/telemetry
+            bookkeeping — every retry, success or failure, still produces
+            one calls.ndjson row so the audit trail is complete."""
+            _t0 = time.monotonic()
+            envelope = await _invoke(build(retry_note), cwd, timeout,
+                                     sid, leerie_dir, verbosity,
+                                     stdin_data=user_prompt + retry_note,
+                                     progress=lambda: _get_progress(st),
+                                     idle_warn_sec=caps.get(
+                                         "worker_idle_warn_sec",
+                                         DEFAULT_CAPS["worker_idle_warn_sec"]),
+                                     worker_memory_max_bytes=caps.get(
+                                         "worker_memory_max_bytes"),
+                                     worker_pids_max=caps.get(
+                                         "worker_pids_max",
+                                         DEFAULT_CAPS["worker_pids_max"]))
+            _latency_ms = int((time.monotonic() - _t0) * 1000)
 
-        # capture NDJSON record — written on every attempt (success and failure)
-        # so a hard-killed run leaves a complete audit trail.
-        # Skipped when _suppress_capture=True (replay mode) so replays
-        # never pollute the captures stream.
-        if not _suppress_capture:
-            _usage = envelope.get("usage") or {}
-            _parsed_ok = envelope.get("structured_output") is not None
-            _success = not envelope.get("is_error") and _parsed_ok
-            # cgroup_applied: whether the per-worker cgroup containment
-            # was active for this spawn. Useful when post-mortem
-            # inspecting a calls.ndjson — a run with cgroup_applied
-            # consistently False means the launcher's writable
-            # /sys/fs/cgroup mount didn't propagate, and the OOM-
-            # cascade safety net was off.
-            _cgroup_applied = _CGROUP_PROBE_RESULT is True
-            # failure_kind: why this call failed (null on success). Covers
-            # only envelope-returning failures — RateLimitedExit / WorkerError
-            # raise past this block and are never captured (see
-            # _classify_failure_kind's KNOWN GAP).
-            _failure_kind = _classify_failure_kind(envelope, _parsed_ok)
-            _capture_call(st.run_dir, {
-                "call_id": str(uuid.uuid4()),
-                "run_id": st.run_id,
-                "call_type": schema_key,
-                "model": model,
-                "system_prompt": system_prompt,
-                "user_content": user_prompt + retry_note,
-                "response_content": str(envelope.get("result") or ""),
-                "parsed_ok": _parsed_ok,
-                "input_tokens": int(_usage.get("input_tokens") or 0),
-                "output_tokens": int(_usage.get("output_tokens") or 0),
-                "latency_ms": _latency_ms,
-                "success": _success,
-                "failure_kind": _failure_kind,
-                "cgroup_applied": _cgroup_applied,
-                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-            })
+            # record run-weight telemetry
+            st.add_telemetry(envelope)
 
-        # surface non-clean exits — a worker that hit --max-turns exits 0 and
-        # can still produce structured_output, but stopped mid-work
-        term = envelope.get("terminal_reason", "")
-        turns = envelope.get("num_turns", -1)
-        if term and term != "completed":
-            log(f"  ⚠  worker exited with terminal_reason='{term}' "
-                f"(num_turns={turns}) — output may be incomplete")
-        # Context-decay proxy: a worker that returned at or above 80% of its
-        # turn budget likely produced its final result against a degraded
-        # context window. The schema only checks structure, not the quality
-        # of reasoning underneath it. Surface the proxy so a 9.x confidence
-        # score from a near-cap worker is read with the right scepticism.
-        # `elif`: this branch only fires when the worker stopped cleanly —
-        # if terminal_reason was set, the warning above already named
-        # num_turns, so we avoid double-warning the same condition.
-        elif turns >= 0 and turns >= int(0.8 * max_turns):
-            log(f"  ⚠  worker returned at {turns}/{max_turns} turns "
-                f"(≥80% of cap) — output may have been produced against a "
-                "degraded context window")
+            # capture NDJSON record — written on every attempt (success and failure)
+            # so a hard-killed run leaves a complete audit trail.
+            # Skipped when _suppress_capture=True (replay mode) so replays
+            # never pollute the captures stream.
+            if not _suppress_capture:
+                _usage = envelope.get("usage") or {}
+                _parsed_ok = envelope.get("structured_output") is not None
+                _success = not envelope.get("is_error") and _parsed_ok
+                # cgroup_applied: whether the per-worker cgroup containment
+                # was active for this spawn. Useful when post-mortem
+                # inspecting a calls.ndjson — a run with cgroup_applied
+                # consistently False means the launcher's writable
+                # /sys/fs/cgroup mount didn't propagate, and the OOM-
+                # cascade safety net was off.
+                _cgroup_applied = _CGROUP_PROBE_RESULT is True
+                # failure_kind: why this call failed (null on success). Covers
+                # only envelope-returning failures — RateLimitedExit / WorkerError
+                # raise past this block and are never captured (see
+                # _classify_failure_kind's KNOWN GAP).
+                _failure_kind = _classify_failure_kind(envelope, _parsed_ok)
+                _capture_call(st.run_dir, {
+                    "call_id": str(uuid.uuid4()),
+                    "run_id": st.run_id,
+                    "call_type": schema_key,
+                    "model": model,
+                    "system_prompt": system_prompt,
+                    "user_content": user_prompt + retry_note,
+                    "response_content": str(envelope.get("result") or ""),
+                    "parsed_ok": _parsed_ok,
+                    "input_tokens": int(_usage.get("input_tokens") or 0),
+                    "output_tokens": int(_usage.get("output_tokens") or 0),
+                    "latency_ms": _latency_ms,
+                    "success": _success,
+                    "failure_kind": _failure_kind,
+                    "cgroup_applied": _cgroup_applied,
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                })
 
-        return envelope
+            # surface non-clean exits — a worker that hit --max-turns exits 0 and
+            # can still produce structured_output, but stopped mid-work
+            term = envelope.get("terminal_reason", "")
+            turns = envelope.get("num_turns", -1)
+            if term and term != "completed":
+                log(f"  ⚠  worker exited with terminal_reason='{term}' "
+                    f"(num_turns={turns}) — output may be incomplete")
+            # Context-decay proxy: a worker that returned at or above 80% of its
+            # turn budget likely produced its final result against a degraded
+            # context window. The schema only checks structure, not the quality
+            # of reasoning underneath it. Surface the proxy so a 9.x confidence
+            # score from a near-cap worker is read with the right scepticism.
+            # `elif`: this branch only fires when the worker stopped cleanly —
+            # if terminal_reason was set, the warning above already named
+            # num_turns, so we avoid double-warning the same condition.
+            elif turns >= 0 and turns >= int(0.8 * max_turns):
+                log(f"  ⚠  worker returned at {turns}/{max_turns} turns "
+                    f"(≥80% of cap) — output may have been produced against a "
+                    "degraded context window")
 
-    auth_retry_max_sec = caps.get(
-        "auth_retry_max_sec", DEFAULT_CAPS["auth_retry_max_sec"])
-    last_problem = ""
-    # Set when the prior attempt ended with no result event at all (the
-    # synthetic envelope from _invoke). That failure is upstream and
-    # session-level, not a schema mistake, so the nudge names the
-    # finalizer tool explicitly rather than talking about the schema.
-    last_was_no_result = False
-    for attempt in (1, 2):
-        if attempt == 1:
-            retry_note = ""
-        elif last_was_no_result:
-            retry_note = (
-                f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
-                "The session ended without producing a final result. You "
-                "MUST finish by calling the StructuredOutput tool with your "
-                "answer — describing the answer in prose is not enough, the "
-                "run has no result until that tool call is made.")
-        else:
-            retry_note = (
-                f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
-                "Return output that conforms exactly to the required schema.")
-        envelope = await _spawn(retry_note)
+            return envelope
 
-        # Terminal auth failure (expired/absent OAuth session): checked
-        # BEFORE the auth/quota backoff below, and raised immediately —
-        # no tenacity loop. Claude Code has already failed to renew the
-        # login and cleared the credential, so it sends no request at
-        # all; every retry within `auth_retry_max_sec` would fail
-        # identically, burning the whole backoff budget for nothing.
-        # main()'s handler routes TerminalAuthFailure to a resumable
-        # EXIT_LOCKED pause instead of the generic WorkerError exit(1).
-        if _is_terminal_auth_failure(envelope):
-            raise TerminalAuthFailure(str(envelope.get("result") or ""))
-
-        # Auth/quota backoff: 401/429/529/auth-message envelopes need
-        # waiting, not the immediate corrective retry below. The gateway
-        # has already rejected the request and a fresh request will be
-        # rejected too until the user's Claude Code subscription window
-        # clears (401/429) or the transient overload (529) subsides. Run
-        # tenacity's exponential-backoff-with-jitter loop, capped at
-        # `auth_retry_max_sec` cumulative seconds. The loop exits when an
-        # invocation returns a non-auth envelope (success or a different
-        # error class) or when the budget is exhausted.
-        if _is_auth_or_quota_failure(envelope):
-            # Lazy import (not module-scope) so this file loads on a bare host
-            # python3 lacking requirements.txt deps — see the module-top note.
-            from tenacity import (
-                AsyncRetrying,
-                RetryCallState,
-                RetryError,
-                retry_if_result,
-                stop_after_delay,
-                wait_exponential_jitter,
-            )
-
-            def _log_before_sleep(rs: RetryCallState) -> None:
-                env = rs.outcome.result()
-                marker = (env.get("api_error_status") or "auth/quota")
-                log(f"  worker hit {marker} — retrying in "
-                    f"{rs.next_action.sleep:.0f}s "
-                    f"(elapsed {rs.seconds_since_start:.0f}s of "
-                    f"{auth_retry_max_sec}s budget)")
-
-            # Use tenacity's __call__ (decorator) form rather than the
-            # iterator form: the iterator form's AttemptManager.__exit__
-            # unconditionally overwrites retry_state's result with None
-            # on clean exit, defeating retry_if_result. __call__ sets
-            # the result correctly inside its own loop and surfaces the
-            # last attempt via RetryError.last_attempt on stop-fire.
-            try:
-                envelope = await AsyncRetrying(
-                    wait=wait_exponential_jitter(
-                        initial=15, max=120, jitter=5),
-                    stop=stop_after_delay(auth_retry_max_sec),
-                    retry=retry_if_result(_is_auth_or_quota_failure),
-                    reraise=False,
-                    before_sleep=_log_before_sleep,
-                )(_spawn, retry_note)
-            except RetryError as e:
-                # Budget exhausted with the envelope still auth/quota.
-                # Surface the last attempt's envelope so the
-                # subscription-cap WorkerError below fires with
-                # accurate context. retry_if_result only filters
-                # results (not exceptions), so last_attempt holds a
-                # result Future — .result() returns the envelope.
-                envelope = e.last_attempt.result()
-
-            if _is_auth_or_quota_failure(envelope):
-                # A 529 is transient gateway overload, not a subscription
-                # cap — don't misattribute it. 401/429 (and the text-marker
-                # path) stay on the rolling-usage-cap message.
-                if envelope.get("api_error_status") == 529:
-                    raise WorkerError(
-                        "Claude API returned an overloaded (529) error "
-                        f"after ~{auth_retry_max_sec}s of retries — the "
-                        "Anthropic gateway is under transient load. Run "
-                        "--resume to retry.")
-                raise WorkerError(
-                    "Claude API returned auth/quota error after "
-                    f"~{auth_retry_max_sec}s of retries — your Claude "
-                    "Code subscription likely hit its rolling usage "
-                    "cap. Run --resume once the window clears.")
-
-        if envelope.get("is_error"):
-            last_problem = str(envelope.get("api_error_status")
-                               or envelope.get("result") or "worker reported an error")
-            last_was_no_result = (
-                envelope.get("_leerie_synthetic") == "no_result_event")
-            if last_was_no_result:
-                log(f"  [{sid}] worker produced no result event "
-                    f"(attempt {attempt} of 2) — retrying with a fresh "
-                    f"session")
-            continue
+        auth_retry_max_sec = caps.get(
+            "auth_retry_max_sec", DEFAULT_CAPS["auth_retry_max_sec"])
+        last_problem = ""
+        # Set when the prior attempt ended with no result event at all (the
+        # synthetic envelope from _invoke). That failure is upstream and
+        # session-level, not a schema mistake, so the nudge names the
+        # finalizer tool explicitly rather than talking about the schema.
         last_was_no_result = False
-        structured = envelope.get("structured_output")
-        if structured is None:
-            last_problem = ("the run produced no structured_output — the final "
-                            "output did not satisfy the JSON schema")
-            continue
-        return structured
+        for attempt in (1, 2):
+            if attempt == 1:
+                retry_note = ""
+            elif last_was_no_result:
+                retry_note = (
+                    f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
+                    "The session ended without producing a final result. You "
+                    "MUST finish by calling the StructuredOutput tool with your "
+                    "answer — describing the answer in prose is not enough, the "
+                    "run has no result until that tool call is made.")
+            else:
+                retry_note = (
+                    f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
+                    "Return output that conforms exactly to the required schema.")
+            envelope = await _spawn(retry_note)
 
-    raise WorkerError(f"worker failed schema-valid output twice: {last_problem}")
+            # Terminal auth failure (expired/absent OAuth session): checked
+            # BEFORE the auth/quota backoff below, and raised immediately —
+            # no tenacity loop. Claude Code has already failed to renew the
+            # login and cleared the credential, so it sends no request at
+            # all; every retry within `auth_retry_max_sec` would fail
+            # identically, burning the whole backoff budget for nothing.
+            # main()'s handler routes TerminalAuthFailure to a resumable
+            # EXIT_LOCKED pause instead of the generic WorkerError exit(1).
+            if _is_terminal_auth_failure(envelope):
+                raise TerminalAuthFailure(str(envelope.get("result") or ""))
+
+            # Auth/quota backoff: 401/429/529/auth-message envelopes need
+            # waiting, not the immediate corrective retry below. The gateway
+            # has already rejected the request and a fresh request will be
+            # rejected too until the user's Claude Code subscription window
+            # clears (401/429) or the transient overload (529) subsides. Run
+            # tenacity's exponential-backoff-with-jitter loop, capped at
+            # `auth_retry_max_sec` cumulative seconds. The loop exits when an
+            # invocation returns a non-auth envelope (success or a different
+            # error class) or when the budget is exhausted.
+            if _is_auth_or_quota_failure(envelope):
+                # Lazy import (not module-scope) so this file loads on a bare host
+                # python3 lacking requirements.txt deps — see the module-top note.
+                from tenacity import (
+                    AsyncRetrying,
+                    RetryCallState,
+                    RetryError,
+                    retry_if_result,
+                    stop_after_delay,
+                    wait_exponential_jitter,
+                )
+
+                def _log_before_sleep(rs: RetryCallState) -> None:
+                    env = rs.outcome.result()
+                    marker = (env.get("api_error_status") or "auth/quota")
+                    log(f"  worker hit {marker} — retrying in "
+                        f"{rs.next_action.sleep:.0f}s "
+                        f"(elapsed {rs.seconds_since_start:.0f}s of "
+                        f"{auth_retry_max_sec}s budget)")
+
+                # Use tenacity's __call__ (decorator) form rather than the
+                # iterator form: the iterator form's AttemptManager.__exit__
+                # unconditionally overwrites retry_state's result with None
+                # on clean exit, defeating retry_if_result. __call__ sets
+                # the result correctly inside its own loop and surfaces the
+                # last attempt via RetryError.last_attempt on stop-fire.
+                try:
+                    envelope = await AsyncRetrying(
+                        wait=wait_exponential_jitter(
+                            initial=15, max=120, jitter=5),
+                        stop=stop_after_delay(auth_retry_max_sec),
+                        retry=retry_if_result(_is_auth_or_quota_failure),
+                        reraise=False,
+                        before_sleep=_log_before_sleep,
+                    )(_spawn, retry_note)
+                except RetryError as e:
+                    # Budget exhausted with the envelope still auth/quota.
+                    # Surface the last attempt's envelope so the
+                    # subscription-cap WorkerError below fires with
+                    # accurate context. retry_if_result only filters
+                    # results (not exceptions), so last_attempt holds a
+                    # result Future — .result() returns the envelope.
+                    envelope = e.last_attempt.result()
+
+                if _is_auth_or_quota_failure(envelope):
+                    # A 529 is transient gateway overload, not a subscription
+                    # cap — don't misattribute it. 401/429 (and the text-marker
+                    # path) stay on the rolling-usage-cap message.
+                    if envelope.get("api_error_status") == 529:
+                        raise WorkerError(
+                            "Claude API returned an overloaded (529) error "
+                            f"after ~{auth_retry_max_sec}s of retries — the "
+                            "Anthropic gateway is under transient load. Run "
+                            "--resume to retry.")
+                    raise WorkerError(
+                        "Claude API returned auth/quota error after "
+                        f"~{auth_retry_max_sec}s of retries — your Claude "
+                        "Code subscription likely hit its rolling usage "
+                        "cap. Run --resume once the window clears.")
+
+            if envelope.get("is_error"):
+                last_problem = str(envelope.get("api_error_status")
+                                   or envelope.get("result") or "worker reported an error")
+                last_was_no_result = (
+                    envelope.get("_leerie_synthetic") == "no_result_event")
+                if last_was_no_result:
+                    log(f"  [{sid}] worker produced no result event "
+                        f"(attempt {attempt} of 2) — retrying with a fresh "
+                        f"session")
+                continue
+            last_was_no_result = False
+            structured = envelope.get("structured_output")
+            if structured is None:
+                last_problem = ("the run produced no structured_output — the final "
+                                "output did not satisfy the JSON schema")
+                continue
+            return structured
+
+        raise WorkerError(f"worker failed schema-valid output twice: {last_problem}")
+    finally:
+        if system_prompt_file is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(system_prompt_file)
 
 
 async def replay_capture(record: dict, *,
