@@ -295,13 +295,13 @@ export LEERIE_MAX_WORKERS=80
 export LEERIE_MAX_PARALLEL=6
 ./leerie "task" --max-parallel 6
 
-# Raise the per-worker cgroup PID cap (default 1024). Bounds fork/clone in
+# Raise the per-worker cgroup PID cap (default 2048). Bounds fork/clone in
 # each worker subtree; raise it for repos whose conformance step runs a
 # subprocess-heavy full test suite (which can burst past a low cap in
 # seconds and wedge every subsequent Bash call with EAGAIN). Positive
 # integer; same precedence: CLI > env > leerie.toml.
-export LEERIE_WORKER_PIDS_MAX=2048
-./leerie "task" --worker-pids-max 2048
+export LEERIE_WORKER_PIDS_MAX=4096
+./leerie "task" --worker-pids-max 4096
 
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
