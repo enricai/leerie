@@ -15082,11 +15082,15 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
       merged plans. It carries no semantic content.
     - With `survivor_hint`: the named sid wins, overriding the lex
       rule. Used by `_apply_overlap_collisions` for the anchor case:
-      when one sid appears in multiple non-`unresolvable` collisions,
-      it is the structural anchor of the cluster (by construction the
-      subtask that overlaps with every partner) and must survive each
-      merge so its partners are absorbed into it. The hint must equal
-      either `a_sid` or `b_sid`; passing any other value die()s.
+      when one sid appears in multiple non-`unresolvable` collisions
+      it is the anchor of that cluster, and the caller keeps it as the
+      survivor of each merge it participates in. In the motivating
+      all-merge cluster the anchor is the broader subtask, so absorbing
+      its partners matches what the judge described — but that is a
+      property of the merge/merge shape, not of anchor membership,
+      which is bare appearance count (see `_compute_overlap_anchors`).
+      The hint must equal either `a_sid` or `b_sid`; passing any other
+      value die()s.
 
     Field semantics — mirrors `_apply_reconciler_output`'s
     `merged_subtasks` apply step but uses the judge's
