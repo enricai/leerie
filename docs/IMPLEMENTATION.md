@@ -2245,19 +2245,24 @@ warning and falls back to the alphabetical default.
 
 ### PR-writer payload caps
 
-The `pr_writer` worker is invoked by passing its entire user prompt
-(task text, classification, subtask titles, full commit log, diff
+The `pr_writer` worker is invoked with its entire user prompt (task
+text, classification, subtask titles, full commit log, diff
 stat/dirstat, sampled diff, and the PR template body — all serialized
-as one JSON string) as a single argv element to `claude -p`. Linux
-`ARG_MAX` in the leerie container (Debian 13) defaults to ~128 KB; a
-degenerate run with thousands of commits, a huge template, or a
-sprawling diff would silently fail with `E2BIG`.
+as one JSON string) passed as `claude_p`'s `user_prompt`, which
+`_invoke` feeds to `claude -p` over stdin rather than argv (§3 "User
+prompt transport — stdin, not argv") — so this payload is not bound by
+Linux's per-argument `MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`)
+the way an argv-passed prompt would be. (Before that transport change,
+this section described the payload as a single argv element and the
+limit as the aggregate `ARG_MAX`; both were incorrect even then — the
+relevant per-argument ceiling is `MAX_ARG_STRLEN`, not `ARG_MAX`.)
 
-Three constants in `orchestrator/leerie.py` cap the unbounded fields so
-the total payload stays well under that ceiling. Each capped field
-gets an in-band `... [<label> truncated at ~N KB; remainder omitted —
-rely on the commit log] ...` sentinel so the worker can see the
-truncation and avoid fabricating detail past the cut-off.
+Three constants in `orchestrator/leerie.py` still cap the unbounded
+fields, now purely to bound the worker's LLM context rather than to
+defend an argv ceiling. Each capped field gets an in-band `... [<label>
+truncated at ~N KB; remainder omitted — rely on the commit log] ...`
+sentinel so the worker can see the truncation and avoid fabricating
+detail past the cut-off.
 
 | Constant | Default | Bounds |
 |----------|---------|--------|
@@ -2270,10 +2275,12 @@ These are **module constants, not `DEFAULT_CAPS` entries**, by
 design. `DEFAULT_CAPS` is the surface for run-wide operational caps
 that are intended to be user-tunable through CLI / env / TOML
 (`max_total_workers`, `worker_timeout_sec`, `worker_memory_max_bytes`,
-etc.). The PR-writer caps are internal protocol limits defending a
-single subprocess invocation against an OS-imposed argv ceiling:
-lowering them silently degrades summaries and raising them risks
-`E2BIG`. `tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
+etc.). The PR-writer caps are internal protocol limits bounding a
+single worker invocation's LLM context: lowering them silently
+degrades summaries, and raising them risks overwhelming the worker's
+context rather than an OS-imposed argv ceiling (the payload travels
+over stdin, not argv — see above).
+`tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
 pins the values so any future change goes through code review.
 
 Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary,
@@ -2295,9 +2302,9 @@ serialized JSON is bounded by
 `_final_conformance_payload` by trimming `warnings` (then `residuals`)
 from the tail until the field fits; at least one of each is
 preserved and the `truncated` marker is set so the prompt can
-mention the cut-off honestly. The cap defends a payload already
-sized close to the ~128 KB Linux ARG_MAX limit on the leerie
-container.
+mention the cut-off honestly. The cap bounds the worker's LLM context
+alongside the other `PR_WRITER_*` caps above, not an argv-size
+constraint — the payload travels over stdin, not argv.
 
 ### Heal-loop convergence parameters
 

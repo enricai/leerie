@@ -384,3 +384,43 @@ class TestExtractDepcapCommandsOrdering:
             assert hit_ceiling
         finally:
             leerie._DEPCAP_TOTAL_BUDGET = orig
+
+
+# ---------------------------------------------------------------------------
+# Guard-value-that-cannot-guard regression (bugfix-004)
+# ---------------------------------------------------------------------------
+
+def test_depcap_budgets_not_argv_bound_by_source(leerie):
+    """dep_capture's user_prompt (manifests_text + commands_text, bounded by
+    _DEPCAP_MANIFEST_TOTAL_BUDGET + _DEPCAP_TOTAL_BUDGET) reaches `claude -p`
+    via claude_p's stdin transport (bugfix-001), not argv — so the combined
+    ~430 KB budget is a token/context sanity check, not a guard against
+    Linux's 131,071-byte MAX_ARG_STRLEN. Pin the comment no longer claims an
+    argv-size guarantee it cannot make, via source inspection (mirrors
+    test_dep_capture_wiring.py's inspect.getsource discipline)."""
+    import inspect
+
+    src = inspect.getsource(leerie)
+    depcap_idx = src.index("_DEPCAP_TOTAL_BUDGET = 307200")
+    comment_block = src[max(0, depcap_idx - 700):depcap_idx]
+    assert "stdin" in comment_block, (
+        "the _DEPCAP_TOTAL_BUDGET comment must state the payload travels "
+        "over stdin, not argv, so a reader does not assume it defends an "
+        "argv ceiling")
+    assert "MAX_ARG_STRLEN" in comment_block
+
+
+def test_depcap_total_budget_value_unchanged_since_incident(leerie):
+    """Regression pin for the incident's specific claim: _DEPCAP_TOTAL_BUDGET
+    (300 KB) is 2.34x the real 131,072-byte MAX_ARG_STRLEN ceiling. Since the
+    payload is stdin-transported (not argv-bound), the fix is documentation,
+    not a value shrink — this pins the value is unchanged and the module
+    exposes MAX_ARG_STRLEN nowhere as a guard on this constant."""
+    assert leerie._DEPCAP_TOTAL_BUDGET == 307200
+    assert leerie._DEPCAP_MANIFEST_TOTAL_BUDGET == 131072
+    # Combined corpus is well over the per-argument argv ceiling — provably
+    # fine only because it never lands on argv.
+    combined = leerie._DEPCAP_TOTAL_BUDGET + leerie._DEPCAP_MANIFEST_TOTAL_BUDGET
+    assert combined > 131_071, (
+        "if this ever drops back under MAX_ARG_STRLEN, double-check whether "
+        "the comment's stdin-transport rationale is still accurate")
