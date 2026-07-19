@@ -824,6 +824,19 @@ block both carry `chmod -R a+rwX /tmp/.cache` + `chmod 1777 /tmp/.cache`
 after the existing `chown`, and the runtime chmod specifically lives
 *inside* the `ROOTLESS != true` guard (rootless has no runtime fixup path
 and relies on the image's baked-in mode alone).
+The same bug class hit `/home/leerie/.local`, `.cache`, and `.gnupg` directly
+(`pip install --user` failing with `EACCES: /home/leerie/.local/lib`), fixed
+in `tests/test_home_leerie_ownership.py` (same source-coupling style, but a
+chown-back rather than a chmod-world-writable, since these are a fixed set
+of pre-created dirs rather than an arbitrary-tool `XDG_CACHE_HOME`): the
+Dockerfile's `mkdir` block for these dirs carries no `chown` (root-owned,
+which is what maps correctly through the rootless remap — the same
+mechanism that already makes bind-mounted host dirs writable with no chown),
+`chmod 700 /home/leerie/.gnupg` is kept, and `container-entry.sh`'s
+rootful-guard block chowns `/home/leerie`, `.local`, `.cache`, and `.gnupg`
+to `leerie` at runtime instead (needed there since the rootful `runuser -u
+leerie` drop is a real UID switch, not a remap). A dedicated test asserts
+the `/tmp/.cache` fix above is unchanged by this.
 The gate *wiring* itself — as opposed to the probe's own runtime
 contract — is pinned in `tests/test_repo_map_gate_wiring.py` via
 source-coupling assertions (mirroring `test_dep_capture_wiring.py`):

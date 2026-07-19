@@ -174,6 +174,12 @@ cd /work
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
 if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
+  # The Dockerfile leaves /home/leerie/.local, .cache, and .gnupg
+  # root-owned (rootless needs that; see the Dockerfile comment there).
+  # The rootful `runuser -u leerie` drop is a real uid switch, so it
+  # needs literal leerie ownership — applied here instead.
+  chown leerie: /home/leerie 2>/dev/null || true
+  chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg 2>/dev/null || true
   # The Dockerfile's `mise install --system` creates /tmp/.cache/mise/
   # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an
   # ephemeral overlay so this is never seen; on Fly the rootfs preserves
