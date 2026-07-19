@@ -242,6 +242,7 @@ class TestSplitterCrashBarrier:
         models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
         efforts = {k: None for k in leerie.WORKER_TYPES}
         planner_resp = json.loads(json.dumps(_PLANNER_RESPONSE))
+        real_recursive_decompose = leerie.recursive_decompose
 
         async def fake_recursive_decompose(subtask, depth, st_, caps_,
                                            models_, efforts_, repo_root_,
@@ -263,7 +264,7 @@ class TestSplitterCrashBarrier:
                     "Failed to authenticate: OAuth session expired")
 
             with patch.object(leerie, "claude_p", new=fake_claude_p):
-                return await leerie.recursive_decompose(
+                return await real_recursive_decompose(
                     subtask, depth, st_, caps_, models_, efforts_,
                     repo_root_, **kwargs)
 
