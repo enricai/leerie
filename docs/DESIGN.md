@@ -469,16 +469,30 @@ pairwise; the orchestrator walks the pairs into a coherent cluster
 decision via the **anchor-survivor rule**: when one subtask sid
 appears in two or more non-`unresolvable` collisions, it is the
 *anchor* of that cluster and survives every merge it participates
-in. The anchor is by construction the subtask whose surface overlaps
-with each of its partners, so absorbing each partner *into* the
-anchor matches what the judge described. Without this override the
+in. In the motivating case the anchor is the subtask the judge paired
+against several narrower siblings, so absorbing each partner *into*
+it matches what the judge described. Without this override the
 default lex-smaller survivor rule (a determinism device with no
 semantic content) would silently keep an arbitrary narrower subtask
 and discard the spec the judge actually identified as broader.
 
-Appearance is the right membership test *for this rule*: a subtask
-overlapping several partners should win each of its merges regardless
-of which side of the pairs the judge happened to write it on.
+Membership is bare *appearance*, and the rule is exactly that literal:
+a sid is an anchor when it shows up in two or more non-`unresolvable`
+collisions, on either side, under any resolution. Merges and drops
+count alike; single drops count the same as the multi-drop clusters
+below; only `unresolvable` is excluded, because those never mutate the
+plan.
+
+Read that as a signal-strength claim, not a semantic one. Anchor
+membership does **not** mean the subtask absorbed anything — a sid the
+judge *dropped* twice is an anchor too (it simply never survives to
+use the hint). What membership says is only that the judge kept
+returning to this sid while writing its pairs, and that is a better
+tie-break for "which of these two survives the merge" than
+alphabetical order, which is what it displaces. Any richer reading —
+"the anchor is the subtask that absorbs its partners" — is false on
+roughly a third of the resolution combinations and should not be
+inferred from the name.
 
 There is a second, narrower predicate in this neighbourhood, and
 keeping the two apart is load-bearing. The orchestrator rejects one

@@ -14719,15 +14719,22 @@ def _collision_surviving_sids(c: dict) -> list[str]:
 
 def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
     """An *anchor* is a sid that appears in two or more non-
-    `unresolvable` collisions. By construction, the anchor is the
-    subtask whose surface overlaps with multiple sibling subtasks
-    on different artifacts (or with structurally compatible intents
-    on related artifacts) — i.e., it is the broader scope that
-    absorbs each partner. Returning the anchor set lets the apply
-    loop survive the anchor through every merge it appears in,
-    overriding the default lex-smaller survivor rule (which is a
-    determinism device with no semantic content — see
-    `_apply_overlap_merge`'s docstring on the lex rule).
+    `unresolvable` collisions — either side of the pair, any
+    resolution. Returning the anchor set lets the apply loop survive
+    the anchor through every merge it appears in, overriding the
+    default lex-smaller survivor rule (which is a determinism device
+    with no semantic content — see `_apply_overlap_merge`'s docstring
+    on the lex rule).
+
+    Membership is bare appearance count and asserts nothing about
+    absorbing a partner. A sid the judge *dropped* twice is an anchor
+    too — it simply never survives to use the hint. Reading it as
+    "the broader scope that absorbs each partner" is false on 20 of
+    the 64 two-collision combinations (measured), e.g. `merge(S, P)`
+    + `drop_a(S, Q)` makes S an anchor while S survives only one.
+    What membership means is only that the judge kept returning to
+    this sid, which is a better merge tie-break than alphabetical
+    order (DESIGN §5).
 
     Appearance-based, because that is what the merge-survivor rule
     needs: a sid overlapping several partners should win each of its
@@ -15299,21 +15306,28 @@ def _apply_overlap_collisions(plans: list[dict],
     non-`unresolvable` collisions (an *anchor*, computed by
     `_compute_overlap_anchors`), every merge it participates in
     keeps it as the survivor. This overrides `_apply_overlap_merge`'s
-    default lex-smaller survivor rule for the cluster case. The
-    rationale is structural: the anchor is by construction the
-    subtask that overlaps with each of its partners, so absorbing
-    each partner *into* the anchor matches what the judge described
-    (every individual `merge_feasibility` statement is appended to
-    the anchor's intent). The pairwise judge output is the simple
+    default lex-smaller survivor rule for the cluster case. In the
+    motivating all-merge cluster the anchor is the broader subtask,
+    so absorbing each partner *into* it matches what the judge
+    described (every individual `merge_feasibility` statement is
+    appended to the anchor's intent). That is a property of the
+    merge/merge shape, not of anchor membership — see the comment on
+    `anchors` below, and `_compute_overlap_anchors`' docstring: a sid
+    the judge dropped twice is an anchor too and absorbs nothing.
+    The pairwise judge output is the simple
     protocol; Python walks the pairs into a coherent cluster
     resolution (DESIGN §12 — logic enforced in code, not in the
     prompt).
 
     Callers must run `_validate_overlap_judge_output` first, which
-    catches the one pathological anchor case the apply loop cannot
-    resolve safely: a `drop_*` whose `dropped_sid` is an anchor —
-    the judge is contradicting itself (asking to delete the same
-    subtask other collisions claim absorbs them).
+    catches the one shape the apply loop cannot resolve safely: a
+    `drop_*` whose `dropped_sid` *survives* another collision
+    (`_contradictory_drop_sids` — kept as a merge endpoint, or as the
+    non-dropped side of another `drop_*`). One claim deletes the
+    subtask, another keeps it, and no apply order satisfies both.
+    Note this is deliberately NOT anchor membership: a sid dropped by
+    several collisions is an anchor by appearance but is legal
+    multi-drop output, handled below by `_apply_multidrop`.
 
     Merges between two anchors (legitimate within a single connected
     cluster — e.g. a triangle of `merge(A,B), merge(A,C), merge(B,C)`)
@@ -15333,6 +15347,13 @@ def _apply_overlap_collisions(plans: list[dict],
     silent no-ops here — the caller is expected to have surfaced
     and die()d on them before invoking this helper.
     """
+    # Computed over ALL non-`unresolvable` collisions — every
+    # resolution type, either side, including the multi-drop clusters
+    # the loop below skips (DESIGN §5). Membership is bare appearance
+    # count and asserts nothing about absorbing a partner: a sid the
+    # judge dropped twice is an anchor too, it just never survives to
+    # use the hint. It is a tie-break with more signal than lex order,
+    # not a semantic claim.
     anchors = _compute_overlap_anchors(collisions)
     applied: list[dict] = []
     # Transitive-rewrite map: sid → its current survivor in `plans`.
@@ -15787,12 +15808,30 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
 
     st.data["plan_overlap_applied"] = applied
     st.save()
+    # Every emitted (action, resolution) shape must land in exactly one
+    # bucket, so the parts sum to len(applied). Two traps here, both
+    # measured: `multi_drop_*` does NOT match startswith('drop') and
+    # needs its own term (without it a multi-drop run logged "applied 2
+    # resolution(s) (0 merge, 0 drop)"), and the multi-drop tier-3 skip
+    # emits action='skipped_would_cycle' — indistinguishable from a
+    # pairwise skip by action alone — so it is attributed by its
+    # `resolution` field instead.
+    def _is_multidrop_cycle_skip(a: dict) -> bool:
+        return (a['action'] == 'skipped_would_cycle'
+                and a.get('resolution') == 'multi_drop')
+
     n_merge = sum(1 for a in applied if a['action'] == 'merge')
     n_drop = sum(1 for a in applied if a['action'].startswith('drop'))
+    n_multidrop = sum(1 for a in applied
+                      if a['action'].startswith('multi_drop')
+                      or _is_multidrop_cycle_skip(a))
     n_skip = sum(1 for a in applied if a['action'] == 'skipped_redundant')
     n_cycle_skip = sum(1 for a in applied
-                       if a['action'] == 'skipped_would_cycle')
+                       if a['action'] == 'skipped_would_cycle'
+                       and not _is_multidrop_cycle_skip(a))
     parts = [f"{n_merge} merge", f"{n_drop} drop"]
+    if n_multidrop:
+        parts.append(f"{n_multidrop} multi_drop")
     if n_skip:
         parts.append(f"{n_skip} skipped_redundant")
     if n_cycle_skip:

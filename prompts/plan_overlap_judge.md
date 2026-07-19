@@ -220,9 +220,9 @@ config-001 creates `tsconfig.server.json`; config-002 wires root
 - `merge(feat-002, config-001)` on `tsconfig.server.json`
 - `merge(feat-002, config-002)` on `tsconfig.json`
 
-The orchestrator will keep feat-002 (the shared endpoint, by
-construction the broader subtask) as the survivor of both merges and
-absorb each partner's intent. Do NOT downgrade these to
+The orchestrator will keep feat-002 (the shared endpoint, and in this
+all-merge shape the broader subtask) as the survivor of both merges
+and absorb each partner's intent. Do NOT downgrade these to
 `unresolvable` just because feat-002 appears twice — the pairwise
 protocol is designed for exactly this case.
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 
 import pytest
 
@@ -811,7 +812,9 @@ def test_apply_collisions_anchor_survives_both_merges(leerie):
                     if s["id"] == "feat-002")
     # Both merge_feasibility statements carried into intent — the
     # discipline that distinguishes merge from frankenstein, applied
-    # twice as the anchor absorbs each partner.
+    # twice as this anchor absorbs each partner. (Absorption is a
+    # property of *merge*, not of anchor membership: see
+    # `test_anchor_membership_is_appearance_not_survivorship`.)
     assert "single emitting tsconfig satisfies both" in survivor["intent"]
     assert "one wired tsconfig with backend reference" in survivor["intent"]
     # provides is the union of all three subtasks.
@@ -2003,3 +2006,346 @@ def test_phase_overlap_judge_dies_on_unresolvable(leerie, monkeypatch,
     assert "unresolvable" in err
     assert "feat-001" in err and "bugfix-002" in err
     assert plans == before
+
+
+def test_multidrop_sid_counts_toward_anchor_membership(leerie):
+    """DESIGN §5: anchors are computed over ALL non-`unresolvable`
+    collisions, including the multi-drop clusters the pairwise loop
+    then skips — so a sid appearing in a cluster *and* in a merge
+    reaches two appearances and wins that merge, overriding
+    lex-smaller.
+
+    The mechanism is appearance count, nothing richer. See
+    `test_anchor_membership_is_appearance_not_survivorship` for the
+    pin on that; an earlier revision of this docstring claimed the
+    anchor was the subtask "absorbing a dropped sibling's surface,"
+    which is false — `feat-m` below absorbs `bugfix-x` identically and
+    is not an anchor.
+
+    This pins the behavior as *chosen*. It was previously accidental:
+    `anchors` happened to be computed before the multi-drop filter, and
+    nothing recorded whether that was intended."""
+    def _mk():
+        return [{"domain": "t", "status": "ready", "subtasks": [
+            _st("feat-a", ["pa"]), _st("feat-m", ["pm"]),
+            _st("bugfix-x", ["px"]), _st("feat-z", ["pz"])]}]
+
+    merge = {"a_sid": "feat-a", "b_sid": "feat-z", "artifact": "m.ts",
+             "resolution": "merge", "reason": "r",
+             "merge_feasibility": "ok"}
+    multidrop = [
+        {"a_sid": "feat-z", "b_sid": "bugfix-x", "artifact": "1.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "feat-m", "b_sid": "bugfix-x", "artifact": "2.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ]
+
+    # Control: the merge alone. No anchors, so lex-smaller picks feat-a.
+    plans = _mk()
+    applied = leerie._apply_overlap_collisions(plans, [dict(merge)])
+    control = [a for a in applied if a["action"] == "merge"][0]
+    assert control["surviving_sid"] == "feat-a"
+
+    # With the multi-drop cluster present, feat-z reaches two
+    # appearances (cluster + merge) and so wins as an anchor. Note the
+    # mechanism is appearance, NOT "absorbing bugfix-x" — feat-m
+    # absorbs it identically and is not an anchor.
+    plans = _mk()
+    applied = leerie._apply_overlap_collisions(
+        plans, [dict(c) for c in multidrop] + [dict(merge)])
+    merged = [a for a in applied if a["action"] == "merge"][0]
+    assert merged["surviving_sid"] == "feat-z"
+    # Whichever endpoint wins, no intent is lost — the carry-forward
+    # invariant holds, so this is survivor *selection*, not corruption.
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert "Absorbed intent" in by_id["feat-z"]["intent"]
+    assert "feat-a" in by_id["feat-z"]["intent"]
+
+
+def _run_phase_overlap_judge(leerie, monkeypatch, plans, collisions):
+    """Drive the real `phase_overlap_judge` with a stubbed worker, so
+    the phase-summary log line is produced by the shipping code path
+    rather than reproduced in the test."""
+    class _St:
+        def __init__(self):
+            self.data = {}
+
+        def save(self):
+            pass
+
+    async def _fake_loop(**kwargs):
+        return ({"collisions": collisions}, [])
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    monkeypatch.setattr(leerie, "check_overlap_judge_output",
+                        lambda *a, **k: [])
+    return asyncio.run(leerie.phase_overlap_judge(
+        plans, "task", _St(), {"judgment_check_rounds": 1}, {}, {}))
+
+
+def _multidrop_two_domain_plans():
+    """Two contributing planners — a single-planner run cheap-skips the
+    judge before any collision is considered."""
+    return [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [_st("feat-001", ["p1"]), _st("feat-002", ["p2"])]},
+        {"domain": "bug-fixing", "status": "ready", "subtasks": [
+            _st("bugfix-003", ["cov"]),
+            _st("bugfix-004", ["c"],
+                [{"tag": "cov", "extent": "in_plan"}], ["bugfix-003"])]},
+    ]
+
+
+def test_anchor_membership_is_appearance_not_survivorship(leerie):
+    """Anchor membership is bare appearance in 2+ non-`unresolvable`
+    collisions — any resolution, either side. It carries no claim that
+    the sid absorbed a partner.
+
+    This pins the fact an earlier DESIGN revision got backwards: it
+    described anchors as subtasks that "absorb a dropped sibling's
+    surface." Measured over all 64 two-collision combinations, that
+    reading is wrong on 20 of them. The clearest case is the first
+    assertion below — the only anchor of a multi-drop cluster is the
+    sid being **deleted**, and neither survivor qualifies."""
+    cluster = [
+        {"a_sid": "feat-z", "b_sid": "bugfix-x", "resolution": "drop_b"},
+        {"a_sid": "feat-m", "b_sid": "bugfix-x", "resolution": "drop_b"},
+    ]
+    assert leerie._compute_overlap_anchors(cluster) == {"bugfix-x"}
+
+    # A sid that survives only one of two collisions is still an anchor.
+    mixed = [
+        {"a_sid": "S", "b_sid": "P", "resolution": "merge",
+         "merge_feasibility": "x"},
+        {"a_sid": "S", "b_sid": "Q", "resolution": "drop_a"},
+    ]
+    assert "S" in leerie._compute_overlap_anchors(mixed)
+
+    # Position is irrelevant — b_sid counts the same as a_sid.
+    flipped = [
+        {"a_sid": "P", "b_sid": "S", "resolution": "merge",
+         "merge_feasibility": "x"},
+        {"a_sid": "Q", "b_sid": "S", "resolution": "merge",
+         "merge_feasibility": "x"},
+    ]
+    assert "S" in leerie._compute_overlap_anchors(flipped)
+
+    # `unresolvable` is the sole exclusion — those never mutate the plan.
+    unres = [
+        {"a_sid": "S", "b_sid": "P", "resolution": "unresolvable"},
+        {"a_sid": "S", "b_sid": "Q", "resolution": "unresolvable"},
+    ]
+    assert leerie._compute_overlap_anchors(unres) == set()
+
+
+def _parse_phase_summary(captured_out):
+    """Parse the phase 2¾ summary line into `(total, {bucket: count})`.
+
+    Reads the numbers the operator actually sees. Deliberately does not
+    recompute them: a test that reproduces the counters it guards
+    passes when the shipping arithmetic breaks, which is exactly how
+    two predecessors of these tests went inert."""
+    lines = [ln for ln in captured_out.splitlines()
+             if "applied" in ln and "resolution(s)" in ln]
+    assert lines, "no phase 2¾ summary line emitted"
+    match = re.search(r"applied (\d+) resolution\(s\) \(([^)]*)\)", lines[-1])
+    assert match, f"unparseable summary line: {lines[-1]}"
+    parts = {}
+    for chunk in match.group(2).split(", "):
+        # Guarded rather than a bare tuple unpack: an unrecognised
+        # format should assert-fail naming the line, not raise
+        # ValueError from inside the helper.
+        bits = chunk.split(" ", 1)
+        assert len(bits) == 2 and bits[0].isdigit(), (
+            f"unrecognised summary chunk {chunk!r} in: {lines[-1]}")
+        parts[bits[1]] = int(bits[0])
+    return int(match.group(1)), parts
+
+
+def _all_shapes_fixture():
+    """Plans + collisions driving **every** `(action, resolution)` shape
+    `_apply_overlap_collisions` can emit, in one run.
+
+    Ten disjoint groups so no group's resolution perturbs another. Two
+    non-obvious requirements, both found by construction rather than
+    reading: a `drop_a` that cycles needs `h03 dep h01, h02 dep h03`
+    (the mirror shape yields a plain `drop_a` instead), and the plans
+    must span two domains or the single-planner cheap-skip aborts the
+    phase before any collision is considered."""
+    subtasks = [
+        # plain merge / drop_a / drop_b
+        _st("feat-a01", ["ga1"]), _st("feat-a02", ["ga2"]),
+        _st("feat-b01", ["gb1"]), _st("feat-b02", ["gb2"]),
+        _st("feat-c01", ["gc1"]), _st("feat-c02", ["gc2"]),
+        # multi-drop fan-out
+        _st("feat-d01", ["gd1"]), _st("feat-d02", ["gd2"]),
+        _st("bugfix-d03", ["gd3"]),
+        _st("feat-d04", ["gd4"], [{"tag": "gd3", "extent": "in_plan"}],
+            ["bugfix-d03"]),
+        # multi-drop degraded: fan-out cycles, lex-smallest single does not
+        _st("feat-e01", ["ge1"]), _st("feat-e02", ["ge2"], depends_on=["feat-e04"]),
+        _st("bugfix-e03", ["ge3"]),
+        _st("feat-e04", ["ge4"], [{"tag": "ge3", "extent": "in_plan"}],
+            ["bugfix-e03"]),
+        # multi-drop tier 3: both survivors depend on the consumer
+        _st("feat-f01", ["gf1"], depends_on=["feat-f04"]),
+        _st("feat-f02", ["gf2"], depends_on=["feat-f04"]),
+        _st("bugfix-f03", ["gf3"]),
+        _st("feat-f04", ["gf4"], [{"tag": "gf3", "extent": "in_plan"}],
+            ["bugfix-f03"]),
+        # merge / drop_a / drop_b that would each close a cycle
+        _st("feat-g01", ["gg1"], depends_on=["feat-g03"]), _st("feat-g02", ["gg2"]),
+        _st("feat-g03", ["gg3"], depends_on=["feat-g02"]),
+        _st("feat-h01", ["gh1"]), _st("feat-h02", ["gh2"], depends_on=["feat-h03"]),
+        _st("feat-h03", ["gh3"], depends_on=["feat-h01"]),
+        _st("feat-i01", ["gi1"]), _st("feat-i02", ["gi2"], depends_on=["feat-i03"]),
+        _st("feat-i03", ["gi3"], depends_on=["feat-i01"]),
+        # triangle: the closing edge collapses to skipped_redundant
+        _st("feat-j01", ["gj1"]), _st("feat-j02", ["gj2"]),
+        _st("feat-j03", ["gj3"]),
+    ]
+    mf = {"merge_feasibility": "ok"}
+    collisions = [
+        {"a_sid": "feat-a01", "b_sid": "feat-a02", "resolution": "merge",
+         "artifact": "a.ts", **mf},
+        {"a_sid": "feat-b01", "b_sid": "feat-b02", "resolution": "drop_a",
+         "artifact": "b.ts"},
+        {"a_sid": "feat-c01", "b_sid": "feat-c02", "resolution": "drop_b",
+         "artifact": "c.ts"},
+        {"a_sid": "feat-d01", "b_sid": "bugfix-d03", "resolution": "drop_b",
+         "artifact": "d1.ts"},
+        {"a_sid": "feat-d02", "b_sid": "bugfix-d03", "resolution": "drop_b",
+         "artifact": "d2.ts"},
+        {"a_sid": "feat-e01", "b_sid": "bugfix-e03", "resolution": "drop_b",
+         "artifact": "e1.ts"},
+        {"a_sid": "feat-e02", "b_sid": "bugfix-e03", "resolution": "drop_b",
+         "artifact": "e2.ts"},
+        {"a_sid": "feat-f01", "b_sid": "bugfix-f03", "resolution": "drop_b",
+         "artifact": "f1.ts"},
+        {"a_sid": "feat-f02", "b_sid": "bugfix-f03", "resolution": "drop_b",
+         "artifact": "f2.ts"},
+        {"a_sid": "feat-g01", "b_sid": "feat-g02", "resolution": "merge",
+         "artifact": "g.ts", **mf},
+        {"a_sid": "feat-h01", "b_sid": "feat-h02", "resolution": "drop_a",
+         "artifact": "h.ts"},
+        {"a_sid": "feat-i02", "b_sid": "feat-i01", "resolution": "drop_b",
+         "artifact": "i.ts"},
+        {"a_sid": "feat-j01", "b_sid": "feat-j02", "resolution": "merge",
+         "artifact": "j.ts", **mf},
+        {"a_sid": "feat-j01", "b_sid": "feat-j03", "resolution": "merge",
+         "artifact": "j.ts", **mf},
+        {"a_sid": "feat-j02", "b_sid": "feat-j03", "resolution": "merge",
+         "artifact": "j.ts", **mf},
+    ]
+    half = len(subtasks) // 2
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": subtasks[:half]},
+        {"domain": "bug-fixing", "status": "ready",
+         "subtasks": subtasks[half:]},
+    ]
+    return plans, collisions
+
+
+def test_all_shapes_fixture_reaches_every_action_shape(leerie):
+    """Guard the guard: if the fixture stops reaching a shape, the
+    partition test below silently narrows instead of failing."""
+    plans, collisions = _all_shapes_fixture()
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+    seen = {(a["action"], a.get("resolution", "-")) for a in applied}
+    expected = {
+        ("merge", "-"), ("drop_a", "-"), ("drop_b", "-"),
+        ("multi_drop_fanout", "-"), ("multi_drop_degraded_single", "-"),
+        ("skipped_redundant", "-"),
+        ("skipped_would_cycle", "merge"), ("skipped_would_cycle", "drop_a"),
+        ("skipped_would_cycle", "drop_b"),
+        ("skipped_would_cycle", "multi_drop"),
+    }
+    assert expected <= seen, f"fixture no longer reaches: {expected - seen}"
+
+
+def test_phase_log_counts_multidrop_in_summary(leerie, monkeypatch, capsys):
+    """The phase 2¾ summary must account for a multi-drop cluster.
+
+    Asserts on the **emitted log text** from the real code path, not on
+    a sum recomputed in the test. The predecessor of this test did the
+    latter and was inert: deleting the `parts.append` that makes the
+    count visible left it passing while the log went back to the exact
+    broken string — "(0 merge, 0 drop)" — that motivated the fix."""
+    collisions = [
+        {"a_sid": "feat-001", "b_sid": "bugfix-003", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "feat-002", "b_sid": "bugfix-003", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ]
+    _run_phase_overlap_judge(
+        leerie, monkeypatch, _multidrop_two_domain_plans(), collisions)
+    total, parts = _parse_phase_summary(capsys.readouterr().out)
+    assert total == 1
+    assert parts.get("multi_drop") == 1, parts
+    # The parts must account for the total — an inflated or dropped
+    # count is caught here rather than by substring matching.
+    assert sum(parts.values()) == total, parts
+
+
+def test_phase_log_attributes_tier3_cluster_skip_to_multidrop(
+        leerie, monkeypatch, capsys):
+    """Tier 3 (fan-out AND lex-smallest-single both cycle) emits
+    `action='skipped_would_cycle'` — indistinguishable from a pairwise
+    merge/drop skip by action alone. It carries `resolution:
+    'multi_drop'` so the counters can attribute it; without that a
+    whole-cluster skip is silently reported as a pairwise one.
+
+    Reachability is not hypothetical: both survivors depending on the
+    consumer makes every tier cycle."""
+    plans = _multidrop_two_domain_plans()
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    by_id["feat-001"]["depends_on"] = ["bugfix-004"]
+    by_id["feat-002"]["depends_on"] = ["bugfix-004"]
+    collisions = [
+        {"a_sid": "feat-001", "b_sid": "bugfix-003", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "feat-002", "b_sid": "bugfix-003", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ]
+    out_plans = _run_phase_overlap_judge(
+        leerie, monkeypatch, plans, collisions)
+    # The subtask is kept — that is what tier 3 means.
+    assert "bugfix-003" in {s["id"] for p in out_plans
+                            for s in p["subtasks"]}
+    total, parts = _parse_phase_summary(capsys.readouterr().out)
+    assert total == 1
+    assert parts.get("multi_drop") == 1, parts
+    assert "skipped_would_cycle" not in parts, parts
+    assert sum(parts.values()) == total, parts
+
+
+def test_phase_log_parts_partition_every_action_shape(
+        leerie, monkeypatch, capsys):
+    """The counter buckets must partition: over a run emitting **every**
+    `(action, resolution)` shape, the per-bucket counts the operator
+    sees sum to the reported total.
+
+    Driven end to end through the real `phase_overlap_judge` and parsed
+    out of its emitted log line. Two predecessors of this test
+    recomputed the counters locally instead and were inert — breaking
+    the shipping partition left both passing while the log reported
+    `applied 1 resolution(s)` against parts summing to 2. A test that
+    reproduces the logic it guards is worse than no test: it reports
+    safety that does not exist."""
+    plans, collisions = _all_shapes_fixture()
+    _run_phase_overlap_judge(leerie, monkeypatch, plans, collisions)
+    total, parts = _parse_phase_summary(capsys.readouterr().out)
+
+    assert sum(parts.values()) == total, (
+        f"parts {parts} sum to {sum(parts.values())} but the log reports "
+        f"{total} — a shape is counted twice or not at all")
+    # Exact per-bucket counts, not just the sum. The sum alone is
+    # invariant under any permutation of counts across labels: swapping
+    # the merge and drop labels leaves it passing while the operator is
+    # told a run did 2 merges and 3 drops when it did 3 and 2 —
+    # opposite semantics, since merge preserves both specs and drop
+    # discards one. The sum assertion stays because it also guards
+    # shapes this fixture does not enumerate.
+    assert parts == {"merge": 3, "drop": 2, "multi_drop": 3,
+                     "skipped_redundant": 1, "skipped_would_cycle": 3}, parts
