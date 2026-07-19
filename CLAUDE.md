@@ -888,7 +888,13 @@ cannot start) and that the payload round-trips through a real `State.save()`.
 `tests/test_decompose_snapshot.py` is `plan_snapshot`'s sibling for the D3 crash
 barrier: a `WorkerError` from `recursive_decompose`'s `fit_judge` call degrades the
 node to a leaf (`[subtask]` unchanged, not dropped, not propagated) rather than
-discarding sibling subtasks' already-completed fit/split decisions; `phase_plan`'s
+discarding sibling subtasks' already-completed fit/split decisions. A `WorkerError`
+from the coupled-minority `splitter` call (the non-migration split path, ~70 lines
+below the `fit_judge` guard) degrades to a leaf the same way — `TestSplitterCrashBarrier`
+pins this as the surviving half of D3: the `fit_judge` guard alone left this call
+unguarded, so a crash there still discarded every fit/split decision already paid for
+in sibling subtasks, including end-to-end through `phase_plan` that a sibling's
+already-completed leaves survive a later subtask's splitter crash. `phase_plan`'s
 expansion loop persists `st.data["decompose_snapshot"]` after each top-level subtask
 finishes, so a later subtask's crash still leaves the earlier ones' completed leaves
 in the snapshot, round-tripped through a real `State.save()`; a normal run's final
