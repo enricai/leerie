@@ -226,13 +226,22 @@ absorb each partner's intent. Do NOT downgrade these to
 `unresolvable` just because feat-002 appears twice — the pairwise
 protocol is designed for exactly this case.
 
-Do NOT emit two collisions sharing one endpoint when that endpoint
-is being *dropped* in one of them — the orchestrator will die() at
-plan time on the contradiction (a `drop_*` of an anchor of another
-`merge` is incoherent: the dropped subtask cannot also be the
-survivor of a merge). If the shared sid genuinely should be dropped,
-the other collision involving it must also be a `drop_*` or
-`unresolvable`.
+Do NOT emit a `drop_*` of a sid that *survives* another collision in
+the same output — the orchestrator will die() at plan time on the
+contradiction (the dropped subtask cannot also be the survivor of a
+merge, or the kept side of another drop; no apply order satisfies
+both). If the shared sid genuinely should be dropped, every other
+collision involving it must also drop it, or be `unresolvable`.
+
+Dropping the same sid in several collisions at once *is* allowed and
+is the right emission when one subtask's surface is jointly covered by
+several siblings — say `drop_b(test-001, bugfix-003)` and
+`drop_b(test-002, bugfix-003)`, where bugfix-003's work is split
+between the two. The orchestrator applies these as one cluster: the
+dropped subtask's `provides` are unioned into every survivor and
+inbound dependencies fan out to all of them. Prefer this over forcing
+an artificial `merge` between siblings that do not actually overlap
+with each other.
 
 Connected-cluster shapes (e.g. emitting `merge(A, B)`, `merge(A, C)`,
 *and* `merge(B, C)` when all three target the same artifact) are
@@ -367,8 +376,11 @@ Before you emit your output, self-gate on one axis:
 
 - `judgment` (float 1–10): how confident you are that all surface collisions
   are identified and each resolution is correct. Earns ≥ 9.0 only when
-  each collision's artifact exists in the repo and the drop/merge does not
-  break the dependency graph.
+  each collision's artifact is real — either present in the repo, or named
+  in a subtask's `files_likely_touched` (two subtasks that both plan to
+  *create* the same file is the canonical collision, so a not-yet-existing
+  artifact is not a reason to discount your own finding) — and the
+  drop/merge does not break the dependency graph.
 
 Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):

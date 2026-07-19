@@ -5385,6 +5385,19 @@ def check_reconciler_output(
     return issues
 
 
+def _normalize_artifact_path(path: str) -> str:
+    """Canonicalize a planner- or judge-authored repo-relative path for
+    comparison: native separators to `/`, leading `./` and `/` stripped.
+
+    Deliberately no case folding — the repos leerie runs against are
+    checked out on case-sensitive filesystems in the container, so
+    folding would make genuinely distinct paths compare equal."""
+    normalized = path.strip().replace(os.sep, "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
+
+
 def check_overlap_judge_output(
     output: dict, plans: list[dict], repo_root: Path,
 ) -> list[str]:
@@ -5397,24 +5410,46 @@ def check_overlap_judge_output(
         for s in plan.get("subtasks", []):
             by_id[s["id"]] = s
 
+    # Files the plan intends to create or rewrite count as real
+    # artifacts alongside the ones already on disk. The judge's charter
+    # is subtasks that both *create* the same exported artifact
+    # (`prompts/plan_overlap_judge.md`), so a not-yet-existing path is
+    # its canonical subject rather than evidence of a hallucination —
+    # a repo-only existence test rejects the primary case and, because
+    # the prompt ties the confidence floor to artifact verifiability,
+    # also pushes the judge to self-downgrade below the
+    # LOW_CONFIDENCE threshold on findings that were correct.
+    planned_files: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            for f in s.get("files_likely_touched", []) or []:
+                planned_files.add(_normalize_artifact_path(f))
+
     _CODE_EXTS = frozenset(
         ".ts .tsx .py .go .rs .java .rb .js .jsx .css .scss".split())
     for c in collisions:
         artifact = c.get("artifact", "")
         if "/" in artifact or any(
                 artifact.endswith(ext) for ext in _CODE_EXTS):
-            if not (repo_root / artifact).exists():
+            normalized = _normalize_artifact_path(artifact)
+            if (normalized not in planned_files
+                    and not (repo_root / artifact).exists()):
                 issues.append(
                     f"PHANTOM_ARTIFACT: collision "
                     f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
                     f"names artifact {artifact!r} which does not "
-                    "exist in the repo")
+                    "exist in the repo and is not in any subtask's "
+                    "files_likely_touched")
 
     for c in collisions:
         a = by_id.get(c.get("a_sid", ""), {})
         b = by_id.get(c.get("b_sid", ""), {})
-        a_files = set(a.get("files_likely_touched", []) or [])
-        b_files = set(b.get("files_likely_touched", []) or [])
+        # Normalized: both sides are planner-authored strings, so
+        # `./src/x.ts` and `src/x.ts` must not read as disjoint.
+        a_files = {_normalize_artifact_path(f)
+                   for f in (a.get("files_likely_touched", []) or [])}
+        b_files = {_normalize_artifact_path(f)
+                   for f in (b.get("files_likely_touched", []) or [])}
         if a_files and b_files and not (a_files & b_files):
             issues.append(
                 f"NO_FILE_OVERLAP: collision "
@@ -14658,6 +14693,30 @@ def _validate_unresolved_must_include(
 # a frankenstein spec.
 
 
+def _collision_dropped_sid(c: dict) -> str | None:
+    """The sid a `drop_a`/`drop_b` collision removes, else None."""
+    res = c.get("resolution")
+    if res == "drop_a":
+        return c.get("a_sid")
+    if res == "drop_b":
+        return c.get("b_sid")
+    return None
+
+
+def _collision_surviving_sids(c: dict) -> list[str]:
+    """The sids a collision keeps. A merge keeps both endpoints (which
+    one absorbs the other is a later, order-dependent decision); a
+    `drop_*` keeps exactly the non-dropped side."""
+    res = c.get("resolution")
+    if res == "merge":
+        return [s for s in (c.get("a_sid"), c.get("b_sid")) if s]
+    if res == "drop_a":
+        return [c["b_sid"]] if c.get("b_sid") else []
+    if res == "drop_b":
+        return [c["a_sid"]] if c.get("a_sid") else []
+    return []
+
+
 def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
     """An *anchor* is a sid that appears in two or more non-
     `unresolvable` collisions. By construction, the anchor is the
@@ -14670,6 +14729,13 @@ def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
     determinism device with no semantic content — see
     `_apply_overlap_merge`'s docstring on the lex rule).
 
+    Appearance-based, because that is what the merge-survivor rule
+    needs: a sid overlapping several partners should win each of its
+    merges regardless of which side of the pairs it sat on.
+    `_contradictory_drop_sids` is the separate, narrower predicate
+    used to reject self-contradictory output — do not conflate the
+    two (see its docstring).
+
     Pure helper. `unresolvable` collisions are excluded because they
     are surfaced separately and never mutate the plan, so they don't
     establish an overlap claim."""
@@ -14681,6 +14747,33 @@ def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
             if sid:
                 counts[sid] = counts.get(sid, 0) + 1
     return {sid for sid, n in counts.items() if n >= 2}
+
+
+def _contradictory_drop_sids(collisions: list[dict]) -> set[str]:
+    """Sids the judge asks to both keep and delete — one collision
+    drops the sid while another keeps it as a survivor. No apply order
+    satisfies both claims, so `_validate_overlap_judge_output` die()s
+    on these before any mutation.
+
+    The predicate is *survives-somewhere ∧ dropped-somewhere*, not
+    "appears twice", and the difference is load-bearing. A sid that is
+    the **dropped** side of several collisions is not contradictory:
+    nothing claims it survives, so every claim agrees it goes away.
+    That is the multi-drop shape (DESIGN §5 *Multi-drop*) — coherent
+    output that `prompts/plan_overlap_judge.md` explicitly sanctions
+    and `_apply_multidrop` applies as a cluster. Gating on appearance
+    count instead die()s that correct emission after the full planning
+    spend, unrecoverably, since this phase precedes `write_plan()`."""
+    survives: set[str] = set()
+    dropped: set[str] = set()
+    for c in collisions:
+        if c.get("resolution") == "unresolvable":
+            continue
+        survives.update(_collision_surviving_sids(c))
+        sid = _collision_dropped_sid(c)
+        if sid:
+            dropped.add(sid)
+    return survives & dropped
 
 
 def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]) -> None:
@@ -14733,16 +14826,22 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
                     "implementer spec. The right answer in this case is "
                     "resolution=unresolvable. Refine the task or re-run.")
 
-    # Anchor-set consistency check (DESIGN §5 anchor rule).
-    # An *anchor* is a sid that appears in two or more non-
-    # `unresolvable` collisions — the structural broader-scope subtask
-    # the apply loop will keep as the survivor of each merge it
-    # appears in. One judge emission involving anchors is pathological
-    # and must die() before any mutation:
+    # Keep-and-delete consistency check (DESIGN §5 anchor rule).
+    # One judge emission is pathological and must die() before any
+    # mutation: a `drop_*` whose `dropped_sid` *survives* another
+    # collision — kept as a merge endpoint, or as the non-dropped side
+    # of another drop. The judge would be asking to delete a subtask
+    # another collision claims absorbs it, so X must both survive and
+    # vanish; no apply order satisfies both.
     #
-    # - drop-of-anchor: a `drop_*` whose `dropped_sid` is an anchor.
-    #   The judge would be asking to delete the same subtask other
-    #   collisions claim absorbs them — directly contradictory.
+    # Deliberately NOT gated: a sid that is the *dropped* side of
+    # several collisions (multi-drop). Nothing claims it survives, so
+    # every claim agrees — the judge found its surface jointly covered
+    # by several siblings, which `prompts/plan_overlap_judge.md`
+    # explicitly instructs. It is applied as a cluster by
+    # `_apply_multidrop`. Gating on bare appearance count (the pre-fix
+    # behavior) die()d that correct output after the full planning
+    # spend, unrecoverably, since this phase precedes `write_plan()`.
     #
     # (Earlier iterations of this audit also gated `merge`-between-
     # two-anchors, but the apply loop's natural semantics — fall
@@ -14752,35 +14851,26 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
     # multi-anchor shape cleanly. The earlier check was over-
     # aggressive and is removed.)
     collisions = output.get("collisions", []) or []
-    anchors = _compute_overlap_anchors(collisions)
-    if anchors:
+    contradictory = _contradictory_drop_sids(collisions)
+    if contradictory:
         for c in collisions:
-            resolution = c.get("resolution")
+            dropped = _collision_dropped_sid(c)
+            if dropped is None or dropped not in contradictory:
+                continue
             a_sid = c.get("a_sid")
             b_sid = c.get("b_sid")
+            partner = b_sid if dropped == a_sid else a_sid
             artifact = c.get("artifact", "<unspecified>")
-            if resolution == "drop_a" and a_sid in anchors:
-                die(f"plan-overlap judge contradicts itself: it asks to "
-                    f"drop {a_sid!r} (collision with {b_sid!r}, artifact "
-                    f"{artifact!r}) but {a_sid!r} also anchors other "
-                    "merge/drop collisions in the same output. A drop "
-                    "of an anchor would delete the subtask other "
-                    "collisions claim absorbs them. Refine the task or "
-                    "re-run; if the cluster is genuine, the judge "
-                    "should emit `merge` (not `drop`) against the "
-                    "anchor and `unresolvable` if the cluster cannot "
-                    "be auto-resolved.")
-            if resolution == "drop_b" and b_sid in anchors:
-                die(f"plan-overlap judge contradicts itself: it asks to "
-                    f"drop {b_sid!r} (collision with {a_sid!r}, artifact "
-                    f"{artifact!r}) but {b_sid!r} also anchors other "
-                    "merge/drop collisions in the same output. A drop "
-                    "of an anchor would delete the subtask other "
-                    "collisions claim absorbs them. Refine the task or "
-                    "re-run; if the cluster is genuine, the judge "
-                    "should emit `merge` (not `drop`) against the "
-                    "anchor and `unresolvable` if the cluster cannot "
-                    "be auto-resolved.")
+            die(f"plan-overlap judge contradicts itself: it asks to "
+                f"drop {dropped!r} (collision with {partner!r}, artifact "
+                f"{artifact!r}) but {dropped!r} also survives another "
+                "collision in the same output — one claims it is "
+                "absorbed away, another keeps it as the surviving "
+                "side. No apply order satisfies both. Refine the task "
+                "or re-run; if the cluster is genuine, the judge "
+                "should emit `merge` (not `drop`) against the "
+                "anchor and `unresolvable` if the cluster cannot "
+                "be auto-resolved.")
 
 
 def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
@@ -14890,6 +14980,86 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
                     if dep not in new_deps and dep != s.get("id"):
                         new_deps.append(dep)
                 s["depends_on"] = new_deps
+
+
+def _apply_multidrop(plans: list[dict], dropped_sid: str,
+                     surviving_sids: list[str]) -> None:
+    """Apply a *multi-drop* cluster — one subtask dropped in favor of
+    several siblings at once — as a single whole-cluster operation
+    (DESIGN §5 *Multi-drop*).
+
+    The judge emits this when it finds one subtask's surface jointly
+    covered by several others. Replaying the pairs through
+    `_apply_overlap_collisions`' transitive `survivor_of` rewrite is
+    silent corruption, not a valid chain: pair 2's `_resolve` maps the
+    already-dropped endpoint onto pair 1's survivor, so the loop drops
+    *that* subtask — a live, wanted one the judge never named — and
+    fabricates a supersedure claim between two subtasks the judge never
+    compared. `_apply_overlap_drop` discards title / intent /
+    success_criteria_seed by design, so the loss is unrecoverable, and
+    it compounds: a three-collision cluster destroys three of the four
+    subtasks involved. Chasing `survivor_of` is safe for a `merge`
+    (intent carries forward) and never safe for a `drop`.
+
+    Semantics: the dropped subtask's `provides` are unioned into
+    **every** survivor (its work is genuinely split across them, which
+    is why no single survivor can own the tags), self-looping
+    `extent: in_plan` requires are cleaned from each survivor exactly
+    as `_apply_overlap_drop` does, the subtask is removed once, and
+    inbound `depends_on` references fan out to all survivors — the same
+    fan-out rule `_remap_vanished_deps` applies to a vanished id.
+
+    Callers must guard this with `_would_cycle_after`: the fan-out
+    *adds* graph edges, so it can close a cycle that no individual pair
+    would."""
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            by_id[s["id"]] = s
+
+    dropped = by_id.get(dropped_sid)
+    # Sorted so the result never depends on the order the judge
+    # happened to emit its pairs in (`schedule()` is documented
+    # deterministic). Self-references are impossible here — a
+    # `drop_*(X, X)` cannot name X as both sides — but filtered
+    # defensively, mirroring `_apply_overlap_drop`'s self-loop guard.
+    survivors = sorted({s for s in surviving_sids
+                        if s in by_id and s != dropped_sid})
+    if dropped is None or not survivors:
+        return
+
+    for sid in survivors:
+        target = by_id[sid]
+        provides = target.setdefault("provides", [])
+        for tag in (dropped.get("provides") or []):
+            if tag not in provides:
+                provides.append(tag)
+        target["requires"] = [
+            entry for entry in (target.get("requires") or [])
+            if not (isinstance(entry, dict)
+                    and entry.get("extent") == "in_plan"
+                    and entry.get("tag") in provides)
+        ]
+
+    for plan in plans:
+        plan["subtasks"] = [
+            t for t in plan.get("subtasks", []) if t.get("id") != dropped_sid
+        ]
+
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            if dropped_sid not in deps:
+                continue
+            new_deps: list[str] = []
+            for dep in deps:
+                if dep == dropped_sid:
+                    for sid in survivors:
+                        if sid not in new_deps and sid != s.get("id"):
+                            new_deps.append(sid)
+                elif dep not in new_deps and dep != s.get("id"):
+                    new_deps.append(dep)
+            s["depends_on"] = new_deps
 
 
 def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
@@ -15184,7 +15354,74 @@ def _apply_overlap_collisions(plans: list[dict],
             survivor_of[s] = cur
         return cur
 
+    # Multi-drop clusters first (DESIGN §5 *Multi-drop*): a sid dropped
+    # by 2+ collisions is applied as one whole-cluster operation, never
+    # by replaying the pairs — see `_apply_multidrop`'s docstring for
+    # why the transitive `survivor_of` rewrite corrupts here. Handled
+    # ahead of the pairwise loop so those collisions never reach it.
+    multidrop: dict[str, list[str]] = {}
     for c in collisions:
+        if c.get("resolution") == "unresolvable":
+            continue
+        dropped_sid = _collision_dropped_sid(c)
+        if dropped_sid:
+            multidrop.setdefault(dropped_sid, []).extend(
+                _collision_surviving_sids(c))
+    multidrop = {sid: survs for sid, survs in multidrop.items()
+                 if len(set(survs)) >= 2}
+
+    for dropped_sid, raw_survivors in sorted(multidrop.items()):
+        survivors = sorted(set(raw_survivors))
+        # Tier 1: full fan-out, if it stays acyclic.
+        if not _would_cycle_after(
+            plans,
+            lambda tr, d=dropped_sid, s=survivors: _apply_multidrop(tr, d, s),
+        ):
+            _apply_multidrop(plans, dropped_sid, survivors)
+            applied.append({
+                "action": "multi_drop_fanout", "dropped_sid": dropped_sid,
+                "surviving_sids": survivors,
+            })
+            log(f"phase 2¾: dropped {dropped_sid}, work split across "
+                f"{', '.join(survivors)} (provides unioned into each, "
+                "inbound deps fanned out)")
+            continue
+        # Tier 2: fan-out would cycle — fall back to the lex-smallest
+        # survivor alone. Sorted, so the choice is deterministic rather
+        # than an artifact of judge emission order.
+        single = survivors[0]
+        if not _would_cycle_after(
+            plans,
+            lambda tr, d=dropped_sid, s=single: _apply_overlap_drop(
+                tr, dropped_sid=d, surviving_sid=s),
+        ):
+            _apply_overlap_drop(plans, dropped_sid=dropped_sid,
+                                surviving_sid=single)
+            applied.append({
+                "action": "multi_drop_degraded_single",
+                "dropped_sid": dropped_sid, "surviving_sid": single,
+                "surviving_sids": survivors,
+                "reason": "fan-out across all survivors would cycle",
+            })
+            log(f"phase 2¾: dropped {dropped_sid}, kept {single} only — "
+                f"fanning out to {', '.join(survivors)} would introduce a "
+                "dependency cycle (multi_drop_degraded_single)")
+            continue
+        # Tier 3: both would cycle — keep the subtask, leave the overlap
+        # for the integrator (mirrors the pairwise skipped_would_cycle).
+        applied.append({
+            "action": "skipped_would_cycle", "resolution": "multi_drop",
+            "dropped_sid": dropped_sid, "surviving_sids": survivors,
+            "reason": "fan-out and single-survivor drop both would cycle",
+        })
+        log(f"phase 2¾: multi-drop of {dropped_sid} (survivors: "
+            f"{', '.join(survivors)}) would introduce a dependency cycle "
+            "either way — skipped_would_cycle; subtask kept for the "
+            "integrator to resolve at integration time")
+
+    for c in collisions:
+        if _collision_dropped_sid(c) in multidrop:
+            continue
         raw_a = c["a_sid"]
         raw_b = c["b_sid"]
         a_sid = _resolve(raw_a)

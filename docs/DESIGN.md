@@ -428,6 +428,17 @@ intent is strictly superseded), or `unresolvable` (the intents are
 structurally contradictory and the run should die at plan time rather
 than crash at integration).
 
+The artifact a collision names is very often one that does **not yet
+exist**: the canonical case is two planners that each propose to
+*create* the same component or test file. A mechanical check that
+requires the artifact to be present in the working tree therefore
+rejects the judge's primary subject matter, and — because the judge is
+told its evidence must be verifiable — pushes it to discount its own
+correct findings. Artifact existence is checked against the union of
+the plan's `files_likely_touched` as well as the repo, so a
+to-be-created file counts as real evidence and only a genuinely
+invented path is flagged.
+
 The judge is biased toward escalation. Before emitting `merge`, it must
 verify the two intents are compositionally consistent — no required-
 vs-forbidden prop conflict, no structural body contradiction, no
@@ -456,19 +467,69 @@ different artifacts — e.g. one subtask creates a new config file
 different sibling's narrower piece. The judge's protocol stays
 pairwise; the orchestrator walks the pairs into a coherent cluster
 decision via the **anchor-survivor rule**: when one subtask sid
-appears in two or more non-`unresolvable` collisions, it is the
-*anchor* of that cluster and survives every merge it participates
-in. The anchor is by construction the subtask whose surface
-overlaps with each of its partners, so absorbing each partner *into*
-the anchor matches what the judge described. Without this override
-the default lex-smaller survivor rule (a determinism device with
-no semantic content) would silently keep an arbitrary narrower
-subtask and discard the spec the judge actually identified as
-broader. The orchestrator also enforces one pathological pattern
-in this neighbourhood: a `drop_*` whose dropped sid is an anchor
-of another collision contradicts itself (asking to delete the
-subtask other collisions claim absorbs them) and `die()`s at plan
-time with both pairs surfaced.
+*survives* two or more non-`unresolvable` collisions — as a merge
+endpoint, or as the kept side of a `drop_*` — it is the *anchor* of
+that cluster and survives every merge it participates in. The anchor
+is by construction the subtask whose surface overlaps with each of
+its partners, so absorbing each partner *into* the anchor matches
+what the judge described. Without this override the default
+lex-smaller survivor rule (a determinism device with no semantic
+content) would silently keep an arbitrary narrower subtask and
+discard the spec the judge actually identified as broader.
+
+Anchor membership is defined by *survivorship*, not by bare
+appearance count. The distinction is load-bearing, and conflating
+the two is a defect: a sid that is the **dropped** side of two
+collisions is not an anchor at all — no collision claims it absorbs
+anything — yet an appearance-count definition sweeps it in and
+`die()`s a run whose judge output was coherent. See *Multi-drop*
+below.
+
+The orchestrator enforces one genuinely pathological pattern in this
+neighbourhood: a `drop_*` whose dropped sid is an *anchor* of another
+collision contradicts itself (asking to delete the subtask another
+collision claims absorbs it — X must both survive a merge and vanish)
+and `die()`s at plan time with both pairs surfaced.
+
+**Multi-drop.** A single sid may legitimately be the dropped side of
+several collisions at once: the judge found its surface jointly
+covered by several siblings, which is the drop-shaped analogue of the
+anchor cluster above and is exactly what the judge prompt instructs
+when a shared endpoint genuinely should be dropped. This is coherent
+output and must not `die()`.
+
+It cannot, however, be applied by replaying the pairs through the
+apply loop's transitive `survivor_of` rewrite. Chasing that pointer is
+safe for a `merge` — the absorbed subtask's intent carries forward, so
+nothing is lost — but a `drop_*` *deliberately discards* the dropped
+subtask's title, intent, and success criteria. Replaying pair two
+after pair one has already rewritten the endpoint therefore drops a
+**live, wanted** subtask the judge never named, silently, and
+fabricates a supersedure claim between two subtasks the judge never
+compared. The damage scales with cluster size: a sid dropped by three
+collisions destroys three of the four subtasks involved.
+
+Multi-drop is instead applied as a single operation over the whole
+cluster. The dropped subtask's `provides` are unioned into **every**
+named survivor and inbound `depends_on` references fan out to all of
+them (mirroring the id-vanishing fan-out rule — a dropped sid's work
+is genuinely split across its survivors, so a consumer depends on all
+of them). Because the fan-out *adds* graph edges it can close a
+dependency cycle that none of the individual pairs would, so it is
+guarded by the same trial-apply check every other resolution uses,
+degrading rather than dying:
+
+1. **`multi_drop_fanout`** — the full fan-out, when it stays acyclic.
+2. **`multi_drop_degraded_single`** — fan-out would cycle: fall back
+   to the lex-smallest survivor alone. Deterministic by sort order,
+   never by collision order.
+3. **`skipped_would_cycle`** — both would cycle: keep the subtask and
+   leave the overlap for the integrator, exactly as a cyclic merge
+   does today.
+
+The whole-cluster application is what makes the result independent of
+the order the judge happened to emit its pairs in — a determinism
+requirement the scheduler's contract depends on.
 
 The anchor rule introduces one new invariant the orchestrator must
 preserve: **merge_feasibility carry-forward**. Each `merge_feasibility`

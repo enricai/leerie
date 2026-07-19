@@ -648,9 +648,13 @@ def test_compute_anchors_excludes_unresolvable(leerie):
 # _validate_overlap_judge_output — anchor consistency checks
 # --------------------------------------------------------------------- #
 #
-# A drop of an anchor would delete the subtask other collisions claim
-# absorbs them. A merge between two anchors is a multi-way tangle the
-# pairwise protocol can't express. Both die() before any mutation.
+# A drop of a sid that *survives* another collision would delete the
+# subtask that other collision claims absorbs it — X must both survive
+# and vanish, so it die()s before any mutation. A merge between two
+# anchors is NOT gated (the apply loop's lex-smaller fall-through plus
+# intent carry-forward handles it), and neither is a multi-drop: a sid
+# dropped by several collisions is coherent output, applied as a
+# cluster by `_apply_multidrop`.
 
 def test_validator_dies_on_drop_of_anchor_via_drop_a(leerie, capsys):
     """drop_a(A, B) where A also appears as the anchor in merge(A, C)
@@ -1489,3 +1493,513 @@ def test_backstop_die_on_logic_bug(leerie, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "orchestrator logic bug" in err
     assert "post-merge acyclicity backstop" in err
+
+
+# --------------------------------------------------------------------- #
+# Multi-drop clusters (DESIGN §5 *Multi-drop*)
+# --------------------------------------------------------------------- #
+#
+# One sid dropped by 2+ collisions is coherent judge output — the judge
+# found its surface jointly covered by several siblings, which
+# `prompts/plan_overlap_judge.md` explicitly sanctions. The pre-fix
+# validator counted bare appearances, called such a sid an "anchor",
+# and die()d, killing a run whose judge output was correct after the
+# full planning spend (unrecoverably — phase 2¾ precedes write_plan()).
+#
+# The apply side matters just as much: replaying the pairs through the
+# transitive `survivor_of` rewrite drops a *live* subtask the judge
+# never named. `_apply_multidrop` applies the cluster as one operation
+# instead.
+
+def _multidrop_plans():
+    """test-001/test-002 jointly cover bugfix-003; test-004 consumes it."""
+    def _st(sid, intent, provides, requires=(), depends_on=()):
+        return {"id": sid, "title": sid, "intent": intent,
+                "success_criteria_seed": f"{sid} done",
+                "files_likely_touched": [f"{sid}.ts"],
+                "provides": list(provides), "requires": list(requires),
+                "depends_on": list(depends_on), "size": "medium"}
+    return [{"domain": "test", "status": "ready", "subtasks": [
+        _st("test-001", "truth table", ["phantom-tests"]),
+        _st("test-002", "cascade", ["cascade-tests"]),
+        _st("bugfix-003", "both", ["bugfix-coverage"]),
+        _st("test-004", "consumer", ["consumer"],
+            requires=[{"tag": "bugfix-coverage", "extent": "in_plan"}],
+            depends_on=["bugfix-003"]),
+    ]}]
+
+
+def _double_drop_collisions():
+    return [
+        {"a_sid": "test-001", "b_sid": "bugfix-003", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "test-001 covers it"},
+        {"a_sid": "test-002", "b_sid": "bugfix-003", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "test-002 covers it"},
+    ]
+
+
+def _ids(plans):
+    return sorted(s["id"] for p in plans for s in p.get("subtasks", []))
+
+
+def test_validator_passes_on_multi_drop(leerie):
+    """The regression pin for the run this fix responds to: one sid
+    dropped by two collisions is not a contradiction. Nothing claims
+    bugfix-003 survives, so every claim agrees it goes away."""
+    by_id = _by_id([{"id": "test-001"}, {"id": "test-002"},
+                    {"id": "bugfix-003"}])
+    leerie._validate_overlap_judge_output(
+        {"collisions": _double_drop_collisions()}, by_id)
+
+
+def test_multi_drop_sid_is_not_a_contradiction(leerie):
+    """`_contradictory_drop_sids` keys on survives-somewhere AND
+    dropped-somewhere, not on appearance count."""
+    assert leerie._contradictory_drop_sids(_double_drop_collisions()) == set()
+
+
+def test_contradictory_drop_sid_survives_a_merge(leerie):
+    """The shape the gate genuinely exists for: A must both survive the
+    merge and vanish in the drop."""
+    collisions = [
+        {"a_sid": "A", "b_sid": "B", "artifact": "x",
+         "resolution": "drop_a", "reason": "r"},
+        {"a_sid": "A", "b_sid": "C", "artifact": "y",
+         "resolution": "merge", "reason": "r", "merge_feasibility": "ok"},
+    ]
+    assert leerie._contradictory_drop_sids(collisions) == {"A"}
+
+
+def test_apply_multi_drop_preserves_both_survivors(leerie):
+    """Against the pre-fix apply loop this deletes test-001: pair 2's
+    `_resolve` maps bugfix-003 onto test-001 and drops *that*. Both
+    survivors must keep their own intents."""
+    plans = _multidrop_plans()
+    applied = leerie._apply_overlap_collisions(
+        plans, _double_drop_collisions())
+
+    assert _ids(plans) == ["test-001", "test-002", "test-004"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["intent"] == "truth table"
+    assert by_id["test-002"]["intent"] == "cascade"
+    # The dropped subtask's provides reach every survivor — its work is
+    # split across them, so no single one can own the tag.
+    assert "bugfix-coverage" in by_id["test-001"]["provides"]
+    assert "bugfix-coverage" in by_id["test-002"]["provides"]
+    # Inbound depends_on fans out to all survivors.
+    assert by_id["test-004"]["depends_on"] == ["test-001", "test-002"]
+    assert [a["action"] for a in applied] == ["multi_drop_fanout"]
+
+
+def test_apply_multi_drop_three_way(leerie):
+    """Damage scales with cluster size: the pre-fix loop destroys three
+    of the four subtasks here (bugfix-004 → test-001 → test-002 →
+    test-003, leaving only test-003)."""
+    def _st(sid, provides, requires=(), depends_on=()):
+        return {"id": sid, "title": sid, "intent": sid,
+                "success_criteria_seed": sid,
+                "files_likely_touched": [f"{sid}.ts"],
+                "provides": list(provides), "requires": list(requires),
+                "depends_on": list(depends_on), "size": "medium"}
+    plans = [{"domain": "test", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"]),
+        _st("test-003", ["p3"]), _st("bugfix-004", ["cov"]),
+        _st("test-005", ["consumer"],
+            requires=[{"tag": "cov", "extent": "in_plan"}],
+            depends_on=["bugfix-004"]),
+    ]}]
+    collisions = [
+        {"a_sid": f"test-00{i}", "b_sid": "bugfix-004", "artifact": f"{i}.ts",
+         "resolution": "drop_b", "reason": "r"} for i in (1, 2, 3)
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+
+    assert _ids(plans) == ["test-001", "test-002", "test-003", "test-005"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    for sid in ("test-001", "test-002", "test-003"):
+        assert "cov" in by_id[sid]["provides"]
+    assert by_id["test-005"]["depends_on"] == [
+        "test-001", "test-002", "test-003"]
+
+
+def test_apply_multi_drop_is_order_independent(leerie):
+    """`schedule()` is documented deterministic, so the applied plan
+    must not depend on the order the judge emitted its pairs in. The
+    naive first-survivor-wins variant fails this."""
+    def _snapshot(plans):
+        return {s["id"]: (sorted(s.get("provides", [])),
+                          sorted(s.get("depends_on", [])))
+                for p in plans for s in p["subtasks"]}
+    forward = _multidrop_plans()
+    leerie._apply_overlap_collisions(forward, _double_drop_collisions())
+    reverse = _multidrop_plans()
+    leerie._apply_overlap_collisions(
+        reverse, list(reversed(_double_drop_collisions())))
+    assert _snapshot(forward) == _snapshot(reverse)
+
+
+def test_apply_multi_drop_degrades_when_fanout_would_cycle(leerie):
+    """The fan-out *adds* edges, so it can close a cycle no individual
+    pair would: here test-002 already depends on test-004, and fanning
+    test-004's inbound dep out to test-002 closes the loop. Must fall
+    back to the lex-smallest survivor rather than dying or corrupting."""
+    plans = _multidrop_plans()
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    by_id["test-002"]["depends_on"] = ["test-004"]
+
+    applied = leerie._apply_overlap_collisions(
+        plans, _double_drop_collisions())
+
+    assert [a["action"] for a in applied] == ["multi_drop_degraded_single"]
+    assert applied[0]["surviving_sid"] == "test-001"
+    live = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert "bugfix-003" not in live
+    assert live["test-004"]["depends_on"] == ["test-001"]
+    # The whole point of degrading: the plan still schedules.
+    leerie.schedule([{"domain": "test", "status": "ready",
+                      "subtasks": [s for p in plans for s in p["subtasks"]]}])
+
+
+def test_apply_legit_transitive_chain_still_applies_both_drops(leerie):
+    """Control: a chain where the judge *genuinely* asked to drop the
+    intermediate (drop bugfix-003 for test-001, then drop test-001 for
+    test-002) must not be suppressed — neither sid is dropped twice."""
+    plans = _multidrop_plans()
+    applied = leerie._apply_overlap_collisions(plans, [
+        {"a_sid": "test-001", "b_sid": "bugfix-003", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "test-002", "b_sid": "test-001", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ])
+    assert [a["action"] for a in applied] == ["drop_b", "drop_b"]
+    assert _ids(plans) == ["test-002", "test-004"]
+
+
+def test_apply_multi_drop_alongside_merge(leerie):
+    """A multi-drop cluster and an unrelated merge in the same output
+    both apply, with the merge's intent carry-forward intact."""
+    plans = _multidrop_plans()
+    plans[0]["subtasks"].extend([
+        {"id": "feat-005", "title": "m1", "intent": "m1",
+         "success_criteria_seed": "m1", "files_likely_touched": ["m.ts"],
+         "provides": ["m1"], "requires": [], "depends_on": [],
+         "size": "medium"},
+        {"id": "feat-006", "title": "m2", "intent": "m2",
+         "success_criteria_seed": "m2", "files_likely_touched": ["m.ts"],
+         "provides": ["m2"], "requires": [], "depends_on": [],
+         "size": "medium"},
+    ])
+    applied = leerie._apply_overlap_collisions(
+        plans, _double_drop_collisions() + [
+            {"a_sid": "feat-005", "b_sid": "feat-006", "artifact": "m.ts",
+             "resolution": "merge", "reason": "r",
+             "merge_feasibility": "same file, sequential"}])
+
+    actions = [a["action"] for a in applied]
+    assert "multi_drop_fanout" in actions and "merge" in actions
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert "feat-006" not in by_id
+    assert "m2" in by_id["feat-005"]["intent"]
+
+
+def test_multi_drop_plan_validates_and_schedules(leerie):
+    """End-to-end: the applied plan passes both downstream gates. Note
+    validate_plan alone is not a safety net here — cycle detection
+    lives only in schedule()."""
+    plans = _multidrop_plans()
+    leerie._apply_overlap_collisions(plans, _double_drop_collisions())
+    subtasks = {s["id"]: s for p in plans for s in p["subtasks"]}
+    leerie.validate_plan(subtasks)
+    _merged, waves = leerie.schedule(plans)
+    assert waves == [["test-001", "test-002"], ["test-004"]]
+
+
+# --------------------------------------------------------------------- #
+# PHANTOM_ARTIFACT — to-be-created files are real artifacts
+# --------------------------------------------------------------------- #
+
+def _phantom_plans(files):
+    return [{"domain": "test", "subtasks": [
+        {"id": "test-001", "files_likely_touched": list(files),
+         "provides": [], "requires": []},
+        {"id": "test-002", "files_likely_touched": list(files),
+         "provides": [], "requires": []},
+    ]}]
+
+
+def _phantom_output(artifact):
+    return {"collisions": [
+        {"a_sid": "test-001", "b_sid": "test-002", "artifact": artifact,
+         "resolution": "drop_b", "reason": "r"}]}
+
+
+def test_phantom_artifact_allows_planned_file(leerie, tmp_path):
+    """Two subtasks that both plan to *create* the same file is the
+    judge's canonical collision — flagging it rejects the primary case
+    and (via the prompt's evidence gate) drives a LOW_CONFIDENCE
+    self-downgrade on a correct finding."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("src/scraper/phantom-click.test.ts"),
+        _phantom_plans(["src/scraper/phantom-click.test.ts"]),
+        tmp_path)
+    assert not [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_phantom_artifact_still_flags_invented_path(leerie, tmp_path):
+    """A path in neither the tree nor the plan is still a phantom."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("src/totally/invented.ts"),
+        _phantom_plans(["src/scraper/phantom-click.test.ts"]),
+        tmp_path)
+    assert [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_phantom_artifact_normalizes_leading_dot_slash(leerie, tmp_path):
+    """Both sides are planner-authored strings, so `./x` and `x` must
+    not read as different files."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("./src/scraper/phantom-click.test.ts"),
+        _phantom_plans(["src/scraper/phantom-click.test.ts"]),
+        tmp_path)
+    assert not [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_no_file_overlap_normalizes_paths(leerie, tmp_path):
+    """Same normalization on the NO_FILE_OVERLAP intersection."""
+    plans = [{"domain": "test", "subtasks": [
+        {"id": "test-001", "files_likely_touched": ["./src/a.ts"],
+         "provides": [], "requires": []},
+        {"id": "test-002", "files_likely_touched": ["src/a.ts"],
+         "provides": [], "requires": []},
+    ]}]
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("src/a.ts"), plans, tmp_path)
+    assert not [i for i in issues if i.startswith("NO_FILE_OVERLAP")]
+
+
+def test_normalize_artifact_path_does_not_case_fold(leerie):
+    """Container checkouts are case-sensitive; folding would make
+    genuinely distinct paths compare equal."""
+    assert leerie._normalize_artifact_path("./src/Foo.ts") == "src/Foo.ts"
+    assert leerie._normalize_artifact_path("src/Foo.ts") != \
+        leerie._normalize_artifact_path("src/foo.ts")
+
+
+# --------------------------------------------------------------------- #
+# Mutation-derived pins
+# --------------------------------------------------------------------- #
+#
+# Poor-man's mutation testing over this region found 7 surviving mutants
+# after the multi-drop fix landed — 5 of them inside `_apply_multidrop`,
+# the newest code, which the fix's own tests exercised through a single
+# 2-survivor fixture. Each test below was verified to fail against the
+# mutation it names.
+#
+# The shared shape of every mutant here: it makes a *policy* decision
+# (which survivor wins, how deep to chase a pointer, what counts as a
+# cluster) that no single line reveals as wrong, and its failure mode is
+# a plausible-looking plan rather than an exception.
+
+def _st(sid, provides, requires=(), depends_on=()):
+    return {"id": sid, "title": sid, "intent": sid,
+            "success_criteria_seed": sid,
+            "files_likely_touched": [f"{sid}.ts"],
+            "provides": list(provides), "requires": list(requires),
+            "depends_on": list(depends_on), "size": "medium"}
+
+
+def test_multi_drop_requires_two_distinct_survivors(leerie):
+    """N13: the cluster gate must count *distinct* survivors. A judge
+    naming the same survivor in both collisions is one drop emitted
+    twice, not a cluster — routing it through the fan-out path would
+    apply multi-drop semantics to a plain single-survivor drop."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("bugfix-002", ["cov"]),
+        _st("test-003", ["c"], [{"tag": "cov", "extent": "in_plan"}],
+            ["bugfix-002"])]}]
+    applied = leerie._apply_overlap_collisions(plans, [
+        {"a_sid": "test-001", "b_sid": "bugfix-002", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "test-001", "b_sid": "bugfix-002", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ])
+    actions = [a["action"] for a in applied]
+    assert "multi_drop_fanout" not in actions
+    assert actions == ["drop_b", "skipped_redundant"]
+
+
+def test_resolve_chases_three_hop_chain(leerie):
+    """A 3-hop drop chain collapses to one survivor absorbing every
+    provides tag along the way.
+
+    Mutation note: making `_resolve` single-hop does NOT change this
+    result — it path-compresses as it walks (`survivor_of[s] = cur`),
+    so the map is already flat by the time each later collision reads
+    it. The `while` and an `if` are equivalent *given* compression;
+    remove the compression and they diverge. Kept as a behavioral pin
+    on deep chains, not as a pin on the loop construct."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"]),
+        _st("test-003", ["p3"]), _st("test-004", ["p4"])]}]
+    leerie._apply_overlap_collisions(plans, [
+        {"a_sid": "test-001", "b_sid": "test-002", "artifact": "a.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "test-003", "b_sid": "test-001", "artifact": "b.ts",
+         "resolution": "drop_b", "reason": "r"},
+        {"a_sid": "test-004", "b_sid": "test-003", "artifact": "c.ts",
+         "resolution": "drop_b", "reason": "r"},
+    ])
+    assert _ids(plans) == ["test-004"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert set(by_id["test-004"]["provides"]) == {"p1", "p2", "p3", "p4"}
+
+
+def test_drop_updates_survivor_of_for_later_collisions(leerie):
+    """N10: a `drop_*` must record its survivor pointer, exactly as a
+    `merge` does. The pre-existing triangle/4-cycle fixtures are
+    all-merge, so the drop side of the identical mechanism was unpinned
+    — an asymmetry invisible from either call site."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"]),
+        _st("test-003", ["p3"])]}]
+    applied = leerie._apply_overlap_collisions(plans, [
+        {"a_sid": "test-002", "b_sid": "test-001", "artifact": "a.ts",
+         "resolution": "drop_a", "reason": "r"},
+        {"a_sid": "test-002", "b_sid": "test-003", "artifact": "b.ts",
+         "resolution": "merge", "reason": "r", "merge_feasibility": "ok"},
+    ])
+    # Collision 2 names test-002, already dropped — it must resolve to
+    # test-001 and merge that with test-003, not resurrect a dead sid.
+    assert _ids(plans) == ["test-001"]
+    assert [a["action"] for a in applied] == ["drop_a", "merge"]
+
+
+def test_multi_drop_filters_self_referencing_survivor(leerie):
+    """A survivor list naming the dropped sid itself still removes it.
+
+    Mutation note: dropping the `s != dropped_sid` filter does NOT
+    change this result — the removal loop runs before anything reads
+    the survivor entries, so a self-referencing survivor is already
+    unreachable. The filter is defense-in-depth (it mirrors
+    `_apply_overlap_drop`'s self-loop guard), and this is a behavioral
+    pin on the outcome, not proof the filter is load-bearing."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"])]}]
+    leerie._apply_multidrop(plans, "test-001", ["test-001", "test-002"])
+    assert _ids(plans) == ["test-002"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert "p1" in by_id["test-002"]["provides"]
+
+
+def test_multi_drop_clears_self_looping_requires(leerie):
+    """N6: after the dropped sid's provides are unioned in, a survivor's
+    own `extent: in_plan` requires on that tag becomes a graph
+    self-loop and must be dropped — mirrors `_apply_overlap_drop`.
+    Left in place it is a subtask depending on itself."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"], [{"tag": "cov", "extent": "in_plan"}]),
+        _st("test-002", ["p2"], [{"tag": "cov", "extent": "in_plan"}]),
+        _st("bugfix-003", ["cov"])]}]
+    leerie._apply_multidrop(plans, "bugfix-003", ["test-001", "test-002"])
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    for sid in ("test-001", "test-002"):
+        assert by_id[sid]["requires"] == []
+        assert "cov" in by_id[sid]["provides"]
+    # An `external` requires is out-of-graph and must survive untouched.
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"], [{"tag": "cov", "extent": "external"}]),
+        _st("test-002", ["p2"]), _st("bugfix-003", ["cov"])]}]
+    leerie._apply_multidrop(plans, "bugfix-003", ["test-001", "test-002"])
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["requires"] == [
+        {"tag": "cov", "extent": "external"}]
+
+
+def test_apply_multidrop_sorts_its_own_survivors(leerie):
+    """`_apply_multidrop` sorts defensively rather than trusting the
+    caller. Unreachable through `_apply_overlap_collisions` today (it
+    pre-sorts), so only a direct call discriminates — which is exactly
+    why it needs its own pin: a future second caller passing survivors
+    in judge-emission order would otherwise reintroduce the
+    nondeterminism silently."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"]),
+        _st("test-003", ["p3"]), _st("bugfix-004", ["cov"]),
+        _st("test-005", ["c"], [{"tag": "cov", "extent": "in_plan"}],
+            ["bugfix-004"])]}]
+    leerie._apply_multidrop(
+        plans, "bugfix-004", ["test-003", "test-001", "test-002"])
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-005"]["depends_on"] == [
+        "test-001", "test-002", "test-003"]
+
+
+def test_multi_drop_survivor_order_is_sorted(leerie):
+    """N1/N3: survivors are sorted at both the cluster-collection and
+    apply layers, so the emitted plan never depends on the order the
+    judge happened to list its pairs in (`schedule()` is documented
+    deterministic). Asserts the sorted order directly rather than only
+    comparing two runs — a sort removed from *both* layers would keep
+    the two runs equal to each other while both being emission-ordered."""
+    plans = [{"domain": "t", "status": "ready", "subtasks": [
+        _st("test-001", ["p1"]), _st("test-002", ["p2"]),
+        _st("test-003", ["p3"]), _st("bugfix-004", ["cov"]),
+        _st("test-005", ["c"], [{"tag": "cov", "extent": "in_plan"}],
+            ["bugfix-004"])]}]
+    # Deliberately emitted worst-first so an unsorted implementation
+    # produces descending order.
+    applied = leerie._apply_overlap_collisions(plans, [
+        {"a_sid": f"test-00{i}", "b_sid": "bugfix-004",
+         "artifact": f"{i}.ts", "resolution": "drop_b", "reason": "r"}
+        for i in (3, 2, 1)])
+    assert applied[0]["surviving_sids"] == [
+        "test-001", "test-002", "test-003"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-005"]["depends_on"] == [
+        "test-001", "test-002", "test-003"]
+
+
+def test_phase_overlap_judge_dies_on_unresolvable(leerie, monkeypatch,
+                                                  capsys):
+    """The highest-severity silent-disable in this phase, and previously
+    unpinned: `unresolvable` is the judge's escalation for two subtasks
+    whose APIs genuinely contradict. If the die() is ever disabled, both
+    implementers ship incompatible APIs against one artifact and it
+    surfaces at integration with no trace back to phase 2¾ — the exact
+    failure this phase exists to prevent. The plan must also be left
+    unmutated: the abort has to precede any apply step."""
+    # Two contributing planners: a single-planner run cheap-skips the
+    # judge entirely before any collision is considered.
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [_st("feat-001", ["p1"])]},
+        {"domain": "bug-fixing", "status": "ready",
+         "subtasks": [_st("bugfix-002", ["p2"])]},
+    ]
+    before = copy.deepcopy(plans)
+    collisions = [
+        {"a_sid": "feat-001", "b_sid": "bugfix-002", "artifact": "x.ts",
+         "resolution": "unresolvable",
+         "reason": "required vs forbidden prop conflict"}]
+
+    class _St:
+        def __init__(self):
+            self.data = {}
+
+        def save(self):
+            pass
+
+    async def _fake_loop(**kwargs):
+        return ({"collisions": collisions}, [])
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    monkeypatch.setattr(leerie, "check_overlap_judge_output",
+                        lambda *a, **k: [])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_overlap_judge(
+            plans, "task", _St(), {"judgment_check_rounds": 1}, {}, {}))
+    err = capsys.readouterr().err
+    assert "unresolvable" in err
+    assert "feat-001" in err and "bugfix-002" in err
+    assert plans == before
