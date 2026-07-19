@@ -64,6 +64,12 @@ read [`docs/DESIGN.md`](docs/DESIGN.md).
 ## Requirements
 
 - `claude` CLI on `PATH`, logged in interactively
+- For long or unattended runs, a long-lived `claude setup-token` OAuth
+  token is recommended: export it as `CLAUDE_CODE_OAUTH_TOKEN` before
+  launching. A container can't refresh a copied subscription token, so
+  an interactive login alone can expire mid-run; the setup-token still
+  bills against your subscription, not the API. See
+  [`docs/DESIGN.md` §6 *Credential strategy*](docs/DESIGN.md) for why.
 - `git`
 - A git repository with `user.email` and `user.name` configured
 - A reasonably clean working tree
@@ -697,6 +703,17 @@ for an audit cleanup across every past run).
   are *not* preserved across an auto-resume. Set those via env
   (`LEERIE_*`) or `leerie.toml` if you want them to survive — both
   channels are re-resolved on every `--resume`.
+
+- **Run hit an expired OAuth session ("OAuth session expired")** — the
+  host's interactive login token expired mid-run and a container can't
+  refresh a copied one. Leerie detects this as terminal (distinct from
+  the rolling rate-limit above) and pauses resumably at exit code 75
+  rather than dying: worktrees are torn down, state and branches are
+  preserved. Fix it immediately with `claude /login`, then
+  `./leerie --resume <id>`. To avoid this class of failure entirely on
+  long or unattended runs, mint a durable token with
+  `claude setup-token` and export it as `CLAUDE_CODE_OAUTH_TOKEN` before
+  launching — see *Requirements* above.
 
 - **Run ran out of credits** — distinct from a rate-limit: credits
   don't reset on a clock (they return on a top-up or billing cycle), so
