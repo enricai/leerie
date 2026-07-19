@@ -659,7 +659,17 @@ runs with sentinel, captures runs without) — is tested across four files.
 `tests/test_dep_capture_budget.py` covers the extraction+budget unit
 (`_extract_depcap_commands`) in focused isolation: dedup, newest-first ordering,
 budget gate (`_DEPCAP_TOTAL_BUDGET`), `hit_ceiling` flag semantics, non-Bash
-filtering, and malformed-line tolerance. Since DESIGN §6½ moved the worker to a
+filtering, and malformed-line tolerance. It also carries the
+guard-value-that-cannot-guard regression pin (bugfix-004, incident
+2026-07-19): `test_depcap_budgets_not_argv_bound_by_source` asserts via
+source inspection that the `_DEPCAP_TOTAL_BUDGET` comment states the
+dep_capture payload travels over stdin (not argv) and names
+`MAX_ARG_STRLEN` rather than the aggregate `ARG_MAX`;
+`test_depcap_total_budget_value_unchanged_since_incident` pins
+`_DEPCAP_TOTAL_BUDGET`/`_DEPCAP_MANIFEST_TOTAL_BUDGET` unchanged and that
+their combined bound still exceeds `MAX_ARG_STRLEN` — safe only because
+the payload is stdin-transported (bugfix-001), not argv-bound. Since
+DESIGN §6½ moved the worker to a
 manifests-first corpus, `_extract_depcap_commands` now keeps **only
 install-shaped Bash commands** (`_is_install_command`) — the install-verb filter
 and its text-tool-pattern exclusion (e.g. `grep "apt-get install …"` is dropped)

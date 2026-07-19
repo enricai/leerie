@@ -7041,6 +7041,14 @@ _INSTALL_CMD_HINT_RE = re.compile(
 # the full command set for essentially every run (~50–80k tokens undeduped,
 # ~66k worst-case) while bounding the LLM input. Mirrors the
 # _FIXTURE_TOTAL_BUDGET idiom in gather_provision_fixtures.
+#
+# This is an LLM-context token budget, not an argv-size constraint: the
+# dep_capture worker's user_prompt (this text plus _gather_dep_manifests'
+# output) travels to `claude -p` over stdin, not argv (see claude_p's
+# `build()` and IMPLEMENTATION.md §3 "User prompt transport — stdin, not
+# argv"), so combining this with _DEPCAP_MANIFEST_TOTAL_BUDGET never risks
+# Linux's per-argument MAX_ARG_STRLEN (131,071 bytes) the way an
+# argv-passed payload would.
 _DEPCAP_TOTAL_BUDGET = 307200  # 300KB ≈ 75k tokens at 4 bytes/token
 
 # Manifests-first dep_capture (DESIGN §6½). The worker's PRIMARY corpus is the
@@ -18899,20 +18907,23 @@ def find_pr_template(repo_root: Path,
     return None
 
 
-# Byte budgets for the pr_writer payload. The launcher passes the whole
-# JSON-encoded payload as a single argv element to `claude -p`; Linux
-# ARG_MAX in the leerie container (Debian 12) is ~128 KB. These caps keep
-# the largest fields well under that ceiling. The diff sample is line-
-# capped instead of byte-capped because individual diff lines can be
-# long but the worker reads them as hunks.
+# Byte budgets for the pr_writer payload. The whole JSON-encoded payload is
+# `claude_p`'s user_prompt, which `_invoke` feeds to `claude -p` over stdin
+# (see build()'s comment and IMPLEMENTATION.md §3 "User prompt transport —
+# stdin, not argv") — it is not an argv element, so it is not bound by
+# Linux's per-argument MAX_ARG_STRLEN (131,071 bytes, PAGE_SIZE*32; the
+# distinct, much larger aggregate ARG_MAX is not the relevant limit either
+# way). These caps instead bound the worker's LLM context: the diff sample
+# is line-capped instead of byte-capped because individual diff lines can
+# be long but the worker reads them as hunks.
 PR_WRITER_COMMIT_LOG_MAX_BYTES = 80_000
 PR_WRITER_TEMPLATE_MAX_BYTES = 32_000
 PR_WRITER_DIFF_SAMPLE_MAX_LINES = 500
 # Bound on the `final_conformance` payload field (DESIGN §6 final-tree
 # pass paragraph). Defends against a pathological run that produces
-# many residuals / many warnings; typical runs are well under this.
-# The combined argv-bound payload + system prompt must stay under
-# Debian's ~128 KB ARG_MAX.
+# many residuals / many warnings; typical runs are well under this —
+# an LLM-context budget alongside the other PR_WRITER_* caps above, not
+# an argv-size constraint.
 PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES = 8_000
 
 
@@ -19084,7 +19095,8 @@ def _final_conformance_payload(st: "State") -> dict | None:
     The serialized JSON is bounded by
     `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES`. A pathological run that
     produces many residuals / many warnings would otherwise add an
-    unbounded field to a payload already sized close to ARG_MAX."""
+    unbounded field to the pr_writer worker's LLM context (the payload
+    travels over stdin, not argv — see PR_WRITER_* caps above)."""
     block = (st.data.get("conformance") or {}).get("_final")
     if not block:
         return None

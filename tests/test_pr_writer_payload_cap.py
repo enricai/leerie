@@ -1,6 +1,7 @@
 """Tests for `_cap_text()` — the byte-budgeted truncator used to keep
-the pr_writer worker's user_prompt under Linux ARG_MAX (~128 KB on
-the leerie container).
+the pr_writer worker's user_prompt within a reasonable LLM context
+budget. The payload travels to `claude -p` over stdin (bugfix-001),
+not argv, so these caps are not defending an OS argv ceiling.
 
 Critical properties:
 - Strings under the cap pass through unchanged.
@@ -72,22 +73,23 @@ def test_cap_text_sentinel_size_in_kb(leerie):
 
 
 def test_pr_writer_byte_budgets_defined(leerie):
-    """Pin the byte budgets so accidentally bumping them up past
-    ARG_MAX (~128 KB on Debian containers) gets caught in code review.
-    The sum of all caps + JSON overhead + the system prompt must stay
-    under ~128 KB."""
+    """Pin the byte budgets so accidentally bumping them up past a
+    reasonable LLM context size gets caught in code review. The payload
+    travels to `claude -p` over stdin (bugfix-001), not argv, so these
+    caps bound worker context rather than an OS argv ceiling — but a
+    generous combined-size sanity check still catches a runaway cap."""
     assert leerie.PR_WRITER_COMMIT_LOG_MAX_BYTES == 80_000
     assert leerie.PR_WRITER_TEMPLATE_MAX_BYTES == 32_000
     assert leerie.PR_WRITER_DIFF_SAMPLE_MAX_LINES == 500
     total = (leerie.PR_WRITER_COMMIT_LOG_MAX_BYTES
              + leerie.PR_WRITER_TEMPLATE_MAX_BYTES)
     assert total < 128_000, (
-        f"large payload fields sum to {total} bytes — too close to "
-        f"Linux ARG_MAX (128 KB). Reduce one of the caps."
+        f"large payload fields sum to {total} bytes — sanity-check "
+        f"threshold for LLM context size. Reduce one of the caps."
     )
     # The `final_conformance` field added by `_final_conformance_payload`
-    # is capped by its own constant. Pin the constant and verify
-    # everything still fits under ARG_MAX. The 8 KB cap is enough for
+    # is capped by its own constant. Pin the constant and verify the
+    # combined context size stays reasonable. The 8 KB cap is enough for
     # the realistic worst case (10 residuals + 3 axes + 20 warnings ≈
     # 9.9 KB *uncapped*); `_final_conformance_payload` trims the
     # residuals + warnings lists from the tail until the JSON fits.
@@ -95,9 +97,31 @@ def test_pr_writer_byte_budgets_defined(leerie):
     assert (total + leerie.PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES) < 128_000, (
         f"adding ~{leerie.PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES} bytes "
         f"of final_conformance to the existing {total}-byte payload "
-        f"would cross ARG_MAX (128 KB). Either lower the cap or reduce "
-        "one of the existing caps."
+        f"would push the combined LLM context past the sanity-check "
+        f"threshold. Either lower the cap or reduce one of the existing "
+        "caps."
     )
+
+
+def test_pr_writer_cap_comment_names_stdin_not_arg_max(leerie):
+    """Regression pin (bugfix-004): the PR_WRITER_* comment block must not
+    claim the payload is a single argv element bound by Linux ARG_MAX — it
+    travels over stdin (bugfix-001) and the real per-argument limit (had it
+    still applied) is MAX_ARG_STRLEN, not the aggregate ARG_MAX. Checked via
+    source inspection, mirroring test_dep_capture_wiring.py's
+    inspect.getsource discipline."""
+    import inspect
+
+    src = inspect.getsource(leerie)
+    const_idx = src.index("PR_WRITER_COMMIT_LOG_MAX_BYTES = 80_000")
+    comment_block = src[max(0, const_idx - 700):const_idx]
+    assert "stdin" in comment_block, (
+        "the PR_WRITER_* cap comment must state the payload travels over "
+        "stdin, not argv")
+    assert "ARG_MAX in the leerie container" not in comment_block, (
+        "the comment must not claim ARG_MAX (aggregate) is the enforced "
+        "limit — MAX_ARG_STRLEN (per-argument) is the real one, and "
+        "neither applies now that the payload is stdin-transported")
 
 
 def test_truncate_diff_sample_short_passthrough(leerie):
