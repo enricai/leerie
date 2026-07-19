@@ -20,6 +20,11 @@ Covers:
     route around.
   - `claude_p` end-to-end (via a stubbed `_invoke`) sends a 150KB+
     prompt through as `stdin_data`, not as part of `cmd`.
+  - The reconciler's size-gate retry prompt (`_build_size_retry_prompt`,
+    which re-appends `original_user_prompt` verbatim on top of
+    per-offender sections — strictly larger than the payload that
+    already overflowed) clears the same argv-length property when fed
+    into `claude_p` as `user_prompt`.
 """
 from __future__ import annotations
 
@@ -101,6 +106,49 @@ def test_no_argv_element_exceeds_max_arg_strlen_for_150kb_prompt(leerie):
     assert stdin_data == user_prompt
     assert not any(user_prompt in elem for elem in cmd), (
         "the user prompt must not appear anywhere in argv")
+
+
+def test_size_retry_prompt_stays_under_argv_ceiling(leerie):
+    """`_build_size_retry_prompt` (the reconciler's size-gate retry
+    builder, `orchestrator/leerie.py:14133`) re-appends
+    `original_user_prompt` verbatim on top of per-offender sections —
+    strictly larger than the input that already overflowed. It is fed
+    into `claude_p` the same way any other `user_prompt` is (via
+    `_spawn_reconciler`), so it must clear the same argv-length property
+    as `test_no_argv_element_exceeds_max_arg_strlen_for_150kb_prompt`
+    even though its payload is larger than the original prompt alone."""
+    original_user_prompt = "z" * 150_063  # the incident's exact overflow size
+    assert len(original_user_prompt.encode()) > MAX_ARG_STRLEN
+
+    oversized = [{
+        "id": "feat-100",
+        "title": "Bundled foundation",
+        "intent": "bundle 3 capabilities",
+        "provides": ["cap-a", "cap-b", "cap-c"],
+        "requires": [{"tag": "some-dep", "extent": "in_plan"}],
+        "depends_on": ["feat-001"],
+        "size": "large",
+    }]
+    size_retry_prompt = leerie._build_size_retry_prompt(
+        oversized, original_user_prompt)
+    # Sanity: the retry prompt is strictly larger than the original
+    # prompt alone (the incident's core claim about this site).
+    assert len(size_retry_prompt.encode()) > len(original_user_prompt.encode())
+
+    cmd, stdin_data = _build_cmd(leerie, size_retry_prompt)
+
+    for i, elem in enumerate(cmd):
+        assert len(elem.encode()) <= MAX_ARG_STRLEN, (
+            f"argv element {i} ({elem[:80]!r}...) is "
+            f"{len(elem.encode())} bytes, exceeding MAX_ARG_STRLEN "
+            f"({MAX_ARG_STRLEN}) — the size-retry prompt must never "
+            "land on argv, even though it re-appends the original "
+            "prompt on top of per-offender sections")
+
+    assert stdin_data == size_retry_prompt
+    assert not any(original_user_prompt in elem for elem in cmd), (
+        "the re-appended original_user_prompt must not appear anywhere "
+        "in argv")
 
 
 def test_no_positional_prompt_after_dash_p(leerie):
