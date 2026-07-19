@@ -5094,20 +5094,31 @@ async def recursive_decompose(
             f"{json.dumps(subtask, indent=2)}\n\n"
             "Split this subtask along real structural seams. Return child subtasks."
         )
-        split_result = await claude_p(
-            system_prompt=sys_prompt_s,
-            user_prompt=user_prompt_s,
-            schema_key="splitter",
-            cwd=str(repo_root),
-            allowed_tools=INSPECT_TOOLS,
-            max_turns=30,
-            autonomous=False,
-            caps=caps,
-            st=st,
-            model=models.get("splitter", MODEL_DEFAULT),
-            effort=efforts.get("splitter"),
-            sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
-        )
+        try:
+            split_result = await claude_p(
+                system_prompt=sys_prompt_s,
+                user_prompt=user_prompt_s,
+                schema_key="splitter",
+                cwd=str(repo_root),
+                allowed_tools=INSPECT_TOOLS,
+                max_turns=30,
+                autonomous=False,
+                caps=caps,
+                st=st,
+                model=models.get("splitter", MODEL_DEFAULT),
+                effort=efforts.get("splitter"),
+                sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
+            )
+        except WorkerError:
+            # Worker crashed mid-split (auth failure, killed session, PID
+            # exhaustion) — degrade to leaf, the same disposition the depth
+            # cap and no-progress guard above already reach when they cannot
+            # establish a confident split. Without this, one WorkerError here
+            # would propagate and discard every fit/split decision already
+            # paid for elsewhere in the tree (DESIGN §6 *Credential strategy*).
+            log(f"recursive_decompose: splitter crashed for "
+                f"{subtask.get('id', '?')}; accepting as leaf")
+            return [subtask]
         children = split_result.get("children") or []
         if not children:
             # Splitter produced no children; accept the subtask as a leaf.

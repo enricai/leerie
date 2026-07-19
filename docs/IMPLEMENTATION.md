@@ -4199,6 +4199,14 @@ accept the subtask as leaf); then splits via either:
     label (`_deterministic_chunk_label()`), never an identical parent-copy.
   - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection
 
+Both the `fit_judge` call and the coupled-path `splitter` call are wrapped in
+`try/except WorkerError`, degrading the node to a leaf (`[subtask]`
+unchanged) on a worker crash — DESIGN §5½ (P1), §6 *Credential strategy*. The
+migration-path (label-only) `splitter` call inside `_label_migration_chunks()`
+carries the same guard, falling back to `_deterministic_chunk_label()` per
+chunk instead of a leaf, since the file partition there is already
+code-computed.
+
 After recursing into a generation's children, the function calls
 `_remap_vanished_deps()` over the flattened leaves with `{child_id: [its_leaf_ids]}`
 for every child whose own id did not survive its expansion. This is the only frame
