@@ -7496,7 +7496,13 @@ async def _backstop_capture_prior_runs(
                 repo_root, bst,
                 caps=caps, models=models, efforts=efforts,
             )
-        except Exception as exc:
+        # TerminalAuthFailure / RateLimitedExit subclass BaseException (so they
+        # propagate through asyncio.gather and worker `except Exception` blocks);
+        # capture_repo_deps -> claude_p can raise them, and a bare
+        # `except Exception` would let them escape this best-effort call and
+        # abort the backstop loop (or, in main()'s exit handlers, skip the
+        # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
+        except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -7578,7 +7584,9 @@ def run_recapture_deps(
                 replace=force,
             ))
             ran_any = True
-        except Exception as exc:
+        # See the backstop guard above: TerminalAuthFailure / RateLimitedExit
+        # are BaseException subclasses that a bare `except Exception` misses.
+        except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
             log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
 
     if not ran_any and not force:
@@ -19280,7 +19288,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             Path(os.getcwd()), st,
             caps=caps, models=models, efforts=efforts,
         )
-    except Exception as _cap_exc:
+    # TerminalAuthFailure / RateLimitedExit are BaseException subclasses that a
+    # bare `except Exception` would let escape — derailing a clean finalize into
+    # a crash. Capture is best-effort; catch them so it never blocks the run.
+    except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -20372,7 +20383,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except Exception as _cap_exc:
+        # The auth-locked pause is *guaranteed* to re-hit the same terminal
+        # auth failure inside capture_repo_deps -> claude_p. TerminalAuthFailure
+        # (and RateLimitedExit) subclass BaseException, so a bare
+        # `except Exception` cannot catch the re-raise: it would escape main()
+        # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
+        # crash the run with exit 1 — defeating this whole resumable-pause arm.
+        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -20422,7 +20439,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     repo_root, st,
                     caps=caps, models=models, efforts=efforts,
                 ))
-            except Exception as _cap_exc:
+            # Same escape hazard as the auth-locked arm: TerminalAuthFailure /
+            # RateLimitedExit are BaseException subclasses a bare
+            # `except Exception` misses, which would skip the `exit_code =
+            # EXIT_LOCKED` below and crash the pause with exit 1.
+            except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -20470,7 +20491,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except Exception as _cap_exc:
+        # TerminalAuthFailure / RateLimitedExit are BaseException subclasses a
+        # bare `except Exception` misses; catching them keeps capture non-fatal
+        # so the cancel arm still reaches its `exit_code = 130`.
+        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -20490,7 +20514,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except Exception as _cap_exc:
+        # TerminalAuthFailure / RateLimitedExit are BaseException subclasses a
+        # bare `except Exception` misses; catching them keeps capture non-fatal
+        # so the signal arm still reaches its `exit_code = 128 + signum`.
+        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
