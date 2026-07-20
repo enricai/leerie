@@ -1,0 +1,46 @@
+{
+  "_note": "Measured per-field byte distribution from the 2026-07-19 incident run (465ff1957fab1a60d8ffde6e95e19925a1d963a0a2781bdf9d30ed1ece6a172e). The real task file is an internal product audit and is deliberately not committed here — generate.py rebuilds a synthetic, shape-matched payload from these numbers so the incident's two root causes stay reproducible without the original file. See docs/incident note '2026-07-19-argv-e2big-and-coverage-freeze.md' (Reproducing section) for the full write-up.",
+
+  "reconciler_payload": {
+    "task_bytes": 51142,
+    "subtask_views_bytes": 88201,
+    "categories_bytes": 106,
+    "measured_component_sum_bytes": 150063,
+    "_measured_component_sum_note": "Sum of the incident note's 'Root cause B' component table (task + subtask_views + categories, each measured standalone). The fully-wrapped RECONCILER INPUT: user_prompt generate.py builds is larger still (adds JSON structural overhead: keys, the RECONCILER INPUT: header, the trailer sentence) — generate.py does not force the wrapped string to this exact figure, since doing so would require inflating task_bytes past its measured value. What matters for the regression is that the wrapped prompt exceeds MAX_ARG_STRLEN (131,071) on these measured component sizes alone, which it does with room to spare.",
+    "subtask_count": 114,
+    "json_indent": 2
+  },
+
+  "system_prompt": {
+    "name": "reconciler.md",
+    "bytes": 25128
+  },
+
+  "coverage_gate": {
+    "source_file": "CLAUDE.md",
+    "referenced_via_token": "CLAUDE.md",
+    "harvested_item_count": 15,
+    "uncoverable_backtick_must_headings": [
+      "Run `pnpm run lint:fix` - MUST pass with no errors",
+      "Run `pnpm run build` - MUST succeed",
+      "Run `pnpm test <touched>` - MUST pass with no errors"
+    ],
+    "other_headings": [
+      "IMPORTANT: Core TypeScript Rules",
+      "IMPORTANT: Logging Rules",
+      "Confirm TypeScript strict mode compliance (explicit return types)",
+      "Verify no `any` types were introduced",
+      "Confirm error boundaries wrap new async components",
+      "Check that new API routes validate input with zod",
+      "Confirm database migrations are reversible",
+      "Verify feature flags default to off",
+      "Check that new env vars are documented in .env.example",
+      "Confirm telemetry events use the shared event schema",
+      "Verify accessibility: interactive elements have aria labels",
+      "Check that new components have Storybook stories"
+    ],
+    "plan_text_matches_none_of_the_above": true,
+    "feedback_rounds_measured": 33,
+    "frozen_ratio": "15/15"
+  }
+}
