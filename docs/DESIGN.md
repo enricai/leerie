@@ -1879,7 +1879,7 @@ Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
 `max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
-to `caps["worker_pids_max"]` (default 1024, overridable per-repo via
+to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
 subtree blows past `memory.max`, the kernel OOM-kills *inside that
@@ -2113,20 +2113,35 @@ workload. There is no reliable way to *detect and refuse* "a full test
 suite run" (the command space — `pytest`, `make test`, `tox`, wrapper
 scripts — is open-ended, and a misfiring guard is worse than none), so
 the cap value itself is the enforcement surface for *legitimate* load:
-the default is set generous enough (1024) to admit a real conformance
+the default is set generous enough (2048) to admit a real conformance
 run, and it is overridable per-repo for suites heavier still. A runaway
 fork-bomb (thousands of PIDs) still trips the cap.
 
-How generous 1024 is, is a measured question rather than a guessed one.
-Leerie's own suite — the canonical heavy example, 3762 tests across 251
-modules, 117 of them fanning out into stubbed-binary subprocesses — peaks
-at **33** concurrent PIDs (median 7, P99 29, sampled at 20 Hz against the
-kernel's own `pids.current` in the release image). So the cap sits ~30×
-above the workload it was sized for, and a worker approaching it is
-almost never doing legitimate work: it is leaking. That measurement is
-what lets the mid-run reaper act on pressure at all — see *Mid-run PID
+The workload the cap is sized against is a measured quantity rather than
+a guessed one. Leerie's own suite — the canonical heavy example, 3762
+tests across 251 modules, 117 of them fanning out into stubbed-binary
+subprocesses — peaks at **33** concurrent PIDs (median 7, P99 29, sampled
+at 20 Hz against the kernel's own `pids.current` in the release image).
+The cap therefore sits ~62× above that workload, and a worker approaching
+it is almost never doing legitimate work: it is leaking. That measurement
+is what lets the mid-run reaper act on pressure at all — see *Mid-run PID
 reaping* below, whose critical tier closes the burst case this paragraph
 used to call uncatchable.
+
+The ~62× figure is deliberate slack, not a fitted multiple. The default
+was 1024 (~31×) until a *second* 1024-saturation incident — distinct from
+the wave-2 integrator death in run `879defae` described under *Mid-run PID
+reaping* below, and later than it. This one was a conformer: having
+backgrounded a test-suite run and lost track of its output file, the
+worker ran the full suite a second time, and the two runs together
+saturated the cap (`pids.current=1024/1024`, fork denials 221 — the
+integrator's count was 213, a different event with the same signature).
+Nothing in that trace needed more than 1024 PIDs to do its work — so the
+raise to 2048 buys a misbehaving worker more room before it dies, and
+does not address why it misbehaved. It is headroom against a class of
+worker error, priced in the knowledge that a genuine leak now issues
+twice as many forks before the kernel starts refusing them at `pids.max`,
+and sits under the mid-run reaper for twice as long before that point.
 
 Per §12 (*prompts are advisory, code enforces*), the orchestrator detects
 this mechanically rather than leaving it to the model. The broker gains a
@@ -2265,12 +2280,24 @@ floor — not the tracking — is what stood between the reaper and the leak.
 The resolution is a second tier rather than a lower floor. The cap's own
 sizing measurement (see *Detecting PID exhaustion* above: the suite peaks at
 33 concurrent PIDs) supplies the discriminator. A worker sitting at 90% of a
-1024 cap holds ~920 PIDs to do work that costs 33; there is no legitimate
+2048 cap holds ~1843 PIDs to do work that costs 33; there is no legitimate
 reading of that state. It is a leak, and the young orphans in it are leaked
 too. So at `_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
 `_PID_REAP_CRITICAL_AGE_SEC` (5 s); below that ratio the 60 s floor stands
 unchanged. The normal tier keeps its protection; the critical tier trades it
 for the worker's life.
+
+The gate is a *fraction* of `pids.max` rather than an absolute count, so it
+tracks the cap instead of needing a re-tune whenever the default moves — the
+1024 → 2048 raise widened the absolute trigger from ~922 to ~1844 without
+touching this constant. But the discriminator is the *gap* between that
+trigger and the 33-PID workload, not the ratio itself, so it is only sound
+while the cap sits well above the measurement. A per-repo
+`--worker-pids-max` set near the workload (say 64, where 90% is ~58) would
+put the critical tier's trigger inside the range legitimate work occupies,
+and the "no legitimate reading of that state" premise would no longer hold.
+Raising the cap strengthens this argument; lowering it toward 33 is what
+breaks it.
 
 *Accepted bounded regression.* Above the 90% gate it is possible that a
 live background process is killed — older than 60 s in the normal tier, or

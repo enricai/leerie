@@ -168,11 +168,17 @@ DEFAULT_CAPS = {
     # shell out to bash harnesses / git / the launcher, run un-scoped by
     # the conformer per prompts/conformer.md) bursts past 256 in seconds
     # and wedges every subsequent fork with EAGAIN — the exact failure
-    # the PID-exhaustion detector then reports. 1024 clears that burst
-    # while a runaway shell loop (in the thousands) still trips the cap.
-    # Overridable per-repo via resolve_worker_pids_max (CLI > env >
-    # leerie.toml > this default).
-    "worker_pids_max": 1024,
+    # the PID-exhaustion detector then reports. 1024 cleared that burst
+    # while a runaway shell loop (in the thousands) still tripped the cap.
+    # 1024 was in turn exhausted by a conformer that backgrounded a suite
+    # run, lost track of its output file, and ran the full suite a second
+    # time (pids.current=1024/1024, fork denials 221). Nothing in that
+    # trace needed >1024 PIDs to do its work, so 2048 is slack against
+    # that class of worker error rather than a re-derivation from the
+    # workload — a genuine leak now issues twice as many forks before the
+    # kernel starts refusing them here. Overridable per-repo via
+    # resolve_worker_pids_max (CLI > env > leerie.toml > this default).
+    "worker_pids_max": 2048,
     # Auth/quota backoff budget. When `claude -p` returns an envelope
     # whose `api_error_status` is 401/429/529 or whose result message
     # names an auth/rate-limit failure, `claude_p()` retries with tenacity's
@@ -1888,8 +1894,10 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # Critical-water / critical-age: above this pressure the min-age floor drops
 # (DESIGN §6 *Why a single 60 s floor is not enough — the critical tier*).
 # Measured: leerie's own full suite peaks at 33 concurrent PIDs, so a worker
-# at 90% of a 1024 cap is leaking, not testing — and the young orphans in
-# that state are leaked too. Held as a constant distinct from
+# at 90% of a 2048 cap is leaking, not testing — and the young orphans in
+# that state are leaked too. A fraction of pids.max, so it tracks the cap;
+# sound only while the cap stays well above that 33-PID measurement (see
+# the DESIGN section cited above). Held as a constant distinct from
 # _PID_REAP_HIGH_WATER despite the equal value: "when do we arm" and "when
 # do we stop trusting youth" are different questions.
 _PID_REAP_HIGH_WATER = 0.90
