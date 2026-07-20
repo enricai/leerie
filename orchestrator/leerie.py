@@ -5656,6 +5656,29 @@ def extract_task_file_structure(
 
 _MAX_COVERAGE_ITEMS = 50
 
+# Matches a backtick-quoted span, e.g. the `` `pnpm run lint:fix` `` in
+# ``Run `pnpm run lint:fix` - MUST pass with no errors``.
+_BACKTICK_SPAN_RE = re.compile(r'`[^`]+`')
+
+
+def _is_uncoverable_convention_item(key: str) -> bool:
+    """True when *key* is a repo-convention imperative that cannot appear
+    verbatim in a subtask title/intent by construction.
+
+    Root cause A (2026-07-19 incident): headings like ``Run `pnpm run
+    lint:fix` - MUST pass with no errors`` are harvested from files like
+    CLAUDE.md as coverage items, but the literal-substring check
+    (``key.lower() not in plan_text``) can never match them — no planner
+    restates a backtick-quoted command plus "MUST" verbatim in a subtask
+    title or intent. Excluding these from the coverage denominator (not
+    from the prompt injection, which stays unconditional) is what stops
+    the gate from re-driving an unwinnable planner feedback round on a
+    signal that cannot move — 33/33 feedback rounds froze at an identical
+    15/15 ratio in the incident run."""
+    has_backtick_span = bool(_BACKTICK_SPAN_RE.search(key))
+    has_imperative = bool(re.search(r'\bMUST\b', key))
+    return has_backtick_span and has_imperative
+
 
 def check_task_file_coverage(
     extracted: list[str], subtasks: list[dict],
@@ -5667,10 +5690,25 @@ def check_task_file_coverage(
     too dilute for meaningful gating — a planner with 5–15 subtasks cannot
     realistically cover half of 200+ spec items.  The prompt injection
     (``_format_task_file_structure``) is unconditional regardless of this
-    cap."""
+    cap.
+
+    Items that are uncoverable by construction — repo-convention
+    imperatives combining a backtick-quoted command with "MUST", which can
+    never appear verbatim in a subtask title/intent — are dropped from
+    both the numerator and denominator before the ratio is computed (see
+    ``_is_uncoverable_convention_item``). This is what keeps the gate from
+    firing forever on files like CLAUDE.md whose headings are coding-
+    standard rules rather than spec items a plan could restate."""
     if not extracted:
         return []
-    if len(extracted) > _MAX_COVERAGE_ITEMS:
+    coverable = [
+        item for item in extracted
+        if not _is_uncoverable_convention_item(
+            item.split(": ", 1)[1] if ": " in item else item)
+    ]
+    if not coverable:
+        return []
+    if len(coverable) > _MAX_COVERAGE_ITEMS:
         return []
     plan_text = " ".join(
         (s.get("intent", "") + " " +
@@ -5679,16 +5717,39 @@ def check_task_file_coverage(
         for s in subtasks
     ).lower()
     uncovered = []
-    for item in extracted:
+    for item in coverable:
         key = item.split(": ", 1)[1] if ": " in item else item
         if key.lower() not in plan_text:
             uncovered.append(item)
-    if uncovered and len(uncovered) > len(extracted) * 0.5:
+    if uncovered and len(uncovered) > len(coverable) * 0.5:
         return [
-            f"LOW_COVERAGE: {len(uncovered)}/{len(extracted)} items "
+            f"LOW_COVERAGE: {len(uncovered)}/{len(coverable)} items "
             f"from task-referenced files not mentioned in plan. "
             f"Sample: {uncovered[:5]}"]
     return []
+
+
+def _dedup_frozen_coverage_issues(
+    coverage_issues: list[str], seen_ratios: set[str],
+) -> list[str]:
+    """Drop LOW_COVERAGE issues whose ratio prefix (e.g. ``"LOW_COVERAGE:
+    15/15"``) was already seen in a prior round of the same planner loop.
+
+    Mutates *seen_ratios* in place (adds every new ratio seen). A ratio
+    that repeats round-over-round means the gate's feedback isn't moving
+    the planner — re-sending it would just re-drive an unwinnable
+    feedback round (root cause A, 2026-07-19 incident: 33/33 feedback
+    rounds froze at an identical 15/15). The first occurrence of a given
+    ratio still passes through, so a genuinely new (even if numerically
+    coincidental across categories) gate still fires once."""
+    fresh = []
+    for issue in coverage_issues:
+        ratio = issue.split(" items ", 1)[0]
+        if ratio in seen_ratios:
+            continue
+        seen_ratios.add(ratio)
+        fresh.append(issue)
+    return fresh
 
 
 def _format_task_file_structure(items: list[str]) -> str:
@@ -12402,11 +12463,24 @@ async def phase_plan(task: str, st: State, caps: dict,
                 feedback_slot.append(fb)
                 return {}
 
+            # LOW_COVERAGE freeze guard (root cause A, 2026-07-19 incident):
+            # even after excluding uncoverable-by-construction convention
+            # items (see _is_uncoverable_convention_item), a coverage ratio
+            # can still fail to converge round over round for other reasons
+            # (e.g. a genuinely hard-to-restate spec file). Once the same
+            # ratio repeats across rounds of this loop, the coverage issue
+            # is dropped (the gate goes advisory-silent for this loop, not
+            # the planner run) so _run_checked_loop still retries on any
+            # *other* issue instead of re-driving on a frozen signal.
+            seen_coverage_ratios: set[str] = set()
+
             def _check_planner(r: dict) -> list[str]:
                 issues = check_planner_output(r, repo_root, category)
                 if task_file_items:
-                    issues.extend(check_task_file_coverage(
-                        task_file_items, r.get("subtasks", [])))
+                    coverage_issues = check_task_file_coverage(
+                        task_file_items, r.get("subtasks", []))
+                    issues.extend(_dedup_frozen_coverage_issues(
+                        coverage_issues, seen_coverage_ratios))
                 return issues
 
             result, gate_warnings = await _run_checked_loop(

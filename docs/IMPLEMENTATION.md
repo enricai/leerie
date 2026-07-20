@@ -4124,9 +4124,30 @@ DESIGN.md §8 for the distinction).
 | `_expand_braces(pattern)` | Pre-expands `{a,b}` brace groups that Python's `glob.glob` does not handle. Recursive for nested braces. |
 | `glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. |
 | `extract_task_file_structure(task, repo_root)` | Extracts H3+ headings from `.md`/`.txt` (regex: `#{3,6}`; H1/H2 skipped as structural), numbered items (excluding TOC anchor links `[...](#...)`), list-item IDs from `.yaml`/`.yml` (regex: `^- id:`), and top-level mapping keys. Stdlib-only (no PyYAML). Returns `list[str]` or `None`. |
-| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Returns `LOW_COVERAGE` issue when >50% uncovered AND item count ≤ `_MAX_COVERAGE_ITEMS` (50). Above the cap, returns empty (too dilute for meaningful gating). |
-| `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. |
+| `_is_uncoverable_convention_item(key)` | True when *key* combines a backtick-quoted span with the marker `MUST` (case-sensitive) — a repo-convention imperative (e.g. ``Run `pnpm run lint:fix` - MUST pass with no errors``) that cannot appear verbatim in a subtask title/intent by construction. |
+| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Items matching `_is_uncoverable_convention_item` are dropped from both the numerator and denominator before the ratio is computed — they inflate the ratio without ever being coverable. Returns `LOW_COVERAGE` issue when >50% of the remaining (coverable) items are uncovered AND the coverable count is ≤ `_MAX_COVERAGE_ITEMS` (50). Above the cap, or when nothing remains coverable, returns empty. |
+| `_dedup_frozen_coverage_issues(coverage_issues, seen_ratios)` | Drops a `LOW_COVERAGE` issue whose `"N/M"` ratio prefix was already seen (tracked in the caller-owned `seen_ratios` set, one per planner-category feedback loop). A ratio that repeats round-over-round means the gate's feedback isn't moving the planner, so the issue is dropped after its first occurrence rather than re-driving another feedback round on a frozen signal. A ratio that changes (even coincidentally shared across categories, since `seen_ratios` is per-loop) still fires. |
+| `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. Unconditional — runs regardless of `check_task_file_coverage`'s cap or freeze-dedup, since the checklist itself is still useful context even when the gate stays silent. |
 | `_MAX_COVERAGE_ITEMS` | 50. A planner with 5–15 subtasks can realistically cover ~50 items; above this the 50% threshold becomes unrealistic. |
+
+**Freeze guard (2026-07-19 incident, root cause A):** a single incidental
+dotted token (e.g. `CLAUDE.md` mentioned once in a task's Verification
+section) causes `extract_task_file_structure` to harvest the repo's real
+CLAUDE.md as spec items — including coding-standard imperatives like
+``Run `pnpm run lint:fix` - MUST pass with no errors`` that can never
+appear verbatim in a subtask title/intent. Before this fix the
+literal-substring gate fired identically every round (33/33 feedback
+rounds at an unchanged 15/15 ratio in the incident run), burning ~35% of
+the run's spend re-sending a signal that never moved. Two independent
+guards now prevent this: (1) `_is_uncoverable_convention_item` excludes
+items that are uncoverable by construction before the ratio is computed,
+and (2) `_dedup_frozen_coverage_issues` (used by `phase_plan`'s
+per-category `_check_planner` closure) stops re-emitting a `LOW_COVERAGE`
+issue once its ratio has repeated within the same feedback loop, covering
+non-convention files that still fail to converge for other reasons. Both
+guards only silence the *gate* — `_format_task_file_structure`'s prompt
+injection stays unconditional, so the planner still sees the full
+checklist as context.
 
 No-op when the task doesn't reference files.
 

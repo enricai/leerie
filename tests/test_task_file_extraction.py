@@ -196,6 +196,129 @@ class TestCheckTaskFileCoverage:
         issues = leerie.check_task_file_coverage(extracted, subtasks)
         assert any("LOW_COVERAGE" in i for i in issues)
 
+    def test_uncoverable_convention_items_excluded(self, leerie):
+        # 2026-07-19 incident shape: CLAUDE.md headings that are
+        # coding-standard imperatives (backtick-quoted command + MUST)
+        # cannot appear verbatim in a subtask title/intent, so they must
+        # not count toward the coverage ratio at all.
+        extracted = [
+            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
+            "CLAUDE.md: Run `pnpm run build` - MUST succeed",
+            "CLAUDE.md: Confirm TypeScript strict mode compliance",
+        ]
+        subtasks = [{"title": "Confirm TypeScript strict mode compliance",
+                     "intent": "", "investigation_notes": ""}]
+        # Only one coverable item (the non-imperative heading) remains,
+        # and it's covered — no LOW_COVERAGE despite 2/3 raw items being
+        # unmatchable by construction.
+        assert leerie.check_task_file_coverage(extracted, subtasks) == []
+
+    def test_all_uncoverable_yields_no_issue(self, leerie):
+        extracted = [
+            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
+            "CLAUDE.md: Run `pnpm run build` - MUST succeed",
+        ]
+        subtasks = [{"title": "unrelated", "intent": "",
+                     "investigation_notes": ""}]
+        assert leerie.check_task_file_coverage(extracted, subtasks) == []
+
+    def test_uncoverable_items_dont_inflate_denominator_for_real_gaps(
+            self, leerie):
+        # A genuine coverage gap among the coverable items still fires,
+        # with the ratio computed over the coverable subset only.
+        extracted = [
+            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
+            "CLAUDE.md: Real spec item A",
+            "CLAUDE.md: Real spec item B",
+        ]
+        subtasks = [{"title": "unrelated", "intent": "",
+                     "investigation_notes": ""}]
+        issues = leerie.check_task_file_coverage(extracted, subtasks)
+        assert any("LOW_COVERAGE: 2/2" in i for i in issues)
+
+    def test_backtick_without_must_still_coverable(self, leerie):
+        # Backticks alone (no MUST) don't make an item uncoverable — only
+        # the combination is the uncoverable-by-construction signature.
+        extracted = ["spec.md: Run `pnpm test`", "spec.md: B", "spec.md: C"]
+        subtasks = [{"title": "unrelated", "intent": "",
+                     "investigation_notes": ""}]
+        issues = leerie.check_task_file_coverage(extracted, subtasks)
+        assert any("LOW_COVERAGE: 3/3" in i for i in issues)
+
+
+class TestIsUncoverableConventionItem:
+    def test_backtick_and_must(self, leerie):
+        assert leerie._is_uncoverable_convention_item(
+            "Run `pnpm run lint:fix` - MUST pass with no errors") is True
+
+    def test_backtick_only(self, leerie):
+        assert leerie._is_uncoverable_convention_item(
+            "Run `pnpm test`") is False
+
+    def test_must_only(self, leerie):
+        assert leerie._is_uncoverable_convention_item(
+            "This MUST pass") is False
+
+    def test_neither(self, leerie):
+        assert leerie._is_uncoverable_convention_item(
+            "Plain heading") is False
+
+    def test_lowercase_must_not_matched(self, leerie):
+        # "MUST" as a rule-imperative marker is case-sensitive on purpose
+        # — lowercase "must" appears in ordinary prose too often to be a
+        # reliable uncoverable-by-construction signal.
+        assert leerie._is_uncoverable_convention_item(
+            "Run `pnpm test` - it must pass") is False
+
+
+# --- _dedup_frozen_coverage_issues --------------------------------------- #
+
+class TestDedupFrozenCoverageIssues:
+    def test_first_occurrence_passes_through(self, leerie):
+        seen: set[str] = set()
+        issues = ["LOW_COVERAGE: 15/15 items from task-referenced files "
+                  "not mentioned in plan. Sample: [...]"]
+        result = leerie._dedup_frozen_coverage_issues(issues, seen)
+        assert result == issues
+        assert seen == {"LOW_COVERAGE: 15/15"}
+
+    def test_repeated_ratio_dropped(self, leerie):
+        # Simulates the incident: the same 15/15 ratio fires every round.
+        seen: set[str] = set()
+        issue = ("LOW_COVERAGE: 15/15 items from task-referenced files "
+                 "not mentioned in plan. Sample: [...]")
+        first = leerie._dedup_frozen_coverage_issues([issue], seen)
+        second = leerie._dedup_frozen_coverage_issues([issue], seen)
+        third = leerie._dedup_frozen_coverage_issues([issue], seen)
+        assert first == [issue]
+        assert second == []
+        assert third == []
+
+    def test_changed_ratio_still_fires(self, leerie):
+        # A ratio that genuinely improves (or worsens) round over round is
+        # real signal and must still reach the planner as feedback.
+        seen: set[str] = set()
+        issue_a = ("LOW_COVERAGE: 15/15 items from task-referenced files "
+                   "not mentioned in plan. Sample: [...]")
+        issue_b = ("LOW_COVERAGE: 8/15 items from task-referenced files "
+                   "not mentioned in plan. Sample: [...]")
+        first = leerie._dedup_frozen_coverage_issues([issue_a], seen)
+        second = leerie._dedup_frozen_coverage_issues([issue_b], seen)
+        assert first == [issue_a]
+        assert second == [issue_b]
+
+    def test_empty_input(self, leerie):
+        seen: set[str] = set()
+        assert leerie._dedup_frozen_coverage_issues([], seen) == []
+        assert seen == set()
+
+    def test_mutates_seen_in_place(self, leerie):
+        seen: set[str] = set()
+        issue = ("LOW_COVERAGE: 4/6 items from task-referenced files "
+                 "not mentioned in plan. Sample: [...]")
+        leerie._dedup_frozen_coverage_issues([issue], seen)
+        assert "LOW_COVERAGE: 4/6" in seen
+
 
 # --- _format_task_file_structure ---------------------------------------- #
 
