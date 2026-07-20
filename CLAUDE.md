@@ -1798,6 +1798,38 @@ envelopes whose auth/quota backoff budget exhausts still raise
 reverted an over-application of the terminal-auth reroute to that
 transient case; and a source-coupling check that `_is_terminal_auth_failure`
 is consulted before `_is_auth_or_quota_failure` inside `claude_p`.
+The 2026-07-19 incident (`argv-e2big-and-coverage-freeze`) — the
+combined argv E2BIG crash (root cause B) and coverage-gate freeze
+(root cause A) that motivated the stdin-transport and coverage-freeze
+fixes above — has a dedicated end-to-end reproduction harness in
+`tests/test_incident_2026_07_19.py`, backed by
+`tests/fixtures/incident_2026_07_19/{shape.json,generate.py}`. The
+fixtures are synthetic and shape-matched to the incident's measured
+per-field byte distribution (task 51,142B, `subtask_views` 88,201B at
+`indent=2`, 114 subtasks, a 15-item CLAUDE.md heading harvest split
+into 3 uncoverable backtick+MUST convention items and 12 other
+headings) — the real internal-audit task file is deliberately not
+committed. `generate.py` rebuilds the reconciler payload shape
+(`build_task`/`build_subtask_views`/`build_user_prompt`) and the
+CLAUDE.md-shaped heading text (`build_claude_md_text`) from
+`shape.json`; it is not itself a test module (`pytest.ini`'s
+`python_files = test_*.py` never collects it) and is imported directly
+via `importlib.util`. `TestRootCauseB_ArgvE2BIG` pins that the
+generated ~150KB payload exceeds `MAX_ARG_STRLEN` (131,071B) as a
+single string, and that `claude_p`'s real `build()` closure — driven
+through a stubbed `_invoke`, no live `claude` binary required —
+constructs no argv element over that ceiling for it, routes the user
+prompt over stdin, and routes the appended system prompt through
+`--append-system-prompt-file`. `TestRootCauseA_CoverageFreeze` pins
+that `extract_task_file_structure` reproduces the incident's exact
+15-item harvest from the generated CLAUDE.md text, that
+`check_task_file_coverage` does not gate on the 3 uncoverable
+backtick+MUST headings alone, and that a genuinely uncoverable item
+mixed into the set still gates (the fix narrows the gate rather than
+disabling it). `TestBothRootCausesComposeOnOnePayload` runs both
+halves against the same generated fixtures in one test, matching the
+incident note's claim that the two fixes compose on one realistic
+payload.
 
 ## Task completion checklist
 
