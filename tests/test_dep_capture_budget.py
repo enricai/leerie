@@ -11,6 +11,7 @@ integration. This file focuses entirely on the extraction+budget unit.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -424,3 +425,195 @@ def test_depcap_total_budget_value_unchanged_since_incident(leerie):
     assert combined > 131_071, (
         "if this ever drops back under MAX_ARG_STRLEN, double-check whether "
         "the comment's stdin-transport rationale is still accurate")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: combined manifests+commands payload never lands on argv
+# ---------------------------------------------------------------------------
+#
+# test_depcap_budgets_not_argv_bound_by_source and
+# test_depcap_total_budget_value_unchanged_since_incident (above, bugfix-004)
+# already pin that _DEPCAP_TOTAL_BUDGET is deliberately left over
+# MAX_ARG_STRLEN and documented as stdin-transported. This section closes
+# the gap those source-inspection tests leave open: that
+# capture_repo_deps's *actual* claude_p invocation, for a corpus sized past
+# both _DEPCAP_MANIFEST_TOTAL_BUDGET and _DEPCAP_TOTAL_BUDGET, really does
+# hand the combined manifests_text + commands_text payload to `claude -p`
+# over stdin_data rather than embedding it in any argv element — i.e. the
+# property that makes the oversized combined budget safe actually holds at
+# the call site, not just in a comment.
+
+_DEPCAP_ENVELOPE = {
+    "type": "result",
+    "subtype": "success",
+    "num_turns": 1,
+    "total_cost_usd": 0.001,
+    "is_error": False,
+    "terminal_reason": "completed",
+    "result": "{}",
+    "structured_output": {
+        "setup_packages": [],
+        "language_installs": [],
+        "dockerfile_notes": None,
+    },
+    "usage": {"input_tokens": 10, "output_tokens": 10},
+}
+
+_DEPCAP_CAPS = {
+    "worker_timeout_sec": 60,
+    "max_total_workers": 200,
+    "max_parallel": 4,
+    "worker_idle_warn_sec": 30,
+}
+_DEPCAP_MODELS = {"dep_capture": "opus"}
+_DEPCAP_EFFORTS: dict[str, str | None] = {"dep_capture": None}
+
+
+def _make_depcap_state(leerie, run_dir: Path) -> object:
+    """Minimal State-alike satisfying claude_p, mirroring
+    test_dep_capture_worker.py's _make_state."""
+    st = leerie.State.__new__(leerie.State)
+    st.run_id = "test-depcap-payload"
+    st.run_dir = run_dir
+    st.path = run_dir / "state.json"
+    st.data = {
+        "telemetry": {"calls": 0, "cost_usd": 0.0,
+                      "input_tokens": 0, "output_tokens": 0},
+        "verbosity": "quiet",
+        "worker_count": 0,
+        "dangerously_skip_permissions": False,
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    st.path.write_text("{}")
+    return st
+
+
+def _write_large_manifest(repo: Path, name: str, min_bytes: int) -> None:
+    """Write a dependency-manifest file at least min_bytes long, made of
+    repeated distinct-looking package lines so it isn't collapsed by any
+    dedup step upstream of _gather_dep_manifests (which has none, but this
+    keeps the fixture realistic)."""
+    lines = []
+    total = 0
+    i = 0
+    while total < min_bytes:
+        line = f"pkg-{name}-{i}==1.0.{i}\n"
+        lines.append(line)
+        total += len(line.encode())
+        i += 1
+    (repo / name).write_text("".join(lines))
+
+
+def test_capture_repo_deps_payload_travels_via_stdin_not_argv(
+        leerie, tmp_path, monkeypatch):
+    """A corpus sized past BOTH _DEPCAP_MANIFEST_TOTAL_BUDGET and
+    _DEPCAP_TOTAL_BUDGET still produces a claude -p invocation with no argv
+    element carrying the manifest/command payload — it travels entirely via
+    stdin_data, so no argv size regardless of corpus size can raise E2BIG
+    for this worker."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Manifests corpus: two files, each larger than the per-file budget, so
+    # _gather_dep_manifests truncates per-file but still emits close to the
+    # _DEPCAP_MANIFEST_TOTAL_BUDGET ceiling in total.
+    _write_large_manifest(repo, "requirements.txt",
+                           leerie._DEPCAP_MANIFEST_FILE_BUDGET + 5000)
+    _write_large_manifest(repo, "package.json",
+                           leerie._DEPCAP_MANIFEST_FILE_BUDGET + 5000)
+
+    # Commands corpus: many distinct install commands, well past
+    # _DEPCAP_TOTAL_BUDGET on their own.
+    log_dir = tmp_path / "run" / "logs"
+    pad = "x" * 200
+    cmds = [f"pip install pkg{i}-{pad}" for i in range(2000)]
+    _write_log(log_dir, cmds, "w-001.log")
+
+    st = _make_depcap_state(leerie, tmp_path / "run")
+
+    captured: dict = {}
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          progress=None, **kw):
+        captured["cmd"] = cmd
+        captured["stdin_data"] = kw.get("stdin_data")
+        return _DEPCAP_ENVELOPE
+
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_DEPCAP_CAPS, models=_DEPCAP_MODELS,
+        efforts=_DEPCAP_EFFORTS,
+    ))
+
+    assert "cmd" in captured, "capture_repo_deps did not invoke the worker"
+    cmd = captured["cmd"]
+    stdin_data = captured["stdin_data"]
+
+    # The combined corpus is, by construction, well over the real argv
+    # ceiling. Prove it never reaches argv: no element of the constructed
+    # command line is anywhere near that size.
+    for arg in cmd:
+        assert len(arg.encode()) < 131_071, (
+            f"argv element {arg[:80]!r}... is {len(arg.encode())} bytes — "
+            "the dep_capture payload must never land on argv")
+
+    # The payload actually was transported — over stdin_data — and it
+    # carries content from BOTH corpora, not just the command hint (closing
+    # the "manifests_text is added on top" gap: both are present in the
+    # bounded, stdin-transported payload).
+    assert stdin_data is not None, (
+        "capture_repo_deps must feed its combined manifests+commands "
+        "payload to claude -p via stdin_data")
+    assert "pkg-requirements.txt-0==1.0.0" in stdin_data
+    assert "pkg-package.json-0==1.0.0" in stdin_data
+    assert "pip install pkg0-" in stdin_data
+
+    # And the combined payload is exactly what the two extraction budgets
+    # promise: bounded by _DEPCAP_MANIFEST_TOTAL_BUDGET (manifests) plus
+    # _DEPCAP_TOTAL_BUDGET (commands) plus a small, fixed amount of prompt
+    # scaffolding text — independent of how many subtasks/logs contributed
+    # to the corpus.
+    scaffold_ceiling = 2000  # generous bound on the fixed prompt headers
+    ceiling = (leerie._DEPCAP_MANIFEST_TOTAL_BUDGET
+               + leerie._DEPCAP_TOTAL_BUDGET + scaffold_ceiling)
+    assert len(stdin_data.encode()) <= ceiling, (
+        f"stdin_data is {len(stdin_data.encode())} bytes, expected <= "
+        f"{ceiling} (manifest + command budgets + scaffolding)")
+
+
+def test_capture_repo_deps_small_corpus_stdin_under_argv_ceiling(
+        leerie, tmp_path, monkeypatch):
+    """Sanity control: a small, realistic corpus also travels via stdin_data
+    (not argv), and — unsurprisingly, since it's small — comfortably fits
+    under MAX_ARG_STRLEN too. This is the common case the incident's fix
+    must not regress."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("requests==2.31.0\nflask==3.0.0\n")
+
+    log_dir = tmp_path / "run" / "logs"
+    _write_log(log_dir, ["pip install -r requirements.txt"], "w-001.log")
+
+    st = _make_depcap_state(leerie, tmp_path / "run")
+
+    captured: dict = {}
+
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          progress=None, **kw):
+        captured["cmd"] = cmd
+        captured["stdin_data"] = kw.get("stdin_data")
+        return _DEPCAP_ENVELOPE
+
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_DEPCAP_CAPS, models=_DEPCAP_MODELS,
+        efforts=_DEPCAP_EFFORTS,
+    ))
+
+    assert captured["stdin_data"] is not None
+    assert len(captured["stdin_data"].encode()) < 131_071
+    for arg in captured["cmd"]:
+        assert len(arg.encode()) < 131_071
