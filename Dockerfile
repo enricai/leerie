@@ -273,7 +273,7 @@ RUN set -eux; \
 # don't appear here because they're added by `mise activate` or by
 # wrapping commands with `mise exec --` — both of which the
 # orchestrator does explicitly when invoking install commands.
-ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH
+ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
 
 # Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245).
 # Installs globally against the LTS Node — lands at
@@ -308,13 +308,17 @@ RUN git config --system --add safe.directory '*'
 RUN mkdir -p /inspect && chown leerie:"${HOST_GID}" /inspect
 
 # Pre-create the leerie user's MISE_DATA_DIR and the per-tool cache
-# mount targets so the launcher's bind-mounts attach cleanly and the
-# user dir owns the right metadata for mise's first run. Also chown
-# /home/leerie itself — `useradd -m` produces /home/leerie with mode 0755
-# but observed images have it as root:root, so the runtime user can't
-# create new dotfiles (e.g. `mise install` invokes gpg, which mkdirs
-# ~/.gnupg and fails with EACCES). The .gnupg subdir is pre-created
-# at mode 0700, which GPG requires.
+# mount targets so the launcher's bind-mounts attach cleanly.
+#
+# Left root-owned (no chown to leerie here): rootless containerd's
+# `unshare --user --map-user=$(id -u leerie)` maps only outer UID 0 ->
+# inner leerie. A dir owned by leerie's literal UID has no entry in that
+# map and appears as nobody/65534 to the remapped process — traversable,
+# not writable. Root-owned dirs map correctly (outer 0 -> inner leerie),
+# the same mechanism that already makes bind mounts like /work writable
+# with no chown. container-entry.sh's rootful branch chowns these to
+# leerie at runtime instead, since the rootful `runuser -u leerie` drop
+# is a real uid switch with no remap to rely on.
 RUN mkdir -p /home/leerie/.local/share/mise \
              /home/leerie/.local/state/mise \
              /home/leerie/.cache/leerie/pnpm-store \
@@ -325,15 +329,35 @@ RUN mkdir -p /home/leerie/.local/share/mise \
              /home/leerie/.cache/rubocop_cache \
              /home/leerie/.cache/selenium \
              /home/leerie/.gnupg \
-    && chown leerie:"${HOST_GID}" /home/leerie \
-    && chown -R leerie:"${HOST_GID}" /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg \
     && chmod 700 /home/leerie/.gnupg
 # mise install --system (above, before useradd) runs as root and creates
 # /tmp/.cache/mise/ (via XDG_CACHE_HOME=/tmp/.cache) owned by root:root.
 # On Fly Machines the rootfs preserves this ownership; the leerie user
 # then gets EACCES when `mise install` tries to write its download cache.
-# On local nerdctl runs /tmp is an ephemeral overlay so this is never seen.
-RUN chown -R leerie: /tmp/.cache
+#
+# Chowning to leerie is not enough on its own, and is actively wrong under
+# rootless containerd: container-entry.sh's privilege drop there is
+# `unshare --user --map-user=$(id -u leerie) ...`, which remaps only
+# outer UID 0 -> inner leerie. A directory explicitly chowned to leerie's
+# own (non-zero) UID is NOT covered by that remap, so it appears owned by
+# nobody/65534 to the remapped process — traversable via its mode-755
+# "other" bits (read/execute), but not writable (no write bit for
+# "other"). That silently breaks every OTHER tool that tries to create
+# its own subdir under XDG_CACHE_HOME here (observed for corepack —
+# see COREPACK_HOME below — and for tree-sitter-language-pack's
+# download-cache lock). Chasing each offender down with its own
+# dedicated, separately-mounted cache dir doesn't scale.
+#
+# Fix it once, generally: make /tmp/.cache itself world-writable with the
+# sticky bit — the same posture /tmp itself already has (`drwxrwxrwt`) —
+# so any UID, real or remapped, can create new entries under it
+# regardless of who "owns" the directory. This container is single-tenant
+# (leerie's own processes only), so there is no security cost to the
+# permissive mode; the chown is kept alongside it for the plain
+# rootful/Fly path where UIDs aren't remapped at all.
+RUN chown -R leerie: /tmp/.cache \
+    && chmod -R a+rwX /tmp/.cache \
+    && chmod 1777 /tmp/.cache
 
 # Bake the orchestrator source into the image at /opt/leerie-image/ so the
 # image is self-contained on Fly.io Machines (no host bind mount available).
