@@ -566,9 +566,16 @@ itself):
 Tests:
 
 ```bash
-pip install pytest    # only dev dependency
-pytest tests/         # from the repo root
+pip install -r requirements.txt   # runtime deps — the suite imports them
+pip install pytest jsonschema     # pytest is the only dev dependency
+pytest tests/                     # from the repo root
 ```
+
+The suite runs on the host Python and imports the orchestrator directly,
+so the pinned *runtime* deps must be installed too — without them, tests
+that exercise the auth/quota backoff fail with `ModuleNotFoundError: No
+module named 'tenacity'`. This mirrors what CI installs
+(`.github/workflows/test.yml`).
 
 The suite covers the deterministic enforcement functions, including a
 coupling test that the retry-policy markers match the live check-function

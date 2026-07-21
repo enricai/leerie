@@ -118,6 +118,20 @@ orchestrator and not used anywhere in this repo.
   orchestrator writes to the state root (default: `$HOME/.leerie/<basename>/`,
   at `/leerie-state` inside the container); workers commit code to their
   worktree branch only.
+- **Evaluate every ownership/permission change against all three runtimes
+  separately** — local rootless containerd, local rootful (Colima/macOS),
+  and Fly/EC2. A change can be correct on one and break another, and CI
+  (`ubuntu-latest`, rootful) structurally cannot catch a rootless-only
+  regression. The specific trap, documented at `Dockerfile:235-241`:
+  rootless drops privilege via `unshare --user --map-user=$(id -u leerie)`,
+  a single-entry map (outer UID 0 → inner leerie) that leaves outer leerie
+  *unmapped*. So an image-layer dir **chowned to leerie is unwritable**
+  (appears as nobody/65534) while a **root-owned dir is writable** — the
+  inverse of normal Docker intuition. Rootful `runuser -u leerie` is a
+  real uid switch with no remap, so it needs the opposite: literal leerie
+  ownership, applied at runtime in `container-entry.sh`'s rootful guard.
+  See `tests/test_tmp_cache_writable.py` and
+  `tests/test_home_leerie_ownership.py` for the pinned form.
 
 ## Code style
 

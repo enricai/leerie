@@ -269,6 +269,10 @@ RUN set -eux; \
 #   1. mise's system shims (mise install --system populates these).
 #   2. LTS Node bin (image-baked claude lives here).
 #   3. (then the pre-existing PATH)
+#   4. /home/leerie/.local/bin — where `pip install --user` puts console
+#      scripts (e.g. pre-commit). Deliberately LAST: image-baked tooling
+#      must win, so a user-installed package can never shadow a baked-in
+#      binary. Pinned by tests/test_dockerfile_path.py.
 # At runtime the user dir's shims at /home/leerie/.local/share/mise/shims
 # don't appear here because they're added by `mise activate` or by
 # wrapping commands with `mise exec --` — both of which the

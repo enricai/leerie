@@ -29,7 +29,8 @@ opening a PR that touches more than a single layer.
 ```bash
 git clone https://github.com/enricai/leerie.git
 cd leerie
-pip install pytest         # the only dev (host-side) dependency
+pip install -r requirements.txt   # runtime deps — the test suite imports them
+pip install pytest jsonschema     # pytest is the only dev (host-side) dependency
 ./leerie --version           # smoke-check; uses the launcher's fast path —
                            # does NOT require the container runtime, so
                            # it works on a fresh clone with no Colima.
@@ -39,7 +40,10 @@ Running leerie against a real task (`./leerie "..."` rather than `--version`)
 requires the container runtime to be installed and started — see
 [`docs/INSTALL.md`](docs/INSTALL.md). Iterating on
 `orchestrator/leerie.py` and running `pytest tests/` is possible without
-it; the test suite runs on the host Python.
+it; the test suite runs on the host Python. Because it imports the
+orchestrator directly, the pinned runtime deps in `requirements.txt` must
+be installed on that host Python as well — `pytest` is the only *dev*
+dependency, not the only dependency the suite needs.
 
 There is no `pyproject.toml`; contributors develop out of the checkout.
 End-users get a one-command install via the Claude Code plugin marketplace
