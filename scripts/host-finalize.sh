@@ -181,6 +181,34 @@ host_finalize() {
     return 0
   fi
 
+  # Empty-run-branch guard (DESIGN §6 *Finalization*). Refuse to push a run
+  # branch that has no commits beyond the working branch — pushing it and
+  # then calling `gh pr create` fails with "No commits between <base> and
+  # <branch>", the exact failure this guard exists to convert into an
+  # actionable message. `finalize.sh` (the in-container finalize) already
+  # has this check, but a run that reached the host push path with an
+  # un-integrated branch (e.g. via a died in-container finalize that the
+  # resume completion guard mistook for success) never re-ran it — so the
+  # host push path needs its own copy as defense in depth. The base is the
+  # working branch (the diff fork-point), matching finalize.sh; when the
+  # working branch is unresolvable, skip the check rather than block a push.
+  if [ -n "$working_branch" ] && \
+     git -C "$USER_REPO" rev-parse --verify "refs/heads/$working_branch" >/dev/null 2>&1; then
+    local _ahead
+    _ahead="$(git -C "$USER_REPO" rev-list --count "$working_branch..$run_branch" 2>/dev/null || echo 0)"
+    if [ "$_ahead" = "0" ]; then
+      _host_finalize_update_run_json "$run_json" \
+        "push_error=run branch $run_branch has no commits beyond $working_branch — nothing to push"
+      echo "leerie: error: run branch \`$run_branch\` has no commits beyond \`$working_branch\` — refusing to push an empty branch." >&2
+      echo "  This usually means the run's waves were never integrated into the run branch." >&2
+      echo "  The per-subtask work (if any) is on the leerie/subtasks/<run-id>/* branches." >&2
+      echo "  Inspect and recover:" >&2
+      echo "    git -C $USER_REPO branch --list 'leerie/subtasks/*'" >&2
+      echo "    git -C $USER_REPO log --oneline $working_branch..$run_branch" >&2
+      return 1
+    fi
+  fi
+
   # Note the re-push (DESIGN §6 *Finalization*). If pushed_at is set and we
   # reached here, the early short-circuit above already ruled out both the
   # equal-tips no-op AND the diverged-origin case — so origin is a strict

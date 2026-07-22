@@ -63,3 +63,55 @@ def test_phase_finalize_has_completion_gate(leerie):
     assert gate_pos < finalize_pos, (
         "the completion gate must fire before run_script('finalize.sh')"
     )
+
+
+def test_current_phase_stamped_after_finalize_sh_succeeds(leerie):
+    """Fix (empty-run-branch finalize): phase_finalize must stamp
+    current_phase="phase 6: finalize" ONLY AFTER finalize.sh returns 0,
+    never before it.
+
+    Root cause it guards: `die()` on a finalize.sh failure sets
+    `finished_at` via main()'s `except SystemExit` handler. If
+    current_phase were stamped on phase entry (before finalize.sh), a
+    *died* finalize would leave state byte-identical to a *succeeded* one
+    (finished_at set AND current_phase == "phase 6: finalize"), and the
+    --resume completion guard in _run_phases would declare the run
+    "already completed" and hand the host launcher an empty run branch to
+    push — which then fails at `gh pr create` with "No commits between …".
+
+    Stamping AFTER the finalize.sh success check keeps a died finalize
+    resumable: current_phase stays at its pre-finalize value, the resume
+    guard falls through, and --resume re-runs finalize.sh's non-empty
+    check. This test pins the ordering by source position."""
+    src = inspect.getsource(leerie.phase_finalize)
+    finalize_call = src.index('run_script("finalize.sh"')
+    stamp = src.index('st.data["current_phase"] = "phase 6: finalize"')
+    assert finalize_call < stamp, (
+        'phase_finalize must set current_phase="phase 6: finalize" AFTER '
+        'the run_script("finalize.sh") call, not before it. Stamping before '
+        "makes a died finalize indistinguishable from a successful one to "
+        "the --resume completion guard, which then pushes an empty branch."
+    )
+    # And specifically after the die-on-nonzero check, so a nonzero
+    # finalize.sh never reaches the stamp.
+    die_check = src.index('finalize failed (run branch is intact)')
+    assert die_check < stamp, (
+        "the current_phase stamp must come after the "
+        "'finalize failed (run branch is intact)' die() guard, so a "
+        "nonzero finalize.sh exits before current_phase is stamped."
+    )
+
+
+def test_resume_completion_guard_keys_on_current_phase(leerie):
+    """The --resume completion guard (in _run_phases) treats a run as
+    terminal when finished_at is set AND current_phase == "phase 6:
+    finalize". This test pins that the guard reads current_phase — the
+    discriminator the Fix-1 ordering change relies on. If the guard stopped
+    consulting current_phase, the ordering fix would be silently defeated."""
+    src = inspect.getsource(leerie._run_phases)
+    assert '"phase 6: finalize"' in src and "finished_at" in src, (
+        "the resume completion guard must key on finished_at AND "
+        'current_phase == "phase 6: finalize"; the Fix-1 ordering change '
+        "depends on current_phase distinguishing a died finalize from a "
+        "successful one."
+    )

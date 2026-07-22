@@ -736,3 +736,121 @@ def test_gate_fails_open_without_state_json(tmp_path):
     assert "refusing to finalize" not in r.stderr
     after = json.loads((run_dir / "run.json").read_text())
     assert after.get("pushed_at") is not None
+
+
+# --- empty-run-branch guard (defense-in-depth for the un-integrated-branch
+#     class: a died in-container finalize.sh that the resume completion guard
+#     mistook for success handed the host push path an empty run branch, which
+#     then failed at `gh pr create` with "No commits between …") -------------
+
+def _empty_branch_git_body(ahead_count: str) -> str:
+    """git stub: rev-parse --verify succeeds (both branches exist), and
+    `rev-list --count <base>..<run>` echoes `ahead_count`. Everything else
+    (ls-remote absent origin, push) succeeds so a non-empty branch reaches
+    the push path."""
+    return f'''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-list" ]; then
+  echo "{ahead_count}"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  exit 2   # origin absent → treated as behind → push path
+fi
+exit 0
+'''
+
+
+def test_refuses_empty_run_branch(tmp_path):
+    """Run branch exists locally but has ZERO commits beyond working_branch
+    (integration never ran). host_finalize must REFUSE to push (return 1),
+    record a push_error, and NOT invoke `git push` — converting the
+    downstream `gh pr create` "No commits between …" failure into an
+    actionable message at the cheapest moment."""
+    run_dir = _make_run(
+        tmp_path, "empty-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/empty-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-22T15:06:17+00:00",
+        },
+    )
+    r = _run_host_finalize(
+        tmp_path, run_dir, git_body=_empty_branch_git_body("0"))
+    assert r.returncode == 1, r.stderr
+    assert "no commits beyond" in r.stderr
+    # No `git push` fired.
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any("push" in line.split() for line in git_log.splitlines())
+    assert not push_invoked, git_log
+    # A push_error was recorded for the operator.
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("push_error"), after
+    assert "no commits beyond" in after["push_error"]
+
+
+def test_non_empty_run_branch_still_pushes(tmp_path):
+    """Control: a run branch WITH commits beyond working_branch (rev-list
+    count 3) passes the empty-branch guard and reaches the push path. Proves
+    the guard does not over-block a legitimate run."""
+    run_dir = _make_run(
+        tmp_path, "full-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/full-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-22T15:06:17+00:00",
+        },
+    )
+    r = _run_host_finalize(
+        tmp_path, run_dir, git_body=_empty_branch_git_body("3"))
+    assert r.returncode == 0, r.stderr
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any("push" in line.split() for line in git_log.splitlines())
+    assert push_invoked, git_log
+
+
+def test_empty_branch_guard_skipped_when_base_ref_missing_locally(tmp_path):
+    """When the working branch ref is not present locally, the guard is
+    SKIPPED (not blocking) — it must never block a push over an
+    unresolvable base, mirroring finalize.sh's fail-open posture. Here the
+    run-branch `rev-parse --verify` succeeds but the working-branch one
+    fails, so the rev-list guard is bypassed and the push path runs."""
+    run_dir = _make_run(
+        tmp_path, "nobase-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/nobase-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-22T15:06:17+00:00",
+        },
+    )
+    # rev-parse --verify succeeds for the run branch but FAILS for the
+    # working branch (only the run-branch ref resolves); rev-list would say
+    # 0 if reached, but the guard is gated on the working-branch ref
+    # resolving and must not run.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  case "$5" in
+    *"refs/heads/main") exit 1 ;;      # base ref missing locally
+    *) exit 0 ;;                        # run branch resolves
+  esac
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-list" ]; then
+  echo "0"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  exit 2
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any("push" in line.split() for line in git_log.splitlines())
+    assert push_invoked, git_log

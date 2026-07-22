@@ -18941,8 +18941,24 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # Integrate successful subtasks BEFORE dying on failures
         # (DESIGN §3 *Partial-wave integration*). integrate_wave already
         # filters for status=="complete", so passing the full wave is safe.
+        #
+        # Distinct phase stamp so the memory sampler / --report can tell
+        # "settling implementers" from "merging branches into the run
+        # branch." Until this stamp, current_phase stayed "phase 4-5:
+        # implementing" across both, so a silently-skipped integration
+        # (an empty run branch reaching finalize — the class this whole
+        # change addresses) left no observable trace in state.json.
+        st.data["current_phase"] = f"phase 5: integrating wave {wi + 1}"
+        st.save()
+        expected = sum(1 for r in results.values()
+                       if r.get("status") == "complete")
         integrated = await integrate_wave(
             wave, results, leerie_dir, caps, st, models, efforts)
+        # Surface the integrated count against what was eligible. A
+        # divergence (integrated < expected with no die() above) is the
+        # visible signature of a silent integration skip.
+        log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
+            f"{expected} completed subtask(s)")
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
@@ -19528,11 +19544,23 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if isinstance(waves, list) and completed < len(waves):
         die(f"refusing to finalize: only {completed} of {len(waves)} waves "
             f"complete. Resume to finish: leerie --resume {st.run_id}")
-    st.data["current_phase"] = "phase 6: finalize"
-    st.save()
     proc = await run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
+    # Stamp the finalize phase ONLY after finalize.sh confirms the run
+    # branch is non-empty. The `die()` above sets `finished_at` via the
+    # SystemExit handler for fetch_branch discovery; if `current_phase`
+    # were stamped *before* finalize.sh (as it was until this fix), a
+    # died finalize would leave state byte-identical to a successful one
+    # — `finished_at` + `current_phase == "phase 6: finalize"` — and the
+    # `--resume` completion guard (in _run_phases) would declare the run
+    # "already completed" and hand the host launcher an empty run branch
+    # to push (which then fails at `gh pr create` with "No commits between
+    # ..."). Stamping here keeps a died finalize resumable: `current_phase`
+    # stays at its pre-finalize value, the resume guard falls through, and
+    # `--resume` re-enters finalize to re-run finalize.sh's non-empty check.
+    st.data["current_phase"] = "phase 6: finalize"
+    st.save()
     await run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
     # Post-cleanup verification: the run branch must survive cleanup.
     # finalize.sh verified it existed moments ago; if it's gone after
