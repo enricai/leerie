@@ -3727,7 +3727,7 @@ export IS_RESUME
 # also take values; cover them with a prefix match.
 LEERIE_TASK_ARG=""
 _prev=""
-_value_flags=" --run-id --answers --pr-template --max-workers \
+_value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
 --worker-pids-max --source-of-truth --runtime --aws-region --aws-profile \
 --inspect-dir --model --effort \
