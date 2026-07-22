@@ -6466,7 +6466,8 @@ discovery without parsing the full `state.json`):
 |-------|-------|-------|
 | `run_id` | str | the run identifier (matches the directory name and the branch suffix) |
 | `branch` | str | the run branch — always `leerie/runs/<run_id>` |
-| `working_branch` | str | the branch HEAD-at-run-start; used as the PR base (leerie does not merge into it locally) |
+| `working_branch` | str | the branch HEAD-at-run-start; the diff fork-point (leerie does not merge into it locally). Also the PR base by default — see `pr_base_branch` below for the override. |
+| `pr_base_branch` | str | the final branch this run's PR merges into; defaults to `working_branch`, overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (see "PR base branch override" above). `scripts/host-finalize.sh` reads this field for `gh pr create --base`, falling back to `working_branch` when absent (a run finalized before this field existed). |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
 | `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success on the normal path; also set by the `except SystemExit` handler in `main()` for `die()` exits that fire after the run directory exists (on Fly, the tail wrapper propagates the orchestrator's exit code via `orchestrator.exit_code` when present, falling back to 0 when absent; either way `fetch_branch`'s discovery script needs `finished_at` to find the run). Idempotent on `--resume` — `phase_finalize` overwrites it with the real completion time if the run succeeds on retry. |
 | `task` | str | the task description (mirrored from `state.json`) |
