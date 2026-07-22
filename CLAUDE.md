@@ -383,6 +383,12 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
 ./leerie "task" --pr-template feature
 
+# Override the final branch this run's PR merges into (default:
+# working_branch — the diff fork-point is unaffected and stays
+# working_branch regardless of this override). Also LEERIE_PR_BASE_BRANCH
+# or `pr_base_branch` in leerie.toml.
+./leerie "task" --pr-base-branch release/1.0
+
 # Override the model for the finalize-time PR-writer worker (default sonnet).
 # Also LEERIE_MODEL_PR_WRITER or `model_pr_writer` in leerie.toml.
 ./leerie "task" --pr-writer-model opus
