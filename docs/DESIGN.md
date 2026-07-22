@@ -1425,8 +1425,7 @@ release branch) without changing where the run's diff is computed from.
 splitting the two roles avoids corrupting the diff base if the override
 branch isn't the actual point the run forked from. The PR title and body
 are written by an LLM worker (`pr_writer`, defaults to Sonnet) that runs
-inside the
-container right before it exits — placed there because that is where
+inside the container right before it exits — placed there because that is where
 `claude -p` is available and where the bind-mounted user repo is
 readable. The worker reads the target repo's PR template if one
 exists (canonical GitHub locations: `.github/pull_request_template.md`,
@@ -1483,8 +1482,10 @@ not pretend the run failed: the local work is intact and reachable on the
 run branch. The orchestrator records what was attempted and what failed in
 a per-run sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`,
 `pr_error`). Push failure exits non-zero with a multi-line message that
-names the run branch (where the work lives) and the working branch
-(unchanged from run start, but the intended PR base), shows the captured
+names the run branch (where the work lives), the working branch
+(unchanged from run start — the diff fork-point), and the PR base branch
+(`pr_base_branch`, which defaults to `working_branch` — see
+`docs/IMPLEMENTATION.md` "PR base branch override"), shows the captured
 stderr, and gives the exact retry command. PR-creation failure is treated
 as non-fatal: the push has already succeeded, so the user receives a
 warning with the GitHub URL of the pushed branch and the exact `gh pr
