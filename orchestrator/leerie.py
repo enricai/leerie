@@ -323,6 +323,14 @@ STATE_FIELDS = (
     # readers (pr_writer payload, run_final_conformance's DIFF_BASE)
     # do not have to re-query git or re-read run.json.
     "working_branch",
+    # pr_base_branch: the final branch this run's PR merges into. Defaults
+    # to working_branch when the user does not override it via
+    # --pr-base-branch / LEERIE_PR_BASE_BRANCH / leerie.toml. This is the
+    # PR base ONLY — never the diff fork-point, which stays working_branch
+    # (rev_range = working_branch..run_branch; final-conformance DIFF_BASE).
+    # Overloading working_branch for both roles would corrupt the diff
+    # base if the override branch isn't the actual fork point.
+    "pr_base_branch",
     # leerie_version: the version string from .claude-plugin/plugin.json at
     # the time the run started (or resumed). Persisted so the PR footer can
     # show the exact version that produced the run, which aids debugging.
@@ -703,6 +711,16 @@ SKIP_SATISFIED_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # LEERIE_PR_TEMPLATE env → pr_template in leerie.toml → None.
 PR_TEMPLATE_ENV = "LEERIE_PR_TEMPLATE"
 PR_TEMPLATE_FILE = SOURCE_OF_TRUTH_FILE
+
+# --pr-base-branch override — the final branch the run's PR merges into.
+# Distinct from `working_branch` (the user's branch at run start), which
+# stays the diff fork-point (`working_branch..run_branch`) and must never
+# be overloaded to also mean "PR base" — see STATE_FIELDS comment near
+# working_branch. Resolution order: --pr-base-branch CLI flag →
+# LEERIE_PR_BASE_BRANCH env → pr_base_branch in leerie.toml → (defaults to
+# working_branch at the run-start call site, once working_branch is known).
+PR_BASE_BRANCH_ENV = "LEERIE_PR_BASE_BRANCH"
+PR_BASE_BRANCH_FILE = SOURCE_OF_TRUTH_FILE
 
 # Verbosity — see IMPLEMENTATION.md §2 "Verbosity". Four levels with
 # stackable -v/-q shortcuts following the clig.dev / cargo / kubectl
@@ -3525,6 +3543,23 @@ def resolve_pr_template(repo_root: Path,
         repo_root, cli_value,
         env_var=PR_TEMPLATE_ENV, file_key="pr_template",
         file_name=PR_TEMPLATE_FILE, default=None)
+
+
+def resolve_pr_base_branch(repo_root: Path,
+                           cli_value: str | None = None) -> str | None:
+    """Resolve the --pr-base-branch override — the final branch the run's
+    PR merges into. Order: --pr-base-branch CLI flag →
+    LEERIE_PR_BASE_BRANCH env → pr_base_branch in leerie.toml → None.
+    Returns None when unset; the run-start call site falls back to
+    `working_branch` once that value is known (git HEAD isn't read until
+    then). No validation against an enum since the branch name is
+    free-form (depends on the target repo). Distinct from
+    `working_branch`, which stays the diff fork-point — do not conflate
+    the two."""
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=PR_BASE_BRANCH_ENV, file_key="pr_base_branch",
+        file_name=PR_BASE_BRANCH_FILE, default=None)
 
 
 def resolve_aws_region(repo_root: Path,
@@ -19756,20 +19791,26 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await phase_classify(task, st, caps, args.clarify, models, efforts)
         log(f"run id: {st.run_id}")
         # Initialize run.json with the immutable run-identity fields
-        # (run_id, branch, working_branch, started_at, task) so
-        # `leerie --list` can enumerate this run from the moment
+        # (run_id, branch, working_branch, pr_base_branch, started_at,
+        # task) so `leerie --list` can enumerate this run from the moment
         # it has a stable identity — not only after finalize.
         head_proc = await run_proc(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"])
         working_branch = (head_proc.stdout.strip()
                           if head_proc.returncode == 0 else "")
         st.data["working_branch"] = working_branch
+        # pr_base_branch defaults to working_branch when unset — the PR
+        # base only, never the diff fork-point (which stays
+        # working_branch; see STATE_FIELDS comment).
+        pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
+        st.data["pr_base_branch"] = pr_base_branch
         st.save()
         _write_run_json(
             st.run_dir,
             run_id=st.run_id,
             branch=compute_run_branch(st.run_id),
             working_branch=working_branch,
+            pr_base_branch=pr_base_branch,
             started_at=st.data["started_at"],
             task=task,
             **({"group_id": args.group_id} if args.group_id else {}),
@@ -20003,6 +20044,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          ".md. Also "
                          f"{PR_TEMPLATE_ENV} env var or pr_template in "
                          "leerie.toml.")
+    ap.add_argument("--pr-base-branch", metavar="BRANCH",
+                    help="override the final branch this run's PR merges "
+                         "into (passed to `gh pr create --base`). Default: "
+                         "working_branch (the branch checked out when the "
+                         "run started) — the diff fork-point used to "
+                         "compute the PR diff is unaffected by this flag "
+                         "and always stays working_branch. Also "
+                         f"{PR_BASE_BRANCH_ENV} env var or pr_base_branch "
+                         "in leerie.toml.")
     ap.add_argument("--dangerously-skip-permissions", action="store_true",
                     help="DANGEROUS: pass --dangerously-skip-permissions "
                          "to EVERY claude -p worker — including the "
@@ -20472,6 +20522,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # PULL_REQUEST_TEMPLATE/" (the discovery helper's default).
     args.pr_template = resolve_pr_template(
         repo_root, getattr(args, "pr_template", None))
+
+    # Resolve --pr-base-branch: free-form string (no enum), None when
+    # unset. The default-to-working_branch fallback happens at the
+    # run-start call site (working_branch isn't known until git HEAD is
+    # read there), not here.
+    args.pr_base_branch = resolve_pr_base_branch(
+        repo_root, getattr(args, "pr_base_branch", None))
 
     # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
     # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
