@@ -279,3 +279,46 @@ def test_stat_reports_oom_kill_count(leerie, monkeypatch):
     # memory OOM*), mirroring pids.events.max's role for fork denial.
     _stub_broker(leerie, monkeypatch, "OK 10 1024 0 2")
     assert leerie._cgroup_stat("feat-001") == (10, 1024, 0, 2)
+
+
+# ---- run-scoped cgroup sid (DESIGN §6 *Memory containment*, run-scoped
+#      cgroup name) — concurrent runs sharing one VM's leerie.slice/ must
+#      not collide on a bare worker sid, else one run's destroy
+#      (v2 cgroup.kill) SIGKILLs another run's worker leader. ---------------
+
+def test_worker_sid_prefixes_with_run_id(leerie):
+    """A run id yields `<run-id[:12]>-<sid>` so two runs' same-named workers
+    map to distinct cgroups."""
+    run = "279400a6d7d79916565abba313a4df0ec9fdd8b91b7fbf73872ad475ec898c8c"
+    assert leerie._cgroup_worker_sid(run, "classifier") == \
+        "279400a6d7d7-classifier"
+
+
+def test_worker_sid_none_run_id_is_bare(leerie):
+    """No run context (e.g. tests / callers without a run) → bare sid,
+    preserving the pre-run-scope name."""
+    assert leerie._cgroup_worker_sid(None, "classifier") == "classifier"
+    assert leerie._cgroup_worker_sid("", "classifier") == "classifier"
+
+
+def test_worker_sid_distinct_across_concurrent_runs(leerie):
+    """The load-bearing property: the same worker sid in two different runs
+    produces two DIFFERENT cgroup names — so one run's cgroup.kill cannot
+    reach the other run's worker. This is the regression that reproduced as
+    the stackpulse/summarizer classifier collision."""
+    a = leerie._cgroup_worker_sid("aaaaaaaaaaaa1111", "classifier")
+    b = leerie._cgroup_worker_sid("bbbbbbbbbbbb2222", "classifier")
+    assert a != b
+    assert a == "aaaaaaaaaaaa-classifier"
+    assert b == "bbbbbbbbbbbb-classifier"
+
+
+def test_worker_sid_passes_broker_validation(leerie):
+    """The composed sid must satisfy the broker's `^[A-Za-z0-9._-]+$` and
+    carry no `..` — else create is rejected and the worker runs uncapped."""
+    import re
+    _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+    scoped = leerie._cgroup_worker_sid(
+        "279400a6d7d79916565abba313a4df0ec9fdd8b91b7fbf73872ad475ec898c8c",
+        "fit-judge-docs-001-d0")
+    assert _SID_RE.match(scoped) and ".." not in scoped

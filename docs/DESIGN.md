@@ -1899,6 +1899,33 @@ in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
 
+**The per-worker cgroup name is run-scoped.** The child cgroup is
+`leerie-w-<run-id-prefix>-<sid>`, not a bare `leerie-w-<sid>`. This is
+load-bearing whenever two runs execute concurrently on the *same* VM,
+which is the common case on Colima: the launcher passes `--cgroupns=host`
+(required — see below — so the broker can enroll worker PIDs into
+`leerie.slice/`), so every concurrent container's workers live in the
+**same physical `leerie.slice/` tree**. Worker `sid`s alone are not
+unique across runs — a phase-1 `sid="classifier"` (and `sid="smoke"`,
+and every conformer/judge `sid`) repeats identically in every run. Absent
+the run-id prefix, two runs both in phase 1 create, enroll into, and tear
+down the *same* `leerie.slice/leerie-w-classifier` cgroup. Teardown on
+cgroup v2 is `cgroup.kill=1` (the broker's `destroy`), which SIGKILLs
+*every* process enrolled in that cgroup — so run B finishing its
+classifier SIGKILLs run A's still-running classifier `claude -p` leader
+mid-stream. The victim leader exits `-9` with no `result` event, no
+`dmesg`/journald record (a `cgroup.kill` is a userspace write, not a
+kernel OOM), and is indistinguishable from a bare crash; leerie's
+`_run_checked_loop` retries it, so it self-heals but wastes the killed
+attempt. Prefixing the cgroup name with a run-id discriminator makes each
+run's worker cgroups unreachable by any other run's teardown. (Reproduced
+live: run `stackpulse`'s classifier leader died at the exact second run
+`summarizer`'s classifier tore down the shared `leerie-w-classifier`.)
+`--cgroupns=private` — which *would* give each container its own
+`leerie.slice` — is not an option: it breaks the broker's cross-scope PID
+enrollment (see the `--cgroupns=host` requirement below), so the name
+must carry the run identity instead.
+
 The per-worker cap must hold **both** the build/test subprocess tree
 *and* the resident `claude -p` process at the same time — `claude`
 stays alive running the build via Bash and streaming its output, so

@@ -300,6 +300,58 @@ def test_invoke_overage_block_with_result_returns_envelope(
     assert result["structured_output"] == {"ok": True}
 
 
+def test_invoke_returns_envelope_despite_nonzero_returncode(
+        leerie, leerie_dir, monkeypatch):
+    """A genuine success `result` event was captured, THEN the process exits
+    nonzero (`-9`/SIGKILL). `_invoke` must RETURN the captured envelope, not
+    raise — `proc.returncode` is only consulted inside the `envelope is None`
+    gate. This is the classifier-collision incident's would-be happy path: if
+    the worker's result had landed a moment before the cross-run cgroup.kill
+    (DESIGN §6 *Memory containment*, run-scoped cgroup name), the run uses it
+    and skips the retry. Every OTHER nonzero-rc test in this file pairs the rc
+    with a *truncated, no-result* stream, so this case (good result + nonzero
+    rc) was previously unpinned — a refactor adding a returncode check outside
+    the gate would silently break it. (Verified non-vacuous against a mutant
+    that raised on this input during the investigation.)"""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 6,
+                    "total_cost_usd": 0.13,
+                    "structured_output": {"categories": ["documentation"]},
+                    "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=-9))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="classifier", leerie_dir=leerie_dir,
+        verbosity="stream"))
+    assert result["subtype"] == "success"
+    assert result["structured_output"] == {"categories": ["documentation"]}
+
+
+def test_invoke_result_then_tasknotification_plus_nonzero_rc(
+        leerie, leerie_dir, monkeypatch):
+    """Genuine result, then a `task-notification` result (which the guard
+    skips), then a nonzero returncode → still returns the genuine envelope.
+    Pins that the task-notification skip and the return-despite-rc contract
+    hold together."""
+    events = [
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 6,
+                    "structured_output": {"ok": True}, "is_error": False}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "origin": {"kind": "task-notification"},
+                    "structured_output": None, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=-9))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="classifier", leerie_dir=leerie_dir,
+        verbosity="stream"))
+    assert result["structured_output"] == {"ok": True}
+
+
 # ----- per-worker log file --------------------------------------------------
 
 def test_log_file_written_at_stream(leerie, leerie_dir, monkeypatch):

@@ -9206,12 +9206,41 @@ def _cgroup_probe() -> bool:
     return False
 
 
+def _cgroup_worker_sid(run_id: str | None, sid: str) -> str:
+    """Compose the run-scoped cgroup sid handed to the broker.
+
+    The broker names the cgroup `leerie-w-<sid>` under the shared VM slice
+    `leerie.slice/`. With `--cgroupns=host` (required so the broker can
+    enroll worker PIDs — DESIGN §6), every concurrent run's containers share
+    that one physical slice, so a bare worker `sid` (`"classifier"`,
+    `"smoke"`, every conformer/judge sid — none are unique across runs) would
+    make two concurrent runs create/enroll/destroy the *same* cgroup. Since
+    v2 `destroy` is `cgroup.kill=1` (SIGKILLs every enrolled process), one
+    run's teardown would then SIGKILL another run's worker `claude -p` leader
+    mid-stream (reproduced live: DESIGN §6 *Memory containment*, run-scoped
+    cgroup name). Prefixing with a run-id discriminator makes each run's
+    worker cgroups unreachable by any other run's teardown.
+
+    `run_id` may be None (callers with no run context, e.g. tests) — then the
+    bare sid is returned, preserving the pre-run-scope name. The 12-char
+    prefix mirrors the existing `call_id[:8]` short-id idiom and stays well
+    within the broker's `^[A-Za-z0-9._-]+$` validation (run ids are container
+    hex or already-slugged strings)."""
+    if not run_id:
+        return sid
+    return f"{run_id[:12]}-{sid}"
+
+
 def _cgroup_create(sid: str, memory_max_bytes: int,
                    pids_max: int) -> str | None:
     """Ask the broker to create a worker cgroup and set its caps. Returns
     the sid on success (the handle passed to `_cgroup_enroll`/
     `_cgroup_destroy`), None on any failure. Idempotent — re-spawning a
-    worker with the same sid re-writes the caps."""
+    worker with the same sid re-writes the caps.
+
+    `sid` here is the run-scoped cgroup sid (see `_cgroup_worker_sid`), not
+    the bare worker sid — so the same worker type in two concurrent runs
+    maps to two distinct cgroups."""
     if not _cgroup_probe():
         return None
     try:
@@ -9346,7 +9375,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   idle_warn_sec: float | None = None,
                   worker_memory_max_bytes: int | None = None,
                   worker_pids_max: int | None = None,
-                  stdin_data: str | None = None) -> dict:
+                  stdin_data: str | None = None,
+                  run_id: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -9445,10 +9475,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # returns None / False and the worker runs without its own sub-cgroup
     # — the cgroup path NEVER aborts the worker (telemetry that crashes its
     # host is worse than no telemetry, same principle as _memory_sampler).
+    # Run-scope the cgroup name so concurrent runs sharing this VM's
+    # leerie.slice/ (the --cgroupns=host case) cannot collide on a bare
+    # worker sid — a bare name lets one run's `destroy` (v2 cgroup.kill)
+    # SIGKILL another run's worker leader mid-stream (DESIGN §6 *Memory
+    # containment*, run-scoped cgroup name). `run_id` is None for callers
+    # with no run context (the smoke test never enters this block anyway,
+    # since it passes no memory/pids caps).
     cgroup_sid: str | None = None
     if (worker_memory_max_bytes is not None
             and worker_pids_max is not None):
-        cgroup_sid = _cgroup_create(sid, worker_memory_max_bytes,
+        cgroup_sid = _cgroup_create(_cgroup_worker_sid(run_id, sid),
+                                    worker_memory_max_bytes,
                                     worker_pids_max)
         if cgroup_sid is not None:
             _cgroup_enroll(cgroup_sid, proc.pid)
@@ -10419,7 +10457,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          "worker_memory_max_bytes"),
                                      worker_pids_max=caps.get(
                                          "worker_pids_max",
-                                         DEFAULT_CAPS["worker_pids_max"]))
+                                         DEFAULT_CAPS["worker_pids_max"]),
+                                     run_id=st.run_id)
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
