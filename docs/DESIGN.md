@@ -1579,7 +1579,9 @@ the 8h token even when a user had gone to the trouble of minting a
 durable one. A user who has set nothing is unaffected: resolution falls
 back to Keychain, then the file, exactly as before. The emitted JSON
 shape is unchanged regardless of which branch resolved the credential
-(`{"claudeAiOauth":{"accessToken":…}}`), matching what `seed-auth.sh`
+(`{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — the
+`scopes` field is required by the CLI's file-auth path, which rejects a
+scope-less blob as "Not logged in"), matching what `seed-auth.sh`
 already stages into the container's `~/.claude/.credentials.json`.
 
 **The expiry preflight is best-effort, not a hard gate.** Before staging

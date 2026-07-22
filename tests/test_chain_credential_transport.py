@@ -156,7 +156,7 @@ def test_env_var_wins_over_keychain_and_file(tmp_path: Path) -> None:
         stub_security_returns='{"claudeAiOauth":{"accessToken":"sk-fresh-keychain"}}',
     )
     assert rc == 0
-    assert out == '{"claudeAiOauth":{"accessToken":"sk-env"}}'
+    assert out == '{"claudeAiOauth":{"accessToken":"sk-env","scopes":["user:inference"]}}'
     assert "sk-stale-disk" not in out
     assert "sk-fresh-keychain" not in out
 

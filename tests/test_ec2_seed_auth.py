@@ -367,7 +367,12 @@ def test_ec2_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     assert creds_path.exists(), f"credentials file not written; landed: {list((dest/'home'/'leerie').rglob('*'))}"
     import json
     payload = json.loads(creds_path.read_text())
-    assert payload == {"claudeAiOauth": {"accessToken": "my-oauth-token"}}
+    # The scopes field is mandatory — CLI 2.1.210's file-auth path rejects a
+    # scope-less blob with "Not logged in" (must match leerie's synthesized
+    # shape in _extract_claude_credentials_json).
+    assert payload == {
+        "claudeAiOauth": {"accessToken": "my-oauth-token", "scopes": ["user:inference"]}
+    }
 
 
 def test_ec2_seed_auth_plugin_cache_and_marketplaces_not_re_excluded_by_tar(tmp_path):

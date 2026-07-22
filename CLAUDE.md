@@ -1785,10 +1785,27 @@ the Keychain branch is `uname -s = Darwin`-only), wins over the file
 alone on non-Darwin, the emitted JSON shape matches what `seed-auth.sh`
 independently constructs for a bare `CLAUDE_CODE_OAUTH_TOKEN` (the printf
 format string is extracted from `seed-auth.sh` at test time via regex
-rather than hand-copied, so the two sites can't silently diverge — same
-discipline as `test_no_result_event_retry.py`), Keychain still wins over
+rather than hand-copied, so `leerie`'s synthesized shape and
+`seed-auth.sh`'s fallback can't silently diverge — same discipline as
+`test_no_result_event_retry.py`), Keychain still wins over
 the file when the env var is unset (the pre-inversion fallback order is
-unchanged), and no credential anywhere yields a clean rc 1. The paired
+unchanged), and no credential anywhere yields a clean rc 1. The
+synthesized blob's mandatory `scopes:["user:inference"]` field (CLI
+2.1.210's file-auth path rejects a scope-less
+`{claudeAiOauth.accessToken}` blob as "Not logged in · Please run
+/login" — measured by field-ablation against the real image;
+`refreshToken`/`expiresAt` are not required, only this scope) is pinned
+at all three synthesized sites — `leerie` by executing the awk-extracted
+helper (`_invoke_helper`), `seed-auth.sh` / `ec2-seed-auth.sh` by
+regex-extracting their printf format strings — and asserted
+byte-identical across the three; and the always-forward
+`-e CLAUDE_CODE_OAUTH_TOKEN` container injection (the env-var auth path
+is permissive and long-lived, so it survives a headless run past a
+copied file blob's `expiresAt` — a copied blob cannot refresh,
+anthropics/claude-code#21765) is source-coupled to sit *before* the
+credential-resolve `if`/`else`, not in the resolve-failure `else` arm
+where it was previously unreachable when the token staged into the file.
+The paired
 best-effort expiry preflight, `_check_claude_credential_ttl` (staged
 before writing a resolved *subscription* credential into the container;
 a no-op for the exempt long-lived-token path, which carries no

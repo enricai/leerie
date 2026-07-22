@@ -69,8 +69,10 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # a worker. Single source of truth for "where do creds live on this
 # host": $CLAUDE_CODE_OAUTH_TOKEN env var first — a long-lived (1-year)
 # token minted by `claude setup-token`, in which case we synthesize the
-# minimal {claudeAiOauth.accessToken} JSON shape that the CLI reads on
-# Linux (same shape seed-auth.sh constructs in its fallback path); then
+# {claudeAiOauth.accessToken + scopes:["user:inference"]} JSON shape that
+# the CLI reads on Linux (the scopes field is mandatory — see the inline
+# note at the printf; same shape seed-auth.sh constructs in its fallback
+# path); then
 # macOS Keychain (service "Claude Code-credentials"); final fall back is
 # ~/.claude/.credentials.json on disk.
 #
@@ -98,7 +100,13 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 _extract_claude_credentials_json() {
   local creds=""
   if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    creds="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
+    # The "scopes":["user:inference"] field is load-bearing: CLI 2.1.210's
+    # file-auth path rejects a blob whose scopes do not include
+    # "user:inference" with "Not logged in · Please run /login", even with a
+    # valid accessToken. A bare {claudeAiOauth.accessToken} blob (no scopes)
+    # is NOT accepted from the file. Measured by field-ablation against the
+    # real image; refreshToken/expiresAt are not required, only this scope.
+    creds="$(printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"]}}' \
                     "$CLAUDE_CODE_OAUTH_TOKEN")"
   fi
   if [ -z "$creds" ] && [ "$(uname -s)" = "Darwin" ]; then
@@ -5435,8 +5443,23 @@ fi
 # `security find-generic-password -w` succeeds silently when the
 # caller is in the user's login session (which `./leerie` always is);
 # outside that (SSH-without-tty, daemons) it would prompt or fail.
-# Best-effort: if extraction fails, fall back to the legacy
-# CLAUDE_CODE_OAUTH_TOKEN env-var bridge so workers still authenticate.
+# Best-effort: if extraction fails and no token env var is set, the Darwin
+# hint in the `else` arm below points the user at the fix.
+#
+# A resolved CLAUDE_CODE_OAUTH_TOKEN must ALSO reach the container as an env
+# var, not only via the staged .credentials.json file. Two reasons: (1) the
+# env-var path hits the CLI's permissive inference-token auth, which never
+# expires the way a copied file blob does (a file blob is only valid to its
+# expiresAt, ~24h, and a container cannot refresh it — anthropics/claude-code
+# #21765; the long-lived setup-token env var is the one that survives a long
+# headless run — DESIGN §6); (2) it is defense-in-depth for the file-blob
+# scopes requirement handled in _extract_claude_credentials_json above.
+# This fires WHENEVER the token is set, independent of which credential branch
+# resolves below — it previously lived only in the `else` arm and was
+# unreachable when the token successfully staged into the file.
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+fi
 if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
    && [ -n "$_CLAUDE_CREDS_JSON" ]; then
   _check_claude_credential_ttl "$_CLAUDE_CREDS_JSON" || exit 1
@@ -5445,9 +5468,7 @@ if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
   unset _CLAUDE_CREDS_JSON
 else
   rm -f "$STAGE/.claude/.credentials.json"
-  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-  elif [ "$OS" = "Darwin" ]; then
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ "$OS" = "Darwin" ]; then
     remote_log "note — could not extract Claude credentials from Keychain."
     echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
     echo "  Keychain access (the prompt that pops up the first time)." >&2

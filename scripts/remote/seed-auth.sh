@@ -216,11 +216,15 @@ seed_auth() {
   # directly to the machine so `claude -p` can authenticate.
   #
   # The file format mirrors what the macOS Keychain stores and what the Linux
-  # CLI reads: {"claudeAiOauth":{"accessToken":"..."}}.
+  # CLI reads: {"claudeAiOauth":{"accessToken":"...","scopes":["user:inference"]}}.
+  # The scopes field is mandatory — CLI 2.1.210's file-auth path rejects a
+  # scope-less blob with "Not logged in" (measured against the real image);
+  # only "user:inference" satisfies it. Must match leerie's synthesized shape
+  # in _extract_claude_credentials_json.
   if [ ! -s "$STAGE/.claude/.credentials.json" ] && \
      [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     local creds_json
-    creds_json="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
+    creds_json="$(printf '{"claudeAiOauth":{"accessToken":"%s","scopes":["user:inference"]}}' \
                          "$CLAUDE_CODE_OAUTH_TOKEN")"
     # Pipe the small creds JSON through ssh console (same mechanism as
     # the tar-pipe above; the cert was already issued by the
