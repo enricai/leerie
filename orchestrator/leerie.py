@@ -148,7 +148,8 @@ DEFAULT_CAPS = {
     # enrolled (by the cgroup broker — see scripts/cgroup-broker.py and
     # DESIGN §6, because the dropped-privilege orchestrator can't enroll
     # workers or set controller limits itself) in its own child
-    # cgroup `leerie-w-<sid>` under leerie.slice on both runtimes, and the
+    # cgroup `leerie-w-<sid>` (run-scoped; see _cgroup_worker_sid) under
+    # leerie.slice on both runtimes, and the
     # broker sets the cgroup's memory.max to this value. When a worker's tool
     # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
     # the cap, the kernel OOM-kills inside the cgroup — sshd / pid 1 /
@@ -9127,7 +9128,8 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # --- cgroup containment for worker subtrees (via the cgroup broker) ------
 # Each `claude -p` worker (and every descendant it forks: bash children,
 # vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
-# cgroup `leerie-w-<sid>`. The cgroup's memory.max and pids.max bound how
+# cgroup `leerie-w-<sid>` (run-scoped; see _cgroup_worker_sid). The
+# cgroup's memory.max and pids.max bound how
 # much RAM / how many PIDs the worker subtree may consume. When it exceeds
 # memory.max the kernel OOM-kills inside that cgroup; when it exceeds
 # pids.max further fork/clone in the subtree gets EAGAIN — sshd / pid 1 /
@@ -9224,8 +9226,11 @@ def _cgroup_worker_sid(run_id: str | None, sid: str) -> str:
     `run_id` may be None (callers with no run context, e.g. tests) — then the
     bare sid is returned, preserving the pre-run-scope name. The 12-char
     prefix mirrors the existing `call_id[:8]` short-id idiom and stays well
-    within the broker's `^[A-Za-z0-9._-]+$` validation (run ids are container
-    hex or already-slugged strings)."""
+    within the broker's `^[A-Za-z0-9._-]+$` validation: live run ids are
+    container/machine ids (nerdctl 64-hex cid, Fly machine id, EC2 `i-...`
+    instance id) or the literal `"replay"` — all hex/instance-id grammar,
+    no `..`, no leading `-`/`.`. The launcher requires `--run-id` and
+    `resolve_run_id` never synthesizes one, so no unsafe value reaches here."""
     if not run_id:
         return sid
     return f"{run_id[:12]}-{sid}"
