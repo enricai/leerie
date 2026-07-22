@@ -2246,6 +2246,26 @@ An override that does not match an existing template is **not fatal** —
 finalize must not block over a cosmetic preference — leerie logs a
 warning and falls back to the alphabetical default.
 
+### PR base branch override
+
+The final branch a run's PR merges into defaults to `working_branch`
+(the branch checked out when the run started). This is distinct from
+the diff fork-point, which always stays `working_branch` regardless of
+this override — overloading `working_branch` for both roles would
+corrupt the diff base if the override branch weren't the actual fork
+point.
+
+Resolution order (highest priority first), via `resolve_pr_base_branch`
+(mirrors `resolve_pr_template`'s `_resolve_str_pref` delegation):
+
+1. **`--pr-base-branch BRANCH`** CLI flag.
+2. **`LEERIE_PR_BASE_BRANCH`** environment variable.
+3. **`leerie.toml`**, `pr_base_branch = "release/1.0"`.
+4. **Default**: `working_branch`.
+
+The resolved value is written to `state.json` and `run.json` as
+`pr_base_branch`, alongside the unmodified `working_branch`.
+
 ### PR-writer payload caps
 
 The `pr_writer` worker is invoked with its entire user prompt (task
@@ -6542,6 +6562,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
+| `pr_base_branch` | str | the final branch this run's PR merges into — overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (resolved by `resolve_pr_base_branch`, CLI > env > file precedence, mirroring `resolve_pr_template`). Defaults to `working_branch` when unset (`resolve_pr_base_branch(...) or working_branch`, computed once at run start alongside `working_branch`). Mirrored to `run.json.pr_base_branch`. This is the PR base ONLY — never the diff fork-point, which stays `working_branch` (`rev_range = working_branch..run_branch`; `run_final_conformance`'s `DIFF_BASE`); overloading `working_branch` for both roles would corrupt the diff base if the override branch isn't the actual fork point. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json` at the time the run started (or resumed). Persisted so the PR footer and Run metadata block can show the exact version that produced the run, which aids debugging when a run was produced by an older release. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. Combined with the sibling sentinel file `<run_dir>/dep_capture.done`, this makes the next-run backstop idempotent: the backstop skips runs whose sentinel file is present, and the cancel-arm capture skips already-captured runs. Absent on runs where capture was skipped or has not yet run. |
 
