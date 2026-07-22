@@ -1416,8 +1416,16 @@ PR body is replaced by the deterministic fallback.
 
 The run branch is pushed to `origin` and a pull request is opened
 via `gh pr create` against the working branch (the branch
-HEAD-at-run-start). The PR title and body are written by an LLM
-worker (`pr_writer`, defaults to Sonnet) that runs inside the
+HEAD-at-run-start) by default. **This PR base is overridable** —
+`--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in
+`leerie.toml` lets the user merge into a different final branch (e.g. a
+release branch) without changing where the run's diff is computed from.
+`working_branch` always remains the diff fork-point
+(`rev_range = working_branch..run_branch`) regardless of this override —
+splitting the two roles avoids corrupting the diff base if the override
+branch isn't the actual point the run forked from. The PR title and body
+are written by an LLM worker (`pr_writer`, defaults to Sonnet) that runs
+inside the
 container right before it exits — placed there because that is where
 `claude -p` is available and where the bind-mounted user repo is
 readable. The worker reads the target repo's PR template if one
