@@ -148,7 +148,7 @@ host_finalize() {
     esac
   fi
 
-  local run_id run_branch working_branch
+  local run_id run_branch working_branch pr_base_branch
   run_id="$(basename "$run_dir")"
   run_branch="$(jq -r '.branch // ""' "$run_json")"
   working_branch="$(jq -r '.working_branch // ""' "$run_json")"
@@ -157,6 +157,16 @@ host_finalize() {
     echo "  Skipping push + PR. Push the run branch manually if it exists." >&2
     return 1
   fi
+
+  # pr_base_branch (IMPLEMENTATION.md "PR base branch override") is the
+  # actual PR base; working_branch stays the diff fork-point regardless.
+  # Falls back to working_branch when absent — older runs finalized before
+  # this field existed, or a run where no override was given (the
+  # orchestrator itself defaults pr_base_branch to working_branch at run
+  # start, so this fallback is mostly a defense-in-depth for pre-existing
+  # run.json files rather than something a fresh run ever hits).
+  pr_base_branch="$(jq -r '.pr_base_branch // ""' "$run_json")"
+  [ -z "$pr_base_branch" ] && pr_base_branch="$working_branch"
 
   # Defense-in-depth: a run branch named in run.json that does not
   # exist locally cannot be pushed. This shape is legitimate for the
@@ -196,7 +206,8 @@ host_finalize() {
     echo "leerie: error: git push failed for branch \`$run_branch\`." >&2
     echo "  Local state is intact:" >&2
     echo "    - run branch:     $run_branch (holds all wave merges)" >&2
-    echo "    - working branch: $working_branch (unchanged from run start; the intended PR base)" >&2
+    echo "    - working branch: $working_branch (unchanged from run start)" >&2
+    echo "    - PR base branch: $pr_base_branch (intended PR base)" >&2
     echo "  Resolve and retry manually:" >&2
     echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
     echo "  Push stderr was:" >&2
@@ -321,22 +332,23 @@ EOF
     fi
   fi
 
-  # The working_branch recorded at run start may no longer exist on
-  # origin — e.g. a stacked run whose parent was squash-merged (and
-  # branch-deleted) while this run was in flight. Detect and fall back
-  # to the repo's default branch so `gh pr create` doesn't 404.
-  local original_working_branch="$working_branch"
-  if ! git -C "$USER_REPO" ls-remote --exit-code --heads origin "$working_branch" >/dev/null 2>&1; then
+  # The resolved PR base (pr_base_branch, or working_branch when no
+  # override) may no longer exist on origin — e.g. a stacked run whose
+  # parent was squash-merged (and branch-deleted) while this run was in
+  # flight, or an overridden base that was renamed/removed. Detect and
+  # fall back to the repo's default branch so `gh pr create` doesn't 404.
+  local original_pr_base_branch="$pr_base_branch"
+  if ! git -C "$USER_REPO" ls-remote --exit-code --heads origin "$pr_base_branch" >/dev/null 2>&1; then
     local default_branch
     default_branch="$(git -C "$USER_REPO" remote show origin 2>/dev/null \
                        | sed -n 's/.*HEAD branch: //p')"
     if [ -n "$default_branch" ]; then
-      echo "[leerie] finalize: base branch $working_branch no longer exists on origin; falling back to $default_branch" >&2
-      working_branch="$default_branch"
+      echo "[leerie] finalize: base branch $pr_base_branch no longer exists on origin; falling back to $default_branch" >&2
+      pr_base_branch="$default_branch"
     fi
   fi
 
-  echo "[leerie] finalize: opening PR against $working_branch" >&2
+  echo "[leerie] finalize: opening PR against $pr_base_branch" >&2
   local pr_output pr_ok=false
   # GitHub's API may not have indexed the freshly-pushed refs yet;
   # retry with backoff to ride out the race (symptom: "Head sha
@@ -350,7 +362,7 @@ EOF
       sleep "$_pr_delay"
     }
     if pr_output="$(echo "$pr_body" | gh pr create \
-                      --base "$working_branch" \
+                      --base "$pr_base_branch" \
                       --head "$run_branch" \
                       --title "$pr_title" \
                       --body-file - 2>&1)"; then
@@ -364,12 +376,12 @@ EOF
       "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
     echo "⚠  \`gh pr create\` failed; branch was pushed successfully." >&2
     echo "  Pushed branch: $run_branch (on origin)" >&2
-    if [ "$working_branch" != "$original_working_branch" ]; then
-      echo "  (base branch $original_working_branch was already deleted from origin;" >&2
-      echo "   tried fallback to $working_branch, which also failed)" >&2
+    if [ "$pr_base_branch" != "$original_pr_base_branch" ]; then
+      echo "  (base branch $original_pr_base_branch was already deleted from origin;" >&2
+      echo "   tried fallback to $pr_base_branch, which also failed)" >&2
     fi
     echo "  Open the PR manually:" >&2
-    echo "    gh pr create --base $working_branch --head $run_branch" >&2
+    echo "    gh pr create --base $pr_base_branch --head $run_branch" >&2
     echo "  Or via the GitHub web UI for the repo." >&2
     echo "  gh stderr was:" >&2
     printf '    %s\n' "$pr_output" >&2
