@@ -1902,14 +1902,21 @@ prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
 
 **The per-worker cgroup name is run-scoped.** The child cgroup is
-`leerie-w-<run-id-prefix>-<sid>`, not a bare `leerie-w-<sid>`. This is
+`leerie-w-<run-id-prefix>-<sid>`, not a bare `leerie-w-<sid>`. The
+prefix is the first 12 hex chars of the run id (the container/machine
+id) — ~48 bits, so the probability two concurrent runs share a prefix
+*and* run the same worker sid at overlapping times is negligible (≪
+1e-9 at any realistic concurrency; only local Colima runs share a slice
+at all — Fly/EC2 give each run its own VM). This is
 load-bearing whenever two runs execute concurrently on the *same* VM,
 which is the common case on Colima: the launcher passes `--cgroupns=host`
 (required — see below — so the broker can enroll worker PIDs into
 `leerie.slice/`), so every concurrent container's workers live in the
 **same physical `leerie.slice/` tree**. Worker `sid`s alone are not
-unique across runs — a phase-1 `sid="classifier"` (and `sid="smoke"`,
-and every conformer/judge `sid`) repeats identically in every run. Absent
+unique across runs — a phase-1 `sid="classifier"`, and every
+conformer/judge `sid` (which repeats identically across two concurrent
+runs of the *same* task, e.g. a multi-repo fan-out), collide by name.
+Absent
 the run-id prefix, two runs both in phase 1 create, enroll into, and tear
 down the *same* `leerie.slice/leerie-w-classifier` cgroup. Teardown on
 cgroup v2 is `cgroup.kill=1` (the broker's `destroy`), which SIGKILLs

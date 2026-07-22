@@ -26,7 +26,21 @@ requires a real cgroup hierarchy the test host lacks.
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import pytest
+
+
+def _load_broker():
+    """Load scripts/cgroup-broker.py as a module (same technique as
+    tests/test_cgroup_broker.py) so tests can call its real `_valid_sid`
+    rather than re-declaring the sid regex — a drift-proof coupling."""
+    path = Path(__file__).resolve().parent.parent / "scripts" / "cgroup-broker.py"
+    spec = importlib.util.spec_from_file_location("cgroup_broker", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 @pytest.fixture(autouse=True)
@@ -314,11 +328,11 @@ def test_worker_sid_distinct_across_concurrent_runs(leerie):
 
 
 def test_worker_sid_passes_broker_validation(leerie):
-    """The composed sid must satisfy the broker's `^[A-Za-z0-9._-]+$` and
-    carry no `..` — else create is rejected and the worker runs uncapped."""
-    import re
-    _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+    """The composed sid must satisfy the broker's OWN `_valid_sid` — else
+    create is rejected and the worker runs uncapped. Coupled to the live
+    broker (not a copied regex) so it can't drift if `_SID_RE` changes."""
+    broker = _load_broker()
     scoped = leerie._cgroup_worker_sid(
         "279400a6d7d79916565abba313a4df0ec9fdd8b91b7fbf73872ad475ec898c8c",
         "fit-judge-docs-001-d0")
-    assert _SID_RE.match(scoped) and ".." not in scoped
+    assert broker._valid_sid(scoped)

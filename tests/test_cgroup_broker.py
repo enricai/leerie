@@ -282,6 +282,39 @@ def test_probe_robust_when_child_already_reaped(broker, monkeypatch):
     assert resp == "OK v2"
 
 
+def test_probe_sid_is_run_scoped_and_distinct_per_call(broker, monkeypatch):
+    """The probe cgroup name must carry a per-probe random suffix, so two
+    concurrent containers' probes never share `leerie-w-PROBE` under the
+    same VM slice (the --cgroupns=host case) — the same cross-run collision
+    class the run-scoped worker cgroup name fixes. Assert (a) the sid matches
+    `PROBE-<8hex>` and passes `_valid_sid`, and (b) two probe calls use two
+    DIFFERENT sids (a bare `PROBE` would fail (b))."""
+    import re
+
+    seen: list[str] = []
+    real_do = broker._do
+
+    def recording_do(verb, args):
+        if verb == "create":
+            seen.append(args[0])
+        return real_do(verb, args)
+
+    monkeypatch.setattr(broker, "_do", recording_do)
+    # Avoid a real fork/kill in this control-flow test.
+    monkeypatch.setattr(broker.os, "fork", lambda: 999999)
+    monkeypatch.setattr(broker.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(broker.os, "waitpid", lambda pid, opts: (pid, 0))
+
+    assert broker._handle("probe") == "OK v2"
+    assert broker._handle("probe") == "OK v2"
+
+    assert len(seen) == 2
+    for sid in seen:
+        assert re.fullmatch(r"PROBE-[0-9a-f]{8}", sid), sid
+        assert broker._valid_sid(sid)
+    assert seen[0] != seen[1], "probe sids must differ across calls"
+
+
 # ---- rootless: LEERIE_CGROUP_V2_ROOT (systemd-delegated user slice) -------
 #
 # DESIGN §6 *Rootless exception*: rootlesskit maps container "root" to the

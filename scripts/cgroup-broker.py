@@ -324,7 +324,16 @@ def _handle(line: str) -> str:
     if verb == "probe":
         # End-to-end round-trip on a throwaway sid: the true test of the
         # path workers use (create + enroll a real pid + destroy).
-        sid = "PROBE"
+        # Per-probe random suffix so two concurrent containers' startup
+        # probes never share `leerie-w-PROBE` under the same VM slice
+        # (the --cgroupns=host case). Without it, one container's probe
+        # `destroy` (v2 cgroup.kill) could SIGKILL another's probe child
+        # or rmdir its cgroup mid-probe — the same cross-run collision
+        # class the run-scoped worker cgroup name fixes (see leerie.py
+        # `_cgroup_worker_sid`). os.urandom is unique regardless of PID
+        # namespace (a container's PIDs reset from 1, so a PID suffix
+        # would not be); `PROBE-<8hex>` passes `_valid_sid`.
+        sid = f"PROBE-{os.urandom(4).hex()}"
         try:
             child = os.fork()
             if child == 0:  # noqa: SIM115 — child just idles until killed
