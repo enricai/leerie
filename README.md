@@ -360,6 +360,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
 | `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
 | `--pr-template NAME` | none | When the target repo has multiple PR templates in `PULL_REQUEST_TEMPLATE/`, pick this one by basename (with or without `.md`). Also `LEERIE_PR_TEMPLATE` or `pr_template` in `leerie.toml`. |
+| `--pr-base-branch BRANCH` | `working_branch` | Override the final branch this run's PR merges into (passed to `gh pr create --base`). The diff fork-point used to compute the PR diff is unaffected and always stays `working_branch`. Also `LEERIE_PR_BASE_BRANCH` or `pr_base_branch` in `leerie.toml`. |
 | `--pr-writer-model ALIAS` | `sonnet` | Model alias for the finalize-time PR title + body writer. Also `LEERIE_MODEL_PR_WRITER` or `model_pr_writer` in `leerie.toml`. |
 
 ### Launcher verbs
@@ -438,6 +439,7 @@ details and sub-flags.
 | `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
 | `LEERIE_SKIP_REPO_MAP` | `skip_repo_map` | Skip the P6 repo-map structural context injection (truthy → skip). Overridden by `--skip-repo-map`. Unset → default `false`. |
 | `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
+| `LEERIE_PR_BASE_BRANCH` | `pr_base_branch` | Final branch this run's PR merges into. Overridden by `--pr-base-branch`. Unset → default `working_branch`. |
 | `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
 | `LEERIE_MODEL_DEP_CAPTURE` | *(none)* | Model alias for the finalize-time dep_capture worker. Env var only — no per-worker CLI flag and no `leerie.toml` key (it still honors the global `model` key / `--model`). Unset → default `opus`. |
 | `LEERIE_CAPTURE_DEPS` | `capture_deps` (`.leerie/config.toml` only — not `leerie.toml`) | Enable finalize-time dependency capture (truthy → on). Precedence: `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` > default `true`. Set to `false` / `0` to disable entirely. |
