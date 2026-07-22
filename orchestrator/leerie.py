@@ -42,6 +42,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # tenacity is imported lazily inside claude_p() (its sole use site), not at
@@ -1681,6 +1682,82 @@ def log(msg: str) -> None:
 def die(msg: str, code: int = 1):
     print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
+
+
+class _TeeStream:
+    """Mirror every write to the original stream AND a log file, flushing
+    per write so a crash still leaves a complete trail on disk.
+
+    Used to persist the orchestrator's own stdout/stderr to
+    `<run_dir>/orchestrator.log` on the local runtime (DESIGN §6). The Fly/
+    EC2 paths already redirect the orchestrator's fd1 to that file via
+    `Popen(stdout=log_f)`, so `_install_run_log_tee` skips installing this
+    there (an inode check) to avoid double-writing. Attribute access falls
+    through to the original stream so `.fileno()`, `.isatty()`, `.encoding`,
+    etc. keep working for callers that introspect stdout."""
+
+    def __init__(self, orig: TextIO, logf: TextIO) -> None:
+        self._orig = orig
+        self._logf = logf
+
+    def write(self, s: str) -> int:
+        n = self._orig.write(s)
+        try:
+            self._logf.write(s)
+            self._logf.flush()
+        except (OSError, ValueError):
+            # Log file unwritable mid-run (disk full, run_dir removed): never
+            # let persistence break the real stream. Terminal output survives.
+            pass
+        self._orig.flush()
+        return n
+
+    def flush(self) -> None:
+        self._orig.flush()
+        with contextlib.suppress(OSError, ValueError):
+            self._logf.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._orig, name)
+
+
+def _stdout_already_targets(path: Path) -> bool:
+    """True if the current `sys.stdout` fd already points at `path` (same
+    device+inode). On the remote runtime the launcher redirects the
+    orchestrator's stdout straight to `<run_dir>/orchestrator.log`, so an
+    in-process tee to the same path would double-write every line. Returns
+    False when it cannot tell (e.g. stdout is a pipe — the local case, where
+    the tee SHOULD be installed), so the check fails toward persisting."""
+    try:
+        st_out = os.fstat(sys.stdout.fileno())
+        st_tgt = path.stat()
+        return (st_out.st_dev, st_out.st_ino) == (st_tgt.st_dev, st_tgt.st_ino)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _install_run_log_tee(run_dir: Path) -> None:
+    """Persist the orchestrator's stdout+stderr to `<run_dir>/orchestrator.log`
+    for the lifetime of the process (DESIGN §6 *Finalization* — the local
+    runtime otherwise has no state-dir copy of the orchestrator's own phase
+    logs, so an abnormal exit or a `tee`d client that loses the stream leaves
+    them unrecoverable; run 26fd0fa5's `leerie.log` was 0 bytes for exactly
+    this reason, which is why its integration-skip could not be diagnosed).
+
+    No-op when stdout already IS that file (the remote runtime, which
+    redirects fd1 to `orchestrator.log` itself — see `_stdout_already_targets`).
+    Best-effort: any failure to open the log leaves the streams untouched so a
+    logging problem never blocks a run."""
+    log_path = run_dir / "orchestrator.log"
+    if _stdout_already_targets(log_path):
+        return
+    try:
+        logf = log_path.open("a", buffering=1)  # line-buffered; lives for the run
+    except OSError as e:
+        log(f"could not open {log_path} for the run log (non-fatal): {e}")
+        return
+    sys.stdout = _TeeStream(sys.stdout, logf)
+    sys.stderr = _TeeStream(sys.stderr, logf)
 
 
 class InterruptedBySignal(BaseException):
@@ -18981,6 +19058,35 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
                 f"See {st.path}; resolve and re-run with --resume.")
 
+        # Integration-integrity gate (DESIGN §6: "the completion signal is
+        # completed_waves == len(waves)"). A wave must not be counted
+        # complete unless every subtask that settled `complete` was actually
+        # merged into the run branch. `integrate_wave` appends a sid to
+        # `integrated` on every path that processes it (rc 0 — including a
+        # zero-commit satisfied-rescue subtask, whose `git merge --no-ff` is
+        # a rc-0 "Already up to date"), and every other path die()s or
+        # resolves-via-integrator, so under correct operation
+        # len(integrated) == expected. A silent shortfall here — the class
+        # that let an empty run branch reach finalize (run 26fd0fa5: 10
+        # complete, 0 integrated, no failure) — must halt the run resumably
+        # rather than advance `completed_waves` onto an un-integrated wave.
+        # `blocked` is already empty at this point (the guard above die()s
+        # otherwise), so a shortfall here is a genuine invisible skip, not a
+        # reported failure. No `blocked` entry is recorded: `--resume` retries
+        # this wave via `completed_waves` (which the gate leaves un-advanced),
+        # not via reading `blocked`, and no consumer reads a wave-level blocked
+        # key — the die() message is the complete diagnostic. (Contrast the
+        # per-sid `blocked[sid]` writes elsewhere, which the resume retry does
+        # consume and which are cleared per-sid on that subtask's completion.)
+        if len(integrated) != expected:
+            die(f"wave {wi + 1}: integration integrity check failed — only "
+                f"{len(integrated)} of {expected} completed subtask(s) reached "
+                f"the run branch. The wave settled with no failures but "
+                f"integration silently skipped {expected - len(integrated)} "
+                f"subtask(s); refusing to advance onto an un-integrated wave. "
+                f"The subtask work is on the leerie/subtasks/{st.run_id}/* "
+                f"branches; re-run with --resume to retry integration.")
+
         st.data["completed_waves"] = wi + 1
         st.save()
 
@@ -20454,6 +20560,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         sys.exit(EXIT_LOCKED)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # Persist the orchestrator's own stdout/stderr to
+    # <run_dir>/orchestrator.log now that the run dir exists (DESIGN §6).
+    # No-op on the remote runtime (stdout is already that file); on local it
+    # captures the phase logs — including the phase-5 wave/integration lines —
+    # so an abnormal exit or a client that loses the piped stream still leaves
+    # a diagnosable trail (the gap that made run 26fd0fa5 undiagnosable).
+    _install_run_log_tee(st.run_dir)
 
     # Resolve source-of-truth and per-worker model preferences once per run.
     # Both die() on a bad value so typos in leerie.toml or env vars are

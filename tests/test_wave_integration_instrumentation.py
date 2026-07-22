@@ -52,3 +52,59 @@ def test_phase_execute_logs_integrated_count_vs_expected(leerie):
         'phase_execute must log "integrated N of M completed subtask(s)" '
         "after integrate_wave so a silent skip (N < M) is visible."
     )
+
+
+# --- Fix 4: integration-integrity gate ------------------------------------
+# The instrumentation (above) makes a silent integration skip *observable*.
+# The gate below makes it *fatal-and-resumable*: a wave that settles with no
+# failures but whose integrate_wave merged fewer subtasks than settled
+# complete must die() rather than advance completed_waves onto an
+# un-integrated wave (run 26fd0fa5: 10 complete, 0 integrated, no failure,
+# reached finalize with an empty run branch).
+
+
+def test_phase_execute_has_integration_integrity_gate(leerie):
+    """phase_execute must die() when len(integrated) != expected."""
+    src = inspect.getsource(leerie.phase_execute)
+    assert "len(integrated) != expected" in src, (
+        "phase_execute must gate on len(integrated) != expected after "
+        "integrate_wave, so a silent integration shortfall halts the run "
+        "instead of advancing completed_waves onto an un-integrated wave."
+    )
+    assert "integration integrity check failed" in src, (
+        "the integrity gate must die() with an 'integration integrity check "
+        "failed' message naming the integrated/expected counts."
+    )
+
+
+def test_integrity_gate_precedes_completed_waves_increment(leerie):
+    """The gate must fire BEFORE completed_waves is advanced — otherwise the
+    wave is already counted complete and the DESIGN §6 completion signal
+    (completed_waves == len(waves)) would certify an un-integrated wave."""
+    src = inspect.getsource(leerie.phase_execute)
+    gate = src.index("len(integrated) != expected")
+    # phase_execute has TWO `completed_waves = wi + 1` assignments: the
+    # `remaining`-empty skip branch (which never integrates and is earlier in
+    # the source) and the end-of-loop one the gate must precede. Anchor on
+    # the LAST occurrence — the post-integration increment.
+    bump = src.rindex('st.data["completed_waves"] = wi + 1')
+    assert gate < bump, (
+        "the integration-integrity gate must precede the post-integration "
+        "completed_waves increment, so a shortfall halts the run before the "
+        "wave is counted."
+    )
+
+
+def test_integrity_gate_die_points_at_resume(leerie):
+    """The gate's die() must be resumable — name --resume and the subtask
+    branches, since the per-subtask work survives on
+    leerie/subtasks/<run-id>/* and --resume retries integration."""
+    src = inspect.getsource(leerie.phase_execute)
+    gate_region = src[src.index("len(integrated) != expected"):]
+    assert "--resume" in gate_region, (
+        "the integrity gate die() must point the operator at --resume."
+    )
+    assert "leerie/subtasks/" in gate_region, (
+        "the integrity gate die() must name the subtask branches where the "
+        "un-integrated work survives."
+    )
