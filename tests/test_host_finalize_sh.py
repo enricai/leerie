@@ -419,6 +419,88 @@ def test_pr_failure_is_non_fatal(tmp_path):
     assert "simulated gh failure" in after["pr_error"]
 
 
+# --- pr_base_branch as the PR base (PR base branch override) --------------
+
+def test_gh_pr_create_uses_pr_base_branch_when_set(tmp_path):
+    """run.json carries pr_base_branch → `gh pr create` is invoked with
+    `--base <pr_base_branch>`, not `--base <working_branch>`."""
+    run_dir = _make_run(tmp_path, "feat-ovr-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-ovr-aaaaaa",
+        "working_branch": "main",
+        "pr_base_branch": "release/1.0",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert "--base release/1.0" in gh_log, gh_log
+    assert "--base main" not in gh_log, gh_log
+    assert "opening PR against release/1.0" in r.stderr
+
+
+def test_gh_pr_create_falls_back_to_working_branch_when_pr_base_branch_absent(tmp_path):
+    """run.json has no pr_base_branch field (older run, pre-override) →
+    `gh pr create` falls back to `--base <working_branch>` — no behavior
+    change for existing runs."""
+    run_dir = _make_run(tmp_path, "feat-old-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-old-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert "--base main" in gh_log, gh_log
+    assert "opening PR against main" in r.stderr
+
+
+def test_gh_pr_create_falls_back_to_working_branch_when_pr_base_branch_empty(tmp_path):
+    """run.json has pr_base_branch set to an empty string (defensive: the
+    same treat-as-absent handling as working_branch/branch elsewhere in
+    this script) → falls back to working_branch."""
+    run_dir = _make_run(tmp_path, "feat-emp-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-emp-aaaaaa",
+        "working_branch": "main",
+        "pr_base_branch": "",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert "--base main" in gh_log, gh_log
+
+
+def test_origin_nonexistence_fallback_applies_to_pr_base_branch(tmp_path):
+    """The default-branch fallback (when the resolved base no longer
+    exists on origin) still fires, and it operates on the resolved
+    pr_base_branch override, not the raw working_branch."""
+    run_dir = _make_run(tmp_path, "feat-gone-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-gone-aaaaaa",
+        "working_branch": "main",
+        "pr_base_branch": "release/1.0",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    # git stub: `ls-remote --exit-code --heads origin release/1.0` fails
+    # (branch deleted from origin); `remote show origin` reports `main`
+    # as the default branch.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  exit 1
+fi
+if [ "$1" = "-C" ] && [ "$3" = "remote" ] && [ "$4" = "show" ]; then
+  echo "  HEAD branch: main"
+  exit 0
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    assert "base branch release/1.0 no longer exists on origin; falling back to main" in r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert "--base main" in gh_log, gh_log
+    assert "opening PR against main" in r.stderr
+
+
 # --- deploy-ordering note in the LLM-less fallback (DESIGN §20) -----------
 
 def _run_host_finalize_capturing_body(
