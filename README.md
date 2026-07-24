@@ -339,7 +339,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--ec2-subnet-id VALUE` | none (required for `--runtime ec2`) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var or `ec2_subnet_id` in `leerie.toml`. |
 | `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
-| `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
+| `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `high`; acting workers — implementer, conformer: inherit Claude default) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift). IMPLEMENTATION.md §2 "Effort selection". |
 | `--effort-<worker> LEVEL` | per-worker default (judgment workers → `high`; acting workers → inherit Claude default) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
 | `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill. Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
@@ -418,7 +418,7 @@ details and sub-flags.
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`. Unset → `implementer`, `conformer`, and `satisfied_probe` → `sonnet`; everything else → `opus`. |
+| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Unset → `implementer`, `conformer`, and `satisfied_probe` → `sonnet`; everything else → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `high`, acting workers inherit Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `high`; acting workers (implementer, conformer) inherit Claude default. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
@@ -493,7 +493,7 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Leerie spawns eleven kinds of `claude -p` worker. Each is a separate
+Leerie spawns twelve kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
 | Worker | Prompt source | Default model | Runs per task | Returns |
@@ -509,6 +509,7 @@ subprocess; there is no in-session agent nesting.
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
 | `fit_judge` | `prompts/fit_judge.md` | opus | 0 or more per subtask (P1 recursive decomposition — one per `recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §5½ (P1) |
 | `splitter` | `prompts/splitter.md` | opus | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §5½ (P1) |
+| `adherence_judge` | `prompts/adherence_judge.md` | opus | registered worker (schema/prompt/model+effort defaults); gate wiring — the `claude_p()` invocation and its position in the planner check loop — is separate, undelivered scope | plan-instruction-adherence score: `{user_prescribed_a_procedure, instruction_adherence (0–10), violations[], rationale}` |
 
 Additionally, two post-run workers run outside the main orchestrate loop and are not in `WORKER_TYPES`:
 
@@ -516,8 +517,8 @@ Additionally, two post-run workers run outside the main orchestrate loop and are
 - `dep_capture` (`prompts/dep_capture.md`, default opus) runs at finalize (and on `--recapture` / next-run backstop) — it reads worker logs, decides what the repo needs across all languages, and writes `setup_packages` / `language_installs` to `.leerie/config.toml`. Overridable via `LEERIE_MODEL_DEP_CAPTURE`. See DESIGN §6½.
 
 **Per-worker model defaults:** judgment workers (classifier, planner,
-reconciler, plan_overlap_judge, provision, integrator, fit_judge, splitter)
-default to Opus; the acting workers (implementer, conformer) and
+reconciler, plan_overlap_judge, provision, integrator, fit_judge, splitter,
+adherence_judge) default to Opus; the acting workers (implementer, conformer) and
 `satisfied_probe` default to Sonnet — their job is concrete subtask
 execution or lightweight per-subtask probing where throughput matters more
 than broad-context judgment. To revert to the all-Sonnet pattern of earlier
@@ -607,6 +608,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
 | `prompts/fit_judge.md` | System prompt: P1 Task-Context Fit scorer — judges whether a subtask's scope and context are co-minimized (DESIGN §5½ (P1)); calibrated to 0.70 threshold |
 | `prompts/splitter.md` | System prompt: P1 structural splitter — labels pre-partitioned migration chunks or emits structural seams for the coupled-minority case (DESIGN §5½ (P1)) |
+| `prompts/adherence_judge.md` | System prompt: plan-instruction-adherence gate — scores whether a plan obeys a user-prescribed procedure (ADHERENCE, not comprehension); opus-only, empirically calibrated |
 | `prompts/config_chat.md` | System prompt: interactive `leerie config --chat` session — reads the repo's CI config and manifests, generates `.leerie/config.toml` and optionally `.leerie/Dockerfile` |
 | `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
 | `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |

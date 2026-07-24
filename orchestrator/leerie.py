@@ -799,11 +799,12 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "dep_capture": "high",
     "fit_judge": "high",
     "splitter": "high",
+    "adherence_judge": "high",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
-                "conformer", "fit_judge", "splitter")
+                "conformer", "fit_judge", "splitter", "adherence_judge")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1696,6 +1697,53 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+        },
+    },
+    "adherence_judge": {
+        # Output of the instruction-adherence gate's semantic judge (see the
+        # plan-time gate architecture note: "instruction-adherence is
+        # code-enforced" — sibling to §12 "prompts advisory, code enforces").
+        # Catches "plan substitutes manual work for the prescribed process"
+        # cases the deterministic command-coverage floor can't see, because
+        # the floor only sees literal command tokens, not paraphrased
+        # substitution.
+        #
+        # EMPIRICALLY CALIBRATED on opus (the production judgment model —
+        # sonnet and an "understanding"-framed judge were both falsified;
+        # see prompts/adherence_judge.md for the full calibration writeup):
+        # incident plan (prescribed-and-violated) scored 2.5/2.5/2.5;
+        # goal-only legit plan scored 9.0/9.0/9.0. Clean separation, no
+        # false positive, on the ADHERENCE frame + opus model combination
+        # only — do not run this worker on sonnet.
+        #
+        # Deliberately carries NO _confidence_schema sub-object (unlike
+        # fit_judge): the §8 evidence-gate discipline (falsifiers,
+        # contradictions, gap_to_close) is designed for iterative
+        # implementer/planner self-assessment: this worker is itself the
+        # independent check that replaces a self-report, so a nested
+        # self-confidence axis would reintroduce the self-grading bias the
+        # gate exists to remove.
+        "type": "object",
+        "required": ["user_prescribed_a_procedure", "instruction_adherence",
+                     "violations", "rationale"],
+        "properties": {
+            # Did the user's task prose prescribe an explicit procedure /
+            # command sequence (vs. a goal-only "implement X" ask)? Mirrors
+            # the classifier's prescribed_procedure.is_prescribed signal but
+            # is independently re-derived here from the plan + task, not
+            # copied from the classifier's own output.
+            "user_prescribed_a_procedure": {"type": "boolean"},
+            # 0–10 instruction-adherence score. Calibration: goal-only task
+            # (no prescribed procedure to violate) => >= 8.5. A plan that
+            # substitutes manual/hand-authored work for an explicitly
+            # prescribed procedure => <= 3.
+            "instruction_adherence": {"type": "number", "minimum": 0,
+                                       "maximum": 10},
+            # Each violation: which prescribed step/command was
+            # circumvented and how the plan substituted for it.
+            "violations": {"type": "array", "items": {"type": "string"}},
+            # Human-readable explanation of the score.
+            "rationale": {"type": "string"},
         },
     },
 }

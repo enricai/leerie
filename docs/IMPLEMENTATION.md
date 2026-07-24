@@ -2415,13 +2415,14 @@ pr_writer) — default to Sonnet.
 | dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
 | fit_judge    | opus    | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 | splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| adherence_judge | opus | plan-instruction-adherence scoring is judgment; empirically falsified on sonnet (false-positives on legitimate plans) and on an opus *understanding*-framed judge (rubber-stamps a plan that disobeys a prescribed procedure while still reflecting correct comprehension) — only the ADHERENCE frame + opus model combination is validated; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `heal`,
 `pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture`, `fit_judge`, `splitter`, and `judge` are **absent** from
-`MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from the global
-`MODEL_DEFAULT` fallback.
+`dep_capture`, `fit_judge`, `splitter`, `judge`, and `adherence_judge` are
+**absent** from `MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from
+the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2434,7 +2435,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Fifteen worker types (plus the global override), each independently overridable:
+Sixteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2450,6 +2451,7 @@ Fifteen worker types (plus the global override), each independently overridable:
 | conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
 | fit_judge          | `LEERIE_MODEL_FIT_JUDGE`        | `--model-fit_judge`          | `model_fit_judge`         |
 | splitter           | `LEERIE_MODEL_SPLITTER`         | `--model-splitter`           | `model_splitter`          |
+| adherence_judge    | `LEERIE_MODEL_ADHERENCE_JUDGE`  | `--model-adherence_judge`    | `model_adherence_judge`   |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
@@ -2516,11 +2518,13 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
 | fit_judge    | high    | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
 | splitter     | high    | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
+| adherence_judge | high | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ ≥8.5, prescribed-and-violated ⇒ ≤3) on opus at `high` effort — pinned depth is part of the validated configuration |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
 workers above and for the finalize-time `pr_writer` and `dep_capture` workers,
-and for the P1 decomposition workers `fit_judge` and `splitter`.
+and for the P1 decomposition workers `fit_judge` and `splitter`, and for
+the plan-instruction-adherence worker `adherence_judge`.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2548,6 +2552,7 @@ model selection:
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
 | fit_judge          | `LEERIE_EFFORT_FIT_JUDGE`        | `--effort-fit_judge`          | `effort_fit_judge`         |
 | splitter           | `LEERIE_EFFORT_SPLITTER`         | `--effort-splitter`           | `effort_splitter`          |
+| adherence_judge    | `LEERIE_EFFORT_ADHERENCE_JUDGE`  | `--effort-adherence_judge`    | `effort_adherence_judge`   |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
 | pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -4415,6 +4420,38 @@ child mirrors the planner subtask shape: required `id`, `title`,
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
 (both default to `"high"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
 (default opus via the global `MODEL_DEFAULT` fallback).
+
+### The `adherence_judge` worker (plan-instruction-adherence gate)
+
+`SCHEMAS["adherence_judge"]` — required fields: `user_prescribed_a_procedure`
+(boolean — independently re-derived from the task + plan, not copied from
+the classifier's own `prescribed_procedure.is_prescribed` signal),
+`instruction_adherence` (number 0–10), `violations` (array of strings, each
+naming a prescribed step/command the plan circumvented and how), `rationale`
+(string). Deliberately carries **no** `_confidence_schema` sub-object —
+unlike `fit_judge`/most other judgment workers, this worker *is itself* the
+independent check that replaces a self-report, so a nested self-confidence
+axis would reintroduce the self-grading bias the gate exists to remove.
+
+Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"high"`),
+absent from `MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT`
+fallback — **required**, not merely preferred: empirically falsified on
+sonnet, which false-positived a legitimate plan). Prompt at
+`prompts/adherence_judge.md` carries the calibration: a goal-only task (no
+prescribed procedure to violate) scores `instruction_adherence >= 8.5`; a
+plan that substitutes hand-authored/manual work for an explicitly
+prescribed procedure scores `<= 3`. The prompt is framed on **ADHERENCE**
+(does the plan obey the prescribed process?), not **understanding** (does
+the plan reflect correct comprehension of the task?) — an
+understanding-framed judge on opus was empirically shown to rubber-stamp a
+plan that disobeys a prescribed procedure while still reflecting correct
+task comprehension (score ~9.0 on the motivating incident's plan).
+
+This worker's `claude_p()` invocation, its position in the plan check loop
+(alongside the deterministic command-coverage floor), and the
+`--skip-adherence-check` flag are gate-wiring concerns documented and
+implemented separately — this section covers only the worker's
+registration (schema, prompt, model/effort defaults).
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
@@ -6809,7 +6846,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the eleven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the twelve `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -6882,7 +6919,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the eleven main-loop workers, not the post-run
+self-heal target set is the twelve main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
