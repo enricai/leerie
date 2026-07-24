@@ -253,6 +253,7 @@ STATE_FIELDS = (
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
+    "skip_adherence_check",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -677,6 +678,18 @@ SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 # LEERIE_SKIP_REPO_MAP env → skip_repo_map in leerie.toml → False.
 SKIP_REPO_MAP_ENV = "LEERIE_SKIP_REPO_MAP"
 SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-adherence-check bypass (instruction-adherence gate — the plan
+# must honor an explicitly prescribed procedure; sibling to §12 "prompts
+# advisory, code enforces"). Suppresses the deterministic
+# prescribed-command-coverage floor and the opus `adherence_judge` worker
+# in the planner check loop. Use only when the operator knows the
+# instruction-adherence gate is producing false positives for this repo's
+# task shape and wants to bypass the discipline. Resolution order:
+# --skip-adherence-check CLI flag → LEERIE_SKIP_ADHERENCE_CHECK env →
+# skip_adherence_check in leerie.toml → False.
+SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
+SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by build_repo_map() so
@@ -4209,6 +4222,26 @@ def resolve_skip_repo_map(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_REPO_MAP_ENV,
         file_key="skip_repo_map",
         file_name=SKIP_REPO_MAP_FILE)
+
+
+def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-adherence-check preference. Order:
+    --skip-adherence-check CLI flag (action='store_true') →
+    LEERIE_SKIP_ADHERENCE_CHECK env var →
+    skip_adherence_check in leerie.toml → False.
+
+    When True, the instruction-adherence gate is not run — the
+    deterministic prescribed-command-coverage floor and the opus
+    `adherence_judge` worker in the planner check loop are both skipped,
+    and a plan that diverges from an explicitly prescribed procedure is
+    not caught before `phase_execute` spends. Off by default; use only
+    when the operator knows the gate is misfiring for this repo's task
+    shape and wants to bypass the discipline."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_ADHERENCE_CHECK_ENV,
+        file_key="skip_adherence_check",
+        file_name=SKIP_ADHERENCE_CHECK_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -19930,6 +19963,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
+        st.data["skip_adherence_check"] = bool(
+            getattr(args, "skip_adherence_check", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -19971,6 +20006,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
+                   "skip_adherence_check": bool(
+                       getattr(args, "skip_adherence_check", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -20342,6 +20379,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "affects runs where the worker would otherwise fire. "
                          f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
                          "skip_overlap_judge in leerie.toml. Default: off.")
+    ap.add_argument("--skip-adherence-check", action="store_true",
+                    help="skip the instruction-adherence gate: the "
+                         "deterministic prescribed-command-coverage floor "
+                         "and the opus adherence_judge worker in the "
+                         "planner check loop. A plan that diverges from an "
+                         "explicitly prescribed procedure is not caught "
+                         "before phase_execute spends. "
+                         f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
+                         "skip_adherence_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -20704,6 +20750,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # key; phase_overlap_judge reads it from there on entry.
     args.skip_overlap_judge = resolve_skip_overlap_judge(
         repo_root, args.skip_overlap_judge)
+
+    # Resolve --skip-adherence-check (instruction-adherence gate). Same
+    # precedence shape as the other skip flags. Re-attach to args so
+    # orchestrate() folds it into state.json under the canonical
+    # "skip_adherence_check" key; the planner check loop reads it from
+    # there on entry.
+    args.skip_adherence_check = resolve_skip_adherence_check(
+        repo_root, args.skip_adherence_check)
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.

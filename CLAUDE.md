@@ -348,6 +348,14 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # `skip_repo_map = true` in leerie.toml. Default: off.
 ./leerie "task" --skip-repo-map
 
+# Skip the instruction-adherence gate: the deterministic prescribed-
+# command-coverage floor and the opus adherence_judge worker in the
+# planner check loop. A plan that diverges from an explicitly
+# prescribed procedure is not caught before phase_execute spends. Also
+# LEERIE_SKIP_ADHERENCE_CHECK=1 or `skip_adherence_check = true` in
+# leerie.toml. Default: off.
+./leerie "task" --skip-adherence-check
+
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + --resume).
 # Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in
