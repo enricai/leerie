@@ -865,6 +865,24 @@ split mechanism therefore separates by structural type:
   1,733-vs-≤474 span separation, not telemetry-calibrated like the 0.70 fit
   threshold).
 
+  - **Oversized-file peel (a dense file bundled with a few others).** The tier-1/2
+    tiling above operates only on a subtask whose `files_likely_touched` is
+    *exactly one* file — a single region can be tiled, a set of files cannot. But
+    the dominant real shape of a dense-file subtask is the file **plus its test
+    file** (measured: 382 two-file subtasks across run history, 244 of them
+    impl+test; feat-005 itself was `[flow-runner.ts, flow-runner.test.ts]`, which
+    is *why* its first fix never engaged the sub-file split). For a small file-set
+    (`1 < len(files) ≤ chunk_size`) where **exactly one** file exceeds
+    `subfile_split_max_span` lines, the mechanism first *peels*: it splits the
+    subtask into a single-file child scoped to the dense file — which re-enters the
+    tier-1/2 tiling above — and a sibling child owning the remaining file(s). The
+    peel is deterministic (a line-count probe, no worker) and generalizes past
+    impl+test. It fires only when exactly one file is oversized: zero oversized
+    files is nothing to peel, and ≥2 oversized files is genuinely coupled
+    multi-file work the LLM splitter should own — both fall through unchanged. The
+    peeled children inherit the parent's edges exactly as the migration/tier
+    children do, so `schedule()`/overlap/integration are unaffected.
+
 **`recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
 
 ```
@@ -1761,6 +1779,38 @@ transient classifier and routed straight to the same resumable pause
 (`EXIT_LOCKED`, exit 75) used for out-of-credits below — worktree-only
 cleanup, state and branches preserved, `--resume` picks back up once
 the operator re-authenticates.
+
+**A mid-stream transport disconnect is a third transient class, and it
+gets the same backoff.** When the network connection carrying a worker's
+streaming response drops mid-answer, `claude -p` surfaces a result
+envelope with `is_error` set, `terminal_reason` = `"api_error"`, a *null*
+`api_error_status` (the connection died before any HTTP status returned),
+and result text `"API Error: Connection closed mid-response. The response
+above may be incomplete."` This is the same *family* as the 529 overload
+case — the session is fine, the request just never completed — so a fresh
+session after backoff has a real chance of succeeding. It is distinct from
+a schema mistake, which is what the immediate corrective-note retry exists
+for; routing a transport drop through that path retries once against the
+same bad network window with a nonsensical "conform to the schema" nudge,
+then fails the subtask. `_is_transient_transport_failure` classifies it
+(keyed on `terminal_reason == "api_error"` with no numeric
+`api_error_status`, or — as a secondary catch — a narrow connection-drop
+text-marker set) and
+routes it through the *same* `_is_auth_or_quota_failure` tenacity backoff
+loop, checked after the terminal-auth classifier so an expired session is
+never mistaken for a transport blip. The measured basis (a scan of 9,020
+worker logs): 58 sids hit this drop; isolating the 56 that did **not** also
+hit `max_turns` (the pure-transport population), **83% recovered on a later
+attempt and 73% on the very next one** — a network transient, not context
+exhaustion (a third of drops fire at ≤3 turns, before any context
+accumulates). The two `max_turns`-coupled sids recovered 0% — an oversized
+subtask that also drops is a *decomposition* problem (see §5½ P1
+*Sub-file*), not one backoff can fix, and `auth_retry_max_sec` correctly
+gives up on that tail. This transient path is upstream-corroborated:
+Claude Code's own remedy for a mid-stream drop is an automatic retry
+(the `claude -p` text-preservation fix landed in CLI v2.1.219); leerie's
+backoff is the fresh-session complement for when the CLI's in-session
+retries are exhausted.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:

@@ -287,11 +287,20 @@ RUN set -eux; \
 #      binary. Pinned by tests/test_dockerfile_path.py.
 ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:/home/leerie/.local/share/mise/shims:$PATH:/home/leerie/.local/bin
 
-# Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245).
+# Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245) for
+# --json-schema. The install is pinned ≥ 2.1.219: that release fixed `claude
+# -p` dropping already-produced text when a turn dies on a mid-stream API
+# error ("Connection closed mid-response"), which is exactly the transport
+# drop leerie's own backoff retry now recovers from (DESIGN §6 *Cleanup on
+# abnormal exit*, IMPLEMENTATION §3 "Transient transport disconnect"). The
+# image should carry the CLI-side in-session fix so leerie's fresh-session
+# backoff is the second line of defense, not the only one. The runtime floor
+# is deliberately NOT bumped to 219 — a resilience nicety must not hard-die a
+# valid older host CLI the way the --json-schema hard requirement does.
 # Installs globally against the LTS Node — lands at
 # /usr/local/share/mise/installs/node/lts-current/lib/node_modules
 # with a bin shim at .../bin/claude (on PATH via the line above).
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g '@anthropic-ai/claude-code@>=2.1.219'
 
 # Non-root user matching the host UID/GID so bind-mounted files keep their
 # host ownership. Defaults are macOS-typical; the launcher overrides them

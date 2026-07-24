@@ -5439,6 +5439,62 @@ def _subfile_split(subtask: dict, repo_root: Path,
     ]
 
 
+def _peel_oversized_file(subtask: dict, repo_root: Path,
+                         max_span: int, chunk_size: int) -> list[dict]:
+    """Peel a single oversized file out of a small multi-file subtask so it can
+    reach `_subfile_split`'s intra-file tiling (DESIGN §5½ (P1) *Sub-file*).
+
+    `_subfile_split` only tiles a subtask whose `files_likely_touched` is exactly
+    one file. But the dominant real shape of a dense-file subtask is the file
+    bundled with its test file (`[flow-runner.ts, flow-runner.test.ts]` — the
+    exact shape of feat-005, which is why its first sub-file fix never engaged).
+    For such a subtask this peels it into two children: a single-file child
+    scoped to the oversized file (which re-enters recursion and gets tiled) and a
+    sibling owning the remaining file(s).
+
+    Fires only when **exactly one** file exceeds `max_span` lines and the set is
+    small (`1 < len(files) <= chunk_size`). Returns `[]` (fall through unchanged)
+    when: the set is a single file (`_subfile_split` already handles it) or too
+    large (a migration sweep the file-count fork owns); zero files are oversized
+    (nothing to peel); or >=2 are oversized (genuinely coupled multi-file work the
+    LLM splitter should own). A file whose line count can't be read is treated as
+    not-oversized (a leaf-safe default), mirroring `_subfile_split`.
+
+    Children are built with `_migration_child` (same edge-copy discipline; the
+    dense-file child re-enters `_subfile_split` on recursion, so it needs no
+    `owned_region` here — the tiling assigns regions)."""
+    files = subtask.get("files_likely_touched") or []
+    if not (1 < len(files) <= chunk_size):
+        return []
+
+    def _line_count(f: str) -> int:
+        try:
+            return (repo_root / f).read_text(errors="replace").count("\n") + 1
+        except OSError:
+            return 0  # unreadable → treat as not-oversized (leaf-safe)
+
+    oversized = [f for f in files if _line_count(f) > max_span]
+    if len(oversized) != 1:
+        return []  # nothing to peel, or genuinely coupled — LLM splitter owns it
+
+    dense = oversized[0]
+    rest = [f for f in files if f != dense]
+    base_id = subtask.get("id", "split")
+    parent_title = subtask.get("title", "file change")
+    seed = subtask.get("success_criteria_seed", "")
+    dense_child = _migration_child(
+        subtask, [dense], f"{base_id}-f1",
+        f"{parent_title} (dense file: {dense})",
+        (f"{seed}\nScope: only {dense}. A sibling subtask owns the "
+         f"remaining file(s).").strip())
+    rest_child = _migration_child(
+        subtask, rest, f"{base_id}-f2",
+        f"{parent_title} (remaining: {', '.join(rest)})",
+        (f"{seed}\nScope: only these files — {', '.join(rest)}. A sibling "
+         f"subtask owns {dense}.").strip())
+    return [dense_child, rest_child]
+
+
 async def recursive_decompose(
     subtask: dict,
     depth: int,
@@ -5582,6 +5638,20 @@ async def recursive_decompose(
 
     # --- split step ----------------------------------------------------------
     files = subtask.get("files_likely_touched") or []
+    chunk_size = 8
+    # Oversized-file peel (DESIGN §5½ (P1) *Sub-file* → *Oversized-file peel*):
+    # a small multi-file subtask (e.g. a dense file + its test file) where
+    # exactly one file is over the span cap is peeled into a single-file child
+    # (which re-enters _subfile_split on recursion below and gets tiled) and a
+    # sibling owning the rest. Checked before _subfile_split because that
+    # function's len(files)==1 guard skips the dominant impl+test shape.
+    # Deterministic — no worker spawn. Returns [] (falls through) when not a
+    # peel candidate.
+    peeled_children = _peel_oversized_file(
+        subtask, repo_root,
+        caps.get("subfile_split_max_span",
+                 DEFAULT_CAPS["subfile_split_max_span"]),
+        chunk_size)
     # Sub-file path (DESIGN §5½ (P1) *Sub-file*): a single dense file (or a
     # single oversized region re-entering) is split WITHIN the file, since the
     # whole-file splitter below cannot break one file. Checked first; falls
@@ -5591,8 +5661,9 @@ async def recursive_decompose(
         subtask, repo_root,
         caps.get("subfile_split_max_span",
                  DEFAULT_CAPS["subfile_split_max_span"]))
-    chunk_size = 8
-    if subfile_children:
+    if peeled_children:
+        children = peeled_children
+    elif subfile_children:
         children = subfile_children
     # Migration path (dominant case, ~84%): code-partitions, LLM only labels.
     # Coupled-minority path: LLM-splitter decides the partition.
@@ -9234,6 +9305,66 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
             or "rate-limit" in msg)
 
 
+# Connection-drop markers for _is_transient_transport_failure. Kept narrow
+# and specific to a *transport-level* disconnect (the connection carrying the
+# stream dropped), not a generic "error" — a broad match would false-positive
+# on a worker legitimately discussing networking in its own output, which the
+# is_error gate mostly but not perfectly guards against. "connection reset" /
+# "timeout while waiting for response" are the sibling shapes already
+# enumerated as non-terminal-auth in tests/test_terminal_auth_failure.py.
+_TRANSPORT_DROP_MARKERS = (
+    "connection closed",
+    "connection reset",
+    "connection error",
+    "mid-response",
+    "timeout while waiting for response",
+)
+
+
+def _is_transient_transport_failure(envelope: dict) -> bool:
+    """True when the `claude -p` envelope is a mid-stream **transport
+    disconnect** — the network connection carrying the streaming response
+    dropped mid-answer, e.g. "API Error: Connection closed mid-response."
+
+    Same family as the 529 overload case `_is_auth_or_quota_failure` covers:
+    the session is fine, the request just never completed, so a fresh session
+    after backoff has a real chance of succeeding. Distinct from a schema
+    mistake (the immediate corrective-note retry) and from an expired session
+    (terminal auth). Routed through the *same* auth/quota tenacity backoff loop,
+    checked AFTER `_is_terminal_auth_failure` so an expired session is never
+    mistaken for a transport blip.
+
+    The measured envelope shape (from a real drop): `is_error: true`,
+    `subtype: "success"` (misleading — do NOT key on subtype), `terminal_reason:
+    "api_error"`, `api_error_status: null` (the drop preceded any HTTP status),
+    result text "API Error: Connection closed mid-response. …". So the primary
+    signal is `terminal_reason == "api_error"` with no numeric `api_error_status`
+    (401/429/529 keep the auth/quota path); the text markers are a secondary
+    catch for drop shapes that arrive without that terminal_reason.
+
+    Gating discipline mirrors the two auth classifiers verbatim (see their
+    docstrings): gated on `is_error` — a successful, schema-valid envelope must
+    never match no matter what its `result` text says — and `_leerie_synthetic`
+    envelopes are exempt, since the no-result envelope interpolates the worker's
+    raw stderr into `result`, which can legitimately contain these markers
+    without a real transport drop. A numeric 401/429/529 status also excludes
+    the envelope here (it belongs to `_is_auth_or_quota_failure`), keeping the
+    two classifiers cleanly partitioned."""
+    if not envelope.get("is_error"):
+        return False
+    if envelope.get("_leerie_synthetic"):
+        return False
+    # 401/429/529 are auth/quota, not a transport drop — let that classifier
+    # own them so the two partition cleanly.
+    if _api_error_category(envelope.get("api_error_status")) is not None:
+        return False
+    if (envelope.get("terminal_reason") == "api_error"
+            and envelope.get("api_error_status") is None):
+        return True
+    msg = str(envelope.get("result") or "").lower()
+    return any(m in msg for m in _TRANSPORT_DROP_MARKERS)
+
+
 def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
     """Categorize *why* a captured `claude -p` call failed, for the
     `failure_kind` field on the calls.ndjson record. Returns None on
@@ -11100,16 +11231,29 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             if _is_terminal_auth_failure(envelope):
                 raise TerminalAuthFailure(str(envelope.get("result") or ""))
 
-            # Auth/quota backoff: 401/429/529/auth-message envelopes need
-            # waiting, not the immediate corrective retry below. The gateway
-            # has already rejected the request and a fresh request will be
-            # rejected too until the user's Claude Code subscription window
-            # clears (401/429) or the transient overload (529) subsides. Run
-            # tenacity's exponential-backoff-with-jitter loop, capped at
-            # `auth_retry_max_sec` cumulative seconds. The loop exits when an
-            # invocation returns a non-auth envelope (success or a different
-            # error class) or when the budget is exhausted.
-            if _is_auth_or_quota_failure(envelope):
+            # Backoff (not immediate corrective retry) is needed for two
+            # envelope classes that share the same remedy — a fresh session
+            # after a short wait:
+            #   (a) auth/quota — 401/429/529/auth-message: the gateway rejected
+            #       the request; it will reject a fresh one too until the rolling
+            #       usage window clears (401/429) or the transient overload (529)
+            #       subsides.
+            #   (b) transport disconnect — the connection carrying the stream
+            #       dropped mid-response (`terminal_reason=api_error`, null
+            #       status, "Connection closed mid-response"). Same family as
+            #       529: the session is fine, the request just never completed.
+            # Both run the SAME tenacity exponential-backoff-with-jitter loop,
+            # capped at `auth_retry_max_sec` cumulative seconds. The loop exits
+            # when an invocation returns an envelope in neither class (success
+            # or a different error) or when the budget is exhausted. Routing a
+            # transport drop here (rather than the immediate `is_error` arm
+            # below) avoids retrying once against the same bad network window
+            # with a nonsensical "conform to the schema" nudge.
+            def _needs_backoff(env: dict) -> bool:
+                return (_is_auth_or_quota_failure(env)
+                        or _is_transient_transport_failure(env))
+
+            if _needs_backoff(envelope):
                 # Lazy import (not module-scope) so this file loads on a bare host
                 # python3 lacking requirements.txt deps — see the module-top note.
                 from tenacity import (
@@ -11123,7 +11267,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
                 def _log_before_sleep(rs: RetryCallState) -> None:
                     env = rs.outcome.result()
-                    marker = (env.get("api_error_status") or "auth/quota")
+                    marker = (env.get("api_error_status")
+                              or ("transport disconnect"
+                                  if _is_transient_transport_failure(env)
+                                  else "auth/quota"))
                     log(f"  worker hit {marker} — retrying in "
                         f"{rs.next_action.sleep:.0f}s "
                         f"(elapsed {rs.seconds_since_start:.0f}s of "
@@ -11140,20 +11287,30 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                         wait=wait_exponential_jitter(
                             initial=15, max=120, jitter=5),
                         stop=stop_after_delay(auth_retry_max_sec),
-                        retry=retry_if_result(_is_auth_or_quota_failure),
+                        retry=retry_if_result(_needs_backoff),
                         reraise=False,
                         before_sleep=_log_before_sleep,
                     )(_spawn, retry_note)
                 except RetryError as e:
-                    # Budget exhausted with the envelope still auth/quota.
-                    # Surface the last attempt's envelope so the
-                    # subscription-cap WorkerError below fires with
-                    # accurate context. retry_if_result only filters
-                    # results (not exceptions), so last_attempt holds a
-                    # result Future — .result() returns the envelope.
+                    # Budget exhausted with the envelope still in a backoff
+                    # class. Surface the last attempt's envelope so the
+                    # WorkerError below fires with accurate context.
+                    # retry_if_result only filters results (not exceptions), so
+                    # last_attempt holds a result Future — .result() returns the
+                    # envelope.
                     envelope = e.last_attempt.result()
 
-                if _is_auth_or_quota_failure(envelope):
+                if _needs_backoff(envelope):
+                    # Name the actual cause so the user isn't told to wait for a
+                    # usage window that isn't the problem. Transport drops are
+                    # checked first: they carry no numeric status, so the 529 /
+                    # auth branches below would otherwise mislabel them.
+                    if _is_transient_transport_failure(envelope):
+                        raise WorkerError(
+                            "Claude API connection dropped mid-response "
+                            f"after ~{auth_retry_max_sec}s of retries — a "
+                            "transient network/gateway transport error. Run "
+                            "--resume to retry.")
                     # A 529 is transient gateway overload, not a subscription
                     # cap — don't misattribute it. 401/429 (and the text-marker
                     # path) stay on the rolling-usage-cap message.

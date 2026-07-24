@@ -872,3 +872,111 @@ def test_subfile_bump_workers_not_called_for_region_children(leerie, tmp_path):
 
     # Exactly one worker call: the parent fit_judge. Region children add none.
     assert st.bump_workers.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# oversized-file peel (DESIGN §5½ (P1) *Sub-file* → *Oversized-file peel*):
+# a small multi-file subtask (impl + test) where exactly one file is over the
+# span cap is peeled so the dense file reaches _subfile_split's tiling.
+# ---------------------------------------------------------------------------
+
+def test_peel_unit_two_file_impl_test(leerie, tmp_path):
+    """`_peel_oversized_file` on the measured feat-005 shape (dense impl +
+    small test) → a single-file dense child + a sibling owning the test file,
+    both inheriting the parent's edges."""
+    _write_lines(tmp_path / "flow-runner.ts", 2000)     # oversized
+    _write_lines(tmp_path / "flow-runner.test.ts", 50)  # small
+    parent = {
+        "id": "feat-005", "title": "Thread FrameTarget",
+        "success_criteria_seed": "all sites routed",
+        "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
+        "depends_on": ["feat-004"],
+        "provides": ["frame-target"],
+    }
+    children = leerie._peel_oversized_file(parent, tmp_path, 700, 8)
+    assert len(children) == 2
+    by_files = {tuple(c["files_likely_touched"]): c for c in children}
+    assert ("flow-runner.ts",) in by_files          # dense peeled to its own child
+    assert ("flow-runner.test.ts",) in by_files      # test file is the sibling
+    for c in children:
+        # edges inherited verbatim (copied, not aliased)
+        assert c["depends_on"] == ["feat-004"]
+        assert c["provides"] == ["frame-target"]
+        assert c["depends_on"] is not parent["depends_on"]
+
+
+def test_peel_unit_no_oversized_file_falls_through(leerie, tmp_path):
+    """Two files, neither over the cap → nothing to peel, returns []."""
+    _write_lines(tmp_path / "a.ts", 100)
+    _write_lines(tmp_path / "b.ts", 120)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.ts", "b.ts"]}
+    assert leerie._peel_oversized_file(parent, tmp_path, 700, 8) == []
+
+
+def test_peel_unit_two_oversized_files_falls_through(leerie, tmp_path):
+    """Two files, BOTH over the cap → genuinely coupled multi-file work; the
+    peel declines (returns []) so the LLM splitter owns it."""
+    _write_lines(tmp_path / "a.ts", 2000)
+    _write_lines(tmp_path / "b.ts", 2000)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.ts", "b.ts"]}
+    assert leerie._peel_oversized_file(parent, tmp_path, 700, 8) == []
+
+
+def test_peel_unit_single_file_declines(leerie, tmp_path):
+    """A single-file subtask is _subfile_split's job, not the peel's."""
+    _write_lines(tmp_path / "a.ts", 2000)
+    parent = {"id": "feat-001", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["a.ts"]}
+    assert leerie._peel_oversized_file(parent, tmp_path, 700, 8) == []
+
+
+def test_peel_end_to_end_dense_file_tiles(leerie, tmp_path):
+    """Full recursive_decompose on the impl+test shape: the dense file peels
+    then tiles into region leaves; the test file survives as its own leaf.
+    Uses the tier-2 line-window fallback (no tree-sitter ranges needed)."""
+    _write_lines(tmp_path / "flow-runner.ts", 2000)
+    _write_lines(tmp_path / "flow-runner.test.ts", 50)
+    parent = {
+        "id": "feat-005", "title": "Thread FrameTarget",
+        "success_criteria_seed": "all sites routed",
+        "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
+    }
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            # The parent (both files) scores low → peel. The peeled test-file
+            # sibling (id feat-005-f2) is a small focused file → well-fit leaf,
+            # so it never reaches the splitter. The dense-file child (feat-005-f1)
+            # carries an owned_region and is decided mechanically (no fit call).
+            # `sid` is fit-judge-<subtask-id>-d<depth>.
+            if "feat-005-f2" in sid:
+                return _fit_response(0.90)  # test-file sibling: well-fit leaf
+            return _fit_response(0.30)      # parent: low fit → peel
+        pytest.fail(f"peel/tiling is code-owned; no {schema_key!r} worker")
+
+    # No tree-sitter ranges → tier-2 line-window fallback tiles the dense file.
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    # The dense file produced >=2 region leaves (each owning only flow-runner.ts
+    # with an owned_region); the test file is exactly one leaf, un-tiled.
+    dense_leaves = [l for l in leaves
+                    if l["files_likely_touched"] == ["flow-runner.ts"]]
+    test_leaves = [l for l in leaves
+                   if l["files_likely_touched"] == ["flow-runner.test.ts"]]
+    assert len(dense_leaves) >= 2, "dense file was not tiled after the peel"
+    assert all(l.get("owned_region") for l in dense_leaves)
+    assert len(test_leaves) == 1, "test file should be one untiled sibling leaf"
+    assert test_leaves[0].get("owned_region") is None
+    # dense regions each within the cap
+    for l in dense_leaves:
+        r = l["owned_region"]
+        assert (r["end"] - r["start"] + 1) <= 700

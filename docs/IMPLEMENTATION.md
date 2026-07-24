@@ -330,9 +330,12 @@ Base layers (top-down):
   its own (DESIGN §6½).
 - corepack activated via `MISE_NODE_COREPACK=true`, so a repo's
   `package.json` `packageManager` field selects its own pnpm/yarn version —
-  no globally pinned pnpm is baked. `npm install -g @anthropic-ai/claude-code`
-  installs the `claude` CLI workers invoke (against the LTS Node above; leerie
-  enforces ≥ 2.1.22 at runtime).
+  no globally pinned pnpm is baked. `npm install -g
+  '@anthropic-ai/claude-code@>=2.1.219'` installs the `claude` CLI workers
+  invoke (against the LTS Node above; leerie enforces ≥ 2.1.22 at runtime for
+  `--json-schema`, and the image install is pinned ≥ 2.1.219 for the `claude
+  -p` mid-stream-drop fix — see the Dockerfile comment and IMPLEMENTATION §3
+  "Transient transport disconnect").
 - `ENV PATH` is set to
   `<system mise shims>:<LTS Node bin>:<MISE_DATA_DIR/shims>:$PATH:/home/leerie/.local/bin`
   (concretely `/usr/local/share/mise/shims` :
@@ -3288,6 +3291,36 @@ The classifier and the budget constant (`auth_retry_max_sec`) live in
 `leerie.py`; the budget is in §6 *Code-enforced caps*. The non-auth
 `is_error` path is unchanged — schema parse failures stay immediate.
 
+#### Transient transport disconnect
+
+The same backoff loop also handles a **mid-stream transport disconnect**:
+the network connection carrying a worker's streaming response drops
+mid-answer, and `claude -p` surfaces a result envelope with `is_error`
+set, `terminal_reason == "api_error"`, a **null** `api_error_status` (the
+connection died before any HTTP status returned, so no numeric category
+applies), and result text `"API Error: Connection closed mid-response. The
+response above may be incomplete."` `_is_transient_transport_failure(envelope)`
+classifies this on the same `is_error`-gated, `_leerie_synthetic`-exempt
+discipline as the two auth classifiers, matching when `terminal_reason ==
+"api_error"` and `_api_error_category(api_error_status)` is `None`
+(401/429/529 keep the auth/quota path above), **or** the result text
+carries a narrow connection-drop marker (`connection closed`, `connection
+reset`, `connection error`, `mid-response`, `timeout while waiting for
+response`). A matching envelope enters the *same* `tenacity.AsyncRetrying`
+loop as `_is_auth_or_quota_failure` (they are OR'd into one branch
+condition, so the backoff mechanics, budget, and per-iteration logging are
+shared — not duplicated). It is checked **after** `_is_terminal_auth_failure`
+so an expired session is never mistaken for a transport blip, and before
+the generic `is_error` corrective-retry arm, which otherwise retries a
+network drop once against the same bad window with a nonsensical "conform
+to the schema" nudge and then fails the subtask. On budget exhaustion the
+raised `WorkerError` names the transport disconnect (not a subscription
+cap) and points at `--resume`. This is the fresh-session complement to the
+CLI's own in-session retry (the `claude -p` mid-stream fix landed in CLI
+v2.1.219); leerie sees the drop only once the CLI's retries are exhausted.
+Measured basis and rationale: DESIGN §6 *Cleanup on abnormal exit* (56 of
+58 dropped sids were pure-transport, 83% recovering on a later attempt).
+
 #### Terminal auth failure
 
 `_is_terminal_auth_failure(envelope)` is checked in `claude_p()` **before**
@@ -4489,6 +4522,21 @@ accept the subtask as leaf); then splits via either:
     downstream (schedule ignores `files_likely_touched`; overlap judge excludes
     same-file/different-region; `git merge` reconciles); `check_planner_output`'s
     `INTRA_DOMAIN_OVERLAP` advisory is suppressed for `_cofile_cluster` children.
+  - **Oversized-file peel** (`1 < len(files) ≤ chunk_size`, exactly one file over
+    `subfile_split_max_span` lines): checked in the split step **before**
+    `_subfile_split()`'s single-file tiling, since that tiling's `len(files) == 1`
+    guard skips the dominant dense-file shape — the file bundled with its test
+    file (`_subfile_split()` returns `[]` for `[impl.ts, impl.test.ts]`, which then
+    falls to the coupled LLM splitter that may not isolate the dense file). The
+    peel (`_peel_oversized_file()`, deterministic — a `read_text().count("\n")`
+    probe per file, no worker) splits the subtask into a single-file child scoped
+    to the one oversized file (which re-enters recursion and hits the sub-file
+    tiling above) and a sibling child owning the remaining file(s). Both children
+    inherit the parent's `depends_on`/`requires`/`provides` verbatim (same
+    deep-copy edge discipline as `_migration_child`). Guard: if **zero** or **≥2**
+    files exceed the cap it returns `[]` and the split falls through unchanged —
+    zero is nothing to peel; ≥2 is genuinely coupled multi-file work the LLM
+    splitter owns.
 
 Both the `fit_judge` call and the coupled-path `splitter` call are wrapped in
 `try/except WorkerError`, degrading the node to a leaf (`[subtask]`

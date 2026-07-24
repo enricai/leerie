@@ -365,13 +365,15 @@ def test_exit_locked_is_75(leerie):
 
 def test_terminal_auth_failure_checked_before_auth_or_quota_in_claude_p(leerie):
     """Source-coupling guard: _is_terminal_auth_failure must be checked
-    before _is_auth_or_quota_failure inside claude_p's retry loop, else
-    the terminal case falls into the tenacity backoff first."""
+    before the backoff branch inside claude_p's retry loop, else the terminal
+    case falls into the tenacity backoff first. The backoff branch is now
+    guarded by the combined `_needs_backoff(envelope)` predicate (which ORs
+    `_is_auth_or_quota_failure` and `_is_transient_transport_failure`)."""
     import inspect
     src = inspect.getsource(leerie.claude_p)
     terminal_idx = src.index("_is_terminal_auth_failure(envelope)")
-    quota_idx = src.index("_is_auth_or_quota_failure(envelope)")
-    assert terminal_idx < quota_idx
+    backoff_idx = src.index("_needs_backoff(envelope)")
+    assert terminal_idx < backoff_idx
 
 
 def test_terminal_auth_failure_is_a_base_exception(leerie):

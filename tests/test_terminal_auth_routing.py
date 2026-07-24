@@ -261,5 +261,10 @@ def test_terminal_auth_checked_before_auth_or_quota_in_claude_p(leerie):
     import inspect
     src = inspect.getsource(leerie.claude_p)
     terminal_idx = src.index("_is_terminal_auth_failure(envelope)")
-    quota_idx = src.index("_is_auth_or_quota_failure(envelope)")
-    assert terminal_idx < quota_idx
+    # The auth/quota + transport-drop backoff branch is now guarded by the
+    # combined `_needs_backoff(envelope)` predicate (which ORs
+    # `_is_auth_or_quota_failure` and `_is_transient_transport_failure`).
+    # Terminal auth must still be checked before it — an expired session must
+    # never be routed into the backoff loop.
+    backoff_idx = src.index("_needs_backoff(envelope)")
+    assert terminal_idx < backoff_idx
