@@ -321,11 +321,18 @@ Base layers (top-down):
   in this container configuration; the required flags are baked in via
   `/etc/chromium.d/leerie-container-flags` (see *Browser-based testing* note
   below).
-- Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
-  → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
-  `ARG NODE_VERSION` so the version is reproducible across builds.
-- `pnpm` (pinned), `npm install -g @anthropic-ai/claude-code` (the
-  `claude` CLI workers invoke; leerie enforces ≥ 2.1.22 at runtime).
+- LTS Node **and** Python 3.12 baked via a single
+  `mise install --system node@lts python@3.12` (`Dockerfile`), landing under
+  `/usr/local/share/mise/installs/<tool>/<version>/`; a stable
+  `.../installs/node/lts-current` symlink is then created so `ENV PATH` and the
+  `claude` global-install don't need to know the concrete version. These are
+  the LTS fallback mise's resolver drops to when a repo declares no version of
+  its own (DESIGN §6½).
+- corepack activated via `MISE_NODE_COREPACK=true`, so a repo's
+  `package.json` `packageManager` field selects its own pnpm/yarn version —
+  no globally pinned pnpm is baked. `npm install -g @anthropic-ai/claude-code`
+  installs the `claude` CLI workers invoke (against the LTS Node above; leerie
+  enforces ≥ 2.1.22 at runtime).
 - `ENV PATH` is set to
   `<system mise shims>:<LTS Node bin>:<MISE_DATA_DIR/shims>:$PATH:/home/leerie/.local/bin`
   (concretely `/usr/local/share/mise/shims` :
