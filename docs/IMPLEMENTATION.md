@@ -6737,10 +6737,22 @@ type. Required fields, current shape:
   declares every command the subtask actually invokes, as structured data —
   populated when the task text prescribes a specific command/script/tool
   invocation the planner gave its own run-the-command subtask (see
-  `prompts/planner.md`); most subtasks omit it or leave it empty. Nothing
-  in the orchestrator consumes `runs_commands` yet — the deterministic
-  coverage-floor check and the adherence judge that read it are separate,
-  not-yet-built work. The schema's required-ness of `confidence`
+  `prompts/planner.md`); most subtasks omit it or leave it empty.
+  `check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
+  list[str]` is the deterministic PRIMARY layer of the instruction-adherence
+  gate (DESIGN §12-sibling, "instruction-adherence is code-enforced"): pure
+  JSON→verdict set logic computing `prescribed.commands −
+  ⋃(subtask.runs_commands)` under normalized (lowercased, stopword-filtered)
+  token-SUBSET matching — not exact string equality, since the planner emits
+  `runs_commands` as a paraphrase wrapping the prescribed command's own
+  tokens (e.g. "barnacle recon browser" for "recon browser"). Returns a
+  `PRESCRIBED_CMD_UNRUN: ...` string per uncovered prescribed command;
+  short-circuits to `[]` when `prescribed_procedure` is absent, `is_prescribed`
+  is falsy, or `commands` is empty. Tested in
+  `tests/test_prescribed_cmd_coverage.py`. This function and the
+  `adherence_judge` worker above are not yet wired into `check_planner_output`
+  or the plan check loop — that gate wiring and the `--skip-adherence-check`
+  flag's effect on it are separate, not-yet-built work. The schema's required-ness of `confidence`
   and `status` is the structural part of DESIGN §8's discipline: a worker
   that skipped self-gating fails its own JSON schema before the orchestrator
   reads the payload.
