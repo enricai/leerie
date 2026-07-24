@@ -62,6 +62,36 @@ they form a producer→consumer pair.
 
 {{include: _clarification_filter.md}}
 
+## Prescribed procedure
+
+Some tasks don't ask you to build or fix something — they prescribe an
+explicit procedure: specific commands to run, in order, with an instruction
+not to hand-write the result (e.g. "run `recon:browser` until it finishes,
+then run `recon:generate` — do not edit the output by hand"). This is a
+distinct signal from category selection: it's about *how* the user wants
+the work done, not *what kind* of work it is.
+
+Extract this as structured data in `prescribed_procedure`:
+
+- `is_prescribed` (bool): true only when the task names one or more
+  specific, runnable commands (a script, a CLI invocation, an npm/make
+  target — something a planner could literally execute) as the required
+  process. A task that merely describes a *goal* ("add pagination to the
+  API") is not prescribed, even if it suggests an approach. When in doubt,
+  false — this field exists to catch explicit process instructions, not to
+  paraphrase every task as a procedure.
+- `commands` (array of strings): the prescribed commands, in the order the
+  task states them. Empty when `is_prescribed` is false.
+- `forbid_manual` (bool): true when the task explicitly says not to
+  hand-write, hand-edit, or manually reproduce what the command(s) would
+  produce.
+- `evidence` (string): the specific phrase(s) in the task that establish
+  `is_prescribed` — required whenever `is_prescribed` is true.
+
+Do this extraction yourself, from the task prose — never leave it for a
+downstream regex or string match. If the task prescribes nothing beyond
+"do the work," leave `is_prescribed` false and `commands` empty.
+
 If the task includes feature work, set `source_of_truth_question` to `true`.
 The orchestrator resolves the value from a preference (`--source-of-truth`
 CLI flag → `LEERIE_SOURCE_OF_TRUTH` env var → per-repo `leerie.toml`
@@ -82,7 +112,13 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "why_underivable": "Why neither the codebase nor research can answer it."
     }
   ],
-  "source_of_truth_question": false
+  "source_of_truth_question": false,
+  "prescribed_procedure": {
+    "is_prescribed": false,
+    "commands": [],
+    "forbid_manual": false,
+    "evidence": ""
+  }
 }
 ```
 
