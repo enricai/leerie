@@ -1005,7 +1005,15 @@ string equality), full and partial coverage, no-subtasks-at-all firing for
 every prescribed command, tolerance of subtasks with missing/empty
 `runs_commands` and of non-string/blank prescribed commands, case-
 insensitivity, and a negative control proving a shared-stopword-only overlap
-does not falsely mark a command covered.
+does not falsely mark a command covered. The gate's own advisory-vs-gating
+outcome — distinct from the G3 `decomposition_quality`/`task_understanding`
+pair above, which covers the *planner's* self-report axes, not the
+adherence floor — is pinned in `tests/test_check_functions.py`'s
+`TestAdherenceGateAdvisoryVsGating`: a prescribed-and-uncovered command
+gates (`PRESCRIBED_CMD_UNRUN`), a goal-only task and a fully-covered
+command never gate, and `check_planner_output` itself carries no separate
+adherence axis to demote to advisory, since the floor is wired only into
+`phase_adherence_gate`, not the planner check loop.
 The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
 gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
 composing the deterministic floor and the opus `adherence_judge` behind

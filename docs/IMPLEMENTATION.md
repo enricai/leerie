@@ -6823,7 +6823,12 @@ type. Required fields, current shape:
   `PRESCRIBED_CMD_UNRUN: ...` string per uncovered prescribed command;
   short-circuits to `[]` when `prescribed_procedure` is absent, `is_prescribed`
   is falsy, or `commands` is empty. Tested in
-  `tests/test_prescribed_cmd_coverage.py`. This function and the
+  `tests/test_prescribed_cmd_coverage.py`; the advisory-vs-gating outcome
+  (prescribed-and-uncovered gates, goal-only and fully-covered never gate,
+  and `check_planner_output` carries no separate self-graded adherence axis
+  to demote) is additionally pinned in `tests/test_check_functions.py`'s
+  `TestAdherenceGateAdvisoryVsGating`, mirroring the G3
+  `decomposition_quality`/`task_understanding` pair. This function and the
   `adherence_judge` worker above are wired into `phase_adherence_gate` (a
   whole-plan gate, not `check_planner_output` — see "Instruction-adherence
   gate" above for the phase-level wiring and the `--skip-adherence-check`
