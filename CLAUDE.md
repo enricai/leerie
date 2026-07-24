@@ -934,6 +934,25 @@ expansion loop precedes final logging); integration — one oversized subtask (s
 first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
 empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
+The plan-instruction-adherence gate's worker registration (schema, prompt,
+model/effort defaults — the gate wiring itself is separate, undelivered
+scope) is tested in two files mirroring the `fit_judge`/`splitter` pair
+above. `tests/test_adherence_judge_schema.py` covers
+`SCHEMAS["adherence_judge"]` — required fields
+(`user_prescribed_a_procedure`, `instruction_adherence`, `violations`,
+`rationale`), `instruction_adherence` bounds (0–10), the deliberate absence
+of a nested `confidence` sub-object (this worker is itself the independent
+check that replaces a self-report, so a self-confidence axis would
+reintroduce the self-grading bias the gate exists to remove), valid/invalid
+instance acceptance, JSON serializability, and wiring (`adherence_judge` in
+`WORKER_TYPES`, absent from `MODEL_DEFAULT_PER_WORKER` so it resolves to
+opus, `EFFORT_DEFAULT_PER_WORKER` entry at `"high"`, prompt file exists).
+`tests/test_resolve_adherence_judge_model.py` covers the model/effort
+resolution precedence chain (mirrors `test_resolve_fit_judge_model.py`),
+explicitly asserting the opus default — empirically required here, not
+merely conventional: calibration testing found sonnet false-positived a
+legitimate plan and an opus *understanding*-framed judge rubber-stamped the
+incident, so only the ADHERENCE frame on opus is validated.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested
