@@ -2205,15 +2205,19 @@ Resolution order (highest priority first):
 ### Judge model
 
 The `claude` model alias used when the judge skill spawns a worker to score a
-batch of captured calls. The judge does not require broad-context judgment like
-the orchestrator's core workers — `sonnet` is the right default for throughput.
+batch of captured calls against a 3-dimensional rubric. This is a judgment
+call (per CLAUDE.md's "judgment workers default to opus" rule), not
+throughput-bound work, so it defaults to `opus` like the orchestrator's core
+judgment workers — `judge` is absent from `MODEL_DEFAULT_PER_WORKER` and
+falls through to the global `MODEL_DEFAULT`.
 
 Resolution order (highest priority first):
 
 1. **`--judge-model MODEL`** CLI flag.
 2. **`LEERIE_MODEL_JUDGE`** environment variable.
-3. **`leerie.toml`**, `model_judge = "sonnet"`.
-4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["judge"]`).
+3. **`leerie.toml`**, `model_judge = "opus"`.
+4. **Default `"opus"`** (`MODEL_DEFAULT`; `judge` is absent from
+   `MODEL_DEFAULT_PER_WORKER`).
 
 ### Heal model
 
@@ -2382,13 +2386,16 @@ judgment work and `sonnet` for high-throughput implementation. Valid values:
 `sonnet` | `opus` | `haiku` (aliases — the `claude` CLI resolves them to the
 current model version).
 
-**Per-worker defaults: Opus for judgment, Sonnet for implementation, post-run analysis, and finalize-time composition.**
-Workers that exercise broad-context judgment (classify the task, decompose
-into subtasks, reconcile cross-domain coupling, detect cross-planner surface
-overlap, resolve merge conflicts behaviorally, check criteria) default to
-Opus. The implementer, conformer, judge, heal, and pr_writer workers —
-which execute concrete tasks with high throughput requirements (implementer,
-conformer) or run as one-shot post-run / finalize calls (judge, heal,
+**Per-worker defaults: Opus for judgment, Sonnet for implementation and
+finalize-time composition.** Any worker that makes a *decision* (classify
+the task, decompose into subtasks, reconcile cross-domain coupling, detect
+cross-planner surface overlap, resolve merge conflicts behaviorally, check
+criteria, score captured calls against a rubric) defaults to Opus —
+measured evidence (a real incident's judge-experiment) shows Sonnet gives
+opposite verdicts from Opus on identical judgment inputs. The implementer,
+conformer, heal, and pr_writer workers — which execute concrete tasks with
+high throughput requirements (implementer, conformer) or run as one-shot
+post-run / finalize calls with no independent-judgment role (heal,
 pr_writer) — default to Sonnet.
 
 | Worker       | Default | Why |
@@ -2397,12 +2404,12 @@ pr_writer) — default to Sonnet.
 | planner      | opus    | decomposition is the load-bearing judgment step |
 | reconciler   | opus    | cross-domain tag equivalence is judgment |
 | plan_overlap_judge | opus | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
-| satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — same profile as conformer/judge. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
+| satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — a **deliberate, documented cost tradeoff** (see the comment at `MODEL_DEFAULT_PER_WORKER["satisfied_probe"]`), not a claim that the check needs no judgment. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
 | provision    | opus    | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
 | integrator   | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
 | implementer  | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
 | conformer    | sonnet  | reads a diff and runs commands; same throughput-first profile as implementer; the phase is advisory so a borderline judgment call costs at most a warning |
-| judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
+| judge        | opus    | scoring a batch of captured calls against a 3-dimensional rubric is judgment, not throughput-bound work; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
 | dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
@@ -2410,9 +2417,9 @@ pr_writer) — default to Sonnet.
 | splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
-overrides it for specific workers (`implementer`, `conformer`, `judge`,
-`heal`, `pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture`, `fit_judge`, and `splitter` are **absent** from
+overrides it for specific workers (`implementer`, `conformer`, `heal`,
+`pr_writer`, and `satisfied_probe` all default to `sonnet`).
+`dep_capture`, `fit_judge`, `splitter`, and `judge` are **absent** from
 `MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from the global
 `MODEL_DEFAULT` fallback.
 
