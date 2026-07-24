@@ -1021,6 +1021,20 @@ triggering exactly one re-plan that then converges; exhaustion `die()`ing
 with the unresolved violations; and the two `WorkerError`-every-round
 degrade outcomes — a clean floor returning the plan unmodified, a violating
 floor still `die()`ing).
+The two-stage gate's composed end-to-end behavior — deliberately independent
+of `test_phase_adherence_gate.py`'s per-branch wiring pins — is locked as a
+regression fixture in `tests/test_adherence_gate_e2e.py`: a synthetic
+incident shape (prescribed `[foo:build, foo:generate]`, no subtask's
+`runs_commands` covers `foo:generate`) drives `check_prescribed_command_coverage`
+directly (no stubbing) to prove the floor fires before any judge/re-plan
+involvement, then drives the full `phase_adherence_gate` (opus
+`adherence_judge` stubbed to a fixed envelope, mirroring
+`test_dep_capture_worker.py`'s `_invoke` stub) to prove it re-plans exactly
+once via the existing `phase_plan`-retry path and converges on a plan the
+floor accepts; a synthetic ordinary shape (`prescribed_procedure` absent, or
+present with `is_prescribed=false`) proves the gate short-circuits with zero
+`claude_p`/`phase_plan` calls — the corpus-validated 0/21-false-positive
+result this gate exists to protect.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested
