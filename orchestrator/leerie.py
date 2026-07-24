@@ -5471,6 +5471,71 @@ def _prune_orphaned_requires(plans: list[dict],
             ]
 
 
+_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "and", "or", "of", "in", "on", "for", "with",
+})
+
+
+def _command_tokens(command: str) -> frozenset[str]:
+    """Lowercased, stopword-filtered token set for a single command string."""
+    return frozenset(
+        tok for tok in command.lower().split() if tok not in _STOPWORDS)
+
+
+def check_prescribed_command_coverage(
+    prescribed_procedure: dict | None, subtasks: list[dict],
+) -> list[str]:
+    """Deterministic JSON→verdict floor for the instruction-adherence gate.
+
+    PRIMARY, model-independent enforcement layer (DESIGN: instruction-
+    adherence is code-enforced, sibling to §12 "prompts advisory, code
+    enforces"). Computes prescribed.commands − ⋃(subtask.runs_commands)
+    under normalized (lowercased, stopword-filtered token-SUBSET) matching
+    — B4-validated: the planner emits `runs_commands` as a paraphrase that
+    wraps the prescribed command's own tokens in extra words (e.g.
+    "barnacle recon browser" for "recon browser"), never byte-identical, so
+    exact string equality would false-positive on every honored command. A
+    prescribed command is "covered" when some subtask's `runs_commands`
+    entry's salient (non-stopword) token set is a SUPERSET of the
+    prescribed command's own salient tokens — i.e. the paraphrase still
+    contains every meaningful word of the prescribed command. (A weaker
+    any-overlap rule would falsely mark an unrelated command "covered" by a
+    single shared word, e.g. two different `recon ...` subcommands sharing
+    only the token "recon".) Pure JSON→JSON set logic, no NL parsing.
+
+    Short-circuits to `[]` (free) when `prescribed_procedure` is absent or
+    `is_prescribed` is falsy, and when `commands` is empty (a goal-only task
+    has nothing to check coverage against — 0 false positives by
+    construction).
+    """
+    prescribed = prescribed_procedure or {}
+    if not prescribed.get("is_prescribed"):
+        return []
+    commands = prescribed.get("commands") or []
+    if not commands:
+        return []
+
+    run_token_sets = [
+        _command_tokens(rc)
+        for s in subtasks
+        for rc in (s.get("runs_commands") or [])
+        if isinstance(rc, str) and rc.strip()
+    ]
+
+    issues: list[str] = []
+    for cmd in commands:
+        if not isinstance(cmd, str) or not cmd.strip():
+            continue
+        cmd_tokens = _command_tokens(cmd)
+        covered = bool(cmd_tokens) and any(
+            cmd_tokens <= run_tokens for run_tokens in run_token_sets)
+        if not covered:
+            issues.append(
+                f"PRESCRIBED_CMD_UNRUN: prescribed command {cmd!r} is not "
+                "covered by any subtask's runs_commands")
+    return issues
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:

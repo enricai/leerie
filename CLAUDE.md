@@ -992,6 +992,22 @@ explicitly asserting the opus default — empirically required here, not
 merely conventional: calibration testing found sonnet false-positived a
 legitimate plan and an opus *understanding*-framed judge rubber-stamped the
 incident, so only the ADHERENCE frame on opus is validated.
+The deterministic PRIMARY layer of the same gate,
+`check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
+list[str]` (pure JSON→verdict set logic, no NL parsing — the gate wiring
+into `check_planner_output` is separate, undelivered scope), is tested in
+`tests/test_prescribed_cmd_coverage.py`: the motivating incident shape
+(prescribed `recon browser`/`recon generate`, no subtask's `runs_commands`
+covers either → both fire), a goal-only task (`is_prescribed=false` or
+`commands=[]`, including `None`/`{}`) staying silent, paraphrase coverage
+(the planner's `runs_commands` wraps the prescribed command's own tokens in
+extra words, e.g. "barnacle recon browser" covers "recon browser", via
+normalized lowercased/stopword-filtered token-SUBSET matching — not exact
+string equality), full and partial coverage, no-subtasks-at-all firing for
+every prescribed command, tolerance of subtasks with missing/empty
+`runs_commands` and of non-string/blank prescribed commands, case-
+insensitivity, and a negative control proving a shared-stopword-only overlap
+does not falsely mark a command covered.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested
