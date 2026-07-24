@@ -257,7 +257,7 @@ def test_judgment_workers_pinned_set(leerie):
     assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == {
         "classifier", "planner", "reconciler", "plan_overlap_judge",
         "provision", "integrator", "pr_writer", "dep_capture",
-        "fit_judge", "splitter",
+        "fit_judge", "splitter", "adherence_judge",
     }
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
