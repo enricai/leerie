@@ -27,7 +27,18 @@ A subtask is **well-fit** when ALL of the following hold:
    well-fit if the *cognitive* scope is minimal — judge cognitive scope,
    not raw file count.
 
-4. **No hidden broad surface.** The subtask's intent does not implicitly
+4. **Bounded edit-site density within a file.** Low file count is *not* on
+   its own evidence of good fit. A subtask touching **one** file but with
+   many edit sites spread across thousands of lines (e.g., "route every
+   call through a new guard" across a 7,000-line file) is over-scoped for a
+   single session even though it lists one file — the mirror image of a
+   many-file sweep. Score such a subtask **under-fit** (below 0.70). You do
+   not need to devise the split yourself: the orchestrator region-splits an
+   over-scoped single file deterministically once you score it under the
+   threshold. Judge honestly — a large, dense single file is a split
+   candidate, not an automatic leaf.
+
+5. **No hidden broad surface.** The subtask's intent does not implicitly
    require touching broad surfaces (e.g., "update all callers of foo()")
    without those surfaces being explicitly enumerated and bounded.
 

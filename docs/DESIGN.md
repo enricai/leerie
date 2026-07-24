@@ -820,6 +820,50 @@ split mechanism therefore separates by structural type:
   that the repo-map exposes, backstopped by the existing `UNCOVERED_MIGRATION_SURFACE`
   check (`_check_migration_surface`) which already rejects any split that fails to
   cover every file.
+- **Sub-file (a single dense file):** the mirror image of the many-file migration
+  sweep. Both whole-file mechanisms above operate at file granularity, so neither
+  can help a subtask whose entire scope is *one* very large, edit-dense file — and
+  the coupled-minority LLM splitter, asked to split one file, can only return it
+  unchanged. That leaves such a subtask with exactly one representation: a
+  monolithic unit too large to hold in one implementer context, finish before a
+  transport blip, or checkpoint before dying. Measured failure (run `5d488583`,
+  subtask feat-005): a 7,041-line file with ~85 edit sites failed 9 times across
+  three runs, each attempt restarting from scratch because it died before writing
+  a checkpoint. leerie's telemetry already grounds the many-file case (§5½: 20% of
+  runs exhaust the budget, 84% in migration sweeps of 30–65 files); the single
+  dense file is the un-covered variant. The mechanism decomposes *within* the
+  file, deterministically, in two tiers:
+  - **Tier 1 — function boundaries.** Tree-sitter symbol spans
+    (`_extract_symbol_ranges`, reading `item.span.start_line`/`end_line`) tile
+    `[1, EOF]` with no gaps or overlap by construction — the `partition_files`
+    guarantee applied to ordered line spans (inter-symbol gaps attach to the
+    preceding region so the union stays exhaustive). Adjacent functions group
+    until a region approaches `subfile_split_max_span`.
+  - **Tier 2 — line windows.** A *single function* can itself exceed the span cap
+    (measured: `executeStepWithHealing` is 1,733 lines — 25% of the file and 34%
+    of feat-005's edit sites — 3.7× the largest function in any sibling file).
+    Function boundaries cannot break it, so that one region is sub-split into
+    contiguous line-windows via the same tiling. This tier needs no range data and
+    is also the whole-file fallback when tree-sitter yields no ranges.
+
+  Each child owns a region of the same file, so N children co-own it. This is
+  already legitimate everywhere downstream: `schedule()` derives waves only from
+  `depends_on`/`requires` (never `files_likely_touched`), so co-owners run the
+  same wave in parallel; the phase 2¾ overlap judge's charter is *same exported
+  artifact with incompatible APIs* and it explicitly excludes "multiple primitive
+  extractions in the same parent file"; and integration is a plain `git merge`
+  whose 3-way merge clean-merges non-overlapping regions, escalating to the
+  integrator worker only on a true textual conflict. The one deliberate
+  interaction: `check_planner_output`'s advisory `INTRA_DOMAIN_OVERLAP` warning
+  ("consider merging or splitting") is suppressed for children tagged with a
+  co-ownership cluster marker, since the overlap is intentional — an accidental
+  same-file overlap between unrelated subtasks still warns. `_check_intra_file_surface`
+  is the zero-tolerance analog of `_check_migration_surface`: the child regions'
+  union must equal `[1, EOF]` and be pairwise-disjoint. Bound:
+  `DEFAULT_CAPS["subfile_split_max_span"]` (line-span above which a file or region
+  is split rather than left a leaf — a heuristic anchored to the measured
+  1,733-vs-≤474 span separation, not telemetry-calibrated like the 0.70 fit
+  threshold).
 
 **`recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
 

@@ -237,6 +237,20 @@ DEFAULT_CAPS = {
     # indefinitely. Prevents a degenerate splitter output from looping to
     # decompose_max_depth.
     "decompose_noprogress_rounds": 2,
+    # Sub-file split span for recursive_decompose() (DESIGN §5½ (P1) *Sub-file*).
+    # A single-file subtask (or a single intra-file region) whose line span
+    # exceeds this is split *within* the file — tier 1 on tree-sitter
+    # function-boundary spans, tier 2 on contiguous line-windows for a function
+    # that alone exceeds the cap. This is the un-covered mirror of the many-file
+    # migration sweep: the whole-file splitter cannot break one dense file, so
+    # such a subtask would otherwise be an unwinnable monolith (run 5d488583,
+    # feat-005 — a 7041-line file failed 9 times). HEURISTIC, not
+    # telemetry-calibrated like decompose_fit_threshold: anchored to that run's
+    # measured span separation — the 1733-line executeStepWithHealing (25% of
+    # the file, 34% of its edit sites) vs a largest-function span of ≤474 in
+    # every sibling file. ~700 splits the giant into 2–3 windows and leaves a
+    # normal function whole.
+    "subfile_split_max_span": 700,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -4952,6 +4966,119 @@ def partition_files(files: list[str], chunk_size: int) -> list[list[str]]:
     return chunks
 
 
+def partition_lines(lo: int, hi: int, max_span: int) -> list[tuple[int, int]]:
+    """Tile the inclusive line range ``[lo, hi]`` into contiguous windows of at
+    most *max_span* lines each (DESIGN §5½ (P1) *Sub-file* — tier 2).
+
+    100% coverage + 0 overlap by construction (the ``partition_files`` guarantee
+    on line numbers instead of files): every line in ``[lo, hi]`` falls in exactly
+    one window, the last window may be shorter. Used to sub-split a single
+    function whose span alone exceeds the cap (function boundaries can't break it)
+    and as the whole-file fallback when tree-sitter yields no symbol ranges.
+    Degenerate guards mirror ``partition_files``: an empty range (``hi < lo``)
+    returns ``[]``; ``max_span < 1`` returns the whole range as one window."""
+    if hi < lo:
+        return []
+    if max_span < 1:
+        return [(lo, hi)]
+    windows: list[tuple[int, int]] = []
+    start = lo
+    while start <= hi:
+        windows.append((start, min(start + max_span - 1, hi)))
+        start += max_span
+    return windows
+
+
+def partition_symbols_by_line(
+    ranges: list[tuple[str, int, int]], total_lines: int, max_span: int,
+) -> list[tuple[int, int]]:
+    """Tile ``[1, total_lines]`` into contiguous regions on function boundaries
+    (DESIGN §5½ (P1) *Sub-file* — tier 1).
+
+    *ranges* is ``_extract_symbol_ranges``' output: ``(name, start, end)`` for the
+    file's top-level symbols, sorted by start line. Regions are built so that:
+
+    - the union is exactly ``[1, total_lines]`` with no gaps or overlap — an
+      inter-symbol gap (blank lines, imports, a comment block) attaches to the
+      *preceding* region, and the final region extends to ``total_lines``, so the
+      tiling stays exhaustive by construction (the ``partition_files`` guarantee);
+    - a region grows by absorbing whole adjacent symbols until adding the next
+      would push it past *max_span*, then a new region starts;
+    - a **single symbol whose own span exceeds *max_span*** still becomes its own
+      region rather than being force-merged — function boundaries cannot break it,
+      so it is handed back oversized on purpose. ``recursive_decompose`` re-enters
+      that region and tier 2 (``partition_lines``) sub-splits it. This is the
+      1,733-line-function case (run 5d488583).
+
+    Returns ``[(1, total_lines)]`` when there are no usable ranges — the caller
+    then falls back to tier-2 line-windows over the whole file."""
+    if total_lines < 1:
+        return []
+    usable = [r for r in ranges if 1 <= r[1] <= r[2] <= total_lines]
+    if not usable:
+        return [(1, total_lines)]
+
+    regions: list[tuple[int, int]] = []
+    cur_start = 1
+    cur_end = 0  # exclusive-of-nothing sentinel; first symbol sets the real end
+    for _name, _s, e in usable:
+        if cur_end == 0:
+            # First symbol: region opened at line 1 absorbs any leading gap.
+            cur_end = e
+            continue
+        # Would absorbing this symbol keep the region within the cap? The region
+        # spans cur_start..e if we absorb. A region already at/over the cap, or
+        # one that would exceed it, closes first — unless it holds a single
+        # oversized symbol, which we intentionally let stand alone (handled by
+        # the close-then-open below producing a >max_span region for tier 2).
+        if (e - cur_start + 1) > max_span and (cur_end - cur_start + 1) > 0:
+            regions.append((cur_start, cur_end))
+            cur_start = cur_end + 1
+        cur_end = e
+    # Final region extends to EOF so the union is exhaustive.
+    regions.append((cur_start, total_lines))
+    return regions
+
+
+def _check_intra_file_surface(
+    regions: list[tuple[int, int]], total_lines: int,
+) -> list[str]:
+    """Zero-tolerance coverage/overlap backstop for an intra-file partition
+    (DESIGN §5½ (P1) *Sub-file*) — the analog of ``_check_migration_surface``.
+
+    Returns a list of issue strings (empty when the partition is exact). The
+    tiling helpers guarantee this by construction, so a non-empty result means a
+    real bug in the partitioner, not a tolerable slack — unlike the file-level
+    check's slack of 5, this demands the region union equal ``[1, total_lines]``
+    exactly and be pairwise-disjoint."""
+    issues: list[str] = []
+    if total_lines < 1:
+        return issues
+    covered: set[int] = set()
+    overlaps = 0
+    for lo, hi in regions:
+        for ln in range(lo, hi + 1):
+            if ln in covered:
+                overlaps += 1
+            covered.add(ln)
+    expected = set(range(1, total_lines + 1))
+    missing = expected - covered
+    extra = covered - expected
+    if missing:
+        issues.append(
+            f"INTRA_FILE_UNCOVERED: {len(missing)} line(s) not owned by any "
+            f"region (e.g. {sorted(missing)[:10]})")
+    if extra:
+        issues.append(
+            f"INTRA_FILE_OUT_OF_RANGE: {len(extra)} region line(s) outside "
+            f"[1, {total_lines}] (e.g. {sorted(extra)[:10]})")
+    if overlaps:
+        issues.append(
+            f"INTRA_FILE_OVERLAP: {overlaps} line(s) owned by more than one "
+            "region")
+    return issues
+
+
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
                      title: str, criteria: str) -> dict:
     """Build one migration-chunk child subtask from its (code-fixed) file
@@ -4996,6 +5123,57 @@ def _deterministic_chunk_label(subtask: dict, chunk: list[str],
         f"Scope: only these files — {files_txt}."
     ).strip()
     return title, criteria
+
+
+def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
+                   symbols: list[str], cid: str, cluster: str,
+                   idx: int, total: int) -> dict:
+    """Build one sub-file child owning a *region* (``(start, end)`` lines) of a
+    single *file* (DESIGN §5½ (P1) *Sub-file*). The analog of ``_migration_child``
+    for intra-file splitting.
+
+    Same deep-copy edge discipline as ``_migration_child`` (see its docstring —
+    aliased lists leak dependencies via `_apply_overlap_drop`). Differences:
+
+    - ``files_likely_touched`` is the *single* parent file — every region child
+      co-owns it, which is legitimate downstream (schedule ignores files; the
+      overlap judge excludes same-file/different-region; `git merge` reconciles).
+    - ``owned_region`` records the code-computed line range + the symbols it
+      contains, so the implementer's prompt scopes it to that span.
+    - ``_cofile_cluster`` marks the child as part of an *intentional* same-file
+      cluster, so ``check_planner_output`` suppresses its advisory
+      INTRA_DOMAIN_OVERLAP warning ("consider merging or splitting" — the opposite
+      of what we want here).
+    - No sibling ``depends_on``: region children edit disjoint line ranges of one
+      file and are independently implementable, so they stay in the same wave
+      (the parent's own inbound/outbound edges are inherited by every child, as on
+      the migration path)."""
+    lo, hi = region
+    parent_title = subtask.get("title", "file change")
+    sym_txt = ", ".join(symbols) if symbols else "(no named symbols in range)"
+    title = f"{parent_title} (region {idx + 1}/{total}: lines {lo}-{hi})"
+    criteria = (
+        f"{subtask.get('success_criteria_seed', '')}\n"
+        f"Scope: only lines {lo}-{hi} of {file} "
+        f"(symbols: {sym_txt}). Do not edit outside this range; a sibling "
+        f"subtask owns the rest of the file."
+    ).strip()
+    return {
+        "id": cid,
+        "title": title,
+        "success_criteria_seed": criteria,
+        "files_likely_touched": [file],
+        "owned_region": {"file": file, "start": lo, "end": hi,
+                         "symbols": list(symbols)},
+        "_cofile_cluster": cluster,
+        "intent": subtask.get("intent", ""),
+        "scope_note": subtask.get("scope_note", ""),
+        "depends_on": list(subtask.get("depends_on", []) or []),
+        "requires": copy.deepcopy(subtask.get("requires", []) or []),
+        "provides": list(subtask.get("provides", []) or []),
+        "size": "medium",
+        "investigation_notes": subtask.get("investigation_notes", ""),
+    }
 
 
 async def _label_migration_chunks(
@@ -5067,6 +5245,84 @@ async def _label_migration_chunks(
     ]
 
 
+def _subfile_split(subtask: dict, repo_root: Path,
+                   max_span: int) -> list[dict]:
+    """Split a single-file subtask *within* the file into region-owning children
+    (DESIGN §5½ (P1) *Sub-file*). Pure + deterministic — no LLM decides
+    membership. Returns ``[]`` when the subtask is not a sub-file split candidate
+    or cannot be split further (the caller then treats the node as a leaf).
+
+    Two entry shapes, both routed here from ``recursive_decompose``:
+
+    - **First entry** — a whole single-file subtask with no ``owned_region``. Tier
+      1: tile the file on function-boundary spans (`partition_symbols_by_line`).
+      A region that is itself over the cap comes back oversized and re-enters
+      recursion, hitting the second shape below.
+    - **Re-entry** — a child carrying ``owned_region`` whose span still exceeds the
+      cap (a single function larger than the cap, e.g. the 1,733-line
+      `executeStepWithHealing`). Tier 2: contiguous line-windows over that region
+      (`partition_lines`), which needs no symbol ranges.
+
+    Coverage/overlap is guaranteed by construction and re-asserted by
+    `_check_intra_file_surface`; a backstop failure logs and returns ``[]`` (fall
+    back to a leaf) rather than emitting a broken partition."""
+    files = subtask.get("files_likely_touched") or []
+    if len(files) != 1:
+        return []
+    file = files[0]
+    base_id = subtask.get("id", "split")
+    cluster = subtask.get("_cofile_cluster") or base_id
+    owned = subtask.get("owned_region")
+
+    if owned:
+        # Re-entry: tier-2 line-windows over the already-owned region.
+        lo, hi = owned.get("start", 1), owned.get("end", 1)
+        if (hi - lo + 1) <= max_span:
+            return []  # small enough — leaf
+        windows = partition_lines(lo, hi, max_span)
+        surface_total = hi - lo + 1
+        # shift windows into a 1-based frame only for the backstop check
+        shifted = [(w0 - lo + 1, w1 - lo + 1) for w0, w1 in windows]
+        issues = _check_intra_file_surface(shifted, surface_total)
+        regions = windows
+        symbols_per = [[] for _ in regions]
+    else:
+        # First entry: tier-1 function-boundary tiling of the whole file.
+        abs_path = repo_root / file
+        try:
+            total_lines = abs_path.read_text(errors="replace").count("\n") + 1
+        except OSError:
+            return []  # file unreadable — can't region-split; leave as leaf
+        if total_lines <= max_span:
+            return []  # whole file already within the cap — leaf
+        ranges = _extract_symbol_ranges(abs_path)
+        regions = partition_symbols_by_line(ranges, total_lines, max_span)
+        if len(regions) <= 1:
+            # No usable boundaries (or one span covers the file): tier-2 fallback
+            # over the whole file so a range-less large file still gets split.
+            regions = partition_lines(1, total_lines, max_span)
+        issues = _check_intra_file_surface(regions, total_lines)
+        # Attach the symbols that fall inside each region for the child's prompt.
+        symbols_per = []
+        for lo, hi in regions:
+            symbols_per.append(
+                [n for (n, s, e) in ranges if lo <= s and e <= hi])
+
+    if issues:
+        log(f"recursive_decompose: intra-file partition of {file!r} failed its "
+            f"coverage backstop ({issues}); accepting as leaf")
+        return []
+    if len(regions) <= 1:
+        return []  # nothing gained — leaf
+
+    total = len(regions)
+    return [
+        _subfile_child(subtask, file, region, symbols_per[i],
+                       f"{base_id}-r{i + 1}", cluster, i, total)
+        for i, region in enumerate(regions)
+    ]
+
+
 async def recursive_decompose(
     subtask: dict,
     depth: int,
@@ -5107,6 +5363,27 @@ async def recursive_decompose(
                          DEFAULT_CAPS["decompose_fit_threshold"])
     noprogress_max = caps.get("decompose_noprogress_rounds",
                               DEFAULT_CAPS["decompose_noprogress_rounds"])
+    max_span = caps.get("subfile_split_max_span",
+                        DEFAULT_CAPS["subfile_split_max_span"])
+
+    # Sub-file region re-entry (DESIGN §5½ (P1) *Sub-file*, tier 2): a child that
+    # already owns a code-computed line region needs no fit_judge — the split
+    # decision is mechanical (its span vs the cap), and an LLM cannot sub-split a
+    # single region anyway. Deciding here, before the worker spawn, both keeps the
+    # decision code-enforced (§12) and saves a fit_judge call per region. A region
+    # over the cap (a single function larger than the cap, e.g. the 1,733-line
+    # executeStepWithHealing) is tier-2 line-window split even if it would have
+    # scored well-fit; one within the cap is a leaf. Depth cap still bounds it.
+    if subtask.get("owned_region") and depth < max_depth:
+        region_children = _subfile_split(subtask, repo_root, max_span)
+        if region_children:
+            leaves: list[dict] = []
+            for child in region_children:
+                leaves.extend(await recursive_decompose(
+                    child, depth + 1, st, caps, models, efforts, repo_root,
+                    repo_map=repo_map))
+            return leaves
+        return [subtask]  # region within span (or unsplittable) → leaf
 
     # Per-node P6 grounding: re-rank the global repo-map to this subtask's
     # files so the fit_judge/splitter see the local structural neighborhood
@@ -5189,10 +5466,21 @@ async def recursive_decompose(
 
     # --- split step ----------------------------------------------------------
     files = subtask.get("files_likely_touched") or []
+    # Sub-file path (DESIGN §5½ (P1) *Sub-file*): a single dense file (or a
+    # single oversized region re-entering) is split WITHIN the file, since the
+    # whole-file splitter below cannot break one file. Checked first; falls
+    # through to the file-count fork when it returns no children (not a
+    # candidate, or already small enough). Deterministic — no worker spawn.
+    subfile_children = _subfile_split(
+        subtask, repo_root,
+        caps.get("subfile_split_max_span",
+                 DEFAULT_CAPS["subfile_split_max_span"]))
+    chunk_size = 8
+    if subfile_children:
+        children = subfile_children
     # Migration path (dominant case, ~84%): code-partitions, LLM only labels.
     # Coupled-minority path: LLM-splitter decides the partition.
-    chunk_size = 8
-    if len(files) > chunk_size:
+    elif len(files) > chunk_size:
         # Migration sweep: partition_files guarantees 100% coverage + 0 overlap
         # BY CONSTRUCTION (the code owns the partition — DESIGN §5½). The
         # splitter worker is then invoked in LABEL-ONLY mode: it titles and
@@ -5409,15 +5697,28 @@ def check_planner_output(
                 f"OVERSIZED: {s.get('id', '?')} has size='large' "
                 "— split it")
 
-    file_owners: dict[str, list[str]] = {}
+    # Track each file's owners as (id, cofile_cluster) so a *deliberate* sub-file
+    # split (DESIGN §5½ (P1) *Sub-file*) does not trip the advisory: region
+    # children of one file all carry the same `_cofile_cluster` marker, and their
+    # same-file overlap is intentional co-ownership, not a planning smell. The
+    # warning still fires when the owners are NOT a single coherent cluster — an
+    # accidental overlap between unrelated subtasks, or two different clusters on
+    # one file.
+    file_owners: dict[str, list[tuple[str, str | None]]] = {}
     for s in subtasks:
         for f in s.get("files_likely_touched", []):
-            file_owners.setdefault(f, []).append(s.get("id", "?"))
+            file_owners.setdefault(f, []).append(
+                (s.get("id", "?"), s.get("_cofile_cluster")))
     for f, owners in file_owners.items():
-        if len(owners) > 1:
-            issues.append(
-                f"INTRA_DOMAIN_OVERLAP: {f!r} touched by "
-                f"{owners} — consider merging or splitting")
+        if len(owners) <= 1:
+            continue
+        clusters = {c for (_sid, c) in owners}
+        # A single non-None cluster shared by every owner is a deliberate split.
+        if len(clusters) == 1 and None not in clusters:
+            continue
+        issues.append(
+            f"INTRA_DOMAIN_OVERLAP: {f!r} touched by "
+            f"{[sid for (sid, _c) in owners]} — consider merging or splitting")
 
     for s in subtasks:
         bad = [f for f in (s.get("files_likely_touched") or [])
@@ -5982,6 +6283,52 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
     except Exception as e:  # graceful degrade; tree-sitter parse errors, IO, etc.
         _last_parse_error = f"{type(e).__name__}: {e}"
         return [], []
+
+
+def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
+    """Return the top-level symbols of *path* as ``(name, start_line, end_line)``,
+    sorted by ``start_line`` — the ordered, exhaustive span sequence the sub-file
+    splitter tiles into regions (DESIGN §5½ (P1) *Sub-file*).
+
+    Deliberately separate from ``_parse_repo_file`` / ``build_repo_map``: the
+    repo-map graph stores bare symbol *names* (no positions) and is pinned by
+    ~10 tests plus an mtime cache whose shape those tests fix. Reading ranges
+    through a dedicated function keeps that contract — and its cache — untouched,
+    at the cost of a second ``tslp.process`` call on the one file being split
+    (rare, and only when a single-file subtask is over-scoped).
+
+    Only **top-level** symbols are tiled: nested defs live inside their parent's
+    span, so including them would double-count lines. ``item.span`` is a ``Span``
+    whose ``start_line``/``end_line`` are **0-based**; this function normalizes to
+    the 1-based, inclusive line numbers the partitioner, prompts, and editors use.
+    Returns ``[]`` when the language is unsupported or extraction fails — the
+    caller falls back to tier-2 line-windows over the whole file
+    (``partition_lines``)."""
+    try:
+        import tree_sitter_language_pack as tslp  # noqa: PLC0415
+    except ImportError:
+        return []
+    try:
+        lang = tslp.detect_language(str(path))
+        if not lang:
+            return []
+        source = path.read_text(errors="replace")
+        proc_result = tslp.process(
+            source,
+            tslp.ProcessConfig(language=lang, structure=True, imports=False),
+        )
+        ranges: list[tuple[str, int, int]] = []
+        for item in proc_result.structure:
+            span = getattr(item, "span", None)
+            if item.name and span is not None:
+                # tree-sitter Span line numbers are 0-based; normalize to the
+                # 1-based line numbers the partitioner, prompts, and editors use.
+                ranges.append(
+                    (item.name, span.start_line + 1, span.end_line + 1))
+        ranges.sort(key=lambda r: r[1])
+        return ranges
+    except Exception:  # graceful degrade — caller uses the line-window fallback
+        return []
 
 
 # Source-code extensions used only to detect the G6 "repo has code but the
@@ -16573,6 +16920,40 @@ def _read_upstream_artifacts(leerie_dir: Path,
     return out
 
 
+def _format_owned_region_section(leerie_dir: Path, sid: str) -> str | None:
+    """Render the sub-file region-ownership prompt section for `sid`, or None
+    when the subtask owns no region (the common case — only sub-file split
+    children carry `owned_region`; DESIGN §5½ (P1) *Sub-file*).
+
+    Read from the on-disk spec so the resume path is identical to the fresh
+    path (mirrors `_format_upstream_artifacts_for_sid`)."""
+    spec_path = leerie_dir / "subtasks" / f"{sid}.json"
+    if not spec_path.exists():
+        return None
+    try:
+        spec = json.loads(spec_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    region = spec.get("owned_region")
+    if not region:
+        return None
+    file = region.get("file", "?")
+    lo, hi = region.get("start", "?"), region.get("end", "?")
+    symbols = region.get("symbols") or []
+    sym_txt = ", ".join(symbols) if symbols else "(no named symbols in range)"
+    return (
+        "\nOWNED_REGION:\n"
+        f"  This subtask owns ONLY lines {lo}-{hi} of {file} "
+        f"(symbols: {sym_txt}).\n"
+        "  A sibling subtask owns the rest of the same file and runs in "
+        "parallel. Confine your edits to this line range: edits outside it "
+        "risk an integration merge conflict the sibling would otherwise "
+        "resolve cleanly. If the change genuinely requires touching a "
+        "shared declaration outside your range (e.g. a type used by several "
+        "regions), make the minimal edit and note it in your summary."
+    )
+
+
 def _format_upstream_artifacts_for_sid(leerie_dir: Path,
                                         sid: str) -> str | None:
     """End-to-end helper: load the persisted plan, recompute the
@@ -16783,6 +17164,15 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     convention_docs_section = _format_convention_docs_section(st.repo_root)
     if convention_docs_section is not None:
         up.append(convention_docs_section)
+    # DESIGN §5½ (P1) *Sub-file*: a region child owns only a line range of a
+    # shared file. Surface the range explicitly so the implementer stays inside
+    # it — a sibling owns the rest of the same file, and edits outside the range
+    # risk an integration conflict the sibling would otherwise own cleanly. Read
+    # from the on-disk spec (same source the worker reads) so --resume is
+    # identical to a fresh run.
+    region_section = _format_owned_region_section(leerie_dir, sid)
+    if region_section is not None:
+        up.append(region_section)
     if continuation:
         up.append(f"This is a CONTINUATION. Read the checkpoint at "
                   f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "

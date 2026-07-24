@@ -131,6 +131,7 @@ def _make_caps(leerie, **overrides):
         "decompose_max_depth": leerie.DEFAULT_CAPS["decompose_max_depth"],
         "decompose_fit_threshold": leerie.DEFAULT_CAPS["decompose_fit_threshold"],
         "decompose_noprogress_rounds": leerie.DEFAULT_CAPS["decompose_noprogress_rounds"],
+        "subfile_split_max_span": leerie.DEFAULT_CAPS["subfile_split_max_span"],
     }
     caps.update(overrides)
     return caps
@@ -678,3 +679,196 @@ def test_recursive_decompose_migration_remap_is_a_noop(leerie):
         assert leaf["provides"] == ["cfg"]
         # No child names a sibling, so nothing to remap.
         assert not [d for d in leaf["depends_on"] if d in ids]
+
+
+# ---------------------------------------------------------------------------
+# recursive_decompose — sub-file split (DESIGN §5½ (P1) *Sub-file*)
+# ---------------------------------------------------------------------------
+
+def _write_lines(path: Path, n: int) -> None:
+    path.write_text("\n".join(f"line {i}" for i in range(1, n + 1)))
+
+
+def test_subfile_oversized_single_file_region_splits(leerie, tmp_path):
+    """A low-fit single-file subtask over the span cap is region-split into
+    children that each own the same file, tile it exactly, and pass as leaves —
+    with NO splitter worker call (the split is fully code-owned)."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    parent = {
+        "id": "feat-005",
+        "title": "Route everything through the guard",
+        "success_criteria_seed": "all sites routed",
+        "files_likely_touched": ["big.ts"],
+    }
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    # Deterministic ranges: two normal functions + one giant (>cap).
+    ranges = [("small1", 1, 100), ("giant", 200, 1900), ("small2", 1901, 1950)]
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            # Parent scores low → split. Region children never reach fit_judge
+            # (the owned_region early path is mechanical), so any fit call here
+            # is the parent.
+            return _fit_response(0.30)
+        pytest.fail(f"no worker expected for a sub-file split, got {schema_key!r}")
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    # Every leaf owns the same single file with an owned_region + cluster marker.
+    assert len(leaves) >= 2
+    for leaf in leaves:
+        assert leaf["files_likely_touched"] == ["big.ts"]
+        assert leaf["owned_region"]["file"] == "big.ts"
+        assert leaf["_cofile_cluster"] == "feat-005"
+        # every region within the cap after the two tiers composed
+        r = leaf["owned_region"]
+        assert (r["end"] - r["start"] + 1) <= 700
+    # Regions tile [1, 2000] exactly (100% coverage, 0 overlap).
+    spans = sorted((l["owned_region"]["start"], l["owned_region"]["end"])
+                   for l in leaves)
+    covered = set()
+    for a, b in spans:
+        rng = set(range(a, b + 1))
+        assert not (rng & covered), "regions overlap"
+        covered |= rng
+    assert covered == set(range(1, 2001))
+
+
+def test_subfile_ids_carry_domain_prefix(leerie, tmp_path):
+    """Region-child ids keep the parent's domain prefix so validate_plan's
+    id-prefix check and schedule() cross-domain wiring still pass."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["big.ts"]}
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+    ranges = [("a", 1, 900), ("b", 901, 1950)]
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        return _fit_response(0.30)
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    for leaf in leaves:
+        assert leaf["id"].startswith("feat-")
+
+
+def test_subfile_no_ranges_uses_line_window_fallback(leerie, tmp_path):
+    """When tree-sitter yields no ranges (unparseable / absent), a large single
+    file still splits via tier-2 line-windows over the whole file."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["big.ts"]}
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        return _fit_response(0.30)
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    assert len(leaves) >= 3  # 2000 / 700 → 3 windows
+    covered = set()
+    for leaf in leaves:
+        r = leaf["owned_region"]
+        covered |= set(range(r["start"], r["end"] + 1))
+    assert covered == set(range(1, 2001))
+
+
+def test_subfile_small_file_not_split(leerie, tmp_path):
+    """A single-file subtask under the span cap is NOT sub-file split — it
+    follows the normal fit-judge path (here scores well-fit → leaf)."""
+    f = tmp_path / "small.ts"
+    _write_lines(f, 120)
+    parent = {"id": "feat-010", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["small.ts"]}
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.85)  # well-fit → leaf
+        pytest.fail("no split expected for a small single file")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    assert leaves == [parent]
+    assert "owned_region" not in parent
+
+
+def test_subfile_unreadable_file_degrades_to_normal_path(leerie, tmp_path):
+    """A single-file subtask whose file does not exist on disk cannot be
+    region-split; it degrades to the normal path (coupled splitter) rather
+    than crashing."""
+    parent = {"id": "feat-020", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["does-not-exist.ts"]}
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            if sid.endswith("-d0"):
+                return _fit_response(0.30)  # parent low → try to split
+            return _fit_response(0.85)
+        elif schema_key == "splitter":
+            # coupled path reached (file unreadable → no sub-file split)
+            return {"children": []}  # no children → parent becomes leaf
+        pytest.fail(f"unexpected {schema_key!r}")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    # Degraded cleanly to a leaf via the coupled path, no crash.
+    assert leaves == [parent]
+
+
+def test_subfile_bump_workers_not_called_for_region_children(leerie, tmp_path):
+    """Region children are decided mechanically (no fit_judge worker), so the
+    only worker spawn is the parent's single fit_judge call."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
+              "files_likely_touched": ["big.ts"]}
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+    ranges = [("a", 1, 900), ("b", 901, 1950)]
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        return _fit_response(0.30)
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    # Exactly one worker call: the parent fit_judge. Region children add none.
+    assert st.bump_workers.call_count == 1

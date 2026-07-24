@@ -6,6 +6,15 @@ Your job: split an over-scoped subtask into smaller child subtasks that each
 have high P1 Task-Context Fit. You operate in two modes depending on what
 the orchestrator provides:
 
+> **Not your job: a single over-scoped file.** When a subtask's whole scope is
+> one large, edit-dense file, the orchestrator splits it *within* the file —
+> deterministically, on function boundaries and line-windows — into
+> region-owning children, without invoking you. You will never be asked to
+> break one file into sub-file pieces; if you receive a subtask listing a
+> single file, treat it under Mode B (a genuine multi-file seam split does not
+> apply) and, if it truly cannot be split across files, return no children so
+> the orchestrator accepts it as-is.
+
 ## Mode A — Migration sweep (pre-partitioned chunks)
 
 When `files_likely_touched` has already been partitioned into per-chunk

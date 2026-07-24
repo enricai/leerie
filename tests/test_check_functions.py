@@ -185,6 +185,46 @@ class TestCheckPlannerOutput:
         issues = leerie.check_planner_output(plan, tmp_path, "testing")
         assert any("INTRA_DOMAIN_OVERLAP" in i for i in issues)
 
+    def test_intra_domain_overlap_suppressed_for_cofile_cluster(self, leerie, tmp_path):
+        # Deliberate sub-file split (DESIGN §5½ (P1) *Sub-file*): region children
+        # of one file share a _cofile_cluster marker — their same-file overlap is
+        # intentional and must NOT trip the advisory.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "big.ts").touch()
+        plan = self._plan([
+            {"id": "test-001-r1", "title": "region 1",
+             "success_criteria_seed": "x",
+             "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "test-001",
+             "depends_on": [], "size": "small"},
+            {"id": "test-001-r2", "title": "region 2",
+             "success_criteria_seed": "y",
+             "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "test-001",
+             "depends_on": [], "size": "small"},
+        ])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("INTRA_DOMAIN_OVERLAP" in i for i in issues)
+
+    def test_intra_domain_overlap_still_warns_on_mixed_cluster(self, leerie, tmp_path):
+        # A cluster child plus an UNRELATED subtask on the same file is an
+        # accidental overlap, not a coherent cluster — the advisory still fires.
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "big.ts").touch()
+        plan = self._plan([
+            {"id": "test-001-r1", "title": "region 1",
+             "success_criteria_seed": "x",
+             "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "test-001",
+             "depends_on": [], "size": "small"},
+            {"id": "test-009", "title": "unrelated",
+             "success_criteria_seed": "z",
+             "files_likely_touched": ["src/big.ts"],
+             "depends_on": [], "size": "small"},
+        ])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("INTRA_DOMAIN_OVERLAP" in i for i in issues)
+
     def test_protected_path(self, leerie, tmp_path):
         plan = self._plan([{
             "id": "test-001", "title": "t",

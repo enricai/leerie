@@ -4308,6 +4308,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | P1 recursive decompose max depth (`decompose_max_depth`) | 5 | Maximum recursion depth for `recursive_decompose()` (DESIGN §5½ (P1) *Recursive judge + splitter*). Recursion terminates at depth ≥ 5 even if `fit_judge` still scores below `decompose_fit_threshold`. A depth-5 tree can represent up to 32 leaves from one subtask. Not user-tunable via CLI / env / toml. |
 | P1 fit-judge pass threshold (`decompose_fit_threshold`) | 0.70 | `fit_judge` confidence score at or above which a subtask is accepted as a leaf (well-fit). MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. Not user-tunable via CLI / env / toml. |
 | P1 no-progress guard (`decompose_noprogress_rounds`) | 2 | Consecutive recursion rounds that produce no child with a fit score above the parent's before the subtask is accepted as a leaf with a warning. Prevents a degenerate splitter from looping to `decompose_max_depth`. Not user-tunable via CLI / env / toml. |
+| P1 sub-file split span (`subfile_split_max_span`) | 700 | Line-span above which a single-file subtask (tier 1) or a single region (tier 2) is split intra-file rather than left a leaf (DESIGN §5½ (P1) *Sub-file*). Heuristic anchored to the measured span separation in run `5d488583` — the 1,733-line `executeStepWithHealing` vs ≤474-line largest functions in sibling files — **not** telemetry-calibrated like `decompose_fit_threshold`. Not user-tunable via CLI / env / toml. |
 
 ### P1 recursive decomposition surface (DESIGN §5½ (P1))
 
@@ -4366,6 +4367,22 @@ accept the subtask as leaf); then splits via either:
     mismatched label set, every chunk falls back to a distinct deterministic
     label (`_deterministic_chunk_label()`), never an identical parent-copy.
   - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection
+  - **Sub-file path** (exactly 1 file, low fit, file/region span > `subfile_split_max_span`):
+    checked **before** the file-count fork, since a single dense file falls into
+    the coupled path today where the LLM splitter cannot break one file. Splits
+    the file *intra*-file in two tiers (both deterministic, no LLM decides
+    membership): tier 1 tiles `[1, EOF]` on tree-sitter function-boundary spans
+    (`_extract_symbol_ranges()` → `partition_symbols_by_line()`); a tier-1 region
+    that is itself still over the cap re-enters recursion and gets tier-2
+    contiguous line-windows (`partition_lines()`), which also serves as the
+    whole-file fallback when no ranges are available. Children are built by
+    `_subfile_child()` (analog of `_migration_child()`), each listing the same
+    single file plus an `owned_region` field and a `_cofile_cluster` marker.
+    `_check_intra_file_surface()` is the zero-tolerance coverage/overlap backstop
+    (union == `[1, EOF]`, pairwise-disjoint). Same-file co-ownership is legitimate
+    downstream (schedule ignores `files_likely_touched`; overlap judge excludes
+    same-file/different-region; `git merge` reconciles); `check_planner_output`'s
+    `INTRA_DOMAIN_OVERLAP` advisory is suppressed for `_cofile_cluster` children.
 
 Both the `fit_judge` call and the coupled-path `splitter` call are wrapped in
 `try/except WorkerError`, degrading the node to a leaf (`[subtask]`

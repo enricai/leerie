@@ -79,6 +79,18 @@ The orchestrator gives you, in your prompt:
    much thinking this unit demands," not "how many files it edits." A single
    dense file can be dominant; a 20-file rename is not.
 
+   You do **not** need to worry about a single file being *too large to edit in
+   one session*. If a subtask's whole scope is one very large, edit-dense file
+   (many edit sites across thousands of lines), the orchestrator splits it
+   *within* the file — on function boundaries, and by line-window when a single
+   function is itself enormous — into region-scoped subtasks that each own part
+   of the file and run in parallel. So keep such a change as one coherent
+   subtask scoped to that file; note the density in `investigation_notes`. Do
+   **not** hand-split it into artificial "part 1 / part 2" subtasks or pad
+   `files_likely_touched` with unrelated files to make it look smaller — the
+   code-owned region split does this correctly and completely, and a manual
+   split only corrupts the partition.
+
    **Migration sweep.** When a subtask introduces a new pattern replacing
    an old one (a new accessor, a new seam, a new abstraction), quantify
    the migration surface:

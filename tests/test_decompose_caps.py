@@ -27,3 +27,14 @@ def test_decompose_fit_threshold(leerie):
 
 def test_decompose_noprogress_rounds(leerie):
     assert leerie.DEFAULT_CAPS["decompose_noprogress_rounds"] == 2
+
+
+def test_subfile_split_max_span(leerie):
+    # Line-span above which a single-file subtask (or region) is split
+    # intra-file (DESIGN §5½ (P1) *Sub-file*). HEURISTIC, not
+    # telemetry-calibrated like decompose_fit_threshold: anchored to run
+    # 5d488583's measured span separation — the 1733-line
+    # executeStepWithHealing vs a largest-function span of <=474 in every
+    # sibling file. ~700 splits the giant into 2-3 windows and leaves a
+    # normal function whole.
+    assert leerie.DEFAULT_CAPS["subfile_split_max_span"] == 700
