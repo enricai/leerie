@@ -312,6 +312,13 @@ STATE_FIELDS = (
     # judge returned `{collisions: []}`.
     "plan_overlap_judge",
     "plan_overlap_applied",
+    # adherence_gate: audit record from the phase 2⅞ instruction-adherence
+    # gate (phase_adherence_gate) — {judge: <adherence_judge output>,
+    # floor_issues: list[str]}. Written once the gate clears (immediately
+    # or after re-planning). Absent when the gate cheap-skipped
+    # (skip_adherence_check / no prescribed procedure) or the judge
+    # crashed every round (degrade path returns without persisting this).
+    "adherence_gate",
     # no_work_required / no_work_reasons: set by _finish_no_work_run when
     # every planner returns status="ready" with empty subtasks (DESIGN §8
     # *The cleared-but-empty terminal state*). The task is already
