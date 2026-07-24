@@ -974,9 +974,8 @@ first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
 empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
 The plan-instruction-adherence gate's worker registration (schema, prompt,
-model/effort defaults — the gate wiring itself is separate, undelivered
-scope) is tested in two files mirroring the `fit_judge`/`splitter` pair
-above. `tests/test_adherence_judge_schema.py` covers
+model/effort defaults) is tested in two files mirroring the
+`fit_judge`/`splitter` pair above. `tests/test_adherence_judge_schema.py` covers
 `SCHEMAS["adherence_judge"]` — required fields
 (`user_prescribed_a_procedure`, `instruction_adherence`, `violations`,
 `rationale`), `instruction_adherence` bounds (0–10), the deliberate absence
@@ -994,8 +993,7 @@ legitimate plan and an opus *understanding*-framed judge rubber-stamped the
 incident, so only the ADHERENCE frame on opus is validated.
 The deterministic PRIMARY layer of the same gate,
 `check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
-list[str]` (pure JSON→verdict set logic, no NL parsing — the gate wiring
-into `check_planner_output` is separate, undelivered scope), is tested in
+list[str]` (pure JSON→verdict set logic, no NL parsing), is tested in
 `tests/test_prescribed_cmd_coverage.py`: the motivating incident shape
 (prescribed `recon browser`/`recon generate`, no subtask's `runs_commands`
 covers either → both fire), a goal-only task (`is_prescribed=false` or
@@ -1008,6 +1006,21 @@ every prescribed command, tolerance of subtasks with missing/empty
 `runs_commands` and of non-string/blank prescribed commands, case-
 insensitivity, and a negative control proving a shared-stopword-only overlap
 does not falsely mark a command covered.
+The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
+gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
+composing the deterministic floor and the opus `adherence_judge` behind
+`_run_checked_loop` — is tested in `tests/test_phase_adherence_gate.py` (22
+tests), split into source-coupling wiring pins (floor+judge both run; a low
+result routes through the retry path via a re-invoked `phase_plan`; a
+`WorkerError` never discards the plan; the call site precedes
+`schedule()`/`validate_plan`, ordered after `phase_overlap_judge`) and
+behavioral integration tests against a stubbed `claude_p` and a stubbed
+`phase_plan` (skip-flag and not-prescribed short-circuits returning `plans`
+unchanged; a clean plan passing without a re-plan; a low-adherence round
+triggering exactly one re-plan that then converges; exhaustion `die()`ing
+with the unresolved violations; and the two `WorkerError`-every-round
+degrade outcomes — a clean floor returning the plan unmodified, a violating
+floor still `die()`ing).
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested

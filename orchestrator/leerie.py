@@ -312,6 +312,13 @@ STATE_FIELDS = (
     # judge returned `{collisions: []}`.
     "plan_overlap_judge",
     "plan_overlap_applied",
+    # adherence_gate: audit record from the phase 2⅞ instruction-adherence
+    # gate (phase_adherence_gate) — {judge: <adherence_judge output>,
+    # floor_issues: list[str]}. Written once the gate clears (immediately
+    # or after re-planning). Absent when the gate cheap-skipped
+    # (skip_adherence_check / no prescribed procedure) or the judge
+    # crashed every round (degrade path returns without persisting this).
+    "adherence_gate",
     # no_work_required / no_work_reasons: set by _finish_no_work_run when
     # every planner returns status="ready" with empty subtasks (DESIGN §8
     # *The cleared-but-empty terminal state*). The task is already
@@ -5474,6 +5481,14 @@ def _prune_orphaned_requires(plans: list[dict],
 _STOPWORDS = frozenset({
     "the", "a", "an", "to", "and", "or", "of", "in", "on", "for", "with",
 })
+
+# Fire threshold for phase_adherence_gate's opus adherence_judge score
+# (0-10 scale). Corpus-validated (21 real runs, see the adherence_judge
+# calibration writeup in prompts/adherence_judge.md): the incident plan
+# scored <= 3.0, every legitimate plan >= 8.5 — a threshold anywhere in
+# 4-6 cleanly separates the two with zero false positives on the tested
+# corpus. Only consulted when `is_prescribed=true` (two-stage gate).
+_ADHERENCE_GATE_THRESHOLD = 5.0
 
 
 def _command_tokens(command: str) -> frozenset[str]:
@@ -16198,6 +16213,217 @@ def _apply_overlap_collisions(plans: list[dict],
     return applied
 
 
+async def phase_adherence_gate(plans: list[dict], task: str, st: State,
+                                caps: dict, models: dict[str, str],
+                                efforts: dict[str, str | None]) -> list[dict]:
+    """Instruction-adherence gate: enforce that the assembled plan honors
+    a procedure the user explicitly prescribed (DESIGN: instruction-
+    adherence is code-enforced, sibling to §12 "prompts advisory, code
+    enforces"). Runs after `phase_overlap_judge` and before `schedule()`.
+
+    Two-stage composition — the corpus-validated (0/21 false positives)
+    design; do NOT gate on the opus judge's score alone, which alone
+    false-positived ~12% of ordinary runs in validation:
+
+    1. Deterministic floor (`check_prescribed_command_coverage`, PRIMARY,
+       model-independent): `prescribed.commands − ⋃(subtask.runs_commands)`
+       under normalized token-subset matching. Free when
+       `prescribed_procedure.is_prescribed` is falsy.
+    2. Opus `adherence_judge` (semantic layer, SECONDARY): only spawned
+       when `is_prescribed=true` — catches "plan substitutes manual work
+       for the prescribed process" cases the floor's literal command-token
+       matching can't see.
+
+    The gate fires — i.e. treats the round as failing and re-plans — only
+    when `is_prescribed=true` AND (a floor violation exists OR
+    `instruction_adherence` is below `_ADHERENCE_GATE_THRESHOLD`). A
+    goal-only task (`is_prescribed=false`) short-circuits before either
+    worker call: nothing to violate, so the gate is a free no-op for the
+    ~90% common case.
+
+    On a violation, re-drives planning through the *existing* checked-loop
+    feedback path — `_run_checked_loop` re-invokes `phase_plan` in full
+    (fresh planner calls, not a new pause/resume mechanism), bounded by
+    `judgment_check_rounds`, `die()`s on exhaustion exactly like every
+    other exhausted planner-adjacent gate (reconciler, overlap-judge).
+
+    `adherence_judge` `WorkerError` (infrastructure crash) degrades: the
+    floor's verdict alone still applies (still model-independent and
+    reliable), but a judge crash never discards the assembled plan — it
+    is treated as if the judge were silent for that round, consistent
+    with `_run_checked_loop`'s existing WorkerError→retry-then-degrade
+    handling (see its docstring).
+
+    Short-circuits entirely when `st.data["skip_adherence_check"]` is set
+    (`--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` /
+    `skip_adherence_check` in leerie.toml).
+
+    Returns the (possibly re-planned) `plans` list, ready for
+    `schedule()` (this phase runs after `phase_overlap_judge`)."""
+    if st.data.get("skip_adherence_check"):
+        log("phase 2⅞: adherence-gate skipped (--skip-adherence-check / "
+            "LEERIE_SKIP_ADHERENCE_CHECK / skip_adherence_check=true)")
+        return plans
+
+    prescribed_procedure = st.data.get("prescribed_procedure") or {}
+    if not prescribed_procedure.get("is_prescribed"):
+        log("phase 2⅞: adherence-gate skipped (no prescribed procedure)")
+        return plans
+
+    log("phase 2⅞: instruction-adherence gate "
+        "(prescribed procedure detected)")
+    st.data["current_phase"] = "phase 2⅞: adherence-gate"
+    st.save()
+
+    repo_root = Path(os.getcwd())
+    sys_prompt = load_prompt("adherence_judge")
+
+    def _build_payload(cur_plans: list[dict]) -> dict:
+        subtasks = [s for plan in cur_plans for s in plan.get("subtasks", []) or []]
+        return {
+            "task": task,
+            "subtasks": [
+                {
+                    "id": s.get("id", ""),
+                    "title": s.get("title", ""),
+                    "intent": s.get("intent", ""),
+                    "success_criteria_seed": s.get("success_criteria_seed", ""),
+                    "runs_commands": list(s.get("runs_commands", []) or []),
+                }
+                for s in subtasks
+            ],
+        }
+
+    # `cur_plans` is mutable closure state: each re-plan round replaces it
+    # wholesale with a fresh `phase_plan()` result, so `_invoke_judge` and
+    # `_check_adherence` always see the round's current plan.
+    cur_plans: list[list[dict]] = [plans]
+
+    async def _invoke_judge() -> dict:
+        st.bump_workers(caps)
+        payload = _build_payload(cur_plans[0])
+        user_prompt = (
+            "TASK:\n" + task + "\n\n"
+            "PLAN (subtasks with their runs_commands):\n" +
+            json.dumps(payload, indent=2) +
+            "\n\nReturn only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            schema_key="adherence_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models["adherence_judge"],
+            effort=efforts["adherence_judge"],
+            sid="adherence_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    last_judge_result: list[dict | None] = [None]
+    last_floor_issues: list[list[str]] = [[]]
+
+    def _check_adherence(judge_result: dict) -> list[str]:
+        last_judge_result[0] = judge_result
+        floor_issues = check_prescribed_command_coverage(
+            prescribed_procedure,
+            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
+        )
+        last_floor_issues[0] = floor_issues
+        adherence = judge_result.get("instruction_adherence")
+        low_adherence = (
+            isinstance(adherence, (int, float))
+            and adherence < _ADHERENCE_GATE_THRESHOLD
+        )
+        issues = list(floor_issues)
+        if low_adherence:
+            violations = judge_result.get("violations") or []
+            issues.append(
+                f"LOW_ADHERENCE: instruction_adherence={adherence} < "
+                f"{_ADHERENCE_GATE_THRESHOLD} — {judge_result.get('rationale', '')} "
+                f"violations: {violations}"
+            )
+        return issues
+
+    async def _on_feedback(fb: str) -> dict:
+        # The re-plan action IS the feedback: re-invoke phase_plan with the
+        # violation text folded into the task so every planner sees why its
+        # plan was rejected. No new pause/resume machinery — this reuses
+        # `_run_checked_loop`'s existing retry semantics exactly like the
+        # reconciler and overlap-judge do.
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — your previous plan did not honor the prescribed "
+            f"process the user asked for:\n{fb}\n"
+            "Re-plan so every prescribed command is actually run by some "
+            "subtask (as that subtask's runs_commands), not substituted "
+            "with hand-authored work."
+        )
+        cur_plans[0] = await phase_plan(
+            replan_task, st, caps, models, efforts)
+        return {}
+
+    judge_result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke_judge,
+        check=_check_adherence,
+        name="adherence_gate",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_feedback,
+    )
+    for w in gate_warnings:
+        log(f"  adherence-gate: {w}")
+
+    if judge_result is None:
+        # adherence_judge crashed every round (WorkerError exhausted the
+        # loop, or a non-WorkerError bug aborted it) — degrade: keep the
+        # floor's own verdict (still fully evaluated below) and never
+        # discard the assembled plan.
+        floor_issues = check_prescribed_command_coverage(
+            prescribed_procedure,
+            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
+        )
+        if floor_issues:
+            die(
+                "instruction-adherence gate: the opus adherence_judge "
+                "crashed on every round, but the deterministic "
+                "prescribed-command-coverage floor still found "
+                f"{len(floor_issues)} unaddressed violation(s):\n" +
+                "\n".join(f"  • {i}" for i in floor_issues) +
+                "\nThis is model-independent evidence the plan drops a "
+                "command the user explicitly prescribed. Re-run with "
+                "--skip-adherence-check to bypass, or refine the task so "
+                "the missing command is unambiguous."
+            )
+        log("  adherence-gate: adherence_judge crashed every round; "
+            "degrading to floor-only verdict (clean) — plan preserved")
+        return cur_plans[0]
+
+    remaining_issues = _check_adherence(judge_result)
+    if remaining_issues:
+        die(
+            "instruction-adherence gate exhausted "
+            f"{caps['judgment_check_rounds']} re-plan round(s) without "
+            "producing a plan that honors the user's prescribed "
+            "procedure:\n" +
+            "\n".join(f"  • {i}" for i in remaining_issues) +
+            "\nThe user's task explicitly prescribed a process "
+            f"(evidence: {prescribed_procedure.get('evidence', '')!r}) "
+            "that the plan still does not honor. Re-run with "
+            "--skip-adherence-check to bypass this gate, or refine the "
+            "task description so the prescribed procedure is "
+            "unambiguous."
+        )
+
+    st.data["adherence_gate"] = {
+        "judge": judge_result,
+        "floor_issues": last_floor_issues[0],
+    }
+    st.save()
+    log("phase 2⅞: instruction-adherence gate clean "
+        f"(instruction_adherence={judge_result.get('instruction_adherence')})")
+    return cur_plans[0]
+
+
 async def phase_overlap_judge(plans: list[dict], task: str, st: State,
                               caps: dict, models: dict[str, str],
                               efforts: dict[str, str | None]) -> list[dict]:
@@ -20219,6 +20445,19 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # plan time, strictly better than the integrator design-
         # conflict crash this exists to prevent).
         plans = await phase_overlap_judge(
+            plans, task, st, caps, models, efforts)
+        # Phase 2⅞: instruction-adherence gate (the deterministic
+        # prescribed-command-coverage floor + the opus adherence_judge).
+        # Short-circuits when the classifier found no prescribed procedure
+        # (the ~90% common case) or when --skip-adherence-check is set.
+        # Fires only on is_prescribed=true AND (floor violation OR low
+        # adherence) — the corpus-validated two-stage design — and
+        # re-plans via the existing checked-loop feedback path, die()ing
+        # on exhaustion. Runs after the overlap-judge (so re-planning
+        # doesn't waste that judge's spend if it doesn't need to fire) and
+        # before schedule() (so a re-plan never rebuilds an already-
+        # scheduled DAG).
+        plans = await phase_adherence_gate(
             plans, task, st, caps, models, efforts)
         # Surface cross-planner file-claim overlaps. Warning only — the
         # reconciler handles capability-tag drift but not file-claim
