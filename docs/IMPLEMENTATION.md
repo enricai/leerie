@@ -6669,7 +6669,7 @@ type. Required fields, current shape:
   9.0). Each subtask is `{id, title,
   success_criteria_seed (all required), intent, scope_note,
   files_likely_touched, depends_on, requires, provides, size,
-  investigation_notes}`. **`requires` is an array of objects, not bare
+  investigation_notes, runs_commands}`. **`requires` is an array of objects, not bare
   strings: `{tag (required string), extent (required enum: "in_plan" |
   "external"), reason (string, required and non-empty when extent ==
   "external")}`. `extent: in_plan` is satisfied by another subtask's
@@ -6678,7 +6678,14 @@ type. Required fields, current shape:
   bypasses the reconciler and surfaces in `plan.json` as a `preconditions`
   entry — see DESIGN §5 `requires.extent`.** `provides` remains an array of
   bare strings. `size` is `small` or `medium` — `large` is
-  rejected by `validate_plan`. The schema's required-ness of `confidence`
+  rejected by `validate_plan`. `runs_commands` (array of strings, optional)
+  declares every command the subtask actually invokes, as structured data —
+  populated when the task text prescribes a specific command/script/tool
+  invocation the planner gave its own run-the-command subtask (see
+  `prompts/planner.md`); most subtasks omit it or leave it empty. Nothing
+  in the orchestrator consumes `runs_commands` yet — the deterministic
+  coverage-floor check and the adherence judge that read it are separate,
+  not-yet-built work. The schema's required-ness of `confidence`
   and `status` is the structural part of DESIGN §8's discipline: a worker
   that skipped self-gating fails its own JSON schema before the orchestrator
   reads the payload.
