@@ -1021,6 +1021,26 @@ triggering exactly one re-plan that then converges; exhaustion `die()`ing
 with the unresolved violations; and the two `WorkerError`-every-round
 degrade outcomes — a clean floor returning the plan unmodified, a violating
 floor still `die()`ing).
+The empirical incident/legit calibration behind the gate's threshold — real
+opus judge runs against the cruiselines incident plan and a 21-run corpus,
+finding the two-stage composition (`is_prescribed=true AND (floor violation
+OR low adherence)`) fires on the incident and stays silent on ordinary
+goal-only tasks with 0 false positives — is frozen as a deterministic,
+no-live-LLM fixture in `tests/test_adherence_gate_regression.py`, distinct
+from `test_prescribed_cmd_coverage.py` (floor in isolation, synthetic
+cases) and `test_phase_adherence_gate.py` (phase wiring/control-flow, ad
+hoc inline stubs): canned classifier/planner JSON committed under
+`tests/fixtures/adherence_gate/{incident_plan,legit_plan}.json` drives both
+the floor directly and the full two-stage composition through
+`phase_adherence_gate` with `claude_p` stubbed to the fixture's recorded
+`adherence_judge` score. Pinned: the floor's issue count on both fixtures;
+the incident floor naming both unrun commands; the legit floor staying
+silent; the incident fixture driving the gate to `die()` after exhausting
+the re-plan budget on a still-noncompliant plan; the legit fixture never
+invoking `claude_p`/`phase_plan` at all (0 false positives via
+short-circuit); and a frozen-score separation test
+(`test_incident_vs_legit_judge_scores_are_cleanly_separated`) that catches
+threshold drift even when the fire/silent outcome alone doesn't change.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested
