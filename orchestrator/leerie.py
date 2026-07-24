@@ -249,7 +249,7 @@ STATE_FIELDS = (
     "decompose_snapshot",
     "blocked",
     "worker_count", "telemetry",
-    "categories", "classifier_questions", "answers",
+    "categories", "classifier_questions", "prescribed_procedure", "answers",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
