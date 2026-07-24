@@ -4211,6 +4211,70 @@ checklist as context.
 
 No-op when the task doesn't reference files.
 
+### Instruction-adherence gate (DESIGN §12 sibling — *Instruction adherence
+is code-enforced*)
+
+The data-side half of this gate has landed: `SCHEMAS["classifier"]`
+carries `prescribed_procedure` (`{is_prescribed, commands, forbid_manual,
+evidence}`, persisted to `st.data["prescribed_procedure"]` — see §3
+"Worker output schemas"), `SCHEMAS["planner"]` carries the optional
+per-subtask `runs_commands` array, and the `adherence_judge` worker is
+fully registered (schema, prompt, `WORKER_TYPES`, opus/`"high"`
+model-effort defaults — see "The `adherence_judge` worker" above). **As of
+this writing, nothing in the orchestrator reads either field yet:** there
+is no `PRESCRIBED_CMD_UNRUN` (or equivalently-named) issue in
+`check_planner_output`'s issue codes (contrast the table in "Per-worker
+mechanical checks" above, which does not list it), and no call site
+invokes `adherence_judge`. The `--skip-adherence-check` /
+`LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` flag is fully
+resolved and persisted to `state.data["skip_adherence_check"]` (see
+"State fields" below), but currently gates nothing — there is no gate yet
+for it to suppress.
+
+The specified mechanism, per DESIGN §12's sibling section, is a
+two-stage, whole-plan gate mirroring `phase_overlap_judge`'s placement
+(a "Phase 2⅞"-shaped check, run once per assembled plan rather than
+per-subtask):
+
+1. **Deterministic floor (primary, JSON→verdict, no NL):** once
+   `prescribed_procedure.is_prescribed` is true, compute
+   `set(prescribed_procedure.commands) − ⋃(subtask.runs_commands for
+   subtask in plan)` using **normalized token-set matching** (lowercase +
+   token overlap — the planner emits paraphrases of the prescribed
+   command, not always the byte-identical string), not exact string
+   equality. A non-empty result names a prescribed command no subtask
+   runs — a `PRESCRIBED_CMD_UNRUN`-shaped issue. Pure set logic over two
+   LLM-emitted structured fields; the check itself does no NL parsing.
+   Silent (and free) when `prescribed_procedure` is absent or
+   `is_prescribed` is false.
+2. **Opus adherence judge (secondary, semantic layer):** gated behind the
+   same `is_prescribed=true` signal — run unconditionally against every
+   plan, the judge measurably false-positives on ordinary tasks that were
+   never given a procedure to violate. Scores `instruction_adherence`
+   (0–10) + `violations[]` for the case the deterministic floor cannot
+   see: every prescribed command runs, but the plan *also* substitutes
+   hand-authored/manual work the user's `forbid_manual` signal prohibited.
+3. **Gate wiring (specified):** the intended insertion point is
+   `phase_plan`'s per-category `_check_planner` closure — the same
+   closure that already composes `check_planner_output` with
+   `check_task_file_coverage` (see "Phase 2 Plan" in the phase-walkthrough
+   table above) — so a `PRESCRIBED_CMD_UNRUN` issue or a low
+   `adherence_judge` score feeds the **existing** `_run_checked_loop`
+   planner-retry path (bounded by `planner_check_rounds`), exactly like
+   every other `check_planner_output` issue. No new pause/resume
+   machinery: `EXIT_NEEDS_ANSWERS` is untouched. `WorkerError` from the
+   judge call degrades (logs and proceeds) rather than discarding the
+   plan, mirroring `fit_judge`'s crash-barrier discipline (DESIGN §5½).
+   `--skip-adherence-check` is intended to suppress both the floor and
+   the judge call for the whole run, mirroring `--skip-overlap-judge`'s
+   opt-out shape.
+
+This section describes the validated design, not shipped behavior — the
+floor computation, its wiring into `check_planner_output`'s issue list,
+and the `adherence_judge` call site are tracked as separate follow-on
+work. Update this section (and the "Per-worker mechanical checks" table
+above) once that code lands, per the CLAUDE.md three-layer rule.
+
 ### P6 repo-map — `build_repo_map` + `rank_repo_map`
 
 Implements DESIGN §5½ (P6) *Codebase structural map*. Both functions are
@@ -4449,9 +4513,10 @@ task comprehension (score ~9.0 on the motivating incident's plan).
 
 This worker's `claude_p()` invocation, its position in the plan check loop
 (alongside the deterministic command-coverage floor), and the
-`--skip-adherence-check` flag are gate-wiring concerns documented and
-implemented separately — this section covers only the worker's
-registration (schema, prompt, model/effort defaults).
+`--skip-adherence-check` flag are gate-wiring concerns — see "Instruction-
+adherence gate" in §5 for the specified wiring and its current (not yet
+implemented) status; this section covers only the worker's registration
+(schema, prompt, model/effort defaults).
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
@@ -6740,7 +6805,8 @@ type. Required fields, current shape:
   `prompts/planner.md`); most subtasks omit it or leave it empty. Nothing
   in the orchestrator consumes `runs_commands` yet — the deterministic
   coverage-floor check and the adherence judge that read it are separate,
-  not-yet-built work. The schema's required-ness of `confidence`
+  not-yet-built work (see "Instruction-adherence gate" in §5 for the
+  specified mechanism). The schema's required-ness of `confidence`
   and `status` is the structural part of DESIGN §8's discipline: a worker
   that skipped self-gating fails its own JSON schema before the orchestrator
   reads the payload.
