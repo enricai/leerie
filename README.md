@@ -342,7 +342,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `high`; acting workers — implementer, conformer: inherit Claude default) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift). IMPLEMENTATION.md §2 "Effort selection". |
 | `--effort-<worker> LEVEL` | per-worker default (judgment workers → `high`; acting workers → inherit Claude default) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
-| `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill. Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
+| `--judge-model ALIAS` | `opus` | Model alias for the post-run judge skill (a judgment worker; absent from `MODEL_DEFAULT_PER_WORKER`, falls through to the global `MODEL_DEFAULT`). Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
 | `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
 | `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
 | `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `LEERIE_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `leerie.toml`. |
@@ -426,7 +426,7 @@ details and sub-flags.
 | `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
 | `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
 | `LEERIE_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |
-| `LEERIE_MODEL_JUDGE` | `model_judge` | Model alias for the post-run judge skill. Overridden by `--judge-model`. Unset → default `sonnet`. |
+| `LEERIE_MODEL_JUDGE` | `model_judge` | Model alias for the post-run judge skill. Overridden by `--judge-model`. Unset → default `opus` (a judgment worker; absent from `MODEL_DEFAULT_PER_WORKER`, falls through to the global `MODEL_DEFAULT`). |
 | `LEERIE_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |
 | `LEERIE_HEAL_MAX_ROUNDS` | `heal_max_rounds` | Maximum heal-loop iterations per `call_type`. Overridden by `--heal-max-rounds`. Unset → default `10`. |
 | `LEERIE_HEAL_SUCCESS_THRESHOLD` | `heal_success_threshold` | Pass-rate threshold for the heal-loop SUCCESS verdict. Overridden by `--heal-success-threshold`. Unset → default `0.9`. |
