@@ -97,6 +97,37 @@ orchestrator and not used anywhere in this repo.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
   pass it via `--json-schema` in `claude_p()`.
+- **All natural-language interpretation is done by an LLM worker
+  returning schema-validated structured JSON — never by regex or
+  hand-parsing in Python.** This is the input-side companion to the
+  bullet above: Python operates only on already-structured data (JSON
+  fields, typed values) — set/string/arithmetic comparison, never
+  inferring meaning from prose. Regex is permitted only on *mechanical*
+  strings (semver, shell commands, fixed CLI output, file paths) —
+  never on task text, planner/worker prose, README/markdown content, or
+  an LLM's response. If a check needs a fact from natural language, the
+  owning worker must surface it as a JSON field. (`tests/test_capture_deps.py`'s
+  `TestRegexPathAbsent` — dep-capture's migration off a regex path onto
+  LLM-structured output, see below — is prior art for this same
+  principle; see DESIGN.md §"Language-to-JSON: natural-language
+  interpretation is never regex" for the architectural statement.)
+- **Judgment workers default to `opus`; acting/workhorse workers
+  default to `sonnet`.** Any worker that makes a *decision* (classify,
+  plan, reconcile, judge, verify, gate) runs on opus — measured
+  evidence (DESIGN.md §"Opus-judgment, sonnet-workhorse") shows the
+  same judge prompt produces opposite verdicts on the two tiers for the
+  same input, so sonnet is not a reliable judgment tier. Workers that
+  *do* the work (implementer, conformer, pr_writer) run on sonnet for
+  throughput/cost. A new judgment worker MUST be absent from
+  `MODEL_DEFAULT_PER_WORKER` (so it falls through to `MODEL_DEFAULT =
+  "opus"`) and carry `EFFORT_DEFAULT_PER_WORKER = "high"`. Exceptions
+  must be justified in a comment as a deliberate cost trade-off, not an
+  unstated default: `satisfied_probe` stays on sonnet because it runs
+  once per subtask and throughput dominates, with correctness resting
+  on its base-tree-only tool scope rather than model tier (see the
+  comment at its `MODEL_DEFAULT_PER_WORKER` entry); the post-run `judge`
+  worker was found on sonnet by omission and moved to opus for exactly
+  this reason.
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
