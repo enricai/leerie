@@ -9376,8 +9376,12 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
 
     - "api_error"        — gateway rejected the request. Split by
       `_api_error_category` (401→auth, 429→quota, 529→overload — the same
-      map the auth/quota retry path uses); a bare is_error with no matching
-      numeric status stays "api_error".
+      map the auth/quota retry path uses); a mid-stream transport disconnect
+      (`_is_transient_transport_failure` — `terminal_reason=api_error`, null
+      status, "Connection closed mid-response") is tagged
+      "api_error:transport" so the telemetry taxonomy matches the retry
+      taxonomy that now backs it off; a bare is_error with no matching
+      numeric status and no transport signal stays "api_error".
     - "incomplete"       — the worker stopped mid-work (e.g. --max-turns);
       `terminal_reason` set and not "completed". leerie already warns on
       this at the capture site.
@@ -9398,9 +9402,16 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
     if envelope.get("is_error"):
         # Same status→category map the auth/quota retry path keys on
         # (`_api_error_category`); a bare is_error with no matching numeric
-        # status stays "api_error".
+        # status stays "api_error", except a transport disconnect (which the
+        # retry path now backs off as its own class) gets an "api_error:transport"
+        # sub-tag. Reuse `_is_transient_transport_failure` so the telemetry and
+        # retry taxonomies can never drift.
         cat = _api_error_category(envelope.get("api_error_status"))
-        return f"api_error:{cat}" if cat else "api_error"
+        if cat:
+            return f"api_error:{cat}"
+        if _is_transient_transport_failure(envelope):
+            return "api_error:transport"
+        return "api_error"
     term = envelope.get("terminal_reason") or ""
     if term and term != "completed":
         return "incomplete"

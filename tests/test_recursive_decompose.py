@@ -980,3 +980,114 @@ def test_peel_end_to_end_dense_file_tiles(leerie, tmp_path):
     for l in dense_leaves:
         r = l["owned_region"]
         assert (r["end"] - r["start"] + 1) <= 700
+
+
+def _peel_leaves(leerie, tmp_path, *, downstream=None):
+    """Run the full peel→tile decomposition for the feat-005 impl+test shape and
+    return the flat leaf set. Optionally prepend a `downstream` subtask (a dict)
+    that depends on the dense child so the caller can exercise the grandchild
+    dep-remap. The dense file tiles via the tier-2 line-window fallback (no
+    tree-sitter), mirroring `test_peel_end_to_end_dense_file_tiles`."""
+    _write_lines(tmp_path / "flow-runner.ts", 2000)
+    _write_lines(tmp_path / "flow-runner.test.ts", 50)
+    parent = {
+        "id": "feat-005", "title": "Thread FrameTarget",
+        "success_criteria_seed": "all sites routed",
+        "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
+    }
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            # Parent (both files) low → peel; the test-file sibling (feat-005-f2)
+            # is a small focused file → well-fit leaf (never reaches the splitter).
+            if "feat-005-f2" in sid:
+                return _fit_response(0.90)
+            return _fit_response(0.30)
+        pytest.fail(f"peel/tiling is code-owned; no {schema_key!r} worker")
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        return _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+
+def test_peel_ids_carry_domain_prefix(leerie, tmp_path):
+    """Peel leaf ids (`feat-005-f1-rN`, `feat-005-f2`) inherit the parent's
+    domain prefix so `validate_plan`'s `_ID_PREFIXES` check and `schedule()`'s
+    cross-domain wiring both accept them — mirrors
+    `test_subfile_ids_carry_domain_prefix` for the peel path."""
+    leaves = _peel_leaves(leerie, tmp_path)
+    assert len(leaves) >= 3  # dense file tiles into >=2 regions + the test sibling
+    for leaf in leaves:
+        assert leaf["id"].startswith("feat-"), (
+            f"peel leaf id {leaf['id']!r} must start with 'feat-' so "
+            "validate_plan's id-prefix check passes")
+        assert any(leaf["id"].startswith(p) for p in leerie._ID_PREFIXES)
+
+
+def test_peel_leaves_survive_schedule_and_validate_plan(leerie, tmp_path):
+    """The load-bearing gap: peel leaves must feed `schedule()` and
+    `validate_plan()` end-to-end without a die/dangling-id — the exact
+    invariant class that killed a real run after full planner spend. The
+    split/migration path has `test_recursive_decompose_schedule.py`; this is
+    its peel equivalent."""
+    leaves = _peel_leaves(leerie, tmp_path)
+    subtasks = {l["id"]: l for l in leaves}
+    # No leaf references a vanished intermediate (feat-005, feat-005-f1).
+    all_deps = [d for l in leaves for d in (l.get("depends_on") or [])]
+    assert not [d for d in all_deps if d not in subtasks], (
+        f"dangling depends_on after peel: {all_deps}")
+    # validate_plan die()s on any error; reaching the end means it passed.
+    leerie.validate_plan(subtasks)
+    # schedule() accepts the leaves and partitions them into waves (all
+    # independent here → a single wave).
+    plan = {"domain": "feature-implementation", "status": "ready",
+            "subtasks": list(leaves)}
+    sched_subtasks, waves = leerie.schedule([plan])
+    assert set(sched_subtasks.keys()) == set(subtasks.keys())
+    assert sum(len(w) for w in waves) == len(leaves)  # every leaf scheduled
+
+
+def test_peel_grandchild_expansion_remaps_downstream_dep(leerie, tmp_path):
+    """A downstream subtask depending on the dense child `feat-005-f1` must be
+    remapped to the dense child's terminal leaves (`feat-005-f1-rN`) when it
+    tiles — the peel-grandchild case of `_remap_vanished_deps`. Mirrors
+    `test_recursive_decompose_remaps_sibling_dep_on_split_sibling`, but for a
+    dep that vanishes via the peel→tile path rather than a splitter sibling.
+
+    The downstream subtask is decomposed in its OWN `recursive_decompose` call
+    (as phase_plan does per top-level subtask), so the intra-frame remap does
+    not see it. Instead we assert the invariant at the plan level: after both
+    subtasks decompose, the downstream dep on the vanished `feat-005-f1` must
+    not survive as a dangling id in the combined leaf set — phase_plan's own
+    `_remap_vanished_deps` (keyed by first-pass parent ids) owns that rewrite.
+    Here we prove the *building block*: the dense child's id genuinely vanishes
+    (replaced by `-rN` leaves), so a downstream dep on it is a vanished-id case
+    the plan-level remap must handle."""
+    leaves = _peel_leaves(leerie, tmp_path)
+    ids = {l["id"] for l in leaves}
+    # The dense child id must have vanished (tiled into regions), so any
+    # downstream `depends_on: ["feat-005-f1"]` is a vanished-id reference.
+    assert "feat-005-f1" not in ids, (
+        "dense child id should vanish after tiling")
+    assert any(i.startswith("feat-005-f1-r") for i in ids), (
+        "dense child should have tiled into -rN region leaves")
+    # Build the expansion map the plan-level remap would use and apply it to a
+    # downstream dep, exactly as phase_plan does for first-pass parents.
+    region_ids = sorted(i for i in ids if i.startswith("feat-005-f1-r"))
+    downstream = {"id": "feat-006", "depends_on": ["feat-005-f1"],
+                  "requires": [], "provides": [],
+                  "success_criteria_seed": "c", "size": "medium",
+                  "files_likely_touched": ["x.ts"]}
+    leerie._remap_vanished_deps([downstream], {"feat-005-f1": region_ids})
+    assert downstream["depends_on"] == region_ids, (
+        "downstream dep on the vanished dense child must fan out to its "
+        f"terminal region leaves, got {downstream['depends_on']}")
+    # And the combined plan (peel leaves + remapped downstream) validates.
+    combined = {l["id"]: l for l in leaves}
+    combined["feat-006"] = downstream
+    leerie.validate_plan(combined)

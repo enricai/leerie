@@ -260,3 +260,42 @@ def test_needs_backoff_ors_both_classifiers(leerie):
     body = src[start:start + 300]
     assert "_is_auth_or_quota_failure" in body
     assert "_is_transient_transport_failure" in body
+
+
+# ---------------------------------------------------------------------------
+# telemetry: a transport drop is tagged api_error:transport in calls.ndjson so
+# the failure_kind taxonomy matches the retry taxonomy that now backs it off
+# (docs/IMPLEMENTATION.md §3 "Transient transport disconnect").
+# ---------------------------------------------------------------------------
+
+def test_transport_drop_failure_kind_is_api_error_transport(leerie):
+    """`_classify_failure_kind` sub-tags the measured drop envelope
+    `api_error:transport`, distinct from a generic gateway `api_error` and from
+    the numeric-status auth/quota/overload sub-tags — reusing
+    `_is_transient_transport_failure` so the two taxonomies can't drift."""
+    assert leerie._classify_failure_kind(_DROP, parsed_ok=False) == "api_error:transport"
+
+
+def test_failure_kind_taxonomy_partitions_cleanly(leerie):
+    """The transport sub-tag must not perturb the existing failure_kind tags."""
+    # numeric statuses keep their category sub-tags
+    assert leerie._classify_failure_kind(
+        {"is_error": True, "api_error_status": 401}, parsed_ok=False) == "api_error:auth"
+    assert leerie._classify_failure_kind(
+        {"is_error": True, "api_error_status": 429}, parsed_ok=False) == "api_error:quota"
+    assert leerie._classify_failure_kind(
+        {"is_error": True, "api_error_status": 529}, parsed_ok=False) == "api_error:overload"
+    # a bare non-transport is_error stays "api_error"
+    assert leerie._classify_failure_kind(
+        {"is_error": True, "result": "some unrelated gateway error"},
+        parsed_ok=False) == "api_error"
+    # a synthetic no-result envelope whose stderr mentions the marker is exempt
+    # (matches the retry-path exemption) — stays bare "api_error", not transport
+    assert leerie._classify_failure_kind(
+        {"is_error": True, "_leerie_synthetic": "no_result_event",
+         "result": "claude -p produced no result event (stderr: connection closed)"},
+        parsed_ok=False) == "api_error"
+    # non-error paths unchanged
+    assert leerie._classify_failure_kind({"is_error": False}, parsed_ok=True) is None
+    assert leerie._classify_failure_kind(
+        {"is_error": False}, parsed_ok=False) == "schema_parse_failed"
