@@ -249,7 +249,7 @@ STATE_FIELDS = (
     "decompose_snapshot",
     "blocked",
     "worker_count", "telemetry",
-    "categories", "classifier_questions", "answers",
+    "categories", "classifier_questions", "prescribed_procedure", "answers",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
@@ -940,6 +940,21 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "source_of_truth_question": {"type": "boolean"},
+            # Language→JSON extraction (no NL parsing in Python): the
+            # classifier reads the task prose and declares whether the
+            # user prescribed an explicit procedure/command-sequence,
+            # as structured data the planner and a future deterministic
+            # gate can act on without re-interpreting free text.
+            "prescribed_procedure": {
+                "type": "object",
+                "properties": {
+                    "is_prescribed": {"type": "boolean"},
+                    "commands": {
+                        "type": "array", "items": {"type": "string"}},
+                    "forbid_manual": {"type": "boolean"},
+                    "evidence": {"type": "string"},
+                },
+            },
             "confidence": _confidence_schema(["classification"]),
         },
     },
@@ -4830,6 +4845,13 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
             issues.append(
                 f"EMPTY_WHY: question {q.get('id', '?')!r} has "
                 "empty why_underivable")
+
+    prescribed = result.get("prescribed_procedure") or {}
+    if prescribed.get("is_prescribed") and not (
+            prescribed.get("evidence") or "").strip():
+        issues.append(
+            "EMPTY_EVIDENCE: prescribed_procedure.is_prescribed is true "
+            "but evidence is empty")
 
     if len(cats) > 4:
         issues.append(
@@ -12171,6 +12193,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["categories"] = cats
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
+    st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
     st.save()
     log(f"categories: {', '.join(cats)}")
     return result

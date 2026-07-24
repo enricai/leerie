@@ -4124,7 +4124,7 @@ Each returns `list[str]` — empty when clean. Pure Python, no LLM.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
-| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
+| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `EMPTY_EVIDENCE`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE`, `UNCOVERED_MIGRATION_SURFACE`, `LOW_CONFIDENCE` | `planner_check_rounds` (3) |
 | Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
@@ -6561,6 +6561,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `telemetry` | dict | calls, cost_usd, input_tokens, output_tokens — printed at run end |
 | `categories` | list[str] | classifier output, post-whitelist filtering |
 | `classifier_questions` | list[dict] | intent questions the classifier surfaced |
+| `prescribed_procedure` | dict | classifier's language→JSON signal declaring whether the user prescribed an explicit procedure/command-sequence: `{is_prescribed, commands, forbid_manual, evidence}`. Empty dict when the classifier omitted the field |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
@@ -6649,7 +6650,16 @@ type. Required fields, current shape:
   are required on each question), `source_of_truth_question` (bool). The
   classifier only flags whether the source-of-truth question is relevant;
   the orchestrator's preference resolution (see §2) supplies the value
-  (default `both`).
+  (default `both`). Optional: `prescribed_procedure`
+  (`{is_prescribed (bool), commands (array of strings), forbid_manual
+  (bool), evidence (string)}`) — a language→JSON signal the classifier
+  extracts from the task prose declaring whether the user prescribed an
+  explicit procedure/command-sequence, as opposed to a goal description.
+  `check_classifier_output` enforces non-empty `evidence` whenever
+  `is_prescribed` is true (`EMPTY_EVIDENCE`, mirroring the `EMPTY_WHY`
+  discipline for classifier questions). `phase_classify` persists the
+  field verbatim to `st.data["prescribed_procedure"]` alongside
+  `st.data["categories"]`, defaulting to `{}` when absent.
 - **planner** — required: `domain`, `subtasks`, `status`, `confidence`.
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,

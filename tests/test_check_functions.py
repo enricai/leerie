@@ -48,6 +48,52 @@ class TestCheckClassifierOutput:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert any("EMPTY_WHY" in i for i in issues)
 
+    def test_prescribed_procedure_empty_evidence(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": [],
+                  "prescribed_procedure": {
+                      "is_prescribed": True,
+                      "commands": ["recon browser", "recon generate"],
+                      "forbid_manual": True,
+                      "evidence": ""}}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("EMPTY_EVIDENCE" in i for i in issues)
+
+    def test_prescribed_procedure_whitespace_only_evidence(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": [],
+                  "prescribed_procedure": {
+                      "is_prescribed": True,
+                      "commands": ["recon generate"],
+                      "evidence": "   "}}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("EMPTY_EVIDENCE" in i for i in issues)
+
+    def test_prescribed_procedure_with_evidence_ok(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": [],
+                  "confidence": _conf(classification=9.5),
+                  "prescribed_procedure": {
+                      "is_prescribed": True,
+                      "commands": ["recon browser", "recon generate"],
+                      "forbid_manual": True,
+                      "evidence": "your ONLY job is to run recon browser "
+                                  "then recon generate"}}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("EMPTY_EVIDENCE" in i for i in issues)
+
+    def test_prescribed_procedure_not_prescribed_no_evidence_needed(
+            self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": [],
+                  "confidence": _conf(classification=9.5),
+                  "prescribed_procedure": {
+                      "is_prescribed": False, "commands": [],
+                      "evidence": ""}}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("EMPTY_EVIDENCE" in i for i in issues)
+
+    def test_prescribed_procedure_absent_no_evidence_needed(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("EMPTY_EVIDENCE" in i for i in issues)
+
     def test_many_categories(self, leerie, tmp_path):
         result = {"categories": ["a", "b", "c", "d", "e"],
                   "questions": []}
