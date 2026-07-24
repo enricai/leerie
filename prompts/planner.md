@@ -93,6 +93,19 @@ The orchestrator gives you, in your prompt:
    that will flag plans where the migration surface is not covered.
    Addressing it proactively in your decomposition avoids CRITIC retries.
 
+   **A prescribed command is run, never reimplemented.** When the task
+   text names a specific command, script, or tool invocation the work
+   must go through (a build step, a generator, a CLI the task says to
+   run), give that command its own subtask whose job is to *run* it —
+   not a subtask that hand-writes the output the command would have
+   produced. Declare every command a subtask actually invokes in that
+   subtask's `runs_commands` array (e.g. `["recon:browser"]`), as exact
+   structured data — not paraphrased in `intent` or `investigation_notes`
+   alone. This lets the orchestrator check coverage of prescribed
+   commands over `runs_commands` data, without re-interpreting subtask
+   prose. Leave `runs_commands` empty (or omit it) for subtasks that
+   invoke no prescribed command — most subtasks do not.
+
 3. **Determine dependencies.**
    - Within your domain, set `depends_on` to the ids of subtasks that must
      finish first.
