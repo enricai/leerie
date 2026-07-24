@@ -4522,8 +4522,8 @@ task comprehension (score ~9.0 on the motivating incident's plan).
 This worker's `claude_p()` invocation, its position in the plan check loop
 (alongside the deterministic command-coverage floor), and the
 `--skip-adherence-check` flag are gate-wiring concerns — see "Instruction-
-adherence gate" in §5 for the specified wiring and its current (not yet
-implemented) status; this section covers only the worker's registration
+adherence gate" in §5 for the full wiring (fully shipped as
+`phase_adherence_gate`); this section covers only the worker's registration
 (schema, prompt, model/effort defaults).
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
