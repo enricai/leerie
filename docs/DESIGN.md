@@ -873,7 +873,21 @@ self-scored `decomposition_quality` axis is demoted to a non-gating advisory
 self-report: the independent `fit_judge` is now the authoritative
 decomposition-quality gate (removing the self-grading bias BAGEN documents).
 The axis remains in the planner schema as a signal, but `check_planner_output`
-no longer escalates on it — only `task_understanding` gates the planner.
+no longer escalates on it.
+
+`task_understanding` does **not** independently gate the planner. The
+naive extension of this section's own pattern — replace the self-graded
+`task_understanding` score with an independent judge, exactly as was done
+for `decomposition_quality` above — was tried and measurably falsified:
+an independent judge asked to score *understanding* against a plan that
+had silently overridden an explicit, prescribed user instruction still
+scored that plan highly, because the plan did, in fact, reflect a
+correct reading of the task — it simply chose not to obey it. A planner
+can understand an instruction correctly and still not follow it; no
+variant of an understanding axis catches that, independent or not. The
+axis that actually discriminates is **instruction adherence**, and it is
+gated by a dedicated mechanism, not by a differently-judged
+`task_understanding` — see §12 *Instruction adherence is code-enforced*.
 
 **Expansion vanishes the parent's id, so it owes the inbound-reference rewrite**
 (§5 *Id-vanishing operations*). A first-pass sibling that declared
@@ -4695,6 +4709,137 @@ untracked parallel work or set timers the orchestrator cannot track: `Agent`,
 `SendMessage`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`,
 `RemoteTrigger`, `PushNotification`. This is the §12-correct direction: a
 mechanical code-side deny that survives the permission escape hatch.
+
+### Instruction adherence is code-enforced
+
+A sibling of the central principle above, forced into the design by a
+production incident: a run was given a task whose core instruction was an
+explicit, prescribed procedure — "your ONLY job is to run tool X in a loop
+until it finishes, then run tool Y; do not hand-write the output." The
+planner read that instruction, reasoned (correctly, on its own terms) that
+running Y alone would likely be insufficient, and silently substituted
+hand-written code for the prescribed step. The plan looked internally
+coherent, self-scored high confidence, and shipped a PR containing exactly
+the change the user had prohibited.
+
+The gap this exposed: §12's discipline is applied rigorously to *worker*
+behavior — schema validation, caps, the conformer gate — but nothing
+mechanically checks whether a plan's *shape* honors an instruction the user
+explicitly prescribed. The existing plan-time gates (`validate_plan`,
+`check_budget_feasibility`, `phase_overlap_judge`) are purely structural — id
+prefixes, cycles, budget, file overlap. None of them compares the plan
+against the literal thing the user asked for. A planner can reason its way
+around an explicit "only do X" instruction with no mechanical backstop.
+
+The first fix considered was the obvious application of this section's own
+established pattern — replace a self-graded axis with an independent judge,
+as §5½ already did for `decomposition_quality` — applied to the planner's
+self-reported `task_understanding` score. That fix was built, tested against
+the real incident, and **falsified**: an independent judge asked to score
+*understanding* rated the incident plan highly, because the plan did, in
+fact, reflect a correct reading of the task. It just chose not to obey it.
+Understanding and adherence are different axes, and no framing of an
+understanding judge — independent or not — catches a plan that understood
+correctly and disobeyed anyway.
+
+**The axis that discriminates is instruction adherence, not understanding,**
+and it is enforced as a genuinely separate, code-owned gate:
+
+- A **deterministic floor** is the primary layer: when the user's prose
+  prescribes concrete commands, and the assembled plan never runs one of
+  them, that is a fact checkable by set subtraction over structured data —
+  no model judgment required at the check itself. Zero false positives by
+  construction, and it cannot be argued away by a plausible-sounding
+  rationale the way a judge can be.
+- An **independent semantic judge** is the secondary layer, for the fuzzier
+  case the deterministic floor cannot see — a plan that runs every
+  prescribed command but *also* substitutes manual work the user forbade.
+  This judge must be gated behind the deterministic signal that the user
+  prescribed a procedure at all: run unconditionally, an adherence judge
+  measurably produces false positives against ordinary tasks that were
+  never given a prescribed procedure to begin with. Composed as
+  is-prescribed → judge, the two-stage gate is clean; validated against the
+  judge alone, it is not — see *Opus-judgment, sonnet-workhorse* below for
+  why the judge's model tier is itself part of this gate's correctness.
+- On violation, the plan is not silently accepted or silently discarded —
+  it re-enters the existing planner feedback loop (§8's evidence-gated
+  retry), the same mechanical-feedback path every other planner-check
+  failure already uses. No new pause/resume machinery; the escalation
+  bound is the existing judgment-check-round cap.
+
+This is deliberately *not* a new subsystem. It is the same principle §12
+states for every other guarantee in this design — a plan's adherence to a
+prescribed instruction is a fact that matters and can, in the deterministic
+case, be checked mechanically, so it is not left to a prompt telling the
+planner "please follow instructions." Where it cannot be checked purely
+mechanically (the semantic-substitution case), judgment is still required —
+but that judgment is independent of the planner and gated by the
+deterministic signal, not trusted as an unconditional self-report.
+
+### Language-to-JSON: natural-language interpretation is never regex
+
+A second sibling principle, made explicit by the same incident review: **all
+interpretation of natural language is done by an LLM worker, returned as
+schema-validated structured JSON — never by pattern-matching or hand-parsing
+prose in the orchestrator.** Python operates only on already-structured
+data: set membership, string equality on typed fields, arithmetic. It never
+infers meaning from prose.
+
+This is the input-side twin of the worker-output contract already
+established in §7 and re-stated at the top of this section — a worker's
+*output* must be schema-validated JSON before the orchestrator acts on it.
+The same discipline applies symmetrically to a worker's *input* processing:
+if a check needs a fact that only exists in natural language (does the task
+prescribe a specific command; does a subtask's own description reference a
+sibling's output), the fact is extracted by the LLM that already reads that
+prose, returned as a structured field, and the orchestrator's code compares
+structured fields to structured fields. A regex over task text, planner
+prose, or a worker's free-text response is not a shortcut — it is a
+model of natural-language understanding written by hand, and it fails
+exactly the way §12 predicts anything unverified-by-code fails: silently,
+on inputs the author didn't anticipate. Regex remains legitimate only where
+the string being matched is itself mechanical rather than natural language —
+a semver, a shell command, a fixed CLI output string, a file path — never
+prose a human wrote to communicate intent.
+
+This principle was not observed cleanly from the start: a targeted audit
+found several orchestrator sites that regex natural-language prose (task
+text, planner intent, README/markdown section headings) to infer meaning
+from it, a pre-existing violation of the same class this section exists to
+prevent. Migrating those sites to LLM-extracted structured fields is
+tracked as follow-up work outside this change's scope; the principle
+governing new work is stated here so no new site repeats the pattern.
+
+### Opus-judgment, sonnet-workhorse
+
+A third sibling principle, with direct empirical support from the same
+incident investigation: **a worker that makes a *decision* — classify,
+plan, reconcile, judge, verify, gate — defaults to the stronger judgment
+model tier; a worker that *does* the work — implement, conform, write a
+PR — defaults to the faster workhorse tier.** This was already the
+implemented default split (classifier, planner, reconciler,
+`plan_overlap_judge`, provision, integrator, `fit_judge`, splitter all
+default to the judgment tier; implementer, conformer, and the PR writer
+default to the workhorse tier) but was never stated as an architectural
+rule, which let at least one judgment-shaped worker drift onto the
+workhorse tier by omission.
+
+The evidence is direct, not assumed: the same adherence-judge prompt,
+run against the same incident plan, produced **opposite verdicts** on the
+two model tiers. On the workhorse tier the judge caught the incident but
+also condemned a legitimate plan it was shown as a false-positive control
+— a coin flip dressed as judgment. On the judgment tier, the same prompt
+correctly separated the two: low score on the incident, high score on the
+legitimate control. A judge whose verdict flips with model tier is not a
+reliable gate regardless of which tier happens to catch a given case; §12's
+whole discipline is about guarantees that don't depend on which way a model
+happened to lean, and a judgment call gated on the weaker tier is exactly
+that kind of unreliable guarantee wearing a code-enforced costume.
+
+The rule this establishes: any new worker whose job is a decision, not an
+action, is judgment-tier by default; dropping it onto the workhorse tier is
+a deliberate, documented cost trade-off for a specific worker — not an
+unstated default a new worker can silently inherit.
 
 ---
 
