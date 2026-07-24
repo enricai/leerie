@@ -769,7 +769,6 @@ MODEL_DEFAULT = "opus"
 MODEL_DEFAULT_PER_WORKER = {
     "implementer": "sonnet",
     "conformer": "sonnet",
-    "judge": "sonnet",
     "heal": "sonnet",
     "pr_writer": "sonnet",
     # satisfied_probe runs once per subtask (DESIGN §8 *Already-satisfied
@@ -20509,7 +20508,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                              f"--effort, LEERIE_EFFORT, and leerie.toml")
     ap.add_argument("--judge-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the judge post-run worker "
-                         f"(default {MODEL_DEFAULT_PER_WORKER['judge']}); "
+                         f"(default {MODEL_DEFAULT_PER_WORKER.get('judge', MODEL_DEFAULT)}); "
                          f"also {MODEL_JUDGE_ENV} or model_judge in leerie.toml")
     ap.add_argument("--heal-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the heal post-run worker "
