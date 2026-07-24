@@ -1,0 +1,35 @@
+{
+  "_comment": "Synthesized goal-only control from the Check-3 corpus validation (21 real runs) — a legitimate 'do whatever implementation is needed' task with no prescribed procedure. Used to prove the gate stays silent (0 false positives) on ordinary plan-driven work.",
+  "task": "Add a /volumes endpoint to the storage service with tests and docs.",
+  "classifier_prescribed_procedure": {
+    "is_prescribed": false,
+    "commands": [],
+    "forbid_manual": false,
+    "evidence": ""
+  },
+  "plan_subtasks": [
+    {
+      "id": "feat-001",
+      "title": "Implement /volumes endpoint",
+      "intent": "Add the endpoint handler and route registration",
+      "success_criteria_seed": "GET /volumes returns the volume list",
+      "runs_commands": []
+    },
+    {
+      "id": "test-001",
+      "title": "Add endpoint tests",
+      "intent": "Cover the new endpoint with unit tests",
+      "success_criteria_seed": "pytest tests/test_volumes.py passes",
+      "runs_commands": []
+    }
+  ],
+  "adherence_judge_scores": [9.0, 9.0, 9.0],
+  "adherence_judge_result": {
+    "user_prescribed_a_procedure": false,
+    "instruction_adherence": 9.0,
+    "violations": [],
+    "rationale": "The task states a goal, not a prescribed procedure; the plan freely chooses its own implementation approach."
+  },
+  "expected_floor_issue_count": 0,
+  "expected_gate_fires": false
+}
