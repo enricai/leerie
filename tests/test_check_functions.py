@@ -299,6 +299,76 @@ class TestCheckPlannerOutput:
                    for i in issues)
 
 
+# --- instruction-adherence gate: advisory-vs-gating split --------------- #
+#
+# Mirrors the G3 decomposition_quality-does-not-gate / task_understanding-
+# still-gates pair above, but for the instruction-adherence gate (DESIGN:
+# instruction-adherence is code-enforced, sibling to §12). The deterministic
+# floor (check_prescribed_command_coverage) is a SEPARATE function from
+# check_planner_output — it is wired into phase_adherence_gate, not into the
+# planner check loop — so these tests assert the OUTCOME (a prescribed,
+# uncovered command gates; a goal-only task never gates) rather than
+# asserting against a specific confidence axis name, per the investigation
+# note that the exact wiring choice must not be baked into the test.
+class TestAdherenceGateAdvisoryVsGating:
+    def test_prescribed_cmd_unrun_gates(self, leerie):
+        """A prescribed command with no covering subtask is a gating
+        issue — the deterministic floor is the PRIMARY, always-enforced
+        layer of the instruction-adherence gate."""
+        prescribed = {
+            "is_prescribed": True,
+            "commands": ["recon browser", "recon generate"],
+            "forbid_manual": True,
+            "evidence": "your ONLY job is to run recon browser then "
+                        "recon generate",
+        }
+        subtasks = [{"id": "feat-001", "runs_commands": ["write contract.ts"]}]
+        issues = leerie.check_prescribed_command_coverage(prescribed, subtasks)
+        assert any("PRESCRIBED_CMD_UNRUN" in i for i in issues)
+
+    def test_goal_only_task_does_not_gate(self, leerie):
+        """A goal-only task (no prescribed procedure) never gates — the
+        floor is silent by construction, guarding the ~90% ordinary-task
+        case against false positives."""
+        prescribed = {"is_prescribed": False, "commands": []}
+        subtasks = [{"id": "feat-001", "runs_commands": []}]
+        issues = leerie.check_prescribed_command_coverage(prescribed, subtasks)
+        assert not any("PRESCRIBED_CMD_UNRUN" in i for i in issues)
+
+    def test_covered_prescribed_command_does_not_gate(self, leerie):
+        """A prescribed command that some subtask's runs_commands does
+        cover must not gate — the floor only fires on a genuine gap."""
+        prescribed = {
+            "is_prescribed": True,
+            "commands": ["recon generate"],
+            "forbid_manual": True,
+            "evidence": "explicit procedure",
+        }
+        subtasks = [{"id": "feat-001", "runs_commands": ["run recon generate"]}]
+        issues = leerie.check_prescribed_command_coverage(prescribed, subtasks)
+        assert not any("PRESCRIBED_CMD_UNRUN" in i for i in issues)
+
+    def test_check_planner_output_carries_no_separate_adherence_axis(
+            self, leerie, tmp_path):
+        """check_planner_output itself has no self-reported adherence axis
+        to demote to advisory (unlike decomposition_quality) — the gate
+        lives entirely in the independent, always-enforced floor above.
+        A clean plan with no prescribed_procedure at all must not surface
+        any PRESCRIBED_CMD_UNRUN-shaped issue from check_planner_output."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.ts").touch()
+        plan = {"subtasks": [{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["src/foo.ts"],
+            "depends_on": [], "size": "small"}],
+            "status": "ready", "domain": "testing",
+            "confidence": _conf(task_understanding=9.5,
+                                decomposition_quality=9.5)}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("PRESCRIBED_CMD_UNRUN" in i for i in issues)
+
+
 # --- check_reconciler_output -------------------------------------------- #
 
 class TestCheckReconcilerOutput:
