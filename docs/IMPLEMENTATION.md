@@ -326,6 +326,21 @@ Base layers (top-down):
   `ARG NODE_VERSION` so the version is reproducible across builds.
 - `pnpm` (pinned), `npm install -g @anthropic-ai/claude-code` (the
   `claude` CLI workers invoke; leerie enforces ≥ 2.1.22 at runtime).
+- `ENV PATH` is set to
+  `<system mise shims>:<LTS Node bin>:<MISE_DATA_DIR/shims>:$PATH:/home/leerie/.local/bin`
+  (concretely `/usr/local/share/mise/shims` :
+  `/usr/local/share/mise/installs/node/lts-current/bin` :
+  `/home/leerie/.local/share/mise/shims` : `$PATH` :
+  `/home/leerie/.local/bin`). The ordering is load-bearing: image-baked
+  tooling (the LTS Node that hosts `claude` itself) comes first, so a repo
+  pinning its own Node/Python version can never shadow it; the per-repo
+  `MISE_DATA_DIR/shims` (populated at runtime by `phase_provision`'s
+  `mise install` — DESIGN §6½ *Worker-driven install*) comes next, so a
+  worker's own ad-hoc Bash commands (e.g. `bin/rails test`) reach a
+  repo-pinned runtime by name without an explicit `mise exec --`; and
+  `/home/leerie/.local/bin` (where `pip install --user` lands console
+  scripts) is deliberately **last**, so a user-installed package can never
+  shadow a baked-in binary. Pinned by `tests/test_dockerfile_path.py`.
 - Non-root `leerie` user created with `--build-arg HOST_UID/HOST_GID`
   matching the host user. This is what makes files the container
   writes into `/work` (worktrees) and `/leerie-state` (run state) keep
