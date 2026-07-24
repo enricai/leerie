@@ -994,6 +994,13 @@ SCHEMAS: dict[str, dict] = {
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string"},
                         "investigation_notes": {"type": "string"},
+                        # The commands this subtask actually invokes, as
+                        # structured data — so a prescribed-procedure
+                        # coverage check can set-compare over runs_commands
+                        # rather than re-interpret subtask prose. Optional:
+                        # most subtasks run no prescribed command.
+                        "runs_commands": {
+                            "type": "array", "items": {"type": "string"}},
                     },
                 },
             },
