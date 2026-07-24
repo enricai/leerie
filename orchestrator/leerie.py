@@ -12707,6 +12707,15 @@ async def phase_plan(task: str, st: State, caps: dict,
         # user-visible knob real.
         "confidence_rounds": caps["confidence_rounds"],
     }
+    # PREVENT half of the instruction-adherence gate (DESIGN §12 sibling):
+    # feed the classifier's prescribed_procedure signal into the planner
+    # context so it frames prescribed commands as run-the-command subtasks
+    # at birth, instead of re-deriving this from task prose alone. Omitted
+    # entirely when the classifier found no prescribed procedure, so a
+    # goal-only task carries no false framing.
+    prescribed_procedure = st.data.get("prescribed_procedure") or {}
+    if prescribed_procedure.get("is_prescribed"):
+        ctx_dict["prescribed_procedure"] = prescribed_procedure
     # The built global symbol graph is reused (once) for BOTH the planner ctx
     # (ranked to the task seeds) and the P1 recursion (re-ranked per node —
     # DESIGN §5½). None when skipped or the build fails → graceful degrade.
