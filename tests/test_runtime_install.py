@@ -123,6 +123,64 @@ def test_debian_rootless_setup_runs_without_sudo() -> None:
             assert "sudo" not in line, f"setuptool must not run under sudo: {line!r}"
 
 
+def test_rootless_setup_puts_buildkitd_on_path(tmp_path) -> None:
+    # Regression (2026-07-26): BuildKit installs to ~/.local/bin, but on a fresh
+    # `curl | bash` (non-login) shell ~/.local/bin is NOT on PATH — so
+    # `containerd-rootless-setuptool.sh install-buildkit-containerd`'s own
+    # `command -v buildkitd` precheck would fail and exit 1, resurfacing the
+    # exact wall this change fixes. _runtime_linux_rootless_setup must prepend
+    # ~/.local/bin so buildkitd resolves regardless of the caller's PATH.
+    #
+    # This runs the REAL (non-dry-run) helper with a buildkitd stub in a fake
+    # ~/.local/bin that is deliberately absent from the base PATH, and stubs the
+    # setuptool to record whether buildkitd resolved at call time.
+    home = tmp_path
+    (home / ".local" / "bin").mkdir(parents=True)
+    (home / ".local" / "bin" / "buildkitd").write_text("#!/bin/sh\necho buildkitd\n")
+    (home / ".local" / "bin" / "buildkitd").chmod(0o755)
+    marker = tmp_path / "resolved.txt"
+    # Stub the setuptool as a REAL executable on a dedicated stub dir (not a
+    # bash function) so the `env CONTAINERD_NAMESPACE=default …
+    # containerd-rootless-setuptool.sh` call — which does a PATH lookup and
+    # can't see shell functions — resolves it, exactly as production's
+    # /usr/local/bin copy would. It records whether buildkitd is on PATH at
+    # call time. sudo (loginctl) is stubbed the same way.
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "containerd-rootless-setuptool.sh").write_text(
+        f'#!/bin/sh\nif command -v buildkitd >/dev/null 2>&1; then\n'
+        f'  echo resolved >> "{marker}"\nelse\n  echo missing >> "{marker}"\nfi\n'
+    )
+    (stub / "containerd-rootless-setuptool.sh").chmod(0o755)
+    (stub / "sudo").write_text('#!/bin/sh\nexec "$@"\n')  # loginctl → no-op-ish
+    (stub / "sudo").chmod(0o755)
+    (stub / "loginctl").write_text("#!/bin/sh\nexit 0\n")
+    (stub / "loginctl").chmod(0o755)
+    script = f"""
+      set -u
+      . "{RUNTIME_INSTALL}"
+      DRY_RUN=false
+      _runtime_linux_rootless_setup
+      echo "__rc=$?"
+    """
+    r = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        # Base PATH has the stub dir + system dirs, but deliberately EXCLUDES
+        # ~/.local/bin — the production trap the fix must overcome.
+        env={"PATH": f"{stub}:/usr/bin:/bin", "HOME": str(home)},
+    )
+    assert "__rc=0" in r.stdout, f"rootless_setup should succeed:\n{r.stdout}\n{r.stderr}"
+    recorded = marker.read_text() if marker.exists() else ""
+    # The setuptool ran (at least once) and saw buildkitd resolvable — never
+    # "missing", which is the exit-1 production failure.
+    assert "resolved" in recorded, f"buildkitd did not resolve on PATH: {recorded!r}"
+    assert "missing" not in recorded, (
+        f"buildkitd was missing from PATH at setuptool call — the exit-1 bug: {recorded!r}"
+    )
+
+
 def test_fedora_falls_back_to_docs_hint_not_autoinstall() -> None:
     r = _run_linux_install("fedora")
     assert "__rc=1" in r.stdout, "fedora must return non-zero (hint path)"

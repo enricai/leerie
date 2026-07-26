@@ -408,6 +408,14 @@ _runtime_linux_ensure_subid() {
 # containerd namespace, which the OCI-worker variant can't read). Finally
 # enable linger so the user services survive logout.
 _runtime_linux_rootless_setup() {
+  # Ensure the just-installed binaries resolve regardless of the caller's PATH.
+  # BuildKit went to ~/.local/bin, which is NOT on a fresh `curl | bash`
+  # (non-login) shell's PATH on Ubuntu — so `install-buildkit-containerd`'s
+  # own `command -v buildkitd` precheck would fail and exit 1 without this.
+  # /usr/local/bin (nerdctl + the setuptool itself) is usually present, but we
+  # prepend both to be safe. Same inline-PATH technique the install.sh claude
+  # re-verify uses. Scoped to this function via `local` so it doesn't leak.
+  local PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
   _runtime_log "setting up rootless containerd (containerd-rootless-setuptool.sh install)"
   _runtime_run containerd-rootless-setuptool.sh install || return 1
   _runtime_log "installing the rootless BuildKit containerd-worker"
@@ -459,7 +467,11 @@ runtime_install_linux() {
 
   # Verify end-to-end. The whole point of this rework: never report success on
   # an unreachable runtime. Under --dry-run we can't actually probe, so skip.
+  # Probe with the same PATH the setup used (the just-installed nerdctl is in
+  # /usr/local/bin, buildkit in ~/.local/bin) so the check reflects what a
+  # subsequent leerie run — which prepends ~/.local/bin itself — will see.
   if [ "$DRY_RUN" = "false" ]; then
+    local PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
     _runtime_log "verifying the runtime is reachable (nerdctl info)"
     if ! nerdctl info >/dev/null 2>&1; then
       _runtime_err "rootless containerd was set up but 'nerdctl info' still fails."
