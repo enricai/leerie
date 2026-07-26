@@ -26,7 +26,7 @@ inside the container (DESIGN §6 / §0.5 below).
 |------|---------|
 | `.claude-plugin/marketplace.json` | Single-plugin marketplace manifest. Makes the repo itself discoverable via `/plugin marketplace add enricai/leerie` from inside Claude Code. Points at `.` so Claude Code reads the sibling `.claude-plugin/plugin.json`. |
 | `.claude-plugin/plugin.json` | Existing plugin manifest (commands, skills, metadata). The `version` field is the single source of truth for `leerie --version`. |
-| `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
+| `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/curl checked; `claude` auto-installed via the official native installer if missing, opt-out `--no-claude-install`) → runtime install (colima on macOS; rootless containerd stack on Debian/Ubuntu — Fedora/Arch fall back to a docs hint) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
 | `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` and `config` skip container startup. Per-run auth/config is staged into a fresh `mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX"` (`$STAGE`); a `rm -rf "$STAGE"` EXIT trap is registered **immediately after the mktemp** (before the ~250-line stage-assembly block, which contains an `exit 1`) so an early exit can't leak the dir, and a best-effort startup sweep (`find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 -exec rm -rf`) reclaims dirs leaked by trap-bypassing exits (SIGKILL / OOM / `nerdctl kill`). Because `-mtime` tests the cfg dir's own top-level mtime — which freezes at staging-completion (the running container's writes into `$STAGE/.claude/*` do NOT bump it) — a background keepalive (`while :; do touch "$STAGE"; sleep 3600; done &`, killed by the same EXIT trap) freshens the live dir hourly so a genuinely long-running run (e.g. one auto-resuming across rate-limit backoffs) is never mistaken for stale and deleted by a concurrent launch's sweep. |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (rootful runtimes) or the **rootlesskit-mapped host UID** (rootless containerd — see DESIGN §6 *Rootless exception*); the Dockerfile intentionally omits `USER leerie` so the entrypoint can set up cgroup containment before privilege drop. It resolves `CGROUP_ROOT` (the literal `/sys/fs/cgroup`, or — rootless — the systemd-delegated `user.slice/user-$HOST_UID.slice/user@$HOST_UID.service` subtree), creates `$CGROUP_ROOT/leerie.slice` and enables the memory+pids controllers (needed for the aggregate `memory.max` cap), then — the load-bearing step — launches the **cgroup broker** (`LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &`) at the same identity, before privilege drop, because worker cgroup enrollment and limit-setting cannot be done by the dropped-privilege orchestrator (see `scripts/cgroup-broker.py` below and DESIGN §6). `ulimit -c 0`, the cgroup slice setup, the broker launch, `cd /work`, `chown leerie: /work`, `chown leerie: /home/leerie` + `chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg`, and `chown -R leerie: /tmp/.cache` + `chmod -R a+rwX /tmp/.cache` + `chmod 1777 /tmp/.cache` all run at this pre-drop identity (skipped in rootless mode, along with the `runuser` drop itself). Under rootless containerd's `unshare --user --map-user=<leerie-uid>` privilege drop, only outer UID 0 remaps to inner leerie — a directory chowned to leerie's own (non-zero) UID appears owned by nobody to the remapped process, traversable but not writable. The Dockerfile leaves `/home/leerie`, `.local`, `.cache`, and `.gnupg` root-owned at build time for exactly this reason (outer UID 0 is the one value that does remap correctly, the same mechanism that makes bind-mounted host dirs writable with no chown at all); the rootful path needs literal `leerie` ownership instead (a real `runuser -u leerie` UID switch, no remap involved), which is what the runtime chown here restores. `/tmp/.cache` gets the stronger `chmod 1777` treatment rather than a plain chown-back because arbitrary tools create their own subdirs under `XDG_CACHE_HOME` there at runtime (corepack, `tree-sitter-language-pack`) — a fixed set of pre-created dirs like `.local`/`.cache`/`.gnupg` doesn't need that, a chown-back suffices. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
@@ -153,14 +153,22 @@ curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install
 
 The script:
 
-1. **Preflight**: verifies `git`, `claude`, and `curl` are on `PATH`.
-   Missing deps print a platform-specific remediation hint and the
-   script exits non-zero.
-2. **Runtime preflight**: per `uname -s`. On macOS: verifies `colima`
-   is installed and the VM is running. On Linux: verifies `nerdctl`
-   is installed and reaches containerd. Prints copy-pasteable install
-   hints on failure (`brew install colima` / distro package commands).
-   Does NOT auto-install brew/apt packages — that's the user's choice.
+1. **Preflight**: verifies `git` and `curl` are on `PATH` (missing → hint +
+   non-zero exit). `claude` is **auto-installed** if missing, via Anthropic's
+   official native installer (`curl -fsSL https://claude.ai/install.sh | bash`
+   — a self-contained binary in `~/.local/bin`, no Node/npm), then re-verified;
+   opt out with `--no-claude-install` / `LEERIE_NO_CLAUDE_INSTALL=1` (falls back
+   to a hint + non-zero exit). Leerie shells out to `claude -p` for every unit
+   of LLM work, so a missing `claude` is a hard stop.
+2. **Runtime install**: per `uname -s`. On macOS: installs Colima via brew (if
+   missing) and starts the VM. On **Debian/Ubuntu**: installs and starts the
+   full **rootless** containerd stack — containerd + rootlesskit/slirp4netns/
+   uidmap (apt), pinned nerdctl, CNI plugins, BuildKit, the rootless setuptool +
+   BuildKit containerd-worker — then verifies reachability (`nerdctl info`); it
+   never reports success on an unreachable runtime. On **Fedora/RHEL and Arch**,
+   auto-install is not wired yet — prints a hint pointing at `docs/INSTALL.md`
+   "Rootless mode" and exits non-zero. Opt out of runtime auto-install entirely
+   with `--no-runtime-install` / `LEERIE_NO_RUNTIME_INSTALL=1`.
 3. **Clones** `enricai/leerie` to `$LEERIE_HOME` (default `~/.leerie`).
    `git clone --depth 1` for fresh installs; `git pull --ff-only` for
    upgrades.
@@ -171,8 +179,10 @@ The script:
 6. **Verifies** by invoking `leerie --version` (the launcher's fast path
    answers without spinning up a container — see below).
 
-Supports `--dry-run` (prints actions without executing) and
-`--prefix DIR` (overrides `LEERIE_HOME`).
+Supports `--dry-run` (prints actions without executing), `--prefix DIR`
+(overrides `LEERIE_HOME`), `--no-runtime-install`
+(`LEERIE_NO_RUNTIME_INSTALL=1`), and `--no-claude-install`
+(`LEERIE_NO_CLAUDE_INSTALL=1`).
 
 ### `--version`
 
@@ -268,15 +278,24 @@ which is the abnormal-exit cleanup guarantee.
 | OS | Container engine | CLI | VM? |
 |----|------------------|-----|-----|
 | macOS (arm64 or x86_64) | containerd inside a Colima-managed Linux VM | `nerdctl` host-side shim (`colima nerdctl install`) | Yes — managed by Colima |
-| Linux (any distro with containerd) | containerd native | `nerdctl` from distro or upstream | No |
+| Linux (Debian/Ubuntu) | rootless containerd (native) | `nerdctl` from upstream (+ CNI/BuildKit/RootlessKit) | No |
+| Linux (Fedora/RHEL, Arch) | rootless containerd (manual) | `nerdctl` — set up by hand per `docs/INSTALL.md` | No |
 
 The launcher detects `uname -s` and runs the right preflight. On macOS:
 require `colima` on `PATH`, check `colima status`, auto-install the
 `nerdctl` shim if missing (via `colima nerdctl install`), then check
-`nerdctl info` reaches the runtime. On Linux: require `nerdctl` on
-`PATH` and `nerdctl info` succeeds. Both paths print a copy-pasteable
-install hint on failure and exit non-zero — leerie does not invoke
-`brew`, `apt`, `dnf`, or `pacman` itself.
+`nerdctl info` reaches the runtime. On Linux: if `nerdctl` is missing and
+runtime auto-install is not opted out, `runtime_install_linux`
+(`scripts/runtime-install.sh`) stands up the full rootless stack on
+**Debian/Ubuntu** — invoking `apt-get` for containerd + the rootless
+prerequisites, downloading nerdctl/CNI/BuildKit, and running the rootless
+setuptool — then verifies `nerdctl info` succeeds. **Fedora/RHEL and Arch**
+are not auto-installed yet: the launcher prints a copy-pasteable hint
+(`docs/INSTALL.md` "Rootless mode") and exits non-zero. On macOS leerie does
+not invoke `brew` for the runtime beyond Colima, and on non-Debian Linux it
+does not invoke `dnf`/`pacman` — those remain the user's choice. Pass
+`--no-runtime-install` (`LEERIE_NO_RUNTIME_INSTALL=1`) to skip the Debian/Ubuntu
+auto-install and fall back to the hint.
 
 `brew install nerdctl` does NOT work on macOS — the Homebrew formula
 has `Requires: Linux` because the nerdctl binary talks directly to a
@@ -1089,11 +1108,11 @@ leerie/
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a Unix socket; v1+v2); the dropped-privilege orchestrator drives it
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 │   ├── container-entry.sh         container PID 1 (root rootful / mapped-UID rootless): create leerie.slice + launch cgroup broker + cd /work + drop to leerie via runuser (rootful)
-│   ├── install.sh                 one-command installer (curl | bash); preflight git/claude/curl +
-│   │                               runtime preflight (colima / nerdctl) + clones + symlinks
+│   ├── install.sh                 one-command installer (curl | bash); preflight git/curl + auto-install
+│   │                               claude + runtime install (colima / rootless containerd) + clones + symlinks
 │   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS;
-│   │                              containerd + nerdctl on Debian / Fedora / Arch). Sourced by
-│   │                              install.sh and the launcher.
+│   │                              rootless containerd stack on Debian/Ubuntu — Fedora/Arch: docs hint).
+│   │                              Sourced by install.sh and the launcher.
 │   └── remote/
 │       ├── _log.sh                shared remote_log() helper (timestamped, repo-tagged
 │       │                          stderr) sourced by every other scripts/remote/*.sh file

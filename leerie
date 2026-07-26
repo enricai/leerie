@@ -3579,15 +3579,21 @@ EOF
     Linux)
       cat >&2 <<'EOF'
 
-Install on Linux:
-  # Debian/Ubuntu:
-  sudo apt-get install -y containerd
-  # then install nerdctl from upstream:
-  #   https://github.com/containerd/nerdctl/releases
-  # Or distro packages where available (Arch: pacman -S nerdctl).
-  sudo systemctl enable --now containerd
+Install on Linux (rootless containerd):
+  # Debian/Ubuntu: leerie auto-installs the full rootless stack on first run
+  # (containerd + rootlesskit/slirp4netns/uidmap, nerdctl, CNI plugins,
+  #  BuildKit, the rootless setuptool). Just re-run leerie — or, to skip
+  #  auto-install, follow docs/INSTALL.md "Rootless mode" then pass
+  #  --no-runtime-install.
+  #
+  # A bare `apt-get install containerd` is NOT enough: an unprivileged nerdctl
+  # can't reach the rootful socket, and you still need CNI plugins (for
+  # `nerdctl run`) and BuildKit (for the image build).
+  #
+  # Fedora/RHEL and Arch: not auto-installed yet — follow the same
+  # "Rootless mode" sequence with your package manager.
 
-See docs/INSTALL.md for rootless mode and other distros.
+See docs/INSTALL.md "Rootless mode" for the full copy-pasteable sequence.
 EOF
       ;;
     *)
@@ -4215,7 +4221,7 @@ case "$OS" in
         exit 1
       fi
       if [ -t 0 ]; then
-        remote_log "nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..."
+        remote_log "nerdctl is missing — installing the rootless containerd stack (one-time; may prompt for sudo)..."
         if ! runtime_install_linux; then
           print_install_hint
           exit 1

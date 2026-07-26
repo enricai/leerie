@@ -158,15 +158,25 @@ To allow paths outside the default scope: edit
 
 ## Linux
 
-Containerd and nerdctl run natively — no VM needed. The one-line
-installer **auto-installs and starts** the runtime per distro (Debian/
-Ubuntu via `apt-get`, Fedora/RHEL via `dnf`, Arch via `pacman`; nerdctl
-binary pinned to v2.3.1 from upstream). Unknown distros fall back to a
-hint and exit 1 — install manually then re-run with
-`--no-runtime-install`.
+Containerd runs natively — no VM needed. Leerie runs it **rootless**
+(DESIGN §6 *Rootless exception*): the runtime, workers, and cgroup
+containment all live under your user's systemd slice, no root daemon
+required.
+
+On **Debian/Ubuntu**, the one-line installer **auto-installs and starts the
+full rootless stack** — containerd, RootlessKit, slirp4netns, uidmap, the
+pinned nerdctl binary (v2.3.1), CNI plugins, BuildKit, the rootless
+setuptool + BuildKit containerd-worker — and then verifies the runtime is
+reachable (`nerdctl info`). It refuses to report success on a runtime it
+can't reach.
+
+On **Fedora/RHEL and Arch**, auto-install is not wired yet — the installer
+prints a hint pointing here and exits 1. Follow the manual **Rootless mode**
+steps below (they're the same shape, with your distro's package manager),
+then re-run the installer with `--no-runtime-install`.
 
 ```bash
-# One-line installer — auto-installs containerd + nerdctl, then installs leerie.
+# One-line installer — Debian/Ubuntu: auto-installs the rootless stack, then leerie.
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 ```
 
@@ -178,65 +188,107 @@ commands), then pass `--no-runtime-install`:
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash -s -- --no-runtime-install
 ```
 
-### Debian / Ubuntu
+### Debian / Ubuntu (manual)
 
-```bash
-sudo apt-get install -y containerd
-# nerdctl: install the pinned static binary from upstream. Arch is detected
-# so the same line works on x86_64 (amd64) and arm64 (Asahi, Graviton, Pi).
-NERDCTL_VERSION=2.3.1
-ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-curl -L "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${ARCH}.tar.gz" \
-  | sudo tar -C /usr/local/bin -xz nerdctl
-sudo systemctl enable --now containerd
+On Debian/Ubuntu the one-line installer above does all of this for you.
+The manual steps are the **Rootless mode** sequence below — a bare
+`apt-get install containerd` alone is **not** enough: an unprivileged
+`nerdctl` can't reach the rootful socket, and you still need CNI plugins
+(for `nerdctl run`) and BuildKit (for leerie's image build). Follow
+**Rootless mode** directly.
 
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
-```
+### Fedora / RHEL and Arch
 
-### Fedora / RHEL
+Auto-install is Debian/Ubuntu-only for now, so set the rootless stack up by
+hand using the **Rootless mode** sequence below with your package manager in
+place of `apt-get`:
 
-```bash
-sudo dnf install -y containerd
-# nerdctl: install the pinned static binary from upstream (arch-detected).
-NERDCTL_VERSION=2.3.1
-ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-curl -L "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${ARCH}.tar.gz" \
-  | sudo tar -C /usr/local/bin -xz nerdctl
-sudo systemctl enable --now containerd
+- Fedora/RHEL: `sudo dnf install -y containerd rootlesskit slirp4netns shadow-utils`
+- Arch: `sudo pacman -S containerd nerdctl rootlesskit slirp4netns buildkit cni-plugins`
 
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
-```
-
-### Arch
-
-```bash
-sudo pacman -S containerd nerdctl rootlesskit buildkit cni-plugins fuse-overlayfs
-sudo systemctl enable --now containerd
-
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
-```
+Then re-run the installer with `--no-runtime-install`.
 
 ### Rootless mode (recommended)
 
 Running containerd as root is unnecessary for leerie — it doesn't need
-privileged operations. To set up rootless containerd:
+privileged operations. The full sequence below is exactly what the
+Debian/Ubuntu auto-install runs; do it by hand on other distros (swap the
+`apt-get` line for your package manager, per the section above). Versions
+are pinned; bump them together with `scripts/runtime-install.sh`.
+
+**1. Runtime + rootless prerequisites.** RootlessKit needs
+`newuidmap`/`newgidmap` (from `uidmap`), a port driver (`slirp4netns`), and
+a systemd user session (`dbus-user-session`):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y containerd rootlesskit slirp4netns uidmap dbus-user-session
+```
+
+**2. nerdctl** (also ships `containerd-rootless-setuptool.sh` +
+`containerd-rootless.sh`, which step 5 needs on PATH):
+
+```bash
+NERDCTL_VERSION=2.3.1
+ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+curl -L "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${ARCH}.tar.gz" \
+  | sudo tar -C /usr/local/bin -xz
+```
+
+**3. CNI plugins → `/opt/cni/bin`** (the `CNI_PATH` nerdctl looks in; without
+them `nerdctl run` fails with `needs CNI plugin "bridge" to be installed in
+CNI_PATH`):
+
+```bash
+CNI_VERSION=v1.9.1
+curl -L "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz" \
+  | sudo tar -C /opt/cni/bin -xz   # sudo mkdir -p /opt/cni/bin first if absent
+```
+
+**4. BuildKit → `~/.local`** (puts `buildctl`/`buildkitd` on your PATH). This
+**must** precede step 5: `install-buildkit-containerd` exits with
+`` `buildctl` needs to be installed and `buildkitd` needs to be running ``
+unless `buildkitd` is already on PATH:
+
+```bash
+BUILDKIT_VERSION=v0.31.2
+curl -L "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-${ARCH}.tar.gz" \
+  | tar -C "$HOME/.local" -xz
+command -v buildkitd   # must print a path before continuing
+```
+
+**5. Subuid/subgid** (RootlessKit prerequisite; idempotent — skip if
+`grep "^$(id -un):" /etc/subuid` already returns a line):
+
+```bash
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+```
+
+**6. Rootless containerd + BuildKit worker** (run as your user, **not** sudo).
+`install-buildkit-containerd` is the containerd-worker variant leerie needs —
+its `ensure_base_in_buildkit_ns` copies the base image into the `buildkit`
+containerd namespace, which the OCI-worker variant can't read:
 
 ```bash
 containerd-rootless-setuptool.sh install
+CONTAINERD_NAMESPACE=default containerd-rootless-setuptool.sh install-buildkit-containerd
+sudo loginctl enable-linger "$(id -un)"   # survive logout
 ```
 
-After that, the user's default nerdctl context points at the rootless
-socket (`unix:///run/user/$UID/containerd/containerd.sock`). Leerie's
-launcher uses whatever context nerdctl resolves to, so once rootless is
-set up no extra flags are needed.
+After this, nerdctl's default context points at the rootless socket
+(`unix:///run/user/$UID/containerd/containerd.sock`); leerie's launcher uses
+whatever context nerdctl resolves to, so no extra flags are needed.
 
-Also install BuildKit's containerd-worker variant (needed for repos
-with a custom `.leerie/Dockerfile` or `setup_packages`; see
-`IMPLEMENTATION.md`'s `ensure_base_in_buildkit_ns`):
+**7. Verify:**
 
 ```bash
-containerd-rootless-setuptool.sh install-buildkit-containerd
+nerdctl run --rm hello-world
+# rootless buildkitd listens on its own socket, so point buildctl at it:
+buildctl --addr unix:///run/user/$(id -u)/buildkit-default/buildkitd.sock debug workers
 ```
+
+Both should succeed (a "Hello from Docker!" and a worker row). Then re-run the
+installer with `--no-runtime-install`.
 
 ## Verifying the runtime
 
@@ -502,6 +554,35 @@ manual hint and exits 1 if the runtime is missing. Useful for CI,
 dotfiles managers, or any environment where package installs are
 tracked elsewhere.
 
+**Skip auto-install of the claude CLI** — pass `--no-claude-install` to
+`install.sh`, or set `LEERIE_NO_CLAUDE_INSTALL=1`. By default a missing
+`claude` is installed via Anthropic's official native installer
+(`curl -fsSL https://claude.ai/install.sh | bash` — a self-contained
+binary in `~/.local/bin`, no Node/npm). With the opt-out set, a missing
+`claude` falls back to a hint and exits 1. Leerie shells out to
+`claude -p` for every unit of LLM work, so a missing `claude` is a hard
+stop either way.
+
+**Linux: `` `buildctl` needs to be installed and `buildkitd` needs to be
+running ``** (at `leerie --help` / image build) — the rootless BuildKit
+worker isn't set up. Install the BuildKit binary onto your PATH (step 4 of
+**Rootless mode** above), then
+`CONTAINERD_NAMESPACE=default containerd-rootless-setuptool.sh
+install-buildkit-containerd`. Note the setuptool refuses (exit 1) unless
+`buildkitd` is already on PATH, so the binary install must come first.
+
+**Linux: `needs CNI plugin "bridge" to be installed in CNI_PATH
+("/opt/cni/bin")`** (at `nerdctl run`) — CNI plugins aren't installed. The
+rootless setuptool does not install them; add them explicitly (step 3 of
+**Rootless mode** above).
+
+**Linux: `rootlesskit: not found` / `RootlessKit failed`** (at
+`containerd-rootless-setuptool.sh install`) — a rootless prerequisite is
+missing. Install `rootlesskit slirp4netns uidmap dbus-user-session` (step 1),
+and if `RootlessKit failed` persists, ensure your user has subuid/subgid
+ranges (step 5: `sudo usermod --add-subuids 100000-165535 --add-subgids
+100000-165535 "$(id -un)"`).
+
 **"Colima VM is not running"** (macOS) — start it:
 `colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8`
 (pick `--cpu` / `--memory` matching half your host CPU/RAM; see the
@@ -517,7 +598,12 @@ with containerd: `colima stop && colima start --runtime containerd
 sizing through the restart; the bare command would re-default to
 2/2). The swap-provision YAML block in `~/.colima/default/colima.yaml`
 re-applies on every boot, so swap is preserved through this restart.
-On Linux, check `systemctl status containerd`.
+On Linux (rootless), check the *user* service —
+`systemctl --user status containerd` — not the system one, and make sure
+`~/.local/bin` and `/usr/local/bin` are on your PATH so `nerdctl` and the
+rootless helpers resolve. A bare `sudo apt-get install containerd` alone
+leaves a *rootful* daemon an unprivileged `nerdctl` can't reach; follow the
+**Rootless mode** steps above instead.
 
 **`FATA[NNNN] exit status 255` with no orchestrator diagnostic** — the
 leerie run died because Colima's host-side `nerdctl` / `lima-guestagent`

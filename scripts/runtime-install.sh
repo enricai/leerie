@@ -22,10 +22,18 @@
 
 # --- defaults ------------------------------------------------------------
 
-# Pinned nerdctl version used by the Linux Debian/Fedora paths. Matches
-# the version documented in docs/INSTALL.md and previously hard-coded in
-# install.sh.
+# Pinned nerdctl version used by the Linux Debian path. Matches the version
+# documented in docs/INSTALL.md and previously hard-coded in install.sh.
 NERDCTL_VERSION="${NERDCTL_VERSION:-2.3.1}"
+
+# Pinned CNI plugins + BuildKit versions for the Debian rootless path. The
+# rootless containerd stack these complete (containerd + rootlesskit come from
+# apt; nerdctl from the pinned tarball above) is not fully installed by the
+# rootless setuptool — CNI plugins and BuildKit binaries must be placed on the
+# host separately (see runtime_install_linux). All three release URLs were
+# verified to resolve. Update in lockstep with docs/INSTALL.md.
+CNI_VERSION="${CNI_VERSION:-v1.9.1}"
+BUILDKIT_VERSION="${BUILDKIT_VERSION:-v0.31.2}"
 
 # DRY_RUN may be set by the caller (install.sh's --dry-run). Default off.
 DRY_RUN="${DRY_RUN:-false}"
@@ -277,69 +285,189 @@ runtime_install_macos() {
   return 0
 }
 
-# --- public: Linux install (containerd + nerdctl per distro) ------------
+# --- public: Linux install (rootless containerd, Debian/Ubuntu) ---------
+#
+# Design (DESIGN §6; INSTALL.md "Rootless mode"): stand up a *working,
+# reachable* rootless runtime, not just an enabled rootful daemon. The prior
+# version installed only `containerd` (apt) + the bare `nerdctl` binary and
+# reported success without ever verifying `nerdctl info` — which left a fresh
+# host with an unreachable rootful socket, no CNI plugins (so `nerdctl run`
+# failed on the missing bridge plugin), and no BuildKit (so leerie's image
+# build failed on a missing `buildctl`/`buildkitd`). Those are the three walls
+# a real fresh-Ubuntu install hit, in order.
+#
+# The `containerd-rootless-setuptool.sh install` flow needs a set of host
+# prerequisites it does NOT install itself (it errors and exits if they're
+# absent): rootlesskit + a port driver (slirp4netns), newuidmap/newgidmap
+# (uidmap) plus /etc/subuid+/etc/subgid entries for the user, and a systemd
+# user session (dbus-user-session). And the setuptool never installs CNI
+# plugins or the BuildKit binaries at all. So the Debian path installs all of
+# these explicitly, runs the rootless setup as the non-root user, and verifies
+# reachability end-to-end.
+#
+# Scope: Debian/Ubuntu only. Fedora/Arch are not auto-installed here — their
+# package-name equivalents are unverified, so they fall back to a docs hint
+# rather than a possibly-half-working auto-install that reports false success.
+
+# Install the runtime + rootless prerequisites via apt (the exact package set
+# proven to bring rootless containerd up on Ubuntu):
+#   containerd        — the container runtime (rootless mode reuses the binary)
+#   rootlesskit       — the user-namespace "fake root" the rootless daemon runs in
+#   slirp4netns       — userspace networking for the rootless netns
+#   uidmap            — newuidmap/newgidmap (setuid) for the subuid/subgid map
+#   dbus-user-session — the per-user systemd/D-Bus session `systemctl --user` needs
+_runtime_linux_apt_prereqs() {
+  _runtime_log "installing containerd + rootless prerequisites via apt-get"
+  _runtime_run sudo apt-get update || return 1
+  _runtime_run sudo apt-get install -y \
+    containerd rootlesskit slirp4netns uidmap dbus-user-session || return 1
+  return 0
+}
+
+# Install the pinned upstream nerdctl binary into /usr/local/bin. The tarball
+# also carries containerd-rootless-setuptool.sh + containerd-rootless.sh, which
+# the rootless setup step below needs on PATH.
+_runtime_linux_install_nerdctl() {
+  local arch="$1" url
+  if [ "$arch" = "unknown" ]; then
+    _runtime_err "could not detect host arch for the nerdctl binary download."
+    _runtime_err "Install nerdctl manually from https://github.com/containerd/nerdctl/releases"
+    return 1
+  fi
+  url="https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${arch}.tar.gz"
+  _runtime_log "installing nerdctl ${NERDCTL_VERSION} (linux-${arch}) from upstream"
+  if [ "$DRY_RUN" = "false" ]; then
+    curl -L "$url" | sudo tar -C /usr/local/bin -xz || return 1
+  else
+    printf '  $ curl -L %s | sudo tar -C /usr/local/bin -xz\n' "$url"
+  fi
+  return 0
+}
+
+# Install the CNI plugins into /opt/cni/bin — the CNI_PATH nerdctl looks in.
+# The rootless setuptool never installs these; without them `nerdctl run`
+# fails with `needs CNI plugin "bridge" to be installed in CNI_PATH`.
+_runtime_linux_install_cni() {
+  local arch="$1" url
+  if [ "$arch" = "unknown" ]; then
+    _runtime_err "could not detect host arch for the CNI plugins download."
+    return 1
+  fi
+  url="https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${arch}-${CNI_VERSION}.tgz"
+  _runtime_log "installing CNI plugins ${CNI_VERSION} (linux-${arch}) into /opt/cni/bin"
+  if [ "$DRY_RUN" = "false" ]; then
+    sudo mkdir -p /opt/cni/bin || return 1
+    curl -L "$url" | sudo tar -C /opt/cni/bin -xz || return 1
+  else
+    printf '  $ sudo mkdir -p /opt/cni/bin\n'
+    printf '  $ curl -L %s | sudo tar -C /opt/cni/bin -xz\n' "$url"
+  fi
+  return 0
+}
+
+# Install the BuildKit binaries into ~/.local (bin/buildctl, bin/buildkitd) so
+# they land on the user's PATH. `containerd-rootless-setuptool.sh
+# install-buildkit-containerd` refuses (exit 1) unless `buildkitd` is already
+# on PATH, so this must precede the rootless-buildkit step.
+_runtime_linux_install_buildkit() {
+  local arch="$1" url
+  if [ "$arch" = "unknown" ]; then
+    _runtime_err "could not detect host arch for the BuildKit download."
+    return 1
+  fi
+  url="https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-${arch}.tar.gz"
+  _runtime_log "installing BuildKit ${BUILDKIT_VERSION} (linux-${arch}) into ~/.local"
+  if [ "$DRY_RUN" = "false" ]; then
+    curl -L "$url" | tar -C "$HOME/.local" -xz || return 1
+  else
+    printf '  $ curl -L %s | tar -C %s/.local -xz\n' "$url" "$HOME"
+  fi
+  return 0
+}
+
+# Ensure the invoking user has subordinate uid/gid ranges. RootlessKit (which
+# the rootless setuptool exercises) needs /etc/subuid + /etc/subgid entries of
+# at least 65536 ids for the user; Ubuntu does not guarantee they're populated
+# on every image. Idempotent: a no-op when an entry already exists.
+_runtime_linux_ensure_subid() {
+  local user
+  user="$(id -un)"
+  if [ "$DRY_RUN" = "false" ] && grep -q "^${user}:" /etc/subuid 2>/dev/null; then
+    return 0  # already configured
+  fi
+  _runtime_log "ensuring subuid/subgid ranges for ${user} (RootlessKit prerequisite)"
+  _runtime_run sudo usermod \
+    --add-subuids 100000-165535 --add-subgids 100000-165535 "$user" || return 1
+  return 0
+}
+
+# Run the rootless containerd setup as the invoking (non-root) user — the
+# setuptool installs a `systemctl --user` unit and must NOT run under sudo.
+# Then install the BuildKit containerd-worker (the variant leerie needs: its
+# ensure_base_in_buildkit_ns copies the base image into the `buildkit`
+# containerd namespace, which the OCI-worker variant can't read). Finally
+# enable linger so the user services survive logout.
+_runtime_linux_rootless_setup() {
+  _runtime_log "setting up rootless containerd (containerd-rootless-setuptool.sh install)"
+  _runtime_run containerd-rootless-setuptool.sh install || return 1
+  _runtime_log "installing the rootless BuildKit containerd-worker"
+  _runtime_run env CONTAINERD_NAMESPACE=default \
+    containerd-rootless-setuptool.sh install-buildkit-containerd || return 1
+  _runtime_log "enabling linger so rootless services survive logout"
+  _runtime_run sudo loginctl enable-linger "$(id -un)" || return 1
+  return 0
+}
 
 # Returns 0 on success, 1 on failure. Caller is responsible for the TTY
-# guard before invoking (apt-get / dnf / pacman / sudo systemctl all
-# prompt for the sudo password).
+# guard before invoking (apt-get / sudo all prompt for the sudo password).
 runtime_install_linux() {
   if _runtime_have_runnable nerdctl && nerdctl info >/dev/null 2>&1; then
-    return 0  # already set up
+    return 0  # already set up and reachable
   fi
-  local distro arch nerdctl_url
+  local distro arch
   distro="$(_runtime_detect_distro)"
   arch="$(_runtime_nerdctl_arch)"
-  nerdctl_url="https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${arch}.tar.gz"
 
   case "$distro" in
     debian)
-      _runtime_log "installing containerd via apt-get"
-      _runtime_run sudo apt-get update || return 1
-      _runtime_run sudo apt-get install -y containerd || return 1
-      if [ "$arch" = "unknown" ]; then
-        _runtime_err "could not detect host arch for the nerdctl binary download."
-        _runtime_err "Install nerdctl manually from https://github.com/containerd/nerdctl/releases"
-        return 1
-      fi
-      _runtime_log "installing nerdctl ${NERDCTL_VERSION} (linux-${arch}) from upstream"
-      if [ "$DRY_RUN" = "false" ]; then
-        curl -L "$nerdctl_url" | sudo tar -C /usr/local/bin -xz nerdctl || return 1
-      else
-        printf '  $ curl -L %s | sudo tar -C /usr/local/bin -xz nerdctl\n' "$nerdctl_url"
-      fi
+      _runtime_linux_apt_prereqs || return 1
+      _runtime_linux_install_nerdctl "$arch" || return 1
+      _runtime_linux_install_cni "$arch" || return 1
+      _runtime_linux_install_buildkit "$arch" || return 1
+      _runtime_linux_ensure_subid || return 1
+      _runtime_linux_rootless_setup || return 1
       ;;
-    fedora)
-      _runtime_log "installing containerd via dnf"
-      _runtime_run sudo dnf install -y containerd || return 1
-      if [ "$arch" = "unknown" ]; then
-        _runtime_err "could not detect host arch for the nerdctl binary download."
-        _runtime_err "Install nerdctl manually from https://github.com/containerd/nerdctl/releases"
-        return 1
-      fi
-      _runtime_log "installing nerdctl ${NERDCTL_VERSION} (linux-${arch}) from upstream"
-      if [ "$DRY_RUN" = "false" ]; then
-        curl -L "$nerdctl_url" | sudo tar -C /usr/local/bin -xz nerdctl || return 1
-      else
-        printf '  $ curl -L %s | sudo tar -C /usr/local/bin -xz nerdctl\n' "$nerdctl_url"
-      fi
-      ;;
-    arch)
-      _runtime_log "installing containerd + nerdctl via pacman"
-      _runtime_run sudo pacman -S --noconfirm containerd nerdctl || return 1
+    fedora|arch)
+      # Not auto-installed yet — the apt-equivalent package names for the
+      # rootless prerequisites are unverified on these distros, and a
+      # half-working auto-install that reports success is worse than an honest
+      # hint. See docs/INSTALL.md "Rootless mode" for the manual steps.
+      _runtime_err "auto-install of the rootless runtime is currently"
+      _runtime_err "Debian/Ubuntu-only (detected: ${distro})."
+      _runtime_err "Set up rootless containerd manually — see docs/INSTALL.md"
+      _runtime_err "'Rootless mode' — or pass --no-runtime-install to skip."
+      return 1
       ;;
     *)
       _runtime_err "unsupported Linux distro (detected: ${distro}). Auto-install"
-      _runtime_err "only supports debian/ubuntu, fedora/rhel, and arch."
-      _runtime_err "Install nerdctl + containerd manually (see docs/INSTALL.md) or"
+      _runtime_err "of the rootless runtime currently supports debian/ubuntu only."
+      _runtime_err "Set up rootless containerd manually (see docs/INSTALL.md) or"
       _runtime_err "pass --no-runtime-install to skip the auto-install step."
       return 1
       ;;
   esac
 
-  if [ "$DRY_RUN" = "false" ] \
-     && _runtime_have_runnable nerdctl && ! nerdctl info >/dev/null 2>&1; then
-    _runtime_log "enabling + starting containerd via systemd"
-    _runtime_run sudo systemctl enable --now containerd || return 1
+  # Verify end-to-end. The whole point of this rework: never report success on
+  # an unreachable runtime. Under --dry-run we can't actually probe, so skip.
+  if [ "$DRY_RUN" = "false" ]; then
+    _runtime_log "verifying the runtime is reachable (nerdctl info)"
+    if ! nerdctl info >/dev/null 2>&1; then
+      _runtime_err "rootless containerd was set up but 'nerdctl info' still fails."
+      _runtime_err "Ensure ~/.local/bin and /usr/local/bin are on your PATH, then"
+      _runtime_err "check: systemctl --user status containerd"
+      _runtime_err "See docs/INSTALL.md 'Rootless mode' for the manual steps."
+      return 1
+    fi
   fi
   return 0
 }

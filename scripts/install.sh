@@ -4,13 +4,22 @@
 #   curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 #
 # What this does, in order:
-#   1. Verifies `git`, `claude`, and `curl` are on PATH.
+#   1. Verifies `git` + `curl` are on PATH; auto-installs the `claude` CLI if
+#      missing via Anthropic's official native installer
+#      (`curl -fsSL https://claude.ai/install.sh | bash` — a self-contained
+#      binary in ~/.local/bin, no Node/npm). Pass --no-claude-install (or
+#      LEERIE_NO_CLAUDE_INSTALL=1) to skip — falls back to a hint and exits 1.
+#      Leerie shells out to `claude -p` for every unit of LLM work.
 #   2. Runtime: installs the container runtime if missing AND starts it.
 #      - macOS:    `brew install colima` + `colima start --runtime containerd --mount-type virtiofs --cpu N --memory M`
 #                  (N/M auto-detected: half host CPU/RAM, clamped 2..8 / 4..16 GB — see _runtime_colima_size_flags)
-#      - Debian:   `apt-get install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
-#      - Fedora:   `dnf install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
-#      - Arch:     `pacman -S containerd nerdctl` + `systemctl enable --now containerd`
+#      - Debian/Ubuntu: a full rootless containerd stack — containerd +
+#                  rootlesskit/slirp4netns/uidmap (apt), pinned nerdctl, CNI
+#                  plugins, BuildKit, the rootless setuptool + buildkit worker,
+#                  and an end-to-end `nerdctl info` reachability check. See
+#                  runtime_install_linux in runtime-install.sh.
+#      - Fedora/Arch: not auto-installed yet — falls back to a docs hint
+#                  (docs/INSTALL.md "Rootless mode") + exit 1.
 #      Pass --no-runtime-install (or LEERIE_NO_RUNTIME_INSTALL=1) to skip
 #      auto-install — the installer falls back to a hint and exits 1.
 #      Unknown distros always fall back to the hint.
@@ -27,6 +36,8 @@
 #   --dry-run                Print actions without executing.
 #   --no-runtime-install     Skip auto-install of the container runtime;
 #                            print the manual hint and exit 1 if missing.
+#   --no-claude-install      Skip auto-install of the claude CLI;
+#                            print the manual hint and exit 1 if missing.
 #   --prefix DIR             Install Leerie under DIR (default: $LEERIE_HOME or ~/.leerie).
 #   --bin-dir DIR            Symlink dir (default: ~/.local/bin).
 #   --ref REF                Git ref to install (default: main).
@@ -37,6 +48,7 @@
 #   LEERIE_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
 #   LEERIE_REPO_URL             Repo URL to clone (default https://github.com/enricai/leerie.git).
 #   LEERIE_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
+#   LEERIE_NO_CLAUDE_INSTALL    Same as --no-claude-install when truthy ("1", "true", "yes").
 set -euo pipefail
 
 # --- defaults ------------------------------------------------------------
@@ -61,9 +73,17 @@ case "${LEERIE_NO_RUNTIME_INSTALL:-}" in
   1|true|TRUE|yes|YES) NO_RUNTIME_INSTALL=true ;;
   *)                   NO_RUNTIME_INSTALL=false ;;
 esac
-# Pinned nerdctl version used by the Linux Debian/Fedora paths. Matches
-# the version documented in docs/INSTALL.md. Set BEFORE sourcing
-# runtime-install.sh so the helper inherits it.
+# Same detector for LEERIE_NO_CLAUDE_INSTALL — opt out of auto-installing the
+# claude CLI when it's missing (mirrors --no-runtime-install). When true, a
+# missing claude falls back to the printed hint + exit 1 (the pre-auto-install
+# behavior).
+case "${LEERIE_NO_CLAUDE_INSTALL:-}" in
+  1|true|TRUE|yes|YES) NO_CLAUDE_INSTALL=true ;;
+  *)                   NO_CLAUDE_INSTALL=false ;;
+esac
+# Pinned nerdctl version used by the Linux Debian path. Matches the version
+# documented in docs/INSTALL.md. Set BEFORE sourcing runtime-install.sh so the
+# helper inherits it.
 # shellcheck disable=SC2034  # consumed by runtime-install.sh (sourced below)
 NERDCTL_VERSION=2.3.1
 
@@ -76,11 +96,13 @@ install.sh — one-command installer for Leerie.
   curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 
 What this does, in order:
-  1. Verifies `git`, `claude`, and `curl` are on PATH.
+  1. Verifies `git` + `curl` are on PATH; auto-installs the `claude` CLI if
+     missing (Anthropic's official native installer). Pass --no-claude-install
+     to skip (fall back to hint + exit 1).
   2. Runtime: installs the container runtime if missing AND starts it
-     (Colima on macOS via brew; containerd + pinned nerdctl on
-     Debian/Fedora/Arch via the distro package manager). Pass
-     --no-runtime-install to skip auto-install (fall back to hint + exit 1).
+     (Colima on macOS via brew; a rootless containerd stack on Debian/Ubuntu.
+     Fedora/Arch fall back to a docs hint). Pass --no-runtime-install to skip
+     auto-install (fall back to hint + exit 1).
   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
   5. Verifies the install with `leerie --version`.
@@ -88,6 +110,7 @@ What this does, in order:
 Flags:
   --dry-run                Print actions without executing.
   --no-runtime-install     Skip auto-install of the container runtime.
+  --no-claude-install      Skip auto-install of the claude CLI.
   --prefix DIR             Install Leerie under DIR (default: $LEERIE_HOME or ~/.leerie).
   --bin-dir DIR            Symlink dir (default: ~/.local/bin).
   --ref REF                Git ref to install (default: main).
@@ -98,6 +121,7 @@ Env vars:
   LEERIE_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
   LEERIE_REPO_URL             Repo URL to clone (default https://github.com/enricai/leerie.git).
   LEERIE_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
+  LEERIE_NO_CLAUDE_INSTALL    Same as --no-claude-install when truthy ("1", "true", "yes").
 EOF
 }
 
@@ -134,6 +158,22 @@ remediate_git() {
 remediate_claude() {
   err "claude CLI is missing. Install Claude Code from https://claude.ai/code"
   err "Leerie shells out to \`claude -p\` for every unit of LLM work; there is no fallback."
+  err "(Auto-install is on by default; this hint prints only when"
+  err " --no-claude-install / LEERIE_NO_CLAUDE_INSTALL=1 is set, or the"
+  err " auto-install itself failed.)"
+}
+
+# Auto-install the claude CLI via Anthropic's official native installer
+# (curl -fsSL https://claude.ai/install.sh | bash). It downloads a
+# self-contained binary — no Node/npm — installs to ~/.local/bin/claude, and
+# registers PATH. It refuses to run under sudo, so we never wrap it in sudo.
+# Mirrors the container-runtime auto-install: leerie shells out to `claude -p`
+# for every unit of LLM work, so a missing claude is a hard stop; installing it
+# for the user removes the single most common first-run wall. Returns the
+# installer's exit code; the caller re-verifies runnability regardless.
+install_claude() {
+  log "installing the claude CLI via the official native installer"
+  run bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
 }
 
 remediate_curl() {
@@ -155,6 +195,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)              DRY_RUN=true; shift ;;
     --no-runtime-install)   NO_RUNTIME_INSTALL=true; shift ;;
+    --no-claude-install)    NO_CLAUDE_INSTALL=true; shift ;;
     --prefix)               PREFIX="${2:?--prefix needs an argument}"; shift 2 ;;
     --bin-dir)              BIN_DIR="${2:?--bin-dir needs an argument}"; shift 2 ;;
     --ref)                  REF="${2:?--ref needs an argument}"; shift 2 ;;
@@ -210,19 +251,46 @@ _source_runtime_helpers || exit 1
 # curl is required to download the repo (and for the runtime preflight's
 # nerdctl-from-upstream guidance on Linux).
 
-log "preflight: checking git, claude, and curl on PATH"
+log "preflight: checking git + curl on PATH; auto-installing claude if missing"
 missing=0
+# git and curl are OS-package prerequisites leerie doesn't own — check only,
+# with a distro-appropriate hint. curl in particular is needed *by* the claude
+# auto-install below (and by _source_runtime_helpers), so verify it first.
 if ! have_runnable git; then
   remediate_git
-  missing=1
-fi
-if ! have_runnable claude; then
-  remediate_claude
   missing=1
 fi
 if ! have_runnable curl; then
   remediate_curl
   missing=1
+fi
+# claude is leerie-owned in the sense that every unit of work shells out to it,
+# so we auto-install it (like the container runtime) unless the user opted out.
+# The official native installer lands in ~/.local/bin, which may not be on the
+# current PATH yet — re-verify against that path before failing.
+if ! have_runnable claude; then
+  if [ "$NO_CLAUDE_INSTALL" = "true" ]; then
+    remediate_claude
+    missing=1
+  elif ! have_runnable curl; then
+    # curl already failed above; the claude installer needs it. Fall back to
+    # the manual hint rather than attempting an install that can't run.
+    remediate_claude
+    missing=1
+  else
+    install_claude || true
+    # Re-verify. The native installer commonly lands in ~/.local/bin; add it
+    # to PATH for this check so a just-installed claude is found even if the
+    # user's PATH doesn't include it yet (the PATH-check step below hints the
+    # user to add ~/.local/bin permanently). Skipped under --dry-run since
+    # nothing was actually installed.
+    if [ "$DRY_RUN" = "false" ] \
+       && ! PATH="$HOME/.local/bin:$PATH" have_runnable claude; then
+      err "claude auto-install ran but claude is still not runnable."
+      remediate_claude
+      missing=1
+    fi
+  fi
 fi
 if [ "$missing" -ne 0 ]; then
   exit 1
@@ -281,18 +349,25 @@ case "$(uname -s)" in
   Linux)
     if ! have_runnable nerdctl; then
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
-        err "nerdctl is missing. Install it from your distro's package manager"
-        err "or from https://github.com/containerd/nerdctl/releases."
-        err "Examples: 'sudo apt-get install -y containerd' + nerdctl binary download;"
-        err "          'sudo pacman -S containerd nerdctl' on Arch."
-        err "See docs/INSTALL.md for rootless mode and other distros."
+        err "nerdctl is missing (auto-install skipped via --no-runtime-install)."
+        err "Set up the rootless containerd stack manually — see docs/INSTALL.md"
+        err "\"Rootless mode\" (containerd + rootlesskit/slirp4netns/uidmap, nerdctl,"
+        err "CNI plugins, BuildKit, the rootless setuptool), then re-run."
         runtime_ok=false
       else
         runtime_install_linux || runtime_ok=false
       fi
     elif [ "$DRY_RUN" = "false" ] && ! nerdctl info >/dev/null 2>&1; then
-      log "enabling + starting containerd via systemd"
-      run sudo systemctl enable --now containerd
+      # nerdctl is present but can't reach containerd. Under leerie's rootless
+      # model this is a misconfigured/stopped user service, NOT a case for
+      # enabling the rootful system daemon (which an unprivileged nerdctl can't
+      # reach anyway). Point at the rootless recovery steps.
+      err "nerdctl is installed but cannot reach containerd."
+      err "For rootless containerd, check the user service:"
+      err "  systemctl --user status containerd"
+      err "and ensure ~/.local/bin + /usr/local/bin are on your PATH."
+      err "See docs/INSTALL.md \"Rootless mode\"."
+      runtime_ok=false
     fi
     ;;
   *)
