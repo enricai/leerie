@@ -20966,6 +20966,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await _backstop_capture_prior_runs(
             leerie_dir, Path(os.getcwd()), caps, models, efforts)
         await phase_classify(task, st, caps, args.clarify, models, efforts)
+        # Resumable-planning checkpoint (DESIGN §6 "Resumable planning — a
+        # per-phase checkpoint cursor, not a `waves` gate"). `plans` does
+        # not exist yet at this point in the pipeline (phase_classify
+        # produces categories, not a plan) — the empty list is the
+        # accurate "this phase's output is safely persisted" marker that
+        # --resume treats as proof phase_classify need not be re-invoked.
+        st.data["plans_after_classify"] = []
+        st.save()
         log(f"run id: {st.run_id}")
         # Initialize run.json with the immutable run-identity fields
         # (run_id, branch, working_branch, pr_base_branch, started_at,
@@ -21002,10 +21010,19 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # loop, which is why the lock-free State works.
         gather_answers(st, supplied)
         plans = await phase_plan(task, st, caps, models, efforts)
+        # Resumable-planning checkpoint: post-recursive-decompose `plans`,
+        # persisted so --resume can skip re-invoking phase_plan (DESIGN §6).
+        st.data["plans_after_plan"] = plans
+        st.save()
         # Bridge cross-domain capability-tag mismatches before the
         # scheduler builds its DAG. Short-circuits with no worker call
         # when planners agreed on vocabulary (the common case).
         plans = await phase_reconcile(plans, task, st, caps, models, efforts)
+        # Resumable-planning checkpoint: the reconciled `plans`, persisted
+        # BEFORE the no-work short-circuit below so a run that turns out
+        # to have work is never left without this checkpoint (DESIGN §6).
+        st.data["plans_after_reconcile"] = plans
+        st.save()
         # Cleared-but-empty terminal state (DESIGN §8): every planner
         # cleared its gate and confirmed the task is already satisfied
         # on HEAD. Nothing to schedule, nothing to execute, no run
@@ -21031,6 +21048,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # conflict crash this exists to prevent).
         plans = await phase_overlap_judge(
             plans, task, st, caps, models, efforts)
+        # Resumable-planning checkpoint: post-collision-resolution `plans`,
+        # persisted so --resume can skip re-invoking phase_overlap_judge
+        # (DESIGN §6 *Cross-domain surface overlap*).
+        st.data["plans_after_overlap_judge"] = plans
+        st.save()
         # Phase 2⅞: instruction-adherence gate (the deterministic
         # prescribed-command-coverage floor + the opus adherence_judge).
         # Short-circuits when the classifier found no prescribed procedure
@@ -21044,6 +21066,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # scheduled DAG).
         plans = await phase_adherence_gate(
             plans, task, st, caps, models, efforts)
+        # Resumable-planning checkpoint: post-instruction-adherence-gate
+        # `plans`, persisted so --resume can skip re-invoking
+        # phase_adherence_gate (DESIGN §6).
+        st.data["plans_after_adherence_gate"] = plans
+        st.save()
         # Surface cross-planner file-claim overlaps. Warning only — the
         # reconciler handles capability-tag drift but not file-claim
         # conflicts (yet); empirically these correlate strongly with
@@ -21075,6 +21102,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if satisfied_no_work is not None:
             _finish_no_work_run(st, satisfied_no_work)
             return
+        # Resumable-planning checkpoint: the filtered `plans` immediately
+        # before schedule() — the last plans_after_* checkpoint before
+        # plan_snapshot/waves take over as the resume cursor (DESIGN §6).
+        st.data["plans_after_filters"] = plans
+        st.save()
         st.data["current_phase"] = "phase 3: scheduling"
         st.save()
         subtasks, waves = schedule(plans)
