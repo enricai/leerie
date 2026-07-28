@@ -1193,7 +1193,17 @@ REPORTED FAILURE PINNED — a partial `satisfied_probe_cache` resumes,
 re-probes only the uncached subtasks (asserted by `claude_p` call count),
 and reaches scheduling, where before it would have re-run the whole
 sweep. All 17 pre-existing tests in the file are unchanged (17 + 5 = 22
-passing).
+passing). `tests/test_satisfied_probe_cache.py` is a dedicated, narrower
+pin for the same `probe_one` cache mechanism in isolation (no resume
+control-flow, no state-surface parity — that stays
+`test_filter_satisfied_subtasks.py`'s job): a cached `satisfied` verdict
+drops the subtask with ZERO `claude_p` calls for that sid, a cached
+not-satisfied verdict keeps it with zero calls, an uncached sid is
+probed exactly once with the verdict persisted for both outcomes
+(asserted per-sid, never in aggregate), and a `WorkerError` crash keeps
+the subtask while asserting the cache KEY is ABSENT rather than merely
+that the subtask survived — the anti-vacuity discipline from the
+zombie-reaper harness lesson.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
