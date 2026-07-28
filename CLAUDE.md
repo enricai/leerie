@@ -1144,9 +1144,29 @@ already enforces for every `STATE_FIELDS` entry: each key is present in
 has a row in the IMPLEMENTATION.md §8 `state.json` field table, plus a
 regression pin that the field table no longer carries the old "A run that
 died on the preflight is not resumable" claim now that `plan_snapshot`
-makes a budget-check-stopped run resumable. This subtask (bugfix-002)
-registers the keys and documents them only — no checkpoint-writing or
-resume-rehydration code exists yet (that is bugfix-003/004/005).
+makes a budget-check-stopped run resumable. bugfix-002 registered the keys
+and documented them only; resume-rehydration code is separate work
+(bugfix-004/005).
+The checkpoint-writing half — `_run_phases`'s fresh-run branch persisting
+each `plans_after_*` key immediately after its producing phase returns —
+is pinned in `tests/test_plans_after_checkpoints.py` via the same
+`inspect.getsource(leerie._run_phases)` source-coupling approach as
+`tests/test_plan_snapshot_wiring.py` (driving `_run_phases` end-to-end is
+infeasible: it spawns real workers and shells out to git/preflight).
+Pinned: all six `plans_after_*` keys appear as `st.data[...]` assignments;
+each assignment is followed by `st.save()` within 200 chars (an
+in-memory-only write is lost on pause/crash); each key's assignment sits
+strictly *after* its phase's call in source order — never at entry, which
+is the same "`current_phase` is stamped at entry, not completion" trap
+`plan_snapshot`'s own wiring test guards against; `plans_after_reconcile`
+precedes the `detect_no_work` short-circuit and `plans_after_filters`
+precedes both the `satisfied_no_work` short-circuit and `schedule()`, so a
+run that turns out to have work is never left without its checkpoint; the
+six keys' first-occurrence source order matches pipeline order (guards
+against a correctly-individually-ordered but scrambled insertion producing
+a resume cursor that silently skips a phase); and `plans_after_filters`
+precedes `plan_snapshot`, keeping the existing post-schedule checkpoint
+authoritative and undisturbed.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
