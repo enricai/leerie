@@ -489,3 +489,158 @@ def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
     surv = plans[0]["subtasks"]
     assert [s["id"] for s in surv] == ["feat-001", "feat-002"]
     assert surv[1]["depends_on"] == ["feat-001"]
+
+
+# ---------------------------------------------------------------------------
+# satisfied_probe_cache — per-subtask resume checkpoint (bugfix-005)
+# ---------------------------------------------------------------------------
+
+def _init_git_repo(path: Path) -> str:
+    """Create a minimal real git repo at `path` and return HEAD's sha."""
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"],
+                    cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    (path / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
+                          check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def test_cache_hit_skips_semaphore_and_claude_p(leerie, tmp_path, monkeypatch):
+    """A cached verdict under the CURRENT base sha is consulted before
+    `async with sem:` and claude_p is never invoked for that subtask."""
+    repo = tmp_path / "repo"
+    sha = _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    st.data["satisfied_probe_cache"] = {
+        "feat-001": {"satisfied": True, "evidence": "already on HEAD",
+                     "checked": ["a.py"], "base_sha": sha},
+        "feat-002": {"satisfied": False, "evidence": "still needed",
+                     "base_sha": sha},
+    }
+    plans = [{"domain": "feature-implementation", "status": "ready",
+              "subtasks": [_sub("feat-001"), _sub("feat-002")]}]
+
+    async def unreached(**_kw):
+        raise AssertionError("claude_p must not be called on a cache hit")
+    monkeypatch.setattr(leerie, "claude_p", unreached)
+
+    res = _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+    assert res is None
+    surviving = [s["id"] for s in plans[0]["subtasks"]]
+    assert surviving == ["feat-002"]
+    assert st.data["dropped_subtasks"]["feat-001"]["reason"] == "already_satisfied"
+    assert st.data["dropped_subtasks"]["feat-001"]["evidence"] == "already on HEAD"
+
+
+def test_verdicts_persisted_for_both_outcomes(leerie, tmp_path, monkeypatch):
+    """A fresh probe (no cache entry) persists its verdict to
+    satisfied_probe_cache for BOTH satisfied and not-satisfied outcomes,
+    keyed by sid, carrying satisfied/evidence/checked + base_sha."""
+    repo = tmp_path / "repo"
+    sha = _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-001"), _sub("feat-002")]}]
+    _patch_probe(leerie, monkeypatch, {
+        "feat-001": {"satisfied": True, "evidence": "done",
+                     "checked": ["a.py"]},
+        "feat-002": {"satisfied": False, "evidence": "not yet"},
+    })
+    _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+
+    cache = st.data["satisfied_probe_cache"]
+    assert cache["feat-001"] == {
+        "satisfied": True, "evidence": "done",
+        "checked": ["a.py"], "base_sha": sha,
+    }
+    assert cache["feat-002"] == {
+        "satisfied": False, "evidence": "not yet",
+        "checked": [], "base_sha": sha,
+    }
+
+
+def test_crash_path_writes_no_cache_entry(leerie, tmp_path, monkeypatch):
+    """Regression: the WorkerError crash-keep path must write NO cache
+    entry — a crashed probe is re-probed on resume, not treated as
+    decided."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-001")]}]
+    _patch_probe(leerie, monkeypatch, {"feat-001": "CRASH"})
+    _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+    assert "feat-001" not in st.data.get("satisfied_probe_cache", {})
+
+
+def test_stale_sha_invalidates_cache_and_reprobes(leerie, tmp_path,
+                                                   monkeypatch):
+    """A cached verdict whose recorded sha differs from the current HEAD
+    is invalidated and the subtask is re-probed (correctness test —
+    DESIGN §6 the mid-run-sibling-adjacent hazard: HEAD can move between
+    a pause and a resume)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    st.data["satisfied_probe_cache"] = {
+        "feat-001": {"satisfied": True, "evidence": "stale verdict",
+                     "checked": [], "base_sha": "deadbeef-not-current"},
+    }
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-001")]}]
+    called = {"count": 0}
+
+    async def fake_claude_p(*, user_prompt, sid, **_kw):
+        called["count"] += 1
+        return {"satisfied": False, "evidence": "fresh probe result"}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    res = _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+    assert res is None
+    assert called["count"] == 1, "stale-sha cache entry must trigger a re-probe"
+    surviving = [s["id"] for s in plans[0]["subtasks"]]
+    assert surviving == ["feat-001"]
+    assert st.data["satisfied_probe_cache"]["feat-001"]["evidence"] == \
+        "fresh probe result"
+
+
+def test_resume_reprobes_only_uncached_subtasks(leerie, tmp_path,
+                                                 monkeypatch):
+    """THE REPORTED FAILURE PINNED: a partial satisfied_probe_cache
+    (some subtasks already decided under the current sha) resumes and
+    re-probes only the uncached subtasks, reaching scheduling — asserted
+    by claude_p call count. Reverting the fix must fail this test."""
+    repo = tmp_path / "repo"
+    sha = _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    st.data["satisfied_probe_cache"] = {
+        "feat-001": {"satisfied": False, "evidence": "decided pre-pause",
+                     "checked": [], "base_sha": sha},
+    }
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-001"), _sub("feat-002"),
+                           _sub("feat-003")]}]
+    calls = []
+
+    async def fake_claude_p(*, user_prompt, sid, **_kw):
+        calls.append(sid)
+        return {"satisfied": False, "evidence": "probed after resume"}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    res = _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+    assert res is None
+    # Only the two uncached subtasks trigger a fresh claude_p call.
+    assert sorted(calls) == ["satisfied_probe-feat-002",
+                             "satisfied_probe-feat-003"]
+    assert len(plans[0]["subtasks"]) == 3
