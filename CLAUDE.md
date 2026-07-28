@@ -1146,7 +1146,17 @@ regression pin that the field table no longer carries the old "A run that
 died on the preflight is not resumable" claim now that `plan_snapshot`
 makes a budget-check-stopped run resumable. bugfix-002 registered the keys
 and documented them only; resume-rehydration code is separate work
-(bugfix-004).
+(bugfix-004). `tests/test_planning_checkpoint_keys.py` adds the one check
+neither `test_state_fields.py` nor `test_resumable_planning_keys.py`
+covers: a real `State.save()` / on-disk JSON reload round-trip with all
+seven checkpoint keys populated at once (mirroring
+`test_plan_snapshot_wiring.py::TestSnapshotRoundTrips`), plus a
+`State.load()` round-trip proving the reloaded in-memory `.data` dict —
+not just the on-disk artifact — reproduces every key byte-equal, since
+that in-memory dict is what the real `--resume` path reads. Deliberately
+its own file rather than folded into either of the above two, per its
+narrow scope: pure state-surface assertions, no phase control flow, no
+stubbed workers, no async.
 The checkpoint-writing half — `_run_phases`'s fresh-run branch persisting
 each `plans_after_*` key immediately after its producing phase returns —
 is pinned in `tests/test_plans_after_checkpoints.py` via the same
