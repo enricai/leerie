@@ -364,6 +364,33 @@ STATE_FIELDS = (
     # successful write. The run-start backstop checks the sentinel file to
     # skip runs already captured (idempotency).
     "dep_capture_done",
+    # plans_after_*: per-planning-phase checkpoints (DESIGN §6 "Resumable
+    # planning — a per-phase checkpoint cursor, not a `waves` gate"). Each
+    # key holds the full `plans` list as it stood immediately after the
+    # named phase completed and st.save()'d — never at phase entry (see
+    # DESIGN's "current_phase alone is NOT a completion signal" warning).
+    # `--resume` walks this sequence in order and re-enters at the first
+    # phase whose output key is absent, reusing the persisted `plans` as
+    # that phase's input instead of re-deriving it. Absent for a phase
+    # that has not yet completed (or on a run that has already reached
+    # `waves`, since plan_snapshot/write_plan supersede these by then).
+    "plans_after_classify",
+    "plans_after_plan",
+    "plans_after_reconcile",
+    "plans_after_overlap_judge",
+    "plans_after_adherence_gate",
+    "plans_after_filters",
+    # satisfied_probe_cache: per-subtask satisfied-probe verdicts (DESIGN
+    # §6 "The satisfied-probe sweep needs finer-than-phase granularity"),
+    # keyed by subtask id, persisted as each `probe_one` verdict returns
+    # rather than only in aggregate after the whole sweep's `gather`
+    # completes. Each entry also records the base commit sha at probe
+    # time; a cached verdict whose sha no longer matches HEAD on resume is
+    # treated as absent and the subtask is re-probed (correctness-critical
+    # — the base tree can move between a pause and a resume, e.g. a
+    # sibling run merging its own PR). A probe that crashes (`WorkerError`)
+    # is deliberately never cached — no verdict was actually reached.
+    "satisfied_probe_cache",
 )
 
 CATEGORIES = [
