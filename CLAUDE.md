@@ -1132,6 +1132,21 @@ a `sorted(...)` removal (within one process, unsorted set iteration is still
 self-consistent across calls, so `waves_fresh == waves_rt` etc. can hold even
 without the sort), so the direct per-wave sortedness check is the test that
 actually fails when `sorted(...)` is removed at `:17374`.
+The resumable-planning checkpoint keys (`plans_after_classify`,
+`plans_after_plan`, `plans_after_reconcile`, `plans_after_overlap_judge`,
+`plans_after_adherence_gate`, `plans_after_filters`, `satisfied_probe_cache`
+— DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a
+`waves` gate") are pinned by name in `tests/test_resumable_planning_keys.py`,
+on top of the generic bidirectional parity `tests/test_state_fields.py`
+already enforces for every `STATE_FIELDS` entry: each key is present in
+`leerie.STATE_FIELDS` (mirroring `test_plan_snapshot_wiring.py`'s
+`assert "plan_snapshot" in leerie.STATE_FIELDS` guard-the-guard pattern) and
+has a row in the IMPLEMENTATION.md §8 `state.json` field table, plus a
+regression pin that the field table no longer carries the old "A run that
+died on the preflight is not resumable" claim now that `plan_snapshot`
+makes a budget-check-stopped run resumable. This subtask (bugfix-002)
+registers the keys and documents them only — no checkpoint-writing or
+resume-rehydration code exists yet (that is bugfix-003/004/005).
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
