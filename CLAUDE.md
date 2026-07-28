@@ -1116,6 +1116,22 @@ leaf count matches `plan["subtasks"]` (nothing silently dropped); and, mirroring
 `phase_plan` (which writes the snapshot) strictly before `check_budget_feasibility`
 and `validate_plan` — the two gates that die() and would otherwise make a discarded
 decomposition unrecoverable.
+The safety-by-construction property the planning-resume checkpoint design rests
+on — that `schedule()` (`:17334`) re-sorts every wave by subtask id
+(`wave = sorted(...)`, `:17374`), making the wave partition a pure function of the
+dependency graph plus lexicographic ids, independent of dict/set iteration order
+and of input plan/subtask order — is pinned directly, with no state/stubs/async,
+in `tests/test_schedule_determinism.py`: a multi-domain fixture with both
+intra-domain `depends_on` and cross-domain `requires`/`provides` edges (so the
+tag channel resolved through `_build_predecessor_graph` is exercised, not just
+`depends_on`) produces identical `waves` and subtask-id sets across a fresh call,
+a JSON round-trip (simulating a checkpoint reload), reversed plan order, and
+reversed per-plan subtask order. A companion test asserts every wave is
+lexicographically sorted directly — the round-trip equality alone does not kill
+a `sorted(...)` removal (within one process, unsorted set iteration is still
+self-consistent across calls, so `waves_fresh == waves_rt` etc. can hold even
+without the sort), so the direct per-wave sortedness check is the test that
+actually fails when `sorted(...)` is removed at `:17374`.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
