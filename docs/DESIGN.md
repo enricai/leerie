@@ -922,8 +922,9 @@ practice — decomposition routinely accounts for a large share of a run's
 total planning spend, so losing it to a single transient worker failure
 is expensive. `phase_plan` snapshots decomposition progress into state as
 each top-level subtask finishes expanding, mirroring how `plan_snapshot`
-already persists the plan after `schedule()`; like `plan_snapshot`, this
-is diagnostic only — nothing reads it back on `--resume` in this change.
+already persists the plan after `schedule()`; this `decompose_snapshot` is
+one of the per-phase checkpoints the resumable-planning cursor (§6
+*Resumable planning*) reads on `--resume` — it is no longer diagnostic-only.
 
 ### Wire-in to `phase_plan`
 
@@ -1122,6 +1123,115 @@ The resumable-status narrowing belongs to `--resume` alone. The read-only
 verbs that share the same run-selection logic (`--report`, `--phase`) skip
 it: they act on a run's *records*, not its remaining work, and a finished
 run is the ordinary thing to report on.
+
+**The wave loop above is not the whole resume story.** Everything in this
+section describes resume *after* scheduling — once `waves` exists,
+`--resume` re-enters the wave loop and skips completed waves/subtasks.
+But a run's planning pipeline (classify → provision → plan → reconcile →
+overlap-judge → adherence-gate → off-tree/satisfied filters → schedule)
+can itself run for 30+ minutes and spend real budget before `waves` is
+ever written — and until the per-phase checkpoint model below existed,
+none of that was resumable: a pause anywhere in the planning pipeline
+threw away everything before it, with no way to recover.
+
+### Resumable planning — a per-phase checkpoint cursor, not a `waves` gate
+
+Resume must not be gated *solely* on whether scheduling finished. Every
+planning phase that mutates the plan persists its output through `State`
+as it completes — the same "write to `state.json` only via `State.save()`"
+discipline this document requires everywhere else (§12) — and `--resume`
+re-enters at the first planning phase whose output has not yet been
+persisted, rather than either re-running the whole pipeline or refusing
+to resume at all.
+
+**The checkpoint model.** Each planning phase that mutates `plans` writes
+its result to a phase-named key in `state.json` immediately after the
+phase completes — e.g. `plans_after_reconcile` after `phase_reconcile`,
+`plans_after_overlap_judge` after `phase_overlap_judge` — mirroring how
+`plan_snapshot` already persists `{"subtasks", "waves"}` right after
+`schedule()` and `decompose_snapshot` already persists the flattened leaf
+list as each top-level subtask finishes expanding (§5½). Every one of
+these keys must be added to `STATE_FIELDS` (`orchestrator/leerie.py:259`)
+— a key absent from that allowlist is silently dropped when state is
+reloaded on `--resume`, which would make the checkpoint useless without
+ever raising an error. On `--resume`, the orchestrator walks the phase
+sequence in order and **skips every phase whose output key is already
+present**, re-entering the pipeline at the first phase with no persisted
+output — reusing the persisted `plans` as that phase's input rather than
+re-deriving it. A phase that already ran is never billed again; only the
+phases still needed to reach `schedule()`/`write_plan()` spend further
+budget.
+
+**Why the resume cursor is the *presence of an output key*, and not
+`current_phase` — the load-bearing distinction.** Every planning phase
+stamps `current_phase` at phase *entry*, before it spends anything (so
+the value on disk when a pause lands mid-phase is the name of the phase
+that was interrupted, not the last one that finished). Treating
+`current_phase` as "this phase is done" would resume by skipping a phase
+that only *started* before the pause and never produced output — silently
+carrying forward a half-built plan as though it were complete. The
+correctness property the checkpoint model depends on is: a phase's
+output key is written **only after** the phase fully completes and
+`st.save()`s, never at entry — the same ordering already established and
+pinned for `plan_snapshot` (`tests/test_plan_snapshot_wiring.py`) and for
+`decompose_snapshot`'s crash barrier (§5½, `tests/test_decompose_snapshot.py`):
+a snapshot's absence must mean "this phase's work is not yet safely
+persisted," full stop, with no exception for a phase that merely began.
+`current_phase` remains useful as a secondary, human-readable hint (which
+phase was interrupted) but is never the resume cursor itself.
+
+This makes the checkpoint approach safe by construction, not merely
+convenient: `schedule()` re-sorts every wave by subtask id, so the wave
+partition is a pure function of the dependency graph and lexicographic
+ids, independent of the order in which the persisted-and-reloaded `plans`
+list happens to iterate. A fresh run and a checkpoint-then-resume of the
+same task therefore produce byte-identical `waves`.
+
+**The satisfied-probe sweep needs finer-than-phase granularity.**
+Phase-level checkpointing alone is not enough for the satisfied-probe
+sweep (§8 *Already-satisfied subtask elimination*): that sweep fans out
+one probe per subtask and can itself run for minutes, so a pause
+mid-sweep would otherwise re-probe every subtask from scratch on resume,
+including the ones already judged. The fix persists each subtask's
+verdict — `satisfied`, `evidence`, and the fact that it was `checked` —
+into a `satisfied_probe_cache` keyed by subtask id as soon as that
+subtask's probe returns, rather than only in the aggregate after the
+whole sweep's `gather` completes. On resume, a subtask with a cached
+verdict is not re-probed at all; only the subtasks the pause interrupted
+mid-flight are sent back through the probe. A probe that crashes
+(`WorkerError`) is deliberately **not** cached — the existing
+crash-keeps-the-subtask disposition (§8) means no verdict was actually
+reached, and caching "kept" for a crash would wrongly skip re-probing a
+subtask that was never really judged.
+
+**Correctness-critical: the cache is scoped to the base-tree commit sha,
+and a resume across a moved `HEAD` invalidates it.** This is a distinct
+hazard from the mid-run sibling case §8 describes (where the run's *own*
+later wave changes what's satisfied): here, the gap is between a *pause*
+and a *resume* of the same run, during which some other process —
+commonly a sibling run merging its own PR into the same base branch —
+can move `HEAD` out from under a cached verdict. The satisfied-probe
+judges the base tree as it stood at probe time; if the tree has since
+changed, that verdict no longer describes reality. A stale cache hit is
+not a harmless inefficiency here: it can keep a subtask whose deliverable
+now already exists (which the probe would have caught fresh), or drop one
+that no longer holds (silently discarding real work). The cache is
+therefore keyed or gated on the base commit sha recorded at probe time,
+and any cached verdict whose sha no longer matches `HEAD` on resume is
+treated as absent — the subtask is re-probed, never trusted stale. This
+sha-scoping is mandatory, not an optional refinement, for exactly the
+reason a stale `plan_snapshot`/`decompose_snapshot` would be if resume
+ever rehydrated across a moved base: correctness of a resumed run must
+not depend on nothing else having touched the repository while it was
+paused.
+
+**Budget-check resume.** Once plans are checkpointed per phase, a run
+that stopped at the post-`schedule()` budget-feasibility gate (§13) is no
+longer a dead end: `subtasks`/`waves` are already recoverable from the
+`plan_snapshot` checkpoint, so `--resume` can rehydrate them and re-run
+only the budget check — under a higher `--max-workers` or
+`--skip-budget-check` — instead of discarding the plan and forcing a
+from-scratch re-run.
 
 ### Single owner per run dir
 
@@ -1743,12 +1853,11 @@ to deterministic per-chunk labels since the file partition itself is
 code-computed and unaffected by a labeling crash); and `phase_plan`
 snapshots decomposition progress into state as each top-level subtask
 finishes expanding, the same way `plan_snapshot`
-already persists the post-`schedule()` plan. Like `plan_snapshot`, this
-decomposition snapshot is **diagnostic only** in this change — nothing
-reads it back, and wiring `--resume` to rehydrate mid-decomposition
-progress from it is a separate, not-yet-shipped capability. Overclaiming
-resumability this change does not implement would be worse than not
-documenting the snapshot at all.
+already persists the post-`schedule()` plan. This `decompose_snapshot` is
+now one of the per-phase checkpoints `--resume` rehydrates from (§6
+*Resumable planning*): a pause mid-decomposition resumes from the
+already-expanded top-level subtasks rather than re-running the whole
+decomposition pass.
 
 ### Cleanup on abnormal exit
 
@@ -5093,6 +5202,13 @@ operator knows the conformer phase will degrade heavily to advisory
 warnings or otherwise come in under the estimate. The escape hatch
 matches the same precedence chain as `--skip-smoke` and
 `--skip-overlap-judge`: a deliberate opt-out, not a default.
+
+**This gate firing is not a dead end.** Because `schedule()`'s output is
+one of the per-phase planning checkpoints (§6 *Resumable planning*), a
+run that stops here has its `subtasks`/`waves` already recoverable from
+`plan_snapshot` — `--resume` rehydrates them and re-runs only the budget
+check, under a higher `--max-workers` or `--skip-budget-check`, rather
+than discarding the plan and forcing the operator to re-run from scratch.
 
 ---
 
