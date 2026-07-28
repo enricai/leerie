@@ -1204,6 +1204,22 @@ probed exactly once with the verdict persisted for both outcomes
 the subtask while asserting the cache KEY is ABSENT rather than merely
 that the subtask survived — the anti-vacuity discipline from the
 zombie-reaper harness lesson.
+`tests/test_satisfied_probe_cache_invalidation.py` is the real-moving-repo
+counterpart to the `base_sha` invalidation case above: rather than a
+synthetic `"deadbeef-not-current"` sha
+(`test_filter_satisfied_subtasks.py`'s `test_stale_sha_invalidates_cache_and_reprobes`),
+it builds a real temp git repo (`git init` + commit) and actually advances
+HEAD from sha A to sha B via a second commit, mirroring a sibling run
+merging (or reverting) the deliverable between a pause and a resume
+(DESIGN §8 "the mid-run sibling case"). Both stale directions are pinned: a
+stale `satisfied=True` entry recorded at A must not silently drop a
+subtask that is no longer satisfied on the tree at B (silent lost work),
+and a stale `satisfied=False` entry must not silently keep a subtask that
+has since become satisfied. A cache entry with a missing or malformed
+(`None`, non-string) `base_sha` is treated as a miss and re-probed. The
+falsifier is verified live: deleting the `cached.get("base_sha") ==
+base_sha` comparison in `probe_one` (`orchestrator/leerie.py:7402`) fails
+4 of the file's 5 tests with a stale drop/keep.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
