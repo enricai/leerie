@@ -13166,8 +13166,10 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     worker runs installs in its own worktree against the shared
     cache instead (DESIGN §6½ "Worker-driven install").
 
-    Naturally skipped on `--resume` because the entire fresh-run
-    else-branch in `orchestrate()` is skipped.
+    Skipped on `--resume` when `provision.recipe` is already persisted
+    (checked by key presence, not truthiness — an empty recipe is a
+    valid completed state) — see the resumable-planning re-entry
+    pipeline in `_run_phases` (DESIGN §6).
     """
     log("phase 1½: detecting per-repo deps")
     st.data["current_phase"] = "phase 1½: provision"
@@ -20967,7 +20969,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if override:
             os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
         supplied = (json.loads(Path(args.answers).read_text())
-                   if args.answers else None)
+                    if args.answers else None)
     else:
         if not args.task:
             die("a task description is required (or use --resume)")
@@ -21044,8 +21046,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 # pr_base_branch defaults to working_branch when unset —
                 # the PR base only, never the diff fork-point (which stays
                 # working_branch; see STATE_FIELDS comment).
-                pr_base_branch = (getattr(args, "pr_base_branch", None)
-                                  or working_branch)
+                pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
                 st.data["pr_base_branch"] = pr_base_branch
                 st.save()
                 _write_run_json(
@@ -21059,12 +21060,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     **({"group_id": args.group_id} if args.group_id else {}),
                 )
             # Provision per-repo deps (DESIGN §6½). Runs after classify (so
-            # a docs-only run can short-circuit). Guarded on
-            # provision.recipe rather than unconditional: `mise install`
+            # a docs-only run can short-circuit). Guarded on presence of
+            # the "recipe" key rather than unconditional: `mise install`
             # (inside phase_provision) is real subprocess work, not
             # idempotent, and a resume that already has a recipe persisted
-            # must not redo it.
-            if not (st.data.get("provision") or {}).get("recipe"):
+            # must not redo it. Key-presence, not truthiness — a repo with
+            # no recognized lockfile and no install commands needed is a
+            # legitimate `recipe: []` completed state (mirrors
+            # plans_after_classify's `[]` marker above), and truthiness
+            # would re-run phase_provision (including mise install) on
+            # every resume for that repo.
+            if "recipe" not in (st.data.get("provision") or {}):
                 await phase_provision(
                     Path(os.getcwd()), st, caps, models, efforts)
             # gather_answers blocks on input(). That's fine here: no

@@ -348,6 +348,32 @@ class TestPerPhaseRoundTrip:
 
 
 # ===========================================================================
+# phase_provision resume-skip is guarded by key-PRESENCE, not truthiness.
+# A repo whose recipe legitimately resolves to an empty list (no
+# recognized lockfile, no install commands needed) is a valid completed
+# state — a truthiness check would re-run phase_provision (and its real
+# `mise install` subprocess work) on every resume for that repo.
+# ===========================================================================
+
+def test_resume_skips_provision_when_recipe_is_empty_list(
+    leerie, monkeypatch, run_dirs
+):
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": 3,
+        "categories": ["bug-fixing"],
+        "provision": {"source": "table", "recipe": []},
+    })
+    caps = _caps(leerie)
+    args = _args()
+    _drive(leerie, args, caps, run_dirs, st)
+    assert "phase_provision" not in calls, (
+        "provision.recipe == [] is a valid completed state — "
+        "must not re-invoke phase_provision (mise install) on resume")
+
+
+# ===========================================================================
 # The reported failure, pinned directly: a run whose current_phase is the
 # satisfied-probe sweep (no waves yet) resumes and reaches scheduling
 # instead of dying "did not reach the scheduling phase".
