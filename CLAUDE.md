@@ -1146,7 +1146,7 @@ regression pin that the field table no longer carries the old "A run that
 died on the preflight is not resumable" claim now that `plan_snapshot`
 makes a budget-check-stopped run resumable. bugfix-002 registered the keys
 and documented them only; resume-rehydration code is separate work
-(bugfix-004/005).
+(bugfix-004).
 The checkpoint-writing half — `_run_phases`'s fresh-run branch persisting
 each `plans_after_*` key immediately after its producing phase returns —
 is pinned in `tests/test_plans_after_checkpoints.py` via the same
@@ -1167,6 +1167,23 @@ against a correctly-individually-ordered but scrambled insertion producing
 a resume cursor that silently skips a phase); and `plans_after_filters`
 precedes `plan_snapshot`, keeping the existing post-schedule checkpoint
 authoritative and undisturbed.
+The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
+in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
+CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
+with sem:` — and `claude_p` is never invoked for that subtask (dropped on
+a cached `satisfied=True`, kept otherwise); a fresh probe (no cache entry)
+persists its verdict to `satisfied_probe_cache` for BOTH satisfied and
+not-satisfied outcomes, keyed by sid, carrying
+`satisfied`/`evidence`/`checked`/`base_sha`; the `WorkerError` crash-keep
+path writes no cache entry at all (a crashed probe must be re-probed on
+resume, not treated as decided); a cached verdict whose recorded
+`base_sha` differs from the current `HEAD` is invalidated and the
+subtask is re-probed (the mid-run-sibling hazard — DESIGN §6); and THE
+REPORTED FAILURE PINNED — a partial `satisfied_probe_cache` resumes,
+re-probes only the uncached subtasks (asserted by `claude_p` call count),
+and reaches scheduling, where before it would have re-run the whole
+sweep. All 17 pre-existing tests in the file are unchanged (17 + 5 = 22
+passing).
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:

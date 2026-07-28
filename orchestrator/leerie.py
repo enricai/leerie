@@ -7382,6 +7382,15 @@ async def filter_satisfied_subtasks(
     st.data["current_phase"] = "phase 3: satisfied-probe"
     st.save()
 
+    # base_sha scopes the cache to the current tree identity (DESIGN §6
+    # "Correctness-critical: the cache is scoped to the base-tree commit
+    # sha"). A cached verdict recorded under a different sha describes a
+    # tree that no longer exists (HEAD moved between a pause and a resume
+    # — e.g. a sibling run merged its own PR) and must be treated as
+    # absent, never trusted stale.
+    base_sha = await _branch_head_sha(str(repo_root))
+    cache: dict[str, dict] = st.data.setdefault("satisfied_probe_cache", {})
+
     sys_prompt = load_prompt("satisfied_probe")
     sem = asyncio.Semaphore(caps["max_parallel"])
     # sid → drop record; only satisfied subtasks land here.
@@ -7389,6 +7398,20 @@ async def filter_satisfied_subtasks(
 
     async def probe_one(s: dict) -> None:
         sid = s.get("id", "?")
+        cached = cache.get(sid)
+        if cached is not None and cached.get("base_sha") == base_sha:
+            # Resume fast path: this subtask was already judged against
+            # the SAME base tree — skip the semaphore and claude_p
+            # entirely (DESIGN §6 "The satisfied-probe sweep needs
+            # finer-than-phase granularity").
+            if cached.get("satisfied") is True:
+                dropped[sid] = {
+                    "reason": "already_satisfied",
+                    "evidence": cached.get("evidence", ""),
+                    "checked": list(cached.get("checked", []) or []),
+                    "provides": list(s.get("provides") or []),
+                }
+            return
         payload = {
             "id": sid,
             "title": s.get("title", ""),
@@ -7423,10 +7446,22 @@ async def filter_satisfied_subtasks(
             except WorkerError as e:
                 # A probe crash (e.g. claude_p schema failure twice) must
                 # NOT drop the subtask — fail safe toward keeping the work.
-                # Log and let the subtask survive.
+                # Log and let the subtask survive. Deliberately NOT cached:
+                # no verdict was actually reached, so caching this would
+                # wrongly skip re-probing a subtask that was never judged.
                 log(f"  satisfied-probe {sid}: crashed ({e}); keeping "
                     "subtask (fail-safe — no drop on probe failure)")
                 return
+        # Persist the verdict as soon as it returns — for BOTH satisfied
+        # and not-satisfied outcomes — rather than only in aggregate after
+        # the whole sweep's gather completes. This is the resume gap: a
+        # pause mid-sweep must not re-probe subtasks already decided.
+        cache[sid] = {
+            "satisfied": bool(out.get("satisfied") is True),
+            "evidence": out.get("evidence", ""),
+            "checked": list(out.get("checked", []) or []),
+            "base_sha": base_sha,
+        }
         if out.get("satisfied") is True:
             dropped[sid] = {
                 "reason": "already_satisfied",
@@ -7438,6 +7473,7 @@ async def filter_satisfied_subtasks(
             }
 
     await gather_or_cancel(*(probe_one(s) for s in probeable))
+    st.save()
 
     if not dropped:
         return None
