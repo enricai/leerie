@@ -1147,6 +1147,23 @@ died on the preflight is not resumable" claim now that `plan_snapshot`
 makes a budget-check-stopped run resumable. This subtask (bugfix-002)
 registers the keys and documents them only — no checkpoint-writing or
 resume-rehydration code exists yet (that is bugfix-003/004/005).
+The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
+in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
+CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
+with sem:` — and `claude_p` is never invoked for that subtask (dropped on
+a cached `satisfied=True`, kept otherwise); a fresh probe (no cache entry)
+persists its verdict to `satisfied_probe_cache` for BOTH satisfied and
+not-satisfied outcomes, keyed by sid, carrying
+`satisfied`/`evidence`/`checked`/`base_sha`; the `WorkerError` crash-keep
+path writes no cache entry at all (a crashed probe must be re-probed on
+resume, not treated as decided); a cached verdict whose recorded
+`base_sha` differs from the current `HEAD` is invalidated and the
+subtask is re-probed (the mid-run-sibling hazard — DESIGN §6); and THE
+REPORTED FAILURE PINNED — a partial `satisfied_probe_cache` resumes,
+re-probes only the uncached subtasks (asserted by `claude_p` call count),
+and reaches scheduling, where before it would have re-run the whole
+sweep. All 17 pre-existing tests in the file are unchanged (17 + 5 = 22
+passing).
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
