@@ -13166,8 +13166,10 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     worker runs installs in its own worktree against the shared
     cache instead (DESIGN §6½ "Worker-driven install").
 
-    Naturally skipped on `--resume` because the entire fresh-run
-    else-branch in `orchestrate()` is skipped.
+    Skipped on `--resume` when `provision.recipe` is already persisted
+    (checked by key presence, not truthiness — an empty recipe is a
+    valid completed state) — see the resumable-planning re-entry
+    pipeline in `_run_phases` (DESIGN §6).
     """
     log("phase 1½: detecting per-repo deps")
     st.data["current_phase"] = "phase 1½: provision"
@@ -20907,19 +20909,23 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 f"{st.data.get('finished_at', '<unknown>')} — nothing to "
                 "resume")
             return
-        if "waves" not in st.data:
-            phase = st.data.get("current_phase", "")
-            if phase == "phase 3: scheduling":
-                # Budget-feasibility check fired after schedule() but before
-                # write_plan() — plans are not persisted, so this run cannot
-                # be resumed. User must re-run fresh with a higher budget.
-                die(
-                    "cannot resume — run stopped at the budget-feasibility "
-                    "check before any work was scheduled. Plans are not "
-                    "persisted. Re-run (without --resume) with "
-                    "--skip-budget-check or a higher --max-workers."
-                )
-            die("cannot resume — run did not reach the scheduling phase")
+        # Resumable-planning re-entry (DESIGN §6 "Resumable planning — a
+        # per-phase checkpoint cursor, not a `waves` gate"). `waves` absent
+        # no longer means "cannot resume" — the shared pipeline below
+        # (used by both a fresh run and a resumed one) re-enters at the
+        # first phase whose `plans_after_*` checkpoint (or `plan_snapshot`
+        # for the post-schedule/pre-write_plan gap) is absent, reusing the
+        # last-persisted `plans` as that phase's input. A state.json with
+        # NONE of those keys and no `categories` either (i.e. the run
+        # never got past its very first st.save(), before phase_classify
+        # even started) is the only genuinely-unusable case left to reject.
+        if "waves" not in st.data and "categories" not in st.data:
+            die(
+                "cannot resume — state.json has no recorded progress at "
+                "all (not even phase_classify started). This state.json "
+                "is likely corrupt or was hand-edited; inspect it under "
+                f"{st.run_dir} or re-run without --resume."
+            )
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
         # resolved fresh every run — the user can dial up or down on
@@ -20955,13 +20961,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # worker would re-ask the same question forever. See P5-1.
         absorb_supplied_answers(args, st, leerie_dir)
         # Re-export the mise override env var if the original run
-        # synthesized one. phase_provision (which set it on os.environ
-        # the first time) is skipped on resume, but downstream
+        # synthesized one. phase_provision (below) is skipped when
+        # provision.recipe is already persisted, but downstream
         # implementer/conformer subprocesses still need it to find the
         # synthesized go pin.
         override = (st.data.get("provision") or {}).get("override_file")
         if override:
             os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
+        supplied = (json.loads(Path(args.answers).read_text())
+                    if args.answers else None)
     else:
         if not args.task:
             die("a task description is required (or use --resume)")
@@ -20995,175 +21003,259 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
-        # Run-start backstop (DESIGN §6½): before phase_classify, scan prior
-        # runs that produced logs but whose dep_capture.done sentinel is absent.
-        # Covers the SIGKILL / crash case where the cancel-arm capture couldn't
-        # run. Non-fatal: any error is logged and ignored.
-        await _backstop_capture_prior_runs(
-            leerie_dir, Path(os.getcwd()), caps, models, efforts)
-        await phase_classify(task, st, caps, args.clarify, models, efforts)
-        # Resumable-planning checkpoint (DESIGN §6 "Resumable planning — a
-        # per-phase checkpoint cursor, not a `waves` gate"). `plans` does
-        # not exist yet at this point in the pipeline (phase_classify
-        # produces categories, not a plan) — the empty list is the
-        # accurate "this phase's output is safely persisted" marker that
-        # --resume treats as proof phase_classify need not be re-invoked.
-        st.data["plans_after_classify"] = []
-        st.save()
-        log(f"run id: {st.run_id}")
-        # Initialize run.json with the immutable run-identity fields
-        # (run_id, branch, working_branch, pr_base_branch, started_at,
-        # task) so `leerie --list` can enumerate this run from the moment
-        # it has a stable identity — not only after finalize.
-        head_proc = await run_proc(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        working_branch = (head_proc.stdout.strip()
-                          if head_proc.returncode == 0 else "")
-        st.data["working_branch"] = working_branch
-        # pr_base_branch defaults to working_branch when unset — the PR
-        # base only, never the diff fork-point (which stays
-        # working_branch; see STATE_FIELDS comment).
-        pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
-        st.data["pr_base_branch"] = pr_base_branch
-        st.save()
-        _write_run_json(
-            st.run_dir,
-            run_id=st.run_id,
-            branch=compute_run_branch(st.run_id),
-            working_branch=working_branch,
-            pr_base_branch=pr_base_branch,
-            started_at=st.data["started_at"],
-            task=task,
-            **({"group_id": args.group_id} if args.group_id else {}),
-        )
-        # Provision per-repo deps (DESIGN §6½). Runs after classify (so a
-        # docs-only run can short-circuit). On `--resume` the
-        # entire else-branch is skipped, so phase_provision never re-fires.
-        await phase_provision(Path(os.getcwd()), st, caps, models, efforts)
-        # gather_answers blocks on input(). That's fine here: no concurrent
-        # tasks are scheduled yet, so blocking the loop blocks nothing. Kept
-        # on the event loop deliberately — every State mutation runs on the
-        # loop, which is why the lock-free State works.
-        gather_answers(st, supplied)
-        plans = await phase_plan(task, st, caps, models, efforts)
-        # Resumable-planning checkpoint: post-recursive-decompose `plans`,
-        # persisted so --resume can skip re-invoking phase_plan (DESIGN §6).
-        st.data["plans_after_plan"] = plans
-        st.save()
-        # Bridge cross-domain capability-tag mismatches before the
-        # scheduler builds its DAG. Short-circuits with no worker call
-        # when planners agreed on vocabulary (the common case).
-        plans = await phase_reconcile(plans, task, st, caps, models, efforts)
-        # Resumable-planning checkpoint: the reconciled `plans`, persisted
-        # BEFORE the no-work short-circuit below so a run that turns out
-        # to have work is never left without this checkpoint (DESIGN §6).
-        st.data["plans_after_reconcile"] = plans
-        st.save()
-        # Cleared-but-empty terminal state (DESIGN §8): every planner
-        # cleared its gate and confirmed the task is already satisfied
-        # on HEAD. Nothing to schedule, nothing to execute, no run
-        # branch to push. _finish_no_work_run records the outcome and
-        # we return — skipping phase_execute (which would call
-        # setup-run.sh) and phase_finalize (which would try to push a
-        # non-existent branch). Runs after phase_reconcile so a planner
-        # that emits an empty plan but the reconciler later adds
-        # subtasks is not misclassified as no-work.
-        no_work_map = detect_no_work(plans)
-        if no_work_map is not None:
-            _finish_no_work_run(st, no_work_map)
-            return
-        # Phase 2¾: detect cross-planner surface-overlap collisions
-        # (DESIGN §5 *Cross-domain surface overlap*). Two planners can
-        # independently produce subtasks for the same exported artifact
-        # with incompatible APIs; the reconciler doesn't look for this
-        # (its mandate is `requires`-tag vocabulary drift). The judge
-        # short-circuits on single-planner / <2-subtask runs; on multi-
-        # planner runs it emits zero or more collisions resolved as
-        # merge / drop_* (applied mechanically) or unresolvable (die at
-        # plan time, strictly better than the integrator design-
-        # conflict crash this exists to prevent).
-        plans = await phase_overlap_judge(
-            plans, task, st, caps, models, efforts)
-        # Resumable-planning checkpoint: post-collision-resolution `plans`,
-        # persisted so --resume can skip re-invoking phase_overlap_judge
-        # (DESIGN §6 *Cross-domain surface overlap*).
-        st.data["plans_after_overlap_judge"] = plans
-        st.save()
-        # Phase 2⅞: instruction-adherence gate (the deterministic
-        # prescribed-command-coverage floor + the opus adherence_judge).
-        # Short-circuits when the classifier found no prescribed procedure
-        # (the ~90% common case) or when --skip-adherence-check is set.
-        # Fires only on is_prescribed=true AND (floor violation OR low
-        # adherence) — the corpus-validated two-stage design — and
-        # re-plans via the existing checked-loop feedback path, die()ing
-        # on exhaustion. Runs after the overlap-judge (so re-planning
-        # doesn't waste that judge's spend if it doesn't need to fire) and
-        # before schedule() (so a re-plan never rebuilds an already-
-        # scheduled DAG).
-        plans = await phase_adherence_gate(
-            plans, task, st, caps, models, efforts)
-        # Resumable-planning checkpoint: post-instruction-adherence-gate
-        # `plans`, persisted so --resume can skip re-invoking
-        # phase_adherence_gate (DESIGN §6).
-        st.data["plans_after_adherence_gate"] = plans
-        st.save()
-        # Surface cross-planner file-claim overlaps. Warning only — the
-        # reconciler handles capability-tag drift but not file-claim
-        # conflicts (yet); empirically these correlate strongly with
-        # integrator design-conflict crashes downstream.
-        warn_cross_planner_file_overlap(plans)
-        warn_layer_gaps(plans)
-        # Flag a subtask whose entire file surface is owned by an ordered
-        # predecessor — at high risk of being a mid-run no-op if the
-        # predecessor commits the shared deliverable (DESIGN §5, §8 *The
-        # mid-run sibling case*). Warning only; the mid-run satisfied rescue
-        # in settle_subtask is the actual safety net.
-        warn_provider_subset_subtasks(plans)
-        # Drop subtasks whose files_likely_touched leak into inspect-dir
-        # mounts (read-only) or other off-tree paths. Soft drop so the
-        # surviving subtasks proceed; the drop is recorded in
-        # state.data["dropped_subtasks"] for audit. Must run BEFORE
-        # schedule() so the resulting waves do not reference dropped sids.
-        filter_offtree_subtasks(plans, Path(os.getcwd()),
-                                st.data.get("inspect_dirs") or [], st)
-        # Already-satisfied subtask elimination (DESIGN §8). Per-subtask
-        # probe of the base tree; drops subtasks already met (e.g. a
-        # sibling run merged the deliverable to the base). Soft drop,
-        # recorded in state.data["dropped_subtasks"]. If it empties every
-        # ready plan, route to the same cleared-but-empty terminal state
-        # as detect_no_work — using the drop-derived no_work_map, not the
-        # planner's original confidence.basis. Must run BEFORE schedule().
-        satisfied_no_work = await filter_satisfied_subtasks(
-            plans, Path(os.getcwd()), st, caps, models, efforts)
-        if satisfied_no_work is not None:
-            _finish_no_work_run(st, satisfied_no_work)
-            return
-        # Resumable-planning checkpoint: the filtered `plans` immediately
-        # before schedule() — the last plans_after_* checkpoint before
-        # plan_snapshot/waves take over as the resume cursor (DESIGN §6).
-        st.data["plans_after_filters"] = plans
-        st.save()
-        st.data["current_phase"] = "phase 3: scheduling"
-        st.save()
-        subtasks, waves = schedule(plans)
-        # Diagnostic snapshot BEFORE the two gates that can die() below.
-        # Both are terminal, and the planner/fit_judge/splitter spend that
-        # produced this plan is the most expensive thing in the run — without
-        # this, a die() here leaves state.json with no plan at all and the
-        # whole spend is unrecoverable. Deliberately not write_plan(): that
-        # also emits per-subtask spec files and seeds the execution
-        # scaffolding, which would make a failed run look half-executable
-        # (and the budget preflight above exists precisely to avoid writing
-        # those for a run that cannot win). Inspection only — nothing reads
-        # this back; --resume rehydration is separate work.
-        st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
-        st.save()
+
+    # From here on, fresh run and `--resume` share one pipeline: every
+    # step below is guarded by "has this phase's output already been
+    # persisted?" (DESIGN §6 "Resumable planning — a per-phase checkpoint
+    # cursor, not a `waves` gate"), so a fresh run (nothing persisted)
+    # executes every step exactly as before, and a resumed run skips
+    # whatever a prior invocation already completed and checkpointed.
+    if "waves" not in st.data:
+        if "plans_after_classify" not in st.data:
+            # Run-start backstop (DESIGN §6½): before phase_classify, scan
+            # prior runs that produced logs but whose dep_capture.done
+            # sentinel is absent. Covers the SIGKILL / crash case where the
+            # cancel-arm capture couldn't run. Non-fatal: any error is
+            # logged and ignored.
+            await _backstop_capture_prior_runs(
+                leerie_dir, Path(os.getcwd()), caps, models, efforts)
+            await phase_classify(task, st, caps, args.clarify, models, efforts)
+            # Resumable-planning checkpoint (DESIGN §6 "Resumable planning
+            # — a per-phase checkpoint cursor, not a `waves` gate"). `plans`
+            # does not exist yet at this point in the pipeline
+            # (phase_classify produces categories, not a plan) — the empty
+            # list is the accurate "this phase's output is safely
+            # persisted" marker that --resume treats as proof phase_classify
+            # need not be re-invoked.
+            st.data["plans_after_classify"] = []
+            st.save()
+            if not args.resume:
+                log(f"run id: {st.run_id}")
+                # Initialize run.json with the immutable run-identity
+                # fields (run_id, branch, working_branch, pr_base_branch,
+                # started_at, task) so `leerie --list` can enumerate this
+                # run from the moment it has a stable identity — not only
+                # after finalize. Only needed once — a resumed run that
+                # reaches here (paused before phase_classify completed)
+                # already has run.json from its first invocation.
+                head_proc = await run_proc(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+                working_branch = (head_proc.stdout.strip()
+                                  if head_proc.returncode == 0 else "")
+                st.data["working_branch"] = working_branch
+                # pr_base_branch defaults to working_branch when unset —
+                # the PR base only, never the diff fork-point (which stays
+                # working_branch; see STATE_FIELDS comment).
+                pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
+                st.data["pr_base_branch"] = pr_base_branch
+                st.save()
+                _write_run_json(
+                    st.run_dir,
+                    run_id=st.run_id,
+                    branch=compute_run_branch(st.run_id),
+                    working_branch=working_branch,
+                    pr_base_branch=pr_base_branch,
+                    started_at=st.data["started_at"],
+                    task=task,
+                    **({"group_id": args.group_id} if args.group_id else {}),
+                )
+            # Provision per-repo deps (DESIGN §6½). Runs after classify (so
+            # a docs-only run can short-circuit). Guarded on presence of
+            # the "recipe" key rather than unconditional: `mise install`
+            # (inside phase_provision) is real subprocess work, not
+            # idempotent, and a resume that already has a recipe persisted
+            # must not redo it. Key-presence, not truthiness — a repo with
+            # no recognized lockfile and no install commands needed is a
+            # legitimate `recipe: []` completed state (mirrors
+            # plans_after_classify's `[]` marker above), and truthiness
+            # would re-run phase_provision (including mise install) on
+            # every resume for that repo.
+            if "recipe" not in (st.data.get("provision") or {}):
+                await phase_provision(
+                    Path(os.getcwd()), st, caps, models, efforts)
+            # gather_answers blocks on input(). That's fine here: no
+            # concurrent tasks are scheduled yet, so blocking the loop
+            # blocks nothing. Kept on the event loop deliberately — every
+            # State mutation runs on the loop, which is why the lock-free
+            # State works.
+            gather_answers(st, supplied)
+
+        if "plans_after_plan" not in st.data:
+            plans = await phase_plan(task, st, caps, models, efforts)
+            # Resumable-planning checkpoint: post-recursive-decompose
+            # `plans`, persisted so --resume can skip re-invoking
+            # phase_plan (DESIGN §6).
+            st.data["plans_after_plan"] = plans
+            st.save()
+        else:
+            plans = st.data["plans_after_plan"]
+
+        if "plans_after_reconcile" not in st.data:
+            # Bridge cross-domain capability-tag mismatches before the
+            # scheduler builds its DAG. Short-circuits with no worker call
+            # when planners agreed on vocabulary (the common case).
+            plans = await phase_reconcile(plans, task, st, caps, models, efforts)
+            # Resumable-planning checkpoint: the reconciled `plans`,
+            # persisted BEFORE the no-work short-circuit below so a run
+            # that turns out to have work is never left without this
+            # checkpoint (DESIGN §6).
+            st.data["plans_after_reconcile"] = plans
+            st.save()
+            # Cleared-but-empty terminal state (DESIGN §8): every planner
+            # cleared its gate and confirmed the task is already satisfied
+            # on HEAD. Nothing to schedule, nothing to execute, no run
+            # branch to push. _finish_no_work_run records the outcome and
+            # we return — skipping phase_execute (which would call
+            # setup-run.sh) and phase_finalize (which would try to push a
+            # non-existent branch). Runs after phase_reconcile so a
+            # planner that emits an empty plan but the reconciler later
+            # adds subtasks is not misclassified as no-work. Evaluated
+            # only right after a *fresh* phase_reconcile — a resumed run
+            # reusing an already-checkpointed plans_after_reconcile
+            # already passed (or would have short-circuited via
+            # no_work_required/finished_at above) this check the first
+            # time it ran.
+            no_work_map = detect_no_work(plans)
+            if no_work_map is not None:
+                _finish_no_work_run(st, no_work_map)
+                return
+        else:
+            plans = st.data["plans_after_reconcile"]
+
+        if "plans_after_overlap_judge" not in st.data:
+            # Phase 2¾: detect cross-planner surface-overlap collisions
+            # (DESIGN §5 *Cross-domain surface overlap*). Two planners can
+            # independently produce subtasks for the same exported
+            # artifact with incompatible APIs; the reconciler doesn't look
+            # for this (its mandate is `requires`-tag vocabulary drift).
+            # The judge short-circuits on single-planner / <2-subtask
+            # runs; on multi-planner runs it emits zero or more collisions
+            # resolved as merge / drop_* (applied mechanically) or
+            # unresolvable (die at plan time, strictly better than the
+            # integrator design-conflict crash this exists to prevent).
+            plans = await phase_overlap_judge(
+                plans, task, st, caps, models, efforts)
+            # Resumable-planning checkpoint: post-collision-resolution
+            # `plans`, persisted so --resume can skip re-invoking
+            # phase_overlap_judge (DESIGN §6 *Cross-domain surface
+            # overlap*).
+            st.data["plans_after_overlap_judge"] = plans
+            st.save()
+        else:
+            plans = st.data["plans_after_overlap_judge"]
+
+        if "plans_after_adherence_gate" not in st.data:
+            # Phase 2⅞: instruction-adherence gate (the deterministic
+            # prescribed-command-coverage floor + the opus
+            # adherence_judge). Short-circuits when the classifier found
+            # no prescribed procedure (the ~90% common case) or when
+            # --skip-adherence-check is set. Fires only on
+            # is_prescribed=true AND (floor violation OR low adherence) —
+            # the corpus-validated two-stage design — and re-plans via the
+            # existing checked-loop feedback path, die()ing on
+            # exhaustion. Runs after the overlap-judge (so re-planning
+            # doesn't waste that judge's spend if it doesn't need to
+            # fire) and before schedule() (so a re-plan never rebuilds an
+            # already-scheduled DAG).
+            plans = await phase_adherence_gate(
+                plans, task, st, caps, models, efforts)
+            # Resumable-planning checkpoint: post-instruction-adherence-
+            # gate `plans`, persisted so --resume can skip re-invoking
+            # phase_adherence_gate (DESIGN §6).
+            st.data["plans_after_adherence_gate"] = plans
+            st.save()
+        else:
+            plans = st.data["plans_after_adherence_gate"]
+
+        if "plans_after_filters" not in st.data:
+            # Surface cross-planner file-claim overlaps. Warning only —
+            # the reconciler handles capability-tag drift but not
+            # file-claim conflicts (yet); empirically these correlate
+            # strongly with integrator design-conflict crashes downstream.
+            warn_cross_planner_file_overlap(plans)
+            warn_layer_gaps(plans)
+            # Flag a subtask whose entire file surface is owned by an
+            # ordered predecessor — at high risk of being a mid-run no-op
+            # if the predecessor commits the shared deliverable (DESIGN
+            # §5, §8 *The mid-run sibling case*). Warning only; the
+            # mid-run satisfied rescue in settle_subtask is the actual
+            # safety net.
+            warn_provider_subset_subtasks(plans)
+            # Drop subtasks whose files_likely_touched leak into
+            # inspect-dir mounts (read-only) or other off-tree paths. Soft
+            # drop so the surviving subtasks proceed; the drop is
+            # recorded in state.data["dropped_subtasks"] for audit. Must
+            # run BEFORE schedule() so the resulting waves do not
+            # reference dropped sids.
+            filter_offtree_subtasks(plans, Path(os.getcwd()),
+                                    st.data.get("inspect_dirs") or [], st)
+            # Already-satisfied subtask elimination (DESIGN §8).
+            # Per-subtask probe of the base tree; drops subtasks already
+            # met (e.g. a sibling run merged the deliverable to the
+            # base). Soft drop, recorded in state.data["dropped_subtasks"].
+            # If it empties every ready plan, route to the same
+            # cleared-but-empty terminal state as detect_no_work — using
+            # the drop-derived no_work_map, not the planner's original
+            # confidence.basis. Must run BEFORE schedule(). The
+            # per-subtask satisfied_probe_cache (DESIGN §6, keyed by base
+            # commit sha) already makes a resumed sweep skip every
+            # subtask decided before the pause.
+            satisfied_no_work = await filter_satisfied_subtasks(
+                plans, Path(os.getcwd()), st, caps, models, efforts)
+            if satisfied_no_work is not None:
+                _finish_no_work_run(st, satisfied_no_work)
+                return
+            # Resumable-planning checkpoint: the filtered `plans`
+            # immediately before schedule() — the last plans_after_*
+            # checkpoint before plan_snapshot/waves take over as the
+            # resume cursor (DESIGN §6).
+            st.data["plans_after_filters"] = plans
+            st.save()
+        else:
+            plans = st.data["plans_after_filters"]
+
+        if "plan_snapshot" not in st.data:
+            st.data["current_phase"] = "phase 3: scheduling"
+            st.save()
+            subtasks, waves = schedule(plans)
+            # Diagnostic snapshot BEFORE the two gates that can die()
+            # below. Both are terminal, and the planner/fit_judge/splitter
+            # spend that produced this plan is the most expensive thing in
+            # the run — without this, a die() here leaves state.json with
+            # no plan at all and the whole spend is unrecoverable.
+            # Deliberately not write_plan(): that also emits per-subtask
+            # spec files and seeds the execution scaffolding, which would
+            # make a failed run look half-executable (and the budget
+            # preflight below exists precisely to avoid writing those for
+            # a run that cannot win). `--resume` reads this back (DESIGN
+            # §6 "Budget-check resume") when the run stopped between here
+            # and write_plan().
+            st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
+            st.save()
+        else:
+            # Budget-check resume (DESIGN §6 "Budget-check resume"): a
+            # prior attempt reached schedule() and persisted plan_snapshot,
+            # then died at check_budget_feasibility (or was interrupted
+            # before write_plan ran). Rehydrate subtasks/waves rather than
+            # re-deriving them from plans — schedule() is a pure function
+            # of the dep graph plus lexicographic ids (proven
+            # deterministic, tests/test_schedule_determinism.py), so
+            # re-running it here would be redundant, not incorrect, but
+            # the snapshot is already the exact output.
+            snap = st.data["plan_snapshot"]
+            subtasks, waves = snap["subtasks"], snap["waves"]
+
         # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
         # fail fast at the cheapest moment*). Runs after schedule() so we
         # have the real wave count, before validate_plan / write_plan so
         # no plan.json or subtask spec files get written for a run that
         # is mathematically unwinnable. die()s with EXIT_BUDGET_INFEASIBLE
-        # and a recommended --max-workers; opt-out via --skip-budget-check.
+        # and a recommended --max-workers; opt-out via
+        # --skip-budget-check. Once plans are checkpointed per phase
+        # (above), a run that stops here IS resumable via plan_snapshot
+        # (DESIGN §6 "Budget-check resume") — the next --resume
+        # rehydrates subtasks/waves above and re-runs only this check,
+        # rather than dying "Plans are not persisted".
         check_budget_feasibility(st, caps, subtasks, waves)
         validate_plan(subtasks)
         write_plan(leerie_dir, task, st, subtasks, waves)
