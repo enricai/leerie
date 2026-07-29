@@ -1039,7 +1039,7 @@ adherence axis to demote to advisory, since the floor is wired only into
 `phase_adherence_gate`, not the planner check loop.
 The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
 gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
-composing the deterministic floor and the opus `adherence_judge` behind
+composing the deterministic floor and the `adherence_judge` behind
 `_run_checked_loop` — is tested in `tests/test_phase_adherence_gate.py` (22
 tests), split into source-coupling wiring pins (floor+judge both run; a low
 result routes through the retry path via a re-invoked `phase_plan`; a
