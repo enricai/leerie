@@ -67,17 +67,19 @@ def test_loop_clean_on_first_round(leerie):
 
 
 def test_loop_retries_then_clears(leerie):
+    """A round-to-round DIFFERENT issue each retry (genuine narrowing, not
+    a repeat) converges normally without tripping the oscillation guard."""
     attempt = [0]
 
     async def invoke():
         attempt[0] += 1
         if attempt[0] < 3:
-            return {"bad": True}
+            return {"bad": True, "n": attempt[0]}
         return {"good": True}
 
     def check(r):
         if r.get("bad"):
-            return ["ISSUE: still bad"]
+            return [f"ISSUE: still bad, attempt {r['n']}"]
         return []
 
     result, warnings = _run(leerie._run_checked_loop(
@@ -88,17 +90,28 @@ def test_loop_retries_then_clears(leerie):
 
 
 def test_loop_exhausts_rounds(leerie):
+    """A round-to-round DIFFERENT issue each time (no repeat) exhausts
+    max_rounds normally — the oscillation guard only fires on a repeat."""
+    calls = [0]
+
     async def invoke():
-        return {"always_bad": True}
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        # A distinct issue every round — never repeats, so the oscillation
+        # guard must not intervene; the loop runs the full budget.
+        return [f"ISSUE: bad round {r['n']}"]
 
     result, warnings = _run(leerie._run_checked_loop(
         invoke=invoke,
-        check=lambda r: ["ISSUE: bad"],
+        check=check,
         name="test",
         max_rounds=2,
     ))
-    assert result == {"always_bad": True}
+    assert result == {"n": 2}
     assert len(warnings) == 2
+    assert calls[0] == 2
 
 
 def test_loop_crash_breaks(leerie):
@@ -193,39 +206,196 @@ def test_loop_none_result_breaks(leerie):
 
 
 def test_loop_feedback_callback_called(leerie):
+    """A distinct issue every round (never repeats) must not trip the
+    oscillation guard, so feedback fires on every non-final round."""
     feedback_received = []
+    calls = [0]
 
     async def invoke():
-        return {"x": 1}
+        calls[0] += 1
+        return {"x": calls[0]}
 
     async def on_feedback(fb):
         feedback_received.append(fb)
 
     result, warnings = _run(leerie._run_checked_loop(
         invoke=invoke,
-        check=lambda r: ["ISSUE: x"],
+        check=lambda r: [f"ISSUE: x{r['x']}"],
         name="test",
         max_rounds=3,
         make_feedback_prompt=on_feedback,
     ))
     assert len(feedback_received) == 2
-    assert "ISSUE: x" in feedback_received[0]
+    assert "ISSUE: x1" in feedback_received[0]
 
 
 def test_loop_feedback_not_called_on_last_round(leerie):
     feedback_received = []
+    calls = [0]
 
     async def invoke():
-        return {"x": 1}
+        calls[0] += 1
+        return {"x": calls[0]}
 
     async def on_feedback(fb):
         feedback_received.append(fb)
 
     _run(leerie._run_checked_loop(
         invoke=invoke,
-        check=lambda r: ["ISSUE: x"],
+        check=lambda r: [f"ISSUE: x{r['x']}"],
         name="test",
         max_rounds=2,
         make_feedback_prompt=on_feedback,
     ))
     assert len(feedback_received) == 1
+
+
+# --- Oscillation guard ---------------------------------------------------- #
+# Root-cause fix for the classification-gate thrash incident: neither this
+# loop nor any known caller's make_feedback_prompt accumulates feedback
+# across rounds, so a fix for one round's complaint can silently reintroduce
+# an earlier round's complaint, cycling rather than converging until the
+# caller's own exhaustion die() fires. The guard tracks each round's issue
+# SIGNATURE (the `LABEL: subject` prefix before an em dash, not the full
+# string — real callers' issue text carries free-form LLM-regenerated
+# evidence prose after the dash that differs between rounds even for the
+# identical underlying defect).
+
+def test_issue_signature_strips_evidence_after_dash(leerie):
+    assert leerie._issue_signature(
+        "MISCATEGORIZATION (missing_category): testing — some evidence A"
+    ) == "MISCATEGORIZATION (missing_category): testing"
+    assert leerie._issue_signature(
+        "MISCATEGORIZATION (missing_category): testing — totally different "
+        "evidence B, much longer"
+    ) == "MISCATEGORIZATION (missing_category): testing"
+
+
+def test_issue_signature_no_dash_is_whole_string(leerie):
+    assert leerie._issue_signature("PLAIN_ISSUE") == "PLAIN_ISSUE"
+
+
+def test_loop_breaks_early_on_exact_repeat(leerie):
+    """Round 1 reproduces round 0's exact issue text — the simplest
+    oscillation case. The loop must not burn round 2."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke,
+        check=lambda r: ["ISSUE: same problem every time"],
+        name="test",
+        max_rounds=5,
+    ))
+    assert calls[0] == 2, (
+        f"must stop at round 1 (the repeat), never reach round 2+: "
+        f"{calls[0]} invocations")
+    assert any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_breaks_on_two_round_cycle(leerie):
+    """Reproduces the exact funeralworks incident shape: round 0 flags A,
+    round 1's fix drops A but introduces B, round 2's fix re-introduces A
+    (with different LLM-regenerated evidence prose than round 0's A, as a
+    real re-classify call would produce) — a 2-cycle that never converges.
+    Must stop at round 2 rather than burning the full budget."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        n = r["n"]
+        if n == 1:
+            return ["MISCATEGORIZATION (missing_category): testing — "
+                     "5+ new test files required per the Instructions "
+                     "section"]
+        if n == 2:
+            return ["MISCATEGORIZATION (missing_category): documentation "
+                     "— docs/SEED.md is now factually wrong"]
+        # round 3: testing flagged again, different evidence text than
+        # round 1's — this is the real-world shape (LLM-regenerated prose)
+        return ["MISCATEGORIZATION (missing_category): testing — "
+                 "per-endpoint regression pins across 6 named endpoints"]
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=5))
+    assert calls[0] == 3, (
+        f"must stop at round 2 (the repeat of round 0's signature), "
+        f"never reach round 3+: {calls[0]} invocations")
+    assert any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_does_not_falsely_trigger_on_monotonic_growth(leerie):
+    """Validated against the real matching successful transcript: round 0
+    flags {A, B} missing; the fix narrows too far to {}; round 1 flags a
+    DIFFERENT superset resolution that never repeats an earlier round's
+    signature set. Legitimate convergence must never trip the guard."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        if r["n"] == 1:
+            return [
+                "MISCATEGORIZATION (missing_category): testing — evidence",
+                "MISCATEGORIZATION (missing_category): "
+                "feature-implementation — evidence",
+            ]
+        return []  # round 2: resolved via file-ownership split, clean
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=3))
+    assert calls[0] == 2, "must run both rounds — no oscillation to detect"
+    assert not any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_does_not_falsely_trigger_on_shrinking_issue_set(leerie):
+    """A round whose issue set is a genuine subset of nothing seen before
+    (fewer, different-signature issues than any prior round) must not
+    trigger — the guard only fires when a round's issues are already
+    fully contained in some earlier round's issues."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        if r["n"] == 1:
+            return ["ISSUE_A: one", "ISSUE_B: two", "ISSUE_C: three"]
+        if r["n"] == 2:
+            return ["ISSUE_D: four"]  # different issue, not a subset of round 1
+        return []
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=3))
+    assert calls[0] == 3
+    assert not any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_oscillation_guard_respects_worker_error_rounds(leerie):
+    """A WorkerError round records no issue signature (no `check()` call
+    happened) — it must not corrupt the seen-set bookkeeping for
+    subsequent real rounds."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        if calls[0] == 2:
+            raise leerie.WorkerError("transient crash")
+        return {"n": calls[0]}
+
+    def check(r):
+        return [f"ISSUE: round {r['n']}"]  # always distinct
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=4))
+    assert calls[0] == 4
+    assert not any("repeats an earlier round" in w for w in warnings)

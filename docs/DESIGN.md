@@ -4280,6 +4280,71 @@ mixed outcome by pruning fully-speculative subtasks from a non-empty
 domain — see §5 *Dead-subtask elimination*). The all-blocked case still dies — a blocker
 is a gate failure that the user must see.
 
+**Reaching the cleared-but-empty state from classification, before any
+planner runs.** The mechanism above is triggered post-plan, by
+`detect_no_work` reading every planner's `status`/`subtasks`. But an
+already-satisfied task can make the classification gate itself unable to
+converge on a category set, before a planner is ever spawned: the
+classifier's `check_classifier_output` and the independent
+`classification_judge` (phase 1's own adversarial-verification pair — see
+*Independent adversarial verification* below) can pull in opposite
+directions round after round when the classifier's investigation keeps
+surfacing that the task's deliverable is already present, because a
+category set is being fitted to a diff that doesn't actually exist. The
+classifier schema carries an optional, additive
+`likely_already_satisfied`/`likely_already_satisfied_evidence` pair for
+exactly this — the classifier already investigates the codebase to
+classify at all, so this only structures a claim it could previously only
+make as prose the pipeline discarded. If the classification-gate retry
+loop exhausts without converging, and the classifier's own last
+investigation set `likely_already_satisfied=True` with evidence,
+`phase_classification_gate` routes directly to
+`_finish_no_work_run` — the identical terminal state `detect_no_work`
+produces, reached one phase earlier for this specific case. This is not a
+new trust boundary: it extends the same one `detect_no_work` already
+accepts (a worker's own investigation, un-double-checked by a second
+judge) from "the planner found nothing to do" to "the classifier
+independently found the same thing, and classification could not
+otherwise converge anyway." A classifier that never sets the field (the
+common case — everything that isn't already-done work) sees zero behavior
+change; the gate still dies on genuine miscategorization exhaustion.
+
+Reaching this state from classification instead of post-plan meant a run
+could hit `_finish_no_work_run` earlier than the pipeline previously ever
+called it — earlier, in fact, than `run.json`'s own run-identity fields
+(`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
+`task`) used to be written. `_finish_no_work_run` writes only
+`{finished_at, no_push, no_verify}`, so a run routed here before that
+identity write would produce a `run.json` the launcher's local-runtime
+auto-finalize scan cannot distinguish from one that crashed before
+`phase_classify` ever completed (that scan explicitly treats a missing
+`branch`/`working_branch` as exactly that signal). The identity write is
+therefore hoisted to run immediately at run start — before `phase_classify`
+itself, not just before the gate — so every early-exit path reachable from
+classification, present or future, sees a `run.json` that already
+correctly identifies the run.
+
+**The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
+shared mechanical-feedback retry primitive behind the classifier,
+classification-gate, reconciler, provision, overlap-judge, and integrator
+checks — does not accumulate feedback across rounds: each round's
+worker invocation sees only that round's issues, never the history of
+what an earlier round already tried and the check subsequently flagged
+again. That makes a 2-round cycle reachable and observed in production: a
+round-0 fix for issue A can introduce issue B, whose round-1 fix
+reintroduces A, so the loop cycles between two "fixes" that individually
+resolve the flagged issue without ever converging, burning every
+remaining round before the caller's own exhaustion `die()` fires. The
+loop now tracks each round's issue set (keyed by a stable
+`LABEL: subject` signature, not the full issue string — free-form
+evidence prose regenerated each round would otherwise defeat exact-match
+comparison even for byte-identical underlying defects) and breaks early
+the moment a round's signature set repeats one already seen, rather than
+retrying blind through the remaining budget. This is strictly a
+faster-and-cheaper-failure change: a genuinely narrowing or novel issue
+set is never a repeat of an earlier one, so legitimate convergence is
+unaffected.
+
 **Already-satisfied subtask elimination (the per-subtask sibling).** The
 cleared-but-empty state above is *whole-run*: it fires only when every planner
 natively returned zero subtasks. But a planner does not always know that a

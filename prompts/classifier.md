@@ -98,6 +98,27 @@ CLI flag → `LEERIE_SOURCE_OF_TRUTH` env var → per-repo `leerie.toml`
 → default `both`) and supplies it to every planner and implementer; the
 classifier's job is only to flag that the question is relevant.
 
+## Already satisfied on HEAD
+
+Your investigation sometimes surfaces that the task's described deliverable
+already exists in the checked-out codebase — a prior run's PR already
+merged this exact work, or the task description is stale. When that
+happens, say so as structured data instead of only in prose:
+
+- `likely_already_satisfied` (bool): true only when you can point to
+  concrete, on-tree evidence that the task's deliverable — not just
+  related code, the *actual thing asked for* — is already present. When
+  in doubt, false; this is not a way to avoid classifying real work.
+- `likely_already_satisfied_evidence` (string): the specific files,
+  symbols, or behavior you verified present, and why they satisfy the
+  task — required whenever `likely_already_satisfied` is true.
+
+This is advisory, additive information, not a substitute for classifying
+normally — still choose categories as usual. Downstream, if classification
+cannot otherwise converge on a category set, this signal lets the
+orchestrator recognize the task is already done rather than treating
+non-convergence as an error.
+
 ## Output
 
 Return **only** this JSON object as your final message — no prose, no fences:
@@ -118,7 +139,9 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "commands": [],
     "forbid_manual": false,
     "evidence": ""
-  }
+  },
+  "likely_already_satisfied": false,
+  "likely_already_satisfied_evidence": ""
 }
 ```
 

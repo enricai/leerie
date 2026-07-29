@@ -289,6 +289,14 @@ STATE_FIELDS = (
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "prescribed_procedure", "answers",
+    # likely_already_satisfied / likely_already_satisfied_evidence:
+    # optional, additive classifier-schema fields (DESIGN §8). Written by
+    # phase_classify on every invocation (default False / ""); consulted by
+    # phase_classification_gate on retry-loop exhaustion to route to the
+    # cleared-but-empty terminal state instead of dying, when the
+    # classifier's own investigation already found the task's deliverable
+    # present on HEAD.
+    "likely_already_satisfied", "likely_already_satisfied_evidence",
     "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
@@ -1108,6 +1116,17 @@ SCHEMAS: dict[str, dict] = {
                     "evidence": {"type": "string"},
                 },
             },
+            # Optional, additive signal from the classifier's own
+            # investigation (it already reads the codebase to classify at
+            # all — this just structures a claim it was previously only
+            # allowed to make as ignored prose). True iff the task's
+            # described deliverable already appears to be present on HEAD.
+            # A classifier that never sets it (the common case) sees zero
+            # behavior change downstream — see phase_classification_gate's
+            # exhaustion-routing use, and DESIGN §8 "cleared-but-empty
+            # terminal state".
+            "likely_already_satisfied": {"type": "boolean"},
+            "likely_already_satisfied_evidence": {"type": "string"},
             "confidence": _confidence_schema(["classification"]),
         },
     },
@@ -5290,6 +5309,12 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
         issues.append(
             "EMPTY_EVIDENCE: prescribed_procedure.is_prescribed is true "
             "but evidence is empty")
+
+    if result.get("likely_already_satisfied") and not (
+            result.get("likely_already_satisfied_evidence") or "").strip():
+        issues.append(
+            "EMPTY_EVIDENCE: likely_already_satisfied is true but "
+            "likely_already_satisfied_evidence is empty")
 
     if len(cats) > 4:
         issues.append(
@@ -13454,6 +13479,13 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
+    # Optional, additive (DESIGN §8): persisted so phase_classification_gate
+    # can consult it on exhaustion without threading the raw classifier
+    # result through the gate's own re-invocation loop.
+    st.data["likely_already_satisfied"] = bool(
+        result.get("likely_already_satisfied"))
+    st.data["likely_already_satisfied_evidence"] = (
+        result.get("likely_already_satisfied_evidence") or "")
     st.save()
     log(f"categories: {', '.join(cats)}")
     return result
@@ -13461,7 +13493,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
 
 async def phase_classification_gate(task: str, st: State, caps: dict,
                                     clarify: bool, models: dict[str, str],
-                                    efforts: dict[str, str | None]) -> None:
+                                    efforts: dict[str, str | None]) -> bool:
     """Independent adversarial verification of the classifier's category set
     (DESIGN §8 *Independent adversarial verification*). Runs right after
     `phase_classify` and before provision/plan spend.
@@ -13477,15 +13509,27 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
 
     On a found miscategorization, re-drives `phase_classify` through the
     *existing* checked-loop feedback path (fresh classifier calls with the
-    miscategorizations folded in), bounded by `judgment_check_rounds`,
-    `die()`ing on exhaustion exactly like the adherence/reconciler gates. A
+    miscategorizations folded in), bounded by `judgment_check_rounds` (and
+    cut short earlier by `_run_checked_loop`'s own oscillation guard when a
+    round's issues repeat an earlier round's — see that function). On
+    exhaustion, `die()`s exactly like the adherence/reconciler gates —
+    UNLESS the classifier's own last output carries
+    `likely_already_satisfied=True` with evidence, in which case that is
+    treated as the same "cleared-but-empty terminal state" `detect_no_work`
+    already produces post-plan (DESIGN §8): the run cannot converge on a
+    category set because the classifier itself found the task's deliverable
+    already on HEAD, so classification precision no longer matters. Routes
+    to `_finish_no_work_run` and returns True in that case; the caller must
+    then stop the pipeline (mirroring the existing `detect_no_work` call
+    site's `_finish_no_work_run(...); return` pattern). A
     `classification_judge` `WorkerError` (infrastructure crash) degrades: the
     classifier's own output is preserved (never discarded), consistent with
     `_run_checked_loop`'s WorkerError→retry-then-degrade handling.
 
-    Mutates `st.data["categories"]` in place via the re-driven `phase_classify`;
-    returns None (the categories live on state, like `phase_classify`'s own
-    writes)."""
+    Mutates `st.data["categories"]` in place via the re-driven `phase_classify`.
+    Returns True iff it routed to the no-work terminal state (caller must
+    stop); False otherwise (the categories live on state, like
+    `phase_classify`'s own writes, and the caller proceeds normally)."""
     repo_root = Path(os.getcwd())
     sys_prompt = load_prompt("classification_judge")
 
@@ -13563,10 +13607,29 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
         # classifier's own categories, never discard them.
         log("  classification-gate: classification_judge crashed every round; "
             "degrading to the classifier's own categories")
-        return
+        return False
 
     remaining = _check(judge_result)
     if remaining:
+        # Before dying, check whether the classifier's own last investigation
+        # already explained why convergence is impossible: the task's
+        # deliverable is already on HEAD, so no category set will ever look
+        # "complete" against a diff that doesn't exist. `st.data["categories"]`
+        # was written by phase_classify's last invocation, but the boolean
+        # signal itself lives on the classifier's raw result, not on state —
+        # re-read the last classifier round's own claim via the same
+        # last-write st.data field phase_classify populates each time.
+        satisfied_evidence = (
+            st.data.get("likely_already_satisfied_evidence") or "").strip()
+        if st.data.get("likely_already_satisfied") and satisfied_evidence:
+            log("  classification-gate: exhausted without a converging "
+                "category set, but the classifier's own investigation found "
+                "the task's deliverable already on HEAD — routing to the "
+                "cleared-but-empty terminal state instead of dying "
+                f"(evidence: {satisfied_evidence!r})")
+            _finish_no_work_run(
+                st, {"<unresolved classification>": satisfied_evidence})
+            return True
         die(
             "classification gate exhausted "
             f"{caps['judgment_check_rounds']} re-classify round(s) without "
@@ -13582,6 +13645,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     st.data["classification_coverage_gate"] = judge_result
     st.save()
     log("phase 1: classification gate clean")
+    return False
 
 
 def gather_answers(st: State, supplied: dict | None) -> dict:
@@ -19483,6 +19547,25 @@ def _format_check_feedback(
     return header + body + footer
 
 
+def _issue_signature(issue: str) -> str:
+    """Extract a stable identity from a `_run_checked_loop` issue string,
+    for oscillation detection across rounds.
+
+    Every issue string in this codebase follows `LABEL: subject — detail`
+    or `LABEL (subtype): subject — detail` (e.g. `MISCATEGORIZATION
+    (missing_category): testing — <LLM-written evidence prose>`,
+    `TEST_OWNERSHIP_RISK: 'bug-fixing' and 'testing' both selected — ...`).
+    The `LABEL`/`subject` prefix is the mechanically-meaningful part (what
+    the check flagged); the text after the em dash is free-form,
+    LLM-regenerated justification prose that differs between rounds even
+    when the same underlying issue recurs — comparing on the FULL string
+    would silently defeat oscillation detection on every real caller,
+    since a re-invoked worker essentially never reproduces byte-identical
+    prose for the same defect. Splitting on the first em dash and keeping
+    only the prefix is what makes "the same issue came back" detectable."""
+    return issue.split("—", 1)[0].strip()
+
+
 async def _run_checked_loop(
     *,
     invoke: Callable[..., Awaitable[dict]],
@@ -19510,9 +19593,31 @@ async def _run_checked_loop(
     state the next ``invoke()`` call will read (typically a user-prompt
     variable).  When ``None``, feedback is logged but not injected (the
     loop still retries — useful when the re-invocation alone, as a fresh
-    ``claude -p`` session, is the value)."""
+    ``claude -p`` session, is the value).
+
+    Oscillation guard: neither this loop nor any known caller's
+    ``make_feedback_prompt`` accumulates feedback across rounds — each
+    round's *invoke* only ever sees the current round's issue list, not
+    the history of what earlier rounds already tried and fixed. That
+    makes a 2-round cycle reachable (round 0 flags A, round 1's fix drops
+    A but introduces B, round 2's fix re-introduces A) which would
+    otherwise burn every remaining round before the caller's own
+    exhaustion die() fires. Track each round's issue set, keyed by
+    ``_issue_signature`` (the stable `LABEL: subject` prefix, not the
+    full string — every real issue string here carries free-form,
+    LLM-regenerated evidence prose after an em dash that differs between
+    rounds even for the identical underlying defect, so comparing full
+    strings would never actually detect a real cycle). If a later
+    round's signature set is a non-empty subset of an already-seen
+    earlier round's signature set, that is not forward progress — it is
+    a repeat of a problem already "fixed" once — so stop immediately
+    instead of retrying blind. A genuinely shrinking or strictly
+    different signature set is never a subset of a prior one (unless
+    truly identical, which is the same non-convergence signal), so this
+    cannot fire on legitimate convergence."""
     warnings: list[str] = []
     last_res: dict | None = None
+    seen_issue_sets: list[frozenset[str]] = []
 
     for rnd in range(max_rounds):
         try:
@@ -19552,6 +19657,15 @@ async def _run_checked_loop(
 
         for issue in issues:
             warnings.append(f"{name} round {rnd}: {issue}")
+
+        issue_set = frozenset(_issue_signature(issue) for issue in issues)
+        if any(issue_set <= seen for seen in seen_issue_sets):
+            warnings.append(
+                f"{name} round {rnd}: issue set repeats an earlier round's "
+                "issues — not converging, aborting early instead of "
+                "burning the remaining rounds")
+            break
+        seen_issue_sets.append(issue_set)
 
         if rnd < max_rounds - 1 and make_feedback_prompt is not None:
             feedback = _format_check_feedback(issues, rnd, max_rounds)
@@ -22138,22 +22252,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # logged and ignored.
             await _backstop_capture_prior_runs(
                 leerie_dir, Path(os.getcwd()), caps, models, efforts)
-            await phase_classify(task, st, caps, args.clarify, models, efforts)
-            # Independent adversarial verification of the classifier's category
-            # set (DESIGN §8) — gates before provision/plan spend, may re-drive
-            # phase_classify. Inside the plans_after_classify checkpoint block,
-            # so a resume past this phase skips it.
-            await phase_classification_gate(
-                task, st, caps, args.clarify, models, efforts)
-            # Resumable-planning checkpoint (DESIGN §6 "Resumable planning
-            # — a per-phase checkpoint cursor, not a `waves` gate"). `plans`
-            # does not exist yet at this point in the pipeline
-            # (phase_classify produces categories, not a plan) — the empty
-            # list is the accurate "this phase's output is safely
-            # persisted" marker that --resume treats as proof phase_classify
-            # need not be re-invoked.
-            st.data["plans_after_classify"] = []
-            st.save()
             if not args.resume:
                 log(f"run id: {st.run_id}")
                 # Initialize run.json with the immutable run-identity
@@ -22162,7 +22260,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 # run from the moment it has a stable identity — not only
                 # after finalize. Only needed once — a resumed run that
                 # reaches here (paused before phase_classify completed)
-                # already has run.json from its first invocation.
+                # already has run.json from its first invocation. Placed
+                # BEFORE phase_classify/phase_classification_gate (rather
+                # than after, as originally written) so that ANY early-exit
+                # path reachable from those two calls — including the
+                # cleared-but-empty terminal state phase_classification_gate
+                # can now route to on exhaustion — writes a run.json that
+                # already carries full run identity, not just the terminal
+                # state's own {finished_at, no_push, no_verify} fields. None
+                # of the values below depend on phase_classify having run.
                 head_proc = await run_proc(
                     ["git", "rev-parse", "--abbrev-ref", "HEAD"])
                 working_branch = (head_proc.stdout.strip()
@@ -22184,6 +22290,29 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     task=task,
                     **({"group_id": args.group_id} if args.group_id else {}),
                 )
+            await phase_classify(task, st, caps, args.clarify, models, efforts)
+            # Independent adversarial verification of the classifier's category
+            # set (DESIGN §8) — gates before provision/plan spend, may re-drive
+            # phase_classify. Inside the plans_after_classify checkpoint block,
+            # so a resume past this phase skips it. May itself route to the
+            # cleared-but-empty terminal state (returns True) when the gate
+            # cannot converge but the classifier's own investigation already
+            # found the task's deliverable on HEAD — `_finish_no_work_run`
+            # sets `finished_at` unconditionally, so a resumed run recognizes
+            # completion regardless of which planning checkpoints exist yet.
+            routed_to_no_work = await phase_classification_gate(
+                task, st, caps, args.clarify, models, efforts)
+            if routed_to_no_work:
+                return
+            # Resumable-planning checkpoint (DESIGN §6 "Resumable planning
+            # — a per-phase checkpoint cursor, not a `waves` gate"). `plans`
+            # does not exist yet at this point in the pipeline
+            # (phase_classify produces categories, not a plan) — the empty
+            # list is the accurate "this phase's output is safely
+            # persisted" marker that --resume treats as proof phase_classify
+            # need not be re-invoked.
+            st.data["plans_after_classify"] = []
+            st.save()
             # Provision per-repo deps (DESIGN §6½). Runs after classify (so
             # a docs-only run can short-circuit). Guarded on presence of
             # the "recipe" key rather than unconditional: `mise install`
