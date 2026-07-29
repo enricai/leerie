@@ -1266,10 +1266,9 @@ leerie "task" --state-dir ~/.leerie/myproject
 export LEERIE_RUNTIME=local               # or: fly
 leerie "task" --runtime fly
 
-# Choose the model. Without overrides: judgment workers (classifier,
-# planner, reconciler, plan_overlap_judge, provision, integrator) default
-# to opus; acting workers (implementer, conformer) default to sonnet.
-# Use the env var
+# Choose the model. Without overrides, every worker — judgment (classifier,
+# planner, reconciler, plan_overlap_judge, provision, integrator) and acting
+# (implementer, conformer) alike — defaults to sonnet. Use the env var
 # for a sticky preference, the CLI flag for a one-off, or leerie.toml
 # for the committed repo default. Per-worker overrides also exist —
 # see §2.
@@ -1282,7 +1281,7 @@ leerie "task" --judge-dir my-judge --heal-dir my-heal
 export LEERIE_JUDGE_DIR=my-judge
 export LEERIE_HEAL_DIR=my-heal
 
-# Judge and heal model overrides (default: sonnet for throughput):
+# Judge and heal model overrides (default: sonnet):
 leerie "task" --judge-model opus --heal-model opus
 export LEERIE_MODEL_JUDGE=sonnet
 export LEERIE_MODEL_HEAL=sonnet
@@ -2260,18 +2259,17 @@ Resolution order (highest priority first):
 ### Judge model
 
 The `claude` model alias used when the judge skill spawns a worker to score a
-batch of captured calls against a 3-dimensional rubric. This is a judgment
-call (per CLAUDE.md's "judgment workers default to opus" rule), not
-throughput-bound work, so it defaults to `opus` like the orchestrator's core
-judgment workers — `judge` is absent from `MODEL_DEFAULT_PER_WORKER` and
-falls through to the global `MODEL_DEFAULT`.
+batch of captured calls against a 3-dimensional rubric. `judge` is absent
+from `MODEL_DEFAULT_PER_WORKER` and falls through to the global
+`MODEL_DEFAULT` (`sonnet`), same as every other worker per CLAUDE.md's
+model-default policy.
 
 Resolution order (highest priority first):
 
 1. **`--judge-model MODEL`** CLI flag.
 2. **`LEERIE_MODEL_JUDGE`** environment variable.
 3. **`leerie.toml`**, `model_judge = "opus"`.
-4. **Default `"opus"`** (`MODEL_DEFAULT`; `judge` is absent from
+4. **Default `"sonnet"`** (`MODEL_DEFAULT`; `judge` is absent from
    `MODEL_DEFAULT_PER_WORKER`).
 
 ### Heal model
@@ -2436,53 +2434,54 @@ env var → `leerie.toml` → default.
 ### Model selection
 
 Every worker shells out to `claude -p`. The model passed via `--model` to that
-subprocess is resolved per worker type, so the same run can use `opus` for
-judgment work and `sonnet` for high-throughput implementation. Valid values:
-`sonnet` | `opus` | `haiku` (aliases — the `claude` CLI resolves them to the
-current model version).
+subprocess is resolved per worker type. Valid values: `sonnet` | `opus` |
+`haiku` (aliases — the `claude` CLI resolves them to the current model
+version).
 
-**Per-worker defaults: Opus for judgment, Sonnet for implementation and
-finalize-time composition.** Any worker that makes a *decision* (classify
-the task, decompose into subtasks, reconcile cross-domain coupling, detect
-cross-planner surface overlap, resolve merge conflicts behaviorally, check
-criteria, score captured calls against a rubric) defaults to Opus —
-measured evidence (a real incident's judge-experiment) shows Sonnet gives
-opposite verdicts from Opus on identical judgment inputs. The implementer,
-conformer, heal, and pr_writer workers — which execute concrete tasks with
-high throughput requirements (implementer, conformer) or run as one-shot
-post-run / finalize calls with no independent-judgment role (heal,
-pr_writer) — default to Sonnet.
+**Per-worker defaults: Sonnet 5 for both judgment and implementation.**
+Previously, any worker that makes a *decision* (classify the task, decompose
+into subtasks, reconcile cross-domain coupling, detect cross-planner surface
+overlap, resolve merge conflicts behaviorally, check criteria, score
+captured calls against a rubric) defaulted to Opus — measured evidence (a
+real incident's judge-experiment) showed Sonnet giving opposite verdicts
+from Opus on identical judgment inputs at the time. That gap has since
+closed for Sonnet 5, externally verified to match Opus 4.8 (the prior
+working judgment baseline) on the same class of decisions, so the
+judgment/workhorse model split no longer applies — every worker defaults
+to Sonnet. See DESIGN §5 *Opus-judgment, sonnet-workhorse (historical)* for
+the retained history of why the split existed.
 
 | Worker       | Default | Why |
 |--------------|---------|-----|
-| classifier   | opus    | global judgment over the task description |
-| planner      | opus    | decomposition is the load-bearing judgment step |
-| reconciler   | opus    | cross-domain tag equivalence is judgment |
-| plan_overlap_judge | opus | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
+| classifier   | sonnet  | global judgment over the task description |
+| planner      | sonnet  | decomposition is the load-bearing judgment step |
+| reconciler   | sonnet  | cross-domain tag equivalence is judgment |
+| plan_overlap_judge | sonnet | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
 | satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — a **deliberate, documented cost tradeoff** (see the comment at `MODEL_DEFAULT_PER_WORKER["satisfied_probe"]`), not a claim that the check needs no judgment. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
-| provision    | opus    | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
-| integrator   | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
-| implementer  | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
-| conformer    | sonnet  | reads a diff and runs commands; same throughput-first profile as implementer; the phase is advisory so a borderline judgment call costs at most a warning |
-| judge        | opus    | scoring a batch of captured calls against a 3-dimensional rubric is judgment, not throughput-bound work; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| provision    | sonnet  | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
+| integrator   | sonnet  | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
+| implementer  | sonnet  | concrete subtask execution; also pinned to `low` effort (see "Effort selection" below) — cost/latency, not a judgment-tier change |
+| conformer    | sonnet  | reads a diff and runs commands; also pinned to `low` effort (see "Effort selection" below) — same cost/latency rationale as implementer |
+| judge        | sonnet  | scoring a batch of captured calls against a 3-dimensional rubric; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
-| dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
-| fit_judge    | opus    | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| adherence_judge | opus | plan-instruction-adherence scoring is judgment; empirically falsified on sonnet (false-positives on legitimate plans) and on an opus *understanding*-framed judge (rubber-stamps a plan that disobeys a prescribed procedure while still reflecting correct comprehension) — only the ADHERENCE frame + opus model combination is validated; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| classification_judge | opus | independent adversarial verifier of the classifier's category set against the task + codebase (DESIGN §8 *Independent adversarial verification*); like every verifier it is *itself* the independent check, so it must run on the judgment tier; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| wiring_judge | opus | independent adversarial verifier of the reconciled plan's semantic wiring — the tag/dep dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8); absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| provision_judge | opus | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8); absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
-| artifact_registry | opus | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| dep_capture  | sonnet  | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets |
+| fit_judge    | sonnet  | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| splitter     | sonnet  | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| adherence_judge | sonnet | plan-instruction-adherence scoring is judgment; empirically calibrated per-worker (goal-only task ⇒ high score, prescribed-and-violated ⇒ low score); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback. If adherence gating regresses under the sonnet default, re-run the calibration and consider `--model-adherence-judge opus` as a per-worker override before reintroducing a blanket tier split |
+| classification_judge | sonnet | independent adversarial verifier of the classifier's category set against the task + codebase (DESIGN §8 *Independent adversarial verification*); like every verifier it is *itself* the independent check; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| wiring_judge | sonnet | independent adversarial verifier of the reconciled plan's semantic wiring — the tag/dep dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| provision_judge | sonnet | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 
-`MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
-overrides it for specific workers (`implementer`, `conformer`, `heal`,
-`pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture`, `fit_judge`, `splitter`, `judge`, `adherence_judge`,
-`classification_judge`, `wiring_judge`, and `provision_judge` are
-**absent** from `MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from
-the global `MODEL_DEFAULT` fallback.
+`MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
+lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
+explicitly (all `sonnet` — matching the global default today, but kept as
+explicit per-worker entries since they predate this change and may need to
+diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
+`adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
+and `artifact_registry` are **absent** from `MODEL_DEFAULT_PER_WORKER` —
+their `sonnet` defaults come from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2493,7 +2492,7 @@ Resolution order for each worker type `W` (highest priority first):
 5. **`model_<w>`** key in `leerie.toml`
 6. **`model`** key in `leerie.toml`
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
-8. **Global default `MODEL_DEFAULT`** (`opus`)
+8. **Global default `MODEL_DEFAULT`** (`sonnet`)
 
 Twenty worker types (plus the global override), each independently overridable:
 
@@ -2533,10 +2532,11 @@ An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
 argparse error.
 
-**Cost note:** Opus is materially more expensive than Sonnet. A user who
-wants the old all-Sonnet behavior sets `LEERIE_MODEL=sonnet` (or
-`--model sonnet`). Per-worker overrides (`--model-planner sonnet`) let
-users selectively de-escalate individual workers.
+**Cost note:** every worker now defaults to Sonnet. A user who wants a
+specific judgment worker on Opus (e.g. to re-check a regression against
+the historical judgment-tier baseline) can still opt in per worker with
+`--model-<worker> opus` / `LEERIE_MODEL_<WORKER>=opus`, or globally with
+`--model opus` / `LEERIE_MODEL=opus`.
 
 Models are not persisted in `<state-root>/state.json`. On `--resume`, models are
 re-resolved from the current environment, so changing `LEERIE_MODEL` between
@@ -2556,17 +2556,21 @@ sampling stochasticity cannot be pinned. Effort is the strongest dial
 available; it does not eliminate run-to-run variance but does remove the
 "this run thought harder than that one" axis.
 
-**Per-worker defaults: `medium` for judgment workers, unset for acting workers.**
+**Per-worker defaults: `medium` for judgment workers, `low` for the
+code-writing acting workers, unset for post-run skill workers.**
 The fifteen judgment / finalize workers (classifier, planner, reconciler,
 plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge,
 splitter, adherence_judge, classification_judge, wiring_judge, provision_judge,
 artifact_registry)
-default to `medium`. The acting workers (implementer,
-conformer) and post-run skill workers (judge, heal) default to *unset* —
-when no effort is resolved,
-no `--effort` flag is passed and the worker inherits Claude's default. This
-keeps acting workers' reasoning bounded by their own evidence gates
-(DESIGN §8) rather than by a global dial.
+default to `medium`. `implementer` and `conformer` — the workers that
+actually write code — default to `low`, a deliberate cost/latency call
+(distinct from the judgment workers' `medium`, which is about determinism,
+not cost): these previously defaulted to *unset* (inheriting Claude's own
+default reasoning depth) so their effort stayed bounded by their own
+evidence gates (DESIGN §8) rather than a global dial; that tradeoff is now
+overridden in favor of a fixed low-effort ceiling. The post-run skill
+workers `judge` and `heal` remain *unset* — when no effort is resolved, no
+`--effort` flag is passed and the worker inherits Claude's default.
 
 The default was lowered from `high` to `medium` after the Opus 5 release:
 Opus 5 thinks by default and produces materially more output tokens per call
@@ -2587,8 +2591,8 @@ chain below when a specific worker needs deeper reasoning.
 | satisfied_probe | unset | per-subtask advisory prune (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask, same unset profile as conformer/judge — the base-tree-only tool scope and conservative default carry the correctness, not pinned depth |
 | provision    | medium  | recipe synthesis over arbitrary repo shapes is judgment |
 | integrator   | medium  | behavioral conflict resolution; a wrong merge corrupts state |
-| implementer  | unset   | bounded by §8 evidence gate; pinning would override the gate's adaptive depth |
-| conformer    | unset   | advisory phase; same reasoning as implementer |
+| implementer  | low     | code-writing worker; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
+| conformer    | low     | code-writing worker; same cost/latency rationale as implementer — the phase is advisory, so a borderline judgment call costs at most a warning |
 | judge        | unset   | post-run scoring; no need to pin |
 | heal         | unset   | post-run patch generation; no need to pin |
 | pr_writer    | medium  | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
@@ -2609,7 +2613,10 @@ the finalize-time `pr_writer` and `dep_capture` workers, the P1 decomposition
 workers `fit_judge` and `splitter`, the plan-instruction-adherence worker
 `adherence_judge`, the three independent adversarial verifiers
 `classification_judge`, `wiring_judge`, and `provision_judge`, and the
-pre-planning shared-vocabulary worker `artifact_registry`.
+pre-planning shared-vocabulary worker `artifact_registry`. It separately
+overrides `implementer` and `conformer` to `"low"` — a distinct,
+cost-motivated pin rather than a judgment-reproducibility one, so it is
+called out separately from the `"medium"` judgment cohort above.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -4349,7 +4356,7 @@ Fully shipped. `SCHEMAS["classifier"]` carries `prescribed_procedure`
 `st.data["prescribed_procedure"]` — see §3 "Worker output schemas"),
 `SCHEMAS["planner"]` carries the optional per-subtask `runs_commands`
 array, the `adherence_judge` worker is fully registered (schema, prompt,
-`WORKER_TYPES`, opus/`"medium"` model-effort defaults — see "The
+`WORKER_TYPES`, sonnet/`"medium"` model-effort defaults — see "The
 `adherence_judge` worker" above), and `phase_adherence_gate` (a
 whole-plan gate, "Phase 2⅞", run once per assembled plan rather than
 per-subtask) wires all of it together.
@@ -4652,7 +4659,7 @@ child mirrors the planner subtask shape: required `id`, `title`,
 
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
 (both default to `"medium"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
-(default opus via the global `MODEL_DEFAULT` fallback).
+(default sonnet via the global `MODEL_DEFAULT` fallback).
 
 ### The `adherence_judge` worker (plan-instruction-adherence gate)
 
@@ -4667,18 +4674,26 @@ independent check that replaces a self-report, so a nested self-confidence
 axis would reintroduce the self-grading bias the gate exists to remove.
 
 Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"medium"`),
-absent from `MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT`
-fallback — **required**, not merely preferred: empirically falsified on
-sonnet, which false-positived a legitimate plan). Prompt at
+absent from `MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT`
+fallback). **History:** this worker was previously pinned to opus as a
+required, not merely preferred, override — an earlier Sonnet generation was
+empirically falsified here, false-positiving a legitimate plan. That gap has
+since closed for Sonnet 5 (externally verified against Opus 4.8, DESIGN §5
+*Opus-judgment, sonnet-workhorse*), so the worker now follows the global
+sonnet default like every other worker; `--model-adherence-judge opus`
+remains available as a per-worker override if this gate is ever observed to
+regress and needs re-validation before a broader tier decision. Prompt at
 `prompts/adherence_judge.md` carries the calibration: a goal-only task (no
 prescribed procedure to violate) scores `instruction_adherence >= 8.5`; a
 plan that substitutes hand-authored/manual work for an explicitly
 prescribed procedure scores `<= 3`. The prompt is framed on **ADHERENCE**
 (does the plan obey the prescribed process?), not **understanding** (does
 the plan reflect correct comprehension of the task?) — an
-understanding-framed judge on opus was empirically shown to rubber-stamp a
-plan that disobeys a prescribed procedure while still reflecting correct
-task comprehension (score ~9.0 on the motivating incident's plan).
+understanding-framed judge was empirically shown to rubber-stamp a plan
+that disobeys a prescribed procedure while still reflecting correct task
+comprehension (score ~9.0 on the motivating incident's plan) regardless of
+model tier, so the ADHERENCE framing itself remains load-bearing
+independent of this model-default change.
 
 This worker's `claude_p()` invocation, its position in the plan check loop
 (alongside the deterministic command-coverage floor), and the
@@ -4697,7 +4712,7 @@ each gates on a **non-empty array of concretely-named found defects** rather
 than a score crossing a threshold — there is no lowerable bar (DESIGN §9
 anti-gaming). All three are registered in `WORKER_TYPES` and
 `EFFORT_DEFAULT_PER_WORKER` (`"medium"`), absent from
-`MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT` fallback), and
+`MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT` fallback), and
 invoked read-only (`INSPECT_TOOLS`, `autonomous=False`) after
 `st.bump_workers(caps)`.
 
@@ -5152,7 +5167,7 @@ surface lives in `orchestrator/leerie.py`.
 `dep_capture` is a non-WORKER_TYPES worker (like `pr_writer`) registered in
 `SCHEMAS`, `_allowed_schema_keys`, `EFFORT_DEFAULT_PER_WORKER` (medium), and
 `resolve_models`/`resolve_efforts`. It is **absent** from
-`MODEL_DEFAULT_PER_WORKER`; its `opus` default comes from the global
+`MODEL_DEFAULT_PER_WORKER`; its `sonnet` default comes from the global
 `MODEL_DEFAULT` fallback. Its model override is env-var-only (no CLI flag, no
 `leerie.toml` key): `MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"`.
 System prompt is `prompts/dep_capture.md`. Output schema:
@@ -6913,7 +6928,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
-| `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the opus `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
+| `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_completeness_check` | bool | whether the conformer's gating `solution_defects` completeness axis (DESIGN §9 *The one gating axis: solution completeness*) is demoted to advisory. Resolved from `--skip-completeness-check` / `LEERIE_SKIP_COMPLETENESS_CHECK` / `skip_completeness_check` in `leerie.toml` / default `False`. When True, `settle_subtask` and `run_final_conformance` surface found defects as warnings but never re-drive the implementer, block a subtask, or `die()` the final-tree pass — the escape hatch for a hallucinated completeness defect blocking finalize on every `--resume`. Re-resolved fresh on every run, including `--resume` |
 | `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. The runtime backstop in `State.bump_workers()` is independent of this field — it always fires when the counter actually exceeds `max_total_workers`; this flag only suppresses the *early* die() that catches mathematically-unwinnable runs at the plan/execute boundary. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state. On `--resume` the preflight is moot regardless — the resume path enters past `schedule()` so the check has nothing to gate |
 | `skip_satisfied_check` | bool | whether `filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. When set, no `satisfied_probe` worker spawns and every subtask proceeds to `schedule()`; the mechanical `check_branch_has_commits` backstop then still catches an already-satisfied subtask post-execution — on a no-commits `complete`, `settle_subtask` re-probes the criteria against the run-branch HEAD (`probe_criteria_satisfied_on_head`) and settles it `complete` if met (DESIGN §8 *The mid-run sibling case*), rather than failing it as a retryable no-op. Re-resolved fresh on every run; on `--resume` the phase-3 filter is past, so the flag only affects fresh runs. |
@@ -7314,8 +7329,8 @@ enforcement functions:
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
 | `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; isolation (override doesn't bleed to other workers); structural wiring guards |
 | `test_rank_repo_map.py` | `rank_repo_map()` P6 ranking contract: seed-adjacent nodes rank above unrelated nodes (direct seed file, 1-hop neighbor via callee→caller edge, seed symbol biases definer, all connected-chain files before any island file); token-budget enforcement (explicit budget, `DEFAULT_CAPS["repo_map_tokens"]` when `None`, `None` == cap value, empty map returns `""`); binary-search shrink (lower budget → shorter output and fewer files, increasing budgets → non-decreasing lengths, tight budgets respected). Fixture built directly (no `build_repo_map`); no LLM calls; deterministic. |
-| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (opus via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
-| `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `opus` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `medium` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
+| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (sonnet via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `sonnet` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `medium` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
 | `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "medium"`, prompt file exists) |
 | `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "medium"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
 | `test_recursive_decompose.py` | `partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates + emits "no-progress guard" warning to stdout (asserted via capsys), migration path partitions files via `partition_files()` and invokes the splitter only in label-only mode to title each chunk (distinct titles; distinct deterministic fallback on splitter failure), both `claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps` — C0 regression guard), a passed `repo_map` is injected into fit_judge/splitter prompts and omitted when `None` (G2), bump_workers called before every claude_p |

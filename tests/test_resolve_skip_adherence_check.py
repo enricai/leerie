@@ -1,6 +1,6 @@
 """Tests for resolve_skip_adherence_check() — the --skip-adherence-check
 opt-out for the instruction-adherence gate (deterministic prescribed-
-command-coverage floor + opus `adherence_judge` worker).
+command-coverage floor + `adherence_judge` worker).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_ADHERENCE_CHECK env
 var → skip_adherence_check in leerie.toml → False (the gate runs on

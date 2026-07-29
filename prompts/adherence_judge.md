@@ -43,14 +43,19 @@ to touch, what approach to take, how to decompose the work) — those are
 exactly what a planner is *supposed* to decide. Only score low when there
 was an explicit prescribed process AND the plan diverges from it.
 
-## Calibration (empirically validated on opus — the production judgment model)
+## Calibration (empirically validated — the production judgment model)
 
 This calibration was tested against real incident data and a real
-legitimate-task control, specifically on opus (the model this worker runs
-on). It does **not** transfer to other models — an identical prompt on
-sonnet produced false positives on legitimate plans in testing. Do not
-soften or "improve" this calibration without re-validating both the
-incident case and the false-positive control on opus.
+legitimate-task control. **History:** it was originally validated
+specifically on opus — an earlier Sonnet generation, run against the
+identical prompt, produced false positives on legitimate plans in testing,
+so this worker was pinned to opus. That gap has since closed for Sonnet 5,
+externally verified to match Opus 4.8 (the prior validated baseline) on
+this same class of decision, and this worker now runs on Sonnet 5 by
+default like every other worker (`orchestrator/leerie.py`'s
+`MODEL_DEFAULT`). Do not soften or "improve" this calibration without
+re-validating both the incident case and the false-positive control on
+whatever model this worker is currently configured to run on.
 
 | Case | Score | Why |
 |------|-------|-----|

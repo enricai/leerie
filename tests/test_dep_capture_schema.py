@@ -333,8 +333,8 @@ def test_dep_capture_effort_default_is_medium(leerie):
     assert leerie.EFFORT_DEFAULT_PER_WORKER.get("dep_capture") == "medium"
 
 
-def test_dep_capture_model_defaults_to_opus(leerie):
+def test_dep_capture_model_defaults_to_sonnet(leerie):
     """dep_capture is absent from MODEL_DEFAULT_PER_WORKER, so it falls
-    through to MODEL_DEFAULT ('opus') — the judgment-worker default."""
+    through to MODEL_DEFAULT ('sonnet')."""
     assert "dep_capture" not in leerie.MODEL_DEFAULT_PER_WORKER
-    assert leerie.MODEL_DEFAULT == "opus"
+    assert leerie.MODEL_DEFAULT == "sonnet"

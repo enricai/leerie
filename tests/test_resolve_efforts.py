@@ -27,9 +27,10 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "conformer")
 
 # The expected default per worker, with no overrides. Judgment workers
-# get "medium" (lowered from "high" post-Opus-5, see IMPLEMENTATION.md §2);
-# acting workers (implementer, conformer) and the per-subtask
-# satisfied_probe resolve to None.
+# get "medium" (lowered from "high" post-Opus-5, see IMPLEMENTATION.md §2).
+# implementer/conformer — the code-writing workers — are pinned to "low"
+# (cost/latency, distinct from the judgment "medium"). satisfied_probe
+# has no effort default and resolves to None.
 DEFAULTS: dict[str, str | None] = {
     "classifier": "medium",
     "planner":    "medium",
@@ -38,8 +39,8 @@ DEFAULTS: dict[str, str | None] = {
     "satisfied_probe": None,
     "provision":  "medium",
     "integrator": "medium",
-    "implementer": None,
-    "conformer":  None,
+    "implementer": "low",
+    "conformer":  "low",
 }
 
 
@@ -61,18 +62,19 @@ def repo_root(tmp_path, monkeypatch):
 
 
 def test_all_unset_defaults_per_worker(leerie, repo_root):
-    """With no overrides, judgment workers default to 'medium' and acting
-    workers default to None (no --effort flag passed). Pins both the
-    global default (None) and the per-worker override table together."""
+    """With no overrides, judgment workers default to 'medium' and the
+    code-writing acting workers (implementer, conformer) are pinned to
+    'low'. Pins both the global default (None) and the per-worker
+    override table together."""
     efforts = leerie.resolve_efforts(repo_root, ns())
     worker_slice = {w: efforts[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
     assert leerie.EFFORT_DEFAULT is None
-    # Judgment workers default to medium; acting workers are absent.
+    # Judgment workers default to medium; implementer/conformer to low.
     assert leerie.EFFORT_DEFAULT_PER_WORKER.get("planner") == "medium"
     assert leerie.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "medium"
-    assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("implementer") == "low"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("conformer") == "low"
 
 
 def test_global_env_applies_to_every_worker(leerie, repo_root, monkeypatch):
@@ -140,14 +142,15 @@ def test_full_precedence_per_worker(leerie, repo_root, monkeypatch):
     # Per-worker CLI > global CLI > per-worker env > global env >
     # per-worker TOML > global TOML > per-worker default > EFFORT_DEFAULT.
     # Exercise one rung at a time on the planner (which has a per-worker
-    # default of "medium"). Implementer has no per-worker default — we
-    # check both fallthrough behaviors at the bottom.
+    # default of "medium"). Implementer also has a per-worker default
+    # now ("low") — both are rung 7, so no rung-8 EFFORT_DEFAULT fallback
+    # is exercised for either here (see test_all_unset_defaults_per_worker
+    # for the rung-8 None case, still true for satisfied_probe).
     cfg = repo_root / "leerie.toml"
 
-    # rung 7 (per-worker default → "medium" for planner)
+    # rung 7 (per-worker default → "medium" for planner, "low" for implementer)
     assert leerie.resolve_efforts(repo_root, ns())["planner"] == "medium"
-    # And rung 8 for implementer (no per-worker default, EFFORT_DEFAULT is None)
-    assert leerie.resolve_efforts(repo_root, ns())["implementer"] is None
+    assert leerie.resolve_efforts(repo_root, ns())["implementer"] == "low"
 
     # rung 6: global TOML beats default
     cfg.write_text("effort = low\n")
@@ -251,11 +254,11 @@ def test_post_run_workers_resolved(leerie, repo_root, monkeypatch):
 
 
 def test_judgment_workers_pinned_set(leerie):
-    """Pins which workers default to 'medium'. Adding a worker to the
-    judgment set should be a deliberate decision, not a silent drift.
-    Acting workers (implementer, conformer) must stay absent — their
-    reasoning depth is bounded by the DESIGN §8 evidence gate."""
-    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == {
+    """Pins the exact key set of EFFORT_DEFAULT_PER_WORKER, and which
+    workers get 'medium' vs 'low'. Adding a worker to either set — or a
+    stray unrelated key — should be a deliberate decision, not a silent
+    drift."""
+    judgment_workers = {
         "classifier", "planner", "reconciler", "plan_overlap_judge",
         "provision", "integrator", "pr_writer", "dep_capture",
         "fit_judge", "splitter", "adherence_judge",
@@ -267,8 +270,17 @@ def test_judgment_workers_pinned_set(leerie):
         # worker*) — a judgment worker (decides tag/path per artifact).
         "artifact_registry",
     }
-    assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
+    # implementer/conformer — the code-writing workers — are pinned to
+    # 'low' (cost/latency), distinct from the judgment workers' 'medium'
+    # (determinism/reproducibility). A deliberate override of the prior
+    # "bounded by the DESIGN §8 evidence gate" unset default.
+    acting_workers = {"implementer", "conformer"}
+
+    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == judgment_workers | acting_workers
+    for w in judgment_workers:
+        assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "medium"
+    for w in acting_workers:
+        assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "low"
 
 
 def test_effort_values_set(leerie):

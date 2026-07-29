@@ -769,7 +769,7 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 # --skip-adherence-check bypass (instruction-adherence gate — the plan
 # must honor an explicitly prescribed procedure; sibling to §12 "prompts
 # advisory, code enforces"). Suppresses the deterministic
-# prescribed-command-coverage floor and the opus `adherence_judge` worker
+# prescribed-command-coverage floor and the `adherence_judge` worker
 # in the planner check loop. Use only when the operator knows the
 # instruction-adherence gate is producing false positives for this repo's
 # task shape and wants to bypass the discipline. Resolution order:
@@ -858,13 +858,16 @@ _TERMINAL_STATUSES = frozenset({"complete", "failed", "blocked"})
 # current version. Each worker type has independent CLI/env/TOML
 # overrides; falls back through global CLI/env/TOML/MODEL_DEFAULT.
 MODEL_VALUES = ("sonnet", "opus", "haiku")
-# Global default. Used when no per-worker default applies. DESIGN §5 +
-# IMPLEMENTATION.md §2: judgment workers (everything except implementer)
-# run on Opus by default; implementer's per-worker default is sonnet.
-# Users can override globally with --model / LEERIE_MODEL / `model =`
-# in leerie.toml, or per-worker with --model-<worker> /
-# LEERIE_MODEL_<WORKER> / `model_<worker> =`.
-MODEL_DEFAULT = "opus"
+# Global default. Used when no per-worker default applies. DESIGN §5
+# *Opus-judgment, sonnet-workhorse* previously defaulted judgment workers
+# to Opus based on measured evidence that Sonnet gave opposite verdicts
+# from Opus on identical judgment inputs; that gap has since closed for
+# Sonnet 5 (externally verified against Opus 4.8, which was already the
+# working baseline), so every worker — judgment and workhorse alike — now
+# defaults to Sonnet. Users can override globally with --model /
+# LEERIE_MODEL / `model =` in leerie.toml, or per-worker with
+# --model-<worker> / LEERIE_MODEL_<WORKER> / `model_<worker> =`.
+MODEL_DEFAULT = "sonnet"
 # Per-worker defaults applied *after* user overrides (CLI/env/TOML) but
 # *before* the global MODEL_DEFAULT fallback. Only workers that need a
 # different default from MODEL_DEFAULT appear here.
@@ -879,6 +882,10 @@ MODEL_DEFAULT_PER_WORKER = {
     # the model tier.
     "satisfied_probe": "sonnet",
 }
+# NOTE: with MODEL_DEFAULT now "sonnet", every worker not listed above
+# (all judgment workers, plus the post-run `judge` worker) also resolves
+# to sonnet via the global fallback — this dict no longer needs a
+# judgment/workhorse split to keep them on sonnet.
 MODEL_ENV = "LEERIE_MODEL"
 MODEL_FILE = "leerie.toml"
 # Effort selection — see IMPLEMENTATION.md §2 "Effort selection". The
@@ -912,7 +919,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "adherence_judge": "medium",
     # Independent adversarial verifiers (DESIGN §8 *Independent adversarial
     # verification*). Each is itself the authoritative gate that replaces a
-    # self-graded confidence axis, so it runs on the judgment tier (opus via
+    # self-graded confidence axis, so it runs on the judgment tier (sonnet via
     # the MODEL_DEFAULT fallback — absent from MODEL_DEFAULT_PER_WORKER) at the
     # same `medium` effort every other judgment worker uses post-Opus-5.
     "classification_judge": "medium",
@@ -920,9 +927,17 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "provision_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
-    # so opus via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
+    # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
     # at the standard `medium` judgment effort.
     "artifact_registry": "medium",
+    # Code-writing acting workers. Pinned to `low` per explicit cost/latency
+    # direction — distinct from the judgment workers' `medium` above, which
+    # is about determinism, not cost. These previously inherited Claude's own
+    # default (unset, i.e. high) via EFFORT_DEFAULT; the downstream
+    # conformer/confidence-gate loops already re-drive quality issues, so the
+    # tradeoff is absorbed the same way the post-Opus-5 medium reduction was.
+    "implementer": "low",
+    "conformer": "low",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -1909,13 +1924,15 @@ SCHEMAS: dict[str, dict] = {
         # the floor only sees literal command tokens, not paraphrased
         # substitution.
         #
-        # EMPIRICALLY CALIBRATED on opus (the production judgment model —
-        # sonnet and an "understanding"-framed judge were both falsified;
-        # see prompts/adherence_judge.md for the full calibration writeup):
-        # incident plan (prescribed-and-violated) scored 2.5/2.5/2.5;
-        # goal-only legit plan scored 9.0/9.0/9.0. Clean separation, no
-        # false positive, on the ADHERENCE frame + opus model combination
-        # only — do not run this worker on sonnet.
+        # EMPIRICALLY CALIBRATED (see prompts/adherence_judge.md for the
+        # full calibration writeup): incident plan (prescribed-and-violated)
+        # scored 2.5/2.5/2.5; goal-only legit plan scored 9.0/9.0/9.0. Clean
+        # separation, no false positive, on the ADHERENCE frame. History: an
+        # earlier Sonnet generation and an "understanding"-framed judge were
+        # both falsified, which required pinning this worker to opus; that
+        # gap has since closed for Sonnet 5 (externally verified against
+        # Opus 4.8), so this worker now runs on the global sonnet default
+        # like every other worker.
         #
         # Deliberately carries NO _confidence_schema sub-object (unlike
         # fit_judge): the §8 evidence-gate discipline (falsifiers,
@@ -4593,7 +4610,7 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
     skip_adherence_check in leerie.toml → False.
 
     When True, the instruction-adherence gate is not run — the
-    deterministic prescribed-command-coverage floor and the opus
+    deterministic prescribed-command-coverage floor and the
     `adherence_judge` worker in the planner check loop are both skipped,
     and a plan that diverges from an explicitly prescribed procedure is
     not caught before `phase_execute` spends. Off by default; use only
@@ -4690,7 +4707,7 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
       5. model_<worker> in leerie.toml
       6. model in leerie.toml
       7. MODEL_DEFAULT_PER_WORKER[<worker>] (e.g., implementer → sonnet)
-      8. MODEL_DEFAULT (opus)
+      8. MODEL_DEFAULT (sonnet)
     `args` is the parsed argparse.Namespace (CLI values are already
     validated by argparse choices=). env and file values are rejected
     via die() when not in MODEL_VALUES."""
@@ -4723,8 +4740,8 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
         per_env = from_env(f"{MODEL_ENV}_{worker.upper()}")
         per_file = from_file(f"model_{worker}")
         # Per-worker default kicks in only when no user override applies.
-        # Implementer falls through to "sonnet"; everything else falls
-        # through to MODEL_DEFAULT ("opus").
+        # Every worker not listed in MODEL_DEFAULT_PER_WORKER falls
+        # through to the global MODEL_DEFAULT ("sonnet").
         per_worker_default = MODEL_DEFAULT_PER_WORKER.get(worker, MODEL_DEFAULT)
         models[worker] = (per_cli or global_cli or per_env or global_env
                           or per_file or global_file or per_worker_default)
@@ -4754,9 +4771,9 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
                            or MODEL_DEFAULT_PER_WORKER.get(
                                "pr_writer", MODEL_DEFAULT))
     # dep_capture is env-var-only (no CLI flag, no leerie.toml key) — it is a
-    # post-run worker with no argparse registration. Its opus default comes from
-    # the global MODEL_DEFAULT fallback (it is intentionally absent from
-    # MODEL_DEFAULT_PER_WORKER).
+    # post-run worker with no argparse registration. Its sonnet default
+    # comes from the global MODEL_DEFAULT fallback (it is intentionally
+    # absent from MODEL_DEFAULT_PER_WORKER).
     dep_capture_env = from_env(MODEL_DEP_CAPTURE_ENV)
     models["dep_capture"] = (dep_capture_env
                              or global_cli or global_env or global_file
@@ -6182,7 +6199,7 @@ _STOPWORDS = frozenset({
     "the", "a", "an", "to", "and", "or", "of", "in", "on", "for", "with",
 })
 
-# Fire threshold for phase_adherence_gate's opus adherence_judge score
+# Fire threshold for phase_adherence_gate's adherence_judge score
 # (0-10 scale). Corpus-validated (21 real runs, see the adherence_judge
 # calibration writeup in prompts/adherence_judge.md): the incident plan
 # scored <= 3.0, every legitimate plan >= 8.5 — a threshold anywhere in
@@ -11661,9 +11678,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 "--model", model,
             ])
             # IMPLEMENTATION.md §2 "Effort selection". When effort is None
-            # (unset for this worker, the default for acting workers) the
+            # (e.g. satisfied_probe, or the post-run judge/heal workers) the
             # CLI invocation is byte-identical to the pre-feature behavior;
-            # only opted-in workers carry the flag.
+            # only workers with a resolved effort carry the flag.
             if effort is not None:
                 cmd.extend(["--effort", effort])
             for d in (add_dirs or ()):
@@ -17646,7 +17663,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     enforces"). Runs after `phase_overlap_judge` and before `schedule()`.
 
     Two-stage composition — the corpus-validated (0/21 false positives)
-    design; do NOT gate on the opus judge's score alone, which alone
+    design; do NOT gate on the judge's score alone, which alone
     false-positived ~12% of ordinary runs in validation:
 
     1. Deterministic floor (`check_prescribed_command_coverage`, PRIMARY,
@@ -17808,7 +17825,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         )
         if floor_issues:
             die(
-                "instruction-adherence gate: the opus adherence_judge "
+                "instruction-adherence gate: the adherence_judge "
                 "crashed on every round, but the deterministic "
                 "prescribed-command-coverage floor still found "
                 f"{len(floor_issues)} unaddressed violation(s):\n" +
@@ -17859,7 +17876,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     `check_plan_wiring` — which owns the structural dangle (does every declared
     `requires`/`depends_on` resolve) — is an independent backstop that runs on
     every path (including a budget-check resume); this LLM gate runs once on the
-    fresh planning path (an opus call, not re-invoked on resume).
+    fresh planning path (not re-invoked on resume).
 
     This gate owns the complement: is the set of declared edges the RIGHT one?
     A plan can be structurally wired (every tag resolves) yet semantically
@@ -22273,7 +22290,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
         if "plans_after_adherence_gate" not in st.data:
             # Phase 2⅞: instruction-adherence gate (the deterministic
-            # prescribed-command-coverage floor + the opus
+            # prescribed-command-coverage floor + the
             # adherence_judge). Short-circuits when the classifier found
             # no prescribed procedure (the ~90% common case) or when
             # --skip-adherence-check is set. Fires only on
@@ -22381,7 +22398,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # `plans` here is the post-drop plan (the filters mutated it in
             # place). Deliberately INSIDE the fresh `plan_snapshot` branch (not
             # the outer scope like the cheap deterministic check_plan_wiring):
-            # this is an opus LLM call, so a budget-check resume (plan_snapshot
+            # this is an LLM call, so a budget-check resume (plan_snapshot
             # already persisted) must NOT re-invoke it — its verdict already
             # cleared the run once and is captured in st.data["wiring_gate"].
             plans = await phase_wiring_gate(
@@ -22660,7 +22677,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--skip-adherence-check", action="store_true",
                     help="skip the instruction-adherence gate: the "
                          "deterministic prescribed-command-coverage floor "
-                         "and the opus adherence_judge worker in the "
+                         "and the adherence_judge worker in the "
                          "planner check loop. A plan that diverges from an "
                          "explicitly prescribed procedure is not caught "
                          "before phase_execute spends. "
@@ -22760,11 +22777,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "inspect_dirs in leerie.toml (comma-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
-                         f"({'|'.join(MODEL_VALUES)}); no global default — "
-                         f"without an override, judgment workers default to "
-                         f"{MODEL_DEFAULT} and the acting workers "
-                         f"(implementer, conformer) default to "
-                         f"{MODEL_DEFAULT_PER_WORKER['implementer']} "
+                         f"({'|'.join(MODEL_VALUES)}); without an override, "
+                         f"every worker defaults to {MODEL_DEFAULT} "
                          "(IMPLEMENTATION.md §2). Per-worker "
                          "--model-<worker> flags override this, as do "
                          "LEERIE_MODEL[_*] env vars and leerie.toml")
@@ -22776,16 +22790,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                              f"--model, LEERIE_MODEL, and leerie.toml")
     # Effort selection — see IMPLEMENTATION.md §2 "Effort selection".
     # Same shape as --model: a global --effort plus per-worker --effort-<W>
-    # overrides. Acting workers (implementer, conformer) have no per-worker
-    # default, so without an override they get no --effort flag at all and
+    # overrides. Workers absent from EFFORT_DEFAULT_PER_WORKER (e.g.
+    # satisfied_probe, judge, heal) get no --effort flag at all and
     # inherit Claude's default — the previous behavior.
-    _judgment_workers = ", ".join(sorted(EFFORT_DEFAULT_PER_WORKER))
+    _pinned_workers = ", ".join(sorted(EFFORT_DEFAULT_PER_WORKER))
     ap.add_argument("--effort", choices=EFFORT_VALUES, metavar="LEVEL",
                     help=f"reasoning-depth dial for all workers "
                          f"({'|'.join(EFFORT_VALUES)}); judgment workers "
-                         f"({_judgment_workers}) default to "
-                         f"{EFFORT_DEFAULT_PER_WORKER['planner']}, acting "
-                         "workers (implementer, conformer) default to unset "
+                         f"default to {EFFORT_DEFAULT_PER_WORKER['planner']}, "
+                         f"implementer/conformer default to "
+                         f"{EFFORT_DEFAULT_PER_WORKER['implementer']} "
+                         f"(pinned workers: {_pinned_workers}) "
                          "(IMPLEMENTATION.md §2). Per-worker --effort-<worker> "
                          "flags override this, as do LEERIE_EFFORT[_*] env vars "
                          "and leerie.toml")

@@ -111,23 +111,34 @@ orchestrator and not used anywhere in this repo.
   LLM-structured output, see below — is prior art for this same
   principle; see DESIGN.md §"Language-to-JSON: natural-language
   interpretation is never regex" for the architectural statement.)
-- **Judgment workers default to `opus`; acting/workhorse workers
-  default to `sonnet`.** Any worker that makes a *decision* (classify,
-  plan, reconcile, judge, verify, gate) runs on opus — measured
-  evidence (DESIGN.md §"Opus-judgment, sonnet-workhorse") shows the
-  same judge prompt produces opposite verdicts on the two tiers for the
-  same input, so sonnet is not a reliable judgment tier. Workers that
-  *do* the work (implementer, conformer, pr_writer) run on sonnet for
-  throughput/cost. A new judgment worker MUST be absent from
-  `MODEL_DEFAULT_PER_WORKER` (so it falls through to `MODEL_DEFAULT =
-  "opus"`) and carry `EFFORT_DEFAULT_PER_WORKER = "medium"`. Exceptions
-  must be justified in a comment as a deliberate cost trade-off, not an
-  unstated default: `satisfied_probe` stays on sonnet because it runs
-  once per subtask and throughput dominates, with correctness resting
-  on its base-tree-only tool scope rather than model tier (see the
-  comment at its `MODEL_DEFAULT_PER_WORKER` entry); the post-run `judge`
-  worker was found on sonnet by omission and moved to opus for exactly
-  this reason.
+- **Every worker — judgment and acting/workhorse alike — defaults to
+  `sonnet`.** This was previously split: judgment workers (classify,
+  plan, reconcile, judge, verify, gate) defaulted to opus, because
+  measured evidence (DESIGN.md §"Opus-judgment, sonnet-workhorse
+  (historical)") showed the same judge prompt producing opposite
+  verdicts on the two tiers for the same input at the time. That gap
+  has since closed for Sonnet 5 — externally verified to match Opus
+  4.8 (the prior working judgment baseline) on the same class of
+  decisions — so the split no longer applies: `MODEL_DEFAULT = "sonnet"`
+  and no worker needs a judgment-tier exception to reach it. A new
+  worker MUST be absent from `MODEL_DEFAULT_PER_WORKER` (so it falls
+  through to `MODEL_DEFAULT`) unless it has its own documented reason to
+  diverge. Judgment workers still carry `EFFORT_DEFAULT_PER_WORKER =
+  "medium"` — that dial is about reproducibility/determinism, not model
+  tier, and is unaffected by this change.
+  **Separately, `implementer` and `conformer` — the two workers that
+  actually write code — are pinned to `EFFORT_DEFAULT_PER_WORKER =
+  "low"`,** a deliberate cost/latency trade-off distinct from the
+  judgment workers' `medium`: these previously inherited Claude's own
+  default reasoning depth (unset, i.e. high) so their effort stayed
+  bounded by their own evidence gates (DESIGN §8); that tradeoff is now
+  overridden in favor of a fixed low-effort ceiling, with the downstream
+  conformer/confidence-gate loops absorbing the quality difference.
+  `satisfied_probe` remains an explicit `MODEL_DEFAULT_PER_WORKER` entry
+  (still sonnet, matching the global default, but kept for its own
+  documented reason: it runs once per subtask and throughput dominates,
+  with correctness resting on its base-tree-only tool scope rather than
+  model tier — see the comment at its `MODEL_DEFAULT_PER_WORKER` entry).
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
@@ -304,12 +315,11 @@ export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
   --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
   --ec2-subnet-id subnet-0123456789abcdef0
 
-# Choose the model. Without overrides: judgment workers (classifier,
-# planner, reconciler, plan_overlap_judge, provision, integrator)
-# default to opus; acting workers (implementer, conformer) default to
-# sonnet. Per-worker overrides exist via --model-<worker> /
-# LEERIE_MODEL_<WORKER>. See docs/IMPLEMENTATION.md §2 "Model selection"
-# for the full table.
+# Choose the model. Without overrides, every worker — judgment (classifier,
+# planner, reconciler, plan_overlap_judge, provision, integrator) and acting
+# (implementer, conformer) alike — defaults to sonnet. Per-worker overrides
+# exist via --model-<worker> / LEERIE_MODEL_<WORKER>. See
+# docs/IMPLEMENTATION.md §2 "Model selection" for the full table.
 export LEERIE_MODEL=sonnet               # or: opus, haiku
 ./leerie "task" --model opus
 ./leerie "task" --model-implementer opus --model-classifier haiku
@@ -380,7 +390,7 @@ export LEERIE_WORKER_PIDS_MAX=4096
 ./leerie "task" --skip-repo-map
 
 # Skip the instruction-adherence gate: the deterministic prescribed-
-# command-coverage floor and the opus adherence_judge worker in the
+# command-coverage floor and the adherence_judge worker in the
 # planner check loop. A plan that diverges from an explicitly
 # prescribed procedure is not caught before phase_execute spends. Also
 # LEERIE_SKIP_ADHERENCE_CHECK=1 or `skip_adherence_check = true` in
@@ -440,9 +450,9 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # Also LEERIE_MODEL_PR_WRITER or `model_pr_writer` in leerie.toml.
 ./leerie "task" --pr-writer-model opus
 
-# Override the model for the dep_capture worker (default opus). Env-var only
+# Override the model for the dep_capture worker (default sonnet). Env-var only
 # (no CLI flag or leerie.toml key — dep_capture is a post-run worker):
-export LEERIE_MODEL_DEP_CAPTURE=sonnet
+export LEERIE_MODEL_DEP_CAPTURE=opus
 
 # Filter `--list` output by run status:
 ./leerie --list --status paused
@@ -786,7 +796,7 @@ global TOML > `MODEL_DEFAULT`. The file asserts a stray `args.dep_capture_model`
 and a `model_dep_capture` TOML key are **not** honored. Effort: global CLI >
 global env > global TOML > `EFFORT_DEFAULT_PER_WORKER["dep_capture"]`. It also
 pins the `MODEL_DEP_CAPTURE_ENV` constant, `dep_capture` absent from
-`MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT` fallback), and
+`MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT` fallback), and
 present in `EFFORT_DEFAULT_PER_WORKER` with value `"medium"`.
 The three orchestrator wiring seams that are only verifiable by source
 inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
@@ -822,7 +832,7 @@ top-level `files` field (splitter never decides partition), and the child
 `tests/test_resolve_fit_judge_model.py` and
 `tests/test_resolve_fit_judge_splitter_model.py` cover model and effort
 resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent
-from `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both
+from `MODEL_DEFAULT_PER_WORKER` (sonnet via global `MODEL_DEFAULT` fallback); both
 in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override
 chains; isolation (override doesn't bleed to other workers); structural wiring
 guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
@@ -992,13 +1002,18 @@ check that replaces a self-report, so a self-confidence axis would
 reintroduce the self-grading bias the gate exists to remove), valid/invalid
 instance acceptance, JSON serializability, and wiring (`adherence_judge` in
 `WORKER_TYPES`, absent from `MODEL_DEFAULT_PER_WORKER` so it resolves to
-opus, `EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, prompt file exists).
+sonnet, `EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, prompt file exists).
 `tests/test_resolve_adherence_judge_model.py` covers the model/effort
 resolution precedence chain (mirrors `test_resolve_fit_judge_model.py`),
-explicitly asserting the opus default — empirically required here, not
-merely conventional: calibration testing found sonnet false-positived a
-legitimate plan and an opus *understanding*-framed judge rubber-stamped the
-incident, so only the ADHERENCE frame on opus is validated.
+explicitly asserting the sonnet default. **History:** an earlier Sonnet
+generation was empirically falsified here (false-positived a legitimate
+plan), which required pinning this worker to opus specifically, and an
+opus *understanding*-framed judge separately rubber-stamped the incident
+(only the ADHERENCE frame was validated, independent of tier). Both gaps
+are understood to have closed for Sonnet 5 (DESIGN §5
+*Opus-judgment, sonnet-workhorse (historical)*); if this gate is ever
+observed to regress, re-run the calibration before reintroducing a
+per-worker opus override.
 The deterministic PRIMARY layer of the same gate,
 `check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
 list[str]` (pure JSON→verdict set logic, no NL parsing), is tested in
@@ -1366,7 +1381,7 @@ pins the corrected `phase_wiring_gate` die() message: it no longer recommends
 phase 2¾ overlap judge and does not touch this gate — the old wording sent an
 operator on a `--skip-overlap-judge` retry straight back into the same die()).
 The `artifact_registry` worker (DESIGN §5 *Artifact-registry worker*) — a
-new opus pre-planning worker that reads the task plus the global repo-map
+pre-planning worker that reads the task plus the global repo-map
 (ranked to fit the token budget only, no task-file seeding) and emits a small
 canonical `{description, tag, path}` vocabulary injected into every planner's
 context, softening (not replacing) the reconciler's tag-drift resolution — is
@@ -1374,7 +1389,7 @@ tested in `tests/test_artifact_registry.py` (17 tests): schema validity
 (`SCHEMAS["artifact_registry"]`, required `artifacts` array of
 `{description, tag, path}`), worker registration parity
 (`artifact_registry` in `WORKER_TYPES`, absent from
-`MODEL_DEFAULT_PER_WORKER` so it resolves to opus,
+`MODEL_DEFAULT_PER_WORKER` so it resolves to sonnet,
 `EFFORT_DEFAULT_PER_WORKER["artifact_registry"] == "medium"`), model/effort
 resolution precedence, phase behavior (`test_phase_returns_artifacts`,
 `test_phase_drops_malformed_items` — items missing `tag`/`path` are dropped

@@ -127,7 +127,7 @@ class TestVerifiersCarryNoSelfConfidence:
             assert "confidence" not in schema.get("properties", {}), w
             assert "confidence" not in schema["required"], w
 
-    def test_verifiers_default_to_opus(self, leerie):
+    def test_verifiers_default_via_model_default_fallback(self, leerie):
         for w in ("classification_judge", "wiring_judge", "provision_judge"):
             assert w not in leerie.MODEL_DEFAULT_PER_WORKER, w
 

@@ -9,7 +9,7 @@ the standard per-worker model/effort resolution chain:
   5. model_adherence_judge in leerie.toml
   6. model in leerie.toml
   7. MODEL_DEFAULT_PER_WORKER["adherence_judge"] — absent → falls to MODEL_DEFAULT
-  8. MODEL_DEFAULT ("opus")
+  8. MODEL_DEFAULT ("sonnet")
 
 Effort:
   1. --effort-adherence_judge CLI flag
@@ -20,10 +20,12 @@ Effort:
   6. effort in leerie.toml
   7. EFFORT_DEFAULT_PER_WORKER["adherence_judge"] → "medium"
 
-The opus default is not merely a convention here — it is empirically
-required (DESIGN §5/§8 investigation): sonnet false-positived a legitimate
-plan and an opus understanding-framed judge rubber-stamped the incident;
-only the ADHERENCE frame on opus was validated clean.
+History (DESIGN §5/§8 investigation): an earlier Sonnet generation
+false-positived a legitimate plan and an opus understanding-framed judge
+rubber-stamped the incident; only the ADHERENCE frame was validated
+clean. That gap has since closed for Sonnet 5 (externally verified
+against Opus 4.8), so this worker now follows the global sonnet default
+like every other worker.
 
 Mirrors test_resolve_fit_judge_model.py fixture patterns.
 """
@@ -69,13 +71,13 @@ def repo_root(tmp_path, monkeypatch):
 # adherence_judge — model defaults
 # ---------------------------------------------------------------------------
 
-def test_adherence_judge_model_default_is_opus(leerie, repo_root):
+def test_adherence_judge_model_default_is_sonnet(leerie, repo_root):
     """adherence_judge is absent from MODEL_DEFAULT_PER_WORKER → falls to
-    MODEL_DEFAULT ('opus'), the judgment-worker global."""
+    MODEL_DEFAULT ('sonnet')."""
     models = leerie.resolve_models(repo_root, ns())
-    assert models["adherence_judge"] == "opus"
+    assert models["adherence_judge"] == "sonnet"
     assert "adherence_judge" not in leerie.MODEL_DEFAULT_PER_WORKER
-    assert leerie.MODEL_DEFAULT == "opus"
+    assert leerie.MODEL_DEFAULT == "sonnet"
 
 
 def test_adherence_judge_model_per_worker_cli(leerie, repo_root):
@@ -162,7 +164,7 @@ def test_adherence_judge_model_override_isolated(leerie, repo_root):
     """A per-worker override for adherence_judge doesn't change other workers."""
     models = leerie.resolve_models(repo_root, ns(model_adherence_judge="haiku"))
     assert models["adherence_judge"] == "haiku"
-    assert models["planner"] == "opus"
+    assert models["planner"] == "sonnet"
     assert models["implementer"] == "sonnet"
 
 
@@ -172,7 +174,7 @@ def test_adherence_judge_effort_override_isolated(leerie, repo_root):
     efforts = leerie.resolve_efforts(repo_root, ns(effort_adherence_judge="max"))
     assert efforts["adherence_judge"] == "max"
     assert efforts["planner"] == "medium"
-    assert efforts["implementer"] is None
+    assert efforts["implementer"] == "low"
 
 
 # ---------------------------------------------------------------------------

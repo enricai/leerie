@@ -268,7 +268,7 @@ def test_satisfied_sweep_resume_probes_only_uncached_and_reaches_schedule(
 
     # Only the two uncached subtasks trigger a fresh satisfied-probe call —
     # the cached feat-001 is never re-probed. (This resume reaches scheduling
-    # for the first time, so the post-schedule opus `wiring_judge` gate also
+    # for the first time, so the post-schedule `wiring_judge` gate also
     # legitimately fires once — DESIGN §5 *A wiring re-check on the fully-merged
     # plan*; it is a downstream gate, not a re-run of the satisfied sweep, so
     # we assert on the probe calls specifically.)

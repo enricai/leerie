@@ -3942,7 +3942,7 @@ deterministic corpus selection in code; the model still decides content (§12
 *Prompts are advisory, code enforces*). Structured output (`setup_packages` and
 `language_installs`) is validated against a JSON schema and written to
 `.leerie/config.toml` deterministically. The `dep_capture` worker defaults to
-`opus`/`high` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
+`sonnet`/`medium` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
 **System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
 `setup_packages` output is union-merged into `setup_packages` in
@@ -5239,36 +5239,41 @@ prevent. Migrating those sites to LLM-extracted structured fields is
 tracked as follow-up work outside this change's scope; the principle
 governing new work is stated here so no new site repeats the pattern.
 
-### Opus-judgment, sonnet-workhorse
+### Opus-judgment, sonnet-workhorse (historical) — now sonnet for both
 
-A third sibling principle, with direct empirical support from the same
-incident investigation: **a worker that makes a *decision* — classify,
-plan, reconcile, judge, verify, gate — defaults to the stronger judgment
-model tier; a worker that *does* the work — implement, conform, write a
-PR — defaults to the faster workhorse tier.** This was already the
+A third sibling principle **used to** apply, with direct empirical support
+from an incident investigation: **a worker that makes a *decision* —
+classify, plan, reconcile, judge, verify, gate — defaults to the stronger
+judgment model tier; a worker that *does* the work — implement, conform,
+write a PR — defaults to the faster workhorse tier.** This was the
 implemented default split (classifier, planner, reconciler,
 `plan_overlap_judge`, provision, integrator, `fit_judge`, splitter all
-default to the judgment tier; implementer, conformer, and the PR writer
-default to the workhorse tier) but was never stated as an architectural
-rule, which let at least one judgment-shaped worker drift onto the
-workhorse tier by omission.
+defaulted to the judgment tier; implementer, conformer, and the PR writer
+defaulted to the workhorse tier).
 
-The evidence is direct, not assumed: the same adherence-judge prompt,
-run against the same incident plan, produced **opposite verdicts** on the
-two model tiers. On the workhorse tier the judge caught the incident but
-also condemned a legitimate plan it was shown as a false-positive control
-— a coin flip dressed as judgment. On the judgment tier, the same prompt
-correctly separated the two: low score on the incident, high score on the
-legitimate control. A judge whose verdict flips with model tier is not a
-reliable gate regardless of which tier happens to catch a given case; §12's
-whole discipline is about guarantees that don't depend on which way a model
-happened to lean, and a judgment call gated on the weaker tier is exactly
-that kind of unreliable guarantee wearing a code-enforced costume.
+The original evidence was direct, not assumed: the same adherence-judge
+prompt, run against the same incident plan, produced **opposite verdicts**
+on the two model tiers available at the time. On the workhorse tier the
+judge caught the incident but also condemned a legitimate plan it was
+shown as a false-positive control — a coin flip dressed as judgment. On
+the judgment tier, the same prompt correctly separated the two: low score
+on the incident, high score on the legitimate control. That gap was real
+for the model generation it was measured on.
 
-The rule this establishes: any new worker whose job is a decision, not an
-action, is judgment-tier by default; dropping it onto the workhorse tier is
-a deliberate, documented cost trade-off for a specific worker — not an
-unstated default a new worker can silently inherit.
+**This finding is superseded for Sonnet 5.** Sonnet 5's judgment quality on
+these same decision-shaped tasks has been externally verified to match
+Opus 4.8 — the tier that was the working judgment baseline — closing the
+gap that motivated the split. The standing rule is now: **every worker,
+judgment or workhorse, defaults to Sonnet 5.** (`implementer` and
+`conformer` additionally default to `low` reasoning effort — see
+IMPLEMENTATION.md §2 "Effort selection" — but that is a separate,
+cost-motivated effort-tier decision, not a model-tier one.)
+
+This section is retained as the historical record of *why* the
+judgment/workhorse model split existed, and as a reference point should a
+future model swap reopen the same question: if a verdict-flip-with-tier
+regression is ever observed again, re-run this same adherence-judge
+incident/control pair before reintroducing a tier split.
 
 ---
 

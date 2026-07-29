@@ -241,7 +241,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --json-schema "$integrator_schema" \
       --allowedTools "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit" \
       --max-turns 60 \
-      --model opus \
+      --model sonnet \
       --effort high \
       --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
 

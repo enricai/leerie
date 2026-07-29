@@ -1,7 +1,7 @@
 """End-to-end regression fixture for the two-stage instruction-adherence
 gate (feat-006/007/008): locks the validated composition — the
 deterministic prescribed-command-coverage floor (PRIMARY,
-model-independent) plus the opus `adherence_judge` (SECONDARY, semantic
+model-independent) plus the `adherence_judge` (SECONDARY, semantic
 layer) — against the two shapes the design's corpus validation (21 real
 runs, see the plan writeup) turned on:
 
@@ -157,7 +157,7 @@ class TestDeterministicFloorAlone:
 
 class TestAdherenceGateEndToEnd:
     """Drives the full phase_adherence_gate composition — deterministic
-    floor (real) + opus adherence_judge (stubbed claude_p, mirroring
+    floor (real) + adherence_judge (stubbed claude_p, mirroring
     test_dep_capture_worker.py's envelope-stub pattern) — for both
     shapes named in the seed. This is the regression fixture: if either
     behavior drifts (incident stops firing, or the ordinary case starts

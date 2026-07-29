@@ -57,8 +57,7 @@ leerie "Add a --dry-run flag to the CLI that prints the plan without executing i
 # Equivalent one-off invocation without the env var:
 leerie --source-of-truth codebase "Add a --dry-run flag …"
 
-# Same idea for the model — judgment workers default to `opus` and the
-# acting workers (implementer, conformer) default to `sonnet`; `--model
+# Same idea for the model — every worker defaults to `sonnet`; `--model
 # <alias>` sets every worker. Per-worker overrides exist
 # (e.g. --model-implementer opus).
 leerie --model opus "Add a --dry-run flag …"
@@ -327,9 +326,9 @@ local setup) because nerdctl can't reach Keychain. See
 - `leerie.toml` at the repo root with `source_of_truth = codebase` —
   committed per-repo default; outranked by env and CLI.
 - `--model sonnet|opus|haiku` — model for every worker this run.
-  Without any override the per-worker defaults apply: judgment workers
-  (classifier, planner, reconciler, plan_overlap_judge, provision, integrator)
-  run on `opus`; the acting workers (implementer, conformer) run on `sonnet`.
+  Without any override the per-worker defaults apply: every worker —
+  judgment (classifier, planner, reconciler, plan_overlap_judge, provision,
+  integrator) and acting (implementer, conformer) alike — runs on `sonnet`.
   Per-worker `--model-classifier`, `--model-planner`, `--model-reconciler`,
   `--model-plan_overlap_judge`, `--model-provision`, `--model-implementer`,
   `--model-integrator`,

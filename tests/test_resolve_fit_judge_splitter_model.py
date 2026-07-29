@@ -9,7 +9,7 @@ They follow the standard per-worker model/effort resolution chain:
   5. model_fit_judge / model_splitter in leerie.toml (per-worker TOML)
   6. model in leerie.toml                           (global TOML)
   7. MODEL_DEFAULT_PER_WORKER[...] — absent for both → falls to MODEL_DEFAULT
-  8. MODEL_DEFAULT ("opus")
+  8. MODEL_DEFAULT ("sonnet")
 
 Effort for both (judgment workers):
   1. --effort-fit_judge / --effort-splitter CLI flag
@@ -101,11 +101,11 @@ def test_splitter_in_effort_default_per_worker(leerie):
 # fit_judge — model resolution precedence
 # ---------------------------------------------------------------------------
 
-def test_fit_judge_model_default_is_opus(leerie, repo_root):
-    """fit_judge absent from MODEL_DEFAULT_PER_WORKER → falls to MODEL_DEFAULT ('opus')."""
+def test_fit_judge_model_default_is_sonnet(leerie, repo_root):
+    """fit_judge absent from MODEL_DEFAULT_PER_WORKER → falls to MODEL_DEFAULT ('sonnet')."""
     models = leerie.resolve_models(repo_root, ns())
-    assert models["fit_judge"] == "opus"
-    assert leerie.MODEL_DEFAULT == "opus"
+    assert models["fit_judge"] == "sonnet"
+    assert leerie.MODEL_DEFAULT == "sonnet"
 
 
 def test_fit_judge_model_global_toml(leerie, repo_root):
@@ -144,8 +144,8 @@ def test_fit_judge_model_per_cli_beats_global_cli(leerie, repo_root):
 # splitter — model resolution precedence
 # ---------------------------------------------------------------------------
 
-def test_splitter_model_default_is_opus(leerie, repo_root):
-    assert leerie.resolve_models(repo_root, ns())["splitter"] == "opus"
+def test_splitter_model_default_is_sonnet(leerie, repo_root):
+    assert leerie.resolve_models(repo_root, ns())["splitter"] == "sonnet"
 
 
 def test_splitter_model_global_toml(leerie, repo_root):
@@ -243,14 +243,14 @@ def test_fit_judge_model_override_isolated(leerie, repo_root):
     """A per-worker model override for fit_judge doesn't affect planner or implementer."""
     models = leerie.resolve_models(repo_root, ns(model_fit_judge="haiku"))
     assert models["fit_judge"] == "haiku"
-    assert models["planner"] == "opus"
+    assert models["planner"] == "sonnet"
     assert models["implementer"] == "sonnet"
 
 
 def test_splitter_model_override_isolated(leerie, repo_root):
     models = leerie.resolve_models(repo_root, ns(model_splitter="haiku"))
     assert models["splitter"] == "haiku"
-    assert models["planner"] == "opus"
+    assert models["planner"] == "sonnet"
 
 
 def test_fit_judge_effort_override_isolated(leerie, repo_root):
@@ -258,7 +258,7 @@ def test_fit_judge_effort_override_isolated(leerie, repo_root):
     efforts = leerie.resolve_efforts(repo_root, ns(effort_fit_judge="max"))
     assert efforts["fit_judge"] == "max"
     assert efforts["planner"] == "medium"
-    assert efforts["implementer"] is None
+    assert efforts["implementer"] == "low"
 
 
 def test_splitter_effort_override_isolated(leerie, repo_root):

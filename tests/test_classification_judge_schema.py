@@ -130,8 +130,7 @@ def test_in_worker_types(leerie):
 
 
 def test_not_in_model_default_per_worker(leerie):
-    """Defaults to opus via MODEL_DEFAULT — an independent adversarial
-    verifier must run on the judgment tier."""
+    """Defaults to sonnet via the global MODEL_DEFAULT fallback."""
     assert "classification_judge" not in leerie.MODEL_DEFAULT_PER_WORKER
 
 

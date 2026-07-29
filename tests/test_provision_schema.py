@@ -87,11 +87,11 @@ def test_provision_in_worker_types(leerie):
     assert "provision" in leerie.WORKER_TYPES
 
 
-def test_provision_default_model_is_opus(leerie):
+def test_provision_default_model_is_sonnet(leerie):
     """provision is a judgment worker — it reads README + configs and
-    decides install commands. Default is Opus per the IMPLEMENTATION §2
+    decides install commands. Default is sonnet per the IMPLEMENTATION §2
     model-selection table. (Implemented by being absent from
     MODEL_DEFAULT_PER_WORKER, which means it falls through to
     MODEL_DEFAULT.)"""
-    assert leerie.MODEL_DEFAULT == "opus"
+    assert leerie.MODEL_DEFAULT == "sonnet"
     assert "provision" not in leerie.MODEL_DEFAULT_PER_WORKER

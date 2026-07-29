@@ -2,7 +2,7 @@
 (DESIGN §8): classification_judge, wiring_judge, provision_judge.
 
 Each is a main-loop judgment worker in WORKER_TYPES following the standard
-per-worker resolution chain. Model defaults to opus (absent from
+per-worker resolution chain. Model defaults to sonnet (absent from
 MODEL_DEFAULT_PER_WORKER → MODEL_DEFAULT); effort defaults to "medium".
 
 Mirrors test_resolve_fit_judge_model.py's fixture patterns.
@@ -65,9 +65,9 @@ def test_effort_default_entry_is_medium(leerie, w):
 # --- model resolution ------------------------------------------------------
 
 @pytest.mark.parametrize("w", _NEW)
-def test_model_default_is_opus(leerie, repo_root, w):
+def test_model_default_is_sonnet(leerie, repo_root, w):
     models = leerie.resolve_models(repo_root, ns())
-    assert models[w] == "opus"
+    assert models[w] == "sonnet"
 
 
 @pytest.mark.parametrize("w", _NEW)
@@ -75,7 +75,7 @@ def test_per_worker_cli_flag_wins(leerie, repo_root, w):
     models = leerie.resolve_models(repo_root, ns(**{f"model_{w}": "haiku"}))
     assert models[w] == "haiku"
     # Isolation: the override must not bleed to another worker.
-    assert models["planner"] == "opus"
+    assert models["planner"] == "sonnet"
 
 
 @pytest.mark.parametrize("w", _NEW)

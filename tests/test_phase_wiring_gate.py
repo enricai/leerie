@@ -111,7 +111,7 @@ class TestWiring:
         assert src.count("await phase_wiring_gate(") == 1
 
     def test_wiring_gate_is_not_re_invoked_on_budget_check_resume(self, leerie):
-        """The LLM gate is an opus call, so it lives INSIDE the fresh
+        """The LLM gate is expensive, so it lives INSIDE the fresh
         `if "plan_snapshot" not in st.data:` branch — a budget-check resume
         (plan_snapshot already persisted) rehydrates in the `else:` and must not
         re-invoke it. Pin by source order: the gate call sits between the

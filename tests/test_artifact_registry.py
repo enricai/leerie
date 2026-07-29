@@ -130,9 +130,9 @@ def _ns(leerie, **over):
     return argparse.Namespace(**base)
 
 
-def test_model_default_is_opus(leerie, repo_root):
+def test_model_default_is_sonnet(leerie, repo_root):
     models = leerie.resolve_models(repo_root, _ns(leerie))
-    assert models["artifact_registry"] == leerie.MODEL_DEFAULT == "opus"
+    assert models["artifact_registry"] == leerie.MODEL_DEFAULT == "sonnet"
 
 
 def test_model_per_worker_cli(leerie, repo_root):
@@ -151,7 +151,7 @@ def test_effort_default_medium_resolved(leerie, repo_root):
 # --------------------------------------------------------------------------
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999, "judgment_check_rounds": 3}
-_MODELS = {"artifact_registry": "opus"}
+_MODELS = {"artifact_registry": "sonnet"}
 _EFFORTS = {"artifact_registry": "medium"}
 
 

@@ -7,7 +7,7 @@ leerie.toml key (both were removed as dead slots). Model precedence (highest fir
   2. --model CLI flag (global)
   3. LEERIE_MODEL env var (global)
   4. model in leerie.toml (global)
-  5. MODEL_DEFAULT ("opus") — dep_capture is absent from MODEL_DEFAULT_PER_WORKER
+  5. MODEL_DEFAULT ("sonnet") — dep_capture is absent from MODEL_DEFAULT_PER_WORKER
 
 Effort precedence (highest first):
   1. --effort CLI flag (global — no per-worker effort flag for dep_capture)
@@ -62,13 +62,13 @@ def repo_root(tmp_path, monkeypatch):
 # Model — default
 # ---------------------------------------------------------------------------
 
-def test_dep_capture_model_default_is_opus(leerie, repo_root):
+def test_dep_capture_model_default_is_sonnet(leerie, repo_root):
     """dep_capture is absent from MODEL_DEFAULT_PER_WORKER, so resolve_models
-    falls through to MODEL_DEFAULT ('opus') — the judgment-worker global."""
+    falls through to MODEL_DEFAULT ('sonnet')."""
     models = leerie.resolve_models(repo_root, ns())
-    assert models["dep_capture"] == "opus"
+    assert models["dep_capture"] == "sonnet"
     assert "dep_capture" not in leerie.MODEL_DEFAULT_PER_WORKER
-    assert leerie.MODEL_DEFAULT == "opus"
+    assert leerie.MODEL_DEFAULT == "sonnet"
 
 
 # ---------------------------------------------------------------------------
@@ -125,16 +125,16 @@ def test_dep_capture_model_no_cli_flag(leerie, repo_root):
     """There is no --model-dep-capture flag: a stray args.dep_capture_model
     attribute must NOT influence resolution (the dead CLI slot was removed)."""
     models = leerie.resolve_models(
-        repo_root, ns(dep_capture_model="sonnet"))
-    assert models["dep_capture"] == "opus"  # falls through to MODEL_DEFAULT
+        repo_root, ns(dep_capture_model="opus"))
+    assert models["dep_capture"] == "sonnet"  # falls through to MODEL_DEFAULT
 
 
 def test_dep_capture_model_no_toml_key(leerie, repo_root):
     """A model_dep_capture key in leerie.toml is NOT honored (dead TOML slot
     removed) — only the global `model` key applies to dep_capture."""
-    (repo_root / "leerie.toml").write_text("model_dep_capture = sonnet\n")
+    (repo_root / "leerie.toml").write_text("model_dep_capture = opus\n")
     models = leerie.resolve_models(repo_root, ns())
-    assert models["dep_capture"] == "opus"  # model_dep_capture ignored
+    assert models["dep_capture"] == "sonnet"  # model_dep_capture ignored
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +147,8 @@ def test_dep_capture_model_full_precedence(leerie, repo_root, monkeypatch):
     The per-worker env slot (rung 1) ranks above global CLI (rung 2)."""
     cfg = repo_root / "leerie.toml"
 
-    # rung 5: MODEL_DEFAULT ("opus") — no overrides
-    assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "opus"
+    # rung 5: MODEL_DEFAULT ("sonnet") — no overrides
+    assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "sonnet"
 
     # rung 4: global TOML beats default
     cfg.write_text("model = haiku\n")
@@ -178,7 +178,7 @@ def test_dep_capture_model_override_isolated(leerie, repo_root, monkeypatch):
     models = leerie.resolve_models(repo_root, ns())
     assert models["dep_capture"] == "haiku"
     # Other workers stay at their defaults.
-    assert models["planner"] == "opus"
+    assert models["planner"] == "sonnet"
     assert models["implementer"] == "sonnet"
 
 

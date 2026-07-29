@@ -224,10 +224,12 @@ def test_adherence_judge_in_worker_types(leerie):
 
 
 def test_adherence_judge_not_in_model_default_per_worker(leerie):
-    """adherence_judge defaults to opus (MODEL_DEFAULT); must NOT appear in
+    """adherence_judge defaults to sonnet (MODEL_DEFAULT); must NOT appear in
     MODEL_DEFAULT_PER_WORKER (that dict only holds non-default overrides).
-    This is empirically required, not merely preferred: sonnet
-    false-positived a legitimate plan in calibration testing."""
+    History: an earlier Sonnet generation false-positived a legitimate plan
+    in calibration testing, which required pinning this worker to opus;
+    that gap has since closed for Sonnet 5 (DESIGN §5 *Opus-judgment,
+    sonnet-workhorse (historical)*)."""
     assert "adherence_judge" not in leerie.MODEL_DEFAULT_PER_WORKER
 
 

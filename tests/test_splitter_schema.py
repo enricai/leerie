@@ -178,7 +178,7 @@ def test_splitter_in_worker_types(leerie):
 
 
 def test_splitter_not_in_model_default_per_worker(leerie):
-    """splitter defaults to opus (MODEL_DEFAULT); must NOT appear in
+    """splitter defaults to sonnet (MODEL_DEFAULT); must NOT appear in
     MODEL_DEFAULT_PER_WORKER."""
     assert "splitter" not in leerie.MODEL_DEFAULT_PER_WORKER
 

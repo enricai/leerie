@@ -1,6 +1,6 @@
 """Tests for phase_adherence_gate (feat-008): the whole-plan instruction-
 adherence gate that runs the deterministic prescribed-command-coverage
-floor plus the opus adherence_judge, fires only on the two-stage
+floor plus the adherence_judge, fires only on the two-stage
 `is_prescribed=true AND (floor violation OR low adherence)` composition,
 and re-drives planning via the existing `_run_checked_loop` feedback path.
 
@@ -84,7 +84,7 @@ EFFORTS = {"adherence_judge": "high"}
 
 class TestWiringFloorAndJudgeBothRun:
     """The gate must run BOTH the deterministic floor
-    (check_prescribed_command_coverage) and the opus adherence_judge
+    (check_prescribed_command_coverage) and the adherence_judge
     worker — the two-stage composition is the corpus-validated (0/21 FP)
     design; gating on the judge alone reintroduces the ~12% false-positive
     rate measured in isolation."""
@@ -101,7 +101,7 @@ class TestWiringFloorAndJudgeBothRun:
         src = inspect.getsource(leerie.phase_adherence_gate)
         assert 'schema_key="adherence_judge"' in src, (
             "phase_adherence_gate must invoke claude_p with "
-            "schema_key='adherence_judge' — the opus semantic-layer judge"
+            "schema_key='adherence_judge' — the semantic-layer judge"
         )
 
     def test_short_circuits_on_skip_flag(self, leerie):

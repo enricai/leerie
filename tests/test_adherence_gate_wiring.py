@@ -6,7 +6,7 @@ pipeline is not something this suite does (mirrors
 test_dep_capture_wiring.py's inspect.getsource approach):
 
   1. phase_adherence_gate invokes BOTH the deterministic
-     check_prescribed_command_coverage floor AND the opus adherence_judge
+     check_prescribed_command_coverage floor AND the adherence_judge
      worker (the two-stage, corpus-validated design — DESIGN: the floor
      alone is PRIMARY, the judge is SECONDARY).
   2. A violation (floor issue or low adherence score) routes through the
@@ -34,7 +34,7 @@ import pytest
 
 class TestGateInvokesFloorAndJudge:
     """phase_adherence_gate must run both the PRIMARY deterministic floor
-    (check_prescribed_command_coverage) and the SECONDARY opus adherence_judge
+    (check_prescribed_command_coverage) and the SECONDARY adherence_judge
     worker — the two-stage composition validated (0/21 false positives) in
     the design's corpus check. Gating on the judge alone was measured to
     false-positive ~12% of ordinary runs."""
@@ -49,7 +49,7 @@ class TestGateInvokesFloorAndJudge:
     def test_gate_invokes_adherence_judge_worker(self, leerie):
         src = inspect.getsource(leerie.phase_adherence_gate)
         assert 'schema_key="adherence_judge"' in src, (
-            "phase_adherence_gate must invoke the opus adherence_judge "
+            "phase_adherence_gate must invoke the adherence_judge "
             "worker via claude_p(schema_key=\"adherence_judge\", ...) "
             "(SECONDARY semantic layer)"
         )

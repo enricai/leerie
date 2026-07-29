@@ -8,13 +8,14 @@ Per-worker precedence (highest first):
   5. model_<worker> in leerie.toml
   6. model in leerie.toml
   7. MODEL_DEFAULT_PER_WORKER[<worker>] (e.g. implementer → sonnet)
-  8. MODEL_DEFAULT (opus)
+  8. MODEL_DEFAULT (sonnet)
 
-The judgment-vs-implementation default split was introduced when the
-reconciler worker landed: classifier / planner / reconciler /
-plan_overlap_judge / provision / integrator all default to opus,
-implementer / conformer default to sonnet (cost mitigation for workers
-that run most often).
+Every worker — judgment (classifier, planner, reconciler,
+plan_overlap_judge, provision, integrator, and the rest) and
+implementation (implementer, conformer) alike — now defaults to sonnet.
+This was previously split (judgment workers defaulted to opus), but that
+split no longer applies — see DESIGN.md §"Opus-judgment, sonnet-workhorse
+(historical)".
 """
 from __future__ import annotations
 
@@ -29,24 +30,25 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "classification_judge", "wiring_judge", "provision_judge",
            "artifact_registry")
 
-# The expected default per worker, with no overrides.
+# The expected default per worker, with no overrides. Every worker now
+# defaults to sonnet — see the module docstring.
 DEFAULTS = {
-    "classifier": "opus",
-    "planner":    "opus",
-    "reconciler": "opus",
-    "plan_overlap_judge": "opus",
+    "classifier": "sonnet",
+    "planner":    "sonnet",
+    "reconciler": "sonnet",
+    "plan_overlap_judge": "sonnet",
     "satisfied_probe": "sonnet",
-    "provision":  "opus",
-    "integrator": "opus",
+    "provision":  "sonnet",
+    "integrator": "sonnet",
     "implementer": "sonnet",
     "conformer":  "sonnet",
-    "fit_judge":  "opus",
-    "splitter":   "opus",
-    "adherence_judge": "opus",
-    "classification_judge": "opus",
-    "wiring_judge": "opus",
-    "provision_judge": "opus",
-    "artifact_registry": "opus",
+    "fit_judge":  "sonnet",
+    "splitter":   "sonnet",
+    "adherence_judge": "sonnet",
+    "classification_judge": "sonnet",
+    "wiring_judge": "sonnet",
+    "provision_judge": "sonnet",
+    "artifact_registry": "sonnet",
 }
 
 
@@ -68,9 +70,8 @@ def repo_root(tmp_path, monkeypatch):
 
 
 def test_all_unset_defaults_per_worker(leerie, repo_root):
-    """With no overrides, judgment workers default to opus and the
-    implementer defaults to sonnet. Pins both the global default and
-    the per-worker override table together.
+    """With no overrides, every worker defaults to sonnet. Pins both the
+    global default and the per-worker override table together.
 
     resolve_models() also resolves the post-run skill workers (judge, heal);
     we check only the WORKER_TYPES slice here so this test doesn't need
@@ -78,23 +79,22 @@ def test_all_unset_defaults_per_worker(leerie, repo_root):
     models = leerie.resolve_models(repo_root, ns())
     worker_slice = {w: models[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
-    assert leerie.MODEL_DEFAULT == "opus"
-    # implementer and heal are the current per-worker overrides. judge is
-    # a judgment worker and is absent from MODEL_DEFAULT_PER_WORKER so it
-    # resolves to opus via the MODEL_DEFAULT fallback (see
+    assert leerie.MODEL_DEFAULT == "sonnet"
+    # implementer and heal are explicit per-worker entries (matching the
+    # global default today). judge is absent from MODEL_DEFAULT_PER_WORKER
+    # so it resolves to sonnet via the MODEL_DEFAULT fallback (see
     # resolve_models()'s dedicated judge_cli/judge_env/... chain below).
     assert leerie.MODEL_DEFAULT_PER_WORKER.get("implementer") == "sonnet"
     assert leerie.MODEL_DEFAULT_PER_WORKER.get("judge") is None
     assert leerie.MODEL_DEFAULT_PER_WORKER.get("heal") == "sonnet"
 
 
-def test_judge_worker_resolves_to_opus(leerie, repo_root):
-    """The post-run judge worker is a judgment worker (scores captured
-    calls against a rubric) and must default to opus, not sonnet — sonnet
-    is measurably unreliable for judgment calls. Regression pin for the
-    removal of MODEL_DEFAULT_PER_WORKER['judge']."""
+def test_judge_worker_resolves_to_sonnet(leerie, repo_root):
+    """The post-run judge worker is absent from MODEL_DEFAULT_PER_WORKER
+    and resolves to sonnet via the global MODEL_DEFAULT fallback, same as
+    every other worker."""
     models = leerie.resolve_models(repo_root, ns())
-    assert models["judge"] == "opus"
+    assert models["judge"] == "sonnet"
 
 
 def test_global_env_applies_to_every_worker(leerie, repo_root, monkeypatch):
@@ -162,8 +162,8 @@ def test_full_precedence_per_worker(leerie, repo_root, monkeypatch):
     # — exercise one rung at a time on the same worker (planner).
     cfg = repo_root / "leerie.toml"
 
-    # rung 8 (MODEL_DEFAULT, planner has no per-worker override → opus)
-    assert leerie.resolve_models(repo_root, ns())["planner"] == "opus"
+    # rung 8 (MODEL_DEFAULT, planner has no per-worker override → sonnet)
+    assert leerie.resolve_models(repo_root, ns())["planner"] == "sonnet"
 
     # rung 6: global TOML beats default
     cfg.write_text("model = haiku\n")

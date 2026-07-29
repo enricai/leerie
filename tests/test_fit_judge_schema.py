@@ -206,7 +206,7 @@ def test_fit_judge_in_worker_types(leerie):
 
 
 def test_fit_judge_not_in_model_default_per_worker(leerie):
-    """fit_judge defaults to opus (MODEL_DEFAULT); must NOT appear in
+    """fit_judge defaults to sonnet (MODEL_DEFAULT); must NOT appear in
     MODEL_DEFAULT_PER_WORKER (that dict only holds non-default overrides)."""
     assert "fit_judge" not in leerie.MODEL_DEFAULT_PER_WORKER
 
