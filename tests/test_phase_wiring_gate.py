@@ -70,6 +70,48 @@ class TestWiring:
         i_validate = src.index("validate_plan(subtasks)")
         assert i_check < i_validate
 
+    def test_wiring_gate_runs_after_the_drop_filters(self, leerie):
+        """Regression pin (post-merge Finding C): the LLM wiring_judge must run
+        on the POST-DROP plan — after both soft-drop filters and schedule(),
+        and before validate_plan. It reads `dropped_subtasks` (populated by the
+        filters) for its broken_by_drop / broken_by_merge reasoning and is told
+        the plan is 'post-drop', so a pre-filter placement feeds it a plan that
+        still contains to-be-dropped subtasks + an incomplete drop audit (the
+        bug shipped in PR #117 and preserved through the #116 rebase — no test
+        guarded the placement).
+        """
+        src = inspect.getsource(leerie._run_phases)
+        i_offtree = src.index("filter_offtree_subtasks(")
+        i_satisfied = src.index("await filter_satisfied_subtasks(")
+        i_schedule = src.index("schedule(plans)")
+        i_gate = src.index("await phase_wiring_gate(")
+        i_validate = src.index("validate_plan(subtasks)")
+        # Both drop filters + schedule() precede the gate; the gate precedes
+        # validate_plan (IMPLEMENTATION.md "3 Schedule" sequence + the
+        # phase_wiring_gate docstring + DESIGN §5).
+        assert i_offtree < i_gate
+        assert i_satisfied < i_gate
+        assert i_schedule < i_gate
+        assert i_gate < i_validate
+        # Exactly one call site — a rebase must not duplicate or leave a stale
+        # pre-filter copy.
+        assert src.count("await phase_wiring_gate(") == 1
+
+    def test_wiring_gate_is_not_re_invoked_on_budget_check_resume(self, leerie):
+        """The LLM gate is an opus call, so it lives INSIDE the fresh
+        `if "plan_snapshot" not in st.data:` branch — a budget-check resume
+        (plan_snapshot already persisted) rehydrates in the `else:` and must not
+        re-invoke it. Pin by source order: the gate call sits between the
+        `st.data["plan_snapshot"] = ` write and the `else:` of that if."""
+        src = inspect.getsource(leerie._run_phases)
+        i_snapshot_write = src.index('st.data["plan_snapshot"] = ')
+        i_gate = src.index("await phase_wiring_gate(")
+        # The gate is after the snapshot write (same fresh branch).
+        assert i_snapshot_write < i_gate
+        # And before the budget-check-resume `else` rehydration.
+        i_rehydrate = src.index('snap = st.data["plan_snapshot"]')
+        assert i_gate < i_rehydrate
+
 
 def test_clean_wiring_passes(leerie, tmp_path, monkeypatch):
     st = _state(leerie, tmp_path)

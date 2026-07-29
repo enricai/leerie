@@ -17575,8 +17575,12 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     """Independent SEMANTIC verification of the fully-merged plan's wiring
     (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Runs after
     every id/tag-vanishing operation (reconcile, both soft-drop filters,
-    expansion) and after the deterministic `check_plan_wiring` — which owns the
-    *structural* dangle (does every declared `requires`/`depends_on` resolve).
+    expansion) and after `schedule()`, so it attacks the truly-merged
+    POST-DROP plan. Its structural counterpart, the deterministic
+    `check_plan_wiring` — which owns the structural dangle (does every declared
+    `requires`/`depends_on` resolve) — is an independent backstop that runs on
+    every path (including a budget-check resume); this LLM gate runs once on the
+    fresh planning path (an opus call, not re-invoked on resume).
 
     This gate owns the complement: is the set of declared edges the RIGHT one?
     A plan can be structurally wired (every tag resolves) yet semantically
@@ -21989,17 +21993,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # already-scheduled DAG).
             plans = await phase_adherence_gate(
                 plans, task, st, caps, models, efforts)
-            # Independent SEMANTIC wiring verification (DESIGN §5 *A wiring
-            # re-check on the fully-merged plan*, §8) — detect-and-die: the
-            # wiring_judge attacks the reconciled plan for semantic dangles a
-            # structural provider-existence scan cannot see and die()s on a
-            # concrete defect. Returns `plans` unchanged. Runs inside the
-            # plans_after_adherence_gate checkpoint block (after the adherence
-            # gate, before the checkpoint save) so a resume past this phase
-            # skips it; the deterministic check_plan_wiring below is its
-            # structural counterpart, run post-drop before validate_plan.
-            plans = await phase_wiring_gate(
-                plans, task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-instruction-adherence-
             # gate `plans`, persisted so --resume can skip re-invoking
             # phase_adherence_gate (DESIGN §6).
@@ -22073,6 +22066,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # and write_plan().
             st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
             st.save()
+            # Independent SEMANTIC wiring verification (DESIGN §5 *A wiring
+            # re-check on the fully-merged plan*, §8) — the LLM complement to
+            # the deterministic check_plan_wiring below. The `wiring_judge`
+            # attacks the plan for semantic dangles a provider-existence scan
+            # cannot see (a subtask that should require a capability it never
+            # declares; a merge/drop that severed a real dependency the tags
+            # never encoded) and die()s on a concrete defect (detect-and-die,
+            # returns `plans` unchanged; audit persisted to
+            # st.data["wiring_gate"]). Runs HERE — after both soft-drop filters
+            # (earlier plans_after_filters block) and schedule() — so it attacks
+            # the truly-merged POST-DROP plan with a fully-populated
+            # `dropped_subtasks` audit (its broken_by_drop / broken_by_merge
+            # reasoning depends on that), matching its docstring + DESIGN §5.
+            # `plans` here is the post-drop plan (the filters mutated it in
+            # place). Deliberately INSIDE the fresh `plan_snapshot` branch (not
+            # the outer scope like the cheap deterministic check_plan_wiring):
+            # this is an opus LLM call, so a budget-check resume (plan_snapshot
+            # already persisted) must NOT re-invoke it — its verdict already
+            # cleared the run once and is captured in st.data["wiring_gate"].
+            plans = await phase_wiring_gate(
+                plans, task, st, caps, models, efforts)
         else:
             # Budget-check resume (DESIGN §6 "Budget-check resume"): a
             # prior attempt reached schedule() and persisted plan_snapshot,

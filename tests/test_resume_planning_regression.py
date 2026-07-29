@@ -266,10 +266,17 @@ def test_satisfied_sweep_resume_probes_only_uncached_and_reaches_schedule(
 
     _drive(leerie, args, run_dirs[2], st, caps)
 
-    # Only the two uncached subtasks trigger a fresh claude_p call — the
-    # cached feat-001 is never re-probed.
-    assert sorted(claude_p_calls) == [
+    # Only the two uncached subtasks trigger a fresh satisfied-probe call —
+    # the cached feat-001 is never re-probed. (This resume reaches scheduling
+    # for the first time, so the post-schedule opus `wiring_judge` gate also
+    # legitimately fires once — DESIGN §5 *A wiring re-check on the fully-merged
+    # plan*; it is a downstream gate, not a re-run of the satisfied sweep, so
+    # we assert on the probe calls specifically.)
+    probe_calls = [c for c in claude_p_calls if c.startswith("satisfied_probe-")]
+    assert sorted(probe_calls) == [
         "satisfied_probe-feat-002", "satisfied_probe-feat-003"]
+    # feat-001 (cached) is never re-probed, on any sid.
+    assert "satisfied_probe-feat-001" not in claude_p_calls
     # No planning phase upstream of the sweep re-ran.
     for phase in ("phase_classify", "phase_plan", "phase_reconcile",
                   "phase_overlap_judge", "phase_adherence_gate"):
