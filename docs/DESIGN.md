@@ -1151,10 +1151,16 @@ phase completes — e.g. `plans_after_reconcile` after `phase_reconcile`,
 `plan_snapshot` already persists `{"subtasks", "waves"}` right after
 `schedule()` and `decompose_snapshot` already persists the flattened leaf
 list as each top-level subtask finishes expanding (§5½). Every one of
-these keys must be added to `STATE_FIELDS` (`orchestrator/leerie.py:259`)
-— a key absent from that allowlist is silently dropped when state is
-reloaded on `--resume`, which would make the checkpoint useless without
-ever raising an error. On `--resume`, the orchestrator walks the phase
+these keys must be added to `STATE_FIELDS` (`orchestrator/leerie.py:259`).
+`STATE_FIELDS` is a static allowlist checked by `tests/test_state_fields.py`,
+not a runtime filter — `State.load()` reads the whole on-disk `state.json`
+unconditionally, so an undeclared key is not silently dropped on
+`--resume`. What actually happens is louder: a new `st.data[...]` write
+without a matching `STATE_FIELDS` entry fails
+`test_state_fields.py::test_every_st_data_write_is_declared` immediately,
+before the checkpoint can ever ship uncovered.
+
+On `--resume`, the orchestrator walks the phase
 sequence in order and **skips every phase whose output key is already
 present**, re-entering the pipeline at the first phase with no persisted
 output — reusing the persisted `plans` as that phase's input rather than
