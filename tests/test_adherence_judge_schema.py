@@ -231,10 +231,11 @@ def test_adherence_judge_not_in_model_default_per_worker(leerie):
     assert "adherence_judge" not in leerie.MODEL_DEFAULT_PER_WORKER
 
 
-def test_adherence_judge_effort_default_is_high(leerie):
+def test_adherence_judge_effort_default_is_medium(leerie):
     """adherence_judge is a judgment worker — EFFORT_DEFAULT_PER_WORKER
-    must be 'high' to match other judgment workers."""
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("adherence_judge") == "high"
+    must be 'medium' to match other judgment workers (lowered from 'high'
+    post-Opus-5; see IMPLEMENTATION.md §2)."""
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("adherence_judge") == "medium"
 
 
 def test_adherence_judge_prompt_file_exists(leerie):

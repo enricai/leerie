@@ -124,9 +124,9 @@ negatives.
 
 ## Merge-feasibility discipline (READ BEFORE EMITTING `merge`)
 
-Before emitting `resolution: merge`, you MUST verify that the two
-subtasks' contracts are **compositionally consistent** — i.e., one
-implementation can pass *both* sets of success criteria as written.
+A `resolution: merge` is valid only when the two subtasks' contracts are
+**compositionally consistent** — i.e., one implementation can pass *both*
+sets of success criteria as written.
 Many surface collisions look mergeable on first read but contain
 structurally incompatible API requirements. Picking `merge` when the
 right answer is `unresolvable` produces a frankenstein subtask spec

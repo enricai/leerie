@@ -183,10 +183,10 @@ def test_splitter_not_in_model_default_per_worker(leerie):
     assert "splitter" not in leerie.MODEL_DEFAULT_PER_WORKER
 
 
-def test_splitter_effort_default_is_high(leerie):
+def test_splitter_effort_default_is_medium(leerie):
     """splitter is a judgment worker — EFFORT_DEFAULT_PER_WORKER['splitter']
-    must be 'high'."""
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("splitter") == "high"
+    must be 'medium' (lowered from 'high' post-Opus-5; see IMPLEMENTATION.md §2)."""
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("splitter") == "medium"
 
 
 def test_splitter_prompt_file_exists(leerie):

@@ -132,9 +132,8 @@ Before you emit your classification, self-gate on one axis:
 
 - `classification` (float 1–10): how confident you are that the selected
   categories are correct and the question list is complete and filtered.
-  Earns ≥ 9.0 only when you have verified each category against the actual
-  codebase (e.g., `infrastructure` selected → an `infra/` or `cdk/`
-  directory exists).
+  Earns ≥ 9.0 only when each category is grounded in the actual codebase
+  (e.g., `infrastructure` selected → an `infra/` or `cdk/` directory exists).
 
 Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):

@@ -13,7 +13,7 @@ Effort precedence (highest first):
   1. --effort CLI flag (global — no per-worker effort flag for dep_capture)
   2. LEERIE_EFFORT env var (global)
   3. effort in leerie.toml (global)
-  4. EFFORT_DEFAULT_PER_WORKER["dep_capture"] ("high")
+  4. EFFORT_DEFAULT_PER_WORKER["dep_capture"] ("medium")
 
 Mirrors test_resolve_models.py / test_resolve_efforts.py fixture patterns.
 """
@@ -186,12 +186,13 @@ def test_dep_capture_model_override_isolated(leerie, repo_root, monkeypatch):
 # Effort — default
 # ---------------------------------------------------------------------------
 
-def test_dep_capture_effort_default_is_high(leerie, repo_root):
+def test_dep_capture_effort_default_is_medium(leerie, repo_root):
     """dep_capture is a judgment worker — EFFORT_DEFAULT_PER_WORKER["dep_capture"]
-    is "high", so resolve_efforts returns "high" with no overrides."""
+    is "medium" (lowered from "high" post-Opus-5), so resolve_efforts returns
+    "medium" with no overrides."""
     efforts = leerie.resolve_efforts(repo_root, ns())
-    assert efforts["dep_capture"] == "high"
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("dep_capture") == "high"
+    assert efforts["dep_capture"] == "medium"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("dep_capture") == "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +243,11 @@ def test_dep_capture_effort_global_toml_overrides_default(leerie, repo_root):
 
 def test_dep_capture_effort_full_precedence(leerie, repo_root, monkeypatch):
     """dep_capture has no per-worker effort CLI flag; precedence is:
-    global CLI > global env > global TOML > EFFORT_DEFAULT_PER_WORKER ("high")."""
+    global CLI > global env > global TOML > EFFORT_DEFAULT_PER_WORKER ("medium")."""
     cfg = repo_root / "leerie.toml"
 
-    # rung 4: EFFORT_DEFAULT_PER_WORKER ("high")
-    assert leerie.resolve_efforts(repo_root, ns())["dep_capture"] == "high"
+    # rung 4: EFFORT_DEFAULT_PER_WORKER ("medium")
+    assert leerie.resolve_efforts(repo_root, ns())["dep_capture"] == "medium"
 
     # rung 3: global TOML beats default
     cfg.write_text("effort = low\n")
@@ -294,4 +295,4 @@ def test_dep_capture_effort_in_judgment_set(leerie):
     """dep_capture must be in EFFORT_DEFAULT_PER_WORKER alongside other
     judgment workers (classifier, planner, etc.)."""
     assert "dep_capture" in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert leerie.EFFORT_DEFAULT_PER_WORKER["dep_capture"] == "high"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["dep_capture"] == "medium"

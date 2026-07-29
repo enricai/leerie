@@ -87,8 +87,8 @@ Before you emit your result, self-gate on one axis:
 Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):
 
-- **Falsification (`falsifiers_tested`):** verify no `<<<<<<<` markers remain;
-  verify MERGE_HEAD is gone.
+- **Falsification (`falsifiers_tested`):** no `<<<<<<<` markers remain, and
+  MERGE_HEAD is gone.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
 - **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the

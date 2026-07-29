@@ -530,8 +530,8 @@ Before you emit your output, self-gate on one axis:
 Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):
 
-- **Falsification (`falsifiers_tested`):** for each rename, verify the target
-  tag actually exists. For each added subtask, verify the gap is real.
+- **Falsification (`falsifiers_tested`):** every rename must target a tag that
+  actually exists, and every added subtask must fill a gap that is real.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
 - **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the

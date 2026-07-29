@@ -4,3 +4,23 @@
 # keeps the layout unambiguous and lets `./leerie "task"` work zero-config
 # on this repo.
 state_dir = "~/.leerie/_self"
+
+# Effort defaults lowered high→medium after the Opus 5 release to cut per-call
+# output-token volume (Opus 5 thinks by default and emits ~+50% more output
+# tokens than Opus 4.8 at the same effort, driving OTPM rate-limit pressure).
+# Leerie's downstream checks absorb the small per-worker quality reduction; see
+# IMPLEMENTATION.md §2 "Effort selection". These per-worker keys mirror the
+# EFFORT_DEFAULT_PER_WORKER code default so the intent is explicit for this repo
+# and survives even if the code default is later changed. (pr_writer and
+# dep_capture honor only the global `effort` key, not per-worker keys, so they
+# take medium from the code default — do NOT add a global `effort` key here,
+# which would also pull the acting workers off their intended unset profile.)
+effort_classifier = "medium"
+effort_planner = "medium"
+effort_reconciler = "medium"
+effort_plan_overlap_judge = "medium"
+effort_provision = "medium"
+effort_integrator = "medium"
+effort_fit_judge = "medium"
+effort_splitter = "medium"
+effort_adherence_judge = "medium"

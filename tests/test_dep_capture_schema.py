@@ -326,10 +326,11 @@ def test_dep_capture_not_in_worker_types(leerie):
     assert "dep_capture" not in leerie.WORKER_TYPES
 
 
-def test_dep_capture_effort_default_is_high(leerie):
-    """dep_capture is a judgment worker; its effort default is 'high'
-    (in EFFORT_DEFAULT_PER_WORKER) matching the other judgment workers."""
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("dep_capture") == "high"
+def test_dep_capture_effort_default_is_medium(leerie):
+    """dep_capture is a judgment worker; its effort default is 'medium'
+    (in EFFORT_DEFAULT_PER_WORKER) matching the other judgment workers
+    (lowered from 'high' post-Opus-5; see IMPLEMENTATION.md §2)."""
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("dep_capture") == "medium"
 
 
 def test_dep_capture_model_defaults_to_opus(leerie):

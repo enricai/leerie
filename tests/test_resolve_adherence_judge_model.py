@@ -18,7 +18,7 @@ Effort:
   4. LEERIE_EFFORT env var
   5. effort_adherence_judge in leerie.toml
   6. effort in leerie.toml
-  7. EFFORT_DEFAULT_PER_WORKER["adherence_judge"] → "high"
+  7. EFFORT_DEFAULT_PER_WORKER["adherence_judge"] → "medium"
 
 The opus default is not merely a convention here — it is empirically
 required (DESIGN §5/§8 investigation): sonnet false-positived a legitimate
@@ -118,11 +118,12 @@ def test_adherence_judge_model_per_toml_beats_global_toml(leerie, repo_root):
 # adherence_judge — effort defaults
 # ---------------------------------------------------------------------------
 
-def test_adherence_judge_effort_default_is_high(leerie, repo_root):
-    """adherence_judge is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'high'."""
+def test_adherence_judge_effort_default_is_medium(leerie, repo_root):
+    """adherence_judge is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'medium'
+    (lowered from 'high' post-Opus-5; see IMPLEMENTATION.md §2)."""
     efforts = leerie.resolve_efforts(repo_root, ns())
-    assert efforts["adherence_judge"] == "high"
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("adherence_judge") == "high"
+    assert efforts["adherence_judge"] == "medium"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("adherence_judge") == "medium"
 
 
 def test_adherence_judge_effort_per_worker_cli(leerie, repo_root):
@@ -170,7 +171,7 @@ def test_adherence_judge_effort_override_isolated(leerie, repo_root):
     other workers."""
     efforts = leerie.resolve_efforts(repo_root, ns(effort_adherence_judge="max"))
     assert efforts["adherence_judge"] == "max"
-    assert efforts["planner"] == "high"
+    assert efforts["planner"] == "medium"
     assert efforts["implementer"] is None
 
 
@@ -190,4 +191,4 @@ def test_adherence_judge_not_in_model_default_per_worker(leerie):
 
 def test_adherence_judge_in_effort_default_per_worker(leerie):
     assert "adherence_judge" in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert leerie.EFFORT_DEFAULT_PER_WORKER["adherence_judge"] == "high"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["adherence_judge"] == "medium"

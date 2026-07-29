@@ -2536,39 +2536,52 @@ sampling stochasticity cannot be pinned. Effort is the strongest dial
 available; it does not eliminate run-to-run variance but does remove the
 "this run thought harder than that one" axis.
 
-**Per-worker defaults: `high` for judgment workers, unset for acting workers.**
-Judgment workers (classifier, planner, reconciler, plan_overlap_judge,
-provision, integrator) default to `high`. The acting workers (implementer,
+**Per-worker defaults: `medium` for judgment workers, unset for acting workers.**
+The eleven judgment / finalize workers (classifier, planner, reconciler,
+plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge,
+splitter, adherence_judge) default to `medium`. The acting workers (implementer,
 conformer) and post-run skill workers (judge, heal) default to *unset* —
 when no effort is resolved,
 no `--effort` flag is passed and the worker inherits Claude's default. This
 keeps acting workers' reasoning bounded by their own evidence gates
 (DESIGN §8) rather than by a global dial.
 
+The default was lowered from `high` to `medium` after the Opus 5 release:
+Opus 5 thinks by default and produces materially more output tokens per call
+than Opus 4.8 at the same effort (measured ~+50% output tokens on the planner
+worker across the 4.8→5 boundary), which drove the per-run OTPM (output tokens
+per minute) rate-limit pressure up. `medium` cuts that output-token volume;
+Leerie's downstream checks (confidence gate, conformer, adherence gate, overlap
+judge, `_run_checked_loop` retries) absorb the small per-worker quality
+reduction. `high`/`xhigh`/`max` remain available per-worker via the override
+chain below when a specific worker needs deeper reasoning.
+
 | Worker       | Default | Why |
 |--------------|---------|-----|
-| classifier   | high    | category choice is judgment over the whole task |
-| planner      | high    | decomposition granularity is the load-bearing judgment step (DESIGN §8 planner gate) |
-| reconciler   | high    | cross-domain tag equivalence is judgment |
-| plan_overlap_judge | high | surface-overlap detection over the reconciled plan is judgment (DESIGN §5 *Cross-domain surface overlap*); merge-feasibility discipline rewards pinning reasoning depth |
+| classifier   | medium  | category choice is judgment over the whole task |
+| planner      | medium  | decomposition granularity is the load-bearing judgment step (DESIGN §8 planner gate) |
+| reconciler   | medium  | cross-domain tag equivalence is judgment |
+| plan_overlap_judge | medium | surface-overlap detection over the reconciled plan is judgment (DESIGN §5 *Cross-domain surface overlap*); merge-feasibility discipline rewards pinning reasoning depth |
 | satisfied_probe | unset | per-subtask advisory prune (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask, same unset profile as conformer/judge — the base-tree-only tool scope and conservative default carry the correctness, not pinned depth |
-| provision    | high    | recipe synthesis over arbitrary repo shapes is judgment |
-| integrator   | high    | behavioral conflict resolution; a wrong merge corrupts state |
+| provision    | medium  | recipe synthesis over arbitrary repo shapes is judgment |
+| integrator   | medium  | behavioral conflict resolution; a wrong merge corrupts state |
 | implementer  | unset   | bounded by §8 evidence gate; pinning would override the gate's adaptive depth |
 | conformer    | unset   | advisory phase; same reasoning as implementer |
 | judge        | unset   | post-run scoring; no need to pin |
 | heal         | unset   | post-run patch generation; no need to pin |
-| pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
-| dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
-| fit_judge    | high    | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
-| splitter     | high    | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
-| adherence_judge | high | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ ≥8.5, prescribed-and-violated ⇒ ≤3) on opus at `high` effort — pinned depth is part of the validated configuration |
+| pr_writer    | medium  | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
+| dep_capture  | medium  | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
+| fit_judge    | medium  | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
+| splitter     | medium  | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
+| adherence_judge | medium | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ ≥8.5, prescribed-and-violated ⇒ ≤3). The calibration was originally measured on opus at `high` effort; the default was lowered to `medium` post-Opus-5 for output-token reduction — if adherence gating regresses, this is the first worker to raise back to `high` via `effort_adherence_judge` (see Risk note in the effort-down change) |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
-`EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
-workers above and for the finalize-time `pr_writer` and `dep_capture` workers,
-and for the P1 decomposition workers `fit_judge` and `splitter`, and for
-the plan-instruction-adherence worker `adherence_judge`.
+`EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the eleven
+judgment / finalize workers in the table above: the six core judgment workers
+(classifier, planner, reconciler, plan_overlap_judge, provision, integrator),
+the finalize-time `pr_writer` and `dep_capture` workers, the P1 decomposition
+workers `fit_judge` and `splitter`, and the plan-instruction-adherence worker
+`adherence_judge`.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -4295,7 +4308,7 @@ Fully shipped. `SCHEMAS["classifier"]` carries `prescribed_procedure`
 `st.data["prescribed_procedure"]` — see §3 "Worker output schemas"),
 `SCHEMAS["planner"]` carries the optional per-subtask `runs_commands`
 array, the `adherence_judge` worker is fully registered (schema, prompt,
-`WORKER_TYPES`, opus/`"high"` model-effort defaults — see "The
+`WORKER_TYPES`, opus/`"medium"` model-effort defaults — see "The
 `adherence_judge` worker" above), and `phase_adherence_gate` (a
 whole-plan gate, "Phase 2⅞", run once per assembled plan rather than
 per-subtask) wires all of it together.
@@ -4596,7 +4609,7 @@ child mirrors the planner subtask shape: required `id`, `title`,
 `depends_on`, `requires`, `provides`, `size`, `investigation_notes`.
 
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
-(both default to `"high"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
+(both default to `"medium"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
 (default opus via the global `MODEL_DEFAULT` fallback).
 
 ### The `adherence_judge` worker (plan-instruction-adherence gate)
@@ -4611,7 +4624,7 @@ unlike `fit_judge`/most other judgment workers, this worker *is itself* the
 independent check that replaces a self-report, so a nested self-confidence
 axis would reintroduce the self-grading bias the gate exists to remove.
 
-Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"high"`),
+Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"medium"`),
 absent from `MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT`
 fallback — **required**, not merely preferred: empirically falsified on
 sonnet, which false-positived a legitimate plan). Prompt at
@@ -5036,7 +5049,7 @@ surface lives in `orchestrator/leerie.py`.
 #### dep_capture worker
 
 `dep_capture` is a non-WORKER_TYPES worker (like `pr_writer`) registered in
-`SCHEMAS`, `_allowed_schema_keys`, `EFFORT_DEFAULT_PER_WORKER` (high), and
+`SCHEMAS`, `_allowed_schema_keys`, `EFFORT_DEFAULT_PER_WORKER` (medium), and
 `resolve_models`/`resolve_efforts`. It is **absent** from
 `MODEL_DEFAULT_PER_WORKER`; its `opus` default comes from the global
 `MODEL_DEFAULT` fallback. Its model override is env-var-only (no CLI flag, no
@@ -7168,12 +7181,12 @@ enforcement functions:
 | `test_resolve_source_of_truth.py` | `resolve_source_of_truth()` |
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
-| `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; isolation (override doesn't bleed to other workers); structural wiring guards |
 | `test_rank_repo_map.py` | `rank_repo_map()` P6 ranking contract: seed-adjacent nodes rank above unrelated nodes (direct seed file, 1-hop neighbor via callee→caller edge, seed symbol biases definer, all connected-chain files before any island file); token-budget enforcement (explicit budget, `DEFAULT_CAPS["repo_map_tokens"]` when `None`, `None` == cap value, empty map returns `""`); binary-search shrink (lower budget → shorter output and fewer files, increasing budgets → non-decreasing lengths, tight budgets respected). Fixture built directly (no `build_repo_map`); no LLM calls; deterministic. |
-| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (opus via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
-| `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `opus` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `high` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
-| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "high"`, prompt file exists) |
-| `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "high"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
+| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (opus via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `opus` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `medium` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
+| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "medium"`, prompt file exists) |
+| `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "medium"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
 | `test_recursive_decompose.py` | `partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates + emits "no-progress guard" warning to stdout (asserted via capsys), migration path partitions files via `partition_files()` and invokes the splitter only in label-only mode to title each chunk (distinct titles; distinct deterministic fallback on splitter failure), both `claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps` — C0 regression guard), a passed `repo_map` is injected into fit_judge/splitter prompts and omitted when `None` (G2), bump_workers called before every claude_p |
 | `test_phase_plan_repo_map_ctx.py` | P6 Layer A wiring (`phase_plan` ctx injection, DESIGN §5½ (P6)): repo-map enabled path (ctx contains `repo_map` key, non-empty string, JSON-serializable, known symbol names present, seed_files seeded from `task_file_items`); skip_repo_map=True path (ctx omits `repo_map`, baseline keys `task`/`source_of_truth`/`clarification_answers`/`confidence_rounds` present, values match inputs); empty-repo degrade (`rank_repo_map` returns `""` → key omitted); exception-swallow degrade (`build_repo_map` raises → caught silently, ctx emitted without `repo_map`) |
 | `test_phase_plan_prescribed_procedure_ctx.py` | PREVENT-half wiring (`phase_plan` ctx injection of the classifier's `prescribed_procedure` signal, DESIGN §12 sibling): `is_prescribed=True` → ctx carries `prescribed_procedure` verbatim, baseline keys present, JSON-serializable; absent from `st.data` entirely → key omitted; present but `is_prescribed` false, missing, or an empty dict (the `phase_classify` default when the classifier omits the field) → key omitted in every case (no false framing on a goal-only task) |

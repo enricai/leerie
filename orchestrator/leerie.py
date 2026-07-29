@@ -809,18 +809,26 @@ MODEL_FILE = "leerie.toml"
 # default) — that is the intended behavior for acting workers.
 EFFORT_VALUES = ("low", "medium", "high", "xhigh", "max")
 EFFORT_DEFAULT: str | None = None
+# Lowered high→medium after the Opus 5 release. Opus 5 thinks by default and
+# emits materially more output tokens per call than Opus 4.8 at the same effort
+# (measured ~+50% output tokens on the planner across the 4.8→5 boundary),
+# driving per-run OTPM rate-limit pressure. `medium` cuts that output-token
+# volume; the downstream checks (confidence gate, conformer, adherence gate,
+# overlap judge, _run_checked_loop retries) absorb the small per-worker quality
+# reduction. Per-worker `high`/`xhigh`/`max` overrides remain available via the
+# resolve_efforts chain. See IMPLEMENTATION.md §2 "Effort selection".
 EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
-    "classifier": "high",
-    "planner": "high",
-    "reconciler": "high",
-    "plan_overlap_judge": "high",
-    "provision": "high",
-    "integrator": "high",
-    "pr_writer": "high",
-    "dep_capture": "high",
-    "fit_judge": "high",
-    "splitter": "high",
-    "adherence_judge": "high",
+    "classifier": "medium",
+    "planner": "medium",
+    "reconciler": "medium",
+    "plan_overlap_judge": "medium",
+    "provision": "medium",
+    "integrator": "medium",
+    "pr_writer": "medium",
+    "dep_capture": "medium",
+    "fit_judge": "medium",
+    "splitter": "medium",
+    "adherence_judge": "medium",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -4460,7 +4468,7 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
       4. LEERIE_EFFORT env var
       5. effort_<worker> in leerie.toml
       6. effort in leerie.toml
-      7. EFFORT_DEFAULT_PER_WORKER[<worker>] (e.g., planner → "high")
+      7. EFFORT_DEFAULT_PER_WORKER[<worker>] (e.g., planner → "medium")
       8. EFFORT_DEFAULT (None — flag omitted from CLI invocation)
     A None value means "do not pass --effort"; claude_p's build() omits
     the flag entirely so the worker inherits Claude's default. CLI values

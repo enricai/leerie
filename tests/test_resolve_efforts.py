@@ -7,7 +7,7 @@ Per-worker precedence (highest first):
   4. LEERIE_EFFORT env var
   5. effort_<worker> in leerie.toml
   6. effort in leerie.toml
-  7. EFFORT_DEFAULT_PER_WORKER[<worker>] (judgment workers → "high")
+  7. EFFORT_DEFAULT_PER_WORKER[<worker>] (judgment workers → "medium")
   8. EFFORT_DEFAULT (None — flag omitted from CLI invocation)
 
 The judgment-workers-pinned, acting-workers-unset split was introduced
@@ -27,16 +27,17 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "conformer")
 
 # The expected default per worker, with no overrides. Judgment workers
-# get "high"; acting workers (implementer, conformer) and the per-subtask
+# get "medium" (lowered from "high" post-Opus-5, see IMPLEMENTATION.md §2);
+# acting workers (implementer, conformer) and the per-subtask
 # satisfied_probe resolve to None.
 DEFAULTS: dict[str, str | None] = {
-    "classifier": "high",
-    "planner":    "high",
-    "reconciler": "high",
-    "plan_overlap_judge": "high",
+    "classifier": "medium",
+    "planner":    "medium",
+    "reconciler": "medium",
+    "plan_overlap_judge": "medium",
     "satisfied_probe": None,
-    "provision":  "high",
-    "integrator": "high",
+    "provision":  "medium",
+    "integrator": "medium",
     "implementer": None,
     "conformer":  None,
 }
@@ -60,16 +61,16 @@ def repo_root(tmp_path, monkeypatch):
 
 
 def test_all_unset_defaults_per_worker(leerie, repo_root):
-    """With no overrides, judgment workers default to 'high' and acting
+    """With no overrides, judgment workers default to 'medium' and acting
     workers default to None (no --effort flag passed). Pins both the
     global default (None) and the per-worker override table together."""
     efforts = leerie.resolve_efforts(repo_root, ns())
     worker_slice = {w: efforts[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
     assert leerie.EFFORT_DEFAULT is None
-    # Six judgment workers default to high; nothing else.
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("planner") == "high"
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "high"
+    # Judgment workers default to medium; acting workers are absent.
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("planner") == "medium"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "medium"
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
 
@@ -139,12 +140,12 @@ def test_full_precedence_per_worker(leerie, repo_root, monkeypatch):
     # Per-worker CLI > global CLI > per-worker env > global env >
     # per-worker TOML > global TOML > per-worker default > EFFORT_DEFAULT.
     # Exercise one rung at a time on the planner (which has a per-worker
-    # default of "high"). Implementer has no per-worker default — we
+    # default of "medium"). Implementer has no per-worker default — we
     # check both fallthrough behaviors at the bottom.
     cfg = repo_root / "leerie.toml"
 
-    # rung 7 (per-worker default → "high" for planner)
-    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "high"
+    # rung 7 (per-worker default → "medium" for planner)
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "medium"
     # And rung 8 for implementer (no per-worker default, EFFORT_DEFAULT is None)
     assert leerie.resolve_efforts(repo_root, ns())["implementer"] is None
 

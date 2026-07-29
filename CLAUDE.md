@@ -120,7 +120,7 @@ orchestrator and not used anywhere in this repo.
   *do* the work (implementer, conformer, pr_writer) run on sonnet for
   throughput/cost. A new judgment worker MUST be absent from
   `MODEL_DEFAULT_PER_WORKER` (so it falls through to `MODEL_DEFAULT =
-  "opus"`) and carry `EFFORT_DEFAULT_PER_WORKER = "high"`. Exceptions
+  "opus"`) and carry `EFFORT_DEFAULT_PER_WORKER = "medium"`. Exceptions
   must be justified in a comment as a deliberate cost trade-off, not an
   unstated default: `satisfied_probe` stays on sonnet because it runs
   once per subtask and throughput dominates, with correctness resting
@@ -316,7 +316,7 @@ export LEERIE_MODEL=sonnet               # or: opus, haiku
 
 # Pin reasoning depth via `claude -p --effort`. Without overrides,
 # judgment workers (classifier, planner, reconciler, plan_overlap_judge,
-# provision, integrator) default to `high`; acting workers
+# provision, integrator) default to `medium`; acting workers
 # (implementer, conformer) inherit Claude's default. Per-worker
 # overrides exist via --effort-<worker> / LEERIE_EFFORT_<WORKER>. See
 # docs/IMPLEMENTATION.md §2 "Effort selection".
@@ -779,7 +779,7 @@ and a `model_dep_capture` TOML key are **not** honored. Effort: global CLI >
 global env > global TOML > `EFFORT_DEFAULT_PER_WORKER["dep_capture"]`. It also
 pins the `MODEL_DEP_CAPTURE_ENV` constant, `dep_capture` absent from
 `MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT` fallback), and
-present in `EFFORT_DEFAULT_PER_WORKER` with value `"high"`.
+present in `EFFORT_DEFAULT_PER_WORKER` with value `"medium"`.
 The three orchestrator wiring seams that are only verifiable by source
 inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
 `test_phase_finalize_capture_hook.py`'s `inspect.getsource` approach):
@@ -805,7 +805,7 @@ required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
 bounds (minimum 0, maximum 1), `confidence` using the `"fit"` axis, valid and
 invalid instance acceptance, JSON serializability, and wiring (`fit_judge` in
 `WORKER_TYPES`, not in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER`
-entry at `"high"`, prompt file exists). `tests/test_splitter_schema.py` covers
+entry at `"medium"`, prompt file exists). `tests/test_splitter_schema.py` covers
 `SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
 fields (`id`, `title`, `success_criteria_seed`), optional child fields,
 valid/invalid instances, JSON serializability, the same wiring guards, no
@@ -815,7 +815,7 @@ top-level `files` field (splitter never decides partition), and the child
 `tests/test_resolve_fit_judge_splitter_model.py` cover model and effort
 resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent
 from `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both
-in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
+in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override
 chains; isolation (override doesn't bleed to other workers); structural wiring
 guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
 44 tests across parametrized invariant sweeps (input sizes 0, 1, 8, 29, 64;
@@ -984,7 +984,7 @@ check that replaces a self-report, so a self-confidence axis would
 reintroduce the self-grading bias the gate exists to remove), valid/invalid
 instance acceptance, JSON serializability, and wiring (`adherence_judge` in
 `WORKER_TYPES`, absent from `MODEL_DEFAULT_PER_WORKER` so it resolves to
-opus, `EFFORT_DEFAULT_PER_WORKER` entry at `"high"`, prompt file exists).
+opus, `EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, prompt file exists).
 `tests/test_resolve_adherence_judge_model.py` covers the model/effort
 resolution precedence chain (mirrors `test_resolve_fit_judge_model.py`),
 explicitly asserting the opus default — empirically required here, not

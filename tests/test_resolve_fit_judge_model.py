@@ -18,7 +18,7 @@ Effort for both (judgment workers):
   4. LEERIE_EFFORT env var
   5. effort_fit_judge / effort_splitter in leerie.toml
   6. effort in leerie.toml
-  7. EFFORT_DEFAULT_PER_WORKER["fit_judge"] / ["splitter"] → "high"
+  7. EFFORT_DEFAULT_PER_WORKER["fit_judge"] / ["splitter"] → "medium"
 
 Mirrors test_resolve_dep_capture_model.py fixture patterns.
 """
@@ -134,11 +134,12 @@ def test_splitter_model_global_cli_beats_default(leerie, repo_root):
 # fit_judge — effort defaults
 # ---------------------------------------------------------------------------
 
-def test_fit_judge_effort_default_is_high(leerie, repo_root):
-    """fit_judge is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'high'."""
+def test_fit_judge_effort_default_is_medium(leerie, repo_root):
+    """fit_judge is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'medium'
+    (lowered from 'high' post-Opus-5)."""
     efforts = leerie.resolve_efforts(repo_root, ns())
-    assert efforts["fit_judge"] == "high"
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("fit_judge") == "high"
+    assert efforts["fit_judge"] == "medium"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("fit_judge") == "medium"
 
 
 def test_fit_judge_effort_per_worker_cli(leerie, repo_root):
@@ -173,11 +174,12 @@ def test_fit_judge_effort_global_toml_beats_default(leerie, repo_root):
 # splitter — effort defaults
 # ---------------------------------------------------------------------------
 
-def test_splitter_effort_default_is_high(leerie, repo_root):
-    """splitter is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'high'."""
+def test_splitter_effort_default_is_medium(leerie, repo_root):
+    """splitter is a judgment worker — EFFORT_DEFAULT_PER_WORKER is 'medium'
+    (lowered from 'high' post-Opus-5)."""
     efforts = leerie.resolve_efforts(repo_root, ns())
-    assert efforts["splitter"] == "high"
-    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("splitter") == "high"
+    assert efforts["splitter"] == "medium"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("splitter") == "medium"
 
 
 def test_splitter_effort_per_worker_cli(leerie, repo_root):
@@ -206,7 +208,7 @@ def test_splitter_effort_override_isolated(leerie, repo_root):
     """A per-worker effort override for splitter doesn't change other workers."""
     efforts = leerie.resolve_efforts(repo_root, ns(effort_splitter="max"))
     assert efforts["splitter"] == "max"
-    assert efforts["planner"] == "high"
+    assert efforts["planner"] == "medium"
     assert efforts["implementer"] is None
 
 
@@ -234,9 +236,9 @@ def test_splitter_not_in_model_default_per_worker(leerie):
 
 def test_fit_judge_in_effort_default_per_worker(leerie):
     assert "fit_judge" in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert leerie.EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "high"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "medium"
 
 
 def test_splitter_in_effort_default_per_worker(leerie):
     assert "splitter" in leerie.EFFORT_DEFAULT_PER_WORKER
-    assert leerie.EFFORT_DEFAULT_PER_WORKER["splitter"] == "high"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["splitter"] == "medium"
