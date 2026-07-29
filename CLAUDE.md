@@ -1177,6 +1177,19 @@ against a correctly-individually-ordered but scrambled insertion producing
 a resume cursor that silently skips a phase); and `plans_after_filters`
 precedes `plan_snapshot`, keeping the existing post-schedule checkpoint
 authoritative and undisturbed.
+`tests/test_planning_checkpoint_ordering.py` is a second, independent pin
+of the same write-ordering invariant (call-precedes-checkpoint,
+checkpoint-precedes-`st.save()`, source order matches pipeline order),
+plus the resume-cursor's gating on checkpoint-key presence
+(`"plans_after_<phase>" not in st.data`) rather than `current_phase`, and
+the earliest re-entry gate keying on `waves`/`categories` presence.
+Deliberately overlapping with `test_plans_after_checkpoints.py` rather
+than folded into it: this file is the standalone regression guard for the
+single highest-severity implementation trap in this feature (a checkpoint
+written at phase entry, before the phase spends, would mark an incomplete
+phase done and resume with a half-built plan), kept intentionally small
+and separate so it can't be diluted by unrelated changes to the larger
+checkpoint-writing test file.
 The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
 in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
 CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
