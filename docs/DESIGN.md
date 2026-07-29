@@ -922,9 +922,13 @@ practice — decomposition routinely accounts for a large share of a run's
 total planning spend, so losing it to a single transient worker failure
 is expensive. `phase_plan` snapshots decomposition progress into state as
 each top-level subtask finishes expanding, mirroring how `plan_snapshot`
-already persists the plan after `schedule()`; this `decompose_snapshot` is
-one of the per-phase checkpoints the resumable-planning cursor (§6
-*Resumable planning*) reads on `--resume` — it is no longer diagnostic-only.
+already persists the plan after `schedule()`; like `plan_snapshot`, this
+is diagnostic only — nothing reads it back. The resumable-planning cursor
+(§6 *Resumable planning*) checkpoints at the coarser `phase_plan`
+granularity (`plans_after_plan`, written only after the whole phase
+returns), so a resume that lands mid-decomposition still re-invokes
+`phase_plan` from scratch rather than rehydrating from
+`decompose_snapshot`'s partial leaves.
 
 ### Wire-in to `phase_plan`
 
@@ -1859,11 +1863,16 @@ to deterministic per-chunk labels since the file partition itself is
 code-computed and unaffected by a labeling crash); and `phase_plan`
 snapshots decomposition progress into state as each top-level subtask
 finishes expanding, the same way `plan_snapshot`
-already persists the post-`schedule()` plan. This `decompose_snapshot` is
-now one of the per-phase checkpoints `--resume` rehydrates from (§6
-*Resumable planning*): a pause mid-decomposition resumes from the
-already-expanded top-level subtasks rather than re-running the whole
-decomposition pass.
+already persists the post-`schedule()` plan. Like `plan_snapshot`, this
+decomposition snapshot is **diagnostic only** — nothing reads it back.
+The resumable-planning cursor (§6 *Resumable planning*) checkpoints
+`phase_plan`'s output as a whole (`plans_after_plan`), so a pause
+mid-decomposition still re-runs the entire `phase_plan` invocation
+(including `recursive_decompose`) on resume rather than rehydrating
+from `decompose_snapshot`'s partial leaves. Wiring `--resume` to that
+finer granularity is a separate, not-yet-shipped capability. Overclaiming
+resumability this change does not implement would be worse than not
+documenting the snapshot at all.
 
 ### Cleanup on abnormal exit
 
