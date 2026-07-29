@@ -127,6 +127,16 @@ The orchestrator gives you, in your prompt:
      edges by matching `requires` against every domain's `provides`. Use
      specific tags, e.g. `auth-service-extracted`, `export-endpoint-live`.
 
+     **Prefer the shared artifact vocabulary.** If your `CONTEXT` includes an
+     `artifact_registry` array, it lists artifacts this task will create with a
+     canonical `tag` and `path` each. When you produce or consume one of those
+     artifacts, **use exactly that tag** in `provides`/`requires` and **that
+     path** in `files_likely_touched`. Other planners see the same registry, so
+     matching it is what lets the orchestrator wire the cross-domain edge by
+     exact string — inventing your own name for a listed artifact silently
+     breaks that edge. The registry is advisory: for anything it does not list,
+     name tags as usual.
+
    **`requires` is an array of objects, not strings.** Each entry is
    `{tag, extent, reason}`:
 
@@ -165,6 +175,21 @@ The orchestrator gives you, in your prompt:
       "reason": "Dynamo table + GSI provisioned by the api-services repo's CDK stack; backfill cannot run before the cutover deploy lands there."}
    ]
    ```
+
+   **Test subtasks must wire to their producers.** If you are the `testing`
+   planner (or a subtask of yours writes/updates a test), every test that
+   exercises a file, symbol, or behavior **another subtask creates or changes**
+   MUST declare that dependency — a `requires` capability tag the producer
+   `provides`, or a `depends_on` id within your own domain. Never leave a test
+   subtask with `requires: []` and `depends_on: []` when its assertions depend
+   on not-yet-existing code. This includes *indirect* guards: a coverage-floor
+   or parity test that must list the new source files a feature subtask adds
+   depends on that feature subtask, even though the test file and the source
+   file are different paths. If you do not know the producer's exact tag, name
+   the capability you need (`requires` with a specific tag) and let the
+   reconciler match it — do not silently omit the edge. A test scheduled before
+   its producer fails; the wiring gate will reject the plan, wasting the whole
+   planning spend.
 
    **`infrastructure` ↔ `configuration-build` arrow.** When both
    categories are in scope, the dependency arrow goes

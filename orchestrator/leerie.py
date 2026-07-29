@@ -289,6 +289,7 @@ STATE_FIELDS = (
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "prescribed_procedure", "answers",
+    "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
@@ -917,12 +918,18 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "classification_judge": "medium",
     "wiring_judge": "medium",
     "provision_judge": "medium",
+    # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
+    # worker*). A judgment worker (decides the canonical tag/path per artifact),
+    # so opus via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
+    # at the standard `medium` judgment effort.
+    "artifact_registry": "medium",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
-                "classification_judge", "wiring_judge", "provision_judge")
+                "classification_judge", "wiring_judge", "provision_judge",
+                "artifact_registry")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1786,6 +1793,37 @@ SCHEMAS: dict[str, dict] = {
             "checked": {
                 "type": "array",
                 "items": {"type": "string"},
+            },
+        },
+    },
+    "artifact_registry": {
+        # Output of the pre-planning artifact_registry worker (DESIGN §5
+        # *Artifact-registry worker*). Read-only; runs ONCE after classify,
+        # before any planner. Emits a small canonical vocabulary of the
+        # artifacts the task will plainly create, so blind parallel planners
+        # prefer the same tag + path and the exact-string requires↔provides
+        # matcher wires the edge with no reconciliation. Advisory: planners
+        # are asked to prefer these, never forced.
+        "type": "object",
+        "required": ["artifacts"],
+        "properties": {
+            "artifacts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["description", "tag", "path"],
+                    "properties": {
+                        # Human-readable name of the artifact (e.g.
+                        # "scroll-reveal intersection hook").
+                        "description": {"type": "string", "minLength": 1},
+                        # Canonical capability tag planners SHOULD use in
+                        # provides/requires for this artifact.
+                        "tag": {"type": "string", "minLength": 1},
+                        # Canonical repo-relative file path the artifact
+                        # SHOULD live at.
+                        "path": {"type": "string", "minLength": 1},
+                    },
+                },
             },
         },
     },
@@ -5258,6 +5296,30 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
                 "best-fitting category. If they produce genuinely "
                 "different deliverables, keep both."
             )
+    # A distinct risk from the same-intent overlaps above: a code category
+    # (bug-fixing / feature-implementation / refactoring) selected alongside
+    # `testing` does NOT describe one intent under two labels — the
+    # deliverables genuinely differ (a fix vs. its test). The collision is on
+    # *test-file ownership*: the code planner and the testing planner, running
+    # blind to each other, can both author or rewrite the SAME test file with
+    # contradictory contracts, which the plan-overlap judge then correctly
+    # refuses as unresolvable (the barnacle fake-timer incident). Advisory:
+    # nudge the classifier to keep the source fix and the test assertions in
+    # separate, non-overlapping file surfaces.
+    _TEST_OWNERSHIP_RISK_CODE_CATS = (
+        "bug-fixing", "feature-implementation", "refactoring")
+    if "testing" in cats_set:
+        for code_cat in _TEST_OWNERSHIP_RISK_CODE_CATS:
+            if code_cat in cats_set:
+                issues.append(
+                    f"TEST_OWNERSHIP_RISK: {code_cat!r} and 'testing' both "
+                    "selected — the two planners run blind to each other and "
+                    "can both author/rewrite the SAME test file with "
+                    "incompatible contracts, which the plan-overlap judge "
+                    "refuses as unresolvable (a real prior incident). Ensure "
+                    "the code planner owns the source change and the testing "
+                    "planner owns the assertions, on non-overlapping files."
+                )
     # The classifier's `classification` self-score is NO LONGER a gating axis
     # (DESIGN §8 *Independent adversarial verification*): a worker grading its
     # own output cannot find its own blind spot, so the authoritative gate is
@@ -7500,6 +7562,75 @@ def warn_provider_subset_subtasks(plans: list[dict]) -> None:
             f"[{preds_str}]")
 
 
+def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
+    """Advisory plan-time warning (DESIGN §5): flag a `test-`-domain subtask
+    that declares NO cross-subtask edge at all (`requires` and `depends_on`
+    both empty) while the plan contains code subtasks that produce artifacts.
+
+    This is the dominant real defect behind the two 2026-07-29 wiring-gate
+    deaths: a testing planner, running blind to the code planners, authored a
+    test whose success genuinely depends on a not-yet-created source file, but
+    declared no `requires`/`depends_on` on the producer. The scheduler may then
+    run the test before its producer, and the wiring gate correctly die()s.
+
+    Why this is an ADVISORY warning and not a deterministic auto-add: the
+    missing dependency is SEMANTIC, not structural. Measured against the real
+    failures, the test file and the producer file share no path (the test owns
+    `foo.test.ts`; the producer creates `foo-impl.ts` under a different dir, or
+    the code site lives inside a large shared module), so no `files_likely_
+    touched`-overlap predicate can recover the edge — and raw file overlap is
+    explicitly an unreliable dependency signal (see
+    `warn_provider_subset_subtasks`). §12 assigns such prose-only facts to a
+    worker: the `wiring_judge` remains the enforcer. This warning only surfaces
+    the high-risk shape one phase earlier, and the `planner.md` rule reduces how
+    often planners emit it.
+
+    Heuristic (deliberately broad but low-noise): a test subtask with zero
+    declared edges is almost always under-wired — a test tests *something*, and
+    in a multi-subtask plan that something is usually another subtask's output.
+    We do not attempt to name the producer (that requires the semantic judgment
+    we are explicitly deferring); we flag the missing declaration. Silent when
+    the test declares any edge, when there are no other producing subtasks, or
+    on a single-subtask plan. Pure function; mirrors
+    `warn_provider_subset_subtasks`."""
+    all_subtasks: list[dict] = [
+        s for plan in plans for s in (plan.get("subtasks", []) or [])
+    ]
+    if len(all_subtasks) < 2:
+        return
+    # A "producer" is any subtask that declares provides or touches files —
+    # i.e. something a test could depend on. Excludes the test itself below.
+    def _is_producer(s: dict) -> bool:
+        return bool((s.get("provides") or []) or
+                    (s.get("files_likely_touched") or []))
+
+    flagged: list[str] = []
+    for s in all_subtasks:
+        sid = s.get("id", "?")
+        # Testing-domain subtasks carry the `test-` id prefix (CATEGORY_ABBREV).
+        if not sid.startswith("test-"):
+            continue
+        has_edge = bool((s.get("requires") or []) or (s.get("depends_on") or []))
+        if has_edge:
+            continue
+        # Only warn if some OTHER subtask is a plausible producer.
+        others_produce = any(
+            o.get("id") != sid and _is_producer(o) for o in all_subtasks)
+        if others_produce:
+            flagged.append(sid)
+
+    if not flagged:
+        return
+    log(f"⚠  under-wired test subtask(s): {len(flagged)} `test-` subtask(s) "
+        "declare no requires/depends_on while the plan has producing subtasks. "
+        "A test that needs a not-yet-created source file but declares no edge "
+        "will be scheduled before its producer and the wiring gate will die() "
+        "on it. Ensure each test requires/depends_on the subtask that produces "
+        "every file or behavior it targets (DESIGN §5).")
+    for sid in sorted(flagged):
+        log(f"     {sid}: requires=[] depends_on=[]")
+
+
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
@@ -7711,6 +7842,40 @@ async def filter_satisfied_subtasks(
     # sid → drop record; only satisfied subtasks land here.
     dropped: dict[str, dict] = {}
 
+    # Sibling-invalidation context (DESIGN §8 *The sibling-invalidation case*).
+    # A subtask can be satisfied on the base tree NOW yet be broken mid-run by
+    # another subtask in the same plan (e.g. a parity/coverage test dropped as
+    # already-satisfied while a feature subtask adds the keys/files it guards).
+    # The base-tree-only probe is structurally blind to this, so we hand it the
+    # other subtasks' declared surface (provides + files_likely_touched) as
+    # context for a *keep* decision only — never a substitute for judging the
+    # tree. This is a static snapshot of ALL other subtasks taken before the
+    # sweep runs (drops are decided concurrently as probes return, so we do not
+    # yet know which siblings will themselves be dropped — that is fine: the
+    # snapshot only ever drives the safe direction, a keep). Computed once
+    # (plan-static); each probe sees every OTHER subtask's surface (keyed by sid
+    # so a subtask never counts itself as its own sibling).
+    all_subtasks: list[dict] = [
+        s for plan in plans for s in (plan.get("subtasks", []) or [])
+    ]
+    sibling_surface: dict[str, list[dict]] = {}
+    for s in all_subtasks:
+        sid_s = s.get("id", "?")
+        others = []
+        for o in all_subtasks:
+            if o.get("id", "?") == sid_s:
+                continue
+            prov = list(o.get("provides") or [])
+            files = list(o.get("files_likely_touched") or [])
+            if prov or files:
+                others.append({
+                    "id": o.get("id", "?"),
+                    "title": o.get("title", ""),
+                    "provides": prov,
+                    "files_likely_touched": files,
+                })
+        sibling_surface[sid_s] = others
+
     async def probe_one(s: dict) -> None:
         sid = s.get("id", "?")
         cached = cache.get(sid)
@@ -7734,12 +7899,22 @@ async def filter_satisfied_subtasks(
             "success_criteria_seed": s.get("success_criteria_seed", ""),
             "files_likely_touched": list(
                 s.get("files_likely_touched", []) or []),
+            # Other subtasks' declared surface — context for the
+            # sibling-invalidation keep decision (DESIGN §8). Not read for the
+            # base-tree judgment itself; only to decline a drop when a sibling
+            # would break the criteria. (A pre-sweep snapshot of every other
+            # subtask; which of them will themselves be dropped is not yet
+            # known, and does not matter — the field only drives keeps.)
+            "surviving_siblings": sibling_surface.get(sid, []),
         }
         user_prompt = (
             "SUBTASK:\n" + json.dumps(payload, indent=2) +
             "\n\nReturn only the JSON object per your schema. Judge the "
             "CURRENT working tree / HEAD only — never other branches or "
-            "history. Default satisfied=false on any uncertainty."
+            "history. Default satisfied=false on any uncertainty. Also default "
+            "satisfied=false if any entry in surviving_siblings would "
+            "invalidate these criteria once its work lands (e.g. a sibling "
+            "adds keys/files this subtask's test or check guards)."
         )
         async with sem:
             # bump_workers is OUTSIDE the try: its WorkerError signals
@@ -7770,13 +7945,21 @@ async def filter_satisfied_subtasks(
         # Persist the verdict as soon as it returns — for BOTH satisfied
         # and not-satisfied outcomes — rather than only in aggregate after
         # the whole sweep's gather completes. This is the resume gap: a
-        # pause mid-sweep must not re-probe subtasks already decided.
+        # pause mid-sweep must not re-probe subtasks already decided. The
+        # in-memory write alone is not enough — st.data only reaches disk
+        # via st.save(), so without the save below a pause between this
+        # probe and the sweep-final flush (~7 lines down, after
+        # gather_or_cancel) discards every since-flush verdict and resume
+        # re-probes them. The single-event-loop invariant (CLAUDE.md) means
+        # this data-write / save pair never interleaves with another
+        # coroutine, so the per-verdict save is safe here.
         cache[sid] = {
             "satisfied": bool(out.get("satisfied") is True),
             "evidence": out.get("evidence", ""),
             "checked": list(out.get("checked", []) or []),
             "base_sha": base_sha,
         }
+        st.save()
         if out.get("satisfied") is True:
             dropped[sid] = {
                 "reason": "already_satisfied",
@@ -13891,6 +14074,91 @@ def _select_best_planner_sample(
     return winner[3]
 
 
+async def phase_artifact_registry(
+        task: str, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> list[dict]:
+    """Pre-planning shared-vocabulary step (DESIGN §5 *Artifact-registry
+    worker*). Runs ONCE after classify, before any planner. A single read-only
+    `artifact_registry` worker reads the task plus the global repo-map (ranked
+    to fit the token budget, with no task-file seeding — unlike `phase_plan`'s
+    own repo-map injection, this one is naming artifacts broadly rather than
+    around specific files) and emits a small canonical list of
+    `{description, tag, path}` for the artifacts the task will plainly create.
+    That list is injected into every planner's context (in `phase_plan`) so
+    blind parallel planners prefer the same tag/path and the exact-string
+    `requires`↔`provides` matcher wires the cross-domain edge with no
+    reconciliation.
+
+    Best-effort and non-fatal: this is a purely advisory aid (planners are
+    asked to prefer the registry, never forced), so any failure — the worker
+    crashing every round, or a worker result that genuinely finds nothing to
+    register — returns `[]` and the run proceeds exactly as it did before the
+    registry existed. `--skip-repo-map` only suppresses the repo-map context
+    handed to the worker (mirroring `phase_plan`'s own degrade); the worker
+    still runs on the task alone and can still return a non-empty list. Never
+    die()s. Returns the artifacts list (also persisted to
+    `st.data["artifact_registry"]` by the caller's checkpoint block)."""
+    # Stamp current_phase before the RSS-heavy repo-map build below, so the
+    # memory sampler attributes that growth to this phase rather than the prior
+    # one (matches phase_plan, which stamps for the same reason).
+    st.data["current_phase"] = "phase 2: artifact registry"
+    st.save()
+    repo_root = Path(os.getcwd())
+    sys_prompt = load_prompt("artifact_registry")
+
+    # Reuse the P6 repo-map for grounding, ranked to fit the token budget only —
+    # no task-file seeds (unlike phase_plan's own repo-map injection), since the
+    # registry is naming artifacts broadly rather than around specific files.
+    # Degrades silently.
+    ctx_dict: dict = {"task": task}
+    if not st.data.get("skip_repo_map"):
+        try:
+            repo_map = build_repo_map(repo_root, st.leerie_root)
+            ranked = rank_repo_map(repo_map, [], [])
+            if ranked:
+                ctx_dict["repo_map"] = ranked
+        except Exception:
+            pass  # degrade silently; the worker runs without the map
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            "CONTEXT:\n" + json.dumps(ctx_dict, indent=2) +
+            "\n\nEmit the canonical artifact vocabulary per your schema. "
+            "Keep it short and high-confidence; empty `artifacts` is valid "
+            "when the task creates nothing two planners would need to name "
+            "the same way."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="artifact_registry", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=20, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("artifact_registry", MODEL_DEFAULT),
+            effort=efforts.get("artifact_registry"), sid="artifact_registry",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    # No gating check — the schema validation inside claude_p is the only
+    # correctness bar. _run_checked_loop still gives the bounded fresh-session
+    # retry on a WorkerError (infra crash). check returns no issues ever.
+    result, _warnings = await _run_checked_loop(
+        invoke=_invoke, check=lambda _r: [], name="artifact_registry",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    if result is None:
+        log("  artifact-registry: worker crashed every round; degrading "
+            "(planners run without the shared vocabulary) — non-fatal")
+        return []
+    artifacts = [
+        a for a in (result.get("artifacts") or [])
+        if isinstance(a, dict) and a.get("tag") and a.get("path")
+    ]
+    log(f"phase 2: artifact registry — {len(artifacts)} canonical "
+        "artifact(s) for planner vocabulary")
+    return artifacts
+
+
 async def phase_plan(task: str, st: State, caps: dict,
                      models: dict[str, str],
                      efforts: dict[str, str | None]) -> list[dict]:
@@ -13941,6 +14209,17 @@ async def phase_plan(task: str, st: State, caps: dict,
     prescribed_procedure = st.data.get("prescribed_procedure") or {}
     if prescribed_procedure.get("is_prescribed"):
         ctx_dict["prescribed_procedure"] = prescribed_procedure
+    # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
+    # A pre-planning canonical {description, tag, path} list, injected into
+    # EVERY planner's ctx (built once, shared across all plan_one calls) so
+    # blind parallel planners prefer the same tag/path for the same artifact
+    # and the exact-string requires↔provides matcher wires the edge. Advisory:
+    # the planner prompt asks planners to prefer these, never forces them.
+    # Omitted when the registry is empty or absent (skipped / worker failed),
+    # so a run without it degrades to the pre-existing behavior.
+    artifact_registry = st.data.get("artifact_registry") or []
+    if artifact_registry:
+        ctx_dict["artifact_registry"] = artifact_registry
     # The built global symbol graph is reused (once) for BOTH the planner ctx
     # (ranked to the task seeds) and the P1 recursion (re-ranked per node —
     # DESIGN §5½). None when skipped or the build fails → graceful degrade.
@@ -17684,10 +17963,12 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "\nAn independent review found the plan's declared dependency "
             "edges do not match the work the subtasks actually need (a subtask "
             "that should require a capability it never declares, or a merge/"
-            "drop that severed a real dependency). Add the missing "
-            "requires/provides/depends_on to the plan, refine the task so the "
-            "cross-subtask dependencies are unambiguous, or re-run with "
-            "--skip-overlap-judge to bypass reconciliation gates."
+            "drop that severed a real dependency). This is a correctness gate "
+            "with no bypass flag: add the missing requires/provides/depends_on "
+            "to the plan, or refine the task so the cross-subtask dependencies "
+            "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
+            "bypass this gate — it only skips the phase 2¾ overlap judge, which "
+            "runs earlier and independently.)"
         )
 
     st.data["wiring_gate"] = judge_result
@@ -21914,6 +22195,18 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # State works.
             gather_answers(st, supplied)
 
+        # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
+        # Runs after classify (so it has the task) and before phase_plan (so
+        # every planner sees it). Its own checkpoint key mirrors the
+        # plans_after_* resume-cursor pattern: computed once, persisted, and
+        # skipped on resume. Best-effort — phase_artifact_registry never
+        # die()s and returns [] on any failure, so an empty registry is a
+        # valid completed state (key present, value []), not a redo signal.
+        if "artifact_registry" not in st.data:
+            st.data["artifact_registry"] = await phase_artifact_registry(
+                task, st, caps, models, efforts)
+            st.save()
+
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-recursive-decompose
@@ -22015,6 +22308,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # mid-run satisfied rescue in settle_subtask is the actual
             # safety net.
             warn_provider_subset_subtasks(plans)
+            # Flag a test subtask that declares no cross-subtask edge while
+            # the plan has producing subtasks — the dominant real cause of the
+            # wiring-gate deaths (a test needing a not-yet-created source file
+            # but declaring no requires/depends_on). Advisory; the wiring gate
+            # is the enforcer (DESIGN §5).
+            warn_test_subtask_missing_producer_edge(plans)
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
             # drop so the surviving subtasks proceed; the drop is

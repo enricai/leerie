@@ -276,6 +276,64 @@ It is reconciled by the orchestrator with three mechanisms:
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
   graph, and applies the worker's output mechanically.
 
+  **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
+  the reconciler).** "No enforced dictionary" (above) is what makes blind
+  parallel planning possible, and it is deliberately kept: no planner is
+  *required* to bind to a canonical name, and the reconciler remains the
+  authority that bridges whatever drift survives. But letting every planner
+  invent its own tag *and* file path for the same artifact makes the
+  reconciler's job larger than it needs to be, and — worse — produces path
+  disagreements the reconciler does not even attempt (it bridges the tag
+  channel, not `files_likely_touched`; §5 *Cross-domain surface overlap*).
+  So *before* the planners run, a single read-only `artifact_registry`
+  worker reads the task plus the global repo-map (ranked to fit the token
+  budget — unlike the planner's own repo-map injection, this one carries no
+  task-file seeding, since the registry is naming artifacts broadly rather
+  than around specific files) and emits a small canonical list of the
+  artifacts the task will plainly create — each with one suggested
+  capability tag and one suggested file path. That registry is
+  injected into **every** planner's context with an instruction to *prefer*
+  the canonical tag/path when it produces or consumes a listed artifact.
+  This is strictly advisory and strictly additive: a planner may still
+  invent names for anything the registry did not foresee (the registry
+  covers only what is knowable pre-decomposition — a hook, a component, a
+  route — not the long tail a planner discovers while decomposing), the
+  reconciler still runs and still bridges the remainder, and the wiring gate
+  is still the backstop. Its only job is to raise the *rate* at which two
+  blind planners land on the same string, so the exact-string
+  `requires`↔`provides` matcher wires the edge with no reconciliation
+  needed. It does **not** enforce, gate, or die(); a planner that ignores it
+  is not penalized, only reconciled as before. (Empirically, the registry
+  alone does not prevent a missing-edge wiring death — a planner must also
+  *declare* the edge, §5 *Test subtasks must wire to their producers* — so
+  the registry's value is the reduced-drift/reduced-reconciler-load half,
+  paired with the planner-side declaration discipline.)
+
+  **Test subtasks must wire to their producers (planner discipline +
+  advisory).** The registry above raises the *rate* at which two planners
+  agree on a name, but an edge only forms when the consumer actually
+  *declares* it. The dominant real cause of a plan-time wiring failure is a
+  `testing`-domain subtask that exercises a file, symbol, or behavior another
+  subtask creates yet declares neither a `requires` capability tag nor a
+  `depends_on` id for it — so the scheduler may run the test before its
+  producer and the wiring gate (*A wiring re-check on the fully-merged plan*)
+  correctly rejects the plan. This includes *indirect* guards: a
+  coverage-floor or parity test that must enumerate the new source files a
+  feature subtask adds depends on that feature subtask even though the test
+  file and the source file are different paths. The discipline is prompt-side
+  — the planner is instructed to declare a `requires`/`depends_on` on the
+  producer of every not-yet-existing artifact a test targets — because the
+  dependency is *semantic*: the test's own `files_likely_touched` need not
+  overlap the producer's, so no mechanical file-set predicate can recover the
+  edge (raw file overlap is explicitly an unreliable dependency signal;
+  *Provider-subset subtasks*), and §12 assigns such prose-only facts to a
+  worker rather than to a Python inference. A deterministic
+  `warn_test_subtask_missing_producer_edge` surfaces the high-risk shape (a
+  `test-` subtask with no declared edge while producing subtasks exist) one
+  phase earlier as an advisory; the wiring gate remains the enforcer. This is
+  the consumer-side half the artifact registry (a producer/name-agreement aid)
+  does not by itself supply.
+
   **Dead-subtask elimination (code-enforced).** A planner can emit
   `requires: {tag, extent: in_plan}` for a capability it expects another
   domain to produce. If that domain returns 0 subtasks, the requires is
@@ -4298,6 +4356,39 @@ has no commits to make either way. The mid-run *sibling* case is the one that
 motivated the fix; the base-satisfied case is the same code path with the same
 correct outcome.
 
+**The sibling-invalidation case (why a pre-schedule drop must weigh
+survivors).** The two sibling cases above both concern a sibling that
+*satisfies* a subtask. There is a third, opposite hazard the pre-schedule probe
+was originally blind to: a subtask whose criteria are met on the base tree
+*now*, but which a **surviving sibling in the same plan will invalidate**.
+Concretely: a parity/coverage-floor test passes on the seeded base, so the
+probe soft-drops it as `already_satisfied` — but a surviving feature subtask
+adds the keys/files the test guards, turning it red, and no survivor owns that
+test file. The drop silently removes the only subtask that would have kept the
+suite green. This is not the same as the safe base-satisfied case: there the
+dropped subtask's deliverable already exists and nothing in the plan disturbs
+it; here a *committed sibling* will break the dropped subtask's guarantee
+mid-run.
+
+The base-tree-only discipline (correct for the cross-run case) is exactly what
+makes the probe blind to this: judging only the current checkout, it cannot see
+that a *sibling's* pending work will change that checkout. The resolution keeps
+the base-tree rule but gives the probe the one piece of plan-level context it
+needs to reason about invalidation: the **surviving siblings' declared
+surface** (`provides` and `files_likely_touched`). The probe is asked, as part
+of its verdict, whether any surviving sibling's work would invalidate the
+criteria it just judged met — and if so, it declines the drop (defaults to
+*not satisfied*, the same safe direction as every other uncertainty). This is
+strictly additive to the base-tree judgment: the probe still measures the tree
+only; the sibling surface is context for a *keep* decision, never a substitute
+for reading other branches. A mechanical `files_likely_touched`-intersection
+rule was considered and rejected: the motivating case has none — the test owns
+`nav-parity.test.ts` while the feature edits `messages/*.json`, disjoint file
+sets whose dependency lives only in the test's intent — so a file-overlap
+predicate would silently miss exactly the case this fix exists for. The
+judgment (does a survivor invalidate this?) is left to the worker entirely; it
+is the sole mechanism, not one signal among several.
+
 **Why this is §12-compliant, not an LLM breaching a mechanical gate.** The
 guarantee "a lazy/broken worker that did nothing is caught" stays mechanical:
 `check_branch_has_commits` fires first and unchanged, and the probe can only
@@ -5349,13 +5440,15 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the fifteen worker types in
+Every main-loop LLM call in Leerie passes through one of the sixteen worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
-`wiring_judge`, or `provision_judge` (`fit_judge`/`splitter` are the P1
-recursive-decomposition workers — see §5½; the last three are the independent
-adversarial verifiers — see §8). Each worker type is a distinct **call type** — a
+`wiring_judge`, `provision_judge`, or `artifact_registry` (`fit_judge`/`splitter` are the P1
+recursive-decomposition workers — see §5½; `classification_judge`,
+`wiring_judge`, and `provision_judge` are the independent adversarial verifiers
+— see §8; `artifact_registry` is the pre-planning shared-vocabulary worker —
+see §5). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,

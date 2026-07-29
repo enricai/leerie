@@ -219,6 +219,71 @@ def test_probe_crash_fails_safe_keeps_subtask(leerie, tmp_path, monkeypatch):
     assert "feat-001" not in st.data.get("dropped_subtasks", {})
 
 
+# ---------------------------------------------------------------------------
+# Fix 5 — sibling-invalidation context (DESIGN §8 *The sibling-invalidation
+# case*). The probe payload must carry every OTHER subtask's declared surface
+# (provides + files_likely_touched), keyed so a subtask never sees itself, and
+# a probe that returns satisfied=false on an invalidation must keep the subtask.
+# ---------------------------------------------------------------------------
+
+def test_probe_payload_carries_surviving_siblings_excluding_self(
+        leerie, tmp_path, monkeypatch):
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready", "subtasks": [
+        _sub("test-007", files_likely_touched=["src/tests/nav-parity.test.ts"],
+             provides=["nav-parity-guarded"]),
+        _sub("feat-001", files_likely_touched=["messages/en.json"],
+             provides=["nav-keys-added"]),
+    ]}]
+    seen: dict[str, dict] = {}
+
+    async def capturing_claude_p(*, user_prompt, sid, **_kw):
+        stid = sid.split("satisfied_probe-", 1)[-1]
+        seen[stid] = json.loads(user_prompt.split("SUBTASK:\n", 1)[1]
+                                .rsplit("\n\n", 1)[0])
+        return {"satisfied": False, "evidence": "n/a"}
+    monkeypatch.setattr(leerie, "claude_p", capturing_claude_p)
+
+    _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+
+    # Each probe sees the OTHER subtask as a surviving sibling, never itself.
+    t007_sibs = {s["id"] for s in seen["test-007"]["surviving_siblings"]}
+    assert t007_sibs == {"feat-001"}
+    feat_sibs = {s["id"] for s in seen["feat-001"]["surviving_siblings"]}
+    assert feat_sibs == {"test-007"}
+    # The sibling surface carries provides + files (for the keep judgment).
+    fe = seen["test-007"]["surviving_siblings"][0]
+    assert fe["provides"] == ["nav-keys-added"]
+    assert fe["files_likely_touched"] == ["messages/en.json"]
+
+
+def test_sibling_invalidation_verdict_keeps_the_dropped_test(
+        leerie, tmp_path, monkeypatch):
+    """The funeralworks shape: test-007 passes on the base tree (would be
+    dropped) but feat-001 will invalidate it. When the probe returns
+    satisfied=false (its sibling-invalidation guard firing), the test subtask
+    is KEPT, not silently dropped."""
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready", "subtasks": [
+        _sub("test-007", files_likely_touched=["src/tests/nav-parity.test.ts"]),
+        _sub("feat-001", files_likely_touched=["messages/en.json"],
+             provides=["nav-keys-added"]),
+    ]}]
+    _patch_probe(leerie, monkeypatch, {
+        # Probe declines the drop because feat-001 would invalidate the test.
+        "test-007": {"satisfied": False,
+                     "evidence": "feat-001 adds keys this parity test guards"},
+        "feat-001": {"satisfied": False, "evidence": "keys missing"},
+    })
+    res = _run(leerie.filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
+    assert res is None
+    surviving = [s["id"] for s in plans[0]["subtasks"]]
+    assert "test-007" in surviving  # kept, not silently dropped
+    assert "test-007" not in st.data.get("dropped_subtasks", {})
+
+
 def test_budget_exhaustion_propagates_not_swallowed(leerie, tmp_path,
                                                     monkeypatch):
     """bump_workers' WorkerError (budget exhaustion) is the hard backstop —

@@ -136,6 +136,45 @@ class TestCheckClassifierOutput:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert not any("SAME_WORK_RISK" in i for i in issues)
 
+    # TEST_OWNERSHIP_RISK: a code category + testing can collide on test-file
+    # ownership (the barnacle fake-timer incident). Distinct label from
+    # SAME_WORK_RISK (those are same-intent overlaps); bug+testing correctly
+    # produces NO SAME_WORK_RISK (test above) but DOES produce this advisory.
+    def test_test_ownership_risk_bug_and_testing(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "testing"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("TEST_OWNERSHIP_RISK" in i for i in issues)
+        # And it is NOT mislabeled as a same-intent overlap.
+        assert not any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_test_ownership_risk_feature_and_testing(self, leerie, tmp_path):
+        result = {"categories": ["feature-implementation", "testing"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
+    def test_test_ownership_risk_refactoring_and_testing(self, leerie, tmp_path):
+        result = {"categories": ["refactoring", "testing"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
+    def test_no_test_ownership_risk_without_testing(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "feature-implementation"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
+    def test_no_test_ownership_risk_testing_alone(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
+    def test_no_test_ownership_risk_testing_and_docs(self, leerie, tmp_path):
+        # documentation is not a code category — no test-file ownership clash.
+        result = {"categories": ["documentation", "testing"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
 
 # --- check_planner_output ---------------------------------------------- #
 

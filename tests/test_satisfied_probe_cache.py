@@ -28,6 +28,7 @@ assertions are per-sid call counts, never aggregate.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 
@@ -221,3 +222,69 @@ def test_crash_keeps_subtask_and_writes_no_cache_entry(
     # subtask survived — a version that both keeps AND caches the crash as
     # a false "kept" verdict would still pass a survives-only assertion.
     assert "feat-crash" not in st.data.get("satisfied_probe_cache", {})
+
+
+# ---------------------------------------------------------------------------
+# 5: the mid-sweep durability guarantee (Fix 1 / the leerie run's bugfix-001).
+# probe_one must st.save() each verdict AS IT RETURNS, not only at the
+# post-gather flush — otherwise a pause between one probe finishing and the
+# whole sweep completing discards that verdict and resume re-probes it.
+#
+# The falsifier: removing the `st.save()` after the `cache[sid]={...}` write
+# in probe_one makes this test fail — with the save gone, the on-disk
+# state.json carries no verdict until gather_or_cancel completes, so the
+# in-flight read below sees an empty cache.
+# ---------------------------------------------------------------------------
+
+def test_verdict_reaches_disk_before_the_sweep_completes(
+        leerie, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    sha = _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-fast"), _sub("feat-slow")]}]
+
+    # feat-slow blocks until feat-fast's verdict has been SAVED to disk, then
+    # inspects the on-disk state.json. Because feat-slow's coroutine has not
+    # returned at that point, the sweep-final flush (after gather_or_cancel)
+    # cannot have run yet — so any verdict seen on disk got there via the
+    # per-verdict save inside probe_one.
+    #
+    # The event is fired from a wrapped st.save() (not from inside claude_p),
+    # so it signals AFTER probe_one has written cache[sid] and saved — the
+    # exact seam under test. It fires only once feat-fast's verdict is present
+    # in st.data, ignoring the pre-sweep and bump_workers saves.
+    fast_saved = asyncio.Event()
+    inspected = asyncio.Event()
+    seen_on_disk: dict[str, dict] = {}
+    real_save = st.save
+
+    def wrapped_save():
+        real_save()
+        if "feat-fast" in st.data.get("satisfied_probe_cache", {}):
+            fast_saved.set()
+    monkeypatch.setattr(st, "save", wrapped_save)
+
+    async def fake_claude_p(*, user_prompt, sid, **_kw):
+        stid = sid.split("satisfied_probe-", 1)[-1]
+        if stid == "feat-fast":
+            return {"satisfied": False, "evidence": "still needed",
+                    "checked": ["a.py"]}
+        # feat-slow: wait until feat-fast's verdict is durable, then read disk.
+        await fast_saved.wait()
+        on_disk = json.loads(st.path.read_text())
+        seen_on_disk.update(on_disk.get("satisfied_probe_cache", {}))
+        inspected.set()
+        return {"satisfied": False, "evidence": "slow", "checked": []}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    _run(leerie.filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+
+    assert inspected.is_set()
+    # feat-fast's verdict was on disk while feat-slow's probe was still in
+    # flight — i.e. before the post-gather flush ran.
+    assert seen_on_disk.get("feat-fast") == {
+        "satisfied": False, "evidence": "still needed",
+        "checked": ["a.py"], "base_sha": sha,
+    }

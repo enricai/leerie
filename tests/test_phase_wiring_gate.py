@@ -61,6 +61,19 @@ class TestWiring:
         src = inspect.getsource(leerie.phase_wiring_gate)
         assert "die(" in src
 
+    def test_die_message_does_not_recommend_skip_overlap_judge(self, leerie):
+        """The wiring gate is a distinct, later gate than the overlap judge;
+        --skip-overlap-judge does NOT bypass it (there is no skip guard in
+        phase_wiring_gate). The die() message must not advise it as a bypass —
+        an operator who follows that advice re-runs and re-dies on the same
+        defect. It may still name the flag to explain what it does NOT do."""
+        src = inspect.getsource(leerie.phase_wiring_gate)
+        # The die() text must not present --skip-overlap-judge as a way to
+        # "bypass" this gate. Assert the retired bypass phrasing is gone.
+        assert "to bypass reconciliation gates" not in src
+        # And the message must state this gate has no bypass flag.
+        assert "no bypass flag" in src
+
     def test_deterministic_check_and_gate_both_in_run_phases(self, leerie):
         src = inspect.getsource(leerie._run_phases)
         assert "await phase_wiring_gate(" in src

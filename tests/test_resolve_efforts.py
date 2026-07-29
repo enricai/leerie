@@ -263,6 +263,9 @@ def test_judgment_workers_pinned_set(leerie):
         # authoritative gate replacing a self-graded confidence axis, so each
         # runs on the judgment tier at the same `medium` post-Opus-5 default.
         "classification_judge", "wiring_judge", "provision_judge",
+        # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
+        # worker*) — a judgment worker (decides tag/path per artifact).
+        "artifact_registry",
     }
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER

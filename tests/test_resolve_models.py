@@ -26,7 +26,8 @@ import pytest
 WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "satisfied_probe", "provision", "implementer", "integrator",
            "conformer", "fit_judge", "splitter", "adherence_judge",
-           "classification_judge", "wiring_judge", "provision_judge")
+           "classification_judge", "wiring_judge", "provision_judge",
+           "artifact_registry")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
@@ -45,6 +46,7 @@ DEFAULTS = {
     "classification_judge": "opus",
     "wiring_judge": "opus",
     "provision_judge": "opus",
+    "artifact_registry": "opus",
 }
 
 
