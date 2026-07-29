@@ -1228,6 +1228,36 @@ the source; and that a state.json with no progress at all (no
 `categories`, no `waves` — never reached the first `st.save()` after
 `phase_classify` started) is the one case that still `die()`s, since there
 is nothing to resume from.
+`tests/test_resume_planning_regression.py` is a narrower, deliberately
+end-to-end regression lock on top of `test_resume_planning_reentry.py`'s
+per-phase stub sweep: rather than stubbing every phase to assert call
+counts, it drives `_run_phases` with only the phases upstream of
+`filter_satisfied_subtasks`/`schedule` stubbed, leaving
+`filter_satisfied_subtasks`, `schedule`, `check_budget_feasibility`, and
+`write_plan` REAL (against a real temp git repo, for the `base_sha`
+scoping `satisfied_probe_cache` needs) — so its four scenarios prove the
+fix composes end-to-end, not merely that each phase's skip-flag is
+individually wired. (a) reproduces the reported incident shape verbatim:
+`current_phase` at the satisfied-probe sweep with a partial
+`satisfied_probe_cache` resumes, re-probes only the uncached sids (via
+`claude_p` call tracking), and reaches scheduling with no die(); a paired
+falsification test replays the retired `"waves" not in st.data` gate
+against the same state shape and confirms it would have died with the
+exact historical message, proving (a) exercises the fixed path rather
+than passing vacuously. (b) reruns a real `check_budget_feasibility` twice
+against the same seeded `plan_snapshot` — once under a low
+`max_total_workers` (dies, as expected) and once under a raised cap on a
+fresh `State` reload (mirroring a real second `--resume` invocation) —
+and asserts `write_plan` runs exactly once and no upstream planning phase
+re-runs. (c) asserts a `waves`-present resume reaches `phase_execute` with
+zero calls to every planning phase, `filter_satisfied_subtasks`,
+`check_budget_feasibility`, `validate_plan`, and `write_plan`. (d) covers
+both early-return guards, including the case where planning checkpoints
+ARE present but `no_work_required` still wins ahead of any rehydration.
+A final grep guard (prior art `tests/test_ec2_launcher_dispatch_e2e.py`)
+asserts neither retired die() string survives as a live `die(...)` call
+in `leerie.py` (a trailing comment referencing the old behavior by name is
+permitted).
 The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
 in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
 CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
