@@ -1157,6 +1157,25 @@ that in-memory dict is what the real `--resume` path reads. Deliberately
 its own file rather than folded into either of the above two, per its
 narrow scope: pure state-surface assertions, no phase control flow, no
 stubbed workers, no async.
+**Contributor discipline for adding a new checkpoint/state key:**
+`STATE_FIELDS` (`orchestrator/leerie.py:259`) is a static allowlist
+checked by `tests/test_state_fields.py`, not a runtime filter —
+`State.load()` reads the whole on-disk `state.json` unconditionally, so
+an undeclared key is not silently dropped on `--resume`. What actually
+happens is louder: `test_state_fields.py::test_every_st_data_write_is_declared`
+fails the moment a new `st.data["x"] = ...` write lands without a
+matching `STATE_FIELDS` entry, and `test_state_fields_matches_spec_table`
+fails if the IMPLEMENTATION.md §8 field table and `STATE_FIELDS` drift
+out of sync in either direction. The resumable-planning checkpoint keys
+above additionally get their own named guard-the-guard pins in
+`tests/test_resumable_planning_keys.py` rather than relying solely on
+the generic parity sweep, precisely so a future refactor that drops one
+of these seven keys specifically (versus any arbitrary state key) fails
+with a message naming the checkpoint feature, not just a generic diff.
+The practical rule: any new `st.data[...]` write — checkpoint or
+otherwise — must land in the same commit as its `STATE_FIELDS` entry and
+its IMPLEMENTATION.md §8 table row, or CI catches it immediately; there
+is no scenario where it merely resumes with stale/missing data.
 The checkpoint-writing half — `_run_phases`'s fresh-run branch persisting
 each `plans_after_*` key immediately after its producing phase returns —
 is pinned in `tests/test_plans_after_checkpoints.py` via the same
