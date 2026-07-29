@@ -251,7 +251,7 @@ def test_post_run_workers_resolved(leerie, repo_root, monkeypatch):
 
 
 def test_judgment_workers_pinned_set(leerie):
-    """Pins which workers default to 'high'. Adding a worker to the
+    """Pins which workers default to 'medium'. Adding a worker to the
     judgment set should be a deliberate decision, not a silent drift.
     Acting workers (implementer, conformer) must stay absent — their
     reasoning depth is bounded by the DESIGN §8 evidence gate."""
