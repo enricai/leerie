@@ -116,6 +116,25 @@ DEFAULT_CAPS = {
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
     "conformance_rounds": 3,
+    # Implementer completeness re-drives per subtask (DESIGN §9 *The one
+    # gating axis: solution completeness*). Bounds the loop in
+    # `settle_subtask` that re-drives the implementer when the conformer's
+    # gating `solution_defects` axis found concrete behavioral gaps in the
+    # implementer's diff. A SEPARATE counter from conformance_rounds,
+    # implementer_confidence_retries, failed_retries, and
+    # subtask_continuations — the completeness loop must not silently consume
+    # another budget (a self-graded axis that could borrow the confidence
+    # budget is exactly the class of bug this change removes). Exhaustion is
+    # *terminal*: the subtask returns `blocked` with the residual defects
+    # named (fix + --resume), never silently advisory. This is the
+    # per-subtask analog of the plan-phase gates' die()-on-exhaustion, but
+    # blocks a single subtask (partial-wave integration still proceeds,
+    # DESIGN §3) rather than the whole run. Default 1: the found defects are
+    # concrete and folded into the retry as mandatory criteria, so one
+    # corrective pass is the intended budget; raise it for repos where the
+    # implementer needs more attempts. Independent of --strict-conformer,
+    # which governs only the advisory build/lint/test/residual axes.
+    "completeness_retry_rounds": 1,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -200,16 +219,22 @@ DEFAULT_CAPS = {
     # at 2.0–2.31 calls/subtask (1 implementer + ~1.3 conformer rounds);
     # one died-mid-execution run logged 2.59 with prompts/{implementer,
     # conformer}.md §"Environmental issues are out of scope" not yet
-    # in effect (lint-fighting inflator). 2.5 covers the worst observed
-    # real ratio. NOT a runtime gate — consumed by the planner-output
-    # feasibility preflight only, never by `bump_workers()`.
-    "subtask_call_estimate": 2.5,
+    # in effect (lint-fighting inflator). 2.5 covered the worst observed
+    # real ratio before the per-subtask completeness gate; raised to 3.0
+    # to absorb it (DESIGN §9 *The one gating axis: solution completeness*):
+    # the conformer's `solution_defects` finding re-drives the implementer
+    # up to `completeness_retry_rounds` times, so an N-subtask run can add
+    # up to N extra implementer invocations that the preflight must foresee
+    # or a large plan hits the max_total_workers backstop mid-wave. NOT a
+    # runtime gate — consumed by the planner-output feasibility preflight
+    # only, never by `bump_workers()`.
+    "subtask_call_estimate": 3.0,
     # Multiplier applied to `total_estimate` inside
     # `check_budget_feasibility()` before comparison to
-    # `max_total_workers`. With the default `subtask_call_estimate=2.5`,
-    # the guaranteed cap headroom is ~1.44× — comfortably absorbs the
-    # observed worst case while still flagging the truly-unwinnable
-    # 29-subtask runs that motivated the preflight.
+    # `max_total_workers`. With the default `subtask_call_estimate=3.0`,
+    # the guaranteed cap headroom is ~1.20× — absorbs the observed worst
+    # case plus one completeness re-drive per subtask while still flagging
+    # the truly-unwinnable large runs that motivated the preflight.
     "budget_safety_margin": 1.15,
     # Repo-map token budget for the personalized-PageRank-ranked subgraph
     # injected into the planner and splitter (DESIGN §5½ (P6) *Codebase structural
@@ -268,6 +293,7 @@ STATE_FIELDS = (
     "dangerously_skip_permissions",
     "skip_overlap_judge",
     "skip_adherence_check",
+    "skip_completeness_check",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -333,6 +359,18 @@ STATE_FIELDS = (
     # (skip_adherence_check / no prescribed procedure) or the judge
     # crashed every round (degrade path returns without persisting this).
     "adherence_gate",
+    # classification_coverage_gate: audit record from phase_classification_gate
+    # (DESIGN §8 *Independent adversarial verification*) — the final
+    # classification_judge output. Absent when the judge crashed every round.
+    "classification_coverage_gate",
+    # wiring_gate: audit record from phase_wiring_gate (DESIGN §5 *A wiring
+    # re-check on the fully-merged plan*, §8) — the final wiring_judge output.
+    # Absent when the judge crashed every round.
+    "wiring_gate",
+    # provision_recipe_gate: audit record from phase_provision_gate (DESIGN §8,
+    # §6½) — the final provision_judge output. Absent when no recipe was
+    # detected (kind:none) or the judge crashed every round.
+    "provision_recipe_gate",
     # no_work_required / no_work_reasons: set by _finish_no_work_run when
     # every planner returns status="ready" with empty subtasks (DESIGN §8
     # *The cleared-but-empty terminal state*). The task is already
@@ -739,6 +777,21 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
 SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
+# --skip-completeness-check bypass (the conformer's gating solution_defects
+# axis — DESIGN §9 *The one gating axis: solution completeness*). Unlike the
+# per-subtask completeness retry (bounded by completeness_retry_rounds, blocks
+# one subtask), the FINAL-tree completeness gate in run_final_conformance is
+# always-on and die()s the whole run — a single hallucinated defect on the
+# integrated tree would otherwise block finalize with no escape, and each
+# --resume re-attacks. This flag makes both the per-subtask and final-tree
+# completeness gates advisory (found defects surface as warnings, never block/
+# die). Use only when the operator knows the completeness judge is producing
+# false positives for this repo. Resolution order: --skip-completeness-check
+# CLI flag → LEERIE_SKIP_COMPLETENESS_CHECK env → skip_completeness_check in
+# leerie.toml → False.
+SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
+SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by build_repo_map() so
 # only changed files are re-parsed on subsequent runs (Aider diskcache
@@ -856,11 +909,20 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "fit_judge": "medium",
     "splitter": "medium",
     "adherence_judge": "medium",
+    # Independent adversarial verifiers (DESIGN §8 *Independent adversarial
+    # verification*). Each is itself the authoritative gate that replaces a
+    # self-graded confidence axis, so it runs on the judgment tier (opus via
+    # the MODEL_DEFAULT fallback — absent from MODEL_DEFAULT_PER_WORKER) at the
+    # same `medium` effort every other judgment worker uses post-Opus-5.
+    "classification_judge": "medium",
+    "wiring_judge": "medium",
+    "provision_judge": "medium",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
-                "conformer", "fit_judge", "splitter", "adherence_judge")
+                "conformer", "fit_judge", "splitter", "adherence_judge",
+                "classification_judge", "wiring_judge", "provision_judge")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1413,6 +1475,7 @@ SCHEMAS: dict[str, dict] = {
             "rule_violations_fixed", "rule_violations_residual",
             "docs_updates", "tests_updates",
             "build", "lint", "tests", "summary", "confidence",
+            "solution_defects",
         ],
         "properties": {
             "subtask_id": {"type": "string"},
@@ -1467,11 +1530,55 @@ SCHEMAS: dict[str, dict] = {
             "lint": _CONFORMER_BLT_PROP,
             "tests": _CONFORMER_BLT_PROP,
             "summary": {"type": "string"},
+            # DESIGN §9 *The one gating axis: solution completeness*. The
+            # conformer's independent adversarial attack on the IMPLEMENTER's
+            # committed diff (which it did not write — its own conformance
+            # edits are a separate, later layer). Each entry names a concrete
+            # behavioral gap the diff does not handle: an unhandled input, a
+            # missing guard, a decoy/shortcut, a sibling call site left
+            # unedited. This is the ONE gating axis (build/lint/test and the
+            # confidence self-score below stay advisory). A non-empty set of
+            # ACTIONABLE defects (each carrying a concrete_case + where —
+            # validate_conformance_result drops the rest as non-actionable, so
+            # the gate cannot fire on vague "looks incomplete" prose) re-drives
+            # the implementer with the defects folded in as mandatory criteria
+            # (bounded by completeness_retry_rounds), or blocks on exhaustion.
+            # Not gameable by weakening a test: there is no bar to lower, only
+            # a concrete constructed input to report or not.
+            "solution_defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "concrete_case", "where",
+                                 "why_ships_a_defect"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["unhandled_input", "unhandled_path",
+                                          "missing_guard",
+                                          "sibling_site_unedited",
+                                          "wrong_selector",
+                                          "decoy_or_shortcut"]},
+                        # The specific input / path / site — not a vague
+                        # "incomplete". This concreteness is the anti-gaming
+                        # guard: the gate keys on it. minLength:1 rejects an
+                        # empty string at the JSON layer (worker retries via
+                        # claude_p) so it never reaches validate_conformance_
+                        # result's cross-field check — which would break the
+                        # whole conformance loop early. Mirrors dep_capture's
+                        # minLength discipline.
+                        "concrete_case": {"type": "string", "minLength": 1},
+                        # file:line or function the diff should have handled.
+                        "where": {"type": "string", "minLength": 1},
+                        "why_ships_a_defect": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
             # §8 + §12 structural enforcement via _confidence_schema.
             # The orchestrator loops on observable signals (residuals,
             # build/lint/test), not the score — but requiring the
             # discipline fields ensures a worker that skipped self-gating
-            # fails its own JSON schema.
+            # fails its own JSON schema. This self-score is ADVISORY; the
+            # gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
         },
     },
@@ -1799,6 +1906,120 @@ SCHEMAS: dict[str, dict] = {
             # circumvented and how the plan substituted for it.
             "violations": {"type": "array", "items": {"type": "string"}},
             # Human-readable explanation of the score.
+            "rationale": {"type": "string"},
+        },
+    },
+    # Independent adversarial verifiers (DESIGN §8 *Independent adversarial
+    # verification*). Each replaces a self-graded confidence axis that could
+    # not find the grading worker's own blind spots. Like adherence_judge,
+    # each is *itself* the independent check, so NONE carry a
+    # _confidence_schema sub-object (that would reintroduce the self-grading
+    # bias the gate exists to remove). Each gates on a NON-EMPTY array of
+    # concretely-named found defects — never on a score crossing a threshold,
+    # so there is no lowerable bar (DESIGN §9 anti-gaming): the verified
+    # worker cannot weaken a test or lower a criterion to clear a gate that
+    # keys on an independently-constructed concrete input it mishandles.
+    "classification_judge": {
+        # Attacks the classifier's chosen category set against the task +
+        # codebase. Proven harm: the same task classified [bug-fixing,testing]
+        # → 10 subtasks vs [docs,feat,infra] → 0 subtasks (accomplished
+        # nothing); "Landing Page Feature Pillars" classified `documentation`
+        # (shipped only .md) vs `feature-implementation` (shipped a landing
+        # page). A non-empty `miscategorizations` gates.
+        "type": "object",
+        "required": ["categories_reviewed", "miscategorizations", "rationale"],
+        "properties": {
+            # The category set the judge reviewed (echoed back so the audit
+            # record shows what was attacked, not just the verdict).
+            "categories_reviewed": {
+                "type": "array", "items": {"type": "string"}},
+            # Each entry names a category that should be ADDED (the work
+            # requires it) or REMOVED (the work contradicts it), with the
+            # concrete work in the task/codebase that justifies the change.
+            # Non-empty ⇒ gate.
+            "miscategorizations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "category", "concrete_work_evidence"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["missing_category",
+                                          "spurious_category"]},
+                        "category": {"type": "string"},
+                        "concrete_work_evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "wiring_judge": {
+        # Attacks the reconciled plan's SEMANTIC wiring — the tag/dep dangles
+        # a structural provider-existence scan (check_plan_wiring) cannot see:
+        # a subtask whose work genuinely needs a capability but never declares
+        # the `requires` tag, or a merge/drop that severed a real dependency
+        # the tags never encoded. A non-empty `wiring_defects` gates.
+        "type": "object",
+        "required": ["plan_reviewed", "wiring_defects", "rationale"],
+        "properties": {
+            # False if the plan was empty/unreadable → fail-open (advisory).
+            "plan_reviewed": {"type": "boolean"},
+            "wiring_defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "sid", "tag_or_dep",
+                                 "concrete_reason"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["missing_requires",
+                                          "missing_provides",
+                                          "broken_by_merge",
+                                          "broken_by_drop",
+                                          "orphaned_dependent"]},
+                        "sid": {"type": "string"},
+                        "tag_or_dep": {"type": "string"},
+                        "concrete_reason": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "provision_judge": {
+        # Attacks the detected install recipe against the actual image /
+        # runtime, catching the SEMANTIC gaps the deterministic
+        # _normalize_pip_installs / validate_provision_recipe miss. Proven
+        # harm: a recipe self-graded 9.3 that omitted --break-system-packages
+        # caused 12 real install failures on the externally-managed Debian
+        # image (28 runs got the broken recipe, 20 got the correct one for the
+        # SAME repo — both self-graded correct). A non-empty `recipe_failures`
+        # gates (die() — a recipe that would fail is fatal).
+        "type": "object",
+        "required": ["recipe_reviewed", "recipe_failures", "rationale"],
+        "properties": {
+            # False if there was no recipe to review (kind: none) → the gate
+            # cheap-skips upstream, but the field keeps the schema honest.
+            "recipe_reviewed": {"type": "boolean"},
+            "recipe_failures": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "command", "concrete_reason", "fix"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["missing_break_system_packages",
+                                          "wrong_package_manager",
+                                          "lockfile_mismatch",
+                                          "missing_runtime_dep",
+                                          "wrong_image_assumption"]},
+                        "command": {"type": "string"},
+                        "concrete_reason": {"type": "string"},
+                        "fix": {"type": "string"},
+                    },
+                },
+            },
             "rationale": {"type": "string"},
         },
     },
@@ -4347,6 +4568,25 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_ADHERENCE_CHECK_FILE)
 
 
+def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-completeness-check preference. Order:
+    --skip-completeness-check CLI flag (action='store_true') →
+    LEERIE_SKIP_COMPLETENESS_CHECK env var →
+    skip_completeness_check in leerie.toml → False.
+
+    When True, the conformer's gating `solution_defects` axis (DESIGN §9 *The
+    one gating axis: solution completeness*) becomes advisory: found defects
+    surface as warnings but never re-drive the implementer, block a subtask, or
+    die() the final-tree pass. Off by default; use only when the operator knows
+    the completeness judge is misfiring for this repo (e.g. a hallucinated
+    defect on the integrated tree is blocking finalize on every --resume)."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_COMPLETENESS_CHECK_ENV,
+        file_key="skip_completeness_check",
+        file_name=SKIP_COMPLETENESS_CHECK_FILE)
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper. Rejects non-positive integers with the
     standard argparse error message. Used by --confidence-rounds."""
@@ -5018,8 +5258,12 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
                 "best-fitting category. If they produce genuinely "
                 "different deliverables, keep both."
             )
-    issues.extend(_confidence_issues(
-        result.get("confidence") or {}, ["classification"]))
+    # The classifier's `classification` self-score is NO LONGER a gating axis
+    # (DESIGN §8 *Independent adversarial verification*): a worker grading its
+    # own output cannot find its own blind spot, so the authoritative gate is
+    # the independent `classification_judge` (phase_classification_gate). The
+    # `confidence` object is still emitted and schema-required (the §8
+    # falsifier/gap discipline record), just not read as a gate here.
     return issues
 
 
@@ -6097,8 +6341,11 @@ def check_reconciler_output(
             issues.append(
                 f"SELF_DEP: added subtask {sid!r} depends on itself")
 
-    issues.extend(_confidence_issues(
-        output.get("confidence") or {}, ["reconciliation"]))
+    # The reconciler's `reconciliation` self-score is NO LONGER a gating axis
+    # (DESIGN §8 *Independent adversarial verification*): the authoritative
+    # wiring gate is the deterministic `check_plan_wiring` plus the independent
+    # `wiring_judge` (phase_wiring_gate). The `confidence` object stays emitted
+    # and schema-required (the §8 discipline record), just not gated on here.
     return issues
 
 
@@ -6238,8 +6485,13 @@ def check_provision_output(
         issues.append(
             "EMPTY_RECIPE: recipe is empty but repo has lockfile(s)")
 
-    issues.extend(_confidence_issues(
-        result.get("confidence") or {}, ["recipe_correctness"]))
+    # The provision worker's `recipe_correctness` self-score is NO LONGER a
+    # gating axis (DESIGN §8 *Independent adversarial verification*): the
+    # authoritative gate is the independent `provision_judge`
+    # (phase_provision_gate), which attacks the recipe against the actual
+    # image/runtime. The deterministic MISSING_WORKDIR / WRONG_PM / EMPTY_RECIPE
+    # checks above stay (mechanical, not self-graded). The `confidence` object
+    # stays emitted and schema-required, just not gated on here.
     return issues
 
 
@@ -6978,6 +7230,61 @@ def rank_repo_map(
             hi = mid - 1
 
     return best
+
+
+def check_plan_wiring(subtasks: dict) -> list[str]:
+    """Deterministic wiring re-check on the fully-merged post-drop plan
+    (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Pure Python,
+    no LLM — returns a list of dangle messages ([] when clean).
+
+    Replays exactly `validate_plan`'s two id/tag-channel dangle checks:
+      - every `depends_on` id resolves to a surviving subtask, and
+      - every `requires` tag with `extent: in_plan` has some subtask's
+        `provides` matching it.
+
+    The point is not to duplicate `validate_plan` for its own sake — it is to
+    run these checks *and give a wiring-specific, actionable message* on the
+    merged plan produced AFTER every id/tag-vanishing operation (reconciler
+    merge/rename/drop, both phase-3 soft-drop filters, P1 expansion). Each of
+    those ops owes the plan a rewrite of inbound references; each is an
+    independent opportunity to leave a dangle that only surfaces at
+    `validate_plan` — after the full planner/reconciler spend, whose generic
+    `die()` throws that spend away. Running this first `die()`s earlier with a
+    message that names the wiring failure (and, when derivable, whether the
+    provider vanished via a drop/merge). `validate_plan` stays the backstop:
+    it re-checks the same invariants and catches anything this misses.
+
+    `subtasks` is the sid→subtask dict `schedule()` returns (same shape
+    `validate_plan` consumes). `extent: external` requires are deliberately
+    NOT checked (declared out-of-graph, per `validate_plan`)."""
+    issues: list[str] = []
+    all_ids = set(subtasks.keys())
+    all_provides: set[str] = set()
+    for s in subtasks.values():
+        all_provides.update(s.get("provides", []) or [])
+
+    for sid, s in subtasks.items():
+        for dep in s.get("depends_on", []) or []:
+            if dep not in all_ids:
+                issues.append(
+                    f"{sid}: depends_on '{dep}' which no surviving subtask "
+                    "provides — an id vanished (a merge/rename/drop or "
+                    "expansion) without its inbound depends_on being rewritten "
+                    "(DESIGN §5 *Id-vanishing operations*)")
+        for entry in s.get("requires", []) or []:
+            if not isinstance(entry, dict):
+                continue  # shape errors are validate_plan's job, not wiring's
+            tag = entry.get("tag", "")
+            extent = entry.get("extent", "")
+            if not tag or not isinstance(tag, str):
+                continue
+            if extent == "in_plan" and tag not in all_provides:
+                issues.append(
+                    f"{sid}: requires '{tag}' but no surviving subtask "
+                    "provides it — the only provider vanished (a drop/merge) "
+                    "without its inbound requires being rewritten (DESIGN §5 "
+                    "*A drop is not symmetric with an expansion*)")
+    return issues
 
 
 def validate_plan(subtasks: dict) -> None:
@@ -12952,6 +13259,131 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     return result
 
 
+async def phase_classification_gate(task: str, st: State, caps: dict,
+                                    clarify: bool, models: dict[str, str],
+                                    efforts: dict[str, str | None]) -> None:
+    """Independent adversarial verification of the classifier's category set
+    (DESIGN §8 *Independent adversarial verification*). Runs right after
+    `phase_classify` and before provision/plan spend.
+
+    The classifier self-grades its `classification` confidence axis, but a
+    self-grade cannot find the classifier's own blind spot: the same task
+    classified one way produced 10 subtasks and another way produced ZERO
+    (accomplished nothing); a "landing page feature" classified as
+    `documentation` shipped only markdown. So an independent `classification_judge`
+    attacks the chosen categories against the task + codebase and gates on a
+    NON-EMPTY `miscategorizations` array (a category the work requires but the
+    set omits, or one it contradicts). The self-score is now advisory.
+
+    On a found miscategorization, re-drives `phase_classify` through the
+    *existing* checked-loop feedback path (fresh classifier calls with the
+    miscategorizations folded in), bounded by `judgment_check_rounds`,
+    `die()`ing on exhaustion exactly like the adherence/reconciler gates. A
+    `classification_judge` `WorkerError` (infrastructure crash) degrades: the
+    classifier's own output is preserved (never discarded), consistent with
+    `_run_checked_loop`'s WorkerError→retry-then-degrade handling.
+
+    Mutates `st.data["categories"]` in place via the re-driven `phase_classify`;
+    returns None (the categories live on state, like `phase_classify`'s own
+    writes)."""
+    repo_root = Path(os.getcwd())
+    sys_prompt = load_prompt("classification_judge")
+
+    async def _invoke_judge() -> dict:
+        st.bump_workers(caps)
+        cats = st.data.get("categories") or []
+        prescribed = st.data.get("prescribed_procedure") or {}
+        user_prompt = (
+            "TASK:\n" + task + "\n\n"
+            "CHOSEN CATEGORIES (the classifier's output to attack):\n" +
+            json.dumps(cats, indent=2) +
+            ("\n\nPRESCRIBED PROCEDURE (context; the user named an explicit "
+             "process):\n" + json.dumps(prescribed, indent=2)
+             if prescribed.get("is_prescribed") else "") +
+            "\n\nThe allowed category vocabulary is: " +
+            json.dumps(sorted(CATEGORIES)) +
+            "\n\nAttack the chosen set against the task and codebase. Return "
+            "only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="classification_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+            caps=caps, st=st, model=models.get("classification_judge",
+                                               MODEL_DEFAULT),
+            effort=efforts.get("classification_judge"),
+            sid="classification_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    last_judge: list[dict | None] = [None]
+
+    def _check(judge_result: dict) -> list[str]:
+        last_judge[0] = judge_result
+        issues: list[str] = []
+        for m in judge_result.get("miscategorizations") or []:
+            if not isinstance(m, dict):
+                continue
+            cat = (m.get("category") or "").strip()
+            ev = (m.get("concrete_work_evidence") or "").strip()
+            # Anti-gaming: only a miscategorization naming a concrete category
+            # AND the concrete work that justifies it gates. A vague entry is
+            # dropped (mirrors the completeness gate's concrete_case rule).
+            if not cat or not ev:
+                continue
+            issues.append(
+                f"MISCATEGORIZATION ({m.get('kind', 'miscategorization')}): "
+                f"{cat} — {ev}")
+        return issues
+
+    async def _on_feedback(fb: str) -> dict:
+        # Re-classify with the miscategorizations folded into the task, so the
+        # fresh classifier call sees why its category set was rejected.
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — an independent review of your previous classification "
+            f"found it miscategorized the work:\n{fb}\n"
+            "Re-classify so the category set covers exactly the work this task "
+            "requires — add every category the work needs, drop any the work "
+            "contradicts."
+        )
+        await phase_classify(replan_task, st, caps, clarify, models, efforts)
+        return {}
+
+    judge_result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke_judge, check=_check, name="classification_gate",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_feedback,
+    )
+    for w in gate_warnings:
+        log(f"  classification-gate: {w}")
+
+    if judge_result is None:
+        # classification_judge crashed every round — degrade: keep the
+        # classifier's own categories, never discard them.
+        log("  classification-gate: classification_judge crashed every round; "
+            "degrading to the classifier's own categories")
+        return
+
+    remaining = _check(judge_result)
+    if remaining:
+        die(
+            "classification gate exhausted "
+            f"{caps['judgment_check_rounds']} re-classify round(s) without "
+            "producing a category set that covers the task's actual work:\n" +
+            "\n".join(f"  • {i}" for i in remaining) +
+            "\nAn independent review found the category set still misses (or "
+            "wrongly includes) a category the work requires. A wrong category "
+            "set produces the wrong subtasks — the same task has classified to "
+            "0 subtasks one way and 10 another. Refine the task description so "
+            "the required work is unambiguous."
+        )
+
+    st.data["classification_coverage_gate"] = judge_result
+    st.save()
+    log("phase 1: classification gate clean")
+
+
 def gather_answers(st: State, supplied: dict | None) -> dict:
     """Collect clarification answers — from --answers, from the resolved
     source-of-truth preference, from a TTY prompt, or (no TTY, no answers)
@@ -13307,6 +13739,131 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
 
     log(f"  recipe detected ({len(recipe)} command(s), "
         f"source={prov['source']}) — workers will run installs in their worktrees")
+
+
+async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
+                               models: dict[str, str],
+                               efforts: dict[str, str | None]) -> None:
+    """Independent adversarial verification of the detected install recipe
+    (DESIGN §8 *Independent adversarial verification*, §6½). Runs right after
+    `phase_provision` and before plan spend.
+
+    The provision worker self-grades its `recipe_correctness` axis, but a
+    self-grade cannot find its own blind spot: a recipe self-graded 9.3 that
+    omitted `--break-system-packages` caused 12 real install failures on the
+    externally-managed Debian image (28 runs got the broken recipe, 20 got the
+    correct one for the SAME repo — both self-graded correct). So an
+    independent `provision_judge` attacks the recipe against the actual
+    image/runtime and gates on a NON-EMPTY `recipe_failures` array — catching
+    the SEMANTIC gaps the deterministic `_normalize_pip_installs` /
+    `validate_provision_recipe` (which already ran inside phase_provision)
+    miss.
+
+    A recipe that would fail is fatal (matching phase_provision's own
+    `die("provision recipe failed validation")`), so on an unresolved failure
+    after re-driving `phase_provision` through the checked-loop feedback path
+    (bounded by `judgment_check_rounds`), this `die()`s. A `provision_judge`
+    `WorkerError` degrades: the recipe is preserved (the deterministic checks
+    already ran). Cheap-skips when no recipe was detected (`kind: none`)."""
+    prov = st.data.get("provision") or {}
+    recipe = prov.get("recipe") or []
+    # kind:none (docs-only, or nothing to install) → nothing to attack.
+    kinds = {(e.get("kind") if isinstance(e, dict) else None) for e in recipe}
+    if not recipe or kinds <= {"none"}:
+        log("phase 1½: provision gate skipped (no install recipe)")
+        return
+
+    sys_prompt = load_prompt("provision_judge")
+
+    def _image_runtime_context() -> str:
+        versions = prov.get("mise_versions") or {}
+        version_summary = ", ".join(
+            f"{tool} {entries[0].get('version', '?')}"
+            for tool, entries in sorted(versions.items())
+            if isinstance(entries, list) and entries
+        )
+        return (
+            "RUNTIME IMAGE: Debian 13 (trixie). The system Python is "
+            "externally-managed (PEP 668) — a bare `pip install` fails with "
+            "'externally-managed-environment' unless it carries "
+            "`--break-system-packages` or runs in a venv. Node/pnpm/yarn, Go, "
+            "Ruby, and Rust toolchains are provisioned via mise.\n"
+            f"RESOLVED RUNTIME VERSIONS: {version_summary or '(none detected)'}"
+        )
+
+    async def _invoke_judge() -> dict:
+        st.bump_workers(caps)
+        cur_recipe = (st.data.get("provision") or {}).get("recipe") or []
+        user_prompt = (
+            _image_runtime_context() + "\n\n"
+            "DETECTED INSTALL RECIPE (attack it):\n" +
+            json.dumps(cur_recipe, indent=2) +
+            "\n\nReturn only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="provision_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("provision_judge", MODEL_DEFAULT),
+            effort=efforts.get("provision_judge"), sid="provision_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check(judge_result: dict) -> list[str]:
+        issues: list[str] = []
+        for f in judge_result.get("recipe_failures") or []:
+            if not isinstance(f, dict):
+                continue
+            reason = (f.get("concrete_reason") or "").strip()
+            # Anti-gaming: a failure gates only with a concrete reason.
+            if not reason:
+                continue
+            issues.append(
+                f"RECIPE_FAILURE ({f.get('kind', 'recipe_failure')}) "
+                f"{(f.get('command') or '').strip()}: {reason} "
+                f"[fix: {(f.get('fix') or '').strip()}]")
+        return issues
+
+    # DETECT-AND-DIE, single pass (no re-drive). The recipe is either
+    # deterministic (the lockfile table re-emits the identical recipe, ignoring
+    # any feedback) or an LLM fallback — either way re-driving phase_provision
+    # would re-produce the same recipe and re-attack it, burning N rounds before
+    # dying anyway. A broken recipe is fatal (matching phase_provision's own
+    # `die("provision recipe failed validation")`), so a found failure die()s
+    # immediately with the judge's concrete `fix` named — the actionable
+    # outcome. _run_checked_loop still gives the bounded fresh-session retry on
+    # a WorkerError and the clean-break on a defect-free pass.
+    judge_result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke_judge, check=_check, name="provision_gate",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    for w in gate_warnings:
+        log(f"  provision-gate: {w}")
+
+    if judge_result is None:
+        log("  provision-gate: provision_judge crashed every round; degrading "
+            "(deterministic recipe checks already ran) — recipe preserved")
+        st.save()
+        return
+
+    remaining = _check(judge_result)
+    if remaining:
+        die(
+            "provision recipe gate found a recipe that would fail on the "
+            "runtime image:\n" +
+            "\n".join(f"  • {i}" for i in remaining) +
+            "\nAn independent review found the install recipe would fail (e.g. "
+            "a pip install lacking --break-system-packages, or a package "
+            "manager that does not match the lockfiles present). A broken "
+            "recipe fails every worker's install step. Apply the named fix by "
+            "committing a `.leerie/config.toml` recipe, or fix the repo's "
+            "lockfiles/config so detection is unambiguous."
+        )
+
+    st.data["provision_recipe_gate"] = judge_result
+    st.save()
+    log("phase 1½: provision recipe gate clean")
 
 
 def _select_best_planner_sample(
@@ -17012,6 +17569,129 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     return cur_plans[0]
 
 
+async def phase_wiring_gate(plans: list[dict], task: str, st: State,
+                            caps: dict, models: dict[str, str],
+                            efforts: dict[str, str | None]) -> list[dict]:
+    """Independent SEMANTIC verification of the fully-merged plan's wiring
+    (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Runs after
+    every id/tag-vanishing operation (reconcile, both soft-drop filters,
+    expansion) and after the deterministic `check_plan_wiring` — which owns the
+    *structural* dangle (does every declared `requires`/`depends_on` resolve).
+
+    This gate owns the complement: is the set of declared edges the RIGHT one?
+    A plan can be structurally wired (every tag resolves) yet semantically
+    broken — a subtask whose work genuinely needs a capability but never
+    declares the `requires` tag, or a merge/drop that severed a real dependency
+    the tags never encoded. Those are invisible to a provider-existence scan.
+    The `wiring_judge` attacks the merged plan for them and gates on a
+    NON-EMPTY `wiring_defects` array.
+
+    DETECT-AND-DIE, single pass. The reconciler cannot mechanically act on
+    "subtask X should also *require* Y" — its mandate is resolving already-
+    declared `requires` tags, not inventing missing edges from a semantic
+    argument — so re-driving `phase_reconcile` would re-derive the identical
+    plan, the judge would re-attack it, and after N rounds we'd `die()` anyway
+    having burned N expensive reconciliations. So this gate runs the judge ONCE
+    (a `WorkerError` gets a bounded fresh-session retry, not a re-plan) and, on
+    a found defect, `die()`s immediately with the concrete defect named — the
+    actionable outcome. A `WorkerError` that exhausts the retry degrades: the
+    plan is preserved (the deterministic `check_plan_wiring` already guarded the
+    structural channel).
+
+    Returns `plans` unchanged (the gate does not mutate the plan; it either
+    passes it through or `die()`s)."""
+    repo_root = Path(os.getcwd())
+    sys_prompt = load_prompt("wiring_judge")
+
+    payload = {
+        "subtasks": [
+            {
+                "id": s.get("id", ""),
+                "title": s.get("title", ""),
+                "intent": s.get("intent", ""),
+                "files_likely_touched": list(
+                    s.get("files_likely_touched", []) or []),
+                "depends_on": list(s.get("depends_on", []) or []),
+                "requires": s.get("requires", []) or [],
+                "provides": list(s.get("provides", []) or []),
+            }
+            for plan in plans for s in plan.get("subtasks", []) or []
+        ],
+        # The audit of everything the drop/merge seams removed — the judge
+        # uses it to reason about broken_by_drop / broken_by_merge.
+        "dropped_subtasks": st.data.get("dropped_subtasks") or {},
+    }
+
+    async def _invoke_judge() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            "TASK:\n" + task + "\n\n"
+            "MERGED PLAN (post-drop; attack its wiring):\n" +
+            json.dumps(payload, indent=2) +
+            "\n\nReturn only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="wiring_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("wiring_judge", MODEL_DEFAULT),
+            effort=efforts.get("wiring_judge"), sid="wiring_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check(judge_result: dict) -> list[str]:
+        issues: list[str] = []
+        for d in judge_result.get("wiring_defects") or []:
+            if not isinstance(d, dict):
+                continue
+            reason = (d.get("concrete_reason") or "").strip()
+            tag_or_dep = (d.get("tag_or_dep") or "").strip()
+            # Anti-gaming: a defect gates only with a concrete reason and the
+            # tag/dep it concerns named.
+            if not reason or not tag_or_dep:
+                continue
+            issues.append(
+                f"WIRING_DEFECT ({d.get('kind', 'wiring_defect')}) "
+                f"{d.get('sid', '?')} / {tag_or_dep}: {reason}")
+        return issues
+
+    # No make_feedback_prompt: this is a detect-and-die gate, not a re-drive
+    # loop. _run_checked_loop still gives us the bounded fresh-session retry on
+    # a WorkerError (infra crash) and the clean-break on a defect-free pass.
+    judge_result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke_judge, check=_check, name="wiring_gate",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    for w in gate_warnings:
+        log(f"  wiring-gate: {w}")
+
+    if judge_result is None:
+        log("  wiring-gate: wiring_judge crashed every round; degrading "
+            "(check_plan_wiring already guarded the structural channel) — "
+            "plan preserved")
+        return plans
+
+    remaining = _check(judge_result)
+    if remaining:
+        die(
+            "plan-wiring gate found unresolved semantic wiring defect(s):\n" +
+            "\n".join(f"  • {i}" for i in remaining) +
+            "\nAn independent review found the plan's declared dependency "
+            "edges do not match the work the subtasks actually need (a subtask "
+            "that should require a capability it never declares, or a merge/"
+            "drop that severed a real dependency). Add the missing "
+            "requires/provides/depends_on to the plan, refine the task so the "
+            "cross-subtask dependencies are unambiguous, or re-run with "
+            "--skip-overlap-judge to bypass reconciliation gates."
+        )
+
+    st.data["wiring_gate"] = judge_result
+    st.save()
+    log("phase 3: plan-wiring gate clean")
+    return plans
+
+
 async def phase_overlap_judge(plans: list[dict], task: str, st: State,
                               caps: dict, models: dict[str, str],
                               efforts: dict[str, str | None]) -> list[dict]:
@@ -18190,7 +18870,61 @@ def validate_conformance_result(result: dict, worktree: str) -> str | None:
             if not resolved.exists():
                 return (f"{kind}[{i}] cites path {rel!r} which does not "
                         f"exist in the worktree")
+    # DESIGN §9 *The one gating axis: solution completeness*. Each
+    # solution_defect must carry a non-empty concrete_case AND where — a
+    # defect without them is non-actionable and MUST NOT gate (the
+    # anti-gaming guard: the gate keys on a concretely-named unhandled input,
+    # never on vague "looks incomplete" prose). A malformed defect fails the
+    # honesty check like any other cross-field violation; `actionable_
+    # solution_defects` (below) is the caller-facing filter that then only
+    # gates on the ones that survive, so this validator is deliberately
+    # strict: a worker that emits a bare `{}` defect is signalling a skipped
+    # discipline, not an empty finding.
+    for i, item in enumerate(result.get("solution_defects") or []):
+        if not (item.get("concrete_case") or "").strip():
+            return f"solution_defects[{i}] has empty 'concrete_case'"
+        if not (item.get("where") or "").strip():
+            return f"solution_defects[{i}] has empty 'where'"
     return None
+
+
+def actionable_solution_defects(conf_res: dict | None) -> list[dict]:
+    """The conformer's gating solution-completeness findings (DESIGN §9 *The
+    one gating axis: solution completeness*): solution_defects that carry a
+    concrete_case AND a where. A defect missing either is dropped as
+    non-actionable — the anti-gaming guard that keeps the gate keyed on an
+    independently-constructed concrete input, never on vague prose. Returns
+    [] for a None/empty result (fail-open: nothing to attack)."""
+    if not isinstance(conf_res, dict):
+        return []
+    out: list[dict] = []
+    for d in conf_res.get("solution_defects") or []:
+        if not isinstance(d, dict):
+            continue
+        if (d.get("concrete_case") or "").strip() and \
+                (d.get("where") or "").strip():
+            out.append(d)
+    return out
+
+
+def _format_solution_defects(defects: list[dict]) -> str:
+    """Render actionable solution defects as a mandatory-criteria feedback
+    block for the implementer's retry (DESIGN §9). Each defect becomes a
+    required item the next attempt must handle."""
+    lines = [
+        "An independent completeness review of your committed diff found "
+        "concrete behavioral gaps it does not handle. These are now MANDATORY "
+        "additional success criteria — your next attempt must handle each, "
+        "not merely re-assert the work is complete:",
+    ]
+    for i, d in enumerate(defects, 1):
+        kind = d.get("kind") or "defect"
+        where = (d.get("where") or "").strip()
+        case = (d.get("concrete_case") or "").strip()
+        why = (d.get("why_ships_a_defect") or "").strip()
+        lines.append(f"  {i}. [{kind}] at {where}: {case}"
+                     + (f" — {why}" if why else ""))
+    return "\n".join(lines)
 
 
 async def _branch_head_sha(worktree: str) -> str:
@@ -18422,20 +19156,6 @@ def _summarize_residuals(conf_res: dict) -> list[str]:
             summary = (a.get("summary") or "").strip() or "(no summary)"
             out.append(f"{axis}-failed: {a.get('command', '')!r}: {summary}")
     return out
-
-
-def _confidence_axes_clear(
-    conf: dict, axes: list[str], threshold: float = 9.0,
-) -> bool:
-    """True when every named axis in *conf* is a number >= *threshold*.
-
-    Used by ``_run_checked_loop`` and the implementer's in-settle_subtask
-    confidence check.  Pure — no I/O, no state mutation."""
-    for ax in axes:
-        val = conf.get(ax)
-        if not isinstance(val, (int, float)) or val < threshold:
-            return False
-    return True
 
 
 def _format_check_feedback(
@@ -19347,6 +20067,23 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     if last_res is not None:
         warnings.extend(_summarize_residuals(last_res))
 
+    # DESIGN §9 *The one gating axis: solution completeness*. On the final
+    # whole-tree pass the conformer attacked the integrated diff against the
+    # working branch; actionable solution_defects gate INDEPENDENT of
+    # --strict-conformer (the build/lint/test/clobber residuals below stay
+    # strict-only). There is no implementer to re-drive here — every wave has
+    # integrated — so a surviving gap is terminal: die() (fix + --resume),
+    # matching the strict final_blocked die. --skip-completeness-check demotes
+    # this to advisory (a hallucinated defect on the integrated tree would
+    # otherwise block finalize with no escape, re-attacking on every --resume).
+    final_defects = actionable_solution_defects(last_res)
+    if final_defects and st.data.get("skip_completeness_check"):
+        warnings.append(
+            f"completeness gate found {len(final_defects)} unhandled case(s) "
+            "on the integrated tree but --skip-completeness-check is set — "
+            "surfaced as advisory, run not blocked")
+        final_defects = []
+
     final_blocked = bool(
         caps.get("strict_conformer")
         and (clobbered_files
@@ -19355,11 +20092,19 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     st.data.setdefault("conformance", {})["_final"] = {
         "result": last_res,
         "warnings": warnings,
-        "blocked": bool(final_blocked),
+        "blocked": bool(final_blocked or final_defects),
     }
     st.save()
     for w in warnings:
         log(f"  final conformance: {w}")
+    if final_defects:
+        summary = "; ".join(
+            f"[{d.get('kind')}] {(d.get('where') or '').strip()}: "
+            f"{(d.get('concrete_case') or '').strip()}"
+            for d in final_defects[:3])
+        die(f"completeness gate: final-tree conformance found "
+            f"{len(final_defects)} unhandled case(s) in the integrated diff: "
+            f"{summary}; run blocked. Fix and --resume.")
     if final_blocked:
         why = (f"conformer reverted/deleted integrated file(s): "
                f"{clobbered_files}" if clobbered_files else "has residuals")
@@ -19385,6 +20130,11 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     continuations = 0
     retries = 0
     confidence_retries = 0
+    # Separate budget for the DESIGN §9 completeness gate (the conformer's
+    # gating solution_defects axis re-driving the implementer). Kept distinct
+    # from confidence_retries/retries/continuations so the completeness loop
+    # cannot silently consume another budget.
+    completeness_retries = 0
     note = ""
     continuation = False
     worktree = str(leerie_dir / "worktrees" / sid)
@@ -19501,28 +20251,21 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
 
         status = res.get("status")
 
-        # CRITIC-pattern confidence + mechanical check on complete results.
-        # Separate budget from subtask_continuations so confidence retries
-        # don't consume the handoff/clarification budget. Skipped for a result
-        # rescued from `empty_handoff`: the worker never returned a confidence
-        # envelope (it was reaped mid-turn), so there is nothing to gate on —
+        # CRITIC-pattern MECHANICAL check on complete results. The implementer's
+        # `root_cause` / `solution` self-score is NO LONGER a gating axis
+        # (DESIGN §8 *Independent adversarial verification*): a worker grading
+        # its own solution cannot find its own blind spot — the authoritative
+        # completeness gate is now the independent conformer `solution_defects`
+        # axis (below, in the success path). The `confidence` object is still
+        # emitted and schema-required (the §8 falsifier/gap discipline record),
+        # just not read as a gate. Only the mechanical `check_implementer_output`
+        # (file-touch / unmet-criterion — not self-graded) gates here.
+        # Separate budget from subtask_continuations so these retries don't
+        # consume the handoff/clarification budget. Skipped for a result
+        # rescued from `empty_handoff`: the worker was reaped mid-turn, so
         # re-spawning it would just repeat the doomed background step.
         if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
-            conf = (res.get("confidence") or {}) \
-                if isinstance(res.get("confidence"), dict) else {}
-            if not _confidence_axes_clear(conf, ["root_cause", "solution"]):
-                below = {ax: conf.get(ax) for ax in ["root_cause", "solution"]
-                         if not isinstance(conf.get(ax), (int, float))
-                         or conf[ax] < 9.0}
-                log(f"  {sid}: confidence gate not cleared: {below}")
-                confidence_retries += 1
-                continuation = True
-                note = (
-                    f"Previous attempt returned complete but confidence "
-                    f"gate did not clear: {below}. Re-examine and either "
-                    f"raise your confidence with evidence or report blocked.")
-                continue
             # Mechanical checks on the implementer's output.
             run_branch = compute_run_branch(st.run_id)
             diff_proc = await run_proc(
@@ -19701,6 +20444,68 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 "warnings": conf_warnings,
             }
             st.save()
+
+            # DESIGN §9 *The one gating axis: solution completeness*. The
+            # conformer independently attacked the implementer's committed
+            # diff and may have found concrete behavioral gaps the
+            # implementer's own confidence self-grade could not see (the
+            # bugfix-002 class: a decoy click, an unhandled error path, a
+            # missing exit-guard, a sibling data-path site left unedited).
+            # This is the ONE gating conformer axis — independent of
+            # --strict-conformer (which governs only the advisory
+            # build/lint/test/residual axes handled by blocked_reason below).
+            # A conformer crash/malformed result leaves conf_res None →
+            # actionable_solution_defects returns [] → fail-open (advisory).
+            # --skip-completeness-check demotes the whole axis to advisory:
+            # found defects surface as warnings but never re-drive or block.
+            solution_defects = actionable_solution_defects(conf_res)
+            if solution_defects and st.data.get("skip_completeness_check"):
+                msg = (f"completeness gate found {len(solution_defects)} "
+                       "unhandled case(s) but --skip-completeness-check is set "
+                       "— surfaced as advisory, subtask still complete")
+                log(f"  {sid}: {msg}")
+                res.setdefault("conformance_warnings", []).append(msg)
+                solution_defects = []
+            if solution_defects:
+                if completeness_retries < caps.get(
+                        "completeness_retry_rounds", 1):
+                    log(f"  {sid}: completeness gate found "
+                        f"{len(solution_defects)} unhandled case(s) in the "
+                        "diff — re-driving the implementer with them as "
+                        "mandatory criteria")
+                    completeness_retries += 1
+                    continuation = True
+                    note = _format_solution_defects(solution_defects)
+                    # Record the in-flight attempt before looping (mirrors the
+                    # mechanical-check retry above): the status write below is
+                    # unreachable from here, so a subtask that commits real
+                    # work and then loops on the completeness gate must not be
+                    # invisible to state.json — a mid-continuation death would
+                    # otherwise resume as if this subtask never ran while its
+                    # branch still carries the commits.
+                    st.data.setdefault("subtask_status", {})[sid] = \
+                        "in_progress"
+                    st.save()
+                    continue
+                # Budget exhausted: the gap is real and unfixed after the
+                # allotted re-drives — block the subtask (terminal per this
+                # subtask; partial-wave integration still proceeds, DESIGN §3)
+                # with the residual defects named, NOT a silent advisory.
+                blocker = (
+                    f"completeness gate: {len(solution_defects)} unhandled "
+                    "case(s) remain after "
+                    f"{caps.get('completeness_retry_rounds', 1)} re-drive(s): "
+                    + "; ".join(
+                        f"[{d.get('kind')}] {(d.get('where') or '').strip()}: "
+                        f"{(d.get('concrete_case') or '').strip()}"
+                        for d in solution_defects[:3])
+                    + " (fix + --resume)")
+                log(f"  {sid}: {blocker}")
+                st.data.setdefault("subtask_status", {})[sid] = "blocked"
+                st.save()
+                return {"subtask_id": sid, "status": "blocked",
+                        "blocker": blocker, "summary": blocker}
+
             if blocked_reason:
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocked_reason,
@@ -20947,6 +21752,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
         st.data["skip_adherence_check"] = bool(
             getattr(args, "skip_adherence_check", False))
+        st.data["skip_completeness_check"] = bool(
+            getattr(args, "skip_completeness_check", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -20992,6 +21799,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
                    "skip_adherence_check": bool(
                        getattr(args, "skip_adherence_check", False)),
+                   "skip_completeness_check": bool(
+                       getattr(args, "skip_completeness_check", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -21028,6 +21837,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             await _backstop_capture_prior_runs(
                 leerie_dir, Path(os.getcwd()), caps, models, efforts)
             await phase_classify(task, st, caps, args.clarify, models, efforts)
+            # Independent adversarial verification of the classifier's category
+            # set (DESIGN §8) — gates before provision/plan spend, may re-drive
+            # phase_classify. Inside the plans_after_classify checkpoint block,
+            # so a resume past this phase skips it.
+            await phase_classification_gate(
+                task, st, caps, args.clarify, models, efforts)
             # Resumable-planning checkpoint (DESIGN §6 "Resumable planning
             # — a per-phase checkpoint cursor, not a `waves` gate"). `plans`
             # does not exist yet at this point in the pipeline
@@ -21081,6 +21896,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             if "recipe" not in (st.data.get("provision") or {}):
                 await phase_provision(
                     Path(os.getcwd()), st, caps, models, efforts)
+            # Independent adversarial verification of the detected install
+            # recipe (DESIGN §8) — gates before plan spend, detect-and-die.
+            # Cheap-skips when no recipe was detected (docs-only / kind:none).
+            # Inside the plans_after_classify block, so a resume past this
+            # phase skips it.
+            await phase_provision_gate(
+                Path(os.getcwd()), st, caps, models, efforts)
             # gather_answers blocks on input(). That's fine here: no
             # concurrent tasks are scheduled yet, so blocking the loop
             # blocks nothing. Kept on the event loop deliberately — every
@@ -21166,6 +21988,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # fire) and before schedule() (so a re-plan never rebuilds an
             # already-scheduled DAG).
             plans = await phase_adherence_gate(
+                plans, task, st, caps, models, efforts)
+            # Independent SEMANTIC wiring verification (DESIGN §5 *A wiring
+            # re-check on the fully-merged plan*, §8) — detect-and-die: the
+            # wiring_judge attacks the reconciled plan for semantic dangles a
+            # structural provider-existence scan cannot see and die()s on a
+            # concrete defect. Returns `plans` unchanged. Runs inside the
+            # plans_after_adherence_gate checkpoint block (after the adherence
+            # gate, before the checkpoint save) so a resume past this phase
+            # skips it; the deterministic check_plan_wiring below is its
+            # structural counterpart, run post-drop before validate_plan.
+            plans = await phase_wiring_gate(
                 plans, task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-instruction-adherence-
             # gate `plans`, persisted so --resume can skip re-invoking
@@ -21265,6 +22098,25 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # rehydrates subtasks/waves above and re-runs only this check,
         # rather than dying "Plans are not persisted".
         check_budget_feasibility(st, caps, subtasks, waves)
+        # Deterministic wiring re-check on the fully-merged POST-DROP plan
+        # (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Runs
+        # after both soft-drop filters and schedule() so ids/tags are final,
+        # and BEFORE validate_plan so a dangle left by a merge/rename/drop
+        # rewrite dies here with a wiring-specific, actionable message rather
+        # than at validate_plan's generic die — both throw the plan spend
+        # away, but this one names the failure. validate_plan stays the
+        # backstop (it re-checks the same invariants below).
+        wiring_issues = check_plan_wiring(subtasks)
+        if wiring_issues:
+            die(
+                "plan-wiring check found "
+                f"{len(wiring_issues)} unresolved dangle(s) on the merged "
+                "post-drop plan — an id/tag-vanishing operation "
+                "(reconciler merge/rename/drop, a soft-drop filter, or P1 "
+                "expansion) did not rewrite an inbound reference "
+                "(DESIGN §5 *Id-vanishing operations*):\n" +
+                "\n".join(f"  • {i}" for i in wiring_issues)
+            )
         validate_plan(subtasks)
         write_plan(leerie_dir, task, st, subtasks, waves)
 
@@ -21501,6 +22353,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "before phase_execute spends. "
                          f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
                          "skip_adherence_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-completeness-check", action="store_true",
+                    help="demote the conformer's gating solution_defects "
+                         "completeness axis (DESIGN §9) to advisory: found "
+                         "defects surface as warnings but never re-drive the "
+                         "implementer, block a subtask, or die() the "
+                         "final-tree pass. Use when a false-positive "
+                         "completeness defect is blocking finalize on every "
+                         "--resume. "
+                         f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
+                         "skip_completeness_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -21871,6 +22733,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # there on entry.
     args.skip_adherence_check = resolve_skip_adherence_check(
         repo_root, args.skip_adherence_check)
+
+    # Resolve --skip-completeness-check (the conformer's gating
+    # solution_defects axis, DESIGN §9). Same precedence shape; orchestrate()
+    # folds it into state.json under "skip_completeness_check"; settle_subtask
+    # and run_final_conformance read it from there.
+    args.skip_completeness_check = resolve_skip_completeness_check(
+        repo_root, getattr(args, "skip_completeness_check", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.

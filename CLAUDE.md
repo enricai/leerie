@@ -387,6 +387,14 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # leerie.toml. Default: off.
 ./leerie "task" --skip-adherence-check
 
+# Demote the conformer's gating solution_defects completeness axis (DESIGN
+# §9 *The one gating axis: solution completeness*) to advisory: found defects
+# surface as warnings but never re-drive the implementer, block a subtask, or
+# die() the final-tree pass. Use when a false-positive completeness defect is
+# blocking finalize on every --resume. Also LEERIE_SKIP_COMPLETENESS_CHECK=1
+# or `skip_completeness_check = true` in leerie.toml. Default: off.
+./leerie "task" --skip-completeness-check
+
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + --resume).
 # Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in

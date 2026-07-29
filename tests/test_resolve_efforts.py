@@ -259,6 +259,10 @@ def test_judgment_workers_pinned_set(leerie):
         "classifier", "planner", "reconciler", "plan_overlap_judge",
         "provision", "integrator", "pr_writer", "dep_capture",
         "fit_judge", "splitter", "adherence_judge",
+        # Independent adversarial verifiers (DESIGN §8) — each is itself the
+        # authoritative gate replacing a self-graded confidence axis, so each
+        # runs on the judgment tier at the same `medium` post-Opus-5 default.
+        "classification_judge", "wiring_judge", "provision_judge",
     }
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
     assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER

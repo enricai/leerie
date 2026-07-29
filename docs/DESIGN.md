@@ -637,6 +637,36 @@ with per-resolution avoidance in place it must never fire, so a surviving cycle
 is treated as an orchestrator logic bug (the tentative check and the real apply
 path disagreed), not a user-recoverable condition.
 
+**A wiring re-check on the fully-merged plan, before `validate_plan`.** The
+per-operation rewrite discipline above is applied at each vanishing site — the
+drop filters prune both channels, expansion fans out. But the discipline is
+distributed across many operations (reconciler merge/rename/drop, both phase-3
+soft-drop filters, P1 expansion), and each is an independent opportunity to leave
+a dangle: a reconciler `merged_subtasks`/`renames` that rewired the id channel but
+not an inbound `requires`, an expansion whose successor inheritance missed a tag,
+or a *chained* vanishing that `_remap_vanished_deps`'s single-pass flatten does not
+fully resolve. `validate_plan` is the terminal backstop that catches any survivor —
+but it fires *after* the full planner/reconciler spend, so a dangle it catches
+throws that spend away. So a deterministic `check_plan_wiring` runs on the
+fully-merged post-drop plan (after both soft-drop filters and `schedule()`, before
+`validate_plan`): it replays `validate_plan`'s own provider-existence and
+`depends_on`-existence logic and, on a dangle, dies with a wiring-specific message
+that names the vanishing operation when derivable — front-running the generic
+`validate_plan` die with an actionable one, while `validate_plan` stays the
+backstop. This is the §12 boundary: the structural guarantee (every surviving
+`requires`/`depends_on` resolves) is a code check, not spread across per-operation
+prompt discipline alone.
+
+Structural existence is necessary but not sufficient — a plan can be *wired* (every
+tag resolves) yet *semantically* incomplete: a subtask whose work genuinely needs a
+capability but never declares the `requires` tag, or a merge that silently dropped a
+real dependency the tags never encoded. Those gaps are invisible to a
+provider-existence scan. So an independent `wiring_judge` (§8 *Independent
+adversarial verification*) reviews the merged plan and attacks its wiring for the
+semantic dangles the structural check is blind to. The two are complementary: the
+deterministic check owns "does every declared edge resolve," the judge owns "is the
+set of declared edges the right one."
+
 ### Migration-surface completeness
 
 When a plan introduces a new pattern replacing an old one — a new
@@ -4288,24 +4318,94 @@ before the orchestrator ever reads it (see §12). The *quality* of the
 artifacts each field names is model-judged; the *presence* of the discipline
 is not.
 
-**Confidence is the only load-bearing gate.** The implementer's
-`root_cause` / `solution` scores (and the planner's `task_understanding`)
-are the only confidence signals the orchestrator escalates to `failed` or
-`blocked` on. (The planner's `decomposition_quality` axis is retained as an
-advisory self-report but no longer gates — the independent `fit_judge` is the
-authoritative decomposition-quality gate; see §5½.) Tests passing, lint clean, build
-green, per-criterion satisfaction in a written criteria file — all
-**best-effort signals**. The orchestrator surfaces them as warnings
-attached to the subtask result and to telemetry, never as gating
-conditions. The reason is the same incentive §9 *Post-work conformance*
-flags from a different angle: any code-enforced "tests must pass" gate
-invites a stuck model to weaken the test rather than fix the code. The
-confidence gate, anchored to falsifiers and gap evidence, is the
-discipline that cannot be cheated by lowering a bar — a worker that
-cannot justify confidence in *the work itself* exits blocked, and the
-orchestrator's structural enforcement is limited to "did the worker
-fill in the self-gate fields at all," not "is the model's score
-correct."
+**Self-graded confidence is advisory; an independent verifier gates.**
+A worker's confidence score is a self-report, and a self-report has a
+structural ceiling that no amount of adversarial-falsification instruction
+can raise: you cannot disprove a failure mode you cannot conceive, and the
+mind that produced an incomplete solution bounds the failure modes it can
+imagine. Adversarial self-grading is a contradiction in exactly the cases
+that matter — the shallow-evidence case, where a real subtask scored itself
+`solution 9.5` with maximal confidence while every falsifier it "tested" was
+about its own test plumbing, and shipped three latent behavioral defects that
+later re-runs of the same task had to fix. The implementer prompt *already*
+commands maximal adversarial falsification; the implementer followed it and
+still missed the gaps, because it was grading itself.
+
+The fix is not more adversarial instruction — it is to change *who* runs the
+check. This generalizes the planner precedent (`fit_judge`, below): the
+independent judge finds cuts the self-grader was blind to *because* it did not
+produce the artifact, not because it is "more adversarial." So the load-bearing
+gate for each self-graded axis is an **independent adversarial verifier**, and
+the self-score is demoted to advisory. See *Independent adversarial
+verification* immediately below.
+
+Tests passing, lint clean, build green, per-criterion satisfaction in a
+written criteria file remain **best-effort signals** — surfaced as warnings,
+never gating. That is deliberate and unchanged: any code-enforced "tests must
+pass" gate invites a stuck model to weaken the test rather than fix the code
+(§9 *Post-work conformance* flags the same incentive). What replaces the
+self-graded confidence gate does *not* reintroduce that bar — see how
+independence dissolves the gaming incentive below. The structural schema
+enforcement is also unchanged: the worker's output schema still requires the
+falsification/reconciliation/gap fields to be present, so a worker that skipped
+the discipline fails its own JSON gate; the orchestrator just no longer treats
+the *score* those fields carry as the gate.
+
+#### Independent adversarial verification
+
+The planner already demonstrated the pattern. The planner's
+`decomposition_quality` self-score is retained as advisory but does not gate —
+the independent `fit_judge` is the authoritative decomposition-quality gate
+(§5½), and `plan_overlap_judge` / `adherence_judge` gate other planner
+dimensions the same way. `fit_judge` works because it is a *separate* worker
+that did not produce the decomposition, so it sees cuts the planner was blind
+to.
+
+The same discipline now covers every ungated self-grader. Each of the four
+remaining self-graded axes gets an independent verifier that (a) did not
+produce the artifact, (b) is handed only the artifact plus the task, and (c) is
+told to **attack** it — enumerate concrete unhandled inputs, paths, cases, or
+mis-wirings:
+
+- **implementer `solution`** → verified by the **conformer's `solution_defects`
+  axis**. The conformer already runs independently after the implementer's
+  success path and reviews the implementer's committed diff (it did not write
+  that diff — its own conformance edits are a separate, later layer). Its remit
+  is extended to adversarially attack the implementer's diff for the behavioral
+  gaps the self-grade missed (the decoy click, the unhandled error path, the
+  missing exit-guard, the sibling data-path site left unedited). This axis
+  **gates** in `settle_subtask`; the conformer's existing build/lint/test and
+  drift/docs/rule work stays advisory (below).
+- **classifier** → an independent verifier of the category set against the
+  task + codebase: does the chosen set cover the actual work, and does it
+  exclude none it needs? A miscategorization here is not cosmetic — the same
+  task classified one way produced ten subtasks and another way produced *zero*
+  (accomplished nothing), and a "landing page feature" classified as
+  documentation shipped only markdown. Gates on a found miscategorization.
+- **reconciler / plan wiring** → the deterministic `check_plan_wiring` plus the
+  independent `wiring_judge` described in §5 *A wiring re-check on the
+  fully-merged plan*.
+- **provision** → an independent verifier of the detected recipe against the
+  actual image/runtime: does a `pip install` recipe carry
+  `--break-system-packages` on the externally-managed Debian image; does the
+  detected package manager match the lockfiles present? A recipe self-graded
+  9.3 that omitted `--break-system-packages` caused twelve real install
+  failures. Gates on a recipe that would fail.
+
+**Why this does not reintroduce the gameable bar §9 removed.** The old
+criteria-lock / "tests must pass" gate was gameable because the *same* worker
+controlled the bar — it authored the criteria and could lower them, or weaken a
+test to clear them. Independence dissolves that incentive at the root. An
+independent verifier that (a) did not write the artifact and (b) gates on "here
+is a concrete input this artifact mishandles" — never on "a test passed" or
+"the criteria say met" — presents no bar for the graded worker to lower, and
+cannot be defeated by weakening a test, because the verifier constructs *new*
+adversarial inputs the graded worker never anticipated. So every one of these
+gates keys on an **independently-found concrete defect in the artifact's
+behavior**, never on a self-assertable or lowerable signal. That is precisely
+why `fit_judge` gates the planner without being gameable, and it is the invariant
+each new verifier must preserve: a verdict is a list of concrete found defects,
+not a score crossing a threshold.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
@@ -4461,6 +4561,26 @@ Two further disciplines apply, and they sit at the §12 axis:
   assertion, or skip a lint rule to clear the bar. Keeping the phase
   advisory removes that incentive while still surfacing the residual to the
   human and to telemetry.
+- **The one gating axis: solution completeness.** The conformer carries a
+  single gating axis, `solution_defects`, and it is gating for the exact
+  reason build/lint/test are not: it is not a self-assertable bar the
+  conformer can lower, but an adversarial attack on an artifact the conformer
+  did not write. The conformer reviews the *implementer's* committed diff
+  (§8 *Independent adversarial verification*) and enumerates concrete
+  behavioral gaps it does not handle — an unhandled input, a missing guard, a
+  decoy shortcut, a sibling call site left unedited. A non-empty set of
+  concretely-named defects gates the subtask: the found gaps become mandatory
+  additional criteria and the subtask retries the implementer with them folded
+  in (bounded by `completeness_retry_rounds`; on exhaustion the subtask blocks
+  with the residual defects named, fix + `--resume`). This is *independent* of
+  `--strict-conformer`, which governs the advisory build/lint/test/residual
+  axes above. It does not reintroduce the gameable bar because there is no bar
+  to lower — the conformer cannot weaken a test to make a concrete
+  unhandled-input defect disappear; it can only report the input it constructed
+  or not. A defect without a concrete case is dropped as non-actionable, so the
+  axis cannot gate on vague "looks incomplete" prose. When the diff is empty or
+  unreadable the axis fails open (advisory, never gates) — there is nothing to
+  attack.
 - **No backsliding.** The conformer can add commits but must not write to
   protected paths. The diff-scope check — no writes to `.leerie/`,
   `.git/`, or `.claude/` *except for the user-deliverable subtrees*
@@ -5229,11 +5349,13 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the eleven worker types in
+Every main-loop LLM call in Leerie passes through one of the fifteen worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
-`fit_judge`, or `splitter` (the last two are the P1 recursive-decomposition
-workers — see §5½). Each worker type is a distinct **call type** — a
+`fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
+`wiring_judge`, or `provision_judge` (`fit_judge`/`splitter` are the P1
+recursive-decomposition workers — see §5½; the last three are the independent
+adversarial verifiers — see §8). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,

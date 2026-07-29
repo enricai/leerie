@@ -1,55 +1,17 @@
 """Tests for the mechanical-feedback retry loop infrastructure:
-``_confidence_axes_clear``, ``_format_check_feedback``, and
-``_run_checked_loop`` (CRITIC pattern — DESIGN §8 + §12).
+``_format_check_feedback`` and ``_run_checked_loop`` (CRITIC pattern —
+DESIGN §8 + §12).
+
+(``_confidence_axes_clear`` was removed when the implementer's self-score
+gate was retired — DESIGN §8 *Independent adversarial verification*: the
+conformer's independent ``solution_defects`` axis is now the authoritative
+completeness gate, so no worker gates on its own confidence number.)
 """
 from __future__ import annotations
 
 import asyncio
 
 import pytest
-
-
-# --- _confidence_axes_clear ---------------------------------------------- #
-
-def test_axes_clear_all_above(leerie):
-    assert leerie._confidence_axes_clear(
-        {"a": 9.5, "b": 9.0}, ["a", "b"])
-
-
-def test_axes_clear_one_below(leerie):
-    assert not leerie._confidence_axes_clear(
-        {"a": 8.9, "b": 9.5}, ["a", "b"])
-
-
-def test_axes_clear_exactly_threshold(leerie):
-    assert leerie._confidence_axes_clear(
-        {"x": 9.0}, ["x"], threshold=9.0)
-
-
-def test_axes_clear_missing_key(leerie):
-    assert not leerie._confidence_axes_clear(
-        {"a": 9.5}, ["a", "b"])
-
-
-def test_axes_clear_non_numeric(leerie):
-    assert not leerie._confidence_axes_clear(
-        {"a": "high"}, ["a"])
-
-
-def test_axes_clear_none_value(leerie):
-    assert not leerie._confidence_axes_clear(
-        {"a": None}, ["a"])
-
-
-def test_axes_clear_empty_axes(leerie):
-    assert leerie._confidence_axes_clear({"a": 1.0}, [])
-
-
-def test_axes_clear_custom_threshold(leerie):
-    assert leerie._confidence_axes_clear(
-        {"a": 7.5}, ["a"], threshold=7.0)
-    assert not leerie._confidence_axes_clear(
-        {"a": 6.9}, ["a"], threshold=7.0)
 
 
 # --- _format_check_feedback ---------------------------------------------- #

@@ -600,11 +600,14 @@ class TestConfidenceIssues:
 # --- LOW_CONFIDENCE in check functions ---------------------------------- #
 
 class TestLowConfidenceGating:
-    def test_classifier_low_confidence(self, leerie, tmp_path):
+    def test_classifier_self_score_does_not_gate(self, leerie, tmp_path):
+        """DESIGN §8: the classifier's `classification` self-score is NO
+        LONGER a gating axis — the independent classification_judge is the
+        authoritative gate. A low self-score must NOT produce LOW_CONFIDENCE."""
         result = {"categories": ["testing"], "questions": [],
-                  "confidence": _conf(classification=8.0)}
+                  "confidence": _conf(classification=2.0)}
         issues = leerie.check_classifier_output(result, tmp_path)
-        assert any("LOW_CONFIDENCE" in i for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_planner_low_confidence(self, leerie, tmp_path):
         plan = {"subtasks": [], "status": "ready", "domain": "testing",
@@ -614,11 +617,15 @@ class TestLowConfidenceGating:
         assert any("LOW_CONFIDENCE" in i and "task_understanding" in i
                     for i in issues)
 
-    def test_reconciler_low_confidence(self, leerie):
+    def test_reconciler_self_score_does_not_gate(self, leerie):
+        """DESIGN §8: the reconciler's `reconciliation` self-score is NO
+        LONGER a gating axis — the deterministic check_plan_wiring + the
+        independent wiring_judge are authoritative. Low self-score must NOT
+        produce LOW_CONFIDENCE."""
         output = {"renames": [], "added_subtasks": [],
-                  "confidence": _conf(reconciliation=5.0)}
+                  "confidence": _conf(reconciliation=2.0)}
         issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
-        assert any("LOW_CONFIDENCE" in i for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_overlap_judge_low_confidence(self, leerie, tmp_path):
         output = {"collisions": [],
@@ -627,11 +634,17 @@ class TestLowConfidenceGating:
             output, [{"subtasks": []}], tmp_path)
         assert any("LOW_CONFIDENCE" in i for i in issues)
 
-    def test_provision_low_confidence(self, leerie, tmp_path):
-        result = {"recipe": [],
-                  "confidence": _conf(recipe_correctness=0.0)}
+    def test_provision_self_score_does_not_gate(self, leerie, tmp_path):
+        """DESIGN §8: the provision worker's `recipe_correctness` self-score
+        is NO LONGER a gating axis — the independent provision_judge is
+        authoritative. A recipe with content but a low self-score must NOT
+        produce LOW_CONFIDENCE (empty recipe with lockfiles is a separate
+        mechanical EMPTY_RECIPE check; tmp_path has no lockfiles)."""
+        result = {"recipe": [{"kind": "install", "command": ["true"],
+                              "working_dir": "."}],
+                  "confidence": _conf(recipe_correctness=2.0)}
         issues = leerie.check_provision_output(result, tmp_path)
-        assert any("LOW_CONFIDENCE" in i for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_integrator_low_confidence(self, leerie):
         result = {"confidence": _conf(resolution=7.5)}
