@@ -1190,6 +1190,44 @@ written at phase entry, before the phase spends, would mark an incomplete
 phase done and resume with a half-built plan), kept intentionally small
 and separate so it can't be diluted by unrelated changes to the larger
 checkpoint-writing test file.
+The re-entry (`--resume`-consuming) half of the same mechanism — that a
+`state.json` checkpointed through phase K reloads and re-enters at phase
+K+1 without re-invoking any completed phase's worker — is pinned
+behaviorally in `tests/test_resume_planning_reentry.py`, distinct from
+`test_plans_after_checkpoints.py`'s source-coupling pin of the write side.
+It drives the real `_run_phases` end-to-end with every phase function
+stubbed via call-counting monkeypatches (mirroring
+`test_phase_adherence_gate.py`'s stub discipline), a stubbed `phase_execute`
+that raises a sentinel exception so the test can inspect state without
+touching the unrelated execute/finalize phases, and asserts, per
+`plans_after_*` checkpoint present in the seeded `state.json`, that every
+phase up to and including the checkpointed one is absent from the call log
+and every phase after it ran exactly once. `TestPerPhaseRoundTrip` covers
+all six planning-phase boundaries (classify → plan → reconcile →
+overlap_judge → adherence_gate → filters → schedule). Anti-vacuity per the
+CLAUDE.md checklist: the completed phases are stubbed with counters that
+would fire if called (not merely omitted from the fixture), and the
+fixture never pre-seeds a *downstream* phase's output — only the
+checkpoint(s) up to the resume point are present, so the "not re-invoked"
+assertion is falsifiable by the code, not vacuously true because nothing
+downstream could run anyway. Also pinned: `phase_provision`'s
+key-presence-not-truthiness resume-skip (an empty `recipe: []` is a valid
+completed state, not "resume must redo it"); the reported incident
+directly (`current_phase` naming the satisfied-probe sweep with a partial
+`satisfied_probe_cache` and no `plans_after_filters` resumes through to
+`write_plan` instead of dying "did not reach the scheduling phase");
+post-scheduling resume falling straight through to `phase_execute`
+unchanged when `waves` is already present; budget-check resume rehydrating
+`plan_snapshot` instead of the old "Plans are not persisted" die; the
+`schedule()`-determinism guarantee end-to-end (a fresh `schedule()` call
+and a checkpoint-then-resume of the same `plans` produce byte-identical
+`waves`/`subtasks`); an allowlist guard that every checkpoint key this
+consumer reads is present in `STATE_FIELDS`; that the old
+`"did not reach the scheduling phase"` die() message string is gone from
+the source; and that a state.json with no progress at all (no
+`categories`, no `waves` — never reached the first `st.save()` after
+`phase_classify` started) is the one case that still `die()`s, since there
+is nothing to resume from.
 The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
 in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
 CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
