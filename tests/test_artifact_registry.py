@@ -5,7 +5,7 @@ Covers:
   - SCHEMAS["artifact_registry"] structural contract (required fields, item
     shape, minLength guards, valid/invalid acceptance)
   - worker registration (WORKER_TYPES; absent from MODEL_DEFAULT_PER_WORKER so
-    it resolves opus; EFFORT_DEFAULT_PER_WORKER entry "medium"; prompt exists)
+    it resolves sonnet; EFFORT_DEFAULT_PER_WORKER entry "medium"; prompt exists)
   - model/effort resolution precedence
   - phase_artifact_registry behavior: returns the artifacts list, drops
     malformed items, degrades to [] on worker crash, is best-effort (no die)
@@ -95,7 +95,7 @@ def test_in_worker_types(leerie):
 
 
 def test_absent_from_model_default_per_worker(leerie):
-    # → resolves to opus via the global MODEL_DEFAULT fallback.
+    # → resolves to sonnet via the global MODEL_DEFAULT fallback.
     assert "artifact_registry" not in leerie.MODEL_DEFAULT_PER_WORKER
 
 
