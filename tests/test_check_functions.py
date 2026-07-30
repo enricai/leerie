@@ -697,10 +697,15 @@ class TestLowConfidenceGating:
         issues = leerie.check_provision_output(result, tmp_path)
         assert not any("LOW_CONFIDENCE" in i for i in issues)
 
-    def test_integrator_low_confidence(self, leerie):
+    # feat-006 — integrator's resolution self-score is demoted to an advisory
+    # self-report: the independent integration_judge (in integrate_wave) is now
+    # the authoritative behavioral-integration gate (DESIGN §8), removing the
+    # integrator's self-grading bias.
+    def test_integrator_low_resolution_does_not_gate(self, leerie):
         result = {"confidence": _conf(resolution=7.5)}
         issues = leerie.check_integrator_output(result)
-        assert any("LOW_CONFIDENCE" in i for i in issues)
+        assert not any("resolution" in i.lower() for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_integrator_clean(self, leerie):
         result = {"confidence": _conf(resolution=9.0)}
