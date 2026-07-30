@@ -568,6 +568,10 @@ def test_call_site_exits_before_reaching_generic_note_path() -> None:
 # depending on the larger helper's plumbing.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
 def test_reason_survives_a_dollar_paren_subshell_call(tmp_path: Path) -> None:
     """The rejection-reason channel must be readable by the caller after
     invoking _extract_claude_credentials_json via $(...) -- the exact
