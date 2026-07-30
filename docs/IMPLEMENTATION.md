@@ -423,7 +423,8 @@ relevant bash surface:
 ### Persistent out-of-repo dependency bake
 
 Dependencies are installed once at image-build time into persistent paths
-outside `/work`. The concrete bake targets and environment variables per
+outside `/work`. The concrete bake targets and environment variables the
+Dockerfile emitter and `PROVISION_RECIPE` generator must produce, per
 ecosystem:
 
 | Ecosystem | Bake target | Env var(s) | Notes |
@@ -436,15 +437,15 @@ ecosystem:
 
 **`PROVISION_RECIPE` contract (updated):** For baked ecosystems
 (Python/Ruby/Rust/Go), the recipe injected into implementer/conformer prompts
-is **informational only** — it shows what was baked but does not instruct a
+is **informational only** — it shows what was baked but does **not** instruct a
 per-run install, since the bake already satisfied the dependencies. For
 Node/pnpm repos, the recipe carries the residual offline-relink command (`pnpm
 install --offline --frozen-lockfile`), which workers run when their subtask
 needs built dependencies (e.g., running tests or linting). A config-only or
 docs-only subtask skips the residual step.
 
-**`capture_repo_deps` contract (updated):** The `dep_capture` worker always
-runs at finalize time — it is **not skipped** when a committed
+**`capture_repo_deps` contract (updated):** The `dep_capture` worker **always
+runs** at finalize time — it is **not skipped** when a committed
 `.leerie/Dockerfile` exists. The worker writes only **residual** dependencies
 to `.leerie/config.toml` (`setup_packages` for apt packages workers had to
 install, `language_installs` entries for commands that cannot be baked). For
