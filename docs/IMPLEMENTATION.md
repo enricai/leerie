@@ -4291,7 +4291,7 @@ Each returns `list[str]` — empty when clean. Pure Python, no LLM.
 | Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `EMPTY_EVIDENCE`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE`, `UNCOVERED_MIGRATION_SURFACE`, `LOW_CONFIDENCE` | `planner_check_rounds` (3) |
 | Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
-| Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
+| Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH` | `judgment_check_rounds` (3) |
 | Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION` | `implementer_confidence_retries` (2) |
@@ -4315,9 +4315,12 @@ for its `files_likely_touched` set intersection.
 `LOW_CONFIDENCE` is emitted by `_confidence_issues(conf, axes, threshold=9.0)`,
 a helper that returns one issue string per axis below threshold. Each check
 function calls it with its worker's schema-defined axes: classifier
-`["classification"]`, planner `["task_understanding", "decomposition_quality"]`,
-reconciler `["reconciliation"]`, overlap judge `["judgment"]`, provision
-`["recipe_correctness"]`, integrator `["resolution"]`.
+`["classification"]`, reconciler `["reconciliation"]`. The overlap judge's
+`judgment`, planner's `task_understanding`/`decomposition_quality`,
+provision's `recipe_correctness`, and integrator's `resolution` axes are no
+longer gated here — each is either demoted to advisory-only (overlap judge)
+or superseded by an independent adversarial verifier (the others; see
+"Independent adversarial verifiers" below).
 
 The reconciler's size-gate and cycle-gate retry paths also run
 `check_reconciler_output` after each retry's `_apply_reconciler_output`,

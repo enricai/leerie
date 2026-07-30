@@ -672,12 +672,18 @@ class TestLowConfidenceGating:
         issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
         assert not any("LOW_CONFIDENCE" in i for i in issues)
 
-    def test_overlap_judge_low_confidence(self, leerie, tmp_path):
+    def test_overlap_judge_self_score_does_not_gate(self, leerie, tmp_path):
+        """DESIGN §8: the overlap judge's `judgment` self-score is NO LONGER
+        a gating axis — this worker is already the independent adversarial
+        check, so its own deterministic validators (PHANTOM_ARTIFACT,
+        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH) are authoritative. A low
+        self-score with otherwise-clean output must NOT produce
+        LOW_CONFIDENCE."""
         output = {"collisions": [],
-                  "confidence": _conf(judgment=8.9)}
+                  "confidence": _conf(judgment=1.0)}
         issues = leerie.check_overlap_judge_output(
             output, [{"subtasks": []}], tmp_path)
-        assert any("LOW_CONFIDENCE" in i for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_provision_self_score_does_not_gate(self, leerie, tmp_path):
         """DESIGN §8: the provision worker's `recipe_correctness` self-score

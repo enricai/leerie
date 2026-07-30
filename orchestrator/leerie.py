@@ -6585,8 +6585,15 @@ def check_overlap_judge_output(
                     f"would remove provides tags {orphaned} that "
                     "other subtasks require")
 
-    issues.extend(_confidence_issues(
-        output.get("confidence") or {}, ["judgment"]))
+    # The overlap judge's `judgment` self-score is NO LONGER a gating axis
+    # (DESIGN §8 *Independent adversarial verification*): this worker IS an
+    # adversarial judge grading its own judgment, the purest self-scoring
+    # case, and a self-score cannot substitute for an independent check. The
+    # authoritative gate is the deterministic PHANTOM_ARTIFACT /
+    # NO_FILE_OVERLAP / DROP_BREAKS_GRAPH checks above plus
+    # `_validate_overlap_judge_output`'s merge-feasibility backstop. The
+    # `confidence` object stays emitted and schema-required, just not gated
+    # on here.
     return issues
 
 
