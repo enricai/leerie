@@ -28,7 +28,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "satisfied_probe", "provision", "implementer", "integrator",
            "conformer", "fit_judge", "splitter", "adherence_judge",
            "classification_judge", "wiring_judge", "provision_judge",
-           "task_coverage_judge", "artifact_registry")
+           "task_coverage_judge", "artifact_registry", "integration_judge")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -50,6 +50,7 @@ DEFAULTS = {
     "provision_judge": "sonnet",
     "task_coverage_judge": "sonnet",
     "artifact_registry": "sonnet",
+    "integration_judge": "sonnet",
 }
 
 
