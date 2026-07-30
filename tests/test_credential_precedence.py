@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
-from tests.test_chain_credential_transport import _invoke_helper
+from tests.test_chain_credential_transport import LAUNCHER, _invoke_helper
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_AUTH_SH = REPO_ROOT / "scripts" / "remote" / "seed-auth.sh"
@@ -346,3 +348,289 @@ def test_valid_keychain_blob_with_mcp_oauth_alongside_is_still_accepted(
     )
     assert rc == 0
     assert out == blob
+
+
+# ---------------------------------------------------------------------------
+# (i) The rejection reason: the call site (STAGE-assembly block) uses this
+# to distinguish "found an mcpOAuth-only blob" (a confirmed, currently
+# unresolved upstream Claude Code CLI bug -- steipete/CodexBar#1844 -- where
+# /login does not help) from "found nothing at all" (which /login or
+# Keychain access CAN plausibly fix), and die()s with an accurate message
+# for each case rather than the previous single generic "note and continue".
+#
+# The reason travels via a PID-scoped temp file
+# ($_CLAUDE_CREDS_REJECT_REASON_FILE), not a plain shell variable --
+# _extract_claude_credentials_json is invoked at the real call site via
+# $(...) command substitution, which forks a subshell, so a var it assigns
+# internally would never be visible to the caller once that subshell exits.
+# _invoke_helper_with_reason below deliberately invokes the function the
+# same way (via $(...)) rather than as a bare statement, so it actually
+# exercises this subshell boundary instead of silently sidestepping it --
+# an earlier version of this helper invoked the function as a bare
+# statement, which does NOT fork a subshell, so it could not have caught a
+# regression back to a plain-variable reason channel. See
+# test_reason_survives_a_dollar_paren_subshell_call below for a minimal,
+# targeted regression pin of that exact class of bug.
+# ---------------------------------------------------------------------------
+
+def _invoke_helper_with_reason(
+    tmp_path: Path,
+    env: dict[str, str],
+    *,
+    credentials_file: str | None = None,
+    stub_security_returns: str | None = None,
+) -> tuple[int, str, str]:
+    """Like _invoke_helper, but also captures the rejection reason after
+    the call. Invokes _extract_claude_credentials_json via $(...) --
+    exactly as the real call site does -- so this test exercises the same
+    subshell boundary the real code crosses, not a shortcut around it."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    if credentials_file is not None:
+        claude_dir = fake_home / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / ".credentials.json").write_text(credentials_file)
+
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    sec = bin_dir / "security"
+    if stub_security_returns is None:
+        sec.write_text("#!/bin/sh\nexit 1\n")
+    else:
+        sec.write_text(f"#!/bin/sh\nprintf '%s' '{stub_security_returns}'\nexit 0\n")
+    sec.chmod(0o755)
+
+    extract = tmp_path / "extract-helper.sh"
+    extract.write_text(textwrap.dedent(f"""\
+        #!/bin/bash
+        grep '^_CLAUDE_CREDS_REJECT_REASON_FILE=' "{LAUNCHER}"
+        awk '
+          /^_claude_creds_has_oauth_token\\(\\)/ {{ p=1 }}
+          /^_extract_claude_credentials_json\\(\\)/ {{ p=1 }}
+          p {{ print }}
+          p && /^}}$/ {{ p=0 }}
+        ' "{LAUNCHER}"
+        """))
+    extract.chmod(0o755)
+    helper_src = subprocess.run(
+        ["bash", str(extract)], capture_output=True, text=True, check=True,
+    ).stdout
+    helper_file = tmp_path / "helper.sh"
+    helper_file.write_text(helper_src)
+
+    reason_file = tmp_path / "reason-file-location"
+    # TMPDIR redirects _CLAUDE_CREDS_REJECT_REASON_FILE's
+    # ${TMPDIR:-/tmp}/... resolution into this test's own auto-cleaned
+    # tmp_path, instead of leaking a scratch file into the real host
+    # /tmp on every test invocation.
+    reason_tmpdir = tmp_path / "reason-tmpdir"
+    reason_tmpdir.mkdir()
+    full_env = {
+        "HOME": str(fake_home),
+        "TMPDIR": str(reason_tmpdir),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+    }
+    full_env.update(env)
+    result = subprocess.run(
+        ["bash", "-c",
+         # Mirrors the real call site verbatim: creds captured via $(...)
+         # (a subshell), reason read back from the file afterward in the
+         # (now-resumed) parent shell.
+         f". {helper_file} && "
+         f"CREDS=\"$(_extract_claude_credentials_json)\"; rc=$?; "
+         f"printf '%s' \"$CREDS\"; "
+         f"cat \"$_CLAUDE_CREDS_REJECT_REASON_FILE\" 2>/dev/null "
+         f">'{reason_file}'; "
+         f"exit $rc"],
+        env=full_env, capture_output=True, text=True, timeout=10,
+    )
+    reason = reason_file.read_text() if reason_file.exists() else ""
+    return result.returncode, result.stdout, reason
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_reject_reason_set_for_mcp_oauth_only_keychain_blob(tmp_path: Path) -> None:
+    """An mcpOAuth-only Keychain blob with no file fallback sets the
+    reason to keychain-mcp-oauth-only, so the call site can name the
+    upstream-bug-specific failure instead of a generic one."""
+    rc, out, reason = _invoke_helper_with_reason(
+        tmp_path, env={},
+        stub_security_returns='{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}}}',
+    )
+    assert rc != 0
+    assert out == ""
+    assert reason == "keychain-mcp-oauth-only"
+
+
+def test_reject_reason_set_for_mcp_oauth_only_file(tmp_path: Path) -> None:
+    """An mcpOAuth-only on-disk file (no Keychain hit) sets the reason to
+    file-mcp-oauth-only."""
+    rc, out, reason = _invoke_helper_with_reason(
+        tmp_path, env={},
+        credentials_file='{"mcpOAuth":{"plugin:vercel:vercel|def":{"accessToken":""}}}',
+    )
+    assert rc != 0
+    assert out == ""
+    assert reason == "file-mcp-oauth-only"
+
+
+def test_reject_reason_empty_when_nothing_found_at_all(tmp_path: Path) -> None:
+    """No env var, no Keychain, no file -> reason stays empty (this is a
+    genuinely-plain 'nothing found' case, distinct from the mcpOAuth-only
+    upstream-bug shape; /login or granting Keychain access remain
+    plausible fixes here, unlike the mcpOAuth-only case)."""
+    rc, out, reason = _invoke_helper_with_reason(tmp_path, env={})
+    assert rc != 0
+    assert out == ""
+    assert reason == ""
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_reject_reason_empty_when_successfully_resolved(tmp_path: Path) -> None:
+    """A successful resolution must not leave a stale reason from a
+    previous call lingering -- the function resets the reason at entry."""
+    rc, out, reason = _invoke_helper_with_reason(
+        tmp_path, env={},
+        stub_security_returns='{"claudeAiOauth":{"accessToken":"sk-good"}}',
+    )
+    assert rc == 0
+    assert out == '{"claudeAiOauth":{"accessToken":"sk-good"}}'
+    assert reason == ""
+
+
+# ---------------------------------------------------------------------------
+# (j) The STAGE-assembly call site's die() message content, pinned via
+# source inspection (the launcher's main flow cannot easily be driven
+# end-to-end in a unit test -- it requires a full container/image
+# pipeline). Mirrors the source-coupling discipline used elsewhere in this
+# suite (e.g. tests/test_no_result_event_retry.py's ast-based extraction).
+# ---------------------------------------------------------------------------
+
+def _stage_assembly_block_source() -> str:
+    src = LAUNCHER.read_text()
+    start = src.index('if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)"')
+    end = src.index("\nfi\n", start) + len("\nfi\n")
+    return src[start:end]
+
+
+def test_die_message_names_mcp_oauth_only_reasons() -> None:
+    """The call site's die() message for the mcpOAuth-only reasons must
+    name the upstream bug and its tracking issue, and must explicitly
+    say /login will not fix it."""
+    block = _stage_assembly_block_source()
+    assert "keychain-mcp-oauth-only|file-mcp-oauth-only" in block
+    assert "steipete/CodexBar#1844" in block
+    assert "will NOT fix this" in block
+    assert "claude setup-token" in block
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in block
+
+
+def test_die_message_recommends_setup_token_not_login_for_mcp_oauth_case() -> None:
+    """Regression guard: the mcpOAuth-only branch of the die() message
+    must not tell the user to run /login (verified ineffective against
+    the confirmed upstream bug) -- only the genuinely-different
+    nothing-found branch may mention /login-adjacent remediation
+    ('grant Keychain access')."""
+    block = _stage_assembly_block_source()
+    mcp_branch_start = block.index("keychain-mcp-oauth-only|file-mcp-oauth-only")
+    mcp_branch_end = block.index(";;", mcp_branch_start)
+    mcp_branch = block[mcp_branch_start:mcp_branch_end]
+    assert "/login" not in mcp_branch or "will NOT fix" in mcp_branch
+
+
+def test_call_site_exits_before_reaching_generic_note_path() -> None:
+    """The old soft 'note — could not extract...' message must be fully
+    replaced by the hard die() -- no dead code path continues past this
+    block into a container run with no valid credentials staged."""
+    src = LAUNCHER.read_text()
+    assert "note — could not extract Claude credentials from Keychain." not in src
+    block = _stage_assembly_block_source()
+    assert "exit 1" in block
+
+
+# ---------------------------------------------------------------------------
+# (k) Minimal, targeted regression pin for the exact bug class found in the
+# 2026-07-30 correctness audit: _extract_claude_credentials_json is invoked
+# at the call site via $(...) command substitution, which forks a subshell.
+# A plain global var assigned inside the function (the original, buggy
+# implementation) is invisible to the caller once that subshell exits --
+# reproduced live during the audit via a minimal standalone script before
+# the fix landed. This test is deliberately independent of
+# _invoke_helper_with_reason (which already exercises the same boundary,
+# see its docstring above) -- a direct, minimal reproduction so a future
+# refactor back to a bare variable fails immediately and obviously, without
+# depending on the larger helper's plumbing.
+# ---------------------------------------------------------------------------
+
+def test_reason_survives_a_dollar_paren_subshell_call(tmp_path: Path) -> None:
+    """The rejection-reason channel must be readable by the caller after
+    invoking _extract_claude_credentials_json via $(...) -- the exact
+    invocation shape the real call site uses. A plain shell variable
+    assigned inside the function cannot satisfy this (variables set in a
+    $(...) subshell do not propagate to the parent shell); only a real
+    file (or another channel that survives subshell exit) can."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    sec = bin_dir / "security"
+    sec.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"mcpOAuth\":{\"plugin:supabase:supabase|abc\":"
+        "{\"accessToken\":\"\"}}}'\n"
+        "exit 0\n"
+    )
+    sec.chmod(0o755)
+
+    extract = tmp_path / "extract-helper.sh"
+    extract.write_text(textwrap.dedent(f"""\
+        #!/bin/bash
+        grep '^_CLAUDE_CREDS_REJECT_REASON_FILE=' "{LAUNCHER}"
+        awk '
+          /^_claude_creds_has_oauth_token\\(\\)/ {{ p=1 }}
+          /^_extract_claude_credentials_json\\(\\)/ {{ p=1 }}
+          p {{ print }}
+          p && /^}}$/ {{ p=0 }}
+        ' "{LAUNCHER}"
+        """))
+    extract.chmod(0o755)
+    helper_src = subprocess.run(
+        ["bash", str(extract)], capture_output=True, text=True, check=True,
+    ).stdout
+    helper_file = tmp_path / "helper.sh"
+    helper_file.write_text(helper_src)
+
+    # TMPDIR redirects _CLAUDE_CREDS_REJECT_REASON_FILE's
+    # ${TMPDIR:-/tmp}/... resolution into this test's own auto-cleaned
+    # tmp_path, instead of leaking a scratch file into the real host
+    # /tmp on every test invocation.
+    reason_tmpdir = tmp_path / "reason-tmpdir"
+    reason_tmpdir.mkdir()
+    full_env = {
+        "HOME": str(fake_home),
+        "TMPDIR": str(reason_tmpdir),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+    }
+    result = subprocess.run(
+        ["bash", "-c",
+         # The exact shape that broke in the audit: call the function via
+         # $(...), THEN try to read whatever it left behind for the reason,
+         # from the resumed parent shell -- after the subshell has exited.
+         f". {helper_file} && "
+         f"_=\"$(_extract_claude_credentials_json)\"; "
+         f"cat \"$_CLAUDE_CREDS_REJECT_REASON_FILE\" 2>/dev/null"],
+        env=full_env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.stdout == "keychain-mcp-oauth-only", (
+        "the rejection reason did not survive the $(...) subshell boundary "
+        "-- this is the exact bug found in the 2026-07-30 audit; the "
+        "reason channel must be a file (or another subshell-surviving "
+        "mechanism), not a plain shell variable"
+    )

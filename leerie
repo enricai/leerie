@@ -114,17 +114,37 @@ except Exception:
 # Prints the JSON to stdout. Returns 0 if creds were found, 1 otherwise.
 #
 # Both the Keychain entry and the on-disk file are shared with Claude
-# Code's MCP-server OAuth state (a known upstream bug — e.g.
-# anthropics/claude-code and steipete/CodexBar#1844 — lets a background
-# MCP-plugin auth flow overwrite the shared "Claude Code-credentials"
-# Keychain item with only {"mcpOAuth": {...}}, dropping claudeAiOauth
-# entirely). A blob in that shape is valid, non-empty JSON, so it is
-# shape-checked via _claude_creds_has_oauth_token above for a real
-# claudeAiOauth.accessToken before being accepted — otherwise it stages
-# into the container and the CLI there fails with "Not logged in ·
-# Please run /login".
+# Code's MCP-server OAuth state. As of CLI 2.1.x, current Claude Code
+# builds (confirmed live through at least 2.1.220, the newest release as
+# of this writing) have a confirmed, currently-unresolved upstream bug
+# where the "Claude Code-credentials" Keychain item stops carrying the
+# real claudeAiOauth session block at all and holds only
+# {"mcpOAuth": {...}} — MCP-plugin OAuth discovery/session state — even
+# while the CLI itself is fully logged in and working
+# (steipete/CodexBar#1844; matching anthropics/claude-code's own
+# `area:auth` `bug`-labeled open issues, e.g. #80603, explicitly titled
+# as a regression). Critically, `claude /login` does NOT fix this: per
+# the same upstream report, the CLI "writes the token to the new
+# location, not into Claude Code-credentials" — so re-running /login
+# cannot repair this item. A blob in the mcpOAuth-only shape is valid,
+# non-empty JSON, so it is shape-checked via _claude_creds_has_oauth_token
+# above for a real claudeAiOauth.accessToken before being accepted —
+# otherwise it would stage into the container and the CLI there would
+# fail with "Not logged in · Please run /login". The caller invokes this
+# function via $(...) command substitution, which forks a subshell — a
+# plain global var assigned inside the function would be invisible to the
+# caller once that subshell exits. So the rejection reason (which source,
+# if any, was rejected and why) is instead written to a fixed, PID-scoped
+# file at $_CLAUDE_CREDS_REJECT_REASON_FILE, which survives the subshell
+# because it's a real file, not a shell variable. The caller reads and
+# removes it immediately after the $(...) call returns, letting it die()
+# with an accurate diagnosis instead of silently continuing into a
+# container run that is already doomed to fail — see the call site in the
+# STAGE-assembly block.
+_CLAUDE_CREDS_REJECT_REASON_FILE="${TMPDIR:-/tmp}/.leerie-creds-reject-reason.$$"
 _extract_claude_credentials_json() {
   local creds=""
+  : >"$_CLAUDE_CREDS_REJECT_REASON_FILE"
   if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     # The "scopes":["user:inference"] field is load-bearing: CLI 2.1.210's
     # file-auth path rejects a blob whose scopes do not include
@@ -140,12 +160,14 @@ _extract_claude_credentials_json() {
                 -w 2>/dev/null || true)"
     if [ -n "$creds" ] && ! _claude_creds_has_oauth_token "$creds"; then
       creds=""
+      printf '%s' "keychain-mcp-oauth-only" >"$_CLAUDE_CREDS_REJECT_REASON_FILE"
     fi
   fi
   if [ -z "$creds" ] && [ -s "$HOME/.claude/.credentials.json" ]; then
     creds="$(cat "$HOME/.claude/.credentials.json")"
     if [ -n "$creds" ] && ! _claude_creds_has_oauth_token "$creds"; then
       creds=""
+      printf '%s' "file-mcp-oauth-only" >"$_CLAUDE_CREDS_REJECT_REASON_FILE"
     fi
   fi
   if [ -z "$creds" ]; then
@@ -5500,16 +5522,49 @@ if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
 fi
 if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
    && [ -n "$_CLAUDE_CREDS_JSON" ]; then
+  rm -f "$_CLAUDE_CREDS_REJECT_REASON_FILE"
   _check_claude_credential_ttl "$_CLAUDE_CREDS_JSON" || exit 1
   printf '%s' "$_CLAUDE_CREDS_JSON" >"$STAGE/.claude/.credentials.json"
   chmod 600 "$STAGE/.claude/.credentials.json"
   unset _CLAUDE_CREDS_JSON
 else
   rm -f "$STAGE/.claude/.credentials.json"
+  # Read the rejection reason back from the file _extract_claude_credentials_json
+  # wrote it to. This must be a file, not a plain shell var set inside the
+  # function: the function above is invoked via $(...), which forks a
+  # subshell, so a var it assigns is invisible here once that subshell
+  # exits. The file is real filesystem state and survives the subshell.
+  _CLAUDE_CREDS_REJECT_REASON="$(cat "$_CLAUDE_CREDS_REJECT_REASON_FILE" 2>/dev/null || true)"
+  rm -f "$_CLAUDE_CREDS_REJECT_REASON_FILE"
   if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ "$OS" = "Darwin" ]; then
-    remote_log "note — could not extract Claude credentials from Keychain."
-    echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
-    echo "  Keychain access (the prompt that pops up the first time)." >&2
+    # A run with no valid Claude credentials cannot do anything useful in
+    # the container — die() here, before the image pull/build/run cycle,
+    # rather than silently continuing and failing ~a minute later at the
+    # container's own claude -p smoke test with a much less specific
+    # "Not logged in" error (the previous behavior).
+    case "$_CLAUDE_CREDS_REJECT_REASON" in
+      keychain-mcp-oauth-only|file-mcp-oauth-only)
+        echo "leerie: error: found Claude Keychain/credentials data, but it holds only" >&2
+        echo "  MCP-plugin OAuth state, not a Claude login session (no claudeAiOauth" >&2
+        echo "  token). This is a confirmed, currently-unresolved upstream Claude Code" >&2
+        echo "  CLI bug (steipete/CodexBar#1844), reproducing at least through CLI" >&2
+        echo "  2.1.220 -- current builds can stop writing the login session into the" >&2
+        echo "  \"Claude Code-credentials\" Keychain item even while the CLI itself is" >&2
+        echo "  fully logged in and working." >&2
+        echo "  Running 'claude /login' again will NOT fix this -- the CLI does not" >&2
+        echo "  write session state back into that Keychain item in current 2.1.x" >&2
+        echo "  builds. The durable fix: run 'claude setup-token' to mint a long-lived" >&2
+        echo "  token, then export CLAUDE_CODE_OAUTH_TOKEN=<token> and re-run -- this" >&2
+        echo "  bypasses the affected Keychain item entirely via an unaffected code path." >&2
+        ;;
+      *)
+        echo "leerie: error: could not extract Claude credentials from the Keychain" >&2
+        echo "  or ~/.claude/.credentials.json." >&2
+        echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell (see 'claude setup-token'), or" >&2
+        echo "  grant the launcher Keychain access (the prompt that pops up the first time)." >&2
+        ;;
+    esac
+    exit 1
   fi
 fi
 

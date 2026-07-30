@@ -78,7 +78,14 @@ def _invoke_helper(
         # source it, along with its _claude_creds_has_oauth_token helper
         # (defined just above it, called from inside it — must travel
         # together). Anchor on the first function name and close-brace at
-        # column 1 that follows the second function's start.
+        # column 1 that follows the second function's start. Also pull the
+        # _CLAUDE_CREDS_REJECT_REASON_FILE declaration line -- without it,
+        # the function's internal `: >"$_CLAUDE_CREDS_REJECT_REASON_FILE"`
+        # redirects to an empty/unset path and prints spurious
+        # "No such file or directory" stderr noise on every call (harmless
+        # to rc/stdout here, since it's a `:` no-op mid-function, but still
+        # real noise worth avoiding).
+        grep '^_CLAUDE_CREDS_REJECT_REASON_FILE=' "{LAUNCHER}"
         awk '
           /^_claude_creds_has_oauth_token\\(\\)/ {{ p=1 }}
           /^_extract_claude_credentials_json\\(\\)/ {{ p=1 }}
@@ -93,8 +100,15 @@ def _invoke_helper(
     helper_file = tmp_path / "helper.sh"
     helper_file.write_text(helper_src)
 
+    # TMPDIR redirects _CLAUDE_CREDS_REJECT_REASON_FILE's
+    # ${TMPDIR:-/tmp}/... resolution into this test's own auto-cleaned
+    # tmp_path, instead of leaking a scratch file into the real host
+    # /tmp on every test invocation.
+    reason_tmpdir = tmp_path / "reason-tmpdir"
+    reason_tmpdir.mkdir()
     full_env = {
         "HOME": str(fake_home),
+        "TMPDIR": str(reason_tmpdir),
         "PATH": f"{bin_dir}:/usr/bin:/bin",
     }
     full_env.update(env)
