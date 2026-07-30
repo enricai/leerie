@@ -2473,7 +2473,7 @@ the retained history of why the split existed.
 | wiring_judge | sonnet | independent adversarial verifier of the reconciled plan's semantic wiring — the tag/dep dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | provision_judge | sonnet | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
-| task_coverage_judge *(planned — see §8 "The final two independent adversarial verifiers")* | sonnet | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8 *Independent adversarial verification*); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| task_coverage_judge | sonnet | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8 *Independent adversarial verification*); registered (schema, prompt, `WORKER_TYPES`) but not yet wired into a gate — see §8 "The final two independent adversarial verifiers"; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | integration_judge *(planned — see §8 "The final two independent adversarial verifiers")* | sonnet | independent adversarial verifier of the integrator's merge for behavioral (not just textual) correctness (DESIGN §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
@@ -2482,7 +2482,7 @@ explicitly (all `sonnet` — matching the global default today, but kept as
 explicit per-worker entries since they predate this change and may need to
 diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
-`artifact_registry`, and (once landed) `task_coverage_judge` /
+`artifact_registry`, `task_coverage_judge`, and (once landed)
 `integration_judge` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their
 `sonnet` defaults come from the global `MODEL_DEFAULT` fallback.
 
@@ -2517,6 +2517,7 @@ Twenty worker types (plus the global override), each independently overridable:
 | classification_judge | `LEERIE_MODEL_CLASSIFICATION_JUDGE` | `--model-classification_judge` | `model_classification_judge` |
 | wiring_judge       | `LEERIE_MODEL_WIRING_JUDGE`     | `--model-wiring_judge`       | `model_wiring_judge`      |
 | provision_judge    | `LEERIE_MODEL_PROVISION_JUDGE`  | `--model-provision_judge`    | `model_provision_judge`   |
+| task_coverage_judge | `LEERIE_MODEL_TASK_COVERAGE_JUDGE` | `--model-task_coverage_judge` | `model_task_coverage_judge` |
 | artifact_registry  | `LEERIE_MODEL_ARTIFACT_REGISTRY` | `--model-artifact_registry` | `model_artifact_registry` |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
@@ -2607,22 +2608,23 @@ chain below when a specific worker needs deeper reasoning.
 | wiring_judge | medium | independent semantic-wiring verification of the reconciled plan (DESIGN §5, §8); same `medium` judgment-worker profile |
 | provision_judge | medium | independent recipe verification against the image/runtime (DESIGN §6½, §8); same `medium` judgment-worker profile |
 | artifact_registry | medium | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*); same `medium` judgment-worker profile |
-| task_coverage_judge *(planned)* | medium | independent adversarial verification of plan-vs-task coverage (DESIGN §8); same `medium` judgment-worker profile as the other independent adversarial verifiers |
+| task_coverage_judge | medium | independent adversarial verification of plan-vs-task coverage (DESIGN §8); registered but not yet wired into a gate; same `medium` judgment-worker profile as the other independent adversarial verifiers |
 | integration_judge *(planned)* | medium | independent adversarial verification of the integrator's merge for behavioral correctness (DESIGN §8); same `medium` judgment-worker profile |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
-`EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the fifteen
+`EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the sixteen
 judgment / finalize workers in the table above: the six core judgment workers
 (classifier, planner, reconciler, plan_overlap_judge, provision, integrator),
 the finalize-time `pr_writer` and `dep_capture` workers, the P1 decomposition
 workers `fit_judge` and `splitter`, the plan-instruction-adherence worker
-`adherence_judge`, the three independent adversarial verifiers
-`classification_judge`, `wiring_judge`, and `provision_judge`, and the
-pre-planning shared-vocabulary worker `artifact_registry`. It separately
+`adherence_judge`, the four independent adversarial verifiers
+`classification_judge`, `wiring_judge`, `provision_judge`, and
+`task_coverage_judge`, and the pre-planning shared-vocabulary worker
+`artifact_registry`. It separately
 overrides `implementer` and `conformer` to `"low"` — a distinct,
 cost-motivated pin rather than a judgment-reproducibility one, so it is
 called out separately from the `"medium"` judgment cohort above.
-Once `task_coverage_judge` and `integration_judge` land (see §8 "The final
+Once `integration_judge` lands (see §8 "The final
 two independent adversarial verifiers"), each gets its own
 `EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, matching every other
 independent adversarial verifier, plus the same `--effort-<W>` /
@@ -2660,6 +2662,7 @@ model selection:
 | classification_judge | `LEERIE_EFFORT_CLASSIFICATION_JUDGE` | `--effort-classification_judge` | `effort_classification_judge` |
 | wiring_judge       | `LEERIE_EFFORT_WIRING_JUDGE`     | `--effort-wiring_judge`       | `effort_wiring_judge`      |
 | provision_judge    | `LEERIE_EFFORT_PROVISION_JUDGE`  | `--effort-provision_judge`    | `effort_provision_judge`   |
+| task_coverage_judge | `LEERIE_EFFORT_TASK_COVERAGE_JUDGE` | `--effort-task_coverage_judge` | `effort_task_coverage_judge` |
 | artifact_registry  | `LEERIE_EFFORT_ARTIFACT_REGISTRY` | `--effort-artifact_registry` | `effort_artifact_registry` |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -7302,7 +7305,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the sixteen `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `artifact_registry`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the seventeen `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -7370,6 +7373,7 @@ a system prompt, and no system prompt is shared between call types.
 | `classification_judge` | `prompts/classification_judge.md` | independent adversarial verifier of the classifier's category set (DESIGN §8) |
 | `wiring_judge`   | `prompts/wiring_judge.md` | independent semantic-wiring verifier of the reconciled plan (DESIGN §5, §8) |
 | `provision_judge`| `prompts/provision_judge.md` | independent verifier of the install recipe vs image/runtime (DESIGN §6½, §8) |
+| `task_coverage_judge`| `prompts/task_coverage_judge.md` | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8); registered but not yet wired into a gate |
 | `artifact_registry` | `prompts/artifact_registry.md` | pre-planning shared-vocabulary worker, phase 2, runs once before any planner (DESIGN §5 *Artifact-registry worker*) |
 | `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when `push_will_happen` is true (DESIGN §6 *Finalization*) |
 | `judge`          | `prompts/judge.md` | post-run skill; not used by the main orchestrate loop |
@@ -7379,7 +7383,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the sixteen main-loop workers, not the post-run
+self-heal target set is the seventeen main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
