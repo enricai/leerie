@@ -352,10 +352,6 @@ def test_check_planner_output_source_has_no_confidence_issues_call(leerie):
         "the independent task_coverage_judge (phase_planning_coverage_gate) "
         "is now the sole coverage gate"
     )
-    assert "task_understanding" not in src, (
-        "check_planner_output must no longer reference task_understanding "
-        "as a gating axis"
-    )
 
 
 def test_check_planner_output_ignores_low_task_understanding_confidence(

@@ -368,6 +368,12 @@ STATE_FIELDS = (
     # (skip_adherence_check / no prescribed procedure) or the judge
     # crashed every round (degrade path returns without persisting this).
     "adherence_gate",
+    # coverage_gate: audit record from the phase 2⅞½ task-coverage gate
+    # (phase_planning_coverage_gate) — the final task_coverage_judge output
+    # ({task_covered, coverage_gaps, rationale}). Written once the gate
+    # clears (immediately or after re-planning). Absent when the judge
+    # crashed every round (degrade path returns without persisting this).
+    "coverage_gate",
     # classification_coverage_gate: audit record from phase_classification_gate
     # (DESIGN §8 *Independent adversarial verification*) — the final
     # classification_judge output. Absent when the judge crashed every round.

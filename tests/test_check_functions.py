@@ -362,7 +362,11 @@ class TestCheckPlannerOutput:
         issues = leerie.check_planner_output(plan, tmp_path, "testing")
         assert not any("decomposition_quality" in i for i in issues)
 
-    def test_low_task_understanding_still_gates(self, leerie, tmp_path):
+    # feat-003 — task_understanding is likewise demoted to an advisory
+    # self-report: the independent task_coverage_judge
+    # (phase_planning_coverage_gate) is now the authoritative coverage gate
+    # (DESIGN §8), removing the planner's self-grading bias.
+    def test_low_task_understanding_does_not_gate(self, leerie, tmp_path):
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "foo.ts").touch()
         plan = {"subtasks": [{
@@ -374,8 +378,7 @@ class TestCheckPlannerOutput:
             "confidence": _conf(task_understanding=2.0,
                                 decomposition_quality=9.5)}
         issues = leerie.check_planner_output(plan, tmp_path, "testing")
-        assert any("task_understanding" in i and "LOW_CONFIDENCE" in i
-                   for i in issues)
+        assert not any("task_understanding" in i for i in issues)
 
 
 # --- instruction-adherence gate: advisory-vs-gating split --------------- #
@@ -648,13 +651,16 @@ class TestLowConfidenceGating:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert not any("LOW_CONFIDENCE" in i for i in issues)
 
-    def test_planner_low_confidence(self, leerie, tmp_path):
+    def test_planner_self_score_does_not_gate(self, leerie, tmp_path):
+        """DESIGN §8: the planner's `task_understanding` self-score is NO
+        LONGER a gating axis — the independent task_coverage_judge
+        (phase_planning_coverage_gate) is the authoritative gate. A low
+        self-score must NOT produce LOW_CONFIDENCE."""
         plan = {"subtasks": [], "status": "ready", "domain": "testing",
-                "confidence": _conf(task_understanding=8.0,
+                "confidence": _conf(task_understanding=2.0,
                                     decomposition_quality=9.5)}
         issues = leerie.check_planner_output(plan, tmp_path, "testing")
-        assert any("LOW_CONFIDENCE" in i and "task_understanding" in i
-                    for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_reconciler_self_score_does_not_gate(self, leerie):
         """DESIGN §8: the reconciler's `reconciliation` self-score is NO
