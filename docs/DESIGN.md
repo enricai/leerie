@@ -1043,6 +1043,11 @@ variant of an understanding axis catches that, independent or not. The
 axis that actually discriminates is **instruction adherence**, and it is
 gated by a dedicated mechanism, not by a differently-judged
 `task_understanding` — see §12 *Instruction adherence is code-enforced*.
+(A separate, differently-framed gate, `task_coverage_judge` — §8
+*Independent adversarial verification* — later replaces the
+`task_understanding` self-score for a distinct question, plan-vs-task
+*coverage* rather than *understanding*; it does not reopen this
+falsification.)
 
 **Expansion vanishes the parent's id, so it owes the inbound-reference rewrite**
 (§5 *Id-vanishing operations*). A first-pass sibling that declared
@@ -4563,6 +4568,18 @@ mis-wirings:
   independently re-read. Gates on a non-empty array of concretely-named
   coverage gaps. The planner **can** mechanically act on a found gap (add
   or revise a subtask), so this gate **re-drives** `phase_plan`, mirroring
+  `classification_judge`. **This does not reopen the falsified attempt
+  described above** ("`task_understanding` does **not** independently gate
+  the planner" / §12 *Instruction adherence is code-enforced*): that finding
+  was specific to an *understanding*-framed judge asked to score whether the
+  plan correctly read the task, which cannot distinguish "understood and
+  disobeyed" from "understood and obeyed." `task_coverage_judge` is framed
+  differently — it does not score understanding or adherence at all, only
+  whether the union of subtasks is complete against the task — a question
+  the falsified attempt never tested and instruction-adherence enforcement
+  (the deterministic floor + `adherence_judge`, §12) does not cover either,
+  since a plan can honor every prescribed instruction and still omit
+  unprescribed required work.
   `classification_judge`.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
