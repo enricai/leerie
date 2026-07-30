@@ -201,6 +201,17 @@ def _stub_common(leerie, monkeypatch, calls: dict):
         raise _StopAtExecute()
     monkeypatch.setattr(leerie, "phase_execute", _execute)
 
+    async def _artifact_registry(*a, **kw):
+        calls["phase_artifact_registry"] = calls.get(
+            "phase_artifact_registry", 0) + 1
+        return []
+    monkeypatch.setattr(leerie, "phase_artifact_registry", _artifact_registry)
+
+    async def _wiring_gate(plans, task, st, caps, models, efforts):
+        calls["phase_wiring_gate"] = calls.get("phase_wiring_gate", 0) + 1
+        return plans
+    monkeypatch.setattr(leerie, "phase_wiring_gate", _wiring_gate)
+
 
 def _drive(leerie, args, caps, run_dirs, st):
     leerie_root, run_id, run_dir = run_dirs
@@ -585,6 +596,92 @@ def test_old_scheduling_phase_die_message_is_gone():
     # everywhere in the file.
     assert 'die(\n                    "cannot resume — run stopped at the ' \
            'budget-feasibility "' not in src
+
+
+# ===========================================================================
+# worker_count must not be double-counted on resume: re-entering a phase
+# whose output is already checkpointed must not spend (bump_workers) for
+# work that already ran before the pause (mandatory Design constraint —
+# "resume must NOT re-count workers that already ran before the pause").
+# Every phase function here is stubbed (no real claude_p calls), so if the
+# resume path is correctly skipping already-completed phases, worker_count
+# must stay byte-identical to its seeded value from before resume to after
+# `_run_phases` re-enters and reaches `_StopAtExecute`.
+# ===========================================================================
+
+def test_worker_count_unchanged_across_mid_pipeline_resume(
+    leerie, monkeypatch, run_dirs
+):
+    """Resume after plans_after_reconcile: only overlap_judge onward is
+    re-invoked (all stubbed, no real bump_workers calls), so the seeded
+    worker_count must be byte-identical after resume re-enters."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
+    seeded_worker_count = 7
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": seeded_worker_count,
+        "categories": ["bug-fixing"],
+        "plans_after_classify": [],
+        "plans_after_plan": persisted_plans,
+        "plans_after_reconcile": persisted_plans,
+    })
+    caps = _caps(leerie)
+    args = _args()
+    _drive(leerie, args, caps, run_dirs, st)
+
+    assert "phase_classify" not in calls
+    assert "phase_plan" not in calls
+    assert "phase_reconcile" not in calls
+    assert calls.get("phase_overlap_judge") == 1
+    assert calls.get("phase_adherence_gate") == 1
+    assert st.data["worker_count"] == seeded_worker_count, (
+        "resume re-entered at overlap_judge but worker_count changed — "
+        "a skipped (already-checkpointed) phase must never bump_workers, "
+        "and no stubbed downstream phase in this test calls bump_workers "
+        "either, so the seeded count must be byte-identical"
+    )
+
+
+def test_worker_count_unchanged_across_satisfied_probe_cache_resume(
+    leerie, monkeypatch, run_dirs
+):
+    """Resume at the satisfied-probe-cache checkpoint (the reported
+    incident's exact pause point): worker_count must remain byte-identical
+    to its seeded value — the already-decided (cached) probe verdicts and
+    every completed planning phase must not be re-spent for."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
+    seeded_worker_count = 10
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": seeded_worker_count,
+        "categories": ["bug-fixing"],
+        "current_phase": "phase 3: satisfied-probe",
+        "plans_after_classify": [],
+        "plans_after_plan": persisted_plans,
+        "plans_after_reconcile": persisted_plans,
+        "plans_after_overlap_judge": persisted_plans,
+        "plans_after_adherence_gate": persisted_plans,
+        "satisfied_probe_cache": {
+            "bugfix-001": {
+                "satisfied": False, "evidence": "", "checked": [],
+                "base_sha": "deadbeef",
+            }
+        },
+    })
+    caps = _caps(leerie)
+    args = _args()
+    _drive(leerie, args, caps, run_dirs, st)
+
+    assert calls.get("filter_satisfied_subtasks") == 1
+    assert calls.get("write_plan") == 1
+    assert "plans_after_filters" in st.data
+    assert st.data["worker_count"] == seeded_worker_count, (
+        "resume re-entered at the satisfied-probe-cache checkpoint but "
+        "worker_count changed — already-completed planning phases and "
+        "already-cached probe verdicts must not be re-counted"
+    )
 
 
 def test_genuinely_no_progress_still_dies(leerie, monkeypatch, run_dirs):
