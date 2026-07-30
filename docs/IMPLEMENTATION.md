@@ -364,9 +364,9 @@ Base layers (top-down):
   tooling (the LTS Node that hosts `claude` itself) comes first, so a repo
   pinning its own Node/Python version can never shadow it; the per-repo
   `MISE_DATA_DIR/shims` (populated at runtime by `phase_provision`'s
-  `mise install` — DESIGN §6½ *Worker-driven install*) comes next, so a
-  worker's own ad-hoc Bash commands (e.g. `bin/rails test`) reach a
-  repo-pinned runtime by name without an explicit `mise exec --`; and
+  `mise install` — DESIGN §6½ *Persistent out-of-repo dependency bake*)
+  comes next, so a worker's own ad-hoc Bash commands (e.g. `bin/rails test`)
+  reach a repo-pinned runtime by name without an explicit `mise exec --`; and
   `/home/leerie/.local/bin` (where `pip install --user` lands console
   scripts) is deliberately **last**, so a user-installed package can never
   shadow a baked-in binary. Pinned by `tests/test_dockerfile_path.py`.
@@ -3516,7 +3516,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | Preflight | `preflight` | git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. `setup-run.sh` repeats the external-branch check as defense-in-depth for `--resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive. On a fresh (non-resumed) run, `run.json`'s identity fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`, `task`) are written immediately BEFORE this phase runs — not after, as originally implemented — so any early-exit path reachable from classification (including the classification gate's no-work routing, below) sees a fully-identified `run.json` rather than one carrying only `_finish_no_work_run`'s own `{finished_at, no_push, no_verify}` (DESIGN §8 *Reaching the cleared-but-empty state from classification*) |
 |   • Classification gate | `phase_classification_gate` | independent adversarial verifier of the classifier's category set (DESIGN §8 *Independent adversarial verification*). One `classification_judge` worker attacks the chosen categories against the task + codebase; a non-empty `miscategorizations` array (a missing category the work requires, or a spurious one) re-drives `phase_classify` via `_run_checked_loop` (bounded by `judgment_check_rounds`, and cut short earlier by `_run_checked_loop`'s own oscillation guard when a round's issues repeat an earlier round's — DESIGN §8 *The CRITIC retry pattern's oscillation guard*). On exhaustion, `die()`s with the residuals named — UNLESS `st.data["likely_already_satisfied"]` is `True` with non-empty evidence, in which case it routes to `_finish_no_work_run` (the same terminal state `detect_no_work` produces post-plan; DESIGN §8 *Reaching the cleared-but-empty state from classification*) and returns `True`, signaling the caller (`_run_phases`) to stop the pipeline. Gates before provision/plan spend. Runs inside the `plans_after_classify` checkpoint block (DESIGN §6 "Resumable planning"), so a resume past classify skips it. Persists to `state.data["classification_coverage_gate"]`. |
-|   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |
+|   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ *Persistent out-of-repo dependency bake*). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — for baked ecosystems (Python/Ruby/Rust/Go), the block is informational only; for Node, it carries the residual offline-relink command (not run by the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |
 |   • Provision gate | `phase_provision_gate` | independent adversarial verifier of the detected install recipe (DESIGN §8, §6½). One `provision_judge` worker attacks `st.data["provision"]["recipe"]` against the image/runtime — catching the semantic gaps the deterministic `_normalize_pip_installs` / `validate_provision_recipe` miss (a `pip install` missing `--break-system-packages` on the externally-managed Debian image, a package manager that doesn't match the lockfiles present). A non-empty `recipe_failures` array `die()`s immediately with the judge's concrete `fix` named — **detect-and-die, single pass** (no re-drive: a table recipe re-emits identically and an LLM recipe would re-produce the same defect, so re-driving only burns rounds before dying anyway; a broken recipe is fatal, matching `phase_provision`'s own recipe-validation die). A `provision_judge` `WorkerError` degrades (the deterministic checks already ran). Skipped when no recipe was detected (`kind: none`); runs inside the `plans_after_classify` checkpoint block so a resume past classify skips it. Persists to `state.data["provision_recipe_gate"]`. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_artifact_registry`, `phase_plan` | **First: `phase_artifact_registry`** runs a single read-only `artifact_registry` worker (after classify, before any planner) that emits a small canonical `{description, tag, path}` vocabulary for the artifacts the task will plainly create (DESIGN §5 *Artifact-registry worker*). Persisted to `state.data["artifact_registry"]` (own resume checkpoint, keyed on presence — `[]` is a valid completed state); `phase_plan` injects it into every planner's `ctx_dict` so blind parallel planners prefer the same tag/path. Best-effort/non-fatal — never die()s, returns `[]` when the worker crashes every round or genuinely finds nothing to register; `--skip-repo-map` only suppresses the repo-map context handed to the worker (mirroring `phase_plan`'s own degrade) — the worker still runs and can still return a non-empty list. **Then `phase_plan`:** one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `recursive_decompose(subtask, depth=0, …)` and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → validate_plan → write_plan) receives this expanded flat leaf set unchanged. |
@@ -5204,19 +5204,20 @@ Six host caches mounted into the container, all `rw`. Listed in §0.5
   Bundler 2.2+; all supported Ruby versions ship a sufficiently recent
   Bundler.
 
-### Worker-driven install (replaces per-worktree replay)
+### Persistent bake + residual worker install
 
 `scripts/new-worktree.sh` does just the `git worktree add` and prints
-the worktree path. There is **no orchestrator-driven install** after
-that — the implementer runs the install itself from its own worktree
-via its Bash tool, against the shared package-manager caches. The
-conformer does the same before running BUILD/LINT/TEST.
+the worktree path. Worktrees inherit the persistent bake from the
+image (DESIGN §6½ *Persistent out-of-repo dependency bake*) with zero
+or minimal install cost. There is **no orchestrator-driven install**
+after the worktree is created.
 
-How the recipe reaches the worker:
+How dependencies reach the worker:
 
 1. `git worktree add` checks out the worktree (tracked files only).
-   It starts with no `node_modules/` / `.venv/` / `target/`, by
-   design.
+   It starts with no `node_modules/` / `.venv/` / `target/` by
+   design, but the persistent bake at `/opt/venv`, `/opt/bundle`,
+   etc. is already present in the image.
 2. The orchestrator parses the worktree path from the script's stdout.
 3. `run_implementer` (and later `run_conformer`) read
    `st.data["provision"]["recipe"]` and inject it as a
@@ -5224,29 +5225,32 @@ How the recipe reaches the worker:
    `_format_provision_recipe_section(...)`.
 4. The worker's prompt (see `prompts/implementer.md` §2 and
    `prompts/conformer.md` §Input) instructs it to decide whether the
-   subtask needs the install and to run the command from its
-   worktree if yes. The shared store / cache makes re-runs across
-   worktrees fast.
-5. If the recipe is missing or empty (docs-only run), no
-   `PROVISION_RECIPE:` block is injected and the worker proceeds
-   without one.
+   subtask needs the residual install step (for Node: the offline
+   relink; for Python/Ruby/Rust/Go: typically nothing) and to run
+   the command from its worktree if needed. For fully-baked
+   ecosystems, the `PROVISION_RECIPE:` block is informational only.
+5. If the recipe is missing or empty (docs-only run, or fully-baked
+   with no residual), no `PROVISION_RECIPE:` block is injected and
+   the worker proceeds without one.
 6. Install failures inside a worker surface through the worker's
    normal exit machinery — a hard-failing build/test in the
    implementer becomes a `failed` or `blocked` status; in the
    conformer it surfaces as a `tests-failed: …` advisory warning
    (DESIGN §9).
 
-Why this shape (vs. an orchestrator-driven install at `repo_root` or
-per-worktree replay):
+Why this shape (persistent bake + residual worker install):
 
 - The host's repo is bind-mounted at `repo_root`, so an
-  orchestrator-driven install there writes linux-arm64 native
+  orchestrator-driven install there would write linux-arm64 native
   binaries into the host's darwin `node_modules`, corrupting the
   host's checkout.
-- Per-worktree pre-install is wasted work for subtasks that don't
-  need built deps (config-only, doc-only, pure-code refactors that
-  don't run tests). The barnacle reference run showed ~half of
-  implementer subtasks correctly skip install when given the choice.
+- Per-worktree pre-install wastes work for subtasks that don't need
+  built deps (config-only, doc-only, pure-code refactors that don't
+  run tests). The persistent bake eliminates this waste for
+  Python/Ruby/Rust/Go; Node's residual relink is minimal.
+- The bake is shared read-only across concurrent worktrees, so
+  dependency installs are paid once per image build, not once per
+  worktree.
 - `claude -p`'s built-in stream-event plumbing surfaces Bash tool
   I/O to the orchestrator log live, so an install running inside a
   worker is visible to the user without any special orchestrator
