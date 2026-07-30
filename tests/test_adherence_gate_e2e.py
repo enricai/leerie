@@ -193,7 +193,7 @@ class TestAdherenceGateEndToEnd:
 
         replan_calls = []
 
-        async def fake_phase_plan(task, st_, caps, models, efforts):
+        async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
             replan_calls.append(task)
             return good_plans
 

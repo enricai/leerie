@@ -145,7 +145,7 @@ def test_incident_gate_fires(leerie, monkeypatch, tmp_path):
     async def fake_claude_p(**kwargs):
         return dict(fixture["adherence_judge_result"])
 
-    async def fake_phase_plan(task, st_, caps, models, efforts):
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
         # A re-plan that still does not honor the prescribed procedure —
         # the incident's actual outcome. The gate must not silently accept
         # this; it should exhaust the retry budget and die().

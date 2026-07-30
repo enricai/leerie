@@ -247,7 +247,7 @@ def test_coverage_gap_triggers_replan_then_converges(
 
     replan_calls = []
 
-    async def fake_phase_plan(task, st_, caps, models, efforts):
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
         replan_calls.append(task)
         return good_plans
 
@@ -307,7 +307,7 @@ def test_exhaustion_dies(leerie, monkeypatch, tmp_path, capsys):
             "rationale": "still not covered",
         }
 
-    async def fake_phase_plan(task, st_, caps, models, efforts):
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
         return plans  # never fixes it
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)

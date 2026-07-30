@@ -140,18 +140,19 @@ def test_create_returns_none_on_broker_reject(leerie, monkeypatch):
 
 def test_enroll_sends_payload(leerie, monkeypatch):
     sent = _stub_broker(leerie, monkeypatch, "OK")
-    assert leerie._cgroup_enroll("sid-b", 12345) is True
+    assert leerie._cgroup_enroll("sid-b", 12345) is None
     assert sent == ["enroll sid-b 12345"]
 
 
-def test_enroll_returns_false_on_broker_err(leerie, monkeypatch):
+def test_enroll_returns_reason_on_broker_err(leerie, monkeypatch):
     _stub_broker(leerie, monkeypatch, "ERR bad sid/pid")
-    assert leerie._cgroup_enroll("sid", 1) is False
+    assert leerie._cgroup_enroll("sid", 1) == "ERR bad sid/pid"
 
 
-def test_enroll_returns_false_on_unreachable(leerie, monkeypatch):
+def test_enroll_returns_reason_on_unreachable(leerie, monkeypatch):
     _stub_broker(leerie, monkeypatch, "RAISE refused")
-    assert leerie._cgroup_enroll("sid", 1) is False
+    reason = leerie._cgroup_enroll("sid", 1)
+    assert reason is not None and "refused" in reason
 
 
 # ---- destroy --------------------------------------------------------------

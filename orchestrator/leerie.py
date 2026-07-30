@@ -10632,20 +10632,33 @@ def _cgroup_create(sid: str, memory_max_bytes: int,
     return None
 
 
-def _cgroup_enroll(sid: str, pid: int) -> bool:
+def _cgroup_enroll(sid: str, pid: int) -> str | None:
     """Ask the broker to migrate `pid` into the worker cgroup. Called
-    immediately after the worker subprocess spawns. Returns True on
-    success. Failure logs but does not abort the worker — it simply runs
-    in the parent cgroup (uncapped)."""
+    immediately after the worker subprocess spawns. Returns None on
+    success, or the broker's rejection/error text on failure. Failure
+    logs but does not abort the worker — it simply runs in the parent
+    cgroup (uncapped).
+
+    The caller (`_invoke`) stashes this string so that if the SAME
+    worker later crashes (e.g. exits nonzero, or produces no result
+    event), the crash message can name the enroll failure as a probable
+    contributing cause instead of leaving it a separate, seemingly-
+    unrelated log line — see the incident this closes: run
+    870cf82cdcd4c3df2c860b94c4608b63f4debf4f211c99cb1a2c5517c62cb9b4,
+    where `cgroup enroll rejected by broker ... ProcessLookupError`
+    (this function) and the CLI's own 3s-stdin-timeout crash (a few
+    lines later in the same worker's stream) were logged as two
+    apparently-unconnected events, with no link surfaced between them."""
     try:
         resp = _cgroup_request(f"enroll {sid} {pid}")
     except OSError as e:
-        log(f"  cgroup enroll failed for pid={pid}: {e.strerror or e}")
-        return False
+        reason = str(e.strerror or e)
+        log(f"  cgroup enroll failed for pid={pid}: {reason}")
+        return reason
     if resp == "OK":
-        return True
+        return None
     log(f"  cgroup enroll rejected by broker for pid={pid}: {resp}")
-    return False
+    return resp
 
 
 def _cgroup_destroy(sid: str | None) -> None:
@@ -10858,13 +10871,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # with no run context (the smoke test never enters this block anyway,
     # since it passes no memory/pids caps).
     cgroup_sid: str | None = None
+    # Stashed so a later crash in THIS worker's stream (nonzero rc, or no
+    # result event) can name this as a probable contributing cause instead
+    # of surfacing as an apparently-unrelated log line — see _cgroup_enroll's
+    # docstring for the incident this closes.
+    cgroup_enroll_failure: str | None = None
     if (worker_memory_max_bytes is not None
             and worker_pids_max is not None):
         cgroup_sid = _cgroup_create(_cgroup_worker_sid(run_id, sid),
                                     worker_memory_max_bytes,
                                     worker_pids_max)
         if cgroup_sid is not None:
-            _cgroup_enroll(cgroup_sid, proc.pid)
+            cgroup_enroll_failure = _cgroup_enroll(cgroup_sid, proc.pid)
     # Track every descendant PID that ever appears under this worker. Claude
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
     # long-running commands (test runners, builds, dev servers); those
@@ -11308,9 +11326,19 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 f"(memory.max={cap_gib}) — raise --worker-memory-max or "
                 f"lower --max-parallel")
         if proc.returncode and proc.returncode != 0:
+            # Name a cgroup-enroll failure as a probable contributing cause
+            # when this same worker also crashed — otherwise the two are
+            # left as separate, apparently-unrelated log lines (the
+            # incident _cgroup_enroll's docstring documents: enroll
+            # rejected with ProcessLookupError, followed by the CLI's own
+            # 3s-stdin-timeout crash, with nothing connecting them).
+            enroll_note = (
+                f" — cgroup enroll for this worker also failed "
+                f"({cgroup_enroll_failure}); possibly related"
+                if cgroup_enroll_failure else "")
             raise WorkerError(
                 f"claude -p exited {proc.returncode}: "
-                f"{stderr_txt or '(no stderr)'}")
+                f"{stderr_txt or '(no stderr)'}{enroll_note}")
         # `claude -p` exited on its own (rc 0) having streamed a full
         # session but never emitting the terminal `result` event — a known
         # upstream CLI failure (anthropics/claude-code #8126, #1920, #74761;
@@ -14331,9 +14359,27 @@ async def phase_artifact_registry(
 
 async def phase_plan(task: str, st: State, caps: dict,
                      models: dict[str, str],
-                     efforts: dict[str, str | None]) -> list[dict]:
+                     efforts: dict[str, str | None],
+                     replan_round: int = 0) -> list[dict]:
     """Phase 2: one planner per category, run in parallel (bounded by
-    max_parallel). Each returns a JSON plan of granular subtasks."""
+    max_parallel). Each returns a JSON plan of granular subtasks.
+
+    `replan_round` distinguishes a fresh top-level call (0, the default)
+    from a re-invocation via `phase_adherence_gate`/
+    `phase_planning_coverage_gate`'s `_on_feedback` (1, 2, ...). Each
+    `plan_one` worker's cgroup/log sid folds this in so a re-plan never
+    reuses the identical bare sid (e.g. `planner-documentation-s0`) a
+    prior invocation in the SAME run already created+destroyed a cgroup
+    for — see the incident this guards against: run
+    870cf82cdcd4c3df2c860b94c4608b63f4debf4f211c99cb1a2c5517c62cb9b4,
+    where `planner-documentation`'s second invocation crashed 9/9
+    attempts with `cgroup enroll rejected by broker ... ProcessLookupError`
+    immediately followed by the CLI's own 3s stdin timeout. The
+    investigation into that incident could not confirm same-run sid
+    reuse as the root mechanism (the destroy-then-create sequence is
+    provably sequential at the Python level), but it is a real,
+    verified hazard independent of whatever the actual root cause was —
+    removing it costs nothing and closes off one plausible contributor."""
     log("phase 2: planning")
     st.data["current_phase"] = "phase 2: planning"
     st.save()
@@ -14413,8 +14459,13 @@ async def phase_plan(task: str, st: State, caps: dict,
     async def plan_one(category: str, sample_idx: int = 0) -> dict | None:
         async with sem:
             prefix = f"{CATEGORY_ABBREV[category]}-"
-            sid = (f"planner-{category}-s{sample_idx}" if n_samples > 1
-                   else f"planner-{category}")
+            # round_suffix is "" on the first (top-level) call, "-r1",
+            # "-r2", ... on re-plan invocations — see phase_plan's
+            # docstring for why this must never collide with an earlier
+            # invocation's sid within the same run.
+            round_suffix = f"-r{replan_round}" if replan_round else ""
+            sid = (f"planner-{category}-s{sample_idx}{round_suffix}"
+                   if n_samples > 1 else f"planner-{category}{round_suffix}")
             base_prompt = (
                 f"DOMAIN: {category}\nID_PREFIX: {prefix}\n\n"
                 f"CONTEXT:\n{ctx}\n\n"
@@ -17939,12 +17990,15 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             )
         return issues
 
+    replan_round = [0]
+
     async def _on_feedback(fb: str) -> dict:
         # The re-plan action IS the feedback: re-invoke phase_plan with the
         # violation text folded into the task so every planner sees why its
         # plan was rejected. No new pause/resume machinery — this reuses
         # `_run_checked_loop`'s existing retry semantics exactly like the
         # reconciler and overlap-judge do.
+        replan_round[0] += 1
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — your previous plan did not honor the prescribed "
@@ -17954,7 +18008,8 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             "with hand-authored work."
         )
         cur_plans[0] = await phase_plan(
-            replan_task, st, caps, models, efforts)
+            replan_task, st, caps, models, efforts,
+            replan_round=replan_round[0])
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
@@ -18116,12 +18171,15 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
                 f"{desc} — {ev}")
         return issues
 
+    replan_round = [0]
+
     async def _on_feedback(fb: str) -> dict:
         # The re-plan action IS the feedback: re-invoke phase_plan with the
         # found coverage gaps folded into the task, so every planner sees
         # why the merged plan was rejected. No new pause/resume machinery —
         # this reuses `_run_checked_loop`'s existing retry semantics exactly
         # like the reconciler/adherence/overlap-judge gates do.
+        replan_round[0] += 1
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — an independent review of your previous plan found "
@@ -18131,7 +18189,8 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             "the task."
         )
         cur_plans[0] = await phase_plan(
-            replan_task, st, caps, models, efforts)
+            replan_task, st, caps, models, efforts,
+            replan_round=replan_round[0])
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
