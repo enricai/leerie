@@ -5536,7 +5536,22 @@ else
   # exits. The file is real filesystem state and survives the subshell.
   _CLAUDE_CREDS_REJECT_REASON="$(cat "$_CLAUDE_CREDS_REJECT_REASON_FILE" 2>/dev/null || true)"
   rm -f "$_CLAUDE_CREDS_REJECT_REASON_FILE"
-  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ "$OS" = "Darwin" ]; then
+  # Exempt both Bedrock auth modes, not just CLAUDE_CODE_OAUTH_TOKEN: a
+  # user authenticating via AWS_BEARER_TOKEN_BEDROCK or a settings.json
+  # CLAUDE_CODE_USE_BEDROCK flag needs no Claude subscription
+  # Keychain/file credential at all — that path is handled entirely
+  # independently a few lines below (the "Bedrock bearer-token mode" and
+  # "~/.aws/ (Bedrock SSO/profile mode only)" blocks). Without this
+  # exemption, a Bedrock-authenticated run with a broken/absent Keychain
+  # item (e.g. the mcpOAuth-only upstream bug this block otherwise
+  # diagnoses) would die here even though the run would have succeeded
+  # via Bedrock — a real regression reported against v0.9.89.
+  # detect_bedrock_mode is defined above (STAGE-assembly preamble), so
+  # it's already in scope here.
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+     && [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ] \
+     && ! detect_bedrock_mode \
+     && [ "$OS" = "Darwin" ]; then
     # A run with no valid Claude credentials cannot do anything useful in
     # the container — die() here, before the image pull/build/run cycle,
     # rather than silently continuing and failing ~a minute later at the

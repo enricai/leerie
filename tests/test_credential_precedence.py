@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -554,6 +555,31 @@ def test_call_site_exits_before_reaching_generic_note_path() -> None:
     assert "exit 1" in block
 
 
+def test_die_guard_exempts_bedrock_bearer_token() -> None:
+    """Regression guard (v0.9.89 reported failure): a user authenticating
+    via AWS_BEARER_TOKEN_BEDROCK needs no Claude subscription Keychain/file
+    credential at all -- that path is handled entirely independently a few
+    lines below this block. The die() guard must not fire just because
+    AWS_BEARER_TOKEN_BEDROCK is set and no Claude credential resolved."""
+    block = _stage_assembly_block_source()
+    guard_start = block.index('if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]')
+    guard_end = block.index("; then", guard_start)
+    guard = block[guard_start:guard_end]
+    assert "AWS_BEARER_TOKEN_BEDROCK" in guard
+
+
+def test_die_guard_exempts_settings_json_bedrock_mode() -> None:
+    """Same regression class as the bearer-token case, for the sibling
+    settings.json-driven Bedrock auth path (detect_bedrock_mode) -- never
+    independently reported, but has the identical latent gap and must be
+    exempted the same way."""
+    block = _stage_assembly_block_source()
+    guard_start = block.index('if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]')
+    guard_end = block.index("; then", guard_start)
+    guard = block[guard_start:guard_end]
+    assert "detect_bedrock_mode" in guard
+
+
 # ---------------------------------------------------------------------------
 # (k) Minimal, targeted regression pin for the exact bug class found in the
 # 2026-07-30 correctness audit: _extract_claude_credentials_json is invoked
@@ -638,3 +664,190 @@ def test_reason_survives_a_dollar_paren_subshell_call(tmp_path: Path) -> None:
         "reason channel must be a file (or another subshell-surviving "
         "mechanism), not a plain shell variable"
     )
+
+
+# ---------------------------------------------------------------------------
+# (l) Behavioral (not just source-coupling) confirmation of the Bedrock
+# exemption above: actually run the real, extracted STAGE-assembly call
+# site -- including its _extract_claude_credentials_json,
+# detect_bedrock_mode, and _check_claude_credential_ttl dependencies -- end
+# to end, against the exact real-world shape reported against v0.9.89: a
+# broken (mcpOAuth-only) Keychain item plus a valid AWS_BEARER_TOKEN_BEDROCK.
+# Source-coupling alone (the tests above) proves the guard *mentions* the
+# right variable names; this proves the actual bash boolean composition
+# behaves correctly when run.
+# ---------------------------------------------------------------------------
+
+def _build_call_site_harness(tmp_path: Path) -> Path:
+    """Extract _extract_claude_credentials_json (+ its
+    _claude_creds_has_oauth_token helper), detect_bedrock_mode,
+    _check_claude_credential_ttl, and the real STAGE-assembly call site
+    verbatim from the launcher, and assemble them into one sourceable
+    script with STAGE/OS/USER_REPO stubbed. Mirrors
+    _invoke_helper_with_reason's extraction technique."""
+    extract = tmp_path / "extract-harness.sh"
+    extract.write_text(textwrap.dedent(f"""\
+        #!/bin/bash
+        grep '^_CLAUDE_CREDS_REJECT_REASON_FILE=' "{LAUNCHER}"
+        awk '
+          /^_claude_creds_has_oauth_token\\(\\)/ {{ p=1 }}
+          /^_extract_claude_credentials_json\\(\\)/ {{ p=1 }}
+          p {{ print }}
+          p && /^}}$/ {{ p=0 }}
+        ' "{LAUNCHER}"
+        awk '
+          /^detect_bedrock_mode\\(\\)/ {{ p=1 }}
+          p {{ print }}
+          p && /^}}$/ {{ p=0 }}
+        ' "{LAUNCHER}"
+        awk '/^_CLAUDE_TTL_WARN_THRESHOLD_SEC=/,/^}}$/' "{LAUNCHER}"
+        """))
+    extract.chmod(0o755)
+    functions_src = subprocess.run(
+        ["bash", str(extract)], capture_output=True, text=True, check=True,
+    ).stdout
+
+    src = LAUNCHER.read_text()
+    start = src.index('if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)"')
+    end = src.index("\nfi\n", start) + len("\nfi\n")
+    call_site = src[start:end]
+
+    harness = tmp_path / "call-site-harness.sh"
+    harness.write_text(
+        functions_src
+        + "\n"
+        + 'STAGE="${TEST_STAGE:?}"\n'
+        + 'mkdir -p "$STAGE/.claude"\n'
+        + 'OS="Darwin"\n'
+        + 'USER_REPO="${TEST_USER_REPO:-/tmp/nonexistent-repo-leerie-test}"\n\n'
+        + call_site
+        + '\necho "CALL_SITE_RESULT=proceeded"\n'
+    )
+    return harness
+
+
+def _run_call_site(
+    tmp_path: Path,
+    *,
+    oauth_token: str | None = None,
+    bearer_token: str | None = None,
+    bedrock_settings: str | None = None,
+    stub_security_returns: str | None = None,
+) -> tuple[int, str]:
+    """Run the real extracted call site with a controlled env, return
+    (rc, stdout). rc != 0 means the call site died (exit 1); rc == 0
+    with 'CALL_SITE_RESULT=proceeded' in stdout means it proceeded past
+    the credential-extraction block, matching the real launcher's
+    behavior for a --runtime local/fly/ec2 run reaching this point."""
+    harness = _build_call_site_harness(tmp_path)
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    sec = bin_dir / "security"
+    if stub_security_returns is None:
+        sec.write_text("#!/bin/sh\nexit 1\n")
+    else:
+        sec.write_text(f"#!/bin/sh\nprintf '%s' '{stub_security_returns}'\nexit 0\n")
+    sec.chmod(0o755)
+
+    if bedrock_settings is not None:
+        claude_dir = fake_home / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / "settings.json").write_text(bedrock_settings)
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    env = {
+        "HOME": str(fake_home),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "TMPDIR": str(stage),
+        "TEST_STAGE": str(stage),
+        "TEST_USER_REPO": str(repo_dir),
+    }
+    if oauth_token is not None:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    if bearer_token is not None:
+        env["AWS_BEARER_TOKEN_BEDROCK"] = bearer_token
+
+    result = subprocess.run(
+        ["bash", str(harness)], env=env, capture_output=True, text=True, timeout=10,
+    )
+    return result.returncode, result.stdout
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_proceeds_with_bearer_token_despite_broken_keychain() -> None:
+    """The exact regression reported against v0.9.89: AWS_BEARER_TOKEN_BEDROCK
+    set, Keychain holds only an mcpOAuth-only blob (the confirmed upstream
+    Claude Code bug). Must proceed, not die -- Bedrock auth doesn't need a
+    Claude Keychain credential at all."""
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(
+            Path(d),
+            bearer_token="AB-fake-bedrock-token",
+            stub_security_returns='{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}}}',
+        )
+        assert rc == 0, f"call site died despite AWS_BEARER_TOKEN_BEDROCK being set (rc={rc}): {out}"
+        assert "CALL_SITE_RESULT=proceeded" in out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_proceeds_with_settings_json_bedrock_mode_despite_broken_keychain() -> None:
+    """Sibling case to the bearer-token regression: CLAUDE_CODE_USE_BEDROCK
+    enabled via settings.json (detect_bedrock_mode) rather than the env
+    var, same broken-Keychain shape. Must also proceed."""
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(
+            Path(d),
+            bedrock_settings='{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}',
+            stub_security_returns='{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}}}',
+        )
+        assert rc == 0, f"call site died despite settings.json Bedrock mode (rc={rc}): {out}"
+        assert "CALL_SITE_RESULT=proceeded" in out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_still_dies_with_no_auth_anywhere() -> None:
+    """Negative control: the Bedrock exemption must not overly widen into
+    a silent no-op for a genuinely unauthenticated run -- no
+    CLAUDE_CODE_OAUTH_TOKEN, no AWS_BEARER_TOKEN_BEDROCK, no
+    settings.json Bedrock mode, broken Keychain. Must still die()."""
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(
+            Path(d),
+            stub_security_returns='{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}}}',
+        )
+        assert rc != 0, "call site proceeded despite no auth mechanism being configured at all"
+        assert "CALL_SITE_RESULT=proceeded" not in out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_proceeds_with_healthy_keychain_unaffected_by_bedrock_change() -> None:
+    """Regression control: the common/working case (a valid Claude
+    subscription credential resolves normally from Keychain, no Bedrock
+    involved at all) must be completely unaffected by widening the
+    guard -- it should proceed exactly as it did before this fix."""
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(
+            Path(d),
+            stub_security_returns='{"claudeAiOauth":{"accessToken":"sk-good"}}',
+        )
+        assert rc == 0, f"call site died despite a healthy resolved Keychain credential (rc={rc}): {out}"
+        assert "CALL_SITE_RESULT=proceeded" in out
