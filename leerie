@@ -96,7 +96,33 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # each per-job ./leerie --runtime fly invocation runs its own
 # STAGE-assembly + seed-auth pipeline.)
 #
+# Returns 0 if the blob (Keychain output or on-disk file contents) has a
+# real, non-empty claudeAiOauth.accessToken, 1 otherwise. Used by
+# _extract_claude_credentials_json below to reject a blob that is valid,
+# non-empty JSON but carries no usable Claude session token — see the
+# note on that function for why this check exists.
+_claude_creds_has_oauth_token() {
+  printf '%s' "$1" | python3 -c \
+    'import json, sys
+try:
+    d = json.load(sys.stdin)
+    sys.exit(0 if d.get("claudeAiOauth", {}).get("accessToken") else 1)
+except Exception:
+    sys.exit(1)' 2>/dev/null
+}
+
 # Prints the JSON to stdout. Returns 0 if creds were found, 1 otherwise.
+#
+# Both the Keychain entry and the on-disk file are shared with Claude
+# Code's MCP-server OAuth state (a known upstream bug — e.g.
+# anthropics/claude-code and steipete/CodexBar#1844 — lets a background
+# MCP-plugin auth flow overwrite the shared "Claude Code-credentials"
+# Keychain item with only {"mcpOAuth": {...}}, dropping claudeAiOauth
+# entirely). A blob in that shape is valid, non-empty JSON, so it is
+# shape-checked via _claude_creds_has_oauth_token above for a real
+# claudeAiOauth.accessToken before being accepted — otherwise it stages
+# into the container and the CLI there fails with "Not logged in ·
+# Please run /login".
 _extract_claude_credentials_json() {
   local creds=""
   if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
@@ -112,9 +138,15 @@ _extract_claude_credentials_json() {
   if [ -z "$creds" ] && [ "$(uname -s)" = "Darwin" ]; then
     creds="$(security find-generic-password -s "Claude Code-credentials" \
                 -w 2>/dev/null || true)"
+    if [ -n "$creds" ] && ! _claude_creds_has_oauth_token "$creds"; then
+      creds=""
+    fi
   fi
   if [ -z "$creds" ] && [ -s "$HOME/.claude/.credentials.json" ]; then
     creds="$(cat "$HOME/.claude/.credentials.json")"
+    if [ -n "$creds" ] && ! _claude_creds_has_oauth_token "$creds"; then
+      creds=""
+    fi
   fi
   if [ -z "$creds" ]; then
     return 1

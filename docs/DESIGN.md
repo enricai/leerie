@@ -1882,6 +1882,26 @@ shape is unchanged regardless of which branch resolved the credential
 scope-less blob as "Not logged in"), matching what `seed-auth.sh`
 already stages into the container's `~/.claude/.credentials.json`.
 
+**Keychain/file resolution requires a real token, not just non-empty
+JSON.** The macOS Keychain entry and `~/.claude/.credentials.json` are
+shared with Claude Code's own MCP-server OAuth state — a documented
+upstream bug (steipete/CodexBar#1844) lets a background MCP-plugin auth
+flow (e.g. the Supabase/Stripe/Vercel Claude Code plugins performing
+Dynamic Client Registration) overwrite the shared `Claude
+Code-credentials` Keychain item with only `{"mcpOAuth": {...}}`,
+dropping `claudeAiOauth` — the actual Claude session token — entirely.
+That blob is syntactically valid, non-empty JSON, so a presence-only
+check (`[ -z "$creds" ]`) accepts it, stages it into the container, and
+the CLI there fails with "Not logged in · Please run /login" despite the
+launcher having reported success. Both the Keychain and on-disk-file
+branches therefore additionally require a non-empty
+`claudeAiOauth.accessToken` in the resolved blob before accepting it; a
+blob failing that check is treated as if that source were empty and
+resolution falls through the same chain (Keychain → file → the existing
+"could not extract credentials" hint), rather than short-circuiting on a
+false positive. This does not change the precedence order above, only
+what counts as "found" at the Keychain/file layer.
+
 **The expiry preflight is best-effort, not a hard gate.** Before staging
 a resolved *subscription* credential (the long-lived token has no
 `expiresAt` and is exempt from this check entirely), leerie parses

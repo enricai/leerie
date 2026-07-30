@@ -2244,8 +2244,29 @@ rather than hand-copied, so `leerie`'s synthesized shape and
 `seed-auth.sh`'s fallback can't silently diverge — same discipline as
 `test_no_result_event_retry.py`), Keychain still wins over
 the file when the env var is unset (the pre-inversion fallback order is
-unchanged), and no credential anywhere yields a clean rc 1. The
-synthesized blob's mandatory `scopes:["user:inference"]` field (CLI
+unchanged), and no credential anywhere yields a clean rc 1.
+`test_credential_precedence.py` additionally pins the shape-validation
+gate that rejects a syntactically valid but semantically empty
+Keychain/file blob (the documented upstream Claude Code bug,
+steipete/CodexBar#1844, where a background MCP-plugin OAuth flow
+overwrites the shared `Claude Code-credentials` Keychain item with only
+`{"mcpOAuth": {...}}`, dropping `claudeAiOauth` entirely — see DESIGN §6
+*Credential strategy*): an mcpOAuth-only Keychain blob is rejected and
+falls through to a present on-disk file; the same mcpOAuth-only
+Keychain blob with no file fallback available yields rc 1 rather than a
+false-positive success; the identical mcpOAuth-only shape is rejected on
+the on-disk-file branch too; a blob with `claudeAiOauth` present but an
+empty `accessToken` is rejected (the check inspects the actual token
+value, not just key presence); and a positive control confirms a blob
+carrying both `mcpOAuth` and a real `claudeAiOauth.accessToken` (the
+healthy shape Claude Code should normally produce) is still accepted —
+the gate rejects on absence of a usable token, not on the mere presence
+of an `mcpOAuth` sibling key. The extraction harness in
+`test_chain_credential_transport.py`'s `_invoke_helper` was widened to
+also pull the new `_claude_creds_has_oauth_token` helper out of the
+launcher alongside `_extract_claude_credentials_json` (the two must
+travel together when sourced for tests, since the latter calls the
+former). The synthesized blob's mandatory `scopes:["user:inference"]` field (CLI
 2.1.210's file-auth path rejects a scope-less
 `{claudeAiOauth.accessToken}` blob as "Not logged in · Please run
 /login" — measured by field-ablation against the real image;

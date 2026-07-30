@@ -248,3 +248,101 @@ def test_returns_nonzero_when_no_creds_available(tmp_path: Path) -> None:
     rc, out = _invoke_helper(tmp_path, env={})
     assert rc != 0
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# (h) Keychain/file blobs missing claudeAiOauth.accessToken (e.g. the
+# upstream Claude Code bug — steipete/CodexBar#1844 — where a background
+# MCP-plugin OAuth flow overwrites the shared "Claude Code-credentials"
+# Keychain item with only {"mcpOAuth": {...}}) must be rejected rather than
+# staged into the container, where the CLI would then report "Not logged
+# in · Please run /login" despite the launcher believing it found creds.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_mcp_oauth_only_keychain_blob_is_rejected_falls_through_to_file(
+    tmp_path: Path,
+) -> None:
+    """A Keychain blob shaped like the upstream MCP-OAuth-clobber bug
+    (mcpOAuth present, claudeAiOauth absent) must not be accepted — it
+    should fall through to the on-disk file."""
+    disk_blob = '{"claudeAiOauth":{"accessToken":"sk-disk"}}'
+    rc, out = _invoke_helper(
+        tmp_path, env={},
+        credentials_file=disk_blob,
+        stub_security_returns='{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}}}',
+    )
+    assert rc == 0
+    assert out == disk_blob
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_mcp_oauth_only_keychain_blob_with_no_file_returns_nonzero(
+    tmp_path: Path,
+) -> None:
+    """Same mcpOAuth-only Keychain blob, with no on-disk file fallback
+    available either -> rc 1, not a false-positive success."""
+    rc, out = _invoke_helper(
+        tmp_path, env={},
+        stub_security_returns='{"mcpOAuth":{"plugin:stripe:stripe|xyz":{"accessToken":""}}}',
+    )
+    assert rc != 0
+    assert out == ""
+
+
+def test_mcp_oauth_only_credentials_file_is_rejected(tmp_path: Path) -> None:
+    """Same defect shape on the on-disk-file fallback: an mcpOAuth-only
+    file must not be accepted as valid Claude session credentials."""
+    rc, out = _invoke_helper(
+        tmp_path, env={},
+        credentials_file='{"mcpOAuth":{"plugin:vercel:vercel|def":{"accessToken":""}}}',
+    )
+    assert rc != 0
+    assert out == ""
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_keychain_blob_with_claude_ai_oauth_but_empty_access_token_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """claudeAiOauth present but accessToken empty/missing must also be
+    rejected — the shape check looks at the actual token value, not just
+    key presence."""
+    rc, out = _invoke_helper(
+        tmp_path, env={},
+        stub_security_returns='{"claudeAiOauth":{"accessToken":""}}',
+    )
+    assert rc != 0
+    assert out == ""
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_valid_keychain_blob_with_mcp_oauth_alongside_is_still_accepted(
+    tmp_path: Path,
+) -> None:
+    """A blob carrying BOTH mcpOAuth and a real claudeAiOauth.accessToken
+    (the healthy post-fix shape Claude Code should normally produce) is
+    still accepted — the fix rejects on absence of a real token, not on
+    the mere presence of an mcpOAuth sibling key."""
+    blob = (
+        '{"mcpOAuth":{"plugin:supabase:supabase|abc":{"accessToken":""}},'
+        '"claudeAiOauth":{"accessToken":"sk-real-token"}}'
+    )
+    rc, out = _invoke_helper(
+        tmp_path, env={},
+        stub_security_returns=blob,
+    )
+    assert rc == 0
+    assert out == blob

@@ -74,10 +74,13 @@ def _invoke_helper(
     extract = tmp_path / "extract-helper.sh"
     extract.write_text(textwrap.dedent(f"""\
         #!/bin/bash
-        # Pull just the _extract_claude_credentials_json function out of
-        # the launcher and source it. Anchor on the function name and
-        # close-brace at column 1.
+        # Pull _extract_claude_credentials_json out of the launcher and
+        # source it, along with its _claude_creds_has_oauth_token helper
+        # (defined just above it, called from inside it — must travel
+        # together). Anchor on the first function name and close-brace at
+        # column 1 that follows the second function's start.
         awk '
+          /^_claude_creds_has_oauth_token\\(\\)/ {{ p=1 }}
           /^_extract_claude_credentials_json\\(\\)/ {{ p=1 }}
           p {{ print }}
           p && /^}}$/ {{ p=0 }}
