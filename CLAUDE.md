@@ -315,6 +315,21 @@ export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
   --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
   --ec2-subnet-id subnet-0123456789abcdef0
 
+# Route model calls through Amazon Bedrock via a static bearer token — the
+# Bedrock analogue of CLAUDE_CODE_OAUTH_TOKEN. Needs no `aws` CLI, no SSO
+# session, and no ~/.aws/ staging (unlike the settings.json-driven
+# CLAUDE_CODE_USE_BEDROCK + `aws sso login` mode, whose SSO token the
+# container cannot refresh). AWS_REGION is optional (the CLI defaults to
+# us-east-1); CLAUDE_CODE_USE_BEDROCK defaults to 1 once the bearer token is
+# set, but can still be overridden explicitly. If both this bearer token and
+# a settings.json CLAUDE_CODE_USE_BEDROCK are present, the bearer token wins.
+# Note: if also using --runtime ec2, its AWS_REGION-consuming preflight
+# (require_aws) can pick up this same var — set LEERIE_AWS_REGION explicitly
+# if you want a different EC2-provisioning region than the Bedrock region.
+export AWS_BEARER_TOKEN_BEDROCK=<token>
+export AWS_REGION=us-east-1              # optional, forwarded when set
+./leerie "task"
+
 # Choose the model. Without overrides, every worker — judgment (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator) and acting
 # (implementer, conformer) alike — defaults to sonnet. Per-worker overrides
@@ -2264,6 +2279,71 @@ hard gate on missing/bogus data; and two constant pins confirm the
 threshold is exactly 90 minutes and that the launcher never hard-codes
 an 8-hour TTL assumption anywhere (the community-reported 2–15h range
 is why `expiresAt` must be read, never assumed).
+The Bedrock bearer-token auth path (`AWS_BEARER_TOKEN_BEDROCK` — the
+static-credential analogue of `CLAUDE_CODE_OAUTH_TOKEN` for Bedrock,
+DESIGN §6 *Credential strategy*: preferred over the pre-existing
+settings.json-driven SSO/profile Bedrock path since a container cannot
+refresh a short-lived SSO token any more than it can refresh a subscription
+OAuth session) is tested in `tests/test_bedrock_bearer_token.py`: the
+bearer token is forwarded verbatim alongside a `CLAUDE_CODE_USE_BEDROCK`
+default of `1` (confirmed live against the real CLI that the token alone is
+a no-op without this flag — the CLI falls through to firstParty/OAuth
+dispatch otherwise) and an optional `AWS_REGION`; an explicit
+`CLAUDE_CODE_USE_BEDROCK=0` override still wins over the default; the
+bearer-token path never invokes `bedrock_preflight()`/`aws sts
+get-caller-identity` and mounts no `~/.aws`, even when `aws` is present and
+would fail; the bearer-token path wins when both it and a settings.json
+`CLAUDE_CODE_USE_BEDROCK=1` are present (matching the real CLI's own
+credential-resolution order — its Bedrock client construction
+short-circuits SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is
+set); and the pre-existing SSO/profile path is unaffected when the bearer
+token is absent (regression control). The Fly detached-launch heredoc gets
+its own dedicated coverage for three defects found and fixed during
+implementation, since the heredoc is unquoted (`<<PY`) and therefore
+substitutes shell expansions inside what looks like inert Python comment
+text: (1) a raw `"${AWS_BEARER_TOKEN_BEDROCK}"` string substitution let a
+token containing `"`/`\` break out of the Python string literal and run as
+arbitrary code on the remote Fly machine — fixed by JSON-encoding every
+heredoc-substituted value host-side (mirroring the pre-existing
+`_launch_argv_json` technique), pinned by
+`test_fly_heredoc_values_are_json_encoded_not_raw` and three live
+end-to-end tests (`test_malicious_token_with_quote_does_not_break_out_of_python_literal`,
+`test_malicious_token_with_backslash_does_not_break_out`,
+`test_normal_token_unaffected_by_json_encoding`) that extract the real
+JSON-encoding lines and `child_env[...]` block verbatim from the launcher,
+splice them into a harness, and actually pipe the result through
+`python3 -`; (2) a first-draft fix comment containing the literal text
+`${VAR}` crashed the entire launcher with `unbound variable` under
+`set -u` on every Bedrock bearer-token Fly launch (worse than the injection
+defect, since it fired unconditionally rather than only on a hostile
+token) — pinned by
+`test_child_env_heredoc_body_has_no_stray_unbound_var_substitution`, which
+scans the real extracted heredoc body for any `${...}`-shaped token outside
+an explicit allowlist of the known, intentional substitution names; (3) a
+balanced backtick pair in a comment (`` `if <json>:` ``) was parsed by bash
+as a command-substitution delimiter — a different expansion mechanism than
+`${...}`, so unguarded by the previous fix — printing a spurious `syntax
+error: unexpected end of file` to the user's terminal on every launch and
+silently dropping that comment's text from the script sent to the remote
+machine (caught by diffing `shellcheck -x leerie` against `git stash`,
+since `bash -n` does not catch it) — pinned by
+`test_child_env_heredoc_body_has_no_backtick_characters`. All three
+regression tests were falsified live (reintroducing each exact defect and
+confirming the corresponding test fails, then re-confirming it passes on
+the fix) rather than trusted on inspection alone.
+Since the existing Bedrock SSO/profile path (`detect_bedrock_mode()` /
+`bedrock_preflight()`) shipped with zero test coverage before this work,
+`tests/test_bedrock_mode.py` closes that gap: `detect_bedrock_mode()`'s
+3-file merge and truthy-value matching (`1`/`true`/`yes`/`on`,
+case-insensitive, OR semantics since the flag has no "disable" value, and
+tolerance of a malformed settings file); and `bedrock_preflight()`'s three
+outcomes (missing `aws` binary, a failing `aws sts get-caller-identity`
+simulating an expired/missing SSO token — with and without an `AWS_PROFILE`
+naming the profile in the recovery hint — and a valid SSO session). Both
+files extract `detect_bedrock_mode()`/`bedrock_preflight()` verbatim from
+the launcher via source-slicing (same discipline as
+`test_launcher_env_forwarding.py`'s `_extract_forwarding_loop`) rather than
+reproducing them by hand.
 The terminal auth-failure classifier and its full routing path — the
 `b57027d3…` incident this run's credential-strategy work responds to,
 where a container's expired OAuth session surfaced as "worker failed

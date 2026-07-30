@@ -5543,7 +5543,30 @@ if [ -d "$HOME/.gnupg" ]; then
   fi
 fi
 
-# -- ~/.aws/ (Bedrock mode only) --
+# -- Bedrock bearer-token mode (AWS_BEARER_TOKEN_BEDROCK) --
+# The static-bearer-token analogue of CLAUDE_CODE_OAUTH_TOKEN: a plain,
+# non-expiring-by-refresh credential the Claude CLI sends as
+# `Authorization: Bearer <token>` directly to the Bedrock runtime endpoint.
+# Unlike SSO/profile Bedrock auth below, it needs no `aws` CLI, no SSO
+# session, and no ~/.aws/ staging — verified live against the Claude CLI
+# (v2.1.220): the bearer token alone does nothing (the CLI falls through to
+# firstParty/OAuth) unless CLAUDE_CODE_USE_BEDROCK is also set, so this
+# block always forwards both. Triggered by a plain host env var, independent
+# of the settings.json-driven detect_bedrock_mode() below — and takes
+# precedence over it, mirroring the CLI's own credential resolution (its
+# Bedrock client construction short-circuits SSO/profile resolution when
+# AWS_BEARER_TOKEN_BEDROCK is set) and DESIGN §6's "prefer the credential
+# immune to the container-can't-refresh failure class" precedent for
+# CLAUDE_CODE_OAUTH_TOKEN vs Keychain.
+_BEDROCK_BEARER_ACTIVE=false
+if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
+  _BEDROCK_BEARER_ACTIVE=true
+  AUTH_MOUNTS+=(-e "AWS_BEARER_TOKEN_BEDROCK=$AWS_BEARER_TOKEN_BEDROCK")
+  AUTH_MOUNTS+=(-e "CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-1}")
+  [ -n "${AWS_REGION:-}" ] && AUTH_MOUNTS+=(-e "AWS_REGION=$AWS_REGION")
+fi
+
+# -- ~/.aws/ (Bedrock SSO/profile mode only) --
 # The Claude CLI's AWS SDK resolves credentials via pure file I/O:
 #   ~/.aws/config          — profile definition + SSO session config
 #   ~/.aws/sso/cache/*.json — cached SSO access tokens (~12 h TTL)
@@ -5551,10 +5574,13 @@ fi
 # No aws binary is needed inside the container for normal operation.
 # cli/cache is excluded (CLI result cache; large, irrelevant to auth).
 # Mount read-only: workers never write AWS credentials.
+# Skipped entirely when the bearer-token block above is active: no aws
+# CLI/SSO dependency for that path, and the CLI prefers the bearer token
+# over SSO/profile credentials anyway when both are present.
 _BEDROCK_ACTIVE=false
 _BEDROCK_PROFILE=""
 _BEDROCK_REGION=""
-if detect_bedrock_mode; then
+if [ "$_BEDROCK_BEARER_ACTIVE" = "false" ] && detect_bedrock_mode; then
   _BEDROCK_ACTIVE=true
   if [ ! -d "$HOME/.aws" ]; then
     remote_log "error: Bedrock mode is enabled but ~/.aws/ not found on host."
@@ -6251,6 +6277,20 @@ print(json.dumps(sys.argv[1:]))
         # name. Empty if /etc/localtime isn't a symlink — Python's
         # astimezone() then falls back to UTC.
         _host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
+        # JSON-encode every value substituted into the heredoc below as a
+        # Python string literal (same technique _launch_argv_json already
+        # uses for argv) — a raw "${VAR}" substitution is not injection-safe:
+        # a value containing `"` or `\` breaks out of the literal and runs
+        # as arbitrary Python on the remote machine. Load-bearing for
+        # AWS_BEARER_TOKEN_BEDROCK specifically (an opaque secret token is
+        # exactly the kind of value likely to contain such bytes), applied
+        # to every substituted value here for consistency.
+        _host_tz_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_host_tz")"
+        _bedrock_bearer_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_BEARER_TOKEN_BEDROCK:-}")"
+        _bedrock_use_bedrock_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_USE_BEDROCK:-1}")"
+        _bedrock_bearer_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
+        _bedrock_profile_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_PROFILE")"
+        _bedrock_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_REGION")"
         _launch_script="$(cat <<PY
 import fcntl, os, pwd, subprocess, sys, time
 argv = ${_launch_argv_json}
@@ -6312,17 +6352,34 @@ child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 # tzdata so /usr/share/zoneinfo/<IANA> resolves. If readlink fails
 # (e.g. /etc/localtime not a symlink), the substitution yields ""
 # and Python's astimezone() falls back to UTC — same as today.
-child_env["TZ"] = "${_host_tz}"
-# Belt-and-suspenders Bedrock activation: inject env vars explicitly so
-# claude -p workers use Bedrock via process.env regardless of whether the
-# settings.json env block is applied by the in-container claude binary.
-# Variables are substituted host-side (heredoc is unquoted <<PY).
-if "${_BEDROCK_ACTIVE}" == "true":
+child_env["TZ"] = ${_host_tz_json}
+# Bedrock bearer-token activation (AWS_BEARER_TOKEN_BEDROCK) -- takes
+# precedence over the SSO/profile block below, mirroring the nerdctl path's
+# AUTH_MOUNTS ordering above. Every value is JSON-encoded host-side before
+# substitution instead of a raw quoted-var string -- an opaque bearer
+# token is exactly the kind of value likely to contain a double-quote or
+# backslash that would otherwise break out of a raw Python string literal
+# and run as arbitrary code on this remote machine (see _launch_argv_json
+# above, which already uses this technique for argv). A JSON-encoded empty
+# string is falsy in Python, so the truthiness checks below behave the
+# same as the unset case. NOTE: this heredoc is unquoted (<<PY) -- never
+# put a backtick pair in a comment here, since bash treats it as a
+# command-substitution delimiter even inside heredoc body text.
+if "${_BEDROCK_BEARER_ACTIVE}" == "true":
+    child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
+    child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
+    if ${_bedrock_bearer_region_json}:
+        child_env["AWS_REGION"] = ${_bedrock_bearer_region_json}
+# Belt-and-suspenders Bedrock SSO/profile activation: inject env vars
+# explicitly so claude -p workers use Bedrock via process.env regardless of
+# whether the settings.json env block is applied by the in-container claude
+# binary. Skipped when the bearer-token block above already activated.
+elif "${_BEDROCK_ACTIVE}" == "true":
     child_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-    if "${_BEDROCK_PROFILE}":
-        child_env["AWS_PROFILE"] = "${_BEDROCK_PROFILE}"
-    if "${_BEDROCK_REGION}":
-        child_env["AWS_REGION"] = "${_BEDROCK_REGION}"
+    if ${_bedrock_profile_json}:
+        child_env["AWS_PROFILE"] = ${_bedrock_profile_json}
+    if ${_bedrock_region_json}:
+        child_env["AWS_REGION"] = ${_bedrock_region_json}
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not

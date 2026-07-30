@@ -1938,6 +1938,35 @@ sets `CLAUDE_CODE_OAUTH_TOKEN` — the same long-lived-token launch this
 section already recommends structurally avoids the failure in the first
 place.
 
+**The same refresh-vs-static distinction applies to Bedrock auth.** The
+launcher's Bedrock support (§"Finalization" above) predates this section
+and defaults to AWS SSO/profile auth: `detect_bedrock_mode()` reads
+`CLAUDE_CODE_USE_BEDROCK` out of the merged Claude `settings.json` files,
+then `bedrock_preflight()` requires the host `aws` CLI and a live `aws sts
+get-caller-identity` before staging `~/.aws/` (config + SSO token cache)
+read-only into the container. SSO access tokens are short-lived (~12h) and
+refreshed only by the host's interactive `aws sso login` browser flow — a
+non-interactive container cannot do that either, the identical
+container-cannot-refresh problem this section already solved for
+subscription auth via `CLAUDE_CODE_OAUTH_TOKEN`.
+
+`AWS_BEARER_TOKEN_BEDROCK` is the Bedrock analogue: a static bearer
+credential the Claude CLI sends as `Authorization: Bearer <token>` directly
+to the Bedrock runtime endpoint, with no refresh-token/expiry machinery
+anywhere near it (verified against the CLI's own bundled source and live
+end-to-end testing — the token alone is a no-op unless
+`CLAUDE_CODE_USE_BEDROCK` is also set, since the CLI otherwise falls
+through to its firstParty/OAuth dispatch path). Because it needs no `aws`
+CLI, no SSO session, and no `~/.aws/` staging, leerie triggers this path
+from a plain host env var (`AWS_BEARER_TOKEN_BEDROCK`), independent of the
+settings.json-driven `detect_bedrock_mode()` gate, and skips
+`bedrock_preflight()`/the `~/.aws` mount entirely when it is set — mirroring
+this section's existing precedent of preferring the credential immune to
+the expiry failure class over the one that requires host-side refresh.
+When both are present, the bearer token wins, matching the Claude CLI's own
+credential-resolution order (its Bedrock client construction short-circuits
+SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is set).
+
 **Decomposition needs the same discipline against the loss of
 in-progress spend.** §5½ (P1)'s `fit_judge` and coupled-minority
 `splitter` calls have no crash barrier today: a single `WorkerError`

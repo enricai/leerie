@@ -742,7 +742,8 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` | rw | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
 | `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` | rw | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
 | `$STAGE/.gnupg` (per-run host scratch) | `/home/leerie/.gnupg` | rw | Per-container copy of `~/.gnupg/` with agent socket files (`S.gpg-agent*`, `S.scdaemon`, `S.keyboxd`) excluded and `use-keyboxd` stripped from `common.conf` (the container cannot reach the host keyboxd daemon; stripping the directive makes gpg fall back to file-based `pubring.kbx` lookup — on keyboxd-only hosts signing keys become unfindable, which is acceptable since commit signing is best-effort). Keyrings + `trustdb.gpg` ride along so workers can `git commit -S` if signing is configured. Permissions set to `0700`. |
-| `$STAGE/.aws` (per-run host scratch, **Bedrock mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` set to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive — matching Claude CLI's `isEnvTruthy`) in the `env` block of any of the three settings files the Claude CLI merges (`~/.claude/settings.json` (userSettings), `<USER_REPO>/.claude/settings.json` (projectSettings), `<USER_REPO>/.claude/settings.local.json` (localSettings)). The Claude CLI's AWS SDK resolves credentials via pure file I/O — reads `~/.aws/config` (profile + SSO session config) and `~/.aws/sso/cache/*.json` (SSO access tokens, ~12 h TTL) directly; no `aws` binary is needed inside the container. `~/.aws/cli/cache` is excluded (CLI result cache; large, irrelevant to auth). Mounted **read-only** because workers never write credentials. The `aws` binary (`awsAuthRefresh`) is a host-only concern: `aws sso login` requires an interactive TTY/browser and cannot run inside a non-interactive container; `bedrock_preflight()` catches an expired SSO token on the host before the container starts and prints the recovery hint (`aws sso login --profile <profile>`). On the Fly.io path, `$STAGE/.aws/` is included in the tar pipe to `seed_auth` automatically (`.aws` is not in the seed-auth exclude list) and lands at `/home/leerie/.aws/` on the remote machine. Belt-and-suspenders: when Bedrock mode is active, the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, and `AWS_REGION` as explicit env vars — via `AUTH_MOUNTS` `-e` flags on the local nerdctl path and via `child_env` in the Fly detached-launch heredoc — so workers activate Bedrock through `process.env` independently of how the in-container claude binary handles `settings.json` env blocks. |
+| `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` set to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive — matching Claude CLI's `isEnvTruthy`) in the `env` block of any of the three settings files the Claude CLI merges (`~/.claude/settings.json` (userSettings), `<USER_REPO>/.claude/settings.json` (projectSettings), `<USER_REPO>/.claude/settings.local.json` (localSettings)) — and only when `AWS_BEARER_TOKEN_BEDROCK` (see below) is **not** set on the host; the bearer-token path needs none of this. The Claude CLI's AWS SDK resolves credentials via pure file I/O — reads `~/.aws/config` (profile + SSO session config) and `~/.aws/sso/cache/*.json` (SSO access tokens, ~12 h TTL) directly; no `aws` binary is needed inside the container. `~/.aws/cli/cache` is excluded (CLI result cache; large, irrelevant to auth). Mounted **read-only** because workers never write credentials. The `aws` binary (`awsAuthRefresh`) is a host-only concern: `aws sso login` requires an interactive TTY/browser and cannot run inside a non-interactive container; `bedrock_preflight()` catches an expired SSO token on the host before the container starts and prints the recovery hint (`aws sso login --profile <profile>`). On the Fly.io path, `$STAGE/.aws/` is included in the tar pipe to `seed_auth` automatically (`.aws` is not in the seed-auth exclude list) and lands at `/home/leerie/.aws/` on the remote machine. Belt-and-suspenders: when Bedrock SSO/profile mode is active, the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, and `AWS_REGION` as explicit env vars — via `AUTH_MOUNTS` `-e` flags on the local nerdctl path and via `child_env` in the Fly detached-launch heredoc — so workers activate Bedrock through `process.env` independently of how the in-container claude binary handles `settings.json` env blocks. |
+| `AWS_BEARER_TOKEN_BEDROCK` (host env var, **Bedrock bearer-token mode**) | forwarded as `-e`/`child_env` only — **no bind mount** | n/a | The static-bearer-token analogue of `CLAUDE_CODE_OAUTH_TOKEN`, triggered by a plain host env var independently of `detect_bedrock_mode()`'s settings.json scan, and taking precedence over the SSO/profile path above when both are present (matching the Claude CLI's own credential-resolution order — verified live against the CLI, v2.1.220: its Bedrock client construction short-circuits SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is set). No `aws` CLI, no SSO session, no `~/.aws` staging — `bedrock_preflight()` is skipped entirely on this path. The launcher forwards `AWS_BEARER_TOKEN_BEDROCK` verbatim, `CLAUDE_CODE_USE_BEDROCK` (defaulting to `1` if the host didn't set it — confirmed live that the bearer token alone is a no-op without this flag, since the CLI otherwise falls through to firstParty/OAuth dispatch), and `AWS_REGION` when set (optional — the CLI defaults to `us-east-1`) as explicit `-e` flags on the local nerdctl path and `child_env` entries in the Fly detached-launch heredoc, mirroring the `CLAUDE_CODE_OAUTH_TOKEN` forwarding pattern above rather than the SSO path's settings.json extraction. On the Fly path specifically, every value substituted into the detached-launch heredoc (the bearer token, region, and use-bedrock flag, plus the pre-existing `_BEDROCK_PROFILE`/`_BEDROCK_REGION`/host-TZ values) is JSON-encoded host-side first (`python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))'`, the same technique `_launch_argv_json` already uses for orchestrator argv) rather than substituted as a raw `"${VAR}"` string — an opaque bearer token is exactly the kind of value likely to contain a `"` or `\` that would otherwise break out of the Python string literal and execute as arbitrary code on the remote machine. |
 
 The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`,
 `$SSH_AUTH_SOCK`) that earlier versions of leerie bind-mounted **no longer
@@ -5934,16 +5935,35 @@ child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 # `readlink /etc/localtime | sed 's|.*/zoneinfo/||'` (works on
 # macOS and Linux). Dockerfile installs `tzdata` so the IANA name
 # resolves; empty value → Python astimezone() falls back to UTC.
-child_env["TZ"] = "${_host_tz}"
-# Belt-and-suspenders Bedrock activation (when _BEDROCK_ACTIVE=true on
-# the host): variables substituted host-side before the script is piped
-# to the machine (same pattern as USER_REPO and TZ above).
-if "${_BEDROCK_ACTIVE}" == "true":
+child_env["TZ"] = ${_host_tz_json}
+# Bedrock bearer-token activation (when _BEDROCK_BEARER_ACTIVE=true on the
+# host): takes precedence over the SSO/profile block below, mirroring the
+# nerdctl path's AUTH_MOUNTS ordering. Every value below is JSON-encoded
+# host-side (via a `python3 -c 'import json,sys; print(json.dumps(...))'`
+# call per variable, same technique _launch_argv_json above already uses
+# for argv) rather than substituted as a raw quoted-var string — a raw
+# substitution is not injection-safe: an opaque secret like a bearer token
+# is exactly the kind of value likely to contain a double-quote or
+# backslash that would otherwise break out of the Python string literal
+# and run as arbitrary code on this remote machine. A JSON-encoded empty
+# string is falsy in Python, so the truthiness checks below behave the
+# same as unset. NOTE: this heredoc is unquoted (<<PY) -- never put a
+# backtick pair in a comment here, since bash treats it as a
+# command-substitution delimiter even inside heredoc body text.
+if "${_BEDROCK_BEARER_ACTIVE}" == "true":
+    child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
+    child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
+    if ${_bedrock_bearer_region_json}:
+        child_env["AWS_REGION"] = ${_bedrock_bearer_region_json}
+# Belt-and-suspenders Bedrock SSO/profile activation (when
+# _BEDROCK_ACTIVE=true on the host), skipped when the bearer-token block
+# above already activated:
+elif "${_BEDROCK_ACTIVE}" == "true":
     child_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-    if "${_BEDROCK_PROFILE}":
-        child_env["AWS_PROFILE"] = "${_BEDROCK_PROFILE}"
-    if "${_BEDROCK_REGION}":
-        child_env["AWS_REGION"] = "${_BEDROCK_REGION}"
+    if ${_bedrock_profile_json}:
+        child_env["AWS_PROFILE"] = ${_bedrock_profile_json}
+    if ${_bedrock_region_json}:
+        child_env["AWS_REGION"] = ${_bedrock_region_json}
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
