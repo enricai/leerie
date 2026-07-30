@@ -4580,7 +4580,6 @@ mis-wirings:
   (the deterministic floor + `adherence_judge`, §12) does not cover either,
   since a plan can honor every prescribed instruction and still omit
   unprescribed required work.
-  `classification_judge`.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the
