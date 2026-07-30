@@ -4547,6 +4547,59 @@ mis-wirings:
   detected package manager match the lockfiles present? A recipe self-graded
   9.3 that omitted `--break-system-packages` caused twelve real install
   failures. Gates on a recipe that would fail.
+- **planner `task_understanding`** → an independent `task_coverage_judge`
+  that did not write the plan, handed only the task plus the reconciled
+  subtask set: does the plan actually address what the user asked for — is
+  any required piece of work missing entirely, or is any subtask off-task
+  (drifted onto work the user did not ask for)? This is distinct from
+  `fit_judge` (is each subtask sized/scoped correctly — a *decomposition*
+  question) and from `wiring_judge` (are the subtasks correctly wired to
+  each other — a *graph* question): `task_coverage_judge` is the one check
+  asking whether the union of subtasks, correctly wired and correctly sized
+  or not, actually *covers the task*. A planner can self-report high
+  `task_understanding` while a whole required piece of work never became a
+  subtask, because a decomposition self-review is anchored to the
+  decomposition the planner already committed to, not to the task
+  independently re-read. Gates on a non-empty array of concretely-named
+  coverage gaps. The planner **can** mechanically act on a found gap (add
+  or revise a subtask), so this gate **re-drives** `phase_plan`, mirroring
+  `classification_judge`.
+- **integrator `resolution`** → an independent `integration_judge` that did
+  not perform the merge, handed the merged result plus both parent diffs and
+  the conflicting subtasks' intents: did the merge actually resolve the
+  conflict *behaviorally*, not just remove `<<<<<<<` markers? The existing
+  conflict-marker scan plus `check_merge_committed` catch the mechanical
+  failure (markers left in, or no commit made); they cannot see a
+  syntactically clean merge that silently drops one side's behavior — e.g.
+  a merge that keeps side A's function signature but side B's call sites,
+  compiling but breaking at runtime. Gates on a non-empty array of
+  concretely-named behavioral defects in the merged result. An integrator
+  cannot always mechanically fix a semantic finding it didn't itself reason
+  through the same way a planner can add a subtask, so this gate is
+  **detect-and-die, single pass**, mirroring `wiring_judge` /
+  `provision_judge`.
+- **`plan_overlap_judge`'s own `judgment` self-score is dropped, with no new
+  independent verifier.** This worker is already the independent adversarial
+  check for cross-planner surface collisions — layering a second judge on
+  top of a judge would be self-scoring one level removed, not a case this
+  pattern generalizes to (there is no "artifact" here that a fresh mind
+  reviews with fresh eyes; the judge's own output IS the finding). Its
+  existing deterministic validators — `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
+  `DROP_BREAKS_GRAPH` (`check_overlap_judge_output`, §5 *Cross-domain
+  surface overlap*), and `_validate_overlap_judge_output`'s
+  `merge_feasibility`-presence backstop — already catch the concrete,
+  checkable failure modes (a hallucinated artifact, a collision with no
+  shared file evidence, a drop that orphans a still-required capability, a
+  merge with no stated feasibility). What remains ungated by dropping the
+  self-score is purely a *quality-of-judgment* concern (did the judge use
+  good taste in choosing `merge` vs `drop_a` vs `drop_b`) with no
+  mechanically-attackable "artifact" for a second worker to find concrete
+  defects in — the same reason the implementer's `solution` axis is
+  verified by a *different-role* worker (the conformer) rather than a
+  second implementer grading the first. The deterministic validators become
+  this worker's sole gate; `check_overlap_judge_output`'s `_confidence_issues`
+  call on `judgment` is removed, and the `confidence` object stays emitted
+  as an advisory record only.
 
 **Why this does not reintroduce the gameable bar §9 removed.** The old
 criteria-lock / "tests must pass" gate was gameable because the *same* worker

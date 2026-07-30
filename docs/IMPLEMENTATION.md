@@ -2473,6 +2473,8 @@ the retained history of why the split existed.
 | wiring_judge | sonnet | independent adversarial verifier of the reconciled plan's semantic wiring — the tag/dep dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | provision_judge | sonnet | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| task_coverage_judge *(planned — see §8 "The final two independent adversarial verifiers")* | sonnet | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8 *Independent adversarial verification*); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| integration_judge *(planned — see §8 "The final two independent adversarial verifiers")* | sonnet | independent adversarial verifier of the integrator's merge for behavioral (not just textual) correctness (DESIGN §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
 lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
@@ -2480,8 +2482,9 @@ explicitly (all `sonnet` — matching the global default today, but kept as
 explicit per-worker entries since they predate this change and may need to
 diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
-and `artifact_registry` are **absent** from `MODEL_DEFAULT_PER_WORKER` —
-their `sonnet` defaults come from the global `MODEL_DEFAULT` fallback.
+`artifact_registry`, and (once landed) `task_coverage_judge` /
+`integration_judge` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their
+`sonnet` defaults come from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2604,6 +2607,8 @@ chain below when a specific worker needs deeper reasoning.
 | wiring_judge | medium | independent semantic-wiring verification of the reconciled plan (DESIGN §5, §8); same `medium` judgment-worker profile |
 | provision_judge | medium | independent recipe verification against the image/runtime (DESIGN §6½, §8); same `medium` judgment-worker profile |
 | artifact_registry | medium | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*); same `medium` judgment-worker profile |
+| task_coverage_judge *(planned)* | medium | independent adversarial verification of plan-vs-task coverage (DESIGN §8); same `medium` judgment-worker profile as the other independent adversarial verifiers |
+| integration_judge *(planned)* | medium | independent adversarial verification of the integrator's merge for behavioral correctness (DESIGN §8); same `medium` judgment-worker profile |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the fifteen
@@ -2617,6 +2622,13 @@ pre-planning shared-vocabulary worker `artifact_registry`. It separately
 overrides `implementer` and `conformer` to `"low"` — a distinct,
 cost-motivated pin rather than a judgment-reproducibility one, so it is
 called out separately from the `"medium"` judgment cohort above.
+Once `task_coverage_judge` and `integration_judge` land (see §8 "The final
+two independent adversarial verifiers"), each gets its own
+`EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, matching every other
+independent adversarial verifier, plus the same `--effort-<W>` /
+`LEERIE_EFFORT_<W>` / `effort_<w>` override triple and `--model-<W>` /
+`LEERIE_MODEL_<W>` / `model_<w>` triple every other `WORKER_TYPES` entry in
+the tables above gets.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -4520,7 +4532,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. **Intentional provenance deviation:** unlike the per-worker cap, there is *no* CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint *before* the Python orchestrator (and its resolver machinery) starts, so a Python-side resolver could not set it in time; the env var is the single override knob. Best-effort: any read/write failure leaves the slice uncapped (prior behavior). Sets `memory.max` (RAM) only, not `memory.swap.max` — a capped slice may swap before the cgroup OOM fires, which still contains the pressure to the slice (no global OOM); bounding total RAM+swap via `memory.swap.max` is a possible future refinement. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container* (per-worker `-998` protection is only relative within the slice), instead of a VM-wide *global* OOM that would kill unprotected host-session processes — the `nerdctl` client especially — and orphan the container (wedging the run-dir flock). See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. Terminal auth failures (`_is_terminal_auth_failure`, below) never reach this loop. |
 | credential near-expiry warning threshold (`credential_expiry_warn_sec`, proposed 90 min) | 5400 s (90 min) | Launcher-side preflight (`_check_claude_credential_ttl`, staging block) run only when the resolved credential is a *subscription* token — the long-lived `$CLAUDE_CODE_OAUTH_TOKEN` has no `expiresAt` and is exempt. Parses `claudeAiOauth.expiresAt` (ms epoch) from the resolved JSON and compares to now, reusing the pattern at `scripts/remote/aws-credentials.sh:183-196`. Already expired → refuse to launch, print `claude /login`. Inside the threshold → warn with the exact expiry and point at `claude setup-token`, but still launch. `expiresAt` absent or malformed → proceed silently — this is a best-effort diagnostic, never a hard gate, since the 1-year token legitimately has no `expiresAt` at all. See DESIGN §6 *Credential strategy*. Never hard-code a TTL duration (community reports for the subscription token range 2–15h); `expiresAt` is the sole source of truth. |
-| mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator, adherence gate, and the three independent adversarial verifiers (`classification_judge`, `wiring_judge`, `provision_judge` — DESIGN §8). The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) or an independent judge on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings (or `die()` for the adversarial-verifier gates, which are terminal on an unresolved defect) — except the classification gate, which routes to the cleared-but-empty terminal state instead of `die()`ing when the classifier's own `likely_already_satisfied` signal is set (DESIGN §8 *Reaching the cleared-but-empty state from classification*). The loop itself also cuts a round short of exhaustion when a round's issue signatures repeat an earlier round's — not new information, so retrying further is not forward progress (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). CRITIC pattern (ICLR 2024). A round that raises `WorkerError` (infrastructure: PID exhaustion, OOM, a killed session) is retried against the same budget — the re-invocation is a fresh `claude -p` session with a clean PID table — and only returns `None` if every round crashes. Any other exception is a leerie bug, not a flaky worker, and still abandons the loop immediately. |
+| mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator, adherence gate, and the five independent adversarial verifiers (`classification_judge`, `wiring_judge`, `provision_judge`, and — once landed — `task_coverage_judge`, `integration_judge` — DESIGN §8). The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) or an independent judge on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings (or `die()` for the adversarial-verifier gates, which are terminal on an unresolved defect) — except the classification gate, which routes to the cleared-but-empty terminal state instead of `die()`ing when the classifier's own `likely_already_satisfied` signal is set (DESIGN §8 *Reaching the cleared-but-empty state from classification*). The loop itself also cuts a round short of exhaustion when a round's issue signatures repeat an earlier round's — not new information, so retrying further is not forward progress (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). CRITIC pattern (ICLR 2024). A round that raises `WorkerError` (infrastructure: PID exhaustion, OOM, a killed session) is retried against the same budget — the re-invocation is a fresh `claude -p` session with a clean PID table — and only returns `None` if every round crashes. Any other exception is a leerie bug, not a flaky worker, and still abandons the loop immediately. |
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
 | implementer confidence retries (`implementer_confidence_retries`) | 2 | Separate from `subtask_continuations`. Orchestrator checks confidence scores + scope drift + unmet criteria on complete results and re-invokes as a continuation if issues found. |
 | planner samples (`planner_samples`) | 3 | Independent parallel invocations per domain. Mechanical selection: fewest issues, tiebreak on subtask count. Set to 1 to disable. Also `LEERIE_PLANNER_SAMPLES` env or `planner_samples` in `leerie.toml`. CLI: `--planner-samples`. |
@@ -4762,11 +4774,80 @@ reviews the implementer's committed diff, so it attacks that diff for behavioral
 gaps. See "Per-subtask post-work conformance" in §5 for the gating wiring in
 `settle_subtask`.
 
+### The final two independent adversarial verifiers: `task_coverage_judge` and `integration_judge` (DESIGN §8)
+
+Two more judgment workers close out the remaining self-graded axes on the
+planner (`task_understanding`) and the integrator (`resolution`) — DESIGN §8
+*Independent adversarial verification*. Both mirror `adherence_judge`/the
+three verifiers above exactly: no `_confidence_schema` sub-object (each
+worker *is* the independent check), gate on a **non-empty array of
+concretely-named found defects**, registered in `WORKER_TYPES` and
+`EFFORT_DEFAULT_PER_WORKER` (`"medium"`), absent from
+`MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT` fallback —
+`MODEL_DEFAULT` is currently `"sonnet"` for every worker; see CLAUDE.md
+"Every worker — judgment and acting/workhorse alike — defaults to
+`sonnet`"), invoked read-only (`INSPECT_TOOLS`, `autonomous=False`) after
+`st.bump_workers(caps)`.
+
+`SCHEMAS["task_coverage_judge"]` — required fields: `task_covered` (boolean),
+`coverage_gaps` (array of `{kind: enum[missing_work, off_task_subtask],
+description (string), concrete_evidence (string)}` — non-empty ⇒ gate),
+`rationale` (string). Handed only the task text plus the reconciled subtask
+set (titles, intents, success criteria — not the codebase), it attacks
+whether the union of subtasks actually covers what the user asked for:
+`missing_work` names a required piece of work no subtask addresses;
+`off_task_subtask` names a subtask that does not serve the task at all.
+Distinct from `fit_judge` (per-subtask sizing) and `wiring_judge`
+(inter-subtask graph correctness) — this is the one check for
+whole-plan-vs-task coverage. Wired as `phase_task_coverage_gate` after the
+existing wiring gate, before `schedule()`; a non-empty `coverage_gaps`
+re-drives `phase_plan` via `_run_checked_loop` (bounded by
+`judgment_check_rounds`, cut short earlier by that loop's own oscillation
+guard on a repeated issue signature), `die()`ing on exhaustion. Persists to
+`state.data["task_coverage_gate"]`.
+
+`SCHEMAS["integration_judge"]` — required fields: `merge_reviewed` (boolean),
+`behavioral_defects` (array of `{kind: enum[dropped_behavior,
+signature_mismatch, call_site_mismatch, silent_precedence_loss], description
+(string), concrete_evidence (string)}` — non-empty ⇒ gate), `rationale`
+(string). Handed the merged result plus both parent diffs and the
+conflicting subtasks' intents, it attacks the merge for behavioral breakage
+the mechanical conflict-marker scan and `check_merge_committed` cannot see —
+a syntactically clean merge that keeps one side's signature but the other
+side's call sites, or silently drops one side's behavior entirely. Wired
+into the integration phase after a successful merge commit — **detect-and-
+die, single pass**: a non-empty `behavioral_defects` `die()`s immediately
+with the concrete defect named (an integrator cannot always mechanically
+re-derive a correct behavioral resolution from a semantic finding the same
+way a planner can add a subtask, so no re-drive). Persists to
+`state.data["integration_gate"]`.
+
+**`plan_overlap_judge`'s `judgment` self-score gets no new verifier — it is
+dropped, and its existing deterministic validators become its sole gate.**
+`check_overlap_judge_output`'s `_confidence_issues(output.get("confidence"),
+["judgment"])` call is removed; `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
+`DROP_BREAKS_GRAPH` (already computed in that same function), and
+`_validate_overlap_judge_output`'s `merge_feasibility`-presence check remain
+the worker's authoritative checks — see DESIGN §8 *Independent adversarial
+verification* for why this site does not get a second-opinion judge (a judge
+grading a judge is self-scoring one level removed, and there is no
+mechanically-attackable "artifact" a fresh worker could review — the
+deterministic validators already cover the concrete, checkable failure
+modes). The `confidence` object on `plan_overlap_judge`'s output schema is
+unchanged and stays emitted as an advisory record; only the gate is removed.
+
+With these two workers wired, `_confidence_issues` has zero remaining
+callers: no worker gates on its own self-reported confidence anywhere in the
+pipeline. Every gating check is either deterministic or an independent
+adversarial verifier.
+
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
 conformer 60, judge 40, heal patch_generator 40, pr_writer 20, fit_judge 30,
 splitter 30, adherence_judge 30, classification_judge 30, wiring_judge 30,
-provision_judge 30. For
+provision_judge 30 (`task_coverage_judge` and `integration_judge`, once
+landed, take 30 as well — matching every other read-only judgment
+verifier). For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its
 scope is narrower (read a diff, read a small set of rules files, update
