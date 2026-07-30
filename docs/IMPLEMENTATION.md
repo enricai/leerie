@@ -2474,7 +2474,7 @@ the retained history of why the split existed.
 | provision_judge | sonnet | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 | task_coverage_judge | sonnet | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8 *Independent adversarial verification*); registered (schema, prompt, `WORKER_TYPES`) but not yet wired into a gate — see §8 "The final two independent adversarial verifiers"; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
-| integration_judge *(planned — see §8 "The final two independent adversarial verifiers")* | sonnet | independent adversarial verifier of the integrator's merge for behavioral (not just textual) correctness (DESIGN §8); absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
+| integration_judge | sonnet | independent adversarial verifier of the integrator's merge for behavioral (not just textual) correctness (DESIGN §8); registered (schema, prompt, `WORKER_TYPES`) but not yet wired into a gate — see §8 "The final two independent adversarial verifiers"; absent from `MODEL_DEFAULT_PER_WORKER` — sonnet default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
 lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
@@ -2482,9 +2482,9 @@ explicitly (all `sonnet` — matching the global default today, but kept as
 explicit per-worker entries since they predate this change and may need to
 diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
-`artifact_registry`, `task_coverage_judge`, and (once landed)
-`integration_judge` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their
-`sonnet` defaults come from the global `MODEL_DEFAULT` fallback.
+`artifact_registry`, `task_coverage_judge`, and `integration_judge` are
+**absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet` defaults come
+from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2518,6 +2518,7 @@ Twenty worker types (plus the global override), each independently overridable:
 | wiring_judge       | `LEERIE_MODEL_WIRING_JUDGE`     | `--model-wiring_judge`       | `model_wiring_judge`      |
 | provision_judge    | `LEERIE_MODEL_PROVISION_JUDGE`  | `--model-provision_judge`    | `model_provision_judge`   |
 | task_coverage_judge | `LEERIE_MODEL_TASK_COVERAGE_JUDGE` | `--model-task_coverage_judge` | `model_task_coverage_judge` |
+| integration_judge  | `LEERIE_MODEL_INTEGRATION_JUDGE` | `--model-integration_judge` | `model_integration_judge` |
 | artifact_registry  | `LEERIE_MODEL_ARTIFACT_REGISTRY` | `--model-artifact_registry` | `model_artifact_registry` |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
@@ -2609,7 +2610,7 @@ chain below when a specific worker needs deeper reasoning.
 | provision_judge | medium | independent recipe verification against the image/runtime (DESIGN §6½, §8); same `medium` judgment-worker profile |
 | artifact_registry | medium | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*); same `medium` judgment-worker profile |
 | task_coverage_judge | medium | independent adversarial verification of plan-vs-task coverage (DESIGN §8); registered but not yet wired into a gate; same `medium` judgment-worker profile as the other independent adversarial verifiers |
-| integration_judge *(planned)* | medium | independent adversarial verification of the integrator's merge for behavioral correctness (DESIGN §8); same `medium` judgment-worker profile |
+| integration_judge | medium | independent adversarial verification of the integrator's merge for behavioral correctness (DESIGN §8); registered but not yet wired into a gate; same `medium` judgment-worker profile |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the sixteen
@@ -2617,20 +2618,13 @@ judgment / finalize workers in the table above: the six core judgment workers
 (classifier, planner, reconciler, plan_overlap_judge, provision, integrator),
 the finalize-time `pr_writer` and `dep_capture` workers, the P1 decomposition
 workers `fit_judge` and `splitter`, the plan-instruction-adherence worker
-`adherence_judge`, the four independent adversarial verifiers
-`classification_judge`, `wiring_judge`, `provision_judge`, and
-`task_coverage_judge`, and the pre-planning shared-vocabulary worker
-`artifact_registry`. It separately
+`adherence_judge`, the five independent adversarial verifiers
+`classification_judge`, `wiring_judge`, `provision_judge`,
+`task_coverage_judge`, and `integration_judge`, and the pre-planning
+shared-vocabulary worker `artifact_registry`. It separately
 overrides `implementer` and `conformer` to `"low"` — a distinct,
 cost-motivated pin rather than a judgment-reproducibility one, so it is
 called out separately from the `"medium"` judgment cohort above.
-Once `integration_judge` lands (see §8 "The final
-two independent adversarial verifiers"), each gets its own
-`EFFORT_DEFAULT_PER_WORKER` entry at `"medium"`, matching every other
-independent adversarial verifier, plus the same `--effort-<W>` /
-`LEERIE_EFFORT_<W>` / `effort_<w>` override triple and `--model-<W>` /
-`LEERIE_MODEL_<W>` / `model_<w>` triple every other `WORKER_TYPES` entry in
-the tables above gets.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2663,6 +2657,7 @@ model selection:
 | wiring_judge       | `LEERIE_EFFORT_WIRING_JUDGE`     | `--effort-wiring_judge`       | `effort_wiring_judge`      |
 | provision_judge    | `LEERIE_EFFORT_PROVISION_JUDGE`  | `--effort-provision_judge`    | `effort_provision_judge`   |
 | task_coverage_judge | `LEERIE_EFFORT_TASK_COVERAGE_JUDGE` | `--effort-task_coverage_judge` | `effort_task_coverage_judge` |
+| integration_judge  | `LEERIE_EFFORT_INTEGRATION_JUDGE` | `--effort-integration_judge` | `effort_integration_judge` |
 | artifact_registry  | `LEERIE_EFFORT_ARTIFACT_REGISTRY` | `--effort-artifact_registry` | `effort_artifact_registry` |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -4794,7 +4789,9 @@ concretely-named found defects**, registered in `WORKER_TYPES` and
 `MODEL_DEFAULT` is currently `"sonnet"` for every worker; see CLAUDE.md
 "Every worker — judgment and acting/workhorse alike — defaults to
 `sonnet`"), invoked read-only (`INSPECT_TOOLS`, `autonomous=False`) after
-`st.bump_workers(caps)`.
+`st.bump_workers(caps)`. `task_coverage_judge` and `integration_judge` are
+both registered (schema, prompt, `WORKER_TYPES`) but neither is wired into a
+gate yet.
 
 `SCHEMAS["task_coverage_judge"]` — required fields: `task_covered` (boolean),
 `coverage_gaps` (array of `{kind: enum[missing_work, off_task_subtask],
@@ -4813,20 +4810,22 @@ a non-empty `coverage_gaps` re-drives `phase_plan` via `_run_checked_loop`
 oscillation guard on a repeated issue signature), `die()`ing on exhaustion.
 Persists to `state.data["coverage_gate"]`.
 
-`SCHEMAS["integration_judge"]` — required fields: `merge_reviewed` (boolean),
-`behavioral_defects` (array of `{kind: enum[dropped_behavior,
-signature_mismatch, call_site_mismatch, silent_precedence_loss], description
-(string), concrete_evidence (string)}` — non-empty ⇒ gate), `rationale`
-(string). Handed the merged result plus both parent diffs and the
-conflicting subtasks' intents, it attacks the merge for behavioral breakage
-the mechanical conflict-marker scan and `check_merge_committed` cannot see —
-a syntactically clean merge that keeps one side's signature but the other
-side's call sites, or silently drops one side's behavior entirely. Wired
-into the integration phase after a successful merge commit — **detect-and-
-die, single pass**: a non-empty `behavioral_defects` `die()`s immediately
+`SCHEMAS["integration_judge"]` — required fields: `merge_reviewed`
+(boolean), `defects` (array of `{kind: enum[dropped_change,
+reintroduced_conflict, call_site_mismatch, semantic_regression,
+incomplete_resolution], concrete_scenario (string), location (string),
+why_broken (string)}` — non-empty ⇒ gate), `rationale` (string). Given the
+merged result plus both parent diffs and the conflicting subtasks' intents,
+it attacks the merge for behavioral breakage the mechanical conflict-marker
+scan and `check_merge_committed` cannot see — a syntactically clean merge
+that keeps one side's signature but the other side's call sites, or
+silently drops one side's behavior entirely. Registered (schema, prompt,
+`WORKER_TYPES`) but not yet wired into a gate — once wired, the plan is
+**detect-and-die, single pass** into the integration phase after a
+successful merge commit: a non-empty `defects` array `die()`s immediately
 with the concrete defect named (an integrator cannot always mechanically
 re-derive a correct behavioral resolution from a semantic finding the same
-way a planner can add a subtask, so no re-drive). Persists to
+way a planner can add a subtask, so no re-drive). Will persist to
 `state.data["integration_gate"]`.
 
 **`plan_overlap_judge`'s `judgment` self-score gets no new verifier — it is
@@ -4852,9 +4851,8 @@ adversarial verifier.
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
 conformer 60, judge 40, heal patch_generator 40, pr_writer 20, fit_judge 30,
 splitter 30, adherence_judge 30, classification_judge 30, wiring_judge 30,
-provision_judge 30 (`task_coverage_judge` and `integration_judge`, once
-landed, take 30 as well — matching every other read-only judgment
-verifier). For
+provision_judge 30, task_coverage_judge 30, integration_judge 30 —
+matching every other read-only judgment verifier. For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its
 scope is narrower (read a diff, read a small set of rules files, update
@@ -7311,7 +7309,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the seventeen `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the eighteen `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
