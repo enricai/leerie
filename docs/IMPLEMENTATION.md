@@ -420,6 +420,53 @@ relevant bash surface:
 
 **`nerdctl run` image arg**: `"${REPO_IMAGE_TAG:-$IMAGE_TAG}"` — falls back to the base image transparently when no repo Dockerfile is present.
 
+### Persistent out-of-repo dependency bake
+
+Dependencies are installed once at image-build time into persistent paths
+outside `/work`. The concrete bake targets and environment variables per
+ecosystem:
+
+| Ecosystem | Bake target | Env var(s) | Notes |
+|---|---|---|---|
+| Python | `/opt/venv` | `VIRTUAL_ENV=/opt/venv`, `PATH` includes `/opt/venv/bin` | Virtual environment activated in the image; workers inherit it |
+| Ruby | `/opt/bundle` | `BUNDLE_PATH=/opt/bundle`, `BUNDLE_APP_CONFIG=/opt/bundle` | Gems installed here; Bundler finds them without per-worktree install |
+| Rust | Baked build artifacts + warmed cache | `CARGO_TARGET_DIR`, `CARGO_HOME` (warmed registry) | `cargo build` reuses compiled deps, no network |
+| Go | Baked cache + warmed modules | `GOCACHE`, `GOMODCACHE` (warmed) | `go build` network-free, reuses module cache |
+| Node/pnpm | Warmed content-addressable store | pnpm store path, `frozenStore` set | Residual per-run: `pnpm install --offline --frozen-lockfile` relinks only |
+
+**`PROVISION_RECIPE` contract (updated):** For baked ecosystems
+(Python/Ruby/Rust/Go), the recipe injected into implementer/conformer prompts
+is **informational only** — it shows what was baked but does not instruct a
+per-run install, since the bake already satisfied the dependencies. For
+Node/pnpm repos, the recipe carries the residual offline-relink command (`pnpm
+install --offline --frozen-lockfile`), which workers run when their subtask
+needs built dependencies (e.g., running tests or linting). A config-only or
+docs-only subtask skips the residual step.
+
+**`capture_repo_deps` contract (updated):** The `dep_capture` worker always
+runs at finalize time — it is **not skipped** when a committed
+`.leerie/Dockerfile` exists. The worker writes only **residual** dependencies
+to `.leerie/config.toml` (`setup_packages` for apt packages workers had to
+install, `language_installs` entries for commands that cannot be baked). For
+fully-baked ecosystems (Python/Ruby/Rust/Go), the captured output is typically
+empty or minimal. For Node/pnpm, it may carry the offline-relink note. The
+worker still writes the `dep_capture.done` sentinel to
+`<run_dir>/dep_capture.done` and sets `dep_capture_done = True` in
+`state.json` after a successful write.
+
+**Dockerfile-emitter gating (spec-level fix):** The auto-generated
+`.leerie/Dockerfile` bake must fire when `setup_packages` is empty but a
+lockfile or `language_installs` entry is present. The existing gating
+(generation body conditioned on `setup_packages` non-empty) is a spec/code
+mismatch: a repo with only language dependencies and no apt packages would
+skip the bake entirely, forcing per-run installs. The corrected spec: generate
+the Dockerfile when **any** of the following are present: (1)
+`setup_packages` non-empty, (2) a dependency lockfile exists (`package-lock.json`,
+`pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `Gemfile.lock`,
+`Cargo.lock`, `go.sum`, etc.), or (3) `language_installs` is non-empty. This
+aligns the emitter with the design intent (DESIGN §6½ *Persistent out-of-repo
+dependency bake*).
+
 ### Registry publish path (fly.io / remote Machines)
 
 Fly.io Machines pull an image from a registry rather than using a
