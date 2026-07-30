@@ -21491,7 +21491,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 "sid": sid,
                 "incoming_intent": incoming_subtask.get("intent", ""),
                 "incoming_criteria": incoming_subtask.get("criteria_results", []),
-                "integrated_so_far": integrated_so_far[:-1] if integrated_so_far else [],
+                "integrated_so_far": list(integrated_so_far),
                 "merge_commit_sha": merge_head_sha,
                 "merge_diff": merge_diff,
             }
