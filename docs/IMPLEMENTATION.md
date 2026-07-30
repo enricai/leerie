@@ -416,14 +416,15 @@ relevant bash surface:
 
 **Rebuild triggers** (checked in order): (1) `nerdctl image inspect "$REPO_IMAGE_TAG"` fails, OR (2) `<LEERIE_VERSION>:<sha256>` of the current Dockerfile differs from the stored hash. Second run with unchanged Dockerfile hits the skip path ("per-repo image up-to-date; skipping build"). Before the build fires, `ensure_base_in_buildkit_ns` copies the base into the `buildkit` namespace (idempotent) so the derived `FROM $BASE_IMAGE` resolves against the local image store rather than the registry.
 
-**Auto-generation from `setup_packages`**: when `.leerie/config.toml` declares `setup_packages` and no `.leerie/Dockerfile` exists, the launcher generates an apt-install Dockerfile at `.leerie/Dockerfile` (atomic write via temp file + `mv`) before the build-decision block. A committed Dockerfile always takes precedence — `setup_packages` is ignored when both exist.
+**Auto-generation triggers**: when no `.leerie/Dockerfile` exists, the launcher generates one at `.leerie/Dockerfile` (atomic write via temp file + `mv`) before the build-decision block if **any** of the following are present: (1) `.leerie/config.toml` declares `setup_packages`, (2) a dependency lockfile exists (`package-lock.json`, `pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `Gemfile.lock`, `Cargo.lock`, `go.sum`, etc.), or (3) `.leerie/config.toml` declares `language_installs`. A committed Dockerfile always takes precedence — the auto-generation logic is bypassed entirely when one exists.
 
 **`nerdctl run` image arg**: `"${REPO_IMAGE_TAG:-$IMAGE_TAG}"` — falls back to the base image transparently when no repo Dockerfile is present.
 
 ### Persistent out-of-repo dependency bake
 
 Dependencies are installed once at image-build time into persistent paths
-outside `/work`. The concrete bake targets and environment variables per
+outside `/work`. The concrete bake targets and environment variables the
+Dockerfile emitter and `PROVISION_RECIPE` generator must produce, per
 ecosystem:
 
 | Ecosystem | Bake target | Env var(s) | Notes |
@@ -436,15 +437,15 @@ ecosystem:
 
 **`PROVISION_RECIPE` contract (updated):** For baked ecosystems
 (Python/Ruby/Rust/Go), the recipe injected into implementer/conformer prompts
-is **informational only** — it shows what was baked but does not instruct a
+is **informational only** — it shows what was baked but does **not** instruct a
 per-run install, since the bake already satisfied the dependencies. For
 Node/pnpm repos, the recipe carries the residual offline-relink command (`pnpm
 install --offline --frozen-lockfile`), which workers run when their subtask
 needs built dependencies (e.g., running tests or linting). A config-only or
 docs-only subtask skips the residual step.
 
-**`capture_repo_deps` contract (updated):** The `dep_capture` worker always
-runs at finalize time — it is **not skipped** when a committed
+**`capture_repo_deps` contract (updated):** The `dep_capture` worker **always
+runs** at finalize time — it is **not skipped** when a committed
 `.leerie/Dockerfile` exists. The worker writes only **residual** dependencies
 to `.leerie/config.toml` (`setup_packages` for apt packages workers had to
 install, `language_installs` entries for commands that cannot be baked). For
