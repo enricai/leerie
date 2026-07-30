@@ -100,6 +100,33 @@ class TestDemotedSelfScoresDoNotGate:
         issues = leerie.check_overlap_judge_output(output, plans, tmp_path)
         assert any("NO_FILE_OVERLAP" in i for i in issues)
 
+    def test_planner_low_self_score_does_not_gate(self, leerie, tmp_path):
+        """The planner's `task_understanding` self-score is NO LONGER a
+        gating axis — the independent task_coverage_judge is authoritative. A
+        low self-score must NOT produce LOW_CONFIDENCE."""
+        plan = {"subtasks": [], "status": "ready", "domain": "testing",
+                "confidence": {"task_understanding": 2.0,
+                               "decomposition_quality": 9.5,
+                               "basis": "",
+                               "falsifiers_tested": [],
+                               "contradictions_reconciled": [],
+                               "gap_to_close": {}}}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_integrator_low_self_score_does_not_gate(self, leerie):
+        """The integrator's `resolution` self-score is NO LONGER a gating
+        axis — the independent integration_judge is authoritative. A low
+        self-score must NOT produce LOW_CONFIDENCE."""
+        result = {"confidence": {"resolution": 7.5,
+                                 "basis": "",
+                                 "falsifiers_tested": [],
+                                 "contradictions_reconciled": [],
+                                 "gap_to_close": {}}}
+        issues = leerie.check_integrator_output(result)
+        assert not any("resolution" in i.lower() for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
+
     def test_provision_low_self_score_does_not_gate(self, leerie, tmp_path):
         result = {"recipe": [{"kind": "install", "command": ["true"],
                               "working_dir": "."}],

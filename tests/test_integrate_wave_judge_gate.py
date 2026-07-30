@@ -126,8 +126,7 @@ class TestWiring:
         assert len(lines) == 0, f"Remaining _confidence_issues calls: {lines}"
 
 
-@pytest.mark.asyncio
-async def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
+def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
     """A clean judge result (empty defects) lets integration proceed."""
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
@@ -201,16 +200,18 @@ async def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
 
-    out = await leerie.integrate_wave(
-        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
 
     assert integrator_called, "integrator should have been invoked"
     assert judge_called, "integration_judge should have been invoked"
     assert "feat-001" in out, "clean integration should succeed"
 
 
-@pytest.mark.asyncio
-async def test_concrete_defect_dies(leerie, tmp_path, monkeypatch):
+def test_concrete_defect_dies(leerie, tmp_path, monkeypatch):
     """A non-empty concrete defect result die()s with the defect named."""
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
@@ -280,13 +281,15 @@ async def test_concrete_defect_dies(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
 
-    with pytest.raises(SystemExit):
+    async def _run():
         await leerie.integrate_wave(
             ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
 
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
 
-@pytest.mark.asyncio
-async def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
+
+def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
     """A WorkerError on every round degrades: merge preserved, no die()."""
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
@@ -354,16 +357,18 @@ async def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypat
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
 
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
     # Should degrade, not die
-    out = await leerie.integrate_wave(
-        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+    out = asyncio.run(_run())
 
     assert judge_call_count == _caps(leerie)["judgment_check_rounds"]
     assert "feat-001" in out, "should preserve merge on WorkerError degradation"
 
 
-@pytest.mark.asyncio
-async def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
+def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
     """Anti-gaming: a defect without concrete_scenario or location does not
     gate."""
     st = _state(leerie, tmp_path)
@@ -434,7 +439,10 @@ async def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
 
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
     # Should pass — vague defects don't gate
-    out = await leerie.integrate_wave(
-        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+    out = asyncio.run(_run())
     assert "feat-001" in out
