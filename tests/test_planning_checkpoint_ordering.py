@@ -31,6 +31,7 @@ CHECKPOINT_KEYS_IN_ORDER = (
     "plans_after_reconcile",
     "plans_after_overlap_judge",
     "plans_after_adherence_gate",
+    "plans_after_coverage_gate",
     "plans_after_filters",
 )
 
@@ -44,6 +45,7 @@ PHASE_CALL_FOR_KEY = {
     ),
     "plans_after_overlap_judge": "await phase_overlap_judge(",
     "plans_after_adherence_gate": "await phase_adherence_gate(",
+    "plans_after_coverage_gate": "await phase_planning_coverage_gate(",
 }
 
 
@@ -101,6 +103,15 @@ class TestCheckpointFollowsItsPhaseCall:
         assert call != -1, "_run_phases must call phase_adherence_gate"
         assert key != -1, (
             'missing st.data["plans_after_adherence_gate"] assignment')
+        assert call < key
+
+    def test_coverage_gate_checkpoint_follows_coverage_gate_call(self, leerie):
+        src = _phases_src(leerie)
+        call = src.find(PHASE_CALL_FOR_KEY["plans_after_coverage_gate"])
+        key = src.find('st.data["plans_after_coverage_gate"]')
+        assert call != -1, "_run_phases must call phase_planning_coverage_gate"
+        assert key != -1, (
+            'missing st.data["plans_after_coverage_gate"] assignment')
         assert call < key
 
     def test_filters_checkpoint_follows_both_filter_calls(self, leerie):

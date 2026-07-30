@@ -34,6 +34,7 @@ CHECKPOINT_KEYS = (
     "plans_after_reconcile",
     "plans_after_overlap_judge",
     "plans_after_adherence_gate",
+    "plans_after_coverage_gate",
     "plans_after_filters",
     "satisfied_probe_cache",
 )

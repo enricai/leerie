@@ -4803,12 +4803,12 @@ whether the union of subtasks actually covers what the user asked for:
 `off_task_subtask` names a subtask that does not serve the task at all.
 Distinct from `fit_judge` (per-subtask sizing) and `wiring_judge`
 (inter-subtask graph correctness) — this is the one check for
-whole-plan-vs-task coverage. Wired as `phase_task_coverage_gate` after the
-existing wiring gate, before `schedule()`; a non-empty `coverage_gaps`
-re-drives `phase_plan` via `_run_checked_loop` (bounded by
-`judgment_check_rounds`, cut short earlier by that loop's own oscillation
-guard on a repeated issue signature), `die()`ing on exhaustion. Persists to
-`state.data["task_coverage_gate"]`.
+whole-plan-vs-task coverage. Wired as `phase_planning_coverage_gate` after
+`phase_adherence_gate` and before the phase-3 soft-drop filters/`schedule()`;
+a non-empty `coverage_gaps` re-drives `phase_plan` via `_run_checked_loop`
+(bounded by `judgment_check_rounds`, cut short earlier by that loop's own
+oscillation guard on a repeated issue signature), `die()`ing on exhaustion.
+Persists to `state.data["coverage_gate"]`.
 
 `SCHEMAS["integration_judge"]` — required fields: `merge_reviewed` (boolean),
 `behavioral_defects` (array of `{kind: enum[dropped_behavior,

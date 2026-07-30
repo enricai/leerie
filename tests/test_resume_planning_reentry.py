@@ -165,6 +165,13 @@ def _stub_common(leerie, monkeypatch, calls: dict):
         return plans
     monkeypatch.setattr(leerie, "phase_adherence_gate", _adherence_gate)
 
+    async def _coverage_gate(plans, task, st, caps, models, efforts):
+        calls["phase_planning_coverage_gate"] = calls.get(
+            "phase_planning_coverage_gate", 0) + 1
+        return plans
+    monkeypatch.setattr(
+        leerie, "phase_planning_coverage_gate", _coverage_gate)
+
     monkeypatch.setattr(
         leerie, "warn_cross_planner_file_overlap", lambda plans: None)
     monkeypatch.setattr(leerie, "warn_layer_gaps", lambda plans: None)
@@ -251,6 +258,7 @@ class TestPerPhaseRoundTrip:
         assert calls.get("phase_reconcile") == 1
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
+        assert calls.get("phase_planning_coverage_gate") == 1
         assert calls.get("filter_satisfied_subtasks") == 1
         assert calls.get("check_budget_feasibility") == 1
         assert calls.get("write_plan") == 1
@@ -273,6 +281,7 @@ class TestPerPhaseRoundTrip:
         assert calls.get("phase_reconcile") == 1
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
+        assert calls.get("phase_planning_coverage_gate") == 1
         assert calls.get("write_plan") == 1
 
     def test_resume_after_reconcile_skips_reconcile_reruns_overlap_onward(
@@ -291,6 +300,7 @@ class TestPerPhaseRoundTrip:
             "phase_reconcile already checkpointed — must not re-invoke it")
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
+        assert calls.get("phase_planning_coverage_gate") == 1
         assert calls.get("write_plan") == 1
 
     def test_resume_after_overlap_judge_skips_it_reruns_adherence_onward(
@@ -308,9 +318,10 @@ class TestPerPhaseRoundTrip:
         assert "phase_overlap_judge" not in calls, (
             "phase_overlap_judge already checkpointed — must not re-invoke it")
         assert calls.get("phase_adherence_gate") == 1
+        assert calls.get("phase_planning_coverage_gate") == 1
         assert calls.get("write_plan") == 1
 
-    def test_resume_after_adherence_gate_skips_it_reruns_filters_onward(
+    def test_resume_after_adherence_gate_skips_it_reruns_coverage_gate_onward(
         self, leerie, monkeypatch, run_dirs
     ):
         persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
@@ -325,6 +336,28 @@ class TestPerPhaseRoundTrip:
         assert "phase_overlap_judge" not in calls
         assert "phase_adherence_gate" not in calls, (
             "phase_adherence_gate already checkpointed — must not "
+            "re-invoke it")
+        assert calls.get("phase_planning_coverage_gate") == 1
+        assert calls.get("filter_offtree_subtasks") == 1
+        assert calls.get("filter_satisfied_subtasks") == 1
+        assert calls.get("write_plan") == 1
+
+    def test_resume_after_coverage_gate_skips_it_reruns_filters_onward(
+        self, leerie, monkeypatch, run_dirs
+    ):
+        persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
+        calls, st = self._run(leerie, monkeypatch, run_dirs, {
+            "categories": ["bug-fixing"],
+            "plans_after_classify": [],
+            "plans_after_plan": persisted_plans,
+            "plans_after_reconcile": persisted_plans,
+            "plans_after_overlap_judge": persisted_plans,
+            "plans_after_adherence_gate": persisted_plans,
+            "plans_after_coverage_gate": persisted_plans,
+        })
+        assert "phase_adherence_gate" not in calls
+        assert "phase_planning_coverage_gate" not in calls, (
+            "phase_planning_coverage_gate already checkpointed — must not "
             "re-invoke it")
         assert calls.get("filter_offtree_subtasks") == 1
         assert calls.get("filter_satisfied_subtasks") == 1
@@ -341,11 +374,13 @@ class TestPerPhaseRoundTrip:
             "plans_after_reconcile": persisted_plans,
             "plans_after_overlap_judge": persisted_plans,
             "plans_after_adherence_gate": persisted_plans,
+            "plans_after_coverage_gate": persisted_plans,
             "plans_after_filters": persisted_plans,
         })
         for phase in (
             "phase_classify", "phase_plan", "phase_reconcile",
             "phase_overlap_judge", "phase_adherence_gate",
+            "phase_planning_coverage_gate",
             "filter_offtree_subtasks", "filter_satisfied_subtasks",
         ):
             assert phase not in calls, (
@@ -408,6 +443,7 @@ def test_reported_failure_resumes_past_satisfied_probe_sweep(
         "plans_after_reconcile": persisted_plans,
         "plans_after_overlap_judge": persisted_plans,
         "plans_after_adherence_gate": persisted_plans,
+        "plans_after_coverage_gate": persisted_plans,
         "satisfied_probe_cache": {
             "bugfix-001": {
                 "satisfied": False, "evidence": "", "checked": [],
@@ -445,6 +481,7 @@ def test_post_scheduling_resume_falls_through_to_execute_unchanged(
         "plans_after_reconcile": [],
         "plans_after_overlap_judge": [],
         "plans_after_adherence_gate": [],
+        "plans_after_coverage_gate": [],
         "plans_after_filters": [],
         "plan_snapshot": {"subtasks": {}, "waves": [["bugfix-001"]]},
     })
@@ -454,6 +491,7 @@ def test_post_scheduling_resume_falls_through_to_execute_unchanged(
     for phase in (
         "phase_classify", "phase_plan", "phase_reconcile",
         "phase_overlap_judge", "phase_adherence_gate",
+        "phase_planning_coverage_gate",
         "filter_offtree_subtasks", "filter_satisfied_subtasks",
         "check_budget_feasibility", "write_plan",
     ):
@@ -485,6 +523,7 @@ def test_budget_check_resume_rehydrates_plan_snapshot(
         "plans_after_reconcile": persisted_plans,
         "plans_after_overlap_judge": persisted_plans,
         "plans_after_adherence_gate": persisted_plans,
+        "plans_after_coverage_gate": persisted_plans,
         "plans_after_filters": persisted_plans,
         "plan_snapshot": {
             "subtasks": snapshot_subtasks, "waves": snapshot_waves},
@@ -495,6 +534,7 @@ def test_budget_check_resume_rehydrates_plan_snapshot(
     for phase in (
         "phase_classify", "phase_plan", "phase_reconcile",
         "phase_overlap_judge", "phase_adherence_gate",
+        "phase_planning_coverage_gate",
         "filter_offtree_subtasks", "filter_satisfied_subtasks",
     ):
         assert phase not in calls, (
@@ -540,6 +580,7 @@ def test_fresh_run_and_checkpointed_resume_produce_identical_waves(
         "plans_after_reconcile": plans,
         "plans_after_overlap_judge": plans,
         "plans_after_adherence_gate": plans,
+        "plans_after_coverage_gate": plans,
         "plans_after_filters": json.loads(json.dumps(plans)),
     })
     caps = _caps(leerie)
@@ -567,6 +608,7 @@ def test_all_consumed_checkpoint_keys_are_in_state_fields(leerie):
         "plans_after_reconcile",
         "plans_after_overlap_judge",
         "plans_after_adherence_gate",
+        "plans_after_coverage_gate",
         "plans_after_filters",
         "plan_snapshot",
         "satisfied_probe_cache",
