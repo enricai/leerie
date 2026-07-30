@@ -3775,34 +3775,119 @@ classification and planning, layered top-to-bottom by determinism:
    it are restricted by an argv-allowlist, and any deviation
    from the schema rejects the worker. This is a *deliberate*
    exception to §12 — see below.
-5. **Worker-driven install.** Each fresh worktree is dependency-
-   less by design. The orchestrator does *not* pre-install
-   anything — neither at `repo_root` (which is bind-mounted from
-   the host and writing to it would clobber the host's checkout
-   with linux-built artifacts when the host is darwin) nor in
-   each worktree (which would be redundant work the worker often
-   doesn't need). Instead, the detected recipe is **persisted to
-   state and injected into the implementer and conformer prompts
-   as a `PROVISION_RECIPE:` advisory block**. Each worker reads
-   the recipe and decides whether its subtask actually needs the
-   install (a config-only or docs-only subtask doesn't; a "run
-   the tests" subtask does), then runs the command itself from
-   its own worktree via its Bash tool. The package-manager
-   caches (pnpm store, pip wheel cache, go module cache, cargo
-   registry, Bundler gem cache) are shared across worktrees and
-   across runs, so re-running the install command in worktree N
-   is fast.
+5. **Persistent out-of-repo dependency bake.** Dependencies are
+   installed once at image-build time into persistent paths
+   outside `/work`, so a fresh worktree inherits the bake with
+   zero (or minimal, for Node) install cost. The bake targets:
 
-   This shape has three benefits over an orchestrator-driven
-   install: (a) the host's checked-out source tree and tracked
-   dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are
-   never written to by leerie's install path — `.leerie-setup.sh`
-   (user-opt-in) is the only path leerie ever modifies under the host
-   repo (run state lives outside the repo at `<state-root>`); (b) no work
-   is wasted on worktrees whose subtasks don't need built deps;
-   (c) the same `claude -p` event-streaming the workers use for
-   everything else makes install progress visible to the user,
-   without any special orchestrator plumbing.
+   - **Python:** `/opt/venv` — a virtual environment created via
+     `pip` or `uv` from the repo's `requirements.txt`,
+     `pyproject.toml`, or `Pipfile.lock`. Workers activate it via
+     `ENV VIRTUAL_ENV=/opt/venv` and `PATH`.
+   - **Ruby:** `/opt/bundle` — Bundler installs gems here via
+     `BUNDLE_PATH=/opt/bundle`. Workers inherit the env var and
+     find gems without a per-worktree `bundle install`.
+   - **Rust:** A pre-populated `CARGO_TARGET_DIR` (for build
+     artifacts) plus a warmed `CARGO_HOME` (for the registry
+     cache). A `cargo build` in a worktree hits no network and
+     reuses compiled dependencies from the bake.
+   - **Go:** A pre-populated `GOCACHE` (for build cache) plus a
+     warmed `GOMODCACHE` (for fetched modules). A `go build` in a
+     worktree is network-free and reuses the module cache.
+   - **Node/pnpm:** A warmed pnpm content-addressable store with
+     `frozenStore` set. Node dependencies (`node_modules`) cannot
+     be fully baked — they must live inside the repo tree for
+     resolution to work — so the residual per-run step is a fast,
+     network-free, extract-free `pnpm install --offline
+     --frozen-lockfile` that relinks the baked store into the
+     worktree. This is not zero-cost but eliminates download and
+     extraction, leaving only symlink creation.
+
+   **Immutability invariant:** The baked layer is shared and
+   read-only across up to `max_parallel` (default 5) concurrent
+   worktrees. A worktree that changes a dependency (edits
+   `package.json`, `requirements.txt`, `Gemfile`, `Cargo.toml`,
+   etc.) must materialize its own private, mutated layer rather
+   than writing to the shared bake — this prevents both staleness
+   (a worktree silently resolving deps it changed) and
+   cross-worktree corruption. Node, Rust, and Go are naturally
+   safe to bake: their package managers use content-addressed
+   stores or input-hash-keyed caches, so concurrent access is
+   read-only by design.
+
+   **Python requires a clone-then-delta approach.** A
+   `.pth`-file overlay or a `--system-site-packages` venv does not
+   correctly handle dependency *removal* (uninstalling a package
+   from the overlay leaves it visible in the base) or a fresh
+   venv's isolation from another venv's packages (site-packages
+   leaks across environments). The only correct mechanism is `cp
+   -r /opt/venv` into a private, relocated copy, then `pip install
+   -e .` or `pip uninstall` the diff. This materializes a full
+   private environment only when a worktree's subtask actually
+   mutates dependencies — the common case (no mutation) consumes
+   the shared `/opt/venv` directly with zero clone cost.
+
+   **Cache invalidation is preserved.** The existing
+   rebuild-decision mechanism — SHA-256 of every
+   dependency-input file (lockfiles, manifests, workspace
+   `package.json`s, `patches/`, `.npmrc`) folded into the
+   generated Dockerfile, driving a `.dockerfile-hash` rebuild
+   check — continues to work. The lockfiles and manifests are
+   still `COPY`'d into the Dockerfile's build context for
+   hashing; only the install *target* changes from `/work` to
+   `/opt/*`. A dependency-input change triggers a full image
+   rebuild. A change to an unrelated source file does not
+   invalidate the layer. The cost — minutes per rebuild — is paid
+   once across all subsequent runs.
+
+   **config.toml's role narrows to residual-only.** The file no
+   longer represents "what gets installed per run" broadly — it
+   holds only the irreducible residual that cannot be baked. For
+   Python, Ruby, Rust, and Go repos, this is typically empty
+   (everything bakes). For Node/pnpm repos, it holds only the
+   residual offline-relink note. The `dep_capture` worker (see
+   *Auto-capture* below) always runs at finalize time — it is not
+   skipped when a committed `.leerie/Dockerfile` exists — and
+   writes only residual dependencies that workers actually
+   executed but could not be baked. This makes `config.toml` a
+   stable artifact: it grows only when new residual deps appear,
+   never churns on every baked-dep change.
+
+   **Permissions under rootless containerd.** The baked `/opt/*`
+   directories must be **root-owned and world-readable** (`drwxr-xr-x
+   root:root`), not chowned to the `leerie` user. This is the
+   inverse of normal Docker intuition and is load-bearing under
+   rootless containerd. Rootless drops privilege via `unshare
+   --user --map-user=$(id -u leerie)`, a single-entry UID map
+   (outer UID 0 → inner `leerie`) that leaves outer `leerie`
+   *unmapped*. An image-layer directory explicitly chowned to
+   `leerie`'s non-zero UID appears as `nobody/65534` to the
+   privilege-dropped process — traversable via mode-755 "other"
+   bits but not writable. A root-owned directory, by contrast, is
+   writable because outer root maps to inner `leerie`. Rootful
+   (Colima/macOS, Fly/EC2) needs the opposite: `runuser -u
+   leerie` is a real UID switch with no remap, so
+   `container-entry.sh`'s rootful guard applies literal `leerie`
+   ownership at runtime for `/home/leerie` (user dirs), but
+   `/opt/*` (shared cross-worktree state) stays root-owned in the
+   image. See `CLAUDE.md` "Evaluate every ownership/permission
+   change" and `tests/test_tmp_cache_writable.py` /
+   `test_home_leerie_ownership.py` for the pinned form.
+
+   The detected recipe is still **persisted to state and injected
+   into the implementer and conformer prompts as a
+   `PROVISION_RECIPE:` advisory block**, but its role has
+   narrowed: for baked ecosystems (Python/Ruby/Rust/Go), the
+   recipe is informational (shows what was baked); for Node, it
+   carries the residual offline-relink command. Each worker reads
+   the recipe and decides whether its subtask needs the residual
+   step (a config-only or docs-only subtask doesn't; a "run the
+   tests" subtask does). The host's checked-out source tree and
+   tracked dep artifacts (`node_modules/`, `.venv/`, `target/`,
+   etc.) are never written to by leerie's install path —
+   `.leerie-setup.sh` (user-opt-in) is the only path leerie ever
+   modifies under the host repo (run state lives outside the repo
+   at `<state-root>`).
 
 ### The §12 carve-out
 
