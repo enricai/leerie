@@ -6684,9 +6684,14 @@ def check_provision_output(
 
 
 def check_integrator_output(result: dict) -> list[str]:
-    """Confidence gate for the integrator."""
-    return _confidence_issues(
-        result.get("confidence") or {}, ["resolution"])
+    """Mechanical checks for the integrator.
+
+    The resolution self-score gate was removed — integration_judge is the
+    authoritative behavioral-integration gate (DESIGN §8). The confidence
+    object is still emitted (§8 falsifier/gap discipline record)."""
+    # No checks — integration_judge is the gate. This function remains as
+    # the check callback slot for _run_checked_loop in integrate_wave.
+    return []
 
 
 def check_implementer_output(
@@ -21455,6 +21460,119 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 log(f"  ⚠  integrator commit warning for {sid}: {commit_err}")
                 st.data.setdefault("integrator_warnings", {})[sid] = commit_err
                 st.save()
+
+            # Independent behavioral verification of the merged result (DESIGN
+            # §8 *Independent adversarial verification*). The mechanical checks
+            # (conflict markers, merge committed) passed; this gate attacks for
+            # behavioral breakage they cannot see — e.g. a merge that silently
+            # drops one side's change, or keeps side A's signature but side B's
+            # call sites. Detect-and-die, single pass: an integrator cannot
+            # mechanically fix a semantic finding from an independent judge
+            # without a fresh conflict-resolution attempt, so re-driving would
+            # reproduce the same merge.
+            sys_prompt_judge = load_prompt("integration_judge")
+            repo_root = Path(os.getcwd())
+
+            # Build context: the merged diff, both parent subtask intents, and
+            # the list of already-integrated subtasks that were potential
+            # conflict sources.
+            merge_head_sha = (await run_proc(
+                ["git", "rev-parse", "HEAD"], cwd=str(staging)
+            )).stdout.strip()
+            merge_diff = (await run_proc(
+                ["git", "show", "--format=%B", merge_head_sha],
+                cwd=str(staging)
+            )).stdout
+
+            # Get the incoming subtask's details
+            incoming_subtask = results.get(sid, {})
+
+            payload_judge = {
+                "sid": sid,
+                "incoming_intent": incoming_subtask.get("intent", ""),
+                "incoming_criteria": incoming_subtask.get("criteria_results", []),
+                "integrated_so_far": integrated_so_far[:-1] if integrated_so_far else [],
+                "merge_commit_sha": merge_head_sha,
+                "merge_diff": merge_diff,
+            }
+
+            async def _invoke_integration_judge() -> dict:
+                st.bump_workers(caps)
+                user_prompt = (
+                    f"CONFLICT RESOLUTION TO REVIEW:\n"
+                    f"Incoming subtask: {sid}\n"
+                    f"Intent: {payload_judge['incoming_intent']}\n\n"
+                    f"Already-integrated subtasks: "
+                    f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
+                    f"MERGED RESULT:\n"
+                    f"Commit: {merge_head_sha}\n\n"
+                    f"{merge_diff}\n\n"
+                    f"Attack the merged result for behavioral breakage. "
+                    f"Return only the JSON object per your schema."
+                )
+                return await claude_p(
+                    user_prompt=user_prompt, system_prompt=sys_prompt_judge,
+                    schema_key="integration_judge", cwd=str(repo_root),
+                    allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+                    caps=caps, st=st,
+                    model=models.get("integration_judge", MODEL_DEFAULT),
+                    effort=efforts.get("integration_judge"),
+                    sid=f"integration_judge-{sid}",
+                    add_dirs=st.data.get("inspect_dirs") or None,
+                )
+
+            def _check_integration(judge_result: dict) -> list[str]:
+                issues: list[str] = []
+                for d in judge_result.get("defects") or []:
+                    if not isinstance(d, dict):
+                        continue
+                    scenario = (d.get("concrete_scenario") or "").strip()
+                    location = (d.get("location") or "").strip()
+                    # Anti-gaming: a defect gates only with concrete scenario
+                    # and location named.
+                    if not scenario or not location:
+                        continue
+                    issues.append(
+                        f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
+                        f"{location}: {scenario} — {d.get('why_broken', '')}")
+                return issues
+
+            # No make_feedback_prompt: detect-and-die, single pass. The
+            # integrator cannot mechanically fix a semantic finding without
+            # re-resolving the conflict from scratch.
+            judge_result, judge_warnings = await _run_checked_loop(
+                invoke=_invoke_integration_judge,
+                check=_check_integration,
+                name=f"integration_judge-{sid}",
+                max_rounds=caps["judgment_check_rounds"],
+            )
+            for w in judge_warnings:
+                log(f"  integration-judge-{sid}: {w}")
+
+            if judge_result is None:
+                # The judge crashed every round (infrastructure). The merge is
+                # already committed and passed the mechanical checks, so degrade
+                # rather than undo it.
+                log(f"  ⚠  integration-judge for {sid} crashed every round; "
+                    "degrading (merge preserved, check_merge_committed already ran)")
+            else:
+                remaining_defects = _check_integration(judge_result)
+                if remaining_defects:
+                    # Found behavioral breakage. Unlike the wiring gate (pre-merge),
+                    # we already have a committed merge, so the abort instruction
+                    # differs.
+                    die(
+                        f"integration gate found behavioral defect(s) in the merge "
+                        f"for {sid}:\n" +
+                        "\n".join(f"  • {d}" for d in remaining_defects) +
+                        f"\n\nAn independent review found the merge is textually "
+                        f"clean (no conflict markers, committed) but behaviorally "
+                        f"broken. The merge has been committed to staging. Either "
+                        f"revert it manually and resolve the conflict differently, "
+                        f"or accept the finding and revise one of the conflicting "
+                        f"subtasks' approaches, then re-run with --resume."
+                    )
+
             integrated.append(sid)
             integrated_so_far.append(sid)
         else:
