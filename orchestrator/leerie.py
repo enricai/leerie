@@ -941,6 +941,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "wiring_judge": "medium",
     "provision_judge": "medium",
     "task_coverage_judge": "medium",
+    "integration_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -960,7 +961,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
-                "task_coverage_judge", "artifact_registry")
+                "task_coverage_judge", "artifact_registry",
+                "integration_judge")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -2130,6 +2132,43 @@ SCHEMAS: dict[str, dict] = {
                                           "off_task_subtask"]},
                         "description": {"type": "string"},
                         "concrete_evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "integration_judge": {
+        # Attacks the integrator's MERGED RESULT for behavioral breakage the
+        # conflict-marker scan / merge-committed check cannot see -- the
+        # merge can be marker-free and committed and still be behaviorally
+        # wrong (e.g. one side's edit silently dropped, a call site left
+        # pointing at a signature the other side changed). A non-empty
+        # `defects` gates. Carries no confidence sub-object -- this worker
+        # IS the independent check, so a self-confidence axis would
+        # reintroduce the bias it replaces.
+        "type": "object",
+        "required": ["merge_reviewed", "defects", "rationale"],
+        "properties": {
+            # False if there was nothing reviewable (e.g. no merge commit
+            # produced) -> fail-open (advisory), never fabricate a defect.
+            "merge_reviewed": {"type": "boolean"},
+            "defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "concrete_scenario", "location",
+                                 "why_broken"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["dropped_change",
+                                          "reintroduced_conflict",
+                                          "call_site_mismatch",
+                                          "semantic_regression",
+                                          "incomplete_resolution"]},
+                        "concrete_scenario": {"type": "string"},
+                        "location": {"type": "string"},
+                        "why_broken": {"type": "string"},
                     },
                 },
             },
