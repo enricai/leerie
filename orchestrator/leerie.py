@@ -933,6 +933,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "classification_judge": "medium",
     "wiring_judge": "medium",
     "provision_judge": "medium",
+    "task_coverage_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -952,7 +953,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
-                "artifact_registry")
+                "task_coverage_judge", "artifact_registry")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -2091,6 +2092,37 @@ SCHEMAS: dict[str, dict] = {
                         "command": {"type": "string"},
                         "concrete_reason": {"type": "string"},
                         "fix": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "task_coverage_judge": {
+        # Attacks the reconciled plan's coverage of the task — handed only
+        # the task text plus the reconciled subtask set (titles, intents,
+        # success criteria — not the codebase), it asks whether the union of
+        # subtasks actually addresses what the user asked for. Distinct from
+        # fit_judge (per-subtask sizing) and wiring_judge (inter-subtask
+        # graph correctness): this is the one check for whole-plan-vs-task
+        # coverage. A non-empty `coverage_gaps` gates.
+        "type": "object",
+        "required": ["task_covered", "coverage_gaps", "rationale"],
+        "properties": {
+            # False whenever any coverage_gaps entry is present; True only
+            # when the union of subtasks was judged to cover the task.
+            "task_covered": {"type": "boolean"},
+            "coverage_gaps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "description", "concrete_evidence"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["missing_work",
+                                          "off_task_subtask"]},
+                        "description": {"type": "string"},
+                        "concrete_evidence": {"type": "string"},
                     },
                 },
             },
