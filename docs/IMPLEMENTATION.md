@@ -4676,12 +4676,25 @@ accept the subtask as leaf); then splits via either:
     contiguous line-windows (`partition_lines()`), which also serves as the
     whole-file fallback when no ranges are available. Children are built by
     `_subfile_child()` (analog of `_migration_child()`), each listing the same
-    single file plus an `owned_region` field and a `_cofile_cluster` marker.
-    `_check_intra_file_surface()` is the zero-tolerance coverage/overlap backstop
-    (union == `[1, EOF]`, pairwise-disjoint). Same-file co-ownership is legitimate
-    downstream (schedule ignores `files_likely_touched`; overlap judge excludes
-    same-file/different-region; `git merge` reconciles); `check_planner_output`'s
-    `INTRA_DOMAIN_OVERLAP` advisory is suppressed for `_cofile_cluster` children.
+    single file plus an `owned_region` field, a `_cofile_cluster` marker, and
+    (unlike `_migration_child()`, whose verbatim `intent` inheritance is safe
+    because chunks own disjoint files) a **region-scoped `intent`** — mechanically
+    derived from the parent's intent plus the region's line range and symbols,
+    not a byte-identical copy. `_check_intra_file_surface()` is the
+    zero-tolerance coverage/overlap backstop (union == `[1, EOF]`,
+    pairwise-disjoint). Same-file co-ownership is legitimate downstream
+    (schedule ignores `files_likely_touched`; `git merge` reconciles);
+    `check_planner_output`'s `INTRA_DOMAIN_OVERLAP` advisory is suppressed for
+    `_cofile_cluster` children. The overlap judge excludes same-file/
+    different-region collisions via two mechanisms: the region-scoped
+    `intent` gives it a textual signal (its prompt's "What is NOT a
+    collision" list names same-`_cofile_cluster` pairs explicitly), and
+    `check_overlap_judge_output`'s `SPURIOUS_COFILE_COLLISION` check is a
+    code-enforced backstop (§12) that flags any `unresolvable` verdict
+    between same-`_cofile_cluster` subtasks regardless of the judge's own
+    reasoning — closing a real incident where 40 region children with an
+    unscoped, identical `intent` gave the judge no signal to distinguish
+    them and it wrongly died on 5 "unresolvable" collisions.
   - **Oversized-file peel** (`1 < len(files) ≤ chunk_size`, exactly one file over
     `subfile_split_max_span` lines): checked in the split step **before**
     `_subfile_split()`'s single-file tiling, since that tiling's `len(files) == 1`

@@ -5713,8 +5713,11 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
     aliased lists leak dependencies via `_apply_overlap_drop`). Differences:
 
     - ``files_likely_touched`` is the *single* parent file — every region child
-      co-owns it, which is legitimate downstream (schedule ignores files; the
-      overlap judge excludes same-file/different-region; `git merge` reconciles).
+      co-owns it, which is legitimate downstream (schedule ignores files;
+      `git merge` reconciles; the overlap judge is told to exclude same-file/
+      different-region collisions via the region-scoped ``intent`` below plus
+      the ``_cofile_cluster`` marker it's shown — DESIGN §5 *Cross-domain
+      surface overlap*).
     - ``owned_region`` records the code-computed line range + the symbols it
       contains, so the implementer's prompt scopes it to that span.
     - ``_cofile_cluster`` marks the child as part of an *intentional* same-file
@@ -5735,6 +5738,20 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
         f"(symbols: {sym_txt}). Do not edit outside this range; a sibling "
         f"subtask owns the rest of the file."
     ).strip()
+    # Region-scoped, not a verbatim parent copy (unlike _migration_child,
+    # where verbatim inheritance is safe because chunks own disjoint files).
+    # Region children co-own the SAME file, so an unscoped intent gives
+    # plan_overlap_judge no textual signal to distinguish N children each
+    # claiming to implement the parent's complete feature — the direct
+    # cause of a real false-positive "unresolvable surface collision"
+    # incident (DESIGN §5 *Cross-domain surface overlap*). Mechanically
+    # derived, no LLM call, matching this function's "Pure + deterministic"
+    # guarantee.
+    intent = (
+        f"{subtask.get('intent', '')} This subtask's slice: only lines "
+        f"{lo}-{hi} of {file} (symbols: {sym_txt}). A sibling subtask "
+        f"owns the rest of the file."
+    ).strip()
     return {
         "id": cid,
         "title": title,
@@ -5743,7 +5760,7 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
         "owned_region": {"file": file, "start": lo, "end": hi,
                          "symbols": list(symbols)},
         "_cofile_cluster": cluster,
-        "intent": subtask.get("intent", ""),
+        "intent": intent,
         "scope_note": subtask.get("scope_note", ""),
         "depends_on": list(subtask.get("depends_on", []) or []),
         "requires": copy.deepcopy(subtask.get("requires", []) or []),
@@ -6623,6 +6640,33 @@ def check_overlap_judge_output(
                     f"DROP_BREAKS_GRAPH: dropping {dropped_sid!r} "
                     f"would remove provides tags {orphaned} that "
                     "other subtasks require")
+
+    # Code-enforced backstop for a real incident (DESIGN §5½ *Sub-file*):
+    # two subtasks sharing the same non-null `_cofile_cluster` are, by
+    # construction, disjoint-region siblings of one deliberate P1 sub-file
+    # split — their line ranges are pre-verified non-overlapping and their
+    # union covers the whole file (`_check_intra_file_surface`). The judge
+    # is told this in its prompt ("What is NOT a collision"), but a prompt
+    # rule is advisory (§12) — an `unresolvable` verdict between cluster
+    # siblings is always wrong regardless of what the judge's free-text
+    # reasoning says, so it's flagged here as a mechanical issue and fed
+    # back through the existing retry loop (`phase_overlap_judge` passes
+    # `make_feedback_prompt`, unlike the single-pass gates) rather than
+    # trusted to self-correct only from prompt wording.
+    for c in collisions:
+        if c.get("resolution") != "unresolvable":
+            continue
+        a = by_id.get(c.get("a_sid", ""), {})
+        b = by_id.get(c.get("b_sid", ""), {})
+        a_cluster = a.get("_cofile_cluster")
+        b_cluster = b.get("_cofile_cluster")
+        if a_cluster and a_cluster == b_cluster:
+            issues.append(
+                f"SPURIOUS_COFILE_COLLISION: {c.get('a_sid', '?')} <-> "
+                f"{c.get('b_sid', '?')} share _cofile_cluster "
+                f"{a_cluster!r} — same-file/different-region siblings of "
+                "a deliberate sub-file split can never collide; retract "
+                "this finding")
 
     # The overlap judge's `judgment` self-score is NO LONGER a gating axis
     # (DESIGN §8 *Independent adversarial verification*): this worker IS an
@@ -18453,9 +18497,13 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
 
     # Build the judge's input. The worker sees every subtask's
     # id/title/intent/scope_note/files_likely_touched/provides/requires/
-    # depends_on. `requires` is left as the planner-emitted object form
-    # since the judge may want to read `reason` text in addition to
-    # tag/extent.
+    # depends_on/_cofile_cluster. `requires` is left as the planner-emitted
+    # object form since the judge may want to read `reason` text in
+    # addition to tag/extent. `_cofile_cluster` is the same structural
+    # marker `check_planner_output` uses to suppress its INTRA_DOMAIN_OVERLAP
+    # advisory for a deliberate P1 sub-file split (DESIGN §5½ *Sub-file*) —
+    # included here so the judge has a code-derived signal, not just prose
+    # similarity, for recognizing disjoint-region siblings of one file.
     subtask_views: list[dict] = []
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
@@ -18469,6 +18517,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
                 "provides": list(s.get("provides", []) or []),
                 "requires": list(s.get("requires", []) or []),
                 "depends_on": list(s.get("depends_on", []) or []),
+                "_cofile_cluster": s.get("_cofile_cluster"),
             })
     payload = {"task": task, "subtasks": subtask_views}
 

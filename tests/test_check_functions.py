@@ -572,6 +572,62 @@ class TestCheckOverlapJudgeOutput:
             output, plans, tmp_path)
         assert any("DROP_BREAKS_GRAPH" in i for i in issues)
 
+    def test_spurious_cofile_collision_flagged(self, leerie, tmp_path):
+        """A P1 sub-file split's region siblings share a _cofile_cluster —
+        an `unresolvable` verdict between them is always wrong (DESIGN
+        §5½ *Sub-file*) and must be flagged regardless of the judge's
+        free-text reasoning."""
+        plans = [{"subtasks": [
+            {"id": "feat-002-r1", "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "feat-002"},
+            {"id": "feat-002-r2", "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "feat-002"},
+        ]}]
+        output = {"collisions": [{
+            "a_sid": "feat-002-r1", "b_sid": "feat-002-r2",
+            "artifact": "src/big.ts", "resolution": "unresolvable",
+            "reason": "identical intents"}]}
+        issues = leerie.check_overlap_judge_output(
+            output, plans, tmp_path)
+        assert any("SPURIOUS_COFILE_COLLISION" in i for i in issues)
+
+    def test_spurious_cofile_collision_not_flagged_for_different_clusters(
+            self, leerie, tmp_path):
+        """A genuine collision between subtasks in DIFFERENT (or absent)
+        _cofile_cluster groups must still be reported — the check must
+        not over-suppress an accidental same-file overlap."""
+        plans = [{"subtasks": [
+            {"id": "feat-002-r1", "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "feat-002"},
+            {"id": "refactor-009", "files_likely_touched": ["src/big.ts"]},
+        ]}]
+        output = {"collisions": [{
+            "a_sid": "feat-002-r1", "b_sid": "refactor-009",
+            "artifact": "src/big.ts", "resolution": "unresolvable",
+            "reason": "genuine conflict"}]}
+        issues = leerie.check_overlap_judge_output(
+            output, plans, tmp_path)
+        assert not any("SPURIOUS_COFILE_COLLISION" in i for i in issues)
+
+    def test_spurious_cofile_collision_ignores_non_unresolvable(
+            self, leerie, tmp_path):
+        """The check only fires on `unresolvable` — a `merge`/`drop_a`/
+        `drop_b` resolution between cluster siblings is not the failure
+        mode this guards against (an unresolvable die() is)."""
+        plans = [{"subtasks": [
+            {"id": "feat-002-r1", "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "feat-002"},
+            {"id": "feat-002-r2", "files_likely_touched": ["src/big.ts"],
+             "_cofile_cluster": "feat-002"},
+        ]}]
+        output = {"collisions": [{
+            "a_sid": "feat-002-r1", "b_sid": "feat-002-r2",
+            "artifact": "src/big.ts", "resolution": "merge",
+            "reason": "unrelated"}]}
+        issues = leerie.check_overlap_judge_output(
+            output, plans, tmp_path)
+        assert not any("SPURIOUS_COFILE_COLLISION" in i for i in issues)
+
 
 # --- check_implementer_output ------------------------------------------ #
 

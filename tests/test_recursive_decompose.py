@@ -742,6 +742,59 @@ def test_subfile_oversized_single_file_region_splits(leerie, tmp_path):
     assert covered == set(range(1, 2001))
 
 
+def test_subfile_region_children_have_distinct_intents(leerie, tmp_path):
+    """Regression: region children must NOT copy the parent's identical
+    `intent` verbatim (unlike _migration_child, where verbatim inheritance
+    is safe because chunks own disjoint files). Region children co-own the
+    SAME file, so an unscoped intent gives plan_overlap_judge no textual
+    signal to distinguish siblings — the direct cause of a real false-
+    positive "unresolvable surface collision" incident."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    parent_intent = ("Add all token-management machinery: probe functions, "
+                      "ranking logic, failover hook.")
+    parent = {
+        "id": "feat-005",
+        "title": "Route everything through the guard",
+        "intent": parent_intent,
+        "success_criteria_seed": "all sites routed",
+        "files_likely_touched": ["big.ts"],
+    }
+    caps = _make_caps(leerie, subfile_split_max_span=700)
+    st = _make_state(leerie, caps)
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+    ranges = [("small1", 1, 100), ("giant", 200, 1900), ("small2", 1901, 1950)]
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.30)
+        pytest.fail(f"no worker expected for a sub-file split, got {schema_key!r}")
+
+    with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie.recursive_decompose(
+            parent, 0, st, caps, models, efforts, tmp_path))
+
+    assert len(leaves) >= 2
+    intents = [leaf["intent"] for leaf in leaves]
+    assert len(set(intents)) == len(intents), (
+        "region children must have distinct intents, got duplicates: "
+        f"{intents}")
+    for leaf in leaves:
+        assert leaf["intent"] != parent_intent, (
+            "a region child's intent must not be a byte-identical copy "
+            "of the parent's — plan_overlap_judge cannot distinguish "
+            "siblings from unscoped intent text")
+        # Children must extend, not discard, the parent's stated purpose.
+        assert parent_intent in leaf["intent"], (
+            "a region child's intent must still contain the parent's "
+            "original intent text")
+        r = leaf["owned_region"]
+        assert f"lines {r['start']}-{r['end']}" in leaf["intent"], (
+            "a region child's intent must name its own line range")
+
+
 def test_subfile_ids_carry_domain_prefix(leerie, tmp_path):
     """Region-child ids keep the parent's domain prefix so validate_plan's
     id-prefix check and schedule() cross-domain wiring still pass."""

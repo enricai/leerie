@@ -2349,3 +2349,50 @@ def test_phase_log_parts_partition_every_action_shape(
     # shapes this fixture does not enumerate.
     assert parts == {"merge": 3, "drop": 2, "multi_drop": 3,
                      "skipped_redundant": 1, "skipped_would_cycle": 3}, parts
+
+
+def test_subtask_views_include_cofile_cluster():
+    """`phase_overlap_judge`'s `subtask_views` payload build must include
+    `_cofile_cluster` — the same structural marker `check_planner_output`
+    uses to suppress its INTRA_DOMAIN_OVERLAP advisory for a deliberate
+    P1 sub-file split. Without it in the judge's payload, the judge has
+    no code-derived signal (only free-text `intent`/`scope_note`
+    similarity) to recognize disjoint-region siblings of one file — the
+    root cause of a real false-positive "unresolvable surface collision"
+    incident (DESIGN §5 *Cross-domain surface overlap*, §5½ *Sub-file*).
+
+    Source-coupled rather than driven end-to-end: the existing
+    `_run_phase_overlap_judge` test helper stubs `_run_checked_loop`
+    directly, bypassing the `subtask_views` build entirely, so it cannot
+    observe this payload (mirrors test_inspect_tools.py's
+    test_overlap_judge_call_site_uses_inspect_tools pattern for the same
+    reason)."""
+    from pathlib import Path
+    leerie_py = (Path(__file__).resolve().parent.parent
+                 / "orchestrator" / "leerie.py")
+    src = leerie_py.read_text()
+    start = src.index("async def phase_overlap_judge(")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+    assert '"_cofile_cluster": s.get("_cofile_cluster")' in body, (
+        "phase_overlap_judge's subtask_views build must include "
+        "_cofile_cluster so the judge has a structural signal for "
+        "disjoint-region same-file siblings"
+    )
+
+
+def test_prompt_documents_cofile_cluster_exclusion():
+    """`prompts/plan_overlap_judge.md`'s "What is NOT a collision" list
+    must name `_cofile_cluster` explicitly — the prompt-side half of the
+    fix (advisory; `check_overlap_judge_output`'s SPURIOUS_COFILE_COLLISION
+    is the code-enforced backstop, per CLAUDE.md §12 "prompts are
+    advisory, code enforces")."""
+    from pathlib import Path
+    prompt_path = (Path(__file__).resolve().parent.parent
+                   / "prompts" / "plan_overlap_judge.md")
+    text = prompt_path.read_text()
+    assert "_cofile_cluster" in text, (
+        "plan_overlap_judge.md must document the _cofile_cluster "
+        "exclusion rule so the judge is told about the signal it's "
+        "given in its payload"
+    )
