@@ -6,9 +6,20 @@ This test reads the launcher source text directly — no subprocess execution �
 so any refactor that silently drops the bundle lines causes an immediate test
 failure rather than a silent regression where every `bundle install` downloads
 and compiles gems from scratch.
+
+`BUNDLE_PATH` is not part of the `CACHE_MOUNTS=( ... )` array literal itself:
+since commit 241259b (out-of-repo dependency bake, DESIGN §6½), the correct
+value depends on whether the per-repo Dockerfile actually baked gems to
+/opt/bundle, so it's appended conditionally via `CACHE_MOUNTS+=(...)` in an
+if/else AFTER the literal closes — not something a static array can express.
+`_extract_cache_mounts_block()` therefore also scoops up any
+`CACHE_MOUNTS+=( ... )` append blocks that directly follow the literal
+(tolerating the if/else/fi control-flow lines between them), so both the
+/opt/bundle and cache-dir BUNDLE_PATH values are visible to the tests below.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -16,8 +27,21 @@ LAUNCHER_PATH = REPO_ROOT / "leerie"
 
 _BUNDLE_VOLUME_TARGET = "/home/leerie/.cache/leerie/bundle"
 _BUNDLE_PATH_ENV = "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle"
+_BUNDLE_PATH_BAKED_ENV = "BUNDLE_PATH=/opt/bundle"
 _BUNDLE_MKDIR = "$HOME/.cache/leerie/bundle"
 _CACHE_MOUNTS_OPEN = "CACHE_MOUNTS=("
+
+# Matches a `CACHE_MOUNTS+=( ... )` append — either a single physical line
+# (as leerie's BUNDLE_PATH if/else arms are: `  CACHE_MOUNTS+=(-e "...")`,
+# indented inside the if/else body) or a multi-line block closed by `)` on
+# its own line, mirroring the array-literal closing convention. re.MULTILINE
+# so `^` anchors to start of line (tolerating leading indentation before
+# `CACHE_MOUNTS+=`, and guarding against matching the token inside a
+# comment, which would need a `#` before it on the same line — not excluded
+# here since no such comment currently exists, but the anchor at least keeps
+# matches to real statement starts).
+_CACHE_MOUNTS_APPEND_RE = re.compile(
+    r"^[ \t]*CACHE_MOUNTS\+=\((?:[^\n)]*\)|.*?\n\))\n", re.MULTILINE | re.DOTALL)
 
 
 def _launcher_text() -> str:
@@ -25,11 +49,20 @@ def _launcher_text() -> str:
 
 
 def _extract_cache_mounts_block(text: str) -> str:
-    """Return the text of the CACHE_MOUNTS=( ... ) array, inclusive of delimiters."""
+    """Return the CACHE_MOUNTS=( ... ) array literal PLUS any
+    CACHE_MOUNTS+=( ... ) append blocks that directly follow it (skipping
+    over intervening non-append text such as if/else/fi control flow and
+    comments) — the array's true runtime contents span both."""
     start = text.index(_CACHE_MOUNTS_OPEN)
     # Walk forward to find the closing ')' on its own line.
     end = text.index("\n)\n", start)
-    return text[start : end + 3]
+    block = text[start : end + 3]
+
+    tail = text[end + 3:]
+    for m in _CACHE_MOUNTS_APPEND_RE.finditer(tail):
+        block += m.group(0)
+
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -97,13 +130,44 @@ def test_bundle_path_env_in_cache_mounts():
         f"Got block:\n{block}"
     )
 
-    # The entry must be a -e flag (environment variable, not a comment).
+    # The entry must be a -e flag (environment variable, not a comment) —
+    # either directly (a line inside the CACHE_MOUNTS=( ... ) literal starts
+    # with -e) or via a CACHE_MOUNTS+=(-e "...") append (DESIGN §6½'s
+    # conditional BUNDLE_PATH arms), which starts with `CACHE_MOUNTS+=(-e`
+    # rather than a bare `-e` token.
     env_lines = [
         line.strip()
         for line in block.splitlines()
         if _BUNDLE_PATH_ENV in line and not line.strip().startswith("#")
     ]
-    assert any(line.startswith("-e") for line in env_lines), (
-        f"Expected a '-e ...' line containing '{_BUNDLE_PATH_ENV}'. "
-        f"Matching lines: {env_lines}"
+    assert any(
+        line.startswith("-e") or line.startswith('CACHE_MOUNTS+=(-e')
+        for line in env_lines
+    ), (
+        f"Expected a '-e ...' or 'CACHE_MOUNTS+=(-e ...)' line containing "
+        f"'{_BUNDLE_PATH_ENV}'. Matching lines: {env_lines}"
+    )
+
+
+def test_both_bundle_path_arms_visible_to_extraction():
+    """BUNDLE_PATH is appended conditionally (CACHE_MOUNTS+=(...) in an
+    if/else, DESIGN §6½ out-of-repo bake) rather than living in the
+    CACHE_MOUNTS=( ... ) array literal itself. Pin that the extraction
+    helper reaches past the `if` arm into the `else` arm too — a
+    regression here (e.g. stopping at the first CACHE_MOUNTS+=(...)
+    block) would pass test_bundle_path_env_in_cache_mounts vacuously if
+    only the first arm happened to match, while silently missing the
+    other."""
+    text = _launcher_text()
+    block = _extract_cache_mounts_block(text)
+
+    assert _BUNDLE_PATH_BAKED_ENV in block, (
+        f"Expected the baked-gems arm '{_BUNDLE_PATH_BAKED_ENV}' inside the "
+        f"extracted block (the `if` arm of the BUNDLE_PATH conditional). "
+        f"Got block:\n{block}"
+    )
+    assert _BUNDLE_PATH_ENV in block, (
+        f"Expected the cache-dir arm '{_BUNDLE_PATH_ENV}' inside the "
+        f"extracted block (the `else` arm of the BUNDLE_PATH conditional). "
+        f"Got block:\n{block}"
     )
