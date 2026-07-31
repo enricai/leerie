@@ -4786,6 +4786,15 @@ def _emit_layer(copy_files, run_cmd, copy_shas, workdir=None, env_lines=None,
     covers the real dependency-input files, not the scratch dir the install
     writes into, so the existing .dockerfile-hash cache-invalidation
     mechanism (leerie:~4982) is unaffected by where the RUN line installs to.
+
+    NOTE: this WORKDIR is never reset back to /work afterward, so it leaks
+    into the final image's baked WORKDIR config. Confirmed harmless: the
+    launcher's `nerdctl run` always passes an explicit `-w /work`
+    (leerie:~7503), which overrides any image-baked WORKDIR at container
+    start; every worker subprocess additionally passes its own explicit
+    `cwd=worktree` (orchestrator/leerie.py's claude_p/run_proc calls) rather
+    than inheriting cwd from the container. Nothing in this codebase relies
+    on the image's own WORKDIR value.
     """
     sha_comment = "# copy-input-shas: " + " ".join(
         f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
