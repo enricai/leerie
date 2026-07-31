@@ -19076,6 +19076,61 @@ def write_plan(leerie_dir: Path, task: str, st: State,
     st.save()
 
 
+def _is_baked_ecosystem_command(command: list[str]) -> bool:
+    """Return True if this install command is for an ecosystem whose
+    dependencies are baked into the image at `/opt/*`, making the per-run
+    install unnecessary (DESIGN §6½ "Persistent out-of-repo dependency bake").
+
+    Ecosystems with zero per-run install:
+      - Python (pip, uv, poetry, pipenv) → baked to /opt/venv
+      - Ruby (bundle) → baked to /opt/bundle
+      - Rust (cargo) → baked to CARGO_HOME + CARGO_TARGET_DIR
+      - Go (go) → baked to GOMODCACHE + GOCACHE
+
+    Ecosystems with irreducible residual:
+      - Node/pnpm → requires offline relink (NOT filtered here; handled separately)
+      - npm/yarn → full offline install (still network-free, kept for now)
+    """
+    if not command:
+        return False
+
+    cmd0 = command[0]
+
+    # Python: pip, pip3, python -m pip, uv, poetry, pipenv
+    if cmd0 in ("pip", "pip3", "uv", "poetry", "pipenv"):
+        return True
+    if cmd0 in ("python", "python3") and len(command) >= 3 and command[1:3] == ["-m", "pip"]:
+        return True
+
+    # Ruby: bundle
+    if cmd0 == "bundle":
+        return True
+
+    # Rust: cargo
+    if cmd0 == "cargo":
+        return True
+
+    # Go: go
+    if cmd0 == "go":
+        return True
+
+    return False
+
+
+def _is_node_offline_relink(command: list[str]) -> bool:
+    """Return True if this is the Node/pnpm offline relink command —
+    the single irreducible residual for Node repos (DESIGN §6½).
+
+    Pattern: `pnpm install --offline --frozen-lockfile`
+    """
+    if not command or command[0] != "pnpm":
+        return False
+    # Must have "install" subcommand and both --offline and --frozen-lockfile
+    return ("install" in command and
+            "--offline" in command and
+            "--frozen-lockfile" in command)
+
+
 def _format_provision_recipe_section(recipe: list[dict],
                                       *, audience: str) -> str | None:
     """Render the persisted provision recipe as a prompt section, or
@@ -19090,11 +19145,31 @@ def _format_provision_recipe_section(recipe: list[dict],
     function is the prompt-injection helper that hands the recipe to
     workers verbatim — no per-worker variation, same string in every
     prompt.
+
+    For repos with baked dependencies (Python to /opt/venv, Ruby to /opt/bundle,
+    Rust/Go with warmed caches), install commands for those ecosystems are
+    filtered out — workers inherit the bake with zero install cost. Only Node/pnpm
+    retains the offline relink residual (DESIGN §6½ "Persistent out-of-repo
+    dependency bake").
     """
     install_entries = [e for e in recipe
                        if e.get("kind") in ("install", "build")
                        and e.get("command")]
     if not install_entries:
+        return None
+
+    # Filter out baked ecosystem installs (Python, Ruby, Rust, Go).
+    # Keep Node offline relink and any other commands (npm/yarn, build steps).
+    filtered_entries = []
+    for e in install_entries:
+        cmd = e.get("command", [])
+        if e.get("kind") == "install" and _is_baked_ecosystem_command(cmd):
+            # Baked ecosystem — skip this install
+            continue
+        # Keep: build commands, Node offline relink, npm/yarn, anything else
+        filtered_entries.append(e)
+
+    if not filtered_entries:
         return None
 
     lines = ["", "PROVISION_RECIPE:"]
@@ -19124,7 +19199,7 @@ def _format_provision_recipe_section(recipe: list[dict],
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
-    for i, e in enumerate(install_entries, 1):
+    for i, e in enumerate(filtered_entries, 1):
         cmd_str = " ".join(e["command"])
         wd = e.get("working_dir", ".")
         timeout = e.get("timeout_s") or 1800
