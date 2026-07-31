@@ -255,11 +255,13 @@ The orchestrator gives you, in your prompt:
      `decomposition_quality`: for each subtask, test whether it could be
      independently verified standing alone, or whether it would need a
      sibling first that you missed. Record what you tested and what you
-     found.
+     found — **one or two sentences per item, citing a file/line or a
+     specific grep result rather than quoting large blocks of text.**
    - **Drift reconciliation (`contradictions_reconciled`):** before
      scoring, re-read your own prior statements in this session and name
      any contradictions or quiet retreats, with the kept version and its
-     evidence. Empty array when there are none.
+     evidence. Empty array when there are none. Same brevity discipline
+     as `falsifiers_tested`.
    - **Gap surfacing (`gap_to_close`):** if either score is below 9.0,
      fill the corresponding field with the *specific artifact* that would
      close the gap — a citation, a measurement, a research source — not

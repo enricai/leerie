@@ -141,8 +141,8 @@ def test_clean_wiring_passes(leerie, tmp_path, monkeypatch):
 
 
 def test_defect_dies(leerie, tmp_path, monkeypatch):
-    """A concrete wiring defect die()s immediately (detect-and-die, no
-    re-drive)."""
+    """A concrete, live wiring defect die()s immediately (detect-and-die,
+    no re-drive)."""
     st = _state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
@@ -150,7 +150,61 @@ def test_defect_dies(leerie, tmp_path, monkeypatch):
             "kind": "missing_requires", "sid": "feat-002",
             "tag_or_dep": "schema",
             "concrete_reason": "reads the schema but declares no requires",
+            "severity": "live_defect",
         }], "rationale": "missing edge"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_wiring_gate(
+            _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+
+def test_latent_risk_defect_does_not_gate(leerie, tmp_path, monkeypatch):
+    """Regression pin for run d8302c0d46d8... (barnacle, 2026-07-31): a
+    defect the judge itself scored latent_risk (correct today, fragile to
+    a future edit — its own rationale said 'a latent fragility rather than
+    a live defect... not a true missing edge') must NOT die(). Only
+    live_defect gates."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-003-1",
+            "tag_or_dep": "uchealth-workhistory-gate-fixture",
+            "concrete_reason": "feat-003-1 only declares requires on "
+                               "feat-002's tag, inheriting feat-001's "
+                               "fixture transitively.",
+            "severity": "latent_risk",
+        }], "rationale": "a latent fragility rather than a live defect"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == _PLANS
+
+
+def test_mixed_severity_still_dies_on_the_live_defect(leerie, tmp_path,
+                                                        monkeypatch):
+    """A live_defect entry gates the whole plan even alongside a
+    latent_risk entry — severity filtering narrows what counts as a
+    defect, it doesn't create a per-defect bypass for real ones."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [
+            {
+                "kind": "missing_requires", "sid": "feat-003-1",
+                "tag_or_dep": "some-fixture",
+                "concrete_reason": "transitive but resolves today",
+                "severity": "latent_risk",
+            },
+            {
+                "kind": "missing_requires", "sid": "feat-002",
+                "tag_or_dep": "schema",
+                "concrete_reason": "reads the schema, no requires at all",
+                "severity": "live_defect",
+            },
+        ], "rationale": "mixed"}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     with pytest.raises(SystemExit):

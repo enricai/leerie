@@ -69,6 +69,77 @@ def test_failure_kind_schema_parse_failed(leerie):
         {"is_error": False}, parsed_ok=False) == "schema_parse_failed"
 
 
+def test_failure_kind_malformed_tool_call(leerie):
+    # Sub-case of schema_parse_failed: the StructuredOutput tool call itself
+    # was malformed (CLI-internal JSON/XML tool-call corruption,
+    # anthropics/claude-code#49747), not an ordinary schema-content miss.
+    assert leerie._classify_failure_kind(
+        {"is_error": False,
+         "result": "InputValidationError: StructuredOutput was called "
+                    "with input that could not be parsed as JSON."},
+        parsed_ok=False) == "malformed_tool_call"
+
+
+def test_failure_kind_malformed_tool_call_real_incident_text(leerie):
+    # Verbatim shape from run d8302c0d46d8... (barnacle, 2026-07-31),
+    # planner-feature-implementation-s1, __unparsedToolInput capture.
+    result_text = (
+        '<tool_use_error>InputValidationError: StructuredOutput was '
+        'called with input that could not be parsed as JSON.\n'
+        'You sent (first 200 of 16840 bytes): {"domain": '
+        '"feature-implementation", "status": "ready", "confidence": \n'
+        '<parameter name="task_understanding">9.4, "decomposition_quality": '
+        '"9.2", "basis": "Read the full repro evidence bundle...\n'
+        'Common causes: unescaped backslashes in file paths (use / or '
+        '\\\\), unescaped control characters, or truncated output. Retry '
+        'with valid JSON.</tool_use_error>'
+    )
+    assert leerie._classify_failure_kind(
+        {"is_error": False, "result": result_text},
+        parsed_ok=False) == "malformed_tool_call"
+
+
+def test_failure_kind_ordinary_schema_mismatch_is_not_malformed_tool_call(
+        leerie):
+    # An ordinary schema-CONTENT miss (valid JSON, wrong/missing field) must
+    # stay "schema_parse_failed" — the malformed_tool_call tag is only for
+    # the CLI's own tool-call-parse-failure diagnostic text.
+    assert leerie._classify_failure_kind(
+        {"is_error": False,
+         "result": "Output does not match required schema: root: must "
+                    "have required property 'domain'"},
+        parsed_ok=False) == "schema_parse_failed"
+
+
+def test_failure_kind_malformed_tool_call_gated_on_not_parsed_ok(leerie):
+    # A success envelope must never match on result-text alone.
+    assert leerie._classify_failure_kind(
+        {"is_error": False,
+         "result": "could not be parsed as JSON"},
+        parsed_ok=True) is None
+
+
+def test_is_malformed_tool_call_has_its_own_is_error_guard(leerie):
+    # _is_malformed_tool_call must carry its own is_error guard, mirroring
+    # _is_terminal_auth_failure/_is_auth_or_quota_failure — a successful,
+    # schema-valid envelope must never match no matter what its result
+    # text says, regardless of what any future caller checks first. Called
+    # directly (not through _classify_failure_kind) so this pins the
+    # function's own invariant rather than relying on its one current
+    # caller's branch ordering.
+    assert leerie._is_malformed_tool_call(
+        {"is_error": True,
+         "result": "InputValidationError: ... could not be parsed as JSON"}
+    ) is False
+
+
+def test_is_malformed_tool_call_matches_on_is_error_false(leerie):
+    assert leerie._is_malformed_tool_call(
+        {"is_error": False,
+         "result": "could not be parsed as JSON"}
+    ) is True
+
+
 def test_failure_kind_api_error_split(leerie):
     assert leerie._classify_failure_kind(
         {"is_error": True, "api_error_status": 401}, False) == "api_error:auth"

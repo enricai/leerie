@@ -172,6 +172,17 @@ class TestVerifierGatesKeyOnConcreteDefects:
         assert "wiring_defects" in src
         assert "concrete_reason" in src
 
+    def test_wiring_gate_only_gates_on_live_defect_severity(self, leerie):
+        """A non-empty wiring_defects array alone is not sufficient to
+        gate — only a live_defect-severity entry is (run
+        d8302c0d46d8..., barnacle, 2026-07-31: the judge's own rationale
+        called a flagged item a latent fragility, not a live defect, and
+        the gate died anyway before this distinction existed)."""
+        src = inspect.getsource(leerie.phase_wiring_gate)
+        assert "severity" in src
+        assert "live_defect" in src
+        assert "latent_risk" in src
+
     def test_provision_gate_keys_on_recipe_failures(self, leerie):
         src = inspect.getsource(leerie.phase_provision_gate)
         assert "recipe_failures" in src

@@ -61,13 +61,35 @@ drop/merge seams removed — use it to reason about `broken_by_*`.
 | Case | Gate? |
 |------|-------|
 | Every real cross-subtask dependency is declared in some channel | **no** (empty `wiring_defects`) |
-| Subtask B parses a config subtask A writes, but B has no requires/depends_on to A | **yes** — `missing_requires` |
-| Two API subtasks merged; the merged one dropped a dependency on the shared schema subtask | **yes** — `broken_by_merge` |
+| Subtask B parses a config subtask A writes, but B has no requires/depends_on to A | **yes** — `missing_requires`, `live_defect` |
+| Two API subtasks merged; the merged one dropped a dependency on the shared schema subtask | **yes** — `broken_by_merge`, `live_defect` |
 | A subtask you merely think *could* depend on another, no concrete consuming work | **no** — latitude, not a defect |
+| B's real dependency is on A, but B only declares it transitively (B→C→A, and C→A is real) — resolves correctly today, would silently vanish only if C were later merged/dropped | **yes**, but `latent_risk` — see below |
 
 Attack the plan. Return an empty `wiring_defects` array only when you genuinely
 tried to find a missing edge and could not — the correct, common answer for a
 well-wired plan. A fabricated defect triggers a wasted re-reconcile.
+
+## Severity: `live_defect` vs `latent_risk`
+
+Every entry in `wiring_defects` carries a `severity`. This is not optional
+detail — it decides whether the entry stops the run.
+
+- **`live_defect`**: the plan *as written* will actually misbehave. The
+  scheduler can order work wrong, a consumer can run and find nothing there,
+  a real dependency is expressed in **no channel at all**. This gates the run.
+- **`latent_risk`**: the plan is correct today — every real dependency does
+  resolve, through some channel, right now — but the wiring is fragile to a
+  plausible future edit (e.g. only a transitive chain expresses a real
+  dependency, and an intermediate link being merged or dropped later would
+  silently sever it). This does **not** gate; it is logged as a warning.
+
+If you find yourself writing a `concrete_reason` that says the dependency
+*does* resolve today and your real complaint is about robustness to a
+hypothetical future change — that is `latent_risk`, not `live_defect`. Do not
+inflate a robustness observation into `live_defect` to make sure it's noticed;
+say `latent_risk` and it will still be surfaced, just without stopping the run
+on a plan that actually works.
 
 ## What to return
 
@@ -79,7 +101,8 @@ well-wired plan. A fabricated defect triggers a wasted re-reconcile.
       "kind": "missing_requires",
       "sid": "feat-003",
       "tag_or_dep": "auth-config-schema",
-      "concrete_reason": "feat-003 reads auth-config-schema.json (its intent says 'validate the login form against the auth config'), which feat-001 provides as `auth-config-schema`, but feat-003 declares no requires for it — feat-003 may run first and read a file that does not exist yet."
+      "concrete_reason": "feat-003 reads auth-config-schema.json (its intent says 'validate the login form against the auth config'), which feat-001 provides as `auth-config-schema`, but feat-003 declares no requires for it — feat-003 may run first and read a file that does not exist yet.",
+      "severity": "live_defect"
     }
   ],
   "rationale": "One consumer of the auth config schema does not declare the dependency, so the scheduler may order it before the producer."
@@ -94,7 +117,8 @@ well-wired plan. A fabricated defect triggers a wasted re-reconcile.
   capability tag or subtask id the edge concerns (**must be non-empty**);
   `concrete_reason` is the **specific** consuming/producing work that proves the
   edge is real — **must be non-empty and concrete**, or the entry is dropped and
-  does not gate. Empty array when the wiring is correct.
+  does not gate; `severity` is `live_defect` or `latent_risk` (see above — this
+  decides whether the run stops). Empty array when the wiring is correct.
 - `rationale`: 1–3 sentences on whether the declared edges match the real
   dependencies.
 

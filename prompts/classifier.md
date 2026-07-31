@@ -162,7 +162,8 @@ Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):
 
 - **Falsification (`falsifiers_tested`):** for each category, name a probe
-  that would disprove it and what you observed.
+  that would disprove it and what you observed. One or two sentences per
+  item, citing a file/line rather than quoting large blocks of text.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions with evidence for the kept
   version.

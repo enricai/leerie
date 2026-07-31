@@ -1067,6 +1067,21 @@ _REQUIRES_ITEM = {
 }
 
 
+# _confidence_schema()'s free-text fields are length-capped as a mitigation
+# for anthropics/claude-code#49747 (open, unfixed as of 2026-07-31): the
+# `claude` CLI intermittently corrupts a StructuredOutput tool call — valid
+# JSON switching mid-payload into legacy XML `<parameter name="...">` tags —
+# correlated with the length of a single tool-call string argument. Observed
+# directly in leerie run d8302c0d46d8... (barnacle, 2026-07-31): the raw
+# `__unparsedToolInput` capture showed the switch happening exactly where the
+# (uncapped) `confidence.basis` field's ~16KB of prose began. This is a CLI
+# decoder-level bug leerie cannot fix; the cap only reduces how often a
+# worker's own output is long enough to trigger it. Revisit once #49747
+# closes upstream.
+_CONFIDENCE_BASIS_MAX_LENGTH = 2000
+_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 500
+
+
 def _confidence_schema(axes: list[str]) -> dict:
     """Build the §8 confidence sub-schema for the given score axes.
 
@@ -1080,11 +1095,16 @@ def _confidence_schema(axes: list[str]) -> dict:
                      "contradictions_reconciled", "gap_to_close"],
         "properties": {
             **{ax: {"type": "number"} for ax in axes},
-            "basis": {"type": "string"},
+            "basis": {"type": "string",
+                      "maxLength": _CONFIDENCE_BASIS_MAX_LENGTH},
             "falsifiers_tested": {
-                "type": "array", "items": {"type": "string"}},
+                "type": "array",
+                "items": {"type": "string",
+                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
             "contradictions_reconciled": {
-                "type": "array", "items": {"type": "string"}},
+                "type": "array",
+                "items": {"type": "string",
+                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
             "gap_to_close": {
                 "type": "object",
                 "properties": {ax: {"type": "string"} for ax in axes},
@@ -2043,7 +2063,20 @@ SCHEMAS: dict[str, dict] = {
         # a structural provider-existence scan (check_plan_wiring) cannot see:
         # a subtask whose work genuinely needs a capability but never declares
         # the `requires` tag, or a merge/drop that severed a real dependency
-        # the tags never encoded. A non-empty `wiring_defects` gates.
+        # the tags never encoded. A `live_defect`-severity `wiring_defects`
+        # entry gates; a `latent_risk` one is logged as a warning only.
+        #
+        # `severity` exists because a real incident (run
+        # d8302c0d46d8..., 2026-07-31) showed the judge could already
+        # express "this isn't really a defect" — but only in the
+        # free-text `rationale`, which phase_wiring_gate's _check() never
+        # reads. The judge's own rationale said the flagged item was "a
+        # latent fragility rather than a live defect... low-confidence...
+        # not a true missing edge," and the gate died anyway because it
+        # only checks concrete_reason/tag_or_dep presence. `severity` is
+        # the structured field that lets the judge say the same thing in
+        # a channel the code actually consults (CLAUDE.md: NL judgment
+        # must reach code as structured JSON, not be stranded in prose).
         "type": "object",
         "required": ["plan_reviewed", "wiring_defects", "rationale"],
         "properties": {
@@ -2054,7 +2087,7 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "required": ["kind", "sid", "tag_or_dep",
-                                 "concrete_reason"],
+                                 "concrete_reason", "severity"],
                     "properties": {
                         "kind": {"type": "string",
                                  "enum": ["missing_requires",
@@ -2065,6 +2098,15 @@ SCHEMAS: dict[str, dict] = {
                         "sid": {"type": "string"},
                         "tag_or_dep": {"type": "string"},
                         "concrete_reason": {"type": "string"},
+                        # live_defect: the plan AS WRITTEN will actually
+                        # misbehave (a wave can run out of order, a
+                        # consumer can see nothing). latent_risk: correct
+                        # today, fragile only to a future edit (e.g. a
+                        # transitive requires/depends_on chain that
+                        # resolves now but would silently vanish if an
+                        # intermediate subtask were later merged/dropped).
+                        "severity": {"type": "string",
+                                     "enum": ["live_defect", "latent_risk"]},
                     },
                 },
             },
@@ -10173,6 +10215,22 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
     - "schema_parse_failed" — the worker returned but its output did not
       validate against the call_type schema (`not parsed_ok`, no is_error).
       This is the dominant real-world failure mode.
+    - "malformed_tool_call" — a sub-case of the above: the worker's
+      StructuredOutput tool call itself was malformed (the CLI's own
+      `InputValidationError: ... could not be parsed as JSON` diagnostic, or
+      a raw `__unparsedToolInput` capture), not merely schema-content-invalid
+      JSON. This is a known, unfixed CLI bug
+      (anthropics/claude-code#49747): a JSON tool-call payload intermittently
+      switches mid-blob into legacy XML `<parameter name="...">` tags,
+      correlated with the length of a single string argument — see
+      `_confidence_schema`'s `maxLength` comment. Usually self-corrects
+      within the same worker session (the CLI retries the tool call
+      internally) and so never reaches this classifier; this tag exists for
+      the rarer case where it surfaces all the way to a captured envelope,
+      so the resulting `WorkerError`/die() message doesn't read like a
+      leerie schema-authoring defect. Detected on fixed CLI diagnostic
+      text (CLAUDE.md's regex carve-out for mechanical strings), never on
+      worker-authored content.
     - None               — success (is_error false and parsed_ok true).
 
     KNOWN GAP (see the capture-site comment and DESIGN §14): the richest
@@ -10202,7 +10260,38 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
         return "incomplete"
     # Reaching here means is_error is false and (is_error false, parsed_ok true)
     # already returned None above — so parsed_ok is necessarily false here.
+    if _is_malformed_tool_call(envelope):
+        return "malformed_tool_call"
     return "schema_parse_failed"
+
+
+# Fixed diagnostic strings the `claude` CLI itself emits when a tool call
+# (specifically StructuredOutput here) cannot be parsed as JSON at all —
+# distinct from a schema-CONTENT mismatch, where the JSON parses fine but a
+# required field is wrong/missing. Mechanical CLI-output matching per
+# CLAUDE.md's regex carve-out, not NL interpretation of worker content.
+_MALFORMED_TOOL_CALL_MARKERS = (
+    "could not be parsed as json",
+    "__unparsedtoolinput",
+)
+
+
+def _is_malformed_tool_call(envelope: dict) -> bool:
+    """True if the envelope's result text carries the CLI's own
+    tool-call-parse-failure diagnostic (see _classify_failure_kind's
+    "malformed_tool_call" docstring paragraph and
+    anthropics/claude-code#49747), as opposed to an ordinary schema-content
+    validation miss. Currently only called after the `not parsed_ok, no
+    is_error` guard already narrows to a failure case, but this function
+    carries its own `is_error` guard anyway — mirroring
+    `_is_terminal_auth_failure`/`_is_auth_or_quota_failure` (a successful,
+    schema-valid envelope must never match no matter what its `result`
+    text says) — so the invariant holds regardless of caller ordering,
+    not just under the one call site that exists today."""
+    if envelope.get("is_error"):
+        return False
+    msg = str(envelope.get("result") or "").lower()
+    return any(m in msg for m in _MALFORMED_TOOL_CALL_MARKERS)
 
 
 def _extract_tool_result_text(block: dict) -> str:
@@ -18461,9 +18550,21 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             # tag/dep it concerns named.
             if not reason or not tag_or_dep:
                 continue
-            issues.append(
-                f"WIRING_DEFECT ({d.get('kind', 'wiring_defect')}) "
+            label = (
+                f"({d.get('kind', 'wiring_defect')}) "
                 f"{d.get('sid', '?')} / {tag_or_dep}: {reason}")
+            # latent_risk: the judge itself doesn't believe this is a live
+            # defect (correct today, fragile to a future edit) — surface it
+            # as a warning, never as a gating issue. Only live_defect gates.
+            # (Run d8302c0d46d8..., 2026-07-31: a wiring_judge rationale
+            # explicitly called a flagged item "a latent fragility rather
+            # than a live defect... not a true missing edge," and the gate
+            # died anyway because this function only checked concrete_reason
+            # / tag_or_dep presence, never severity.)
+            if d.get("severity") == "latent_risk":
+                log(f"  wiring-gate: LATENT_RISK {label}")
+                continue
+            issues.append(f"WIRING_DEFECT {label}")
         return issues
 
     # No make_feedback_prompt: this is a detect-and-die gate, not a re-drive

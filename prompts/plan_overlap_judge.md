@@ -394,7 +394,9 @@ Apply the three universal disciplines and record them in the `confidence`
 object (required by schema):
 
 - **Falsification (`falsifiers_tested`):** for each collision, verify the
-  artifact exists and the two subtasks actually overlap on files.
+  artifact exists and the two subtasks actually overlap on files. One or
+  two sentences per item, citing a file/line rather than quoting large
+  blocks of text.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
 - **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the

@@ -4340,7 +4340,7 @@ regardless of `make_feedback_prompt`.
 | `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). Its free-text fields carry length caps: `basis` is capped at `_CONFIDENCE_BASIS_MAX_LENGTH` (2000 chars) and each `falsifiers_tested`/`contradictions_reconciled` array item at `_CONFIDENCE_LIST_ITEM_MAX_LENGTH` (500 chars) — a mitigation for `anthropics/claude-code#49747` (open, unfixed): the `claude` CLI intermittently corrupts a `StructuredOutput` tool call (valid JSON switching mid-payload into legacy XML `<parameter name="...">` tags) correlated with the length of a single tool-call string argument. Observed directly in run `d8302c0d46d8...` (barnacle, 2026-07-31): the raw `__unparsedToolInput` capture showed the corruption starting exactly where the (then-uncapped) `confidence.basis` field's ~16KB of prose began. The cap reduces trigger frequency; it does not fix the upstream CLI bug — revisit once #49747 closes. |
 
 ### Per-worker mechanical checks
 
@@ -4834,13 +4834,33 @@ contract). Persists to `state.data["classification_coverage_gate"]`.
 `SCHEMAS["wiring_judge"]` — required fields: `plan_reviewed` (boolean),
 `wiring_defects` (array of `{kind: enum[missing_requires, missing_provides,
 broken_by_merge, broken_by_drop, orphaned_dependent], sid (string), tag_or_dep
-(string), concrete_reason (string)}` — non-empty ⇒ gate), `rationale`
-(string). The *semantic* half of the plan-wiring check (the *structural* half
-is the deterministic `check_plan_wiring`, below); wired as `phase_wiring_gate`
-before `validate_plan` — **detect-and-die, single pass**: a non-empty
-`wiring_defects` `die()`s immediately with the concrete defect named (the
-reconciler cannot mechanically invent a missing edge, so no re-drive). Persists
-to `state.data["wiring_gate"]`.
+(string), concrete_reason (string), severity: enum[live_defect,
+latent_risk]}` — a `live_defect` entry ⇒ gate; a `latent_risk` entry is
+logged as a warning and never gates), `rationale` (string). The *semantic*
+half of the plan-wiring check (the *structural* half is the deterministic
+`check_plan_wiring`, below); wired as `phase_wiring_gate` before
+`validate_plan` — **detect-and-die, single pass**: a `live_defect` entry
+`die()`s immediately with the concrete defect named (the reconciler cannot
+mechanically invent a missing edge, so no re-drive). Persists to
+`state.data["wiring_gate"]`.
+
+**`severity` (added after run `d8302c0d46d8...`, barnacle, 2026-07-31):**
+before this field existed, `phase_wiring_gate`'s `_check()` gated on any
+`wiring_defects` entry carrying a non-empty `concrete_reason`/`tag_or_dep`,
+with no way to read the judge's own confidence. In that run the judge's
+`rationale` explicitly called the flagged item "a latent fragility rather
+than a live defect... low-confidence... not a true missing edge" — a
+transitive `requires`/`depends_on` chain (A→B→C) that resolved correctly
+as written, flagged only as fragile to a *future* merge/drop of the
+intermediate subtask — and the gate `die()`d anyway, since the only signal
+it read was reason/tag presence, never the judge's stated confidence. This
+was the CLAUDE.md structured-output principle inverted: the gap wasn't
+Python parsing prose, it was that the judge's judgment had nowhere
+structured to go. `severity` gives it one. `live_defect` = the plan as
+written will actually misbehave; `latent_risk` = correct today, fragile to
+a plausible future edit. Only `live_defect` gates; a mixed list still
+gates on its `live_defect` entries (severity narrows what counts as a
+defect, it is not a per-entry bypass).
 
 `SCHEMAS["provision_judge"]` — required fields: `recipe_reviewed` (boolean),
 `recipe_failures` (array of `{kind: enum[missing_break_system_packages,
@@ -7439,7 +7459,7 @@ post-run operation performed by the judge and heal skills.
 | `output_tokens` | int | `usage.output_tokens` from the CLI envelope |
 | `latency_ms` | int | wall-clock milliseconds from subprocess start to return |
 | `success` | bool | whether the call produced a schema-valid result (false on WorkerError or schema retry exhaustion) |
-| `failure_kind` | str \| null | why a call failed, or `null` on success. Derived at the capture site by `_classify_failure_kind` from the returned envelope: `api_error` (with `:auth`/`:quota`/`:overload` suffix for `api_error_status` 401/429/529, or `:transport` for a mid-stream connection drop — `terminal_reason=api_error` with a null status, e.g. "Connection closed mid-response"), `incomplete` (non-`completed` `terminal_reason`, e.g. `--max-turns`), or `schema_parse_failed` (returned but output failed schema validation — the dominant case). **Known gap:** rate-limit / out-of-credits / hard-crash failures raise `RateLimitedExit`/`WorkerError` past the capture block, so no record is written for them and `failure_kind` cannot cover them. |
+| `failure_kind` | str \| null | why a call failed, or `null` on success. Derived at the capture site by `_classify_failure_kind` from the returned envelope: `api_error` (with `:auth`/`:quota`/`:overload` suffix for `api_error_status` 401/429/529, or `:transport` for a mid-stream connection drop — `terminal_reason=api_error` with a null status, e.g. "Connection closed mid-response"), `incomplete` (non-`completed` `terminal_reason`, e.g. `--max-turns`), `malformed_tool_call` (sub-case of the next bucket: the CLI's own `StructuredOutput`-tool-call-parse-failure diagnostic text — `InputValidationError: ... could not be parsed as JSON` or a raw `__unparsedToolInput` capture — matched via `_is_malformed_tool_call` on a fixed CLI marker string, distinct from an ordinary schema-CONTENT mismatch; see `anthropics/claude-code#49747` and the `_confidence_schema` entry above), or `schema_parse_failed` (returned but output failed schema validation, no CLI-parse-failure marker — the dominant case). **Known gap:** rate-limit / out-of-credits / hard-crash failures raise `RateLimitedExit`/`WorkerError` past the capture block, so no record is written for them and `failure_kind` cannot cover them; `malformed_tool_call` usually self-corrects *within* a worker's own session (the CLI retries the tool call internally) before ever reaching this capture site, so most occurrences are invisible even to this tag — it only fires for the rarer case where the corruption survives to the final envelope. |
 | `cgroup_applied` | bool | whether per-worker cgroup memory/PID containment was active for this spawn (`_CGROUP_PROBE_RESULT`); a run with this consistently `false` means the writable `/sys/fs/cgroup` mount did not propagate |
 | `ts` | str (ISO-8601) | UTC timestamp at the moment the line is written |
 
