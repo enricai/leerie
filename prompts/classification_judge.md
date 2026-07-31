@@ -63,6 +63,14 @@ genuinely tried to find a coverage gap and could not — that is the correct,
 common answer for a well-classified task. A fabricated miscategorization is
 worse than an honest empty array (it triggers a wasted re-classify).
 
+Report **every** coverage defect you find in this pass, not just the first
+one — `miscategorizations` is a list for exactly this reason. Each
+re-classify round is a limited, mechanically-bounded resource: naming only
+one missing category per round when several are actually missing wastes a
+round on each one individually and can exhaust the retry budget before the
+set ever becomes complete. If the set is missing two categories, report
+both `missing_category` entries in this same response.
+
 ## What to return
 
 ```json

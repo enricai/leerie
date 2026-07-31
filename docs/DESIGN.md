@@ -168,7 +168,14 @@ same deliverables — same files modified for the same reason — the classifier
 picks the single best-fitting label. The orchestrator surfaces a
 `SAME_WORK_RISK` advisory for category pairs that commonly over-classify
 (e.g. `bug-fixing` + `feature-implementation`); the classifier addresses it
-on its structured-feedback retry.
+on its structured-feedback retry. This advisory is a self-check the
+classifier can act on alone, and it yields to the independent
+`classification_judge`'s (§8) authoritative finding: once the judge has
+confirmed both categories in a flagged pair are genuinely required (a task
+can legitimately need all of `bug-fixing` + `feature-implementation` +
+`testing` at once), the advisory is suppressed for that pair on later
+re-classify rounds rather than re-litigated — see §8 *The CRITIC retry
+pattern's oscillation guard* for the incident this prevents.
 
 ---
 
@@ -4486,15 +4493,53 @@ round-0 fix for issue A can introduce issue B, whose round-1 fix
 reintroduces A, so the loop cycles between two "fixes" that individually
 resolve the flagged issue without ever converging, burning every
 remaining round before the caller's own exhaustion `die()` fires. The
-loop now tracks each round's issue set (keyed by a stable
-`LABEL: subject` signature, not the full issue string — free-form
-evidence prose regenerated each round would otherwise defeat exact-match
-comparison even for byte-identical underlying defects) and breaks early
-the moment a round's signature set repeats one already seen, rather than
-retrying blind through the remaining budget. This is strictly a
-faster-and-cheaper-failure change: a genuinely narrowing or novel issue
-set is never a repeat of an earlier one, so legitimate convergence is
-unaffected.
+loop tracks each round's issue set (keyed by a stable `LABEL: subject`
+signature, not the full issue string — free-form evidence prose
+regenerated each round would otherwise defeat exact-match comparison even
+for byte-identical underlying defects) and breaks early the moment a
+round's signature set is **exactly equal to** one already seen, rather
+than retrying blind through the remaining budget.
+
+The guard compares by exact equality, not by subset containment. An
+earlier version compared with `issue_set <= seen` (a round's signature
+set is a subset of — including equal to — some earlier round's), on the
+theory that "a genuinely shrinking or strictly different signature set is
+never a subset of a prior one." That theory is false: a round that fixes
+some of a prior round's issues and leaves the rest open produces a
+signature set that is *both* strictly shrinking *and* a proper subset of
+the prior round's — the ordinary shape of incremental convergence when a
+check reports more than one issue at once. Under the subset comparison,
+this legitimate partial progress was indistinguishable from a true
+repeat and aborted the loop mid-convergence. Reproduced and root-caused
+against a real incident (barnacle, 2026-07-31): a classification-gate run
+needing three categories at once (`bug-fixing` + `feature-implementation`
++ `testing`) never held all three simultaneously and died at gate
+exhaustion, even though each round was making genuine forward progress.
+Exact-equality comparison still catches the true A→B→A 2-round cycle
+(round 2's signature set exactly reproduces round 0's) while allowing a
+proper subset — strictly less information than a still-open prior round,
+which is progress, not a repeat — to keep retrying, bounded as always by
+`max_rounds`.
+
+The same incident also surfaced a second, compounding defect fixed
+alongside the guard: `check_classifier_output`'s `SAME_WORK_RISK`/
+`TEST_OWNERSHIP_RISK` advisories (§4, same-work test) fire unconditionally
+inside `phase_classify`'s own inner retry loop and could strip a category
+the independent `classification_judge` (§8) had just confirmed was
+required, because `phase_classification_gate`'s re-classify re-invokes
+`phase_classify` from scratch with no memory of what the judge had
+already vetted. `check_classifier_output` now accepts an accumulated
+`judge_confirmed` set (categories the judge has reviewed without a
+*concrete, evidenced* objection, or explicitly asked to add, across every
+round of the current gate call) and suppresses a same-work/test-ownership
+pair only when both its categories are judge-confirmed — the classifier's
+own self-check yields to the independent judge's authoritative finding
+(§8) instead of re-litigating it every round. "Without objection" applies
+the same anti-gaming evidence discipline as the gate's own `issues`
+list (a `spurious_category` entry with empty `concrete_work_evidence` is
+a vague claim the gate itself never gates on, so it must not silently
+exclude that category from confirmation either — a category the gate
+effectively ignored this round is still reviewed-without-real-objection).
 
 **Already-satisfied subtask elimination (the per-subtask sibling).** The
 cleared-but-empty state above is *whole-run*: it fires only when every planner

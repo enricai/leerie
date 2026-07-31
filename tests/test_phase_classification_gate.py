@@ -429,3 +429,198 @@ def test_fresh_state_unaffected_by_or_preservation(leerie, tmp_path):
     fix — nothing to OR-preserve when nothing was ever set."""
     st = _minimal_state(leerie, tmp_path)
     assert "likely_already_satisfied" not in st.data
+
+
+# === Regression: barnacle classification-gate exhaustion (2026-07-31) ======
+#
+# Real incident: a task genuinely needing all three of bug-fixing +
+# feature-implementation + testing cycled bug-fixing -> feature-implementation
+# -> bug-fixing,testing across 3 rounds, never holding all three at once, and
+# died at gate exhaustion. Root-caused to two compounding, independent
+# defects, each pinned by its own isolated test below (deliberately NOT one
+# combined end-to-end simulation with a hand-rolled "additive classifier"
+# stub: an earlier version of this test used exactly that shape and turned
+# out to be vacuous against BOTH fixes — the stub's own logic re-added
+# whatever a prior round had stripped, so it passed identically whether
+# either fix was present or reverted. Verified live: reverting either fix
+# individually left that version of the test still green. Two narrow,
+# directly-causal tests below replace it, each independently confirmed to
+# fail when its OWN target fix (and only that fix) is reverted.)
+
+def test_gate_survives_partial_progress_across_rounds(leerie, tmp_path, monkeypatch):
+    """Fix 1: _run_checked_loop's oscillation guard must not abort on a
+    round whose issues are a proper subset of an earlier round's — that is
+    genuine partial progress, not a repeat. Isolates the guard fix at the
+    phase_classification_gate layer by stubbing phase_classify directly
+    (mirrors this file's existing convention), so no classifier
+    self-check interaction is involved — only the gate's own outer
+    _run_checked_loop call is exercised.
+
+    Verified non-vacuous: reverting _run_checked_loop's `issue_set in
+    seen_issue_sets` back to `any(issue_set <= seen for seen in
+    seen_issue_sets)` makes this test die (SystemExit) at round 1 instead
+    of reaching round 2's clean pass — the round-1 issue set ({testing})
+    is a proper subset of round 0's ({feature-implementation, testing}),
+    which the old guard treated as a false repeat."""
+    st = _minimal_state(leerie, tmp_path)
+    judge_calls = {"n": 0}
+
+    async def fake_judge(**kwargs):
+        judge_calls["n"] += 1
+        if judge_calls["n"] == 1:
+            # Round 0: two miscategorizations at once.
+            return {"categories_reviewed": ["documentation"],
+                     "miscategorizations": [
+                         {"kind": "missing_category",
+                          "category": "feature-implementation",
+                          "concrete_work_evidence": "ev1"},
+                         {"kind": "missing_category", "category": "testing",
+                          "concrete_work_evidence": "ev2"}]}
+        if judge_calls["n"] == 2:
+            # Round 1: feature-implementation was fixed; testing is still
+            # open. {testing} is a proper subset of round 0's
+            # {feature-implementation, testing} — must NOT be treated as
+            # a repeat.
+            return {"categories_reviewed":
+                     ["documentation", "feature-implementation"],
+                     "miscategorizations": [
+                         {"kind": "missing_category", "category": "testing",
+                          "concrete_work_evidence": "ev3"}]}
+        # Round 2: clean.
+        return {"categories_reviewed":
+                 ["documentation", "feature-implementation", "testing"],
+                 "miscategorizations": []}
+
+    classify_calls = []
+
+    async def fake_phase_classify(*a, **k):
+        classify_calls.append(1)
+        if len(classify_calls) == 1:
+            st.data["categories"] = ["documentation", "feature-implementation"]
+        else:
+            st.data["categories"] = [
+                "documentation", "feature-implementation", "testing"]
+        st.save()
+        return {}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_judge)
+    monkeypatch.setattr(leerie, "phase_classify", fake_phase_classify)
+
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    assert routed is False, "must converge, not route to no-work"
+    assert judge_calls["n"] == 3, (
+        "must reach round 2's clean judge call — a false abort on the "
+        f"round-1 proper subset would stop at 2 calls, got {judge_calls['n']}")
+    assert st.data["categories"] == [
+        "documentation", "feature-implementation", "testing"]
+
+
+def test_judge_confirmed_prevents_same_work_risk_from_stripping_within_classify(
+        leerie, tmp_path, monkeypatch):
+    """Fix 2: check_classifier_output's SAME_WORK_RISK/TEST_OWNERSHIP_RISK
+    advisories must yield when both categories in a flagged pair are
+    judge-confirmed — otherwise phase_classify's own inner retry loop
+    keeps re-flagging a pair the independent classification_judge already
+    vetted, on every round, forever (bounded only by judgment_check_rounds).
+    Isolates the fix at the phase_classify layer directly (not through the
+    gate), since this defect lives entirely inside phase_classify's own
+    inner _run_checked_loop call.
+
+    Verified non-vacuous: calling phase_classify with judge_confirmed
+    omitted (the pre-fix default behavior) against the identical classifier
+    stub makes SAME_WORK_RISK fire every round (the classifier keeps
+    proposing the same pair, unaware anything is wrong), running 2 rounds
+    before the loop's own repeat-detection aborts it — versus 1 round when
+    judge_confirmed covers the pair and the advisory never fires at all."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["categories"] = ["bug-fixing"]
+    st.save()
+    calls = {"n": 0}
+
+    async def stub(**kwargs):
+        calls["n"] += 1
+        # Classifier keeps proposing the same pair every round — it has no
+        # reason to change since it isn't given the judge's confirmation
+        # through any other channel in this isolated test.
+        return {"categories": ["bug-fixing", "feature-implementation"]}
+
+    monkeypatch.setattr(leerie, "claude_p", stub)
+    models = dict(MODELS, classifier="sonnet")
+    efforts = dict(EFFORTS, classifier="medium")
+
+    result = asyncio.run(leerie.phase_classify(
+        "task", st, _caps(leerie), False, models, efforts,
+        judge_confirmed=frozenset({"bug-fixing", "feature-implementation"})))
+
+    assert calls["n"] == 1, (
+        "with the pair judge-confirmed, SAME_WORK_RISK must never fire, so "
+        f"the loop accepts round 0 immediately: got {calls['n']} calls")
+    assert st.data["categories"] == ["bug-fixing", "feature-implementation"]
+
+
+def test_vague_spurious_category_does_not_block_implicit_confirmation(
+        leerie, tmp_path, monkeypatch):
+    """A spurious_category entry with empty concrete_work_evidence is a
+    vague, ungated claim — it never surfaces in the gate's own `issues`
+    (same anti-gaming rule as missing_category), so it must not silently
+    exclude that category from judge_confirmed's implicit-confirmation-via-
+    categories_reviewed path either: a category the gate effectively
+    ignored this round (the objection was too vague to gate on) must still
+    count as reviewed-without-real-objection.
+
+    Made directly observable (not just "doesn't gate", which
+    test_vague_miscategorization_does_not_gate above already covers for
+    missing_category) by inspecting the judge_confirmed set actually
+    passed into the re-invoked phase_classify on a round that DOES gate
+    (a real missing_category alongside the vague spurious one) — proving
+    the taint doesn't leak forward via judge_confirmed's cross-round
+    accumulation. Verified non-vacuous: dropping this fix's
+    `and (m.get("concrete_work_evidence") or "").strip()` guard on the
+    `spurious` set (leerie.py ~13945) makes 'feature-implementation'
+    absent from the captured judge_confirmed set below."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["categories"] = ["bug-fixing", "feature-implementation"]
+    st.save()
+
+    judge_calls = {"n": 0}
+    captured_confirmed = {}
+
+    async def fake_judge(**kwargs):
+        judge_calls["n"] += 1
+        if judge_calls["n"] == 1:
+            return {"categories_reviewed":
+                     ["bug-fixing", "feature-implementation"],
+                     "miscategorizations": [
+                         # Vague: no evidence — must not gate, must not taint.
+                         {"kind": "spurious_category",
+                          "category": "feature-implementation",
+                          "concrete_work_evidence": ""},
+                         # Real: gates, drives a second round.
+                         {"kind": "missing_category", "category": "testing",
+                          "concrete_work_evidence": "real evidence"}]}
+        return {"categories_reviewed":
+                 ["bug-fixing", "feature-implementation", "testing"],
+                 "miscategorizations": []}
+
+    async def fake_phase_classify(replan_task, s, caps, clarify, models,
+                                    efforts, judge_confirmed=frozenset()):
+        captured_confirmed["set"] = set(judge_confirmed)
+        st.data["categories"] = ["bug-fixing", "feature-implementation", "testing"]
+        st.save()
+        return {}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_judge)
+    monkeypatch.setattr(leerie, "phase_classify", fake_phase_classify)
+
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    assert routed is False
+    assert captured_confirmed["set"] == {
+        "bug-fixing", "feature-implementation", "testing"}, (
+        "feature-implementation (implicitly reviewed, only vaguely "
+        "objected to) must still be judge_confirmed alongside bug-fixing "
+        "(implicit) and testing (explicit missing_category): got "
+        f"{captured_confirmed['set']}")

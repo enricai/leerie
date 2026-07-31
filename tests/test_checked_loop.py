@@ -464,8 +464,8 @@ def test_loop_does_not_falsely_trigger_on_monotonic_growth(leerie):
 def test_loop_does_not_falsely_trigger_on_shrinking_issue_set(leerie):
     """A round whose issue set is a genuine subset of nothing seen before
     (fewer, different-signature issues than any prior round) must not
-    trigger — the guard only fires when a round's issues are already
-    fully contained in some earlier round's issues."""
+    trigger — the guard only fires when a round's issues exactly repeat
+    (not merely overlap with) some earlier round's issues."""
     calls = [0]
 
     async def invoke():
@@ -484,6 +484,80 @@ def test_loop_does_not_falsely_trigger_on_shrinking_issue_set(leerie):
         make_feedback_prompt=_noop_feedback))
     assert calls[0] == 3
     assert not any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_does_not_falsely_trigger_on_genuine_partial_progress(leerie):
+    """Regression pin for a real production incident (barnacle
+    classification-gate exhaustion, 2026-07-31): round 0 flags {A, B};
+    round 1's fix resolves A but B is still open, so round 1's issue set
+    is {B} — a non-empty PROPER SUBSET of round 0's {A, B}, not a repeat.
+
+    Before the fix, the guard's `issue_set <= seen` check treated any
+    subset relationship as a repeat and aborted here, even though this is
+    ordinary incremental convergence (fewer open issues, not the same
+    issues coming back). The guard must only abort on an EXACT repeat of
+    a previously seen issue-signature set, never on a proper subset — a
+    proper subset is strictly less information than the round it's a
+    subset of, which is forward progress, not oscillation.
+
+    This is the case `test_loop_does_not_falsely_trigger_on_shrinking_issue_set`
+    above is docstring-named for but does not actually test: that test's
+    round-2 issue (`ISSUE_D`) is DISJOINT from round 1's issues, not a
+    proper subset of them, so it never exercised the `<=` comparison this
+    bug lived in. Verified: reverting the `issue_set in seen_issue_sets`
+    fix back to `any(issue_set <= seen for seen in seen_issue_sets)` fails
+    this test (the loop wrongly stops at round 1, calls[0] == 2)."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        if r["n"] == 1:
+            return ["ISSUE_A: one — evidence", "ISSUE_B: two — evidence"]
+        if r["n"] == 2:
+            # A genuinely fixed; B still open. {B} is a proper subset of
+            # {A, B} — must NOT be treated as a repeat.
+            return ["ISSUE_B: two — different evidence text this round"]
+        return []  # round 3: B also fixed, clean
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=5,
+        make_feedback_prompt=_noop_feedback))
+    assert calls[0] == 3, (
+        "must continue past round 1's partial fix and reach the clean "
+        f"round 2: {calls[0]} invocations")
+    assert not any("repeats an earlier round" in w for w in warnings)
+
+
+def test_loop_still_catches_exact_repeat_of_a_shrunk_set(leerie):
+    """Companion to the partial-progress test above: once a round's issue
+    set has genuinely shrunk to {B}, a LATER round reproducing that exact
+    {B} again (not a further subset, the identical set) is a true
+    stall/repeat and must still abort — the fix narrows the guard to
+    exact-match, it does not disable it."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        if r["n"] == 1:
+            return ["ISSUE_A: one — ev1", "ISSUE_B: two — ev2"]
+        if r["n"] == 2:
+            return ["ISSUE_B: two — ev3"]  # partial progress, allowed through
+        # round 3: identical signature set to round 2 — a true repeat now.
+        return ["ISSUE_B: two — ev4-different-prose"]
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=6,
+        make_feedback_prompt=_noop_feedback))
+    assert calls[0] == 3, (
+        f"must stop at round 2 (exact repeat of round 1's shrunk {{B}} "
+        f"set): {calls[0]} invocations")
+    assert any("repeats an earlier round" in w for w in warnings)
 
 
 def test_loop_oscillation_guard_respects_worker_error_rounds(leerie):

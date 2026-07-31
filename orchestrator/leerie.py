@@ -5401,8 +5401,24 @@ def _confidence_issues(
     return out
 
 
-def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
-    """Thin mechanical checks on the classifier's category selection."""
+def check_classifier_output(
+        result: dict, repo_root: Path,
+        judge_confirmed: frozenset[str] = frozenset()) -> list[str]:
+    """Thin mechanical checks on the classifier's category selection.
+
+    `judge_confirmed` (default empty — no behavior change for the first
+    classify call or any caller other than `phase_classification_gate`'s
+    re-classify loop): categories the independent `classification_judge`
+    has already vetted as required for this task, across every round of
+    the current gate call (see `phase_classification_gate`'s
+    accumulation). The `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` advisories
+    below are self-checks the classifier can act on alone; they must
+    yield when BOTH categories in a flagged pair are judge-confirmed,
+    since the independent judge is the authoritative signal (DESIGN §8)
+    and re-flagging a pair it already vetted would undo its finding on
+    the very next re-classify round — the tug-of-war that let a
+    3-category task (bug-fixing + feature-implementation + testing)
+    oscillate indefinitely without ever holding all three at once."""
     issues: list[str] = []
     cats = result.get("categories", [])
 
@@ -5447,7 +5463,8 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
     ]
     cats_set = set(cats)
     for a, b in _SAME_WORK_RISK_PAIRS:
-        if a in cats_set and b in cats_set:
+        if a in cats_set and b in cats_set and not (
+                a in judge_confirmed and b in judge_confirmed):
             issues.append(
                 f"SAME_WORK_RISK: {a!r} and {b!r} both selected — "
                 "these categories often describe the same intent "
@@ -5472,7 +5489,8 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
         "bug-fixing", "feature-implementation", "refactoring")
     if "testing" in cats_set:
         for code_cat in _TEST_OWNERSHIP_RISK_CODE_CATS:
-            if code_cat in cats_set:
+            if code_cat in cats_set and not (
+                    code_cat in judge_confirmed and "testing" in judge_confirmed):
                 issues.append(
                     f"TEST_OWNERSHIP_RISK: {code_cat!r} and 'testing' both "
                     "selected — the two planners run blind to each other and "
@@ -13724,10 +13742,16 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
 # =========================================================================
 async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
                          models: dict[str, str],
-                         efforts: dict[str, str | None]) -> dict:
+                         efforts: dict[str, str | None],
+                         judge_confirmed: frozenset[str] = frozenset()) -> dict:
     """Phase 1 (classify), which also produces the Clarify sub-step's
     intent questions: classify the task and surface only genuinely
-    underivable (intent-level) questions."""
+    underivable (intent-level) questions.
+
+    `judge_confirmed` (default empty — no behavior change for the initial
+    classify call): see `check_classifier_output`'s docstring. Passed
+    through unchanged from `phase_classification_gate`'s re-classify
+    loop when this function is re-invoked mid-gate."""
     log("phase 1: classifying task")
     st.data["current_phase"] = "phase 1: classify"
     st.save()
@@ -13757,7 +13781,8 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
 
     result, gate_warnings = await _run_checked_loop(
         invoke=_invoke,
-        check=lambda r: check_classifier_output(r, repo_root),
+        check=lambda r: check_classifier_output(
+            r, repo_root, judge_confirmed=judge_confirmed),
         name="classifier",
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_feedback,
@@ -13868,6 +13893,22 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     repo_root = Path(os.getcwd())
     sys_prompt = load_prompt("classification_judge")
 
+    # Accumulated across every round of this gate call: every category the
+    # independent judge has vetted as belonging in the set, so a re-classify
+    # round's own inner self-check (check_classifier_output's
+    # SAME_WORK_RISK/TEST_OWNERSHIP_RISK) never undoes what this gate's
+    # authoritative judge already confirmed. Two sources, unioned:
+    #   - categories_reviewed minus any category the judge flagged
+    #     spurious_category (implicit confirmation via review-without-
+    #     objection);
+    #   - every category named in a missing_category entry (explicit
+    #     confirmation that it belongs, once added).
+    # OR-accumulated like likely_already_satisfied above: a later round
+    # reviewing a narrower set must not retract an earlier round's
+    # confirmation of a category that simply wasn't up for debate that
+    # round.
+    judge_confirmed: set[str] = set()
+
     async def _invoke_judge() -> dict:
         st.bump_workers(caps)
         cats = st.data.get("categories") or []
@@ -13900,7 +13941,26 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     def _check(judge_result: dict) -> list[str]:
         last_judge[0] = judge_result
         issues: list[str] = []
-        for m in judge_result.get("miscategorizations") or []:
+        miscats = judge_result.get("miscategorizations") or []
+        # Same anti-gaming discipline as the issues loop below: a
+        # spurious_category entry with no concrete_work_evidence is a vague,
+        # ungated claim (never surfaces in `issues`), so it must not silently
+        # block that category from implicit confirmation either — otherwise
+        # a category the gate effectively ignored this round could still be
+        # excluded from judge_confirmed on a LATER round's accumulation.
+        spurious = {
+            (m.get("category") or "").strip()
+            for m in miscats
+            if isinstance(m, dict) and m.get("kind") == "spurious_category"
+            and (m.get("concrete_work_evidence") or "").strip()
+        }
+        # Implicit confirmation: every reviewed category the judge did NOT
+        # object to via a spurious_category entry.
+        for cat in judge_result.get("categories_reviewed") or []:
+            cat = (cat or "").strip()
+            if cat and cat not in spurious:
+                judge_confirmed.add(cat)
+        for m in miscats:
             if not isinstance(m, dict):
                 continue
             cat = (m.get("category") or "").strip()
@@ -13910,6 +13970,11 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             # dropped (mirrors the completeness gate's concrete_case rule).
             if not cat or not ev:
                 continue
+            if m.get("kind") == "missing_category":
+                # Explicit confirmation: the judge itself asked for this
+                # category, so it must never be stripped by the classifier's
+                # own inner self-check on the next round.
+                judge_confirmed.add(cat)
             issues.append(
                 f"MISCATEGORIZATION ({m.get('kind', 'miscategorization')}): "
                 f"{cat} — {ev}")
@@ -13918,15 +13983,22 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     async def _on_feedback(fb: str) -> dict:
         # Re-classify with the miscategorizations folded into the task, so the
         # fresh classifier call sees why its category set was rejected.
+        confirmed_note = (
+            "\n\nThe following categories have already been independently "
+            "confirmed as required by this review — keep every one of them "
+            f"in your category set: {sorted(judge_confirmed)}."
+            if judge_confirmed else ""
+        )
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — an independent review of your previous classification "
             f"found it miscategorized the work:\n{fb}\n"
             "Re-classify so the category set covers exactly the work this task "
             "requires — add every category the work needs, drop any the work "
-            "contradicts."
+            "contradicts." + confirmed_note
         )
-        await phase_classify(replan_task, st, caps, clarify, models, efforts)
+        await phase_classify(replan_task, st, caps, clarify, models, efforts,
+                              judge_confirmed=frozenset(judge_confirmed))
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
@@ -20249,13 +20321,26 @@ async def _run_checked_loop(
     LLM-regenerated evidence prose after an em dash that differs between
     rounds even for the identical underlying defect, so comparing full
     strings would never actually detect a real cycle). If a later
-    round's signature set is a non-empty subset of an already-seen
-    earlier round's signature set, that is not forward progress — it is
-    a repeat of a problem already "fixed" once — so stop immediately
-    instead of retrying blind. A genuinely shrinking or strictly
-    different signature set is never a subset of a prior one (unless
-    truly identical, which is the same non-convergence signal), so this
-    cannot fire on legitimate convergence."""
+    round's signature set is EXACTLY EQUAL to an already-seen earlier
+    round's signature set, that is a true repeat/cycle (the fixed-then-
+    reintroduced case above) — stop immediately instead of retrying
+    blind.
+
+    A proper SUBSET is deliberately NOT treated the same as a repeat: a
+    round whose issues are a non-empty proper subset of an earlier
+    round's issues represents genuine partial progress (some issues from
+    that earlier round were fixed; the rest are still open), which is
+    the ordinary shape of convergence whenever a check reports more than
+    one issue and a retry only fixes some of them. An earlier version of
+    this guard aborted on any subset relationship, not just exact
+    equality, and its docstring claimed "a genuinely shrinking ... set is
+    never a subset of a prior one" — that claim is false by construction
+    (round 0 `{A, B}`, round 1 `{B}` is a shrinking set AND a proper
+    subset), and the incorrect guard could kill a caller mid-convergence
+    on legitimate, still-improving retries. Equality is the correct
+    signal for "this is not new information"; a strict subset is new
+    information (fewer open issues) and must be allowed to keep
+    retrying, bounded as always by ``max_rounds``."""
     warnings: list[str] = []
     last_res: dict | None = None
     seen_issue_sets: list[frozenset[str]] = []
@@ -20311,11 +20396,11 @@ async def _run_checked_loop(
             break
 
         issue_set = frozenset(_issue_signature(issue) for issue in issues)
-        if any(issue_set <= seen for seen in seen_issue_sets):
+        if issue_set in seen_issue_sets:
             warnings.append(
                 f"{name} round {rnd}: issue set repeats an earlier round's "
-                "issues — not converging, aborting early instead of "
-                "burning the remaining rounds")
+                "issues exactly — not converging, aborting early instead "
+                "of burning the remaining rounds")
             break
         seen_issue_sets.append(issue_set)
 

@@ -175,6 +175,61 @@ class TestCheckClassifierOutput:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert not any("TEST_OWNERSHIP_RISK" in i for i in issues)
 
+    # --- judge_confirmed suppression (regression: barnacle classification-
+    # gate exhaustion, 2026-07-31 — the independent classification_judge
+    # would confirm a category the classifier's own SAME_WORK_RISK/
+    # TEST_OWNERSHIP_RISK self-check kept stripping on the next re-classify
+    # round, oscillating forever) ---------------------------------------- #
+
+    def test_judge_confirmed_suppresses_same_work_risk(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "feature-implementation"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path,
+            judge_confirmed=frozenset({"bug-fixing", "feature-implementation"}))
+        assert not any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_judge_confirmed_suppresses_test_ownership_risk(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "testing"], "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path,
+            judge_confirmed=frozenset({"bug-fixing", "testing"}))
+        assert not any("TEST_OWNERSHIP_RISK" in i for i in issues)
+
+    def test_judge_confirmed_partial_pair_does_not_suppress(self, leerie, tmp_path):
+        # Only ONE member of the pair is judge-confirmed — the advisory
+        # must still fire, since the pair as a whole was never vetted.
+        result = {"categories": ["bug-fixing", "feature-implementation"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path, judge_confirmed=frozenset({"bug-fixing"}))
+        assert any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_judge_confirmed_does_not_suppress_unconfirmed_pair(self, leerie, tmp_path):
+        # judge_confirmed only covers bug-fixing/feature-implementation;
+        # an unrelated SAME_WORK_RISK pair (bug-fixing/refactoring) present
+        # in the same categories list must still fire.
+        result = {"categories": ["bug-fixing", "feature-implementation",
+                                  "refactoring"], "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path,
+            judge_confirmed=frozenset({"bug-fixing", "feature-implementation"}))
+        assert not any(
+            "SAME_WORK_RISK: 'bug-fixing' and 'feature-implementation'" in i
+            for i in issues)
+        assert any(
+            "SAME_WORK_RISK: 'bug-fixing' and 'refactoring'" in i
+            for i in issues)
+
+    def test_judge_confirmed_default_is_empty_no_behavior_change(self, leerie, tmp_path):
+        # Regression pin: omitting judge_confirmed entirely (every caller
+        # except phase_classification_gate's re-classify loop) must behave
+        # exactly as before this parameter was added.
+        result = {"categories": ["bug-fixing", "feature-implementation"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("SAME_WORK_RISK" in i for i in issues)
+
 
 # --- check_planner_output ---------------------------------------------- #
 
