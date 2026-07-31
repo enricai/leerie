@@ -5765,8 +5765,39 @@ fi
 # This fires WHENEVER the token is set, independent of which credential branch
 # resolves below — it previously lived only in the `else` arm and was
 # unreachable when the token successfully staged into the file.
+#
+# -- CLAUDE_CODE_OAUTH_TOKENS (plural, comma-separated) supersedes the --
+# singular CLAUDE_CODE_OAUTH_TOKEN (DESIGN §6 *Multi-token rotation*).
+# Trim whitespace around each entry and drop empty ones; reassign the
+# singular var to the list's first element so every existing branch below
+# (mcpOAuth-guard, die()-fast diagnosis, _check_claude_credential_ttl)
+# applies unchanged to whichever token seeds the staged .credentials.json
+# — the orchestrator inside the container probes/selects across the full
+# list independently once it has CLAUDE_CODE_OAUTH_TOKENS itself. A
+# single-element list behaves exactly like the singular var alone.
+if [ -n "${CLAUDE_CODE_OAUTH_TOKENS:-}" ]; then
+  _leerie_token_list=()
+  _leerie_old_ifs="$IFS"
+  IFS=','
+  for _leerie_raw_tok in $CLAUDE_CODE_OAUTH_TOKENS; do
+    IFS="$_leerie_old_ifs"
+    # trim leading/trailing whitespace
+    _leerie_tok="${_leerie_raw_tok#"${_leerie_raw_tok%%[![:space:]]*}"}"
+    _leerie_tok="${_leerie_tok%"${_leerie_tok##*[![:space:]]}"}"
+    [ -n "$_leerie_tok" ] && _leerie_token_list+=("$_leerie_tok")
+    IFS=','
+  done
+  IFS="$_leerie_old_ifs"
+  if [ "${#_leerie_token_list[@]}" -gt 0 ]; then
+    CLAUDE_CODE_OAUTH_TOKEN="${_leerie_token_list[0]}"
+  fi
+  unset _leerie_token_list _leerie_old_ifs _leerie_raw_tok _leerie_tok
+fi
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+fi
+if [ -n "${CLAUDE_CODE_OAUTH_TOKENS:-}" ]; then
+  AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKENS=$CLAUDE_CODE_OAUTH_TOKENS")
 fi
 if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
    && [ -n "$_CLAUDE_CREDS_JSON" ]; then
@@ -6675,6 +6706,16 @@ print(json.dumps(sys.argv[1:]))
         _bedrock_bearer_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
         _bedrock_profile_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_PROFILE")"
         _bedrock_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_BEDROCK_REGION")"
+        # CLAUDE_CODE_OAUTH_TOKEN(S) — same JSON-encoding discipline as the
+        # Bedrock values above, load-bearing for the same reason: an opaque
+        # token is exactly the kind of value likely to contain `"`/`\` that
+        # would break out of a raw Python string literal on this remote
+        # machine. Forwarded into child_env below so the in-machine
+        # orchestrator's multi-token probe/rotation (DESIGN §6 *Multi-token
+        # rotation*) sees the full list, independent of which single token
+        # seed-auth.sh staged into .credentials.json.
+        _oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
+        _oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
         _launch_script="$(cat <<PY
 import fcntl, os, pwd, subprocess, sys, time
 argv = ${_launch_argv_json}
@@ -6764,6 +6805,15 @@ elif "${_BEDROCK_ACTIVE}" == "true":
         child_env["AWS_PROFILE"] = ${_bedrock_profile_json}
     if ${_bedrock_region_json}:
         child_env["AWS_REGION"] = ${_bedrock_region_json}
+# CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty JSON string
+# is falsy, same no-op-when-unset behavior as the Bedrock vars above) so the
+# in-machine orchestrator's multi-token probe/rotation sees the full list
+# CLAUDE_CODE_OAUTH_TOKENS carries, not just the single token seed-auth.sh
+# staged into .credentials.json.
+if ${_oauth_token_json}:
+    child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_oauth_token_json}
+if ${_oauth_tokens_json}:
+    child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_oauth_tokens_json}
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not
@@ -7162,6 +7212,12 @@ import json, sys
 print(json.dumps(sys.argv[1:]))
 ' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
           _ec2_host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
+          # JSON-encode before substitution -- same discipline as the Fly
+          # launch heredoc above (leerie:6695-6710): an opaque token is
+          # exactly the kind of value likely to contain `"`/`\` that would
+          # break out of a raw Python string literal on this remote machine.
+          _ec2_oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
+          _ec2_oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
           _ec2_launch_script="$(cat <<PY
 import fcntl, os, pwd, subprocess, sys, time
 argv = ${_ec2_launch_argv_json}
@@ -7198,6 +7254,14 @@ child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = "${_ec2_host_tz}"
+# CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty JSON string
+# is falsy) so the in-machine orchestrator's multi-token probe/rotation
+# (DESIGN §6 *Multi-token rotation*) sees the full list, not just the single
+# token ec2_seed_auth staged into .credentials.json.
+if ${_ec2_oauth_token_json}:
+    child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_ec2_oauth_token_json}
+if ${_ec2_oauth_tokens_json}:
+    child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_ec2_oauth_tokens_json}
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")

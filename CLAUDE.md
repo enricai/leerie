@@ -330,6 +330,20 @@ export AWS_BEARER_TOKEN_BEDROCK=<token>
 export AWS_REGION=us-east-1              # optional, forwarded when set
 ./leerie "task"
 
+# Reduce mid-run quota exhaustion by giving leerie multiple subscription
+# OAuth tokens to rotate across (DESIGN §6 *Multi-token rotation*).
+# CLAUDE_CODE_OAUTH_TOKENS (comma-separated) supersedes the singular
+# CLAUDE_CODE_OAUTH_TOKEN when set. At start, each token is probed for
+# remaining 5h/7d runway and the one with the most is selected — not
+# round-robin. If the active token gets rate-limited mid-run, leerie
+# rotates to another token with runway and continues in the same
+# container (no restart); if all tokens are limited, it waits for
+# whichever resets soonest. Probing is best-effort — an undocumented
+# endpoint failing never blocks the run, it just falls back to
+# react-on-429 with the first token.
+export CLAUDE_CODE_OAUTH_TOKENS=sk-ant-oat01-token-a,sk-ant-oat01-token-b
+./leerie "task"
+
 # Pin which model version the `--model <tier>` alias (sonnet/opus/haiku)
 # resolves to on Bedrock. leerie always invokes claude -p with an explicit
 # --model <tier> flag, never a raw model ID — and on Bedrock the Claude

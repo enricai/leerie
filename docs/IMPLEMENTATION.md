@@ -3514,6 +3514,147 @@ alongside `_is_auth_or_quota_failure` in `leerie.py`.
 
 Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 
+#### Multi-token rotation
+
+`CLAUDE_CODE_OAUTH_TOKENS` (comma-separated) supersedes the singular
+`CLAUDE_CODE_OAUTH_TOKEN` when set, per DESIGN §6 *Multi-token rotation*.
+Whitespace around each entry is trimmed and empty entries are dropped; a
+single-element list behaves exactly like the singular var.
+
+**Launcher.** Before the existing `_extract_claude_credentials_json` call,
+if `CLAUDE_CODE_OAUTH_TOKENS` is set and non-empty after parsing, `leerie`
+reassigns `CLAUDE_CODE_OAUTH_TOKEN` to the list's first element — a plain
+env-var reassignment, not a parallel credential-construction path, so the
+existing mcpOAuth-guard, die()-fast diagnosis, and
+`_check_claude_credential_ttl` in `_extract_claude_credentials_json`
+(above) apply unchanged to whichever token seeds the mounted
+`.credentials.json`. The launcher also forwards the raw
+`CLAUDE_CODE_OAUTH_TOKENS` value into the container as its own `-e
+CLAUDE_CODE_OAUTH_TOKENS=...`, alongside the existing single-token `-e`,
+so the orchestrator can probe/select across the full list independently
+of which token seeded the file. `scripts/remote/seed-auth.sh` and
+`scripts/remote/ec2-seed-auth.sh` mirror the same plural-forwarding as a
+sibling condition to their existing single-token fallback block.
+
+**Orchestrator — per-invocation env threading (the mechanism that makes
+rotation possible without a container restart).** `_invoke` takes an
+explicit `active_token: str | None = None` parameter. When given, it
+builds `worker_env = os.environ.copy()` (independent of the pre-existing
+`LEERIE_WORKER_DEBUG`-gated debug env, which still applies its own
+overrides on top) and sets
+`worker_env["CLAUDE_CODE_OAUTH_TOKEN"] = active_token` before
+`create_subprocess_exec(..., env=worker_env)`. Per the Claude CLI's own
+documented authentication precedence (`CLAUDE_CODE_OAUTH_TOKEN`
+outranks `.credentials.json`/Keychain subscription credentials
+unconditionally — see `code.claude.com/docs/en/authentication`,
+"Authentication precedence"), this env var alone is sufficient to steer
+which credential a given `claude -p` spawn uses; no rewrite of the
+mounted `.credentials.json` is needed on token switch. `claude_p`'s
+`_spawn` passes `active_token=st.data.get("active_oauth_token")` on
+every `_invoke` call; when unset (singular-var-only runs), `None` is
+passed and behavior is byte-identical to before this feature (the
+existing `env=None`/full-inherit path).
+
+**`active_oauth_token`** is a `State` field (`STATE_FIELDS`): the raw
+value of the token currently selected for this run. It is mutated via the
+ordinary `st.data[...] = value; st.save()` pattern and is never written
+to `calls.ndjson` or logged — only its fingerprint
+(`_token_fingerprint(token)`, a truncated `sha256` hex digest) appears in
+logs or telemetry.
+
+**Start-of-run probe + selection.** After `preflight()` returns and before
+`phase_classify`, if `CLAUDE_CODE_OAUTH_TOKENS` is present, each token is
+probed for remaining runway and the winner becomes
+`st.data["active_oauth_token"]`:
+
+- **Probe A** (tried first): `GET https://api.anthropic.com/api/oauth/usage`
+  with `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
+  and `User-Agent: claude-code/<version>` — omitting the User-Agent places
+  the request in an aggressively rate-limited bucket (persistent 429s);
+  with it, ~180s polling is safe (both behaviors externally corroborated,
+  not merely assumed). Returns `five_hour`/`seven_day` objects with
+  `utilization` on a **0–100** scale and `resets_at` as ISO-8601 with a
+  UTC offset, plus optional `seven_day_opus`/`seven_day_sonnet` sublimit
+  objects (`null` when no usage of that model has been recorded — treated
+  as zero usage, i.e. full runway, not as missing data). Requires
+  `user:profile` scope; a `user:inference`-scoped token (e.g. a `claude
+  setup-token` mint, which is what leerie itself uses) gets **403** here.
+- **Probe B** (403 fallback): `POST /v1/messages` with `max_tokens: 1` and
+  a one-character user message, reading the
+  `anthropic-ratelimit-unified-5h-utilization` / `-5h-reset` /
+  `-7d-utilization` / `-7d-reset` / `-5h-status` response headers.
+  **These headers use a different representation than Probe A's JSON
+  body**: utilization is a **0.0–1.0 fraction** and reset is **Unix epoch
+  seconds**, not the 0–100/ISO-8601 shape Probe A returns.
+  `_probe_token_usage` normalizes both probes onto one internal
+  representation (0.0–1.0 fraction, `datetime` reset) before returning, so
+  ranking never has to know which probe produced a given result.
+  `/v1/messages/count_tokens` does **not** carry these headers — a real
+  inference call is required.
+- **Ranking** (`_rank_tokens`): sorts by `min(1 − five_hour_util, 1 −
+  seven_day_util)` descending (accounting for the Opus sublimit, since
+  leerie's judgment workers default to Opus), tie-broken by furthest
+  `resets_at`. A token whose probe failed entirely (as opposed to a `null`
+  sub-field) sorts last but remains eligible.
+- **Cache**: each token's probe result is cached, keyed by
+  `_token_fingerprint(token)` (never the raw token), for
+  `caps["token_probe_cache_sec"]` (default 180s) — both the start-of-run
+  selection and mid-run failover below share this cache and never
+  re-probe a token whose cached result is still fresh.
+- **Best-effort, never a hard gate**: if every probe fails, the first
+  token in the list is selected and the run proceeds — probing never
+  `die()`s. A transient probe failure (timeout, connection error, 5xx, a
+  429 on the probe itself) logs quietly; a 2xx response missing an
+  expected field (endpoint contract drift — these are undocumented,
+  unstable endpoints) logs loudly at WARNING with the stable marker
+  `token-probe: endpoint contract drift` plus the missing field name, so
+  a silent shape change doesn't quietly degrade this feature to
+  "always pick the first token" with no signal. A 401/expired token is
+  logged as a real per-token dead-token signal, distinct from both of the
+  above.
+
+**Mid-run failover.** A rate-limited active token can reach `claude_p`
+through TWO independent surfaces, and both are covered by one shared
+helper, `_rotate_oauth_token_or_raise(st, caps, *, known_reset_at,
+raw_message, retry_fn)`:
+
+1. **Protocol-level**: a `rate_limit_event` stream event (an unexpected
+   `status`, i.e. outside the known-allowed set) is detected inside
+   `_invoke`'s own streaming loop and raises `RateLimitedExit` directly —
+   `_spawn` never returns an envelope at all for this case. `claude_p`'s
+   retry loop wraps `await _spawn(retry_note)` in
+   `try/except RateLimitedExit`, catching it *before* it can propagate to
+   `main()`'s single-token pause/auto-resume path. `out_of_credits=True`
+   bypasses rotation entirely and re-raises immediately unchanged — an
+   account-level exhaustion is not a per-token rate limit, and rotating
+   tokens would not help.
+2. **Envelope-level**: once `_spawn` returns a completed envelope, if it
+   is a rate-limit/quota failure (`_is_auth_or_quota_failure`, not
+   terminal-auth) and `CLAUDE_CODE_OAUTH_TOKENS` has more than one token,
+   the same helper is called again (checked between the terminal-auth
+   check and the tenacity backoff loop's entry).
+
+In both cases the helper: probes/ranks the *other* tokens (respecting the
+shared cache); if one has runway, switches `active_oauth_token` and
+retries the invocation immediately via the caller-supplied `retry_fn` —
+no re-exec, no container restart, strictly before any of
+`auth_retry_max_sec` is spent on a token already known to be exhausted.
+If every token is currently rate-limited, it picks the one with the
+soonest `resets_at` — preferring a live signal (`known_reset_at`, e.g. a
+just-caught `RateLimitedExit.reset_at` for the protocol-level path, which
+has no probe-cache entry to fall back on for the active token since it is
+deliberately excluded from the fresh probe/rank call) over a possibly
+stale or absent `_TOKEN_PROBE_CACHE` entry — and raises the existing
+`RateLimitedExit`, which the pre-existing `_sleep_then_reexec` reset-wait
+path picks up unchanged. A probe failure, or no probe data for any token,
+never raises from the helper itself (returns `None`); each call site
+falls through to its own pre-existing behavior (re-raising the caught
+exception, or continuing into the tenacity backoff loop, respectively).
+Terminal-auth failures are entirely unaffected by this feature — a
+dead/expired credential is not a rate limit and is never rotated.
+
+Maps to `DESIGN.md`: §6 *Multi-token rotation*.
+
 ---
 
 ## 4. Phase walkthrough (`leerie.py`)
@@ -4581,10 +4722,12 @@ selection. If all samples for a domain crash, the run aborts.
 Same resolution pattern as existing resolvers (CLI → env → TOML →
 default): `resolve_judgment_check_rounds`,
 `resolve_planner_check_rounds`,
-`resolve_implementer_confidence_retries`, `resolve_planner_samples`.
+`resolve_implementer_confidence_retries`, `resolve_planner_samples`,
+`resolve_token_probe_cache_sec`.
 Env vars: `LEERIE_JUDGMENT_CHECK_ROUNDS`,
 `LEERIE_PLANNER_CHECK_ROUNDS`,
-`LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES`, `LEERIE_PLANNER_SAMPLES`.
+`LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES`, `LEERIE_PLANNER_SAMPLES`,
+`LEERIE_TOKEN_PROBE_CACHE_SEC`.
 
 ---
 
@@ -4611,6 +4754,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. **Intentional provenance deviation:** unlike the per-worker cap, there is *no* CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint *before* the Python orchestrator (and its resolver machinery) starts, so a Python-side resolver could not set it in time; the env var is the single override knob. Best-effort: any read/write failure leaves the slice uncapped (prior behavior). Sets `memory.max` (RAM) only, not `memory.swap.max` — a capped slice may swap before the cgroup OOM fires, which still contains the pressure to the slice (no global OOM); bounding total RAM+swap via `memory.swap.max` is a possible future refinement. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container* (per-worker `-998` protection is only relative within the slice), instead of a VM-wide *global* OOM that would kill unprotected host-session processes — the `nerdctl` client especially — and orphan the container (wedging the run-dir flock). See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. Terminal auth failures (`_is_terminal_auth_failure`, below) never reach this loop. |
 | credential near-expiry warning threshold (`credential_expiry_warn_sec`, proposed 90 min) | 5400 s (90 min) | Launcher-side preflight (`_check_claude_credential_ttl`, staging block) run only when the resolved credential is a *subscription* token — the long-lived `$CLAUDE_CODE_OAUTH_TOKEN` has no `expiresAt` and is exempt. Parses `claudeAiOauth.expiresAt` (ms epoch) from the resolved JSON and compares to now, reusing the pattern at `scripts/remote/aws-credentials.sh:183-196`. Already expired → refuse to launch, print `claude /login`. Inside the threshold → warn with the exact expiry and point at `claude setup-token`, but still launch. `expiresAt` absent or malformed → proceed silently — this is a best-effort diagnostic, never a hard gate, since the 1-year token legitimately has no `expiresAt` at all. See DESIGN §6 *Credential strategy*. Never hard-code a TTL duration (community reports for the subscription token range 2–15h); `expiresAt` is the sole source of truth. |
+| multi-token probe cache floor (`token_probe_cache_sec`) | 180 s | `resolve_token_probe_cache_sec` (CLI → `LEERIE_TOKEN_PROBE_CACHE_SEC` env → `token_probe_cache_sec` in `leerie.toml` → default), same `_resolve_positive_int_pref` pattern as `resolve_confidence_rounds`. Minimum interval between re-probing a given token's usage/runway (§3 *Multi-token rotation*) — both start-of-run selection and mid-run failover share one cache keyed by `_token_fingerprint(token)`. Matches the interval community tooling around the same undocumented endpoint has independently converged on as safe against its aggressive per-token rate limiting. |
 | mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator, adherence gate, and the five independent adversarial verifiers (`classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `integration_judge` — DESIGN §8). Two families share this bound. **Feedback-driven** callers (those passing `make_feedback_prompt`: classifier, reconciler, provision, overlap judge, integrator, adherence gate, `classification_judge`, `task_coverage_judge`) run deterministic checks or an independent judge on the output and re-invoke with structured feedback if issues are found, cutting a round short of exhaustion when a round's issue signatures repeat an earlier round's — not new information, so retrying further is not forward progress (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). On exhaustion, proceed with best result + warnings (or `die()` for the adversarial-verifier gates among them, terminal on an unresolved defect) — except the classification gate, which routes to the cleared-but-empty terminal state instead of `die()`ing when the OR-accumulated `likely_already_satisfied` signal (set by any re-classify round within the gate call, not just the last) is `True` with evidence (DESIGN §8 *Reaching the cleared-but-empty state from classification*). **Detect-and-die, single-pass** callers (`wiring_judge`, `provision_judge`, `integration_judge` — no `make_feedback_prompt`, since none can mechanically fix a semantic defect it didn't itself reason through) stop at the first round that finds issues rather than retrying an unchanged payload; the oscillation guard does not apply to this path. Both families: CRITIC pattern (ICLR 2024). A round that raises `WorkerError` (infrastructure: PID exhaustion, OOM, a killed session) is retried against the same budget regardless of family — the re-invocation is a fresh `claude -p` session with a clean PID table — and only returns `None` if every round crashes. Any other exception is a leerie bug, not a flaky worker, and still abandons the loop immediately. |
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
 | implementer confidence retries (`implementer_confidence_retries`) | 2 | Separate from `subtask_continuations`. Orchestrator checks confidence scores + scope drift + unmet criteria on complete results and re-invokes as a continuation if issues found. |
@@ -7142,6 +7286,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `plans_after_coverage_gate` | list[dict] | the per-phase planning checkpoint for `phase_planning_coverage_gate` (post-task-coverage-gate `plans`, DESIGN §8 *Independent adversarial verification*). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_filters` | list[dict] | the per-phase planning checkpoint written after the off-tree (`filter_offtree_subtasks`) and already-satisfied (`filter_satisfied_subtasks`) phase-3 filters both complete — the filtered `plans` immediately before `schedule()`. Same absence/presence and resume-cursor semantics as `plans_after_classify`; this is the last `plans_after_*` checkpoint before `plan_snapshot`/`waves` take over as the resume cursor. |
 | `satisfied_probe_cache` | dict[str, dict] | per-subtask `satisfied_probe` verdicts (DESIGN §6 "The satisfied-probe sweep needs finer-than-phase granularity"; §8 *Already-satisfied subtask elimination*), keyed by subtask id. Each value is `{satisfied: bool, evidence: str, checked: [str], base_sha: str}` — `base_sha` is the base commit sha (`git rev-parse HEAD`) recorded at probe time. Written by `probe_one` as soon as its own verdict returns, for both `satisfied` and not-satisfied outcomes — not only in aggregate after the whole sweep's `gather` completes, so a pause mid-sweep does not lose already-decided subtasks. **Correctness-critical:** on `--resume`, a cached entry whose `base_sha` no longer matches the current `HEAD` is treated as absent and that subtask is re-probed — the base tree can move between a pause and a resume (e.g. a sibling run merging its own PR into the same base branch), and a stale hit could wrongly keep a subtask that is no longer satisfied or drop one that now is. A probe that crashes (`WorkerError`) is deliberately never cached — no verdict was actually reached, and caching "kept" for a crash would wrongly skip re-probing a subtask that was never really judged. |
+| `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). Set by `select_active_oauth_token` (the start-of-run probe/ranking sweep, run only when `CLAUDE_CODE_OAUTH_TOKENS` is present) and mutated by `claude_p`'s mid-run failover on a rate-limited active token. Absent/`None` when only the singular `CLAUDE_CODE_OAUTH_TOKEN` is in play — no rotation, and `_invoke`'s `active_token` param stays `None` (behavior byte-identical to before this feature). **The one sanctioned exception to this feature's secrets-hygiene rule**: the raw token is never written to `calls.ndjson`, `run.json`, or any log line (only its fingerprint is), but `state.json` is local-orchestrator-owned and already carries other operational data, so this field is the one place the raw active token persists at rest. |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |

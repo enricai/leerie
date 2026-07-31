@@ -276,6 +276,42 @@ def test_invoke_org_level_disabled_truncation_raises_workererror(
             verbosity="stream"))
 
 
+_EXCEEDED_STATUS_EVENT = {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+        "status": "exceeded", "resetsAt": 1783446600,
+        "rateLimitType": "five_hour",
+    },
+}
+
+
+def test_invoke_exceeded_status_raises_ratelimitedexit_not_out_of_credits(
+        leerie, leerie_dir, monkeypatch):
+    """The protocol-level rate-limit path DESIGN §6 *Multi-token rotation*
+    depends on (orchestrator/leerie.py:10610-10639): a `rate_limit_event`
+    whose `status` is outside the known-allowed set (here "exceeded", a
+    genuine per-token rate limit — NOT the out-of-credits overage latch
+    covered by the tests above) raises RateLimitedExit(out_of_credits=False)
+    with reset_at parsed from resetsAt, directly out of _invoke's
+    streaming loop before any result event. This is the exact exception
+    claude_p's mid-run token-rotation catch (see tests/test_token_failover.py
+    ::TestRotateOnProtocolLevelRateLimitedExit) must intercept."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps(_EXCEEDED_STATUS_EVENT),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=1))
+    with pytest.raises(leerie.RateLimitedExit) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="fit-judge-r0", leerie_dir=leerie_dir,
+            verbosity="stream"))
+    assert ei.value.out_of_credits is False
+    assert ei.value.reset_at is not None
+    assert ei.value.reset_at.timestamp() == 1783446600
+
+
 def test_invoke_overage_block_with_result_returns_envelope(
         leerie, leerie_dir, monkeypatch):
     """Control for the corpus runs that carried an exhaustion overage event

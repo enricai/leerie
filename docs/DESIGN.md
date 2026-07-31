@@ -2015,6 +2015,72 @@ When both are present, the bearer token wins, matching the Claude CLI's own
 credential-resolution order (its Bedrock client construction short-circuits
 SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is set).
 
+**Multi-token rotation reduces quota exhaustion the same way the
+long-lived token above reduces expiry risk — by picking the credential
+least likely to fail, rather than reacting after it does.** A single
+`CLAUDE_CODE_OAUTH_TOKEN` still has one shared 5-hour/7-day usage window;
+a long run (many workers, high `max_parallel`) can exhaust that window
+mid-run even though the token itself never expires. `leerie` supports
+`CLAUDE_CODE_OAUTH_TOKENS` — a comma-separated list of tokens — which
+**supersedes** the singular var when set:
+
+- **Start-of-run smart selection.** Each token's remaining runway (5h/7d
+  utilization, reset time, per-model weekly sublimits) is probed via the
+  same undocumented usage-telemetry surface Anthropic's own official
+  `/usage` view and Claude Code's statusline read internally: `GET
+  /api/oauth/usage` (`user:profile`-scoped tokens only) with a fallback,
+  for `user:inference`-scoped tokens such as a `claude setup-token` mint,
+  to reading the `anthropic-ratelimit-unified-*` headers off a minimal
+  (`max_tokens:1`) `/v1/messages` call. The token with the most runway is
+  selected before any worker spawns — not round-robin, since a
+  round-robin schedule would burn through a nearly-exhausted token at the
+  same rate as a fresh one.
+- **Mid-run failover.** If the active token gets rate-limited mid-run,
+  leerie rotates to another token with runway and **continues in the same
+  container** — no re-exec, no restart — by threading the active token
+  through each worker spawn's environment rather than relying on a
+  container-wide credential file. If every token is currently limited,
+  leerie picks the one whose window resets soonest and falls through to
+  the existing reset-wait auto-resume path (see *Auth failures split into
+  two classes* above) rather than pausing on whichever token happened to
+  fail. This covers **both** of the ways a rate limit reaches `claude_p`:
+  a completed envelope carrying a 401/429/529/auth-message, and the
+  protocol-level `rate_limit_event` stream event that raises
+  `RateLimitedExit` directly out of the streaming loop before any
+  envelope is ever produced — both surfaces get the identical rotation
+  chance rather than only the envelope path.
+
+**This is deliberately structured data in, deterministic Python out — no
+LLM worker** (§12, *prompts are advisory, code enforces*: this section's
+own principle). The probe endpoints return typed JSON fields and HTTP
+headers; ranking is `min(1 − 5h_utilization, 1 − 7d_utilization)` with a
+furthest-reset tie-break, computed the same way every time given the
+same inputs. There is nothing here for a judgment worker to interpret —
+introducing one would only add nondeterminism and cost to a comparison
+that plain Python already does correctly and cheaply.
+
+**Both probe endpoints are undocumented and explicitly best-effort.**
+Anthropic can change or remove either one without notice; every probe
+path is designed to degrade to "use the current/first token and react to
+the next 429" rather than fail the run. A probe response missing an
+expected field (contract drift, distinct from an ordinary transient
+failure like a timeout or a 5xx) is logged loudly, at WARNING, with a
+stable marker — the two failure classes are kept visually distinct
+specifically so that a silent endpoint-shape change doesn't quietly
+degrade this feature to "always pick the first token" for weeks with no
+signal. Each token's probe result is cached for a floor of ~180 seconds
+(matching the interval community tooling around this same endpoint has
+independently converged on as safe) and identified in logs only by a
+short fingerprint — the raw token value is never written to a log line,
+`state.json` field other than the one live "currently active" slot, or
+`calls.ndjson`/`run.json`. `state.json`'s `active_oauth_token` field is
+therefore the one place the raw active token persists at rest (by the
+same rationale `state.json` already carries other operational data —
+it's local-orchestrator-owned, not published); this also travels with
+`state.json` on the existing Fly/EC2 `fetch-branch.sh` state sync, which
+is unchanged behavior for the whole file, not something this feature
+introduces.
+
 **Decomposition needs the same discipline against the loss of
 in-progress spend.** §5½ (P1)'s `fit_judge` and coupled-minority
 `splitter` calls have no crash barrier today: a single `WorkerError`

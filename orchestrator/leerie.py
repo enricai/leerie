@@ -27,6 +27,7 @@ import copy
 import ctypes
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,8 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
@@ -276,6 +279,13 @@ DEFAULT_CAPS = {
     # every sibling file. ~700 splits the giant into 2–3 windows and leaves a
     # normal function whole.
     "subfile_split_max_span": 700,
+    # Floor on how often a given token's runway is re-probed (DESIGN §6
+    # *Multi-token rotation*). Both the start-of-run selection and the
+    # mid-run failover share one cache keyed by token fingerprint. Matches
+    # the interval community tooling around the same undocumented usage
+    # endpoint has independently converged on as safe against its
+    # aggressive per-token rate limiting.
+    "token_probe_cache_sec": 180,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -445,6 +455,15 @@ STATE_FIELDS = (
     # sibling run merging its own PR). A probe that crashes (`WorkerError`)
     # is deliberately never cached — no verdict was actually reached.
     "satisfied_probe_cache",
+    # active_oauth_token: the raw CLAUDE_CODE_OAUTH_TOKEN value currently
+    # selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token
+    # rotation*). Set by the start-of-run probe/ranking sweep when
+    # CLAUDE_CODE_OAUTH_TOKENS is present, and mutated by claude_p's
+    # mid-run failover on a rate-limited active token. Absent/None when
+    # only the singular CLAUDE_CODE_OAUTH_TOKEN is in play (no rotation).
+    # NEVER written to calls.ndjson, run.json, or any log line — only its
+    # fingerprint (_token_fingerprint) is ever surfaced outside state.json.
+    "active_oauth_token",
 )
 
 CATEGORIES = [
@@ -657,6 +676,12 @@ JUDGMENT_CHECK_ROUNDS_ENV = "LEERIE_JUDGMENT_CHECK_ROUNDS"
 PLANNER_CHECK_ROUNDS_ENV = "LEERIE_PLANNER_CHECK_ROUNDS"
 IMPLEMENTER_CONFIDENCE_RETRIES_ENV = "LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES"
 PLANNER_SAMPLES_ENV = "LEERIE_PLANNER_SAMPLES"
+
+# Multi-token rotation probe-cache floor — see DESIGN §6 *Multi-token
+# rotation* / IMPLEMENTATION.md §3 *Multi-token rotation*. Same resolution
+# shape as confidence_rounds.
+TOKEN_PROBE_CACHE_SEC_ENV = "LEERIE_TOKEN_PROBE_CACHE_SEC"
+TOKEN_PROBE_CACHE_SEC_FILE = SOURCE_OF_TRUTH_FILE
 
 # max-workers preference. Same resolution shape as confidence_rounds.
 # CLI --max-workers wins; then LEERIE_MAX_WORKERS env; then max_workers
@@ -4261,6 +4286,19 @@ def resolve_confidence_rounds(repo_root: Path,
         env_var=CONFIDENCE_ROUNDS_ENV, file_key="confidence_rounds",
         file_name=CONFIDENCE_ROUNDS_FILE,
         default=DEFAULT_CAPS["confidence_rounds"])
+
+
+def resolve_token_probe_cache_sec(repo_root: Path,
+                                  cli_value: int | None = None) -> int:
+    """Resolve the multi-token probe-cache floor (DESIGN §6 *Multi-token
+    rotation*). Order: CLI flag (if the caller wires one) →
+    LEERIE_TOKEN_PROBE_CACHE_SEC env var → leerie.toml →
+    DEFAULT_CAPS["token_probe_cache_sec"]."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=TOKEN_PROBE_CACHE_SEC_ENV, file_key="token_probe_cache_sec",
+        file_name=TOKEN_PROBE_CACHE_SEC_FILE,
+        default=DEFAULT_CAPS["token_probe_cache_sec"])
 
 
 def resolve_max_workers(repo_root: Path,
@@ -10956,6 +10994,368 @@ def enforce_and_record_cgroup_containment(st: "State",
         f"(or set {DANGEROUS_ALLOW_UNCAPPED_ENV}=1).")
 
 
+# --- Multi-token OAuth rotation (DESIGN §6 *Multi-token rotation*) -------
+#
+# Structured data in, deterministic Python out — no LLM worker (§12,
+# "prompts advisory, code enforces"). Both probe endpoints are
+# UNDOCUMENTED and UNSTABLE; every function here is best-effort telemetry,
+# never a hard gate — a probe failure must degrade to "use the
+# current/first token and react to the next 429," never fail the run.
+
+_TOKEN_PROBE_CACHE: dict[str, tuple[dict | None, float]] = {}
+
+_TOKEN_PROBE_DRIFT_MARKER = "token-probe: endpoint contract drift"
+
+
+def _token_fingerprint(token: str) -> str:
+    """Short, non-reversible identifier for a token — for logs/telemetry
+    only. NEVER log or persist the raw token itself (DESIGN §6 *Multi-token
+    rotation* secrets hygiene)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def _parse_claude_cli_version_string() -> str:
+    """Best-effort `claude-code/<version>` User-Agent value for Probe A —
+    omitting a real User-Agent puts the request in an aggressively
+    rate-limited bucket (persistent 429s; externally corroborated, not
+    merely assumed). Falls back to a fixed placeholder version on any
+    failure — the exact version number is not load-bearing, only the
+    presence of a `claude-code/` prefixed User-Agent is."""
+    try:
+        r = subprocess.run(["claude", "--version"], capture_output=True,
+                            text=True, timeout=10, check=False)
+        m = re.match(r"(\d+\.\d+\.\d+)", (r.stdout or "").strip())
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "0.0.0"
+
+
+def _probe_token_usage_a(token: str) -> dict | None:
+    """Probe A: GET /api/oauth/usage — zero inference cost, requires
+    `user:profile` scope (403 for a `user:inference`-scoped setup-token,
+    which is what leerie itself uses — caller falls back to Probe B).
+
+    Returns a dict normalized to {five_hour_util, seven_day_util,
+    resets_at, seven_day_opus_util, seven_day_sonnet_util} — utilization
+    as a 0.0-1.0 fraction, resets_at as a datetime — or None on any
+    failure (403 scope mismatch, transient, or contract drift; the caller
+    falls back to Probe B on any None result, regardless of cause)."""
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": f"claude-code/{_parse_claude_cli_version_string()}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return None  # scope mismatch — caller falls back to Probe B
+        log(f"  token-probe: Probe A transient failure "
+            f"(HTTP {e.code}) for token {_token_fingerprint(token)}")
+        return None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError,
+            OSError) as e:
+        log(f"  token-probe: Probe A transient failure "
+            f"({type(e).__name__}) for token {_token_fingerprint(token)}")
+        return None
+
+    def _sub(obj: dict | None) -> float | None:
+        if obj is None:
+            return None
+        return obj.get("utilization")
+
+    five_hour = body.get("five_hour")
+    seven_day = body.get("seven_day")
+    if not isinstance(five_hour, dict) or not isinstance(seven_day, dict) \
+            or "utilization" not in five_hour or "resets_at" not in five_hour \
+            or "utilization" not in seven_day:
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A response missing "
+            f"five_hour/seven_day.utilization or five_hour.resets_at "
+            f"for token {_token_fingerprint(token)} — the undocumented "
+            "endpoint may have changed shape; probe code needs review")
+        return None
+
+    try:
+        resets_at = datetime.fromisoformat(five_hour["resets_at"])
+    except (ValueError, TypeError):
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A five_hour.resets_at "
+            f"is not a parseable ISO-8601 timestamp for token "
+            f"{_token_fingerprint(token)}")
+        return None
+
+    return {
+        "five_hour_util": five_hour["utilization"] / 100.0,
+        "seven_day_util": seven_day["utilization"] / 100.0,
+        "resets_at": resets_at,
+        "seven_day_opus_util": (
+            lambda u: None if u is None else u / 100.0
+        )(_sub(body.get("seven_day_opus"))),
+        "seven_day_sonnet_util": (
+            lambda u: None if u is None else u / 100.0
+        )(_sub(body.get("seven_day_sonnet"))),
+    }
+
+
+def _probe_token_usage_b(token: str) -> dict | None:
+    """Probe B fallback: a minimal (max_tokens=1) /v1/messages call, reading
+    the anthropic-ratelimit-unified-* response headers. Works for
+    user:inference-scoped tokens (setup-tokens) where Probe A 403s.
+    /v1/messages/count_tokens does NOT carry these headers — a real
+    inference call is required (~1 output token cost).
+
+    Returns the same normalized shape as _probe_token_usage_a (utilization
+    0.0-1.0 fraction, resets_at as datetime) — Probe B's own headers use a
+    DIFFERENT native representation (already-fractional utilization, Unix
+    epoch seconds for reset) than Probe A's JSON body (0-100, ISO-8601);
+    this function normalizes before returning so callers never need to
+    know which probe produced a result. No opus/sonnet sublimit
+    information is available from this probe."""
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "anthropic-version": "2023-06-01",
+            "User-Agent": f"claude-code/{_parse_claude_cli_version_string()}",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            headers = resp.headers
+    except urllib.error.HTTPError as e:
+        # A non-2xx response carries no usable rate-limit data — always
+        # return None here rather than falling through to parse e.headers,
+        # which (unlike a successful response) is not guaranteed to carry
+        # the anthropic-ratelimit-unified-* fields at all.
+        if e.code == 401:
+            log(f"  token-probe: token {_token_fingerprint(token)} "
+                "rejected (401) — likely dead/expired")
+        elif e.code not in (429,):
+            log(f"  token-probe: Probe B transient failure "
+                f"(HTTP {e.code}) for token {_token_fingerprint(token)}")
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        log(f"  token-probe: Probe B transient failure "
+            f"({type(e).__name__}) for token {_token_fingerprint(token)}")
+        return None
+
+    five_h = headers.get("anthropic-ratelimit-unified-5h-utilization")
+    seven_d = headers.get("anthropic-ratelimit-unified-7d-utilization")
+    five_h_reset = headers.get("anthropic-ratelimit-unified-5h-reset")
+    if five_h is None or seven_d is None or five_h_reset is None:
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe B response missing "
+            f"anthropic-ratelimit-unified-* headers for token "
+            f"{_token_fingerprint(token)} — the undocumented headers may "
+            "have changed; probe code needs review")
+        return None
+
+    try:
+        return {
+            "five_hour_util": float(five_h),
+            "seven_day_util": float(seven_d),
+            "resets_at": datetime.fromtimestamp(
+                int(five_h_reset), tz=timezone.utc),
+            "seven_day_opus_util": None,
+            "seven_day_sonnet_util": None,
+        }
+    except (ValueError, TypeError):
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe B header values not "
+            f"parseable as expected for token {_token_fingerprint(token)}")
+        return None
+
+
+def _probe_token_usage(token: str, cache_sec: int) -> dict | None:
+    """Probe a token's remaining runway, trying Probe A first and falling
+    back to Probe B on a 403 (scope mismatch). Results are cached per
+    token fingerprint for at least `cache_sec` seconds — both start-of-run
+    selection and mid-run failover share this cache, so a token whose
+    result is still fresh is never re-probed (Probe A rate-limits
+    aggressively per access token).
+
+    Returns None if both probes fail — callers must treat this as "no
+    data," not as an error; the caller's fallback is to proceed with the
+    first token and rely on react-on-429."""
+    fp = _token_fingerprint(token)
+    cached = _TOKEN_PROBE_CACHE.get(fp)
+    if cached is not None:
+        result, ts = cached
+        if time.monotonic() - ts < cache_sec:
+            return result
+
+    result = _probe_token_usage_a(token)
+    if result is None:
+        result = _probe_token_usage_b(token)
+
+    _TOKEN_PROBE_CACHE[fp] = (result, time.monotonic())
+    return result
+
+
+def _rank_tokens(tokens: list[str], cache_sec: int) -> list[str]:
+    """Rank tokens by remaining runway, most runway first.
+
+    Score: min(1 - five_hour_util, 1 - seven_day_util), accounting for the
+    seven_day_opus_util sublimit when present (leerie's judgment workers
+    default to Opus, so a token near its Opus weekly cap has less usable
+    runway than its aggregate suggests) — the effective score also
+    incorporates (1 - seven_day_opus_util) when that field is populated.
+    A None seven_day_opus_util means "no Opus usage recorded" (full
+    runway), not "unknown" — it does not penalize the score. Ties are
+    broken by furthest resets_at. A token whose probe failed entirely
+    (as opposed to a populated result with a None sub-field) sorts last
+    but remains eligible — this is a last-resort ranking, not a filter."""
+    probed = {tok: _probe_token_usage(tok, cache_sec) for tok in tokens}
+
+    def _score(tok: str) -> tuple[float, float, datetime]:
+        result = probed[tok]
+        if result is None:
+            return (-1.0, 0.0, datetime.min.replace(tzinfo=timezone.utc))
+        runway = min(1.0 - result["five_hour_util"],
+                     1.0 - result["seven_day_util"])
+        opus_util = result.get("seven_day_opus_util")
+        if opus_util is not None:
+            runway = min(runway, 1.0 - opus_util)
+        resets_at = result.get("resets_at") or datetime.min.replace(
+            tzinfo=timezone.utc)
+        return (0.0, runway, resets_at)
+
+    return sorted(tokens, key=_score, reverse=True)
+
+
+def _parse_oauth_token_list(raw: str | None) -> list[str]:
+    """Parse CLAUDE_CODE_OAUTH_TOKENS: comma-separated, trimmed, empty
+    entries dropped. Mirrors the launcher's own parsing so orchestrator
+    and launcher agree on what counts as "the token list." Returns []
+    when raw is None/empty/whitespace-only."""
+    if not raw:
+        return []
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
+
+
+async def _rotate_oauth_token_or_raise(
+        st: "State", caps: dict, *, known_reset_at: datetime | None,
+        raw_message: str, retry_fn: Callable[[], Awaitable[dict]],
+) -> dict | None:
+    """Shared mid-run rotation logic for BOTH surfaces the active token's
+    rate-limit condition can reach `claude_p` through (DESIGN §6
+    *Multi-token rotation*):
+      (a) an envelope-level failure (`_is_auth_or_quota_failure`), and
+      (b) a `RateLimitedExit` raised out of `_invoke`'s streaming loop for
+          the protocol-level `rate_limit_event` (the two are otherwise
+          independent code paths that both need identical rotation
+          behavior — factored here so it is written and tested once).
+
+    If more than one token is configured: probes/ranks the OTHER tokens
+    (excluding the active one); if one has runway, switches
+    `active_oauth_token` and calls `retry_fn()` to get a fresh envelope
+    — returns that envelope. If every token is currently rate-limited (or
+    unprobeable), raises `RateLimitedExit` with whichever reset is
+    soonest across `known_reset_at` (the caller's own live signal, e.g. a
+    just-caught exception's `reset_at`, preferred over — but combined
+    with — any fresher cached probe data) and the cached probe data for
+    every configured token, including the active one.
+
+    Returns `None` (no exception, no rotation) when 0 or 1 tokens are
+    configured, or when no probe data exists for ANY token — the caller
+    falls through to its own existing behavior in either case (never
+    raises purely on a probe failure)."""
+    oauth_tokens = _parse_oauth_token_list(
+        os.environ.get("CLAUDE_CODE_OAUTH_TOKENS"))
+    if len(oauth_tokens) <= 1:
+        return None
+
+    cache_sec = caps.get("token_probe_cache_sec",
+                          DEFAULT_CAPS["token_probe_cache_sec"])
+    active = st.data.get("active_oauth_token")
+    others = [t for t in oauth_tokens if t != active]
+    ranked = await asyncio.to_thread(_rank_tokens, others, cache_sec)
+    winner = ranked[0] if ranked else None
+    winner_probe = (_TOKEN_PROBE_CACHE.get(
+        _token_fingerprint(winner), (None, 0.0))[0]
+        if winner is not None else None)
+
+    if winner_probe is not None and min(
+            1.0 - winner_probe["five_hour_util"],
+            1.0 - winner_probe["seven_day_util"]) > 0:
+        # Rotate and retry immediately — no re-exec, no container restart.
+        log(f"  token-probe: active token rate-limited — "
+            f"rotating to {_token_fingerprint(winner)}")
+        st.data["active_oauth_token"] = winner
+        st.save()
+        return await retry_fn()
+
+    # Every token is currently rate-limited (or unprobeable). Pick
+    # whichever resets soonest — including the active token itself, whose
+    # own reset time prefers a live signal (known_reset_at, e.g. a
+    # just-caught exception's reset_at) over its possibly-stale-or-absent
+    # cache entry, since the active token is deliberately excluded from
+    # the fresh probe/rank call above.
+    candidates: list[tuple[str, datetime]] = []
+    if known_reset_at is not None and active is not None:
+        candidates.append((active, known_reset_at))
+    for t in oauth_tokens:
+        if t == active and known_reset_at is not None:
+            continue  # already have a live signal for the active token
+        cached = _TOKEN_PROBE_CACHE.get(_token_fingerprint(t), (None, 0.0))[0]
+        if cached is not None and cached.get("resets_at") is not None:
+            candidates.append((t, cached["resets_at"]))
+
+    if not candidates:
+        # No probe data for any token, no live signal either — fall
+        # through unchanged to the caller's own existing behavior.
+        return None
+
+    soonest_token, soonest_reset = min(candidates, key=lambda pair: pair[1])
+    if soonest_token != active:
+        log(f"  token-probe: all tokens rate-limited — switching to "
+            f"soonest-reset token {_token_fingerprint(soonest_token)}")
+        st.data["active_oauth_token"] = soonest_token
+        st.save()
+    raise RateLimitedExit(reset_at=soonest_reset, raw_message=raw_message)
+
+
+async def select_active_oauth_token(st: "State", caps: dict) -> None:
+    """Start-of-run smart token selection (DESIGN §6 *Multi-token
+    rotation*). Only runs when CLAUDE_CODE_OAUTH_TOKENS is present in the
+    environment — the singular-var-only path is entirely unaffected (no
+    `active_oauth_token` is ever set, so `_invoke`'s active_token stays
+    None and behavior is byte-identical to before this feature).
+
+    Best-effort: if every probe fails, the first token in the list is
+    selected and the run proceeds — this function never die()s."""
+    tokens = _parse_oauth_token_list(os.environ.get("CLAUDE_CODE_OAUTH_TOKENS"))
+    if not tokens:
+        return
+    cache_sec = caps.get("token_probe_cache_sec",
+                          DEFAULT_CAPS["token_probe_cache_sec"])
+    ranked = await asyncio.to_thread(_rank_tokens, tokens, cache_sec)
+    winner = ranked[0]
+    result = _TOKEN_PROBE_CACHE.get(_token_fingerprint(winner), (None, 0.0))[0]
+    if result is not None:
+        runway_5h = 1.0 - result["five_hour_util"]
+        runway_7d = 1.0 - result["seven_day_util"]
+        log(f"  token-probe: selected token {_token_fingerprint(winner)} "
+            f"(5h runway {runway_5h:.0%}, 7d runway {runway_7d:.0%})")
+    else:
+        log(f"  token-probe: all probes failed — selected first token "
+            f"{_token_fingerprint(winner)}, relying on react-on-429")
+    st.data["active_oauth_token"] = winner
+    st.save()
+
+
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   sid: str, leerie_dir: Path, verbosity: str,
                   progress: Callable[[], tuple[int, int, int, int] | None]
@@ -10964,7 +11364,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_memory_max_bytes: int | None = None,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
-                  run_id: str | None = None) -> dict:
+                  run_id: str | None = None,
+                  active_token: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -10990,7 +11391,15 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     Errors / cancellation follow `run_proc`'s contract: timeout raises
     `subprocess.TimeoutExpired`, cancellation kills the child and
     re-raises. A worker that exits without emitting any `result` event
-    raises `WorkerError` — same error class callers already handle."""
+    raises `WorkerError` — same error class callers already handle.
+
+    `active_token`, when given, overrides `CLAUDE_CODE_OAUTH_TOKEN` in the
+    child's environment (DESIGN §6 *Multi-token rotation*) — this is what
+    lets `claude_p` switch which subscription token a worker authenticates
+    with per-invocation, with no container restart. Passed explicitly
+    rather than mutated via ambient `os.environ` because the orchestrator
+    runs many `claude -p` workers concurrently (`asyncio.gather` under
+    `Semaphore(max_parallel)`); mutating process-global env would race."""
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -11014,6 +11423,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         worker_env = os.environ.copy()
         worker_env["DEBUG"] = "*"
         worker_env["ANTHROPIC_LOG"] = "debug"
+    # active_token overrides CLAUDE_CODE_OAUTH_TOKEN independently of the
+    # LEERIE_WORKER_DEBUG gate above — multi-token rotation and worker
+    # debug logging are orthogonal features and must compose (a debug
+    # env still needs to carry the currently-selected token).
+    if active_token is not None:
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        worker_env["CLAUDE_CODE_OAUTH_TOKEN"] = active_token
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -12049,6 +12466,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             bookkeeping — every retry, success or failure, still produces
             one calls.ndjson row so the audit trail is complete."""
             _t0 = time.monotonic()
+            # Read active_oauth_token fresh on every spawn (not captured
+            # once at claude_p entry) so a mid-run rotation (below) takes
+            # effect on the very next _invoke call, including a retry
+            # inside this same claude_p invocation.
             envelope = await _invoke(build(retry_note), cwd, timeout,
                                      sid, leerie_dir, verbosity,
                                      stdin_data=user_prompt + retry_note,
@@ -12061,7 +12482,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                      worker_pids_max=caps.get(
                                          "worker_pids_max",
                                          DEFAULT_CAPS["worker_pids_max"]),
-                                     run_id=st.run_id)
+                                     run_id=st.run_id,
+                                     active_token=st.data.get(
+                                         "active_oauth_token"))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
@@ -12149,7 +12572,32 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 retry_note = (
                     f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
                     "Return output that conforms exactly to the required schema.")
-            envelope = await _spawn(retry_note)
+            # Multi-token mid-run failover (DESIGN §6 *Multi-token
+            # rotation*) covers BOTH surfaces a rate-limited active token
+            # can reach this loop through:
+            #   (a) an envelope-level failure (`_is_auth_or_quota_failure`,
+            #       below, once `_spawn` returns a completed `result`), and
+            #   (b) a `RateLimitedExit` raised directly out of `_invoke`'s
+            #       streaming loop for the protocol-level `rate_limit_event`
+            #       (never reaches an envelope at all — `_spawn` raises
+            #       instead of returning). Caught here, BEFORE it can
+            #       propagate to main()'s single-token pause/auto-resume,
+            #       so this path gets the same rotation chance as (a).
+            # out_of_credits is an account-level exhaustion, not a
+            # per-token rate limit — rotating tokens would not help, so it
+            # re-raises immediately, unaffected by this feature.
+            try:
+                envelope = await _spawn(retry_note)
+            except RateLimitedExit as _rle:
+                if _rle.out_of_credits:
+                    raise
+                _rotated = await _rotate_oauth_token_or_raise(
+                    st, caps, known_reset_at=_rle.reset_at,
+                    raw_message=_rle.raw_message,
+                    retry_fn=lambda: _spawn(retry_note))
+                if _rotated is None:
+                    raise  # no rotation possible — original exception stands
+                envelope = _rotated
 
             # Terminal auth failure (expired/absent OAuth session): checked
             # BEFORE the auth/quota backoff below, and raised immediately —
@@ -12161,6 +12609,21 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # EXIT_LOCKED pause instead of the generic WorkerError exit(1).
             if _is_terminal_auth_failure(envelope):
                 raise TerminalAuthFailure(str(envelope.get("result") or ""))
+
+            # Envelope-level rotation (surface (a) above): the ACTIVE
+            # token is rate-limited (not a transport disconnect, not
+            # terminal-auth — a real 401/429/529/auth-message on the token
+            # currently in use). Try rotating BEFORE spending any of the
+            # tenacity backoff budget below on a token already known to be
+            # exhausted. Never raises on a probe failure — falls through
+            # unchanged to the existing backoff/pause behavior.
+            if _is_auth_or_quota_failure(envelope):
+                _rotated = await _rotate_oauth_token_or_raise(
+                    st, caps, known_reset_at=None,
+                    raw_message=str(envelope.get("result") or ""),
+                    retry_fn=lambda: _spawn(retry_note))
+                if _rotated is not None:
+                    envelope = _rotated
 
             # Backoff (not immediate corrective retry) is needed for two
             # envelope classes that share the same remedy — a fresh session
@@ -23084,6 +23547,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
                         no_push=getattr(args, "no_push", False))
+        # Start-of-run multi-token selection (DESIGN §6 *Multi-token
+        # rotation*) — a no-op when CLAUDE_CODE_OAUTH_TOKENS is unset.
+        # Fresh-run only: on --resume, active_oauth_token (if any) is
+        # already persisted in st.data from the original run.
+        await select_active_oauth_token(st, caps)
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
 
