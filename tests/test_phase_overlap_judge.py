@@ -2396,3 +2396,30 @@ def test_prompt_documents_cofile_cluster_exclusion():
         "exclusion rule so the judge is told about the signal it's "
         "given in its payload"
     )
+
+
+def test_prompt_input_example_lists_cofile_cluster():
+    """The literal worked JSON example in `prompts/plan_overlap_judge.md`'s
+    "## Input" section must itself include `_cofile_cluster` as a field
+    on the example subtask object — not just mentioned elsewhere in the
+    file (test_prompt_documents_cofile_cluster_exclusion covers that).
+
+    Regression pin: the "What is NOT a collision" exclusion rule was
+    added referencing `_cofile_cluster`, and the real Python payload
+    build was updated to include it, but the prompt's own worked example
+    of the input shape was initially missed — an LLM reading its own
+    system prompt could reasonably treat that example as the
+    authoritative field list and disregard a field not shown there,
+    silently undermining the fix."""
+    from pathlib import Path
+    prompt_path = (Path(__file__).resolve().parent.parent
+                   / "prompts" / "plan_overlap_judge.md")
+    text = prompt_path.read_text()
+    start = text.index("## Input")
+    end = text.index("## Output", start)
+    input_section = text[start:end]
+    assert "_cofile_cluster" in input_section, (
+        "the ## Input section's worked JSON example must list "
+        "_cofile_cluster as an example subtask field, not just "
+        "reference it elsewhere in the prompt"
+    )

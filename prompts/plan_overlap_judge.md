@@ -84,7 +84,8 @@ The orchestrator gives you, in your prompt, a JSON payload:
      "files_likely_touched": [...],
      "provides": [...],
      "requires": [...],
-     "depends_on": [...]},
+     "depends_on": [...],
+     "_cofile_cluster": "feat-001" or null},
     ...
   ]
 }
