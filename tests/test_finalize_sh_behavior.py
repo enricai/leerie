@@ -54,7 +54,9 @@ def test_happy_path_exits_zero(tmp_path):
     _add_run_branch_with_extra_commit(repo)
     _write_working_branch_file(repo, "main")
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 0, f"expected exit 0; got {r.returncode}, stderr={r.stderr!r}"
     assert "ready to push" in r.stdout
@@ -67,7 +69,9 @@ def test_run_branch_missing_exits_two(tmp_path):
     _write_working_branch_file(repo, "main")
     # No leerie/runs/test branch created.
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 2, f"expected exit 2; got {r.returncode}, stdout={r.stdout!r}"
     assert "does not exist" in r.stderr
@@ -80,7 +84,9 @@ def test_working_branch_missing_exits_two(tmp_path):
     _add_run_branch_with_extra_commit(repo)
     _write_working_branch_file(repo, "branch-that-does-not-exist")
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 2, f"expected exit 2; got {r.returncode}, stdout={r.stdout!r}"
     assert "no longer exists" in r.stderr
@@ -98,7 +104,9 @@ def test_ahead_zero_exits_one(tmp_path):
                    cwd=repo, check=True)
     _write_working_branch_file(repo, "main")
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 1, f"expected exit 1; got {r.returncode}, stdout={r.stdout!r}"
     assert "no commits beyond main" in r.stderr
@@ -112,7 +120,9 @@ def test_working_branch_file_missing_exits_two(tmp_path):
     _add_run_branch_with_extra_commit(repo)
     # Do NOT create the working-branch file.
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 2, f"expected exit 2; got {r.returncode}, stdout={r.stdout!r}"
     assert "working-branch" in r.stderr
@@ -141,7 +151,9 @@ def test_does_not_modify_working_branch_head(tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 
-    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo,
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
                        capture_output=True, text=True, check=False)
     assert r.returncode == 0
 
