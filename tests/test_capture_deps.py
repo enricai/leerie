@@ -440,6 +440,83 @@ def _fake_claude_p_result(setup_packages=None, language_installs=None):
 
 
 # ---------------------------------------------------------------------------
+# _filter_residual_deps — unit tests for residual-only filtering
+# ---------------------------------------------------------------------------
+
+class TestFilterResidualDeps:
+    """Unit tests for _filter_residual_deps (residual-only filtering logic)."""
+
+    def test_filters_bakeable_managers_entirely(self, leerie):
+        """Python/Ruby/Rust/Go managers filtered out (bake entirely)."""
+        language_installs = [
+            {"manager": "pip", "command": "pip install -r requirements.txt", "copy_inputs": []},
+            {"manager": "pip3", "command": "pip3 install django", "copy_inputs": []},
+            {"manager": "uv", "command": "uv sync", "copy_inputs": []},
+            {"manager": "bundle", "command": "bundle install", "copy_inputs": []},
+            {"manager": "gem", "command": "gem install rails", "copy_inputs": []},
+            {"manager": "cargo", "command": "cargo fetch", "copy_inputs": []},
+            {"manager": "go", "command": "go mod download", "copy_inputs": []},
+        ]
+        result = leerie._filter_residual_deps(language_installs)
+        assert result == [], "All bakeable managers should be filtered out"
+
+    def test_keeps_node_offline_relink_only(self, leerie):
+        """Node managers: keep only offline/frozen-lockfile commands."""
+        language_installs = [
+            {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile", "copy_inputs": []},
+            {"manager": "pnpm", "command": "pnpm install", "copy_inputs": []},  # Full install, filtered
+            {"manager": "npm", "command": "npm install --offline", "copy_inputs": []},
+            {"manager": "npm", "command": "npm install", "copy_inputs": []},  # Full install, filtered
+            {"manager": "yarn", "command": "yarn install --frozen-lockfile", "copy_inputs": []},
+            {"manager": "yarn", "command": "yarn install", "copy_inputs": []},  # Full install, filtered
+        ]
+        result = leerie._filter_residual_deps(language_installs)
+        assert len(result) == 3, "Only offline/frozen-lockfile commands kept"
+        assert all("--offline" in e["command"] or "--frozen-lockfile" in e["command"]
+                   for e in result), "All kept entries must have offline/frozen-lockfile"
+
+    def test_preserves_unknown_managers(self, leerie):
+        """Unknown managers preserved as-is (conservative)."""
+        language_installs = [
+            {"manager": "poetry", "command": "poetry install", "copy_inputs": []},
+            {"manager": "pipenv", "command": "pipenv install", "copy_inputs": []},
+        ]
+        result = leerie._filter_residual_deps(language_installs)
+        assert len(result) == 2, "Unknown managers preserved"
+        assert result == language_installs, "Input unchanged for unknown managers"
+
+    def test_handles_none_command_gracefully(self, leerie):
+        """Entry with command: None is handled (no TypeError on 'in' operator)."""
+        language_installs = [
+            {"manager": "pnpm", "command": None, "copy_inputs": []},
+            {"manager": "pnpm", "command": "pnpm install --offline", "copy_inputs": []},
+            {"manager": "pip", "command": None, "copy_inputs": []},
+        ]
+        # Should not raise TypeError
+        result = leerie._filter_residual_deps(language_installs)
+        # Entry with None command and pnpm manager: no offline/frozen flags, filtered out
+        # Entry with --offline: kept
+        # Entry with pip and None: filtered (bakeable)
+        assert len(result) == 1, "Only offline pnpm entry kept"
+        assert result[0]["command"] == "pnpm install --offline"
+
+    def test_empty_input_returns_empty(self, leerie):
+        """Empty input returns empty list."""
+        result = leerie._filter_residual_deps([])
+        assert result == []
+
+    def test_returns_new_list_input_unchanged(self, leerie):
+        """Returns a new list; input is unchanged."""
+        language_installs = [
+            {"manager": "pip", "command": "pip install django", "copy_inputs": []},
+        ]
+        original = language_installs.copy()
+        result = leerie._filter_residual_deps(language_installs)
+        assert language_installs == original, "Input list unchanged"
+        assert result is not language_installs, "Returns new list"
+
+
+# ---------------------------------------------------------------------------
 # capture_repo_deps — integration tests using tmp_path repos
 # ---------------------------------------------------------------------------
 
