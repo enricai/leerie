@@ -19076,6 +19076,61 @@ def write_plan(leerie_dir: Path, task: str, st: State,
     st.save()
 
 
+def _is_baked_ecosystem_command(command: list[str]) -> bool:
+    """Return True if this install command is for an ecosystem whose
+    dependencies are baked into the image at `/opt/*`, making the per-run
+    install unnecessary (DESIGN §6½ "Persistent out-of-repo dependency bake").
+
+    Ecosystems with zero per-run install:
+      - Python (pip, uv, poetry, pipenv) → baked to /opt/venv
+      - Ruby (bundle) → baked to /opt/bundle
+      - Rust (cargo) → baked to CARGO_HOME + CARGO_TARGET_DIR
+      - Go (go) → baked to GOMODCACHE + GOCACHE
+
+    Ecosystems with irreducible residual:
+      - Node/pnpm → requires offline relink (NOT filtered here; handled separately)
+      - npm/yarn → full offline install (still network-free, kept for now)
+    """
+    if not command:
+        return False
+
+    cmd0 = command[0]
+
+    # Python: pip, pip3, python -m pip, uv, poetry, pipenv
+    if cmd0 in ("pip", "pip3", "uv", "poetry", "pipenv"):
+        return True
+    if cmd0 in ("python", "python3") and len(command) >= 3 and command[1:3] == ["-m", "pip"]:
+        return True
+
+    # Ruby: bundle
+    if cmd0 == "bundle":
+        return True
+
+    # Rust: cargo
+    if cmd0 == "cargo":
+        return True
+
+    # Go: go
+    if cmd0 == "go":
+        return True
+
+    return False
+
+
+def _is_node_offline_relink(command: list[str]) -> bool:
+    """Return True if this is the Node/pnpm offline relink command —
+    the single irreducible residual for Node repos (DESIGN §6½).
+
+    Pattern: `pnpm install --offline --frozen-lockfile`
+    """
+    if not command or command[0] != "pnpm":
+        return False
+    # Must have "install" subcommand and both --offline and --frozen-lockfile
+    return ("install" in command and
+            "--offline" in command and
+            "--frozen-lockfile" in command)
+
+
 def _format_provision_recipe_section(recipe: list[dict],
                                       *, audience: str) -> str | None:
     """Render the persisted provision recipe as a prompt section, or
@@ -19090,6 +19145,12 @@ def _format_provision_recipe_section(recipe: list[dict],
     function is the prompt-injection helper that hands the recipe to
     workers verbatim — no per-worker variation, same string in every
     prompt.
+
+    For repos with baked dependencies (Python to /opt/venv, Ruby to /opt/bundle,
+    Rust/Go with warmed caches), install commands for those ecosystems are
+    filtered out — workers inherit the bake with zero install cost. Only Node/pnpm
+    retains the offline relink residual (DESIGN §6½ "Persistent out-of-repo
+    dependency bake").
     """
     install_entries = [e for e in recipe
                        if e.get("kind") in ("install", "build")
@@ -19097,34 +19158,49 @@ def _format_provision_recipe_section(recipe: list[dict],
     if not install_entries:
         return None
 
+    # Filter out baked ecosystem installs (Python, Ruby, Rust, Go).
+    # Keep Node offline relink and any other commands (npm/yarn, build steps).
+    filtered_entries = []
+    for e in install_entries:
+        cmd = e.get("command", [])
+        if e.get("kind") == "install" and _is_baked_ecosystem_command(cmd):
+            # Baked ecosystem — skip this install
+            continue
+        # Keep: build commands, Node offline relink, npm/yarn, anything else
+        filtered_entries.append(e)
+
+    if not filtered_entries:
+        return None
+
     lines = ["", "PROVISION_RECIPE:"]
     if audience == "implementer":
         lines.append(
-            "  The orchestrator detected the following install (and "
-            "follow-on build) commands for this repo. Your worktree "
-            "starts with NO installed dependencies and no build "
-            "outputs. Decide whether your subtask needs them — if yes, "
-            "run them via Bash in the order shown. The package-manager "
-            "caches (pnpm store, pip wheel cache, go module cache, cargo "
-            "registry) are warm and shared across worktrees, so "
-            "re-running these is fast. These are advisory: skip them if "
-            "your subtask is purely documentation, config, or otherwise "
+            "  The following residual install/build commands could not be "
+            "baked into the image and may need to run in your worktree. "
+            "Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "you inherit them with zero install. This list holds only what "
+            "remains: Node's offline relink, build steps, or other unbaked "
+            "commands. Decide whether your subtask needs them — if yes, run "
+            "them via Bash in the order shown. These are advisory: skip them "
+            "if your subtask is purely documentation, config, or otherwise "
             "doesn't touch buildable code."
         )
     elif audience == "conformer":
         lines.append(
-            "  Your worktree starts with NO installed dependencies "
-            "(or only those the implementer chose to install) and no "
-            "build outputs. Before running BUILD_CMD / LINT_CMD / "
-            "TEST_CMD, ensure deps and any required build artifacts are "
-            "present — either run the install (and follow-on build) "
-            "command(s) yourself first, in the order shown, or react to "
-            "a failing test/build that diagnoses missing deps and run "
-            "them then. The caches are warm so re-running is fast."
+            "  Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "your worktree inherits them with zero install. The following "
+            "residual commands are what could not be baked (Node offline "
+            "relink, build steps, etc.). Before running BUILD_CMD / "
+            "LINT_CMD / TEST_CMD, ensure any residual deps and build "
+            "artifacts are present — either run these command(s) first, "
+            "in the order shown, or react to a failing test/build that "
+            "diagnoses what's missing and run them then."
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
-    for i, e in enumerate(install_entries, 1):
+    for i, e in enumerate(filtered_entries, 1):
         cmd_str = " ".join(e["command"])
         wd = e.get("working_dir", ".")
         timeout = e.get("timeout_s") or 1800

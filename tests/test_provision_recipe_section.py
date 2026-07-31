@@ -62,20 +62,21 @@ def test_conformer_audience_emphasizes_pre_build_install(leerie):
     assert "PROVISION_RECIPE:" in out
     # Conformer framing: ensure deps before BUILD/LINT/TEST.
     assert "BUILD_CMD" in out and "LINT_CMD" in out and "TEST_CMD" in out
-    assert "ensure deps and any required build artifacts" in out
+    assert "ensure any residual deps and build artifacts" in out
 
 
 def test_polyglot_recipe_renders_every_install_entry(leerie):
     """A polyglot repo (e.g. Rails-with-frontend, Go-with-Node) emits
-    multiple install entries. All non-`none` entries must appear."""
+    multiple install entries. With baked ecosystems, only non-baked entries
+    appear (pnpm offline relink is kept; go mod download is filtered)."""
     out = leerie._format_provision_recipe_section(
         [PNPM_INSTALL, GO_DOWNLOAD], audience="implementer")
     assert out is not None
     assert "pnpm install --frozen-lockfile" in out
-    assert "go mod download" in out
-    # Numbered in declaration order.
+    # Go is baked, so go mod download should be filtered out
+    assert "go mod download" not in out
+    # Only pnpm remains, so it's numbered as 1
     assert "1. pnpm install --frozen-lockfile" in out
-    assert "2. go mod download" in out
 
 
 def test_none_entries_are_skipped_in_mixed_recipe(leerie):
