@@ -15,7 +15,12 @@ PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 
 
 def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
+    # Exclude LEERIE_STATE_DIR, LEERIE_STATE_HOST_DIR, and XDG_CACHE_HOME from
+    # the base environment so tests run in isolation. XDG_CACHE_HOME points to
+    # /tmp/.cache which may not be writable in all test contexts, causing mkdir
+    # failures in lib.sh's _leerie_fly_agent_ensure function.
+    base_env = {k: v for k, v in os.environ.items()
+                if k not in ("LEERIE_STATE_DIR", "LEERIE_STATE_HOST_DIR", "XDG_CACHE_HOME")}
     if env:
         base_env.update(env)
     return subprocess.run(
