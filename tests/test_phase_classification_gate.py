@@ -333,3 +333,99 @@ def test_exhaustion_still_dies_when_satisfied_true_but_evidence_empty(
     with pytest.raises(SystemExit):
         asyncio.run(leerie.phase_classification_gate(
             "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+
+def test_exhaustion_routes_to_no_work_when_an_earlier_round_found_it_satisfied(
+        leerie, tmp_path, monkeypatch):
+    """Root-cause fix for a SECOND occurrence of the funeralworks-shaped
+    incident, after Fix 2 above already shipped: phase_classification_gate
+    re-invokes phase_classify fresh on every re-classify round via
+    _on_feedback, and each round's prompt is entirely focused on fixing
+    the category set the judge rejected — not on re-confirming
+    likely_already_satisfied. A real run hit exactly this: an early
+    re-classify round explicitly found the task's deliverable already on
+    HEAD and set the field, but the LAST round (the one judged on
+    exhaustion) reverted to a bare category guess with no such assertion,
+    and the gate died instead of routing to the no-work exit. The fix is
+    OR-accumulation in phase_classify's own write site: once any round
+    within this gate call sets the field with evidence, a later round
+    that omits it must not clear it.
+
+    Unlike every other test in this file, this one does NOT stub
+    phase_classify — it stubs only claude_p and lets the REAL
+    phase_classify run, so this test actually exercises the fixed
+    write-site code end-to-end through the gate's real re-invocation
+    loop. A version of this test that stubs phase_classify (as the rest
+    of this file's tests do) would be vacuous here: the fake would have
+    to perform the OR-preservation itself to reproduce the scenario,
+    which proves nothing about whether phase_classify's own code does it
+    (verified: such a version keeps passing even with the real fix fully
+    reverted). tests/test_phase_classify_satisfied_or_preserve.py covers
+    the same write site in isolation with more edge cases; this test is
+    the composition proof that the two layers work together."""
+    st = _minimal_state(leerie, tmp_path)
+    first_evidence = (
+        "ConfirmDialog + all 7 named fixes + all test files already "
+        "present on HEAD at commit cb4f8be")
+
+    classifier_calls = {"n": 0}
+    judge_calls = {"n": 0}
+
+    async def fake_claude_p(**kwargs):
+        schema_key = kwargs.get("schema_key")
+        if schema_key == "classifier":
+            classifier_calls["n"] += 1
+            if classifier_calls["n"] == 1:
+                # The first re-classify round: finds it satisfied, with
+                # evidence (mirrors the real incident's round 2).
+                return {"categories": ["documentation"],
+                        "likely_already_satisfied": True,
+                        "likely_already_satisfied_evidence": first_evidence}
+            # Every LATER re-classify round: reverts to a bare category
+            # guess, omitting the satisfied claim entirely (mirrors the
+            # real incident's final, exhausting round).
+            return {"categories": ["documentation"]}
+        # classification_judge: a DIFFERENT miscategorization category each
+        # round (never repeating a prior round's issue signature), so
+        # _run_checked_loop's oscillation guard never cuts the loop short —
+        # it must run the full judgment_check_rounds=3 rounds, which is
+        # what drives phase_classify's re-classify calls past the first one
+        # and into the "later round reverts" branch above.
+        judge_calls["n"] += 1
+        missing_cat = ["testing", "feature-implementation", "refactoring"][
+            (judge_calls["n"] - 1) % 3]
+        return {"categories_reviewed": ["documentation"],
+                "miscategorizations": [{
+                    "kind": "missing_category",
+                    "category": missing_cat,
+                    "concrete_work_evidence": f"round {judge_calls['n']} finding",
+                }], "rationale": "still misses a category"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    # phase_classify's own _invoke does models["classifier"] (bracket
+    # access, not .get()) — every other test in this file stubs
+    # phase_classify entirely so that line never runs; this test is the
+    # first to let the real phase_classify execute, so it needs its own
+    # models/efforts dicts that also cover "classifier".
+    models = dict(MODELS, classifier="sonnet")
+    efforts = dict(EFFORTS, classifier="medium")
+
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, models, efforts))
+    assert routed is True
+    assert st.data["no_work_required"] is True
+    assert st.data["finished_at"]
+    assert st.data["waves"] == []
+    # The evidence surfaced in no_work_reasons must be the earlier round's
+    # real finding, not a blank/overwritten value — proving the OR-preserved
+    # evidence (not just the boolean) survived into the terminal state.
+    assert first_evidence in str(st.data["no_work_reasons"])
+
+
+def test_fresh_state_unaffected_by_or_preservation(leerie, tmp_path):
+    """Control: a brand-new State with no pre-existing
+    likely_already_satisfied key must behave identically to before this
+    fix — nothing to OR-preserve when nothing was ever set."""
+    st = _minimal_state(leerie, tmp_path)
+    assert "likely_already_satisfied" not in st.data

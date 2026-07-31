@@ -13599,10 +13599,39 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     # Optional, additive (DESIGN §8): persisted so phase_classification_gate
     # can consult it on exhaustion without threading the raw classifier
     # result through the gate's own re-invocation loop.
-    st.data["likely_already_satisfied"] = bool(
-        result.get("likely_already_satisfied"))
-    st.data["likely_already_satisfied_evidence"] = (
-        result.get("likely_already_satisfied_evidence") or "")
+    #
+    # OR-preserve, not overwrite: phase_classification_gate re-invokes this
+    # function fresh on every re-classify round (_on_feedback), and each
+    # round's prompt is entirely focused on fixing the category set — a
+    # round chasing that feedback can legitimately fail to restate a true
+    # likely_already_satisfied finding an earlier round in the same gate
+    # call already made, without that omission being evidence the earlier
+    # finding was wrong (the repo tree hasn't changed between rounds). A
+    # real production incident hit exactly this: round 2 explicitly found
+    # the task's deliverable already on HEAD, round 3 (the round actually
+    # judged on exhaustion) reverted to a bare category guess with no such
+    # assertion, and the gate died instead of routing to the no-work exit.
+    # A fresh True+evidence claim always wins; a falsy/absent claim only
+    # clears a prior True if there was no prior True to begin with.
+    new_satisfied = bool(result.get("likely_already_satisfied"))
+    new_evidence = (result.get("likely_already_satisfied_evidence") or "")
+    prior_valid = bool(
+        st.data.get("likely_already_satisfied") and
+        (st.data.get("likely_already_satisfied_evidence") or "").strip())
+    if new_satisfied and new_evidence.strip():
+        st.data["likely_already_satisfied"] = True
+        st.data["likely_already_satisfied_evidence"] = new_evidence
+    elif not prior_valid:
+        # Neither this round nor any earlier round in this gate call has a
+        # valid (True + non-empty evidence) claim — the only two states
+        # that may ever be persisted are "a real satisfied claim" (handled
+        # above) or "no claim." A True with empty/whitespace-only evidence
+        # is invalid on its own (same EMPTY_EVIDENCE discipline
+        # check_classifier_output enforces) and must never be persisted as
+        # a bare True — that would violate the invariant every consumer of
+        # this field relies on (a True always carries real evidence).
+        st.data["likely_already_satisfied"] = False
+        st.data["likely_already_satisfied_evidence"] = ""
     st.save()
     log(f"categories: {', '.join(cats)}")
     return result
@@ -13630,12 +13659,19 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     cut short earlier by `_run_checked_loop`'s own oscillation guard when a
     round's issues repeat an earlier round's — see that function). On
     exhaustion, `die()`s exactly like the adherence/reconciler gates —
-    UNLESS the classifier's own last output carries
-    `likely_already_satisfied=True` with evidence, in which case that is
-    treated as the same "cleared-but-empty terminal state" `detect_no_work`
-    already produces post-plan (DESIGN §8): the run cannot converge on a
-    category set because the classifier itself found the task's deliverable
-    already on HEAD, so classification precision no longer matters. Routes
+    UNLESS `st.data["likely_already_satisfied"]` carries `True` with
+    evidence, in which case that is treated as the same "cleared-but-empty
+    terminal state" `detect_no_work` already produces post-plan (DESIGN
+    §8): the run cannot converge on a category set because some round's
+    classifier investigation found the task's deliverable already on HEAD,
+    so classification precision no longer matters. This field is
+    OR-accumulated across re-classify rounds within one gate call (see
+    `phase_classify`'s write site), not last-write-wins: a later round that
+    fails to restate an earlier round's true finding does not clear it,
+    since the re-classify prompt is entirely focused on fixing the
+    category set and re-deriving "already satisfied" from scratch every
+    round is not guaranteed — only a genuinely fresh contradicting claim
+    with its own evidence would ever override an earlier True. Routes
     to `_finish_no_work_run` and returns True in that case; the caller must
     then stop the pipeline (mirroring the existing `detect_no_work` call
     site's `_finish_no_work_run(...); return` pattern). A
@@ -13728,14 +13764,14 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
 
     remaining = _check(judge_result)
     if remaining:
-        # Before dying, check whether the classifier's own last investigation
+        # Before dying, check whether some round's classifier investigation
         # already explained why convergence is impossible: the task's
         # deliverable is already on HEAD, so no category set will ever look
-        # "complete" against a diff that doesn't exist. `st.data["categories"]`
-        # was written by phase_classify's last invocation, but the boolean
-        # signal itself lives on the classifier's raw result, not on state —
-        # re-read the last classifier round's own claim via the same
-        # last-write st.data field phase_classify populates each time.
+        # "complete" against a diff that doesn't exist. This field is
+        # OR-accumulated by phase_classify across every re-classify round
+        # in this gate call (not last-write-wins), so it reflects "did ANY
+        # round find this," not just the final exhausting round's own
+        # output.
         satisfied_evidence = (
             st.data.get("likely_already_satisfied_evidence") or "").strip()
         if st.data.get("likely_already_satisfied") and satisfied_evidence:

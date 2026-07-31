@@ -4435,18 +4435,30 @@ classifier schema carries an optional, additive
 exactly this — the classifier already investigates the codebase to
 classify at all, so this only structures a claim it could previously only
 make as prose the pipeline discarded. If the classification-gate retry
-loop exhausts without converging, and the classifier's own last
-investigation set `likely_already_satisfied=True` with evidence,
-`phase_classification_gate` routes directly to
+loop exhausts without converging, and `st.data["likely_already_satisfied"]`
+is `True` with evidence, `phase_classification_gate` routes directly to
 `_finish_no_work_run` — the identical terminal state `detect_no_work`
-produces, reached one phase earlier for this specific case. This is not a
-new trust boundary: it extends the same one `detect_no_work` already
-accepts (a worker's own investigation, un-double-checked by a second
-judge) from "the planner found nothing to do" to "the classifier
-independently found the same thing, and classification could not
-otherwise converge anyway." A classifier that never sets the field (the
-common case — everything that isn't already-done work) sees zero behavior
-change; the gate still dies on genuine miscategorization exhaustion.
+produces, reached one phase earlier for this specific case. This field is
+OR-accumulated across re-classify rounds within one gate call, not
+last-write-wins: each re-classify round is a fresh classifier invocation
+whose prompt is entirely focused on fixing the category set the judge
+rejected, so a round can legitimately fail to restate a true
+already-satisfied finding an earlier round in the same gate call already
+made — that omission is not evidence the earlier finding was wrong, since
+the repo tree hasn't changed between rounds. A fresh `True` + evidence
+claim always wins; a falsy/absent claim only clears a prior `True` if
+there was no prior `True` to begin with. (A real production incident hit
+exactly the un-accumulated version of this: one round found the
+deliverable already on HEAD, a later round's category-focused re-classify
+silently dropped the claim, and the gate died instead of routing to the
+no-work exit.) This is not a new trust boundary: it extends the same one
+`detect_no_work` already accepts (a worker's own investigation,
+un-double-checked by a second judge) from "the planner found nothing to
+do" to "the classifier independently found the same thing, and
+classification could not otherwise converge anyway." A classifier that
+never sets the field on any round (the common case — everything that
+isn't already-done work) sees zero behavior change; the gate still dies
+on genuine miscategorization exhaustion.
 
 Reaching this state from classification instead of post-plan meant a run
 could hit `_finish_no_work_run` earlier than the pipeline previously ever
