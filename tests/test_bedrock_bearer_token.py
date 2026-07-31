@@ -233,6 +233,89 @@ def test_aws_region_not_forwarded_when_unset(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL forwarded when set, on both
+# Bedrock auth modes (bearer-token and SSO/profile) — the CLI's Bedrock
+# alias table lags the Anthropic-API one, and these vars are the CLI's
+# documented mechanism for repointing what --model <tier> resolves to.
+# Verified live against the real CLI (v2.1.220) that a container -e var is
+# sufficient (plain process env, not settings.json-gated).
+# ---------------------------------------------------------------------------
+
+def test_anthropic_default_sonnet_model_forwarded_bearer_mode(tmp_path: Path) -> None:
+    rc, tokens, _, _ = _run(
+        {
+            "AWS_BEARER_TOKEN_BEDROCK": "bedrock-tok-123",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "us.anthropic.claude-sonnet-5",
+        },
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    pairs = _env_pairs(tokens)
+    assert pairs["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "us.anthropic.claude-sonnet-5"
+
+
+def test_anthropic_default_opus_and_haiku_model_forwarded_bearer_mode(tmp_path: Path) -> None:
+    rc, tokens, _, _ = _run(
+        {
+            "AWS_BEARER_TOKEN_BEDROCK": "bedrock-tok-123",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "us.anthropic.claude-opus-5",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "us.anthropic.claude-haiku-4-5",
+        },
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    pairs = _env_pairs(tokens)
+    assert pairs["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-5"
+    assert pairs["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "us.anthropic.claude-haiku-4-5"
+
+
+def test_anthropic_default_model_vars_not_forwarded_when_unset_bearer_mode(tmp_path: Path) -> None:
+    """No spurious -e ANTHROPIC_DEFAULT_*_MODEL= entries when the user
+    hasn't set any of the three — the CLI's own Bedrock default must be
+    left untouched."""
+    rc, tokens, _, _ = _run(
+        {"AWS_BEARER_TOKEN_BEDROCK": "bedrock-tok-123"}, tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    pairs = _env_pairs(tokens)
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in pairs
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in pairs
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in pairs
+
+
+def test_anthropic_default_sonnet_model_forwarded_sso_mode(tmp_path: Path) -> None:
+    """Parity check: the SSO/profile Bedrock path forwards the same var."""
+    rc, tokens, bearer_active, sso_active = _run(
+        {"ANTHROPIC_DEFAULT_SONNET_MODEL": "us.anthropic.claude-sonnet-5"},
+        aws_on_path=True,
+        aws_succeeds=True,
+        settings_json={"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    assert bearer_active is False
+    assert sso_active is True
+    pairs = _env_pairs(tokens)
+    assert pairs["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "us.anthropic.claude-sonnet-5"
+
+
+def test_anthropic_default_model_vars_not_forwarded_when_unset_sso_mode(tmp_path: Path) -> None:
+    rc, tokens, _, sso_active = _run(
+        {},
+        aws_on_path=True,
+        aws_succeeds=True,
+        settings_json={"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    assert sso_active is True
+    pairs = _env_pairs(tokens)
+    assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in pairs
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in pairs
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in pairs
+
+
+# ---------------------------------------------------------------------------
 # Bearer token set -> no aws CLI / SSO preflight, no ~/.aws mount.
 # ---------------------------------------------------------------------------
 

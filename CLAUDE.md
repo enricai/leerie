@@ -330,6 +330,20 @@ export AWS_BEARER_TOKEN_BEDROCK=<token>
 export AWS_REGION=us-east-1              # optional, forwarded when set
 ./leerie "task"
 
+# Pin which model version the `--model <tier>` alias (sonnet/opus/haiku)
+# resolves to on Bedrock. leerie always invokes claude -p with an explicit
+# --model <tier> flag, never a raw model ID — and on Bedrock the Claude
+# CLI's own alias table can lag the Anthropic-API one by a model
+# generation or more (e.g. `sonnet` resolving to Sonnet 4.5 instead of
+# Sonnet 5). These are the Claude CLI's own documented env vars for
+# repointing an alias; set the ones you need alongside either Bedrock auth
+# mode above (bearer-token or settings.json SSO/profile) and leerie
+# forwards them into the container:
+export ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5
+export ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-5
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=us.anthropic.claude-haiku-4-5
+./leerie "task"
+
 # Choose the model. Without overrides, every worker — judgment (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator) and acting
 # (implementer, conformer) alike — defaults to sonnet. Per-worker overrides

@@ -5666,6 +5666,17 @@ if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
   AUTH_MOUNTS+=(-e "AWS_BEARER_TOKEN_BEDROCK=$AWS_BEARER_TOKEN_BEDROCK")
   AUTH_MOUNTS+=(-e "CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-1}")
   [ -n "${AWS_REGION:-}" ] && AUTH_MOUNTS+=(-e "AWS_REGION=$AWS_REGION")
+  # leerie always invokes claude -p with an explicit --model <tier> alias
+  # (sonnet/opus/haiku), never a raw model ID -- see orchestrator/leerie.py.
+  # On Bedrock, the Claude CLI's own alias table lags the Anthropic-API
+  # alias table by a model generation or more. These three vars are the
+  # CLI's documented mechanism for repointing what an alias resolves to
+  # (read as plain process env vars at CLI startup, independent of
+  # settings.json), so forward them when the user has set them on the
+  # host -- otherwise the CLI's own Bedrock default silently applies.
+  [ -n "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" ] && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL")
+  [ -n "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" ]   && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL")
+  [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]  && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL")
 fi
 
 # -- ~/.aws/ (Bedrock SSO/profile mode only) --
@@ -5737,6 +5748,12 @@ PY
   )"
   [ -n "$_BEDROCK_PROFILE" ] && AUTH_MOUNTS+=(-e "AWS_PROFILE=$_BEDROCK_PROFILE")
   [ -n "$_BEDROCK_REGION" ]  && AUTH_MOUNTS+=(-e "AWS_REGION=$_BEDROCK_REGION")
+  # Same alias-repointing forward as the bearer-token block above -- see
+  # its comment for why. Kept here too so both Bedrock auth modes have
+  # parity on model-pinning.
+  [ -n "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" ] && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_DEFAULT_SONNET_MODEL")
+  [ -n "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" ]   && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_DEFAULT_OPUS_MODEL")
+  [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]  && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL")
 fi
 
 # -- Mount each staged file/dir at its default in-container path. --
