@@ -8814,6 +8814,52 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
+def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
+    """Filter language_installs to only the residual that cannot be baked.
+
+    Per DESIGN §6½ and the out-of-repo bake redesign: Python/Ruby/Rust/Go deps
+    bake entirely to /opt/venv, /opt/bundle, CARGO_HOME, GOMODCACHE — workers
+    resolve them with zero install. Node/pnpm's store is baked read-only, but
+    the in-repo node_modules symlink tree must be recreated per worktree
+    (irreducible ~223ms offline-relink). So config.toml holds ONLY that Node
+    offline-relink residual; everything else is filtered out.
+
+    Returns a filtered copy; the input is unchanged.
+    """
+    # Managers whose installs bake entirely (no residual)
+    BAKEABLE_MANAGERS = frozenset([
+        "pip", "pip3", "uv",        # Python → /opt/venv
+        "bundle", "gem",             # Ruby → /opt/bundle
+        "cargo",                     # Rust → CARGO_HOME/CARGO_TARGET_DIR
+        "go",                        # Go → GOMODCACHE/GOCACHE
+    ])
+    # Node managers: keep only offline-relink commands
+    NODE_MANAGERS = frozenset(["pnpm", "npm", "yarn"])
+
+    residual = []
+    for entry in language_installs:
+        manager = entry.get("manager", "")
+        command = entry.get("command", "") or ""  # Guard against explicit None
+
+        # Filter out bakeable managers entirely
+        if manager in BAKEABLE_MANAGERS:
+            continue
+
+        # For Node managers, keep only offline-relink commands
+        if manager in NODE_MANAGERS:
+            # The irreducible residual is the offline/frozen-lockfile relink
+            # (e.g., "pnpm install --offline --frozen-lockfile")
+            # Filter out full network installs
+            if "--offline" in command or "--frozen-lockfile" in command:
+                residual.append(entry)
+            continue
+
+        # Unknown managers: preserve as-is (conservative)
+        residual.append(entry)
+
+    return residual
+
+
 async def capture_repo_deps(
         repo_root: Path,
         st: object,
@@ -8843,21 +8889,6 @@ async def capture_repo_deps(
     log_dir = Path(log_dir) / "logs"
     if not log_dir.is_dir():
         return
-    # Skip when a committed .leerie/Dockerfile exists; it is authoritative
-    # (DESIGN §6½) and setup_packages / language_installs are ignored.
-    dockerfile = repo_root / ".leerie" / "Dockerfile"
-    if dockerfile.is_file():
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-files", "--error-unmatch",
-                 ".leerie/Dockerfile"],
-                capture_output=True)
-            if result.returncode == 0:
-                log("capture: .leerie/Dockerfile is committed — skipping "
-                    "dep_capture (Dockerfile is authoritative)")
-                return
-        except Exception:
-            pass
     # Manifests-first corpus (DESIGN §6½): manifest files are primary ground
     # truth; install-filtered commands are only a hint for system/native deps.
     manifests_text = _gather_dep_manifests(repo_root)
@@ -8911,7 +8942,25 @@ async def capture_repo_deps(
         sid="dep-capture",
     )
     setup_packages: list[str] = result.get("setup_packages") or []
-    language_installs: list[dict] = result.get("language_installs") or []
+    language_installs_captured: list[dict] = result.get("language_installs") or []
+
+    # Filter to residual-only (DESIGN §6½): the worker captures everything, but
+    # config.toml holds only deps that cannot be baked (Node offline-relink).
+    # Python/Ruby/Rust/Go bake entirely; their installs are filtered out.
+    language_installs = _filter_residual_deps(language_installs_captured)
+
+    # Log what was captured vs. what will be written (makes filtering observable)
+    if language_installs_captured:
+        filtered_count = len(language_installs_captured) - len(language_installs)
+        if filtered_count > 0:
+            log(f"capture: captured {len(language_installs_captured)} language installs, "
+                f"filtered {filtered_count} bakeable (writing {len(language_installs)} residual)")
+        else:
+            log(f"capture: captured {len(language_installs_captured)} language installs "
+                f"(all residual, none filtered)")
+    if setup_packages:
+        log(f"capture: captured {len(setup_packages)} setup_packages")
+
     cfg_path = repo_root / ".leerie" / "config.toml"
     updates: dict[str, str] = {}
     if setup_packages:

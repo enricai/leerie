@@ -9,7 +9,7 @@ Covers:
   - warm repo (all deps already present) → no write (mtime unchanged)
   - LEERIE_CAPTURE_DEPS=0 → opt-out, worker not invoked
   - capture_deps = false in config.toml → opt-out, worker not invoked
-  - committed .leerie/Dockerfile → write skipped, worker not invoked
+  - committed .leerie/Dockerfile → worker STILL runs (feat-003), writes residual
   - missing logs dir → silent no-op (no exception, no write)
   - _write_config_toml_keys raises → exception is catchable (non-fatal guard)
 """
@@ -40,9 +40,9 @@ _DEP_CAPTURE_ENVELOPE = {
         "setup_packages": ["postgresql", "libpq-dev"],
         "language_installs": [
             {
-                "manager": "pip",
-                "command": "pip install -r requirements.txt",
-                "copy_inputs": ["requirements.txt"],
+                "manager": "pnpm",
+                "command": "pnpm install --offline --frozen-lockfile",
+                "copy_inputs": ["package.json", "pnpm-lock.yaml"],
             }
         ],
         "dockerfile_notes": None,
@@ -167,10 +167,10 @@ class TestDepCaptureWorkerWritePath:
         assert "postgresql" in content
 
     def test_writes_language_installs(self, leerie, tmp_path, monkeypatch):
-        """language_installs from worker structured_output are written to config.toml."""
+        """Residual language_installs from worker written to config.toml (feat-003)."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        st = _make_fake_state(leerie, tmp_path, ["pip install -r requirements.txt"])
+        st = _make_fake_state(leerie, tmp_path, ["pnpm install --offline"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
 
@@ -182,16 +182,16 @@ class TestDepCaptureWorkerWritePath:
         assert cfg.exists(), "config.toml not written"
         content = cfg.read_text()
         assert "language_installs" in content
-        assert "pip" in content
+        assert "pnpm" in content
 
     def test_both_setup_packages_and_language_installs_written(
             self, leerie, tmp_path, monkeypatch):
-        """Both keys written in a single pass from the worker envelope."""
+        """Both keys written in a single pass from the worker envelope (residual)."""
         repo = tmp_path / "repo"
         repo.mkdir()
         st = _make_fake_state(leerie, tmp_path, [
             "apt-get install -y postgresql",
-            "pip install -r requirements.txt",
+            "pnpm install --offline",
         ])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch)
@@ -363,13 +363,13 @@ class TestDepCaptureReplace:
 
     def test_replace_overwrites_language_installs_dropping_stale_manager(
             self, leerie, tmp_path, monkeypatch):
-        """replace=True: a manager no longer captured is dropped from the array."""
+        """replace=True: a manager no longer captured is dropped (feat-003 residual)."""
         repo = tmp_path / "repo"
         leerie_dir = repo / ".leerie"
         leerie_dir.mkdir(parents=True)
         existing = [
-            {"manager": "pip", "command": "pip install -r requirements.txt",
-             "copy_inputs": ["requirements.txt"]},
+            {"manager": "pnpm", "command": "pnpm install --offline",
+             "copy_inputs": ["package.json"]},
             {"manager": "cargo", "command": "cargo build",
              "copy_inputs": ["Cargo.toml"]},
         ]
@@ -380,15 +380,15 @@ class TestDepCaptureReplace:
         env = dict(_DEP_CAPTURE_ENVELOPE)
         env["structured_output"] = {
             "setup_packages": [],
-            # Fresh capture: only pip (cargo is gone).
+            # Fresh capture: only pnpm (cargo is gone, pip filtered as bakeable).
             "language_installs": [
-                {"manager": "pip", "command": "pip install -e .",
-                 "copy_inputs": ["setup.py"]},
+                {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
+                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
             ],
             "dockerfile_notes": None,
         }
 
-        st = _make_fake_state(leerie, tmp_path, ["pip install -e ."])
+        st = _make_fake_state(leerie, tmp_path, ["pnpm install --offline"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
         _patch_invoke(leerie, monkeypatch, envelope=env)
 
@@ -399,10 +399,10 @@ class TestDepCaptureReplace:
 
         raw = leerie._read_toml_key(cfg, "language_installs")
         managers = {e["manager"] for e in json.loads(raw)}
-        assert managers == {"pip"}, (
+        assert managers == {"pnpm"}, (
             f"replace=True must drop stale managers; got {managers}")
-        # And the surviving pip entry is the freshly-captured command.
-        assert "setup.py" in raw
+        # And the surviving pnpm entry is the freshly-captured command.
+        assert "pnpm-lock.yaml" in raw
 
     def test_replace_empty_capture_leaves_existing_untouched(
             self, leerie, tmp_path, monkeypatch):
@@ -576,8 +576,9 @@ class TestDepCaptureOptOut:
 class TestDepCaptureDockerfileGuard:
     """A committed .leerie/Dockerfile prevents the worker from running."""
 
-    def test_committed_dockerfile_skips_write(self, leerie, tmp_path, monkeypatch):
-        """If .leerie/Dockerfile is git-tracked, worker is not invoked."""
+    def test_always_runs_worker_even_with_committed_dockerfile(
+            self, leerie, tmp_path, monkeypatch):
+        """Worker always runs (feat-003) even when .leerie/Dockerfile committed."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _git_init(repo)
@@ -607,11 +608,11 @@ class TestDepCaptureDockerfileGuard:
             repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
         ))
 
-        assert not invoke_called, (
-            "_invoke should not be called when committed Dockerfile exists")
+        assert invoke_called, (
+            "_invoke SHOULD be called even when committed Dockerfile exists (feat-003)")
         cfg = leerie_dir / "config.toml"
-        assert not cfg.exists(), (
-            "config.toml must not be created when committed Dockerfile is authoritative")
+        assert cfg.exists(), (
+            "config.toml SHOULD be created with residual deps (feat-003)")
 
     def test_untracked_dockerfile_does_not_block(self, leerie, tmp_path, monkeypatch):
         """An untracked .leerie/Dockerfile does not prevent the write."""
