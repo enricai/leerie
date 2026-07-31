@@ -8839,7 +8839,7 @@ def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
     residual = []
     for entry in language_installs:
         manager = entry.get("manager", "")
-        command = entry.get("command", "")
+        command = entry.get("command", "") or ""  # Guard against explicit None
 
         # Filter out bakeable managers entirely
         if manager in BAKEABLE_MANAGERS:
