@@ -19913,12 +19913,14 @@ async def _run_checked_loop(
 
     Calls *invoke* up to *max_rounds* times.  After each call, runs
     *check* (a pure-Python function) on the result.  If the check
-    returns an empty list the loop breaks (output is clean).  Otherwise
-    the issue list is formatted as external feedback via
-    ``_format_check_feedback`` and the next round's *invoke* is expected
-    to receive it (the caller is responsible for closing over a mutable
-    prompt variable that ``make_feedback_prompt`` updates, or ignoring
-    feedback for workers that don't need prompt mutation).
+    returns an empty list the loop breaks (output is clean).  Otherwise,
+    when *make_feedback_prompt* is provided, the issue list is formatted
+    as external feedback via ``_format_check_feedback`` and the next
+    round's *invoke* is expected to receive it (the caller is
+    responsible for closing over a mutable prompt variable that
+    ``make_feedback_prompt`` updates). When *make_feedback_prompt* is
+    ``None``, a round with issues stops the loop immediately instead —
+    see the *make_feedback_prompt* paragraph below.
 
     Returns ``(last_result, all_warnings)``.  The caller decides
     escalation (die, block, warn).
@@ -19926,9 +19928,20 @@ async def _run_checked_loop(
     *make_feedback_prompt* is optional.  When provided, it receives the
     formatted feedback string and should update whatever closed-over
     state the next ``invoke()`` call will read (typically a user-prompt
-    variable).  When ``None``, feedback is logged but not injected (the
-    loop still retries — useful when the re-invocation alone, as a fresh
-    ``claude -p`` session, is the value).
+    variable) — the caller can mechanically act on a found issue (e.g.
+    re-classify, re-plan) and a further round may converge.  When
+    ``None``, the caller cannot mechanically fix a found issue (a
+    "detect-and-die, single pass" gate, e.g. `phase_wiring_gate`,
+    `phase_provision_gate`, the integration judge): a round that finds
+    issues stops the loop immediately rather than retrying, since a
+    further round attacks the *same unchanged input* with nothing but a
+    fresh, non-deterministic judge session — it can only ever lose the
+    first round's finding (on a re-roll that happens not to reproduce
+    it), never add real information. This is distinct from the
+    `WorkerError` retry below, which is an infrastructure-crash retry
+    (a fresh session recovering from a saturated PID table, not a
+    second opinion on the work) and fires regardless of
+    `make_feedback_prompt`.
 
     Oscillation guard: neither this loop nor any known caller's
     ``make_feedback_prompt`` accumulates feedback across rounds — each
@@ -19960,10 +19973,11 @@ async def _run_checked_loop(
         except WorkerError as exc:
             # Infrastructure failure (PID exhaustion, OOM, a killed session),
             # not a judgment about the work — so spend a round on a fresh
-            # `claude -p` session rather than abandoning the loop. This is the
-            # case the docstring above calls out: "the re-invocation alone, as
-            # a fresh claude -p session, is the value". A PID-exhausted worker
-            # in particular dies with a saturated cgroup that the next
+            # `claude -p` session rather than abandoning the loop. This is
+            # the "infrastructure-crash retry" the docstring above
+            # distinguishes from a found-issue retry — it fires regardless
+            # of `make_feedback_prompt`. A PID-exhausted worker in
+            # particular dies with a saturated cgroup that the next
             # invocation does not inherit.
             #
             # Bounded by `max_rounds` (judgment_check_rounds = 3), and each
@@ -19992,6 +20006,16 @@ async def _run_checked_loop(
 
         for issue in issues:
             warnings.append(f"{name} round {rnd}: {issue}")
+
+        if make_feedback_prompt is None:
+            # Detect-and-die, single pass: nothing re-drives the input
+            # between rounds, so a further round cannot fix what this one
+            # found — it can only lose the finding on a re-roll that
+            # happens not to reproduce it. Stop now; this round's issues
+            # are final. (The oscillation guard below exists for the
+            # feedback-driven case, where a round's fix legitimately
+            # changes the input — it has no meaning here.)
+            break
 
         issue_set = frozenset(_issue_signature(issue) for issue in issues)
         if any(issue_set <= seen for seen in seen_issue_sets):

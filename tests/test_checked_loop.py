@@ -52,6 +52,16 @@ def _run(coro, loop=None):
     return loop.run_until_complete(coro)
 
 
+async def _noop_feedback(fb):
+    """Stub `make_feedback_prompt` for tests modeling a feedback-driven
+    caller (classifier, reconciler, provision, overlap judge, integrator)
+    that mechanically re-drives on a found issue — as opposed to a
+    detect-and-die, single-pass caller (`make_feedback_prompt=None`),
+    which stops on the first round with issues. Its presence, not its
+    body, is what the loop inspects; real callers close over mutable
+    prompt state instead of no-op'ing."""
+
+
 def test_loop_clean_on_first_round(leerie):
     calls = []
 
@@ -83,7 +93,8 @@ def test_loop_retries_then_clears(leerie):
         return []
 
     result, warnings = _run(leerie._run_checked_loop(
-        invoke=invoke, check=check, name="test", max_rounds=5))
+        invoke=invoke, check=check, name="test", max_rounds=5,
+        make_feedback_prompt=_noop_feedback))
     assert result == {"good": True}
     assert len(warnings) == 2
     assert attempt[0] == 3
@@ -108,6 +119,7 @@ def test_loop_exhausts_rounds(leerie):
         check=check,
         name="test",
         max_rounds=2,
+        make_feedback_prompt=_noop_feedback,
     ))
     assert result == {"n": 2}
     assert len(warnings) == 2
@@ -174,7 +186,12 @@ def test_loop_worker_error_every_round_returns_none(leerie):
 
 def test_loop_worker_error_does_not_leak_stale_result(leerie):
     """A crash after a successful-but-dirty round must not return that stale
-    result as if it were the crashed round's output."""
+    result as if it were the crashed round's output. Needs
+    make_feedback_prompt (a feedback-driven caller) to reach round 1 at
+    all — a detect-and-die (no-feedback) caller now stops at round 0's
+    dirty finding and never gets a chance to crash on a later round; see
+    test_loop_no_feedback_worker_error_then_issue_found_stops for that
+    path's own crash-then-issue-found coverage."""
     calls = []
 
     async def invoke():
@@ -188,6 +205,7 @@ def test_loop_worker_error_does_not_leak_stale_result(leerie):
         check=lambda r: ["ISSUE: dirty"],
         name="test",
         max_rounds=3,
+        make_feedback_prompt=_noop_feedback,
     ))
     assert result is None, (
         "the crashed round must clear last_res; returning {'stale': True} "
@@ -203,6 +221,90 @@ def test_loop_none_result_breaks(leerie):
     assert result is None
     assert len(warnings) == 1
     assert "None" in warnings[0]
+
+
+# --- Detect-and-die, single pass (make_feedback_prompt=None) -------------- #
+# `phase_wiring_gate`, `phase_provision_gate`, and the integration judge all
+# call this loop with no `make_feedback_prompt`: nothing re-drives the input
+# between rounds, so a further round can only ever LOSE a found defect (on a
+# non-deterministic re-roll that happens not to reproduce it), never gain
+# real information. A round with issues must be final.
+
+def test_loop_no_feedback_stops_on_first_issue_round(leerie):
+    """With make_feedback_prompt=None (the default — every real detect-and-
+    die caller), a round that finds issues must stop the loop immediately,
+    not retry up to max_rounds."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke,
+        check=lambda r: ["WIRING_DEFECT (missing_requires) sid/tag: reason"],
+        name="test",
+        max_rounds=3,
+    ))
+    assert calls[0] == 1, (
+        f"detect-and-die must stop after the first issue-bearing round, "
+        f"not retry an unchanged payload: {calls[0]} invocations")
+    assert any("missing_requires" in w for w in warnings)
+
+
+def test_loop_no_feedback_does_not_swallow_a_defect_on_re_roll(leerie):
+    """Regression for the silent-un-catch bug: a defect found on round 0
+    must not be discarded because a later round's non-deterministic judge
+    session happens not to reproduce it. Simulates re-roll variance — the
+    payload never changes, but the judge's output does — via odd/even
+    invocation counts."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        return {"n": calls[0]}
+
+    def check(r):
+        # Odd rounds find the defect, even rounds don't — modeling a
+        # non-deterministic judge session re-attacking unchanged input.
+        # The bug this test pins: the OLD loop would continue past round 0
+        # (finding the defect), hit round 1 (clean by luck), and report
+        # clean — silently dropping a real defect.
+        if r["n"] % 2 == 1:
+            return ["WIRING_DEFECT (missing_requires) sid/tag: reason"]
+        return []
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=check, name="test", max_rounds=3))
+    assert calls[0] == 1, (
+        "must stop at round 0's finding, never reach round 1's lucky-clean "
+        f"re-roll: {calls[0]} invocations")
+    assert any("missing_requires" in w for w in warnings)
+
+
+def test_loop_no_feedback_worker_error_then_issue_found_stops(leerie):
+    """The WorkerError infra-crash retry (round 0 crashes) is unaffected by
+    the detect-and-die fix: round 1 runs fresh, finds an issue, and THAT
+    round is final — it must not retry further looking for a clean pass."""
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        if calls[0] == 1:
+            raise leerie.WorkerError("worker x exhausted its PID cgroup")
+        return {"n": calls[0]}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke,
+        check=lambda r: ["RECIPE_FAILURE (bad_recipe) cmd: reason"],
+        name="test",
+        max_rounds=3,
+    ))
+    assert calls[0] == 2, (
+        f"round 0 crash must retry once (infra recovery), then round 1's "
+        f"finding must be final: {calls[0]} invocations")
+    assert any("crashed" in w for w in warnings)
+    assert any("bad_recipe" in w for w in warnings)
 
 
 def test_loop_feedback_callback_called(leerie):
@@ -289,6 +391,7 @@ def test_loop_breaks_early_on_exact_repeat(leerie):
         check=lambda r: ["ISSUE: same problem every time"],
         name="test",
         max_rounds=5,
+        make_feedback_prompt=_noop_feedback,
     ))
     assert calls[0] == 2, (
         f"must stop at round 1 (the repeat), never reach round 2+: "
@@ -323,7 +426,8 @@ def test_loop_breaks_on_two_round_cycle(leerie):
                  "per-endpoint regression pins across 6 named endpoints"]
 
     result, warnings = _run(leerie._run_checked_loop(
-        invoke=invoke, check=check, name="test", max_rounds=5))
+        invoke=invoke, check=check, name="test", max_rounds=5,
+        make_feedback_prompt=_noop_feedback))
     assert calls[0] == 3, (
         f"must stop at round 2 (the repeat of round 0's signature), "
         f"never reach round 3+: {calls[0]} invocations")
@@ -351,7 +455,8 @@ def test_loop_does_not_falsely_trigger_on_monotonic_growth(leerie):
         return []  # round 2: resolved via file-ownership split, clean
 
     result, warnings = _run(leerie._run_checked_loop(
-        invoke=invoke, check=check, name="test", max_rounds=3))
+        invoke=invoke, check=check, name="test", max_rounds=3,
+        make_feedback_prompt=_noop_feedback))
     assert calls[0] == 2, "must run both rounds — no oscillation to detect"
     assert not any("repeats an earlier round" in w for w in warnings)
 
@@ -375,7 +480,8 @@ def test_loop_does_not_falsely_trigger_on_shrinking_issue_set(leerie):
         return []
 
     result, warnings = _run(leerie._run_checked_loop(
-        invoke=invoke, check=check, name="test", max_rounds=3))
+        invoke=invoke, check=check, name="test", max_rounds=3,
+        make_feedback_prompt=_noop_feedback))
     assert calls[0] == 3
     assert not any("repeats an earlier round" in w for w in warnings)
 
@@ -396,6 +502,7 @@ def test_loop_oscillation_guard_respects_worker_error_rounds(leerie):
         return [f"ISSUE: round {r['n']}"]  # always distinct
 
     result, warnings = _run(leerie._run_checked_loop(
-        invoke=invoke, check=check, name="test", max_rounds=4))
+        invoke=invoke, check=check, name="test", max_rounds=4,
+        make_feedback_prompt=_noop_feedback))
     assert calls[0] == 4
     assert not any("repeats an earlier round" in w for w in warnings)
