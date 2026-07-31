@@ -474,17 +474,17 @@ class TestCaptureRepoDeps:
         assert "setup_packages" in content
 
     def test_writes_language_installs(self, leerie, tmp_path, monkeypatch):
-        """language_installs from worker output are written to config.toml."""
+        """Residual language_installs (Node offline-relink) written to config.toml."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        st = _make_fake_state(tmp_path, ["pip install -r requirements.txt"])
+        st = _make_fake_state(tmp_path, ["pnpm install --offline --frozen-lockfile"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
 
         worker_result = {
             "setup_packages": [],
             "language_installs": [
-                {"manager": "pip", "command": "pip install -r requirements.txt",
-                 "copy_inputs": ["requirements.txt"]},
+                {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
+                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
             ],
             "dockerfile_notes": None,
         }
@@ -498,7 +498,7 @@ class TestCaptureRepoDeps:
         assert cfg.exists()
         content = cfg.read_text()
         assert "language_installs" in content
-        assert "pip" in content
+        assert "pnpm" in content
         # Bug C regression: the JSON-encoded value contains `"`; the written
         # config must be VALID TOML (single-quoted literal), not a basic string
         # that the inner quotes terminate early.
@@ -508,8 +508,8 @@ class TestCaptureRepoDeps:
             import tomli as tomllib
         parsed = tomllib.loads(content)
         assert json.loads(parsed["language_installs"]) == [
-            {"manager": "pip", "command": "pip install -r requirements.txt",
-             "copy_inputs": ["requirements.txt"]},
+            {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
+             "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
         ]
 
     def test_no_op_on_warm_repo(self, leerie, tmp_path, monkeypatch):
@@ -538,9 +538,9 @@ class TestCaptureRepoDeps:
         mtime_after = cfg.stat().st_mtime
         assert mtime_before == mtime_after
 
-    def test_skips_write_when_committed_dockerfile_exists(
+    def test_always_runs_worker_even_with_committed_dockerfile(
             self, leerie, tmp_path, monkeypatch):
-        """If .leerie/Dockerfile is git-tracked, write is skipped."""
+        """Worker always runs (per feat-003), even when .leerie/Dockerfile committed."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _git_init(repo)
@@ -570,10 +570,11 @@ class TestCaptureRepoDeps:
                 models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
             ))
 
-        # Worker should NOT be invoked; no config.toml created.
-        assert not called, "dep_capture worker should not run when Dockerfile is committed"
+        # Worker SHOULD run (feat-003 removes the early-return); residual written.
+        assert called, "dep_capture worker must run even when Dockerfile is committed"
         cfg = leerie_dir / "config.toml"
-        assert not cfg.exists()
+        assert cfg.exists()
+        assert "postgresql" in cfg.read_text()
 
     def test_untracked_dockerfile_does_not_block_write(
             self, leerie, tmp_path, monkeypatch):
@@ -802,14 +803,14 @@ class TestCaptureRepoDeps:
             'setup_packages = "postgresql stale-pkg"\n'
             f'language_installs = "{json.dumps(stale_li, separators=(",", ":"))}"\n')
 
-        st = _make_fake_state(tmp_path, ["pip install -r requirements.txt"])
+        st = _make_fake_state(tmp_path, ["pnpm install --offline"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
 
         worker_result = {
             "setup_packages": ["postgresql"],
             "language_installs": [
-                {"manager": "pip", "command": "pip install -r requirements.txt",
-                 "copy_inputs": ["requirements.txt"]},
+                {"manager": "pnpm", "command": "pnpm install --offline",
+                 "copy_inputs": ["package.json"]},
             ],
             "dockerfile_notes": None,
         }
@@ -825,7 +826,7 @@ class TestCaptureRepoDeps:
         assert "stale-pkg" not in content, "replace=True must drop stale packages"
         managers = {e["manager"]
                     for e in json.loads(leerie._read_toml_key(cfg, "language_installs"))}
-        assert managers == {"pip"}, "replace=True must drop stale managers (cargo)"
+        assert managers == {"pnpm"}, "replace=True must drop stale managers (cargo)"
 
     def test_replace_true_empty_capture_leaves_existing(
             self, leerie, tmp_path, monkeypatch):
