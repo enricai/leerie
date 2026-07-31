@@ -19175,27 +19175,28 @@ def _format_provision_recipe_section(recipe: list[dict],
     lines = ["", "PROVISION_RECIPE:"]
     if audience == "implementer":
         lines.append(
-            "  The orchestrator detected the following install (and "
-            "follow-on build) commands for this repo. Your worktree "
-            "starts with NO installed dependencies and no build "
-            "outputs. Decide whether your subtask needs them — if yes, "
-            "run them via Bash in the order shown. The package-manager "
-            "caches (pnpm store, pip wheel cache, go module cache, cargo "
-            "registry) are warm and shared across worktrees, so "
-            "re-running these is fast. These are advisory: skip them if "
-            "your subtask is purely documentation, config, or otherwise "
+            "  The following residual install/build commands could not be "
+            "baked into the image and may need to run in your worktree. "
+            "Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "you inherit them with zero install. This list holds only what "
+            "remains: Node's offline relink, build steps, or other unbaked "
+            "commands. Decide whether your subtask needs them — if yes, run "
+            "them via Bash in the order shown. These are advisory: skip them "
+            "if your subtask is purely documentation, config, or otherwise "
             "doesn't touch buildable code."
         )
     elif audience == "conformer":
         lines.append(
-            "  Your worktree starts with NO installed dependencies "
-            "(or only those the implementer chose to install) and no "
-            "build outputs. Before running BUILD_CMD / LINT_CMD / "
-            "TEST_CMD, ensure deps and any required build artifacts are "
-            "present — either run the install (and follow-on build) "
-            "command(s) yourself first, in the order shown, or react to "
-            "a failing test/build that diagnoses missing deps and run "
-            "them then. The caches are warm so re-running is fast."
+            "  Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "your worktree inherits them with zero install. The following "
+            "residual commands are what could not be baked (Node offline "
+            "relink, build steps, etc.). Before running BUILD_CMD / "
+            "LINT_CMD / TEST_CMD, ensure any residual deps and build "
+            "artifacts are present — either run these command(s) first, "
+            "in the order shown, or react to a failing test/build that "
+            "diagnoses what's missing and run them then."
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
