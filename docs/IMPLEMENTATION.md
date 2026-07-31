@@ -7303,8 +7303,12 @@ type. Required fields, current shape:
   out-of-graph prerequisite (other repo, ops runbook, manual step) that
   bypasses the reconciler and surfaces in `plan.json` as a `preconditions`
   entry — see DESIGN §5 `requires.extent`.** `provides` remains an array of
-  bare strings. `size` is `small` or `medium` — `large` is
-  rejected by `validate_plan`. `runs_commands` (array of strings, optional)
+  bare strings. `size` is a schema enum of `small`, `medium`, or `large` —
+  `large` is a legal value the planner/reconciler prompts are told to avoid,
+  not one the schema rejects: it triggers the size-resolution retry loop
+  (see "Size-resolution retry loop" and the size gate under "Phase 2½
+  checks") and, if it survives that retry, `validate_plan` dies with an
+  OVERSIZED/size-related error as the final backstop. `runs_commands` (array of strings, optional)
   declares every command the subtask actually invokes, as structured data —
   populated when the task text prescribes a specific command/script/tool
   invocation the planner gave its own run-the-command subtask (see

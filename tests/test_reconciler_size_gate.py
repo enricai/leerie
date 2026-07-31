@@ -98,14 +98,16 @@ def test_find_oversized_ignores_reconciler_added_small_medium(leerie):
     assert leerie._find_oversized_added_subtasks(plans) == []
 
 
-def test_find_oversized_case_insensitive(leerie):
-    """Defensive: the validate_plan check is case-insensitive (`.lower()`),
-    and the size gate mirrors that — a `Large` or `LARGE` from a
-    misbehaving model is still caught."""
+def test_find_oversized_is_exact_match_only(leerie):
+    """`size` is now a schema enum (`small`/`medium`/`large`), so a
+    non-canonical value like `LARGE` can never reach this function on a
+    schema-valid response — case-insensitivity is enforced at the schema
+    layer (`claude_p()`'s `--json-schema` validation), not here. This
+    function does an exact-match comparison and does not re-fold case."""
     s = _subtask("feat-001", size="LARGE")
     s["_added_by_reconciler"] = True
     plans = [_plan("_reconciler", s)]
-    assert len(leerie._find_oversized_added_subtasks(plans)) == 1
+    assert leerie._find_oversized_added_subtasks(plans) == []
 
 
 def test_find_oversized_returns_all_offenders(leerie):

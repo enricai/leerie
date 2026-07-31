@@ -193,7 +193,9 @@ done
 staging="${LEERIE_STATE_DIR}/runs/${run_id}/worktrees/staging"
 leerie_dir="${LEERIE_STATE_DIR}/runs/${run_id}"
 integrator_prompt="${SCRIPTS}/../prompts/integrator.md"
-integrator_schema='{"type":"object","required":["incoming_subtask","status"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]}}}'
+# Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py —
+# this script can't import Python, so there's no other guard against drift.
+integrator_schema='{"type":"object","required":["incoming_subtask","status","confidence"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]},"confidence":{"type":"object","required":["resolution","basis","falsifiers_tested","contradictions_reconciled","gap_to_close"],"properties":{"resolution":{"type":"number"},"basis":{"type":"string","maxLength":2000},"falsifiers_tested":{"type":"array","items":{"type":"string","maxLength":500}},"contradictions_reconciled":{"type":"array","items":{"type":"string","maxLength":500}},"gap_to_close":{"type":"object","properties":{"resolution":{"type":"string"}}}}}}}'
 
 integrated_count=0
 resolved_count=0

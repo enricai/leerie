@@ -1194,7 +1194,7 @@ SCHEMAS: dict[str, dict] = {
                         "requires": {"type": "array", "items": _REQUIRES_ITEM},
                         "provides": {"type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string"},
+                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
                         # The commands this subtask actually invokes, as
                         # structured data — so a prescribed-procedure
@@ -1294,7 +1294,7 @@ SCHEMAS: dict[str, dict] = {
                         "requires": {"type": "array", "items": _REQUIRES_ITEM},
                         "provides": {"type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string"},
+                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
                     },
                 },
@@ -1957,7 +1957,7 @@ SCHEMAS: dict[str, dict] = {
                         "provides": {
                             "type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string"},
+                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
                     },
                 },
@@ -6472,7 +6472,7 @@ def check_planner_output(
                 "success_criteria_seed")
 
     for s in subtasks:
-        if (s.get("size") or "").lower() == "large":
+        if s.get("size") == "large":
             issues.append(
                 f"OVERSIZED: {s.get('id', '?')} has size='large' "
                 "— split it")
@@ -7590,7 +7590,7 @@ def validate_plan(subtasks: dict) -> None:
             errors.append(f"{sid}: id must start with one of "
                           f"{sorted(_ID_PREFIXES)} — cross-domain collisions "
                           "and audit-trail ambiguity otherwise")
-        if s.get("size", "").lower() == "large":
+        if s.get("size") == "large":
             # Name the actual author. Reconciler-added subtasks carry
             # `_added_by_reconciler: true` (stamped in
             # `_apply_reconciler_output`). The phase 2½ size gate catches
@@ -15011,7 +15011,7 @@ def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
         for s in plan.get("subtasks", []):
             if not s.get("_added_by_reconciler"):
                 continue
-            if (s.get("size") or "").lower() == "large":
+            if s.get("size") == "large":
                 oversized.append(s)
     return oversized
 
