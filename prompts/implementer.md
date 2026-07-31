@@ -39,6 +39,36 @@ The orchestrator gives you, in your prompt:
   (pure docs/config changes). The package-manager caches are warm and
   shared across worktrees, so a re-run is fast.
 
+### Python dependency changes (`/opt/venv` is shared and read-only)
+
+For Python repos, dependencies are baked into a shared virtual environment at
+`/opt/venv` at image-build time (DESIGN §6½). If your subtask does **not**
+change `requirements.txt` / `pyproject.toml` / `Pipfile`, you don't need to do
+anything — the baked venv is already on `PATH` and importable with zero
+install cost.
+
+If your subtask **does** add, remove, or change a Python dependency, you must
+NOT install into `/opt/venv` directly — it's shared read-only across every
+worktree running in this wave (up to `max_parallel`, default 5), and writing
+to it would corrupt sibling worktrees' dependencies mid-run. Instead,
+materialize your own private copy and diff against it:
+
+```bash
+cp -r /opt/venv .venv-private
+# Always invoke via `python3 -m pip`, NEVER `.venv-private/bin/pip` directly —
+# that script's shebang is hardcoded to the ORIGINAL /opt/venv's python
+# binary, so `bin/pip install` would silently install into /opt/venv instead
+# of your private copy (this corrupts the shared bake for every other
+# worktree; verified — do not skip this).
+.venv-private/bin/python3 -m pip install <added-or-changed-package>
+.venv-private/bin/python3 -m pip uninstall -y <removed-package>
+# Use .venv-private/bin/python3 for the rest of the subtask (running tests,
+# imports, etc.) instead of the shared /opt/venv.
+```
+
+No `pyvenv.cfg` editing or shebang relocation is needed — `python3 -m pip`
+resolves correctly against the clone's own path regardless of where it lives.
+
 The subtask spec includes the overall task, the `source_of_truth`, the
 clarification answers, and this subtask's `success_criteria_seed`,
 `depends_on`, `investigation_notes`, and `files_likely_touched`.

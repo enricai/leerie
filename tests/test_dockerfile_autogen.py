@@ -406,9 +406,16 @@ def test_no_setup_packages_no_dockerfile_does_not_build(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_coupling_autogen_log_sentinel():
-    """The auto-gen log sentinel must be present verbatim in the launcher."""
+    """The auto-gen log sentinel must be present verbatim in the launcher.
+
+    Message changed from "...from setup_packages: $_sp_packages" to
+    "...(setup_packages=${_sp:-<none>})" when the $_sp gating bug was fixed
+    (generation can now fire on a lockfile / language_installs alone, with
+    setup_packages empty) — update this sentinel if the message changes
+    again.
+    """
     launcher = _launcher_text()
-    assert 'remote_log "auto-generating .leerie/Dockerfile from setup_packages' in launcher
+    assert 'remote_log "auto-generating .leerie/Dockerfile (setup_packages=' in launcher
 
 
 def test_coupling_arg_base_image_in_launcher():

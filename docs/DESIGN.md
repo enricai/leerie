@@ -3880,6 +3880,41 @@ classification and planning, layered top-to-bottom by determinism:
      worktree. This is not zero-cost but eliminates download and
      extraction, leaving only symlink creation.
 
+   **Rust and Go require a discardable dummy source file at
+   build time.** Neither `cargo fetch`/`cargo build` nor `go
+   build` will populate their respective build-artifact caches
+   (`CARGO_TARGET_DIR` / `GOCACHE`) against a manifest-only build
+   context (just the lockfile and manifest, no real source) —
+   `cargo` refuses to parse a manifest with no build target at
+   all ("no targets specified"), and `go build ./...` against
+   zero `.go` files is a silent no-op that warms neither cache
+   (only `go mod download`'s module cache, `GOMODCACHE`, warms
+   without one). This is a well-documented Cargo/Go Docker-layer-
+   caching workaround (no `cargo build --dependencies-only`
+   exists): emit a throwaway `src/main.rs` (`fn main() {}`) or
+   `main.go` (a minimal valid package) into the build scratch
+   dir, run the fetch/build step against it to force the
+   dependency graph to compile, then discard the dummy file —
+   never `COPY` it into `/work`. Verified: a real worktree's
+   subsequent build against real source then gets a genuine
+   cache hit from the same baked `CARGO_TARGET_DIR`/`GOCACHE`,
+   fully offline, from a different directory.
+
+   **The Rust bake step must NOT use `cargo build --release`.**
+   Cargo keys its build cache by profile — `debug/` and
+   `release/` are separate subtrees under `CARGO_TARGET_DIR` —
+   so a `--release` bake produces **zero cache benefit** for a
+   plain `cargo build`/`cargo test`, both of which default to
+   the debug profile (the profile implementer/conformer workers
+   actually use). Reproduced live as a real defect during this
+   feature's implementation: baking with `--release` left a real
+   worktree's subsequent `cargo build` recompiling every
+   dependency from scratch (`Compiling serde`, not `Fresh
+   serde`); dropping `--release` from the bake fixed it
+   (`Fresh serde_core`/`Fresh serde`, confirmed for both `cargo
+   build` and `cargo test`). Go has no equivalent profile split,
+   so this trap is Rust-specific.
+
    **Immutability invariant:** The baked layer is shared and
    read-only across up to `max_parallel` (default 5) concurrent
    worktrees. A worktree that changes a dependency (edits
@@ -3897,12 +3932,40 @@ classification and planning, layered top-to-bottom by determinism:
    correctly handle dependency *removal* (uninstalling a package
    from the overlay leaves it visible in the base) or a fresh
    venv's isolation from another venv's packages (site-packages
-   leaks across environments). The only correct mechanism is `cp
-   -r /opt/venv` into a private, relocated copy, then `pip install
-   -e .` or `pip uninstall` the diff. This materializes a full
-   private environment only when a worktree's subtask actually
-   mutates dependencies — the common case (no mutation) consumes
-   the shared `/opt/venv` directly with zero clone cost.
+   leaks across environments). The correct mechanism is `cp -r
+   /opt/venv` into a private copy, then apply the dependency
+   delta via `pip install`/`pip uninstall`. **No `pyvenv.cfg`
+   editing or `bin/` shebang relocation is needed** — verified
+   live: `pyvenv.cfg`'s `home =` line points at the system Python
+   install, not the venv itself, and is unaffected by moving the
+   clone to an arbitrary path. The one real trap is invoking the
+   clone's `bin/pip` directly: that script's shebang is hardcoded
+   to the *original* `/opt/venv`'s python binary, so `bin/pip
+   install`/`bin/pip uninstall` silently operate on the shared
+   `/opt/venv` instead of the clone — corrupting the bake for
+   every other concurrent worktree (reproduced live: an install
+   and an uninstall both leaked through a naive `cp -r` clone).
+   The fix is an invocation convention, not a relocation script:
+   always run `<clone>/bin/python3 -m pip install|uninstall`,
+   never `<clone>/bin/pip`. `python3` resolves correctly via its
+   own relative symlink regardless of where the clone lives, and
+   `-m pip` runs pip as a module inside that interpreter's own
+   `sys.prefix` — sidestepping the shebang trap entirely. This
+   materializes a full private environment only when a worktree's
+   subtask actually mutates dependencies — the common case (no
+   mutation) consumes the shared `/opt/venv` directly with zero
+   clone cost. `uv`/`poetry`/`pipenv` (as opposed to plain `pip`)
+   have their own, less reliable active-venv detection — `uv
+   sync` silently ignores `VIRTUAL_ENV` unless `--active` is
+   passed (verified live: without it, `uv` creates its own
+   `.venv` in the current directory instead of using the baked
+   venv), and `pipenv` has long-standing open bugs about not
+   respecting an already-active venv at all. The bake sidesteps
+   this by installing the tool itself into `/opt/venv` via pip at
+   build time, so the tool's own `/opt/venv/bin/<tool>` binary
+   resolves `sys.prefix` correctly by construction, the same
+   interpreter-path mechanism as the `python3 -m pip` convention
+   above — not environment-variable-based active-venv detection.
 
    **Cache invalidation is preserved.** The existing
    rebuild-decision mechanism — SHA-256 of every

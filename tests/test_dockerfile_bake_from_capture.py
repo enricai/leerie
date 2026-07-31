@@ -168,6 +168,11 @@ def test_pip_install_emits_copy_run_layer(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "COPY requirements.txt ./" in result.stdout
     assert "RUN pip install -r requirements.txt" in result.stdout
+    # Out-of-repo bake (DESIGN §6½): the persisted-installs path routes
+    # through the same /opt/venv bake as the deterministic detection chain —
+    # not a bare /work-targeting RUN.
+    assert "WORKDIR /opt/python-build" in result.stdout
+    assert "ENV VIRTUAL_ENV=/opt/venv" in result.stdout
 
 
 def test_pip_install_emits_apt_layer_alongside(tmp_path):

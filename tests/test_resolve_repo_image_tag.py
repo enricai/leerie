@@ -81,6 +81,41 @@ _leerie_repo_id() {
   printf '%s' "$sanitized"
 }
 
+_leerie_should_generate_dockerfile() {
+  local _repo="$1" _sp_val="$2"
+  if [ -n "$_sp_val" ]; then
+    return 0
+  fi
+  for _lf in package-lock.json pnpm-lock.yaml yarn.lock \
+             uv.lock poetry.lock Pipfile.lock \
+             Gemfile.lock Cargo.lock composer.lock \
+             packages.lock.json; do
+    if [ -f "$_repo/$_lf" ]; then
+      unset _lf
+      return 0
+    fi
+  done
+  unset _lf
+  if [ -f "$_repo/go.mod" ] && [ -f "$_repo/go.sum" ]; then
+    return 0
+  fi
+  local _li_cfg="$_repo/.leerie/config.toml"
+  if [ -f "$_li_cfg" ]; then
+    local _li
+    _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
+                  "$_li_cfg" 2>/dev/null \
+              || true; } \
+            | head -1 \
+            | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
+                      s/[[:space:]]*$//')"
+    case "$_li" in
+      ""|'""'|"''"|'[]'|'"[]"'|"'[]'") : ;;
+      *) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
 resolve_repo_image_tag() {
   local dockerfile="$USER_REPO/.leerie/Dockerfile"
   if [ ! -f "$dockerfile" ]; then
@@ -93,7 +128,7 @@ resolve_repo_image_tag() {
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
                     s/^'"'"'(.*)'"'"'$/\1/')"
-    if [ -z "$sp" ]; then
+    if ! _leerie_should_generate_dockerfile "$USER_REPO" "$sp"; then
       echo ""
       return
     fi
@@ -213,6 +248,45 @@ def test_no_dockerfile_no_setup_packages_repo_image_tag_empty(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     assert "repo_tag=EMPTY" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# ($_sp gating-bug fix) a lockfile present (no setup_packages) must still
+# resolve a non-empty tag — regression coverage for the bug this session
+# fixed: the early-return previously checked setup_packages ONLY.
+# ---------------------------------------------------------------------------
+
+def test_lockfile_without_setup_packages_resolves_nonempty_tag(tmp_path: Path):
+    """A lockfile-only repo (no setup_packages, no Dockerfile) must resolve a
+    real tag, not fall back to the empty string / base image."""
+    user_repo = tmp_path / "myrepo"
+    user_repo.mkdir()
+    (user_repo / "uv.lock").write_text("")
+    result = _run(
+        'echo "tag=$(resolve_repo_image_tag)"',
+        env={
+            "USER_REPO": str(user_repo),
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    tag = result.stdout.strip().removeprefix("tag=")
+    assert tag == "leerie-repo/owner-myrepo:1.2.3", tag
+
+
+def test_bare_requirements_txt_without_setup_packages_returns_empty(tmp_path: Path):
+    """Negative control: bare requirements.txt (no lockfile) is deliberately
+    excluded — must still resolve empty, matching _lockfile_table_entries."""
+    user_repo = tmp_path / "myrepo"
+    user_repo.mkdir()
+    (user_repo / "requirements.txt").write_text("requests==2.31.0\n")
+    result = _run(
+        'echo "tag=$(resolve_repo_image_tag)"',
+        env={"USER_REPO": str(user_repo), "FAKE_GIT_REMOTE": ""},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "tag="
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +500,10 @@ def test_resolve_repo_image_tag_harness_matches_launcher():
         # resolve_repo_image_tag function body
         'local dockerfile="$USER_REPO/.leerie/Dockerfile"',
         'echo "leerie-repo/${repo_id}:${LEERIE_VERSION}"',
+        'if ! _leerie_should_generate_dockerfile "$USER_REPO" "$sp"; then',
+        # _leerie_should_generate_dockerfile (the $_sp gating-bug fix)
+        '_leerie_should_generate_dockerfile() {',
+        'if [ -f "$_repo/go.mod" ] && [ -f "$_repo/go.sum" ]; then',
         # _leerie_repo_id function body
         'raw="$(git -C "$USER_REPO" remote get-url origin 2>/dev/null || true)"',
         'raw="$(basename "$USER_REPO")"',

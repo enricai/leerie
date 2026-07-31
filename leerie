@@ -4467,6 +4467,59 @@ _leerie_repo_id() {
   printf '%s' "$sanitized"
 }
 
+# Shared gating check (IMPLEMENTATION.md §0.5 "Auto-generation triggers"):
+# true when a Dockerfile should be auto-generated because ANY of (1)
+# setup_packages is non-empty, (2) a known dependency lockfile is present in
+# the repo, or (3) language_installs is non-empty in .leerie/config.toml.
+# Used by both resolve_repo_image_tag (the early-return gate) and the main
+# generation body, so the two can never drift out of sync on what counts as
+# "this repo needs a bake."
+#
+# Args: $1 = repo dir, $2 = setup_packages value (already extracted by the
+# caller — avoids re-parsing config.toml twice per call site).
+_leerie_should_generate_dockerfile() {
+  local _repo="$1" _sp_val="$2"
+  if [ -n "$_sp_val" ]; then
+    return 0
+  fi
+  # Mirrors orchestrator/leerie.py's _lockfile_table_entries exactly — bare
+  # requirements.txt / bare pyproject.toml (no lockfile) is deliberately
+  # EXCLUDED here too: it's the ambiguous tail that goes to the LLM
+  # fallback, not the deterministic table, so it must not trigger a bake
+  # either (a bake based on a guess is worse than no bake).
+  for _lf in package-lock.json pnpm-lock.yaml yarn.lock \
+             uv.lock poetry.lock Pipfile.lock \
+             Gemfile.lock Cargo.lock composer.lock \
+             packages.lock.json; do
+    if [ -f "$_repo/$_lf" ]; then
+      unset _lf
+      return 0
+    fi
+  done
+  unset _lf
+  # Go needs BOTH go.mod and go.sum (mirrors _lockfile_table_entries).
+  if [ -f "$_repo/go.mod" ] && [ -f "$_repo/go.sum" ]; then
+    return 0
+  fi
+  local _li_cfg="$_repo/.leerie/config.toml"
+  if [ -f "$_li_cfg" ]; then
+    local _li
+    _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
+                  "$_li_cfg" 2>/dev/null \
+              || true; } \
+            | head -1 \
+            | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
+                      s/[[:space:]]*$//')"
+    # language_installs is a JSON array string in config.toml; "[]" (or
+    # quoted "[]") means empty/absent, anything else non-blank means present.
+    case "$_li" in
+      ""|'""'|"''"|'[]'|'"[]"'|"'[]'") : ;;
+      *) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
 # Returns the per-repo image tag when a .leerie/Dockerfile is present
 # (real or auto-generated); empty string otherwise.
 resolve_repo_image_tag() {
@@ -4482,12 +4535,16 @@ resolve_repo_image_tag() {
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
                     s/^'"'"'(.*)'"'"'$/\1/')"
-    if [ -z "$sp" ]; then
-      # No Dockerfile and no setup_packages — use base image.
+    # Bug fix: this early-return previously checked setup_packages ONLY, so a
+    # repo with a lockfile / language_installs but no setup_packages fell
+    # through to the base image with no bake at all (IMPLEMENTATION.md §0.5
+    # "Dockerfile-emitter gating"). Broaden via the shared helper.
+    if ! _leerie_should_generate_dockerfile "$USER_REPO" "$sp"; then
+      # No Dockerfile and nothing to bake — use base image.
       echo ""
       return
     fi
-    # setup_packages is set; a Dockerfile will be auto-generated (see below).
+    # Something to bake; a Dockerfile will be auto-generated (see below).
   fi
   local repo_id
   repo_id="$(_leerie_repo_id)"
@@ -4636,28 +4693,38 @@ if [ "$_leerie_do_gen" = "true" ]; then
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
                     s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_sp" ]; then
-    # Convert comma-separated list to space-separated package names.
-    _sp_packages="$(printf '%s' "$_sp" | tr ',' ' ' | tr -s ' ')"
-    remote_log "auto-generating .leerie/Dockerfile from setup_packages: $_sp_packages"
+  # Bug fix: this used to be `if [ -n "$_sp" ]; then` — the whole generation
+  # body (apt layer, language-dep layer, build-verify fallback) skipped
+  # entirely for a repo with a lockfile / language_installs but no
+  # setup_packages (IMPLEMENTATION.md §0.5 "Dockerfile-emitter gating").
+  # Broaden the outer gate via the shared helper; the apt-package loop below
+  # stays conditional on `$_sp` specifically so a repo with zero system
+  # packages gets a Dockerfile with no dangling/empty apt RUN.
+  if _leerie_should_generate_dockerfile "$USER_REPO" "$_sp"; then
+    remote_log "auto-generating .leerie/Dockerfile (setup_packages=${_sp:-<none>})"
     mkdir -p "$USER_REPO/.leerie"
     # Write to a temp file then move atomically so a half-written file is
     # never visible to the hash check below.
     _gen_df_tmp="$USER_REPO/.leerie/.Dockerfile.gen.$$"
     printf '%s\n' "$LEERIE_GENERATED_SENTINEL" > "$_gen_df_tmp"
-    printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
-      >> "$_gen_df_tmp"
-    for _pkg in $_sp_packages; do
-      printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
-    done
-    # End the apt layer with the image still at USER root. Do NOT append a
-    # trailing `USER leerie`: the base image's ENTRYPOINT (container-entry.sh)
-    # is inherited here and MUST run as PID-1 root to set up cgroup containment
-    # and launch the cgroup broker before dropping to leerie via `runuser` (see
-    # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
-    # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
-    # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
-    printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
+    printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n' >> "$_gen_df_tmp"
+    if [ -n "$_sp" ]; then
+      # Convert comma-separated list to space-separated package names.
+      _sp_packages="$(printf '%s' "$_sp" | tr ',' ' ' | tr -s ' ')"
+      printf 'RUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
+        >> "$_gen_df_tmp"
+      for _pkg in $_sp_packages; do
+        printf '    %s \\\n' "$_pkg" >> "$_gen_df_tmp"
+      done
+      # End the apt layer with the image still at USER root. Do NOT append a
+      # trailing `USER leerie`: the base image's ENTRYPOINT (container-entry.sh)
+      # is inherited here and MUST run as PID-1 root to set up cgroup containment
+      # and launch the cgroup broker before dropping to leerie via `runuser` (see
+      # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
+      # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
+      # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
+      printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
+    fi
 
     # Language-dep layer (gated on bake_language_deps, default true).
     # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
@@ -4704,7 +4771,22 @@ def _hash_copy_files(repo, copy_files):
     return copy_shas
 
 
-def _emit_layer(copy_files, run_cmd, copy_shas):
+def _emit_layer(copy_files, run_cmd, copy_shas, workdir=None, env_lines=None,
+                 pre_run_lines=None):
+    """Emit the COPY-input-shas comment, an optional `WORKDIR` (out-of-`/work`
+    build scratch dir — never write the /work-mounted tree at build time, see
+    DESIGN §6½ and the darwin no-clobber invariant), optional `ENV` lines
+    (baked ecosystem env like VIRTUAL_ENV/BUNDLE_PATH/CARGO_TARGET_DIR/
+    GOCACHE — must be present in the image so the bake target survives into
+    every container run), the COPY lines, any pre-RUN lines (e.g. a discarded
+    dummy source file some ecosystems need to give their build tool a valid
+    target — see the Rust/Go branches below), and finally the RUN line.
+
+    copy_files/copy_shas stay REPO-RELATIVE regardless of workdir — hashing
+    covers the real dependency-input files, not the scratch dir the install
+    writes into, so the existing .dockerfile-hash cache-invalidation
+    mechanism (leerie:~4982) is unaffected by where the RUN line installs to.
+    """
     sha_comment = "# copy-input-shas: " + " ".join(
         f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
     )
@@ -4720,11 +4802,20 @@ def _emit_layer(copy_files, run_cmd, copy_shas):
     top_level = [c for c in copy_files if not _needs_own_copy(c)]
     own = [c for c in copy_files if _needs_own_copy(c)]
     print(sha_comment)
+    if workdir:
+        # WORKDIR creates the dir if absent — no separate mkdir needed. This
+        # is what keeps the install OUT of the inherited /work WORKDIR: every
+        # COPY/RUN below runs relative to this scratch dir instead.
+        print(f"WORKDIR {workdir}")
+    for line in (env_lines or []):
+        print(f"ENV {line}")
     if top_level:
         print("COPY " + " ".join(top_level) + " ./")
     for c in own:
         # Directories keep their trailing slash on both sides; files map 1:1.
         print(f"COPY {c} ./{c}")
+    for line in (pre_run_lines or []):
+        print(line)
     print(f"RUN {run_cmd}")
 
 
@@ -4764,6 +4855,103 @@ def _node_ancillary(repo, copy_files):
                 copy_files.append(rel)
     if (repo / "patches").is_dir() and "patches/" not in copy_files:
         copy_files.append("patches/")
+
+
+# Out-of-repo bake targets (DESIGN §6½, IMPLEMENTATION.md §0.5). Node/pnpm is
+# deliberately absent: node_modules cannot be fully baked (must live in the
+# repo tree for resolution), so the pnpm/yarn/npm install still targets the
+# inherited /work WORKDIR — only the pnpm *store* is warmed (via the existing
+# npm_config_store_dir cache mount, already wired at runtime), unchanged by
+# this feature. Composer/.NET are also left targeting /work: no verified
+# out-of-repo bake exists for them yet (out of scope — Python/Ruby/Rust/Go
+# are the four ecosystems this feature covers per the plan).
+#
+# Rust and Go both need a discardable dummy source file at build time: neither
+# `cargo build`/`cargo fetch` nor `go build` will populate their respective
+# build-artifact caches (CARGO_TARGET_DIR / GOCACHE) against a manifest-only
+# COPY context with zero real source files — `cargo` refuses to parse a
+# manifest with no build target at all, and `go build ./...` against zero .go
+# files is a silent no-op that warms neither cache. This is a well-documented
+# Cargo/Go Docker-layer-caching workaround (no `cargo build
+# --dependencies-only` exists) — live-verified this session: a genuine cache
+# hit (`Fresh serde`/`packagefile ...` reused, zero network) from a REAL
+# worktree afterward, against the same baked CARGO_TARGET_DIR/GOCACHE, from a
+# different directory, fully offline.
+def _bake_params_for_manager(manager, run_cmd):
+    """Returns (workdir, env_lines, pre_run_lines, run_cmd) for a bakeable
+    manager, or None if this manager doesn't have a verified out-of-repo bake
+    (falls back to the original /work-targeting run_cmd unchanged)."""
+    m = (manager or "").lower()
+    if m in ("pip", "pip3"):
+        # Plain pip installing from requirements.txt: `pip install -r ...`
+        # already targets whatever interpreter runs it, so putting
+        # /opt/venv/bin first on PATH (baked ENV) is sufficient — no
+        # per-tool active-venv detection involved.
+        return (
+            "/opt/python-build",
+            ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:$PATH"],
+            ["RUN python3 -m venv /opt/venv"],
+            run_cmd,
+        )
+    if m in ("uv", "poetry", "pipenv"):
+        # These tools' own active-venv detection is inconsistent and
+        # live-verified to be unreliable via VIRTUAL_ENV/PATH alone: `uv
+        # sync` silently IGNORES VIRTUAL_ENV unless --active is passed
+        # (verified live this session — without it, uv creates its own
+        # .venv in the build scratch dir instead of /opt/venv); pipenv has
+        # long-standing open bugs about not respecting an already-active
+        # venv at all (pypa/pipenv#1021). Sidestep per-tool detection
+        # entirely: install the tool ITSELF into /opt/venv via pip first,
+        # so when /opt/venv/bin/<tool> runs, its own interpreter's
+        # sys.prefix IS /opt/venv — the same interpreter-path-derived
+        # resolution verified for `python3 -m pip` in the clone+delta
+        # mechanism (1b below), not env-var-based active-venv detection.
+        tool = m
+        extra_flag = " --active" if m == "uv" else ""
+        fixed_run_cmd = run_cmd + extra_flag
+        return (
+            "/opt/python-build",
+            ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:$PATH"],
+            [
+                "RUN python3 -m venv /opt/venv",
+                f"RUN /opt/venv/bin/python3 -m pip install {tool}",
+            ],
+            fixed_run_cmd,
+        )
+    if m in ("bundle", "gem"):
+        return (
+            "/opt/ruby-build",
+            ["BUNDLE_PATH=/opt/bundle", "BUNDLE_APP_CONFIG=/opt/bundle"],
+            [],
+            run_cmd,
+        )
+    if m == "cargo":
+        return (
+            "/opt/rust-build",
+            ["CARGO_TARGET_DIR=/opt/cargo-target"],
+            # Dummy target so `cargo fetch`/`cargo build` have something to
+            # resolve the dependency graph against — discarded, never COPY'd
+            # into /work.
+            ["RUN mkdir -p src && printf 'fn main() {}' > src/main.rs"],
+            # NO --release: cargo keys its build cache by profile
+            # (debug/ vs release/ under CARGO_TARGET_DIR) — a --release bake
+            # produces ZERO cache benefit for a normal `cargo build`/`cargo
+            # test` (both default to the debug profile, which is what
+            # implementer/conformer workers actually run). Verified live:
+            # baking with --release left a real worktree's plain `cargo
+            # build` fully recompiling every dependency from scratch
+            # ("Compiling serde", not "Fresh serde"); dropping --release
+            # fixed it (confirmed "Fresh serde_core"/"Fresh serde").
+            "cargo fetch && cargo build --offline && rm -rf src",
+        )
+    if m == "go":
+        return (
+            "/opt/go-build",
+            ["GOCACHE=/opt/go-cache"],
+            ["RUN printf 'package main\\nfunc main() {}\\n' > _leerie_dummy.go"],
+            "go mod download && go build ./... && rm -f _leerie_dummy.go",
+        )
+    return None
 
 
 # Node package managers whose frozen install reads patches/, workspace
@@ -4825,11 +5013,30 @@ if persisted_installs:
         # ENOENT on a patch and silently degrades to apt-only (DESIGN §6½).
         if _is_node_context(repo, entry.get("manager")):
             _node_ancillary(repo, copy_files)
+        # _filter_residual_deps (already shipped, untouched — see
+        # orchestrator/leerie.py) strips bakeable managers out of what gets
+        # persisted to config.toml, so this branch should rarely see one. But
+        # a stale config.toml from before this feature landed could still
+        # carry a bakeable manager's command — route it through the same
+        # /opt/* bake params rather than emit a raw /work-targeting RUN.
+        bake = _bake_params_for_manager(entry.get("manager"), run_cmd)
+        if bake:
+            workdir, env_lines, pre_run_lines, run_cmd = bake
+        else:
+            workdir = env_lines = pre_run_lines = None
         if copy_files:
             copy_shas = _hash_copy_files(repo, copy_files)
-            _emit_layer(copy_files, run_cmd, copy_shas)
+            _emit_layer(copy_files, run_cmd, copy_shas, workdir=workdir,
+                        env_lines=env_lines, pre_run_lines=pre_run_lines)
         else:
-            # No valid copy inputs: emit RUN without COPY.
+            # No valid copy inputs: emit RUN without COPY (still honor
+            # workdir/env_lines/pre_run_lines for a bakeable manager).
+            if workdir:
+                print(f"WORKDIR {workdir}")
+            for line in (env_lines or []):
+                print(f"ENV {line}")
+            for line in (pre_run_lines or []):
+                print(line)
             print(f"RUN {run_cmd}")
         emitted = True
     sys.exit(0 if emitted else 0)
@@ -4849,6 +5056,7 @@ has_dotnet = (repo / "packages.lock.json").is_file()
 
 copy_files = []
 run_cmd = ""
+manager = None
 
 if has_pnpm:
     copy_files.append("pnpm-lock.yaml")
@@ -4856,54 +5064,65 @@ if has_pnpm:
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "pnpm install --frozen-lockfile"
+    manager = "pnpm"
 elif has_yarn:
     copy_files.append("yarn.lock")
     if (repo / "package.json").is_file():
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "yarn install --frozen-lockfile"
+    manager = "yarn"
 elif has_npm:
     copy_files.append("package-lock.json")
     if (repo / "package.json").is_file():
         copy_files.append("package.json")
     _node_ancillary(repo, copy_files)
     run_cmd = "npm ci"
+    manager = "npm"
 elif has_uv:
     copy_files.append("uv.lock")
     if (repo / "pyproject.toml").is_file():
         copy_files.append("pyproject.toml")
     run_cmd = "uv sync"
+    manager = "uv"
 elif has_poetry:
     copy_files.append("poetry.lock")
     if (repo / "pyproject.toml").is_file():
         copy_files.append("pyproject.toml")
     run_cmd = "poetry install"
+    manager = "poetry"
 elif has_pipenv:
     copy_files.append("Pipfile.lock")
     if (repo / "Pipfile").is_file():
         copy_files.append("Pipfile")
     run_cmd = "pipenv install"
+    manager = "pipenv"
 elif has_go:
     copy_files += ["go.mod", "go.sum"]
     run_cmd = "go mod download"
+    manager = "go"
 elif has_cargo:
     copy_files.append("Cargo.lock")
     if (repo / "Cargo.toml").is_file():
         copy_files.append("Cargo.toml")
     run_cmd = "cargo fetch"
+    manager = "cargo"
 elif has_bundle:
     copy_files.append("Gemfile.lock")
     if (repo / "Gemfile").is_file():
         copy_files.append("Gemfile")
     run_cmd = "bundle install"
+    manager = "bundle"
 elif has_composer:
     copy_files.append("composer.lock")
     if (repo / "composer.json").is_file():
         copy_files.append("composer.json")
     run_cmd = "composer install --no-interaction"
+    manager = "composer"
 elif has_dotnet:
     copy_files.append("packages.lock.json")
     run_cmd = "dotnet restore"
+    manager = "dotnet"
 
 if not run_cmd:
     sys.exit(0)
@@ -4913,11 +5132,25 @@ if not run_cmd:
 # only a lockfile bump — triggers a rebuild. A patch edit that leaves the
 # lockfile untouched must still invalidate the image (DESIGN §6½: "every
 # lockfile that participates in the COPY list"; patches participate).
+# NOTE: copy_files stays repo-relative here regardless of the bake's WORKDIR
+# below — hashing covers the real dependency-input files, not the scratch
+# dir the install writes into.
 copy_shas = _hash_copy_files(repo, copy_files)
+
+# Out-of-repo bake (DESIGN §6½): Python/Ruby/Rust/Go target /opt/* instead of
+# the inherited /work WORKDIR. Node/composer/dotnet are unchanged (no
+# verified bake target — Node's node_modules must live in the repo tree; see
+# _bake_params_for_manager's docstring).
+bake = _bake_params_for_manager(manager, run_cmd)
+if bake:
+    workdir, env_lines, pre_run_lines, run_cmd = bake
+else:
+    workdir = env_lines = pre_run_lines = None
 
 # Emit COPY + RUN lines.
 # Shas are embedded as a comment so the Dockerfile sha captures dep-input drift.
-_emit_layer(copy_files, run_cmd, copy_shas)
+_emit_layer(copy_files, run_cmd, copy_shas, workdir=workdir,
+            env_lines=env_lines, pre_run_lines=pre_run_lines)
 PY
       # Guard the exit code so `set -e` never aborts before the temp file is
       # cleaned up (mirrors the _launch_stderr/_early_probe_stderr sites), then
@@ -4956,17 +5189,23 @@ PY
            "$USER_REPO" \
            >/dev/null 2>&1; then
         remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake (bake_language_deps=false for this run)"
-        # Regenerate apt-only Dockerfile without the language-dep layer.
+        # Regenerate without the language-dep layer. Bug fix: this used to
+        # unconditionally emit an apt RUN (looping possibly-unset
+        # $_sp_packages) even for a repo with no setup_packages — guard it
+        # the same way as the primary apt layer above.
         _gen_df_tmp2="$USER_REPO/.leerie/.Dockerfile.gen2.$$"
         printf '%s\n' "$LEERIE_GENERATED_SENTINEL" > "$_gen_df_tmp2"
-        printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
-          >> "$_gen_df_tmp2"
-        for _pkg2 in $_sp_packages; do
-          printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
-        done
-        # End at USER root — no trailing `USER leerie` (see the primary
-        # generator above: PID-1 must be root for cgroup containment).
-        printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp2"
+        printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n' >> "$_gen_df_tmp2"
+        if [ -n "$_sp" ]; then
+          printf 'RUN apt-get update && apt-get install -y --no-install-recommends \\\n' \
+            >> "$_gen_df_tmp2"
+          for _pkg2 in $_sp_packages; do
+            printf '    %s \\\n' "$_pkg2" >> "$_gen_df_tmp2"
+          done
+          # End at USER root — no trailing `USER leerie` (see the primary
+          # generator above: PID-1 must be root for cgroup containment).
+          printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp2"
+        fi
         mv "$_gen_df_tmp2" "$_leerie_dockerfile"
         unset _gen_df_tmp2 _pkg2
       else
@@ -5826,9 +6065,26 @@ CACHE_MOUNTS=(
   -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
   -e "COREPACK_HOME=/home/leerie/.cache/leerie/corepack"
   -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
-  -e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle"
   -e "BUNDLE_CACHE_ALL=1"
 )
+# BUNDLE_PATH: when the per-repo image actually baked gems to /opt/bundle
+# (DESIGN §6½), this `-e` must point there too — a later `-e` wins over an
+# earlier Dockerfile `ENV`, so leaving this at the cache-mount path would
+# silently shadow the bake and send `bundle exec` back to a stale/empty
+# cache dir instead of the baked gems. But /opt/bundle only exists in
+# images that were actually built with the Ruby bake (bake_language_deps
+# disabled, or a build that fell back to apt-only, produces no /opt/bundle
+# at all — pointing BUNDLE_PATH there unconditionally would break `bundle
+# install` for those repos: verified live, "File system is read-only" /
+# ENOENT against a nonexistent, unmounted /opt/bundle). Detect the bake by
+# checking the on-disk Dockerfile (real or auto-generated, already
+# resolved by this point) for the baked ENV line, rather than assuming.
+if [ -f "$USER_REPO/.leerie/Dockerfile" ] && \
+   grep -q '^ENV BUNDLE_PATH=/opt/bundle' "$USER_REPO/.leerie/Dockerfile" 2>/dev/null; then
+  CACHE_MOUNTS+=(-e "BUNDLE_PATH=/opt/bundle")
+else
+  CACHE_MOUNTS+=(-e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle")
+fi
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
 # launcher invocations. Not user-tunable here.

@@ -429,10 +429,10 @@ ecosystem:
 
 | Ecosystem | Bake target | Env var(s) | Notes |
 |---|---|---|---|
-| Python | `/opt/venv` | `VIRTUAL_ENV=/opt/venv`, `PATH` includes `/opt/venv/bin` | Virtual environment activated in the image; workers inherit it |
+| Python | `/opt/venv` | `VIRTUAL_ENV=/opt/venv`, `PATH` includes `/opt/venv/bin` | Virtual environment activated in the image; workers inherit it. `uv`/`poetry`/`pipenv` are installed INTO `/opt/venv` at build time (via `pip`) rather than relying on their own active-venv env-var detection — verified unreliable for `uv sync` (ignores `VIRTUAL_ENV` without `--active`) and `pipenv` (long-standing bugs). Plain `pip install -r requirements.txt` needs no such workaround. |
 | Ruby | `/opt/bundle` | `BUNDLE_PATH=/opt/bundle`, `BUNDLE_APP_CONFIG=/opt/bundle` | Gems installed here; Bundler finds them without per-worktree install |
-| Rust | Baked build artifacts + warmed cache | `CARGO_TARGET_DIR`, `CARGO_HOME` (warmed registry) | `cargo build` reuses compiled deps, no network |
-| Go | Baked cache + warmed modules | `GOCACHE`, `GOMODCACHE` (warmed) | `go build` network-free, reuses module cache |
+| Rust | Baked build artifacts + warmed cache | `CARGO_TARGET_DIR`, `CARGO_HOME` (warmed registry) | `cargo build` reuses compiled deps, no network. Requires a discardable dummy `src/main.rs` at build time — `cargo` cannot fetch/build against a manifest-only context with zero source files (see DESIGN §6½). The bake step must build the **debug** profile (no `--release`) — Cargo's cache is profile-keyed, so a `--release` bake shares nothing with the debug-profile `cargo build`/`cargo test` workers actually run. |
+| Go | Baked cache + warmed modules | `GOCACHE`, `GOMODCACHE` (warmed) | `go build` network-free, reuses module cache. Requires a discardable dummy `.go` file at build time — `go mod download` alone warms only `GOMODCACHE`, not `GOCACHE` (see DESIGN §6½). |
 | Node/pnpm | Warmed content-addressable store | pnpm store path, `frozenStore` set | Residual per-run: `pnpm install --offline --frozen-lockfile` relinks only |
 
 **`PROVISION_RECIPE` contract (updated):** For baked ecosystems
@@ -463,10 +463,16 @@ mismatch: a repo with only language dependencies and no apt packages would
 skip the bake entirely, forcing per-run installs. The corrected spec: generate
 the Dockerfile when **any** of the following are present: (1)
 `setup_packages` non-empty, (2) a dependency lockfile exists (`package-lock.json`,
-`pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `Gemfile.lock`,
-`Cargo.lock`, `go.sum`, etc.), or (3) `language_installs` is non-empty. This
-aligns the emitter with the design intent (DESIGN §6½ *Persistent out-of-repo
-dependency bake*).
+`pnpm-lock.yaml`, `yarn.lock`, `uv.lock`, `poetry.lock`, `Pipfile.lock`,
+`Gemfile.lock`, `Cargo.lock`, `go.mod`+`go.sum` together, `composer.lock`,
+`packages.lock.json`), or (3) `language_installs` is non-empty. This aligns
+the emitter with the design intent (DESIGN §6½ *Persistent out-of-repo
+dependency bake*). Bare `requirements.txt` (no lockfile) is deliberately
+EXCLUDED from this list, mirroring `_lockfile_table_entries`'s existing,
+deliberate exclusion of the same file — it's the ambiguous tail that goes to
+the LLM-driven `dep_capture` fallback, not the deterministic table, so it
+must not trigger a bake either (a bake based on a guessed install command is
+worse than no bake).
 
 ### Registry publish path (fly.io / remote Machines)
 
