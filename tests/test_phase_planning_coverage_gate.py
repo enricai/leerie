@@ -99,6 +99,17 @@ class TestWiringGapRoutesThroughRetry:
             "re-invoke phase_plan to actually re-plan on a coverage gap"
         )
 
+    def test_feedback_reconciles_after_replan(self, leerie):
+        src = inspect.getsource(leerie.phase_planning_coverage_gate)
+        phase_plan_idx = src.index("await phase_plan(")
+        reconcile_idx = src.index("await phase_reconcile(", phase_plan_idx)
+        assert reconcile_idx > phase_plan_idx, (
+            "phase_planning_coverage_gate's feedback callback must "
+            "re-invoke phase_reconcile AFTER phase_plan to bridge any "
+            "cross-domain tag drift the re-plan introduced, before the "
+            "re-planned output reaches the next judge round"
+        )
+
     def test_dies_on_exhaustion(self, leerie):
         src = inspect.getsource(leerie.phase_planning_coverage_gate)
         assert "die(" in src, (
@@ -261,6 +272,146 @@ def test_coverage_gap_triggers_replan_then_converges(
     assert len(replan_calls) == 1, "expected exactly one re-plan"
     assert "regression test" in replan_calls[0]
     assert result == good_plans
+
+
+def test_replan_with_cross_category_tag_drift_gets_reconciled(
+    leerie, monkeypatch, tmp_path
+):
+    """Regression fixture reproducing the funeralworks incident shape: a
+    coverage gap triggers a re-plan, and the re-plan's two categories
+    (bug-fixing / testing) invent DIFFERENT tag strings for the same
+    capability — `bugfix-006` provides `events-create-contract-fixed`,
+    `test-004` requires `events-payload-casing-fixed`. Without the
+    post-replan phase_reconcile call, this mismatch would reach
+    schedule()/phase_wiring_gate unresolved (the exact failure that
+    motivated this fix — DESIGN §5 *Bridge cross-domain capability-tag
+    mismatches*). Falsify by commenting out the `phase_reconcile` call in
+    phase_planning_coverage_gate's `_on_feedback` and re-running: the
+    reconciler stub below is then never invoked."""
+    st = _minimal_state(leerie, tmp_path)
+    bad_plans = [_plan("feature-implementation", _subtask("feat-001"))]
+
+    # The re-plan's output: two categories, tags that mean the same thing
+    # but are spelled differently — exactly the shape a re-plan produces
+    # when each category's planner has no visibility into the other's
+    # already-declared vocabulary.
+    mismatched_plans = [
+        _plan(
+            "bug-fixing",
+            {
+                "id": "bugfix-006", "title": "fix payload casing",
+                "intent": "fix casing", "success_criteria_seed": "fixed",
+                "files_likely_touched": [], "depends_on": [],
+                "provides": ["events-create-contract-fixed"],
+                "requires": [], "size": "small",
+            },
+        ),
+        _plan(
+            "testing",
+            {
+                "id": "test-004", "title": "test payload casing",
+                "intent": "test casing", "success_criteria_seed": "tested",
+                "files_likely_touched": [], "depends_on": [],
+                "provides": ["events-contract-tests-updated"],
+                "requires": [{
+                    "tag": "events-payload-casing-fixed",
+                    "extent": "in_plan", "reason": "",
+                }],
+                "size": "small",
+            },
+        ),
+    ]
+
+    judge_calls = []
+    reconciler_calls = []
+
+    async def fake_claude_p(**kwargs):
+        schema_key = kwargs.get("schema_key")
+        if schema_key == "task_coverage_judge":
+            judge_calls.append(kwargs)
+            if len(judge_calls) == 1:
+                return {
+                    "task_covered": False,
+                    "coverage_gaps": [{
+                        "kind": "missing_work",
+                        "description": "payload casing fix not covered",
+                        "concrete_evidence": "no subtask fixes the "
+                                              "events payload casing",
+                    }],
+                    "rationale": "missing the casing fix",
+                }
+            return {
+                "task_covered": True,
+                "coverage_gaps": [],
+                "rationale": "now covers the casing fix",
+            }
+        if schema_key == "reconciler":
+            reconciler_calls.append(kwargs)
+            # Resolve the mismatch exactly like a real reconciler would:
+            # rename test-004's requires tag to the tag bugfix-006 actually
+            # provides.
+            return {
+                "renames": [{
+                    "sid": "test-004",
+                    "from": "events-payload-casing-fixed",
+                    "to": "events-create-contract-fixed",
+                }],
+                "added_provides": [], "added_subtasks": [],
+                "conditional_drops": [], "dropped_requires": [],
+                "dependency_edges": [], "merged_subtasks": [],
+                "unresolvable": [],
+                "confidence": {"score": 0.9, "reasoning": "clean rename"},
+            }
+        raise AssertionError(f"unexpected schema_key: {schema_key}")
+
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
+        return mismatched_plans
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+
+    # phase_reconcile's _spawn_reconciler indexes models["reconciler"] /
+    # efforts["reconciler"] directly (not .get), so the models/efforts
+    # dicts handed to phase_planning_coverage_gate must carry an entry
+    # for the reconciler too, not just task_coverage_judge.
+    models = {**MODELS, "reconciler": "sonnet"}
+    efforts = {**EFFORTS, "reconciler": "medium"}
+
+    result = asyncio.run(leerie.phase_planning_coverage_gate(
+        bad_plans, "task", st, _caps(leerie), models, efforts))
+
+    assert len(judge_calls) == 2, "expected initial call + 1 retry"
+    assert len(reconciler_calls) == 1, (
+        "phase_reconcile must run exactly once against the re-planned "
+        "output, resolving the cross-category tag mismatch before the "
+        "gate's next judge round"
+    )
+
+    test_004 = next(
+        s for plan in result for s in plan["subtasks"]
+        if s["id"] == "test-004"
+    )
+    assert test_004["requires"][0]["tag"] == "events-create-contract-fixed", (
+        "the reconciler's rename must have been applied to the plan "
+        "phase_planning_coverage_gate returns"
+    )
+
+    # The wiring invariant this whole fix protects: every requires tag
+    # resolves to some subtask's provides in the final plan.
+    all_provides = {
+        tag for plan in result for s in plan["subtasks"]
+        for tag in s.get("provides", [])
+    }
+    for plan in result:
+        for s in plan["subtasks"]:
+            for req in s.get("requires", []) or []:
+                if req.get("extent") == "in_plan":
+                    assert req["tag"] in all_provides, (
+                        f"{s['id']} requires {req['tag']!r} but no "
+                        "subtask provides it — the exact dangle "
+                        "phase_wiring_gate died on in the funeralworks "
+                        "incident"
+                    )
 
 
 def test_vague_gap_does_not_gate(leerie, monkeypatch, tmp_path):

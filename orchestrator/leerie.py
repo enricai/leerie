@@ -18090,6 +18090,15 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         cur_plans[0] = await phase_plan(
             replan_task, st, caps, models, efforts,
             replan_round=replan_round[0])
+        # Re-plans run one planner per category in parallel with no
+        # cross-category tag visibility (DESIGN §5), so a re-plan can
+        # reintroduce the exact cross-domain provides/requires drift
+        # phase_reconcile already resolved on the first pass. Re-run it
+        # here so the re-planned output isn't handed to schedule()/
+        # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
+        # when the re-plan didn't introduce any new unresolved requires.
+        cur_plans[0] = await phase_reconcile(
+            cur_plans[0], task, st, caps, models, efforts)
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
@@ -18271,6 +18280,15 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         cur_plans[0] = await phase_plan(
             replan_task, st, caps, models, efforts,
             replan_round=replan_round[0])
+        # Re-plans run one planner per category in parallel with no
+        # cross-category tag visibility (DESIGN §5), so a re-plan can
+        # reintroduce the exact cross-domain provides/requires drift
+        # phase_reconcile already resolved on the first pass. Re-run it
+        # here so the re-planned output isn't handed to schedule()/
+        # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
+        # when the re-plan didn't introduce any new unresolved requires.
+        cur_plans[0] = await phase_reconcile(
+            cur_plans[0], task, st, caps, models, efforts)
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(

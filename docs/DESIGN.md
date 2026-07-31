@@ -4714,7 +4714,13 @@ mis-wirings:
   independently re-read. Gates on a non-empty array of concretely-named
   coverage gaps. The planner **can** mechanically act on a found gap (add
   or revise a subtask), so this gate **re-drives** `phase_plan`, mirroring
-  `classification_judge`. **This does not reopen the falsified attempt
+  `classification_judge`. Since a re-plan runs one planner per category in
+  parallel with no cross-category visibility into another category's
+  already-declared `provides`/`requires` tags, it can reintroduce the
+  exact cross-domain tag drift `phase_reconcile` already resolved on the
+  first pass — so the re-drive is followed by a second `phase_reconcile`
+  call before the loop's next judge round (§5 *Bridge cross-domain
+  capability-tag mismatches*). **This does not reopen the falsified attempt
   described above** ("`task_understanding` does **not** independently gate
   the planner" / §12 *Instruction adherence is code-enforced*): that finding
   was specific to an *understanding*-framed judge asked to score whether the
@@ -5474,7 +5480,13 @@ and it is enforced as a genuinely separate, code-owned gate:
   it re-enters the existing planner feedback loop (§8's evidence-gated
   retry), the same mechanical-feedback path every other planner-check
   failure already uses. No new pause/resume machinery; the escalation
-  bound is the existing judgment-check-round cap.
+  bound is the existing judgment-check-round cap. The re-plan this retry
+  triggers is followed by a second `phase_reconcile` call before the
+  loop's next judge round, for the same reason `task_coverage_judge`'s
+  re-drive is (§8 *Independent adversarial verification*): a re-plan runs
+  one planner per category in parallel with no cross-category tag
+  visibility, and can reintroduce cross-domain `provides`/`requires`
+  drift `phase_reconcile` already resolved on the first pass.
 
 This is deliberately *not* a new subsystem. It is the same principle §12
 states for every other guarantee in this design — a plan's adherence to a

@@ -142,6 +142,17 @@ class TestWiringLowResultRoutesThroughRetry:
             "phase_plan to actually re-plan on a violation"
         )
 
+    def test_feedback_reconciles_after_replan(self, leerie):
+        src = inspect.getsource(leerie.phase_adherence_gate)
+        phase_plan_idx = src.index("await phase_plan(")
+        reconcile_idx = src.index("await phase_reconcile(", phase_plan_idx)
+        assert reconcile_idx > phase_plan_idx, (
+            "phase_adherence_gate's feedback callback must re-invoke "
+            "phase_reconcile AFTER phase_plan to bridge any cross-domain "
+            "tag drift the re-plan introduced, before the re-planned "
+            "output reaches the next judge round"
+        )
+
     def test_dies_on_exhaustion(self, leerie):
         src = inspect.getsource(leerie.phase_adherence_gate)
         assert "die(" in src, (
