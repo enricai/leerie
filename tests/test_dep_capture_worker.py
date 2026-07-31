@@ -401,8 +401,8 @@ class TestDepCaptureReplace:
         managers = {e["manager"] for e in json.loads(raw)}
         assert managers == {"pnpm"}, (
             f"replace=True must drop stale managers; got {managers}")
-        # And the surviving pip entry is the freshly-captured command.
-        assert "setup.py" in raw
+        # And the surviving pnpm entry is the freshly-captured command.
+        assert "pnpm-lock.yaml" in raw
 
     def test_replace_empty_capture_leaves_existing_untouched(
             self, leerie, tmp_path, monkeypatch):
