@@ -7,7 +7,7 @@
 # leerie runs inside a container — see docs/IMPLEMENTATION.md §0.5
 # "Container shape" and docs/DESIGN.md §6. This launcher:
 #   1. Resolves its own location (walking symlinks).
-#   2. Fast path: `--version` answers without a container so the installer's
+#   2. Fast path: `version` answers without a container so the installer's
 #      smoke test runs the moment the symlink is in place.
 #   3. Per-OS preflight: verifies a working container runtime.
 #   4. Builds the leerie image once per version, reuses thereafter.
@@ -46,21 +46,21 @@ USER_REPO="$(pwd -P)"
 . "$LEERIE_REPO/scripts/remote/_log.sh"
 
 # Image tag = leerie:<version>. Version comes from plugin.json (single source of
-# truth — same one `leerie --version` reads). The launcher only needs the value
+# truth — same one `leerie version` reads). The launcher only needs the value
 # for tagging, so a minimal extractor avoids needing python/jq at this stage.
 LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 IMAGE_TAG="leerie:$LEERIE_VERSION"
 
 # --- fast paths that don't need the container ----------------------------
-# `leerie --version` should answer immediately without spinning up a container
+# `leerie version` should answer immediately without spinning up a container
 # — used by the installer's end-to-end smoke test and by anyone who just
 # wants to check what's installed.
 #
 # `--help` is NOT short-circuited: forwarding it through the container makes
 # the orchestrator's argparse render the full flag list (worker model
 # overrides, telemetry knobs, etc.) plus an epilog listing launcher-only
-# verbs (--stop, --kill, --finalize, etc.). The first --help pays a
+# verbs (stop, kill, finalize, etc.). The first --help pays a
 # one-time image-build cost; every subsequent invocation reuses the cached
 # image and starts in ~2s.
 
@@ -92,7 +92,7 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 #     for the Fly seed-auth tar pipe) — this is the active path.
 #
 # (The function is also called by chain-aware tests; nothing in the
-# laptop-side --chain wave loop currently invokes it directly, since
+# laptop-side chain wave loop currently invokes it directly, since
 # each per-job ./leerie --runtime fly invocation runs its own
 # STAGE-assembly + seed-auth pipeline.)
 #
@@ -253,15 +253,15 @@ PY
 }
 
 # Read stdin and emit a base64-encoded string (no newlines). Used by
-# --chain to pack the queue spec and Claude creds into env-safe values
+# chain to pack the queue spec and Claude creds into env-safe values
 # without duplicating the same python one-liner per call site.
 _b64_stdin() {
   python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
 }
 
 # UUID format pattern (8-4-4-4-12 hex). Used by all chain-scoped verb
-# arms (--stop / --kill / --finalize / --resume / --status / --attach
-# / --chain --chain-id) to distinguish a chain_id from a single-run
+# arms (stop / kill / finalize / resume / status / attach
+# / chain --chain-id) to distinguish a chain_id from a single-run
 # Fly machine id. Case-insensitive grep at the call sites; chain code
 # normalizes to lowercase before string comparison against run.json
 # fields (uuid.uuid4() emits lowercase, so the canonical form is
@@ -269,7 +269,7 @@ _b64_stdin() {
 export UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 # Read a single top-level key from a JSON file. Prints the value
-# (empty string if absent/null/error). Used by --finalize to avoid
+# (empty string if absent/null/error). Used by finalize to avoid
 # repeating the same python3 one-liner.
 _json_get() {
   local file="$1" key="$2"
@@ -284,7 +284,7 @@ except Exception:
 ' "$file" "$key"
 }
 
-# Idempotency probe for the --chain wave loop. Returns 0 (success) when
+# Idempotency probe for the chain wave loop. Returns 0 (success) when
 # every run with chain_id=<id> AND wave_idx=<idx> has pushed_at set,
 # AND the count of such runs equals the expected wave size <n_expected>
 # (so a wave that partially completed in a prior session does not
@@ -324,8 +324,8 @@ PY
 
 # Emit (one per line) every run-id in $LEERIE_STATE_HOST_DIR/runs/
 # that belongs to <chain_id> AND matches the per-verb filter <verb>.
-# Used by the chain-scoped verb arms (--stop, --kill, --finalize,
-# --resume) to enumerate runs for per-run dispatch. The verb name
+# Used by the chain-scoped verb arms (stop, kill, finalize,
+# resume) to enumerate runs for per-run dispatch. The verb name
 # selects a hardcoded filter inside the heredoc (no eval, no
 # injection surface — only known verb names are accepted).
 #
@@ -478,7 +478,7 @@ PY
 }
 
 # Emit (one per line) the branch field of every run with chain_id=<id>
-# AND wave_idx=<idx>. Used by the --chain wave loop to gather wave-N
+# AND wave_idx=<idx>. Used by the chain wave loop to gather wave-N
 # branch names for synth-merge. Works for both the just-fanned path
 # and the resume path (single discovery surface).
 _wave_branches() {
@@ -509,7 +509,7 @@ PY
 }
 
 # Read volume_id from a run's host-side sidecar. provision.sh persists
-# volume_id into both fly-machine.json and run.json. --kill consults
+# volume_id into both fly-machine.json and run.json. kill consults
 # this so the volume is reaped alongside the machine instead of
 # orphaning.
 _resolve_volume_id_from_run_dir() {
@@ -546,7 +546,7 @@ except Exception:
 # persists ec2_instance_id into both ec2-instance.json (unconditional,
 # crash-recovery pointer) and run.json (conditional on LEERIE_RUN_ID being
 # set at provision time). Unlike Fly, the run-id is NOT the instance id
-# for EC2 runs, so --kill/--stop/--resume must read it from a sidecar
+# for EC2 runs, so kill/stop/resume must read it from a sidecar
 # rather than assuming identity.
 _resolve_ec2_instance_id_from_run_dir() {
   local run_dir="$1"
@@ -573,7 +573,7 @@ except Exception:
 
 # --- _resolve_volume_id_from_fly ---------------------------------------
 # Ask Fly which volume a machine has mounted. The fallback for when no
-# sidecar exists (`--kill --machine-id <id>` on an orphan) — without this
+# sidecar exists (`kill --machine-id <id>` on an orphan) — without this
 # the machine is destroyed and its volume leaks, billing forever.
 #
 # MUST be called BEFORE the machine is destroyed: Fly's volume→machine link
@@ -583,11 +583,11 @@ except Exception:
 #
 # Uses `machine list --json` — verified against a live machine to carry
 # `.config.mounts[].volume`, and to keep carrying it while the machine is
-# `stopped` (the --stop-then-kill path). Note `machine status` has NO --json
+# `stopped` (the stop-then-kill path). Note `machine status` has NO --json
 # flag (only -d/--display-config, which embeds JSON in prose), so it is not
 # usable here.
 #
-# Best-effort: any failure prints nothing and returns 0. --kill must still
+# Best-effort: any failure prints nothing and returns 0. kill must still
 # destroy the machine even if the lookup fails — a leaked volume is a
 # billing issue, a machine that won't die is worse.
 _resolve_volume_id_from_fly() {
