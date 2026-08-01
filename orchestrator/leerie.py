@@ -25344,10 +25344,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 launcher verbs (handled before the container starts):
-  --stop <run-id>       pause a remote Fly machine (resumable via --resume)
-  --kill <run-id>       destroy a remote machine permanently (--force skips prompt)
-  --finalize <run-id>   post-detach finalization (--force/--no-verify/--no-push)
-  --re-seed <run-id>    mid-run host-to-machine re-rsync (--force bypasses safety)
+  stop <run-id>         pause a remote Fly machine (resumable via resume)
+  kill <run-id>         destroy a remote machine permanently (--force skips prompt)
+  finalize <run-id>     post-detach finalization (--force/--no-verify/--no-push)
+  re-seed <run-id>      mid-run host-to-machine re-rsync (--force bypasses safety)
   --shell               drop into bash on resume instead of tailing the log
   --auto-finalize       auto-finalize on clean orchestrator exit during resume
   --no-re-seed          skip auto-reseed on resume
@@ -25358,11 +25358,11 @@ launcher verbs (handled before the container starts):
   --local-build         force local image build (not Fly remote builder)
 
 chain verbs (launcher fast-paths — no container started):
-  --chain-submit        submit a multi-run chain (--wave <files> ...)
-  --chain-status <id>   print a chain snapshot
-  --list-chains         list all chains
-  --chain-kill <id>     cancel a chain and destroy its machines
-  --chain-attach <id>   fetch a chain's event log
+  chain                 submit a multi-run chain (--wave <files> ...)
+  status <id>           print a chain or group snapshot
+  list                  list all runs/chains/groups
+  kill <id>             cancel a chain and destroy its machines
+  attach <id>           fetch a chain's event log
 
 See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--version", action="version",
