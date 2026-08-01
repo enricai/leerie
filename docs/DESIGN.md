@@ -6796,7 +6796,7 @@ laptop:
           → destroy_machine
       → Early-write: immediately after provision_machine, the
         child writes chain_id + wave_idx into its host-side
-        run.json so chain-scoped verbs (--resume, --status) can
+        run.json so chain-scoped verbs (resume, status) can
         discover the run while the orchestrator is still running.
         fetch_branch later overwrites run.json with the
         orchestrator's copy; the parent's post-wait tagging loop
@@ -6850,9 +6850,9 @@ laptop:
    completed earlier remain done.
 
 3. **Chain-scoped verbs operate by iteration, not coordination.**
-   `leerie status <chain-id>`, `--kill <chain-id>`, `--stop <chain-id>`,
-   `--resume <chain-id>`, `--finalize <chain-id>`, and
-   `--list --chains` all work by iterating
+   `leerie status <chain-id>`, `leerie kill <chain-id>`, `leerie stop <chain-id>`,
+   `leerie resume <chain-id>`, `leerie finalize <chain-id>`, and
+   `leerie list --chains` all work by iterating
    `$LEERIE_STATE_HOST_DIR/runs/*/run.json` and filtering by the
    `chain_id` field. For per-run action, they dispatch to the
    existing single-run verb implementation per discovered run.
@@ -6985,7 +6985,7 @@ The group layer adds four thin capabilities on top:
    ordering; it cannot enforce it.
 
 4. **Group-scoped verbs.** `status`, `stop`, `resume`, `kill`,
-   `finalize`, and `--list --groups` on a `group_id` discover members by
+   `finalize`, and `list --groups` on a `group_id` discover members by
    scanning for `group_id`-tagged `run.json` files across the members'
    *separate* state directories. Each verb dispatches to the existing per-run
    implementation for each discovered member. The scanning must iterate over
