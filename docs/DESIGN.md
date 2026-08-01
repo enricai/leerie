@@ -512,6 +512,34 @@ class slips past every check between planning and integration. The
 collision then surfaces as an integrator merge-conflict mid-run, with
 worker budget already spent across earlier waves.
 
+**A re-plan invalidates every phase that already ran.** The planning
+pipeline is `reconcile → overlap-judge → adherence-gate → coverage-gate`,
+and the two later gates can reject a plan and re-drive `phase_plan`. A
+re-plan runs one planner per category in parallel with no cross-category
+visibility, exactly like the first pass — so it reintroduces the same
+vocabulary drift the reconciler resolved *and* the same surface
+collisions the overlap judge resolved. Whatever a gate re-plans, it owes
+a re-run of every phase upstream of itself, not just the reconciler.
+
+The repair is asymmetric because the gates sit at different positions. A
+re-plan from the adherence gate must re-run reconcile and the overlap
+judge; it does not need the coverage gate, which has not run yet and will
+see the re-planned output anyway. A re-plan from the coverage gate must
+re-run reconcile, the overlap judge, **and** the adherence gate. Nesting
+a gate inside another gate's retry loop is bounded rather than recursive:
+every gate drives its re-plans through the shared mechanical-feedback
+loop under one round budget, so the worst case is the product of two
+budgets, not an unbounded cycle.
+
+Getting this wrong is expensive and silent. Run `19a70d96` (2026-08-01)
+had the overlap judge correctly merge 8 subtasks down to 4; the coverage
+gate then re-planned, 8 came back with every duplicate restored, nothing
+re-detected them, and all 8 executed. Two subtasks did the same
+migration, the integrator merged both into one document section, and the
+integration gate refused the result — after 4.7 hours and 164 workers.
+The plan handed to execution was one the overlap judge had already
+rejected.
+
 A **plan-overlap judge** worker runs between reconcile and schedule
 specifically to catch this. It reads the full reconciled subtask list
 (title, intent, `files_likely_touched`, `provides`, `requires`) and

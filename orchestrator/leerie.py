@@ -19285,6 +19285,17 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # when the re-plan didn't introduce any new unresolved requires.
         cur_plans[0] = await phase_reconcile(
             cur_plans[0], task, st, caps, models, efforts)
+        # Same argument, second phase: a re-plan also reintroduces the
+        # cross-planner SURFACE collisions phase_overlap_judge already
+        # merged (two planners independently proposing subtasks that
+        # produce the same artifact). A re-plan owes a re-run of every
+        # phase upstream of this gate, not just the reconciler — DESIGN §5
+        # *A re-plan invalidates every phase that already ran*. Cheap-skips
+        # on single-planner / <2-subtask plans. phase_planning_coverage_gate
+        # is deliberately NOT re-run: it sits downstream of this gate and
+        # has not executed yet, so it will see this output anyway.
+        cur_plans[0] = await phase_overlap_judge(
+            cur_plans[0], task, st, caps, models, efforts)
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
@@ -19474,6 +19485,29 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
         # when the re-plan didn't introduce any new unresolved requires.
         cur_plans[0] = await phase_reconcile(
+            cur_plans[0], task, st, caps, models, efforts)
+        # This is the LAST gate in the planning pipeline
+        # (reconcile -> overlap-judge -> adherence-gate -> coverage-gate),
+        # so a re-plan here invalidates all three phases upstream of it,
+        # not just the reconciler (DESIGN §5 *A re-plan invalidates every
+        # phase that already ran*).
+        #
+        # Run 19a70d96 (2026-08-01) is why: phase_overlap_judge correctly
+        # merged 8 subtasks down to 4, this gate re-planned, 8 came back
+        # with every duplicate restored, nothing re-detected them, and all
+        # 8 executed until the integration gate refused the merge — 4.7
+        # hours and 164 workers spent on a plan the overlap judge had
+        # already rejected.
+        #
+        # Both re-runs are cheap: phase_overlap_judge cheap-skips
+        # single-planner / <2-subtask plans, and phase_adherence_gate
+        # short-circuits when the task prescribes no procedure (the common
+        # case). Nesting phase_adherence_gate inside this gate's
+        # _run_checked_loop is bounded, not recursive: both loops cap at
+        # judgment_check_rounds, so the worst case is that product.
+        cur_plans[0] = await phase_overlap_judge(
+            cur_plans[0], task, st, caps, models, efforts)
+        cur_plans[0] = await phase_adherence_gate(
             cur_plans[0], task, st, caps, models, efforts)
         return {}
 

@@ -67,8 +67,12 @@ def _caps(leerie):
     return caps
 
 
-MODELS = {"task_coverage_judge": "sonnet"}
-EFFORTS = {"task_coverage_judge": "medium"}
+# `plan_overlap_judge` is present because a re-plan from this gate re-runs
+# phase_overlap_judge alongside phase_reconcile (DESIGN §5 *A re-plan
+# invalidates every phase that already ran*), and that phase indexes
+# `models`/`efforts` by its own worker name.
+MODELS = {"task_coverage_judge": "sonnet", "plan_overlap_judge": "sonnet"}
+EFFORTS = {"task_coverage_judge": "medium", "plan_overlap_judge": "medium"}
 
 
 # ===========================================================================
@@ -361,6 +365,20 @@ def test_replan_with_cross_category_tag_drift_gets_reconciled(
                 "dependency_edges": [], "merged_subtasks": [],
                 "unresolvable": [],
                 "confidence": {"score": 0.9, "reasoning": "clean rename"},
+            }
+        if schema_key == "plan_overlap_judge":
+            # A re-plan also invalidates phase_overlap_judge, which this
+            # gate re-runs alongside phase_reconcile (DESIGN §5 *A re-plan
+            # invalidates every phase that already ran*). This test is
+            # about the reconcile path, so wave the judge through with no
+            # collisions; the overlap-judge re-run has its own coverage in
+            # tests/test_replan_reruns_upstream_phases.py.
+            return {
+                "collisions": [],
+                "confidence": {"judgment": 9.0, "basis": "",
+                               "falsifiers_tested": [],
+                               "contradictions_reconciled": [],
+                               "gap_to_close": {}},
             }
         raise AssertionError(f"unexpected schema_key: {schema_key}")
 
