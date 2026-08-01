@@ -152,7 +152,7 @@ class TestGroupRunsFilter:
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
 
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert GROUP_ID in result.stdout
         # The non-grouped run must NOT appear under this group.
@@ -164,7 +164,7 @@ class TestGroupRunsFilter:
         """No group_id-tagged runs → friendly empty message."""
         sd = tmp_path / ".leerie" / "myrepo"
         _write_run(sd, NON_GROUP_RUN, {"run_id": NON_GROUP_RUN})
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0
         assert "no groups" in (result.stdout + result.stderr).lower()
 
@@ -176,7 +176,7 @@ class TestGroupRunsFilter:
             sd = tmp_path / ".leerie" / basename
             _write_run(sd, rid, {"run_id": rid, "group_id": GROUP_ID,
                                  "branch": f"leerie/runs/{rid}"})
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert GROUP_ID in result.stdout
         assert "3" in result.stdout

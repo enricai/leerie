@@ -13,8 +13,8 @@ it to the orchestrator, which rejects it with "unrecognized arguments".
 The guard arm emits an actionable error and ``exit 1``s.
 
 Dual-purpose verbs that the orchestrator also handles are excluded:
-``--list`` (falls through to orchestrator on non-fly path), ``--status``
-(orchestrator uses as ``--list`` filter), ``--version`` (handled by
+``list`` (falls through to orchestrator on non-fly path), ``--status``
+(orchestrator uses as ``list`` filter), ``version`` (handled by
 argparse version action), ``--resume`` (already forwarded with special
 ``_prev_was_resume`` handling).
 """
@@ -29,9 +29,9 @@ LEERIE_BASH = REPO_ROOT / "leerie"
 # Verbs intentionally NOT in the guard — handled by the orchestrator
 # too, or forwarded with special logic.
 _DUAL_PURPOSE_VERBS: frozenset[str] = frozenset({
-    "--list",
+    "list",
     "--status",
-    "--version",
+    "version",
     "--resume",
 })
 

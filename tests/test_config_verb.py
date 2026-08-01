@@ -863,7 +863,7 @@ def _extract_config_arm() -> str:
     pattern and trailing `;;`) verbatim from the shipped launcher."""
     launcher_text = (REPO_ROOT / "leerie").read_text()
     start_marker = "  config)\n"
-    end_marker = "\n  --list)"
+    end_marker = "\n  list)"
     s = launcher_text.index(start_marker)
     e = launcher_text.index(end_marker, s)
     return launcher_text[s:e]
@@ -1230,12 +1230,12 @@ def test_recapture_python3_failure_exits_1(tmp_path):
 
 
 def test_recapture_arm_within_parity_guard_boundaries():
-    """The --recapture arm must be inside the config) ... --list) extraction
+    """The --recapture arm must be inside the config) ... list) extraction
     boundary used by the parity guard (and thus by the real config arm tests)."""
     arm = _extract_config_arm()
     assert "--recapture" in arm, (
         "--recapture arm is missing from the config) extraction boundary; "
-        "it must be placed between 'config)' and '--list)' in the launcher"
+        "it must be placed between 'config)' and 'list)' in the launcher"
     )
 
 

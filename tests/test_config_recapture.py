@@ -44,7 +44,7 @@ def _extract_config_arm() -> str:
     """Return the real `config)` case-arm body verbatim from the launcher."""
     launcher_text = (REPO_ROOT / "leerie").read_text()
     start_marker = "  config)\n"
-    end_marker = "\n  --list)"
+    end_marker = "\n  list)"
     s = launcher_text.index(start_marker)
     e = launcher_text.index(end_marker, s)
     return launcher_text[s:e]
@@ -221,11 +221,11 @@ class TestRecaptureDispatch:
         )
 
     def test_recapture_arm_within_parity_guard_boundaries(self):
-        """--recapture arm must be inside the config) ... --list) boundary."""
+        """--recapture arm must be inside the config) ... list) boundary."""
         arm = _extract_config_arm()
         assert "--recapture" in arm, (
             "--recapture arm is missing from the config) extraction boundary; "
-            "it must be placed between 'config)' and '--list)' in the launcher"
+            "it must be placed between 'config)' and 'list)' in the launcher"
         )
 
 

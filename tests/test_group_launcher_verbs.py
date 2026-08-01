@@ -183,14 +183,14 @@ class TestListGroupsDispatch:
     def test_list_groups_shows_group_id(self, tmp_path: Path) -> None:
         """--list --groups renders the shared group_id."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert GROUP_ID in result.stdout
 
     def test_list_groups_shows_member_count(self, tmp_path: Path) -> None:
         """Two-member group → 2 appears in the output row."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert "2" in result.stdout
 
@@ -202,7 +202,7 @@ class TestListGroupsDispatch:
             "run_id": NON_GROUP_RUN,
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stdout
 
@@ -210,7 +210,7 @@ class TestListGroupsDispatch:
         """No group_id-tagged runs → friendly empty message."""
         sd = tmp_path / ".leerie" / "myrepo"
         _write_run(sd, NON_GROUP_RUN, {"run_id": NON_GROUP_RUN})
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0
         assert "no groups" in (result.stdout + result.stderr).lower()
 
