@@ -1815,7 +1815,7 @@ After resolution and before the verb dispatch, the launcher runs
 - **Dir exists, no `.owner`, no recognizable markers (empty or
   unrelated):** claim it by writing `.owner`.
 
-The check is skipped for `version`, `config`, and the `--chain-*` verbs (those
+The check is skipped for `version`, `config`, and the `chain` verb (those
 talk to the chain Fly app or are host-only fast paths that don't touch local state).
 
 Resolution and ownership validation live entirely in the launcher (bash);
@@ -1925,12 +1925,12 @@ substituted:
    before exiting, same as the Fly branch.
 
 Not yet wired for EC2 (documented gaps, not required for an end-to-end
-run): bare `resume` PID-record auto-discovery (an explicit `--run-id`
-is required to resume), mid-run re-seed (`re-seed`/auto-re-seed on
+run): bare `resume` PID-record auto-discovery (an explicit
+`resume <run-id>` is required), mid-run re-seed (`re-seed`/auto-re-seed on
 `resume`), `--inspect-dir` seeding, chain-wave tagging, and
-auto-finalize token plumbing on the tail/attach path. `--finalize
+auto-finalize token plumbing on the tail/attach path. `finalize
 --runtime ec2` is also not yet wired — that verb remains Fly-only
-today; `--stop --runtime ec2` and `--kill --runtime ec2` *are* both
+today; `stop --runtime ec2` and `kill --runtime ec2` *are* both
 wired (see "Explicit pause and destroy verbs" above). DESIGN §6 *EC2
 runtime lifecycle* is the canonical architecture. Default is `local`
 so existing behavior is unchanged for users who have not opted in.
@@ -2123,7 +2123,7 @@ Resolution order (highest priority first):
 
 The resolved value is exported as `LEERIE_FLY_APP` and assigned to
 `FLY_APP` before any remote script is sourced. Verb paths (`stop`,
-`kill`, `finalize`, `--list --runtime fly`, `re-seed`) validate
+`kill`, `finalize`, `list --runtime fly`, `re-seed`) validate
 independently since they exit before the main resolution gate.
 
 ### Prompt loading and the shared filter fragment
