@@ -121,7 +121,7 @@ host_finalize() {
   # it does NOT mean the run's waves all integrated. Pushing such a run
   # opens a PR containing only the waves that finished before the crash
   # (the PR-#22 incident). This is the single chokepoint every host-side
-  # push path funnels through (the auto-finalize block, the --finalize
+  # push path funnels through (the auto-finalize block, the finalize
   # verb, and Fly decide_teardown all call host_finalize), so gating here
   # covers them all. The signal lives in state.json (run.json never carries
   # completed_waves/waves); this mirrors _derive_run_status case 6½.
@@ -174,7 +174,7 @@ host_finalize() {
   # ran, so no branch was created). Treat it as a no-op rather than
   # attempting a `git push` that will fail with `src refspec ... does
   # not match any`. Upstream callers (fetch-branch.sh's stripper and
-  # the --finalize stripper in `leerie`) already preserve no_push=true
+  # the finalize stripper in `leerie`) already preserve no_push=true
   # for this case; this guard backstops them.
   if ! git -C "$USER_REPO" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     echo "[leerie] finalize: run branch $run_branch absent locally; treating as no-op" >&2

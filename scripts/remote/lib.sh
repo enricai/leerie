@@ -406,7 +406,7 @@ $_tail_script"
       if [ -n "$final_id" ]; then
         remote_log "auto-finalize: running 'leerie finalize $final_id'"
         rm -f "$_stderr_capture"
-        exec "${LEERIE_REPO}/leerie" --finalize "$final_id"
+        exec "${LEERIE_REPO}/leerie" finalize "$final_id"
       fi
     fi
     # `return`, not `exit`: this is a sourced function. `exit` here
@@ -441,7 +441,7 @@ $_tail_script"
 # in remote mode*).
 _attach_to_live_orchestrator() {
   if [ "$RESUME_SHELL" = "true" ]; then
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
     local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
     local _shell_payload_q
     _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
@@ -450,7 +450,7 @@ _attach_to_live_orchestrator() {
       --machine "$LEERIE_MACHINE_ID" \
       --command "bash -lc '$_shell_payload_q'" || true
   else
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
     local _tail_script
     _tail_script="$(render_tail_wrapper)"
     tail_with_optional_autofinalize \
