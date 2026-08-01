@@ -625,6 +625,19 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 ## Testing
 
+**Never run two copies of this suite concurrently on one host.** It has dense
+timing-sensitive coverage — real `fork()`s, PID reaping, subreaper races,
+cgroup probes, stalled-transport `timeout` paths — and CPU starvation makes
+dozens of them fail nondeterministically. Measured 2026-08-01 across six full
+runs: serial with the host to itself gave **0 failures** four times out of four
+(`main` twice, a feature branch twice), while two runs overlapping another
+pytest container gave **78** and then **57** failures. The counts are unstable
+and the individual tests pass in isolation — e.g.
+`tests/test_worktree_failure_not_fatal.py` is 3/3 alone. Treat any failure list
+gathered under concurrent load as unusable, and re-run alone before believing
+it. `-n 4` (xdist) is fine on an otherwise-idle host and matches the serial
+totals exactly; what breaks is *two suites at once*, not parallelism itself.
+
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,

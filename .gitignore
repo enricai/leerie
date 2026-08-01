@@ -24,7 +24,10 @@ venv/
 !.leerie/config.toml
 !.leerie/Dockerfile
 # Top-level log when the CLI is teed (`./leerie "..." | tee leerie.log`).
+# The `leerie-*.log` form covers per-task tees, e.g.
+# `leerie prompts/fix-x.md | tee leerie-fix-x.log`.
 leerie.log
+leerie-*.log
 
 # Local Claude Code settings / cache — per-machine, never tracked.
 .claude/

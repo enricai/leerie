@@ -1,0 +1,3767 @@
+{
+ "29a6bf8e": {
+  "plans": [
+   {
+    "domain": "feature-implementation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [
+       "docs-002-1",
+       "docs-002-2-1",
+       "docs-002-2-2-1",
+       "docs-002-2-2-3"
+      ],
+      "files_likely_touched": [
+       "docs/DESIGN.md",
+       "docs/IMPLEMENTATION.md"
+      ],
+      "id": "feat-001",
+      "intent": "",
+      "provides": [
+       "multi-token-design-spec",
+       "multi-token-design-documented",
+       "multi-token-implementation-spec"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-architecture-designed"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001"
+     },
+     {
+      "depends_on": [
+       "feat-001"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002",
+      "intent": "",
+      "provides": [
+       "token-probe-ranking"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-design-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002"
+     },
+     {
+      "depends_on": [
+       "feat-001",
+       "feat-002",
+       "feat-005"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-003",
+      "intent": "",
+      "provides": [],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-design-spec"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "token-probe-ranking"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "invoke-token-env"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-003"
+     },
+     {
+      "depends_on": [
+       "feat-001",
+       "feat-002",
+       "feat-005"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-004",
+      "intent": "",
+      "provides": [
+       "token-failover"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-design-spec"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "token-probe-ranking"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "invoke-token-env"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-004"
+     },
+     {
+      "depends_on": [
+       "feat-001"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-005",
+      "intent": "",
+      "provides": [
+       "invoke-token-env"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-design-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005"
+     },
+     {
+      "depends_on": [
+       "feat-001"
+      ],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-006",
+      "intent": "",
+      "provides": [
+       "launcher-multi-token"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-design-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-006"
+     },
+     {
+      "depends_on": [
+       "feat-006"
+      ],
+      "files_likely_touched": [
+       "scripts/remote/seed-auth.sh"
+      ],
+      "id": "feat-007",
+      "intent": "",
+      "provides": [],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "launcher-multi-token"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-007"
+     },
+     {
+      "depends_on": [
+       "feat-006"
+      ],
+      "files_likely_touched": [
+       "scripts/remote/ec2-seed-auth.sh"
+      ],
+      "id": "feat-008",
+      "intent": "",
+      "provides": [],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "launcher-multi-token"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-008"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_multi_token_probe.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "multi-token-probe-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "token-probe-ranking"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_multi_token_failover.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "multi-token-failover-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "token-failover"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_launcher_multi_token.py"
+      ],
+      "id": "test-003",
+      "intent": "",
+      "provides": [
+       "launcher-multi-token-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "launcher-multi-token"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-003"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_invoke_token_env.py"
+      ],
+      "id": "test-004",
+      "intent": "",
+      "provides": [
+       "token-env-threading-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "invoke-token-env"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-004"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_multi_token_secrets.py"
+      ],
+      "id": "test-005",
+      "intent": "",
+      "provides": [
+       "multi-token-secrets-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "token-probe-ranking"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "token-failover"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-005"
+     }
+    ]
+   },
+   {
+    "domain": "documentation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [],
+      "id": "docs-001",
+      "intent": "",
+      "provides": [
+       "current-credential-docs-mapped"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-001"
+     },
+     {
+      "depends_on": [
+       "docs-001"
+      ],
+      "files_likely_touched": [],
+      "id": "docs-002-1",
+      "intent": "",
+      "provides": [
+       "probe-mechanism-designed"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "current-credential-docs-mapped"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002-1"
+     },
+     {
+      "depends_on": [
+       "docs-002-1"
+      ],
+      "files_likely_touched": [],
+      "id": "docs-002-2-1",
+      "intent": "",
+      "provides": [
+       "token-ranking-algorithm-designed"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "Algorithm consumes probe output schema fields",
+        "tag": "probe-mechanism-designed"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002-2-1"
+     },
+     {
+      "depends_on": [
+       "docs-002-2-1"
+      ],
+      "files_likely_touched": [],
+      "id": "docs-002-2-2-1",
+      "intent": "",
+      "provides": [
+       "start-of-run-selection-designed"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "Initial selection consumes ranking algorithm's output",
+        "tag": "token-ranking-algorithm-designed"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002-2-2-1"
+     },
+     {
+      "depends_on": [
+       "docs-002-2-1"
+      ],
+      "files_likely_touched": [],
+      "id": "docs-002-2-2-3",
+      "intent": "",
+      "provides": [
+       "exhaustion-degradation-designed"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "Degradation strategy references ranking algorithm's empty/unavailable output",
+        "tag": "token-ranking-algorithm-designed"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002-2-2-3"
+     },
+     {
+      "depends_on": [
+       "feat-001"
+      ],
+      "files_likely_touched": [
+       "CLAUDE.md"
+      ],
+      "id": "docs-005",
+      "intent": "",
+      "provides": [
+       "multi-token-user-docs"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "multi-token-implementation-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-005"
+     }
+    ]
+   },
+   {
+    "domain": "_reconciler",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [
+       "docs-002-1",
+       "docs-002-2-1",
+       "docs-002-2-2-1",
+       "docs-002-2-2-3"
+      ],
+      "files_likely_touched": [],
+      "id": "docs-006",
+      "intent": "",
+      "provides": [
+       "multi-token-architecture-designed"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "probe-mechanism-designed"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "token-ranking-algorithm-designed"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "start-of-run-selection-designed"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "exhaustion-degradation-designed"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-006"
+     }
+    ]
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-003",
+    "tag_or_dep": "multi-token-implementation-spec"
+   }
+  ]
+ },
+ "3a4abba3": {
+  "plans": [
+   {
+    "domain": "feature-implementation",
+    "status": "ready",
+    "subtasks": []
+   },
+   {
+    "domain": "refactoring",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [
+       "docs-001",
+       "docs-002"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/task_file_coverage.md"
+      ],
+      "id": "refactor-002",
+      "intent": "",
+      "provides": [
+       "task-file-coverage-worker",
+       "task-file-coverage-schema"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-002"
+     },
+     {
+      "depends_on": [
+       "refactor-002"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/planner.md"
+      ],
+      "id": "refactor-003",
+      "intent": "",
+      "provides": [
+       "planner-migration-targets-field"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-003"
+     },
+     {
+      "depends_on": [
+       "refactor-003"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/provision.md"
+      ],
+      "id": "refactor-004",
+      "intent": "",
+      "provides": [
+       "provision-readme-fold-in"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-004"
+     },
+     {
+      "depends_on": [
+       "refactor-004"
+      ],
+      "files_likely_touched": [
+       "tests/test_regex_migration_absent.py",
+       "tests/test_task_file_coverage_schema.py"
+      ],
+      "id": "refactor-005",
+      "intent": "",
+      "provides": [
+       "nl-regex-migration-verified"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-schema"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "provision-readme-fold-in"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-005"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_extraction.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "task-file-extraction-tests-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-worker"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-schema"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_coverage_schema.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "task-file-coverage-schema-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-schema"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_coverage_freeze.py"
+      ],
+      "id": "test-003",
+      "intent": "",
+      "provides": [
+       "task-file-coverage-freeze-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-003"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_incident_2026_07_19.py"
+      ],
+      "id": "test-004",
+      "intent": "",
+      "provides": [
+       "incident-2026-07-19-coverage-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-004"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_readme_extractor.py"
+      ],
+      "id": "test-005",
+      "intent": "",
+      "provides": [
+       "readme-extractor-tests-migrated"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-005"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_provision_fixtures.py"
+      ],
+      "id": "test-006",
+      "intent": "",
+      "provides": [
+       "provision-fixtures-tests-migrated"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-006"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_migration_surface.py"
+      ],
+      "id": "test-007",
+      "intent": "",
+      "provides": [
+       "migration-surface-tests-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-007"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_planner_migration_targets_schema.py"
+      ],
+      "id": "test-008",
+      "intent": "",
+      "provides": [
+       "planner-migration-targets-schema-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-008"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_phase_plan_recursion_wiring.py",
+       "tests/test_decompose_snapshot.py",
+       "tests/test_replan_sid_scoping.py"
+      ],
+      "id": "test-009",
+      "intent": "",
+      "provides": [
+       "extract-task-file-structure-callsites-updated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-coverage-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-009"
+     }
+    ]
+   },
+   {
+    "domain": "documentation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "docs/DESIGN.md"
+      ],
+      "id": "docs-001",
+      "intent": "",
+      "provides": [
+       "design-nlp-migration-spec",
+       "nl-regex-migration-spec"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-001"
+     },
+     {
+      "depends_on": [
+       "docs-001"
+      ],
+      "files_likely_touched": [
+       "docs/IMPLEMENTATION.md"
+      ],
+      "id": "docs-002",
+      "intent": "",
+      "provides": [
+       "implementation-nlp-migration-spec",
+       "nl-regex-migration-spec"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "design-nlp-migration-spec"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002"
+     }
+    ]
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-005",
+    "tag_or_dep": "provision-readme-fold-in"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-006",
+    "tag_or_dep": "provision-readme-fold-in"
+   }
+  ]
+ },
+ "6146bd2f": {
+  "plans": [
+   {
+    "domain": "refactoring",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "docs/DESIGN.md",
+       "docs/IMPLEMENTATION.md"
+      ],
+      "id": "refactor-001",
+      "intent": "",
+      "provides": [
+       "nl-regex-migration-design-documented",
+       "design-doc-updated-for-nl-regex-migration"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-001"
+     },
+     {
+      "depends_on": [
+       "refactor-001"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/task_file_structure.md",
+       "tests/test_task_file_structure_worker.py"
+      ],
+      "id": "refactor-002",
+      "intent": "",
+      "provides": [
+       "task-file-structure-worker",
+       "task-file-structure-schema"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-design-documented"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-002"
+     },
+     {
+      "depends_on": [
+       "refactor-001"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/planner.md",
+       "tests/test_planner_migration_targets.py"
+      ],
+      "id": "refactor-003",
+      "intent": "",
+      "provides": [
+       "planner-migration-targets-field"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-design-documented"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-003"
+     },
+     {
+      "depends_on": [
+       "refactor-001"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py",
+       "prompts/provision.md",
+       "tests/test_provision_readme_worker.py"
+      ],
+      "id": "refactor-004",
+      "intent": "",
+      "provides": [
+       "provision-readme-section-selection"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "nl-regex-migration-design-documented"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-004"
+     },
+     {
+      "depends_on": [
+       "refactor-002",
+       "refactor-003",
+       "refactor-004"
+      ],
+      "files_likely_touched": [
+       "tests/test_nl_regex_migration_complete.py"
+      ],
+      "id": "refactor-005",
+      "intent": "",
+      "provides": [
+       "nl-regex-migration-verified"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-worker"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "provision-readme-section-selection"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "refactor-005"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_structure_schema.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "task-file-structure-schema-tested"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-worker"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-schema"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_extraction.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "task-file-extraction-tests-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_task_file_coverage_freeze.py",
+       "tests/test_incident_2026_07_19.py",
+       "tests/fixtures/incident_2026_07_19/generate.py"
+      ],
+      "id": "test-003",
+      "intent": "",
+      "provides": [
+       "coverage-freeze-incident-preserved"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-worker"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-003"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_migration_surface.py"
+      ],
+      "id": "test-004",
+      "intent": "",
+      "provides": [
+       "migration-surface-tests-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-004"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_planner_migration_targets_schema.py"
+      ],
+      "id": "test-005",
+      "intent": "",
+      "provides": [
+       "planner-migration-targets-schema-tested"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-005"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_provision_fixtures.py"
+      ],
+      "id": "test-006",
+      "intent": "",
+      "provides": [
+       "provision-fixtures-tests-migrated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "provision-readme-section-selection"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-006"
+     }
+    ]
+   },
+   {
+    "domain": "documentation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [
+       "refactor-001"
+      ],
+      "files_likely_touched": [
+       "docs/IMPLEMENTATION.md"
+      ],
+      "id": "docs-002",
+      "intent": "",
+      "provides": [
+       "implementation-doc-updated-for-nl-regex-migration"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-worker"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "task-file-structure-schema"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "planner-migration-targets-field"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "provision-readme-section-selection"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-002"
+     },
+     {
+      "depends_on": [
+       "docs-002"
+      ],
+      "files_likely_touched": [
+       "CLAUDE.md"
+      ],
+      "id": "docs-003",
+      "intent": "",
+      "provides": [
+       "claude-md-testing-section-updated-for-nl-regex-migration"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "task-file-extraction-tests-migrated"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "migration-surface-tests-migrated"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "provision-fixtures-tests-migrated"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "docs-003"
+     }
+    ]
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "refactor-005",
+    "tag_or_dep": "task-file-extraction-tests-migrated"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "refactor-005",
+    "tag_or_dep": "coverage-freeze-incident-preserved"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "refactor-005",
+    "tag_or_dep": "migration-surface-tests-migrated"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "refactor-005",
+    "tag_or_dep": "provision-fixtures-tests-migrated"
+   }
+  ]
+ },
+ "62a19deb": {
+  "plans": [
+   {
+    "domain": "feature-implementation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r1",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r1"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r2",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r2"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r3",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r3"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r4",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r4"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r5",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r5"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r6",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r6"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r7",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r7"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r9",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r9"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r10",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r10"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001-r11",
+      "intent": "",
+      "provides": [
+       "opt-bake-implemented",
+       "dockerfile-generates-opt-paths",
+       "runtime-env-configured",
+       "python-opt-venv-baked",
+       "ruby-opt-bundle-baked",
+       "lockfile-hash-invalidation-preserved"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001-r11"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r1",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r1"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r2",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r2"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r3-r1",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r3-r1"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r3-r2",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r3-r2"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r4",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r4"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r5",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r5"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r6",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r6"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r7",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r7"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r8",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r8"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r9",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r9"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r10",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r10"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r11",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r11"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r12",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r12"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r13",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r13"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r14",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r14"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r16",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r16"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r17",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r17"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r18",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r18"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r19",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r19"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r20",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r20"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r21",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r21"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r22",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r22"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r23",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r23"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r24",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r24"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r25",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r25"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r26",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r26"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r27",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r27"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r28",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r28"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r29",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r29"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r30",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r30"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r31",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r31"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r32",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r32"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r33",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r33"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r34",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r34"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r35",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r35"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r36",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r36"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r37",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r37"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r38-r1",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r38-r1"
+     },
+     {
+      "depends_on": [
+       "feat-001-r1",
+       "feat-001-r2",
+       "feat-001-r3",
+       "feat-001-r4",
+       "feat-001-r5",
+       "feat-001-r6",
+       "feat-001-r7",
+       "feat-001-r9",
+       "feat-001-r10",
+       "feat-001-r11"
+      ],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "feat-002-r38-r2",
+      "intent": "",
+      "provides": [
+       "python-venv-clone-delta-implemented",
+       "worktree-venv-isolation-working"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-opt-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002-r38-r2"
+     }
+    ]
+   },
+   {
+    "domain": "bug-fixing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "bugfix-001",
+      "intent": "",
+      "provides": [
+       "dockerfile-generation-gates-broadened"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-001"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_build_repo_image.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "dockerfile-emitter-unit-tests"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "",
+        "tag": "dockerfile-generates-opt-paths"
+       },
+       {
+        "extent": "in_plan",
+        "reason": "",
+        "tag": "dockerfile-generation-gates-broadened"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_provision_bake.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "provision-bake-integration-test"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "",
+        "tag": "dockerfile-generates-opt-paths"
+       },
+       {
+        "extent": "in_plan",
+        "reason": "",
+        "tag": "python-venv-clone-delta-implemented"
+       },
+       {
+        "extent": "in_plan",
+        "reason": "",
+        "tag": "dockerfile-generation-gates-broadened"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     }
+    ]
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "bugfix-001"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "bugfix-001"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r1"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r2"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r3"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r4"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r5"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r6"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r7"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r9"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r10"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "feat-001-r11"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r1"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r2"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r3"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r4"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r5"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r6"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r7"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r9"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r10"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "feat-001-r11"
+   }
+  ]
+ },
+ "ad69057f": {
+  "plans": [
+   {
+    "domain": "feature-implementation",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-001",
+      "intent": "",
+      "provides": [
+       "python-venv-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-001"
+     },
+     {
+      "depends_on": [
+       "feat-001"
+      ],
+      "files_likely_touched": [
+       "scripts/new-worktree.sh"
+      ],
+      "id": "feat-002",
+      "intent": "",
+      "provides": [
+       "python-venv-isolation"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "python-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-003",
+      "intent": "",
+      "provides": [
+       "ruby-bundle-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-003"
+     },
+     {
+      "depends_on": [
+       "feat-003"
+      ],
+      "files_likely_touched": [
+       "scripts/new-worktree.sh"
+      ],
+      "id": "feat-004",
+      "intent": "",
+      "provides": [
+       "ruby-bundle-isolation"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "ruby-bundle-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-004"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r1",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r1"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r2",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r2"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r3",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r3"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r4",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r4"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r5",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r5"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r6",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r6"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r7",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r7"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r8",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r8"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r9",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r9"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r10",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r10"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "feat-005-r11",
+      "intent": "",
+      "provides": [
+       "node-pnpm-baked",
+       "rust-cargo-baked",
+       "go-cache-baked"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "feat-005-r11"
+     }
+    ]
+   },
+   {
+    "domain": "bug-fixing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "leerie"
+      ],
+      "id": "bugfix-001",
+      "intent": "",
+      "provides": [
+       "dockerfile-gate-fix"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-001"
+     },
+     {
+      "depends_on": [
+       "bugfix-001"
+      ],
+      "files_likely_touched": [
+       "tests/test_build_repo_image.py"
+      ],
+      "id": "bugfix-002",
+      "intent": "",
+      "provides": [
+       "dockerfile-gate-test"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "dockerfile-gate-fix"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-002"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_build_repo_image.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "dockerfile-emitter-unit-tests"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_out_of_repo_bake.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "bake-integration-test"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "The test must build an image with the /opt/venv bake actually present, which requires feat-001's Dockerfile emitter changes to have landed.",
+        "tag": "python-venv-baked"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_provision_recipe_bake_filter.py"
+      ],
+      "id": "test-003",
+      "intent": "",
+      "provides": [
+       "recipe-filter-correctness-verified"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "The test fixture must have a real /opt/venv bake to verify the filter's assumption is now true.",
+        "tag": "python-venv-baked"
+       },
+       {
+        "extent": "in_plan",
+        "reason": "test-002 proves the bake itself works; this test verifies the recipe filter correctly assumes it. Sequencing: bake correctness before filter correctness.",
+        "tag": "bake-integration-test"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-003"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_python_venv_isolation.py"
+      ],
+      "id": "test-004",
+      "intent": "",
+      "provides": [
+       "python-venv-isolation-verified"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "The test exercises the worktree-level clone+delta mechanism that feat-002 implements in new-worktree.sh.",
+        "tag": "python-venv-isolation"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-004"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_ruby_bundle_isolation.py"
+      ],
+      "id": "test-005",
+      "intent": "",
+      "provides": [
+       "ruby-bundle-isolation-verified"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "reason": "The test exercises the worktree-level Ruby bundle clone+delta mechanism that feat-005 (the Ruby equivalent of feat-002) implements.",
+        "tag": "ruby-bundle-isolation"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-005"
+     }
+    ]
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "feat-002",
+    "tag_or_dep": "dockerfile-gate-fix"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "feat-004",
+    "tag_or_dep": "dockerfile-gate-fix"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-002",
+    "tag_or_dep": "dockerfile-gate-fix"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-003",
+    "tag_or_dep": "dockerfile-gate-fix"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "bugfix-002",
+    "tag_or_dep": "python-venv-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "python-venv-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "ruby-bundle-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "node-pnpm-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "rust-cargo-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "go-cache-baked"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": "live_defect",
+    "sid": "test-001",
+    "tag_or_dep": "dockerfile-gate-fix"
+   }
+  ]
+ },
+ "eed1153d": {
+  "plans": [
+   {
+    "domain": "bug-fixing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "scripts/remote/collect-subtrees.sh"
+      ],
+      "id": "bugfix-001",
+      "intent": "",
+      "provides": [
+       "integrator-schema-drift-fixed"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "orchestrator/leerie.py"
+      ],
+      "id": "bugfix-002",
+      "intent": "",
+      "provides": [
+       "size-field-enum-enforced"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-002"
+     },
+     {
+      "depends_on": [
+       "bugfix-002"
+      ],
+      "files_likely_touched": [
+       "docs/IMPLEMENTATION.md"
+      ],
+      "id": "bugfix-003",
+      "intent": "",
+      "provides": [
+       "size-field-docs-corrected",
+       "size-enum-doc-updated"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "size-field-enum-enforced"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "bugfix-003"
+     }
+    ]
+   },
+   {
+    "domain": "testing",
+    "status": "ready",
+    "subtasks": [
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_size_enum_schema.py"
+      ],
+      "id": "test-001",
+      "intent": "",
+      "provides": [
+       "size-enum-schema-tested"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-001"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_reconciler_size_gate.py"
+      ],
+      "id": "test-002",
+      "intent": "",
+      "provides": [
+       "size-gate-exact-match-tested"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-002"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_check_functions.py"
+      ],
+      "id": "test-003",
+      "intent": "",
+      "provides": [
+       "oversized-gates-exact-match-tested"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "size-enum-schema-tested"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-003"
+     },
+     {
+      "depends_on": [],
+      "files_likely_touched": [
+       "tests/test_collect_subtrees_integrator_schema.py"
+      ],
+      "id": "test-004",
+      "intent": "",
+      "provides": [
+       "integrator-schema-sync-tested"
+      ],
+      "requires": [],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-004"
+     },
+     {
+      "depends_on": [
+       "test-001",
+       "test-002",
+       "test-003",
+       "test-004"
+      ],
+      "files_likely_touched": [],
+      "id": "test-005",
+      "intent": "",
+      "provides": [
+       "prescribed-verification-run-clean"
+      ],
+      "requires": [
+       {
+        "extent": "in_plan",
+        "tag": "size-enum-schema-tested"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "size-gate-exact-match-tested"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "oversized-gates-exact-match-tested"
+       },
+       {
+        "extent": "in_plan",
+        "tag": "integrator-schema-sync-tested"
+       },
+       {
+        "extent": "external",
+        "reason": "The actual `\"size\": {\"type\": \"string\", \"enum\": [...]}\"` edits to orchestrator/leerie.py:1177,1277,1940 and the simplified `==` comparisons at :6433,:7551,:14925 are made by the bug-fixing/refactoring domain's subtasks, not this testing plan; this subtask only runs verification against the composed result.",
+        "tag": "size-enum-added-to-schemas"
+       }
+      ],
+      "runs_commands": [],
+      "size": "small",
+      "success_criteria_seed": "placeholder criteria (redacted)",
+      "title": "test-005"
+     }
+    ]
+   },
+   {
+    "domain": "documentation",
+    "status": "ready",
+    "subtasks": []
+   }
+  ],
+  "wiring_defects": [
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-001",
+    "tag_or_dep": "size-field-enum-enforced"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-002",
+    "tag_or_dep": "size-field-enum-enforced"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-003",
+    "tag_or_dep": "size-field-enum-enforced"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-004",
+    "tag_or_dep": "integrator-schema-drift-fixed"
+   },
+   {
+    "concrete_reason": "redacted \u2014 only presence is asserted",
+    "kind": "missing_requires",
+    "severity": null,
+    "sid": "test-005",
+    "tag_or_dep": "size-field-enum-enforced / integrator-schema-drift-fixed"
+   }
+  ]
+ }
+}
