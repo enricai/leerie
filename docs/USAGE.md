@@ -92,7 +92,7 @@ code 10 — not an error, a structured "need answers" signal. The plugin
 skill at [`commands/leerie.md`](../commands/leerie.md) shows the
 questions to the user, writes their answers to
 `<state-root>/answers.json`, and resumes with
-`--resume --answers <state-root>/answers.json`.
+`resume --answers <state-root>/answers.json`.
 
 ## Step 3 — Planning and scheduling
 
@@ -235,7 +235,7 @@ Leerie does worktree-only cleanup, state and branches survive, and it
 exits non-zero without touching finalize. Re-authenticate (`claude
 /login`, or better, export a `claude setup-token` token — see
 [README "Requirements"](../README.md#requirements)) and run `./leerie
---resume`. See [`DESIGN.md`](DESIGN.md) §6 *Credential strategy* for
+resume`. See [`DESIGN.md`](DESIGN.md) §6 *Credential strategy* for
 why this happens and why the container can't self-heal it.
 
 ## Walking away from a remote run (`--runtime fly`)
@@ -277,17 +277,17 @@ orchestrator never noticed you were gone.
 one table, with the Fly Machine ID column populated for remote runs.
 Filter by status with `leerie list --status <state>` (e.g. `paused`,
 `killed`, `in-progress`) and by runtime with `--runtime <local|fly>`.
-The two axes are orthogonal: `--list --status paused --runtime fly`
+The two axes are orthogonal: `leerie list --status paused --runtime fly`
 shows every paused Fly run. The status taxonomy lives in
 `RUN_STATUSES` in `orchestrator/leerie.py`; `leerie list --status ?`
-prints the full set. `--list --runtime fly` (without `status`)
+prints the full set. `leerie list --runtime fly` (without `status`)
 short-circuits to a direct Fly query (`flyctl machines list`) covering
 every machine under the app, regardless of which host repo launched
 them — useful when you've lost track of a machine ID after Ctrl-C.
 
 > **In-flight detached runs** — runs that are still in the bootstrap
 > phase (before classify completes, ~1 min) won't show up in `leerie
-> --list` yet, because `state.json` lives on the Fly Machine until
+> list` yet, because `state.json` lives on the Fly Machine until
 > `leerie finalize` streams it back. **The detach banner that prints
 > when you Ctrl-C is the canonical source of the run-id during that
 > window** — copy it. Once classify completes the run appears in
@@ -699,5 +699,5 @@ leerie finalize <chain-id>
 leerie kill <chain-id>
 ```
 
-`--kill <chain-id>` iterates the chain's runs and invokes
+`kill <chain-id>` iterates the chain's runs and invokes
 `leerie kill <run-id>` per run; already-killed runs are skipped.
