@@ -6381,7 +6381,7 @@ if [ "$RUNTIME" = "fly" ]; then
   fi
 
   # run_id = machine_id: set AFTER provision_machine succeeds (see below).
-  # For --resume, LEERIE_RUN_ID is already set from --run-id.
+  # For resume, LEERIE_RUN_ID is already set from --run-id.
 
   # Communicate the host's launch-time push intent to the in-Fly
   # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
@@ -6444,7 +6444,7 @@ if [ "$RUNTIME" = "fly" ]; then
     # shellcheck disable=SC1090
     . "$FETCH_SCRIPT"
 
-    # --resume auto-discovery (Phase 1). Runs only when --resume was
+    # resume auto-discovery (Phase 1). Runs only when resume was
     # passed and no explicit --run-id is set. Scans the per-launcher
     # records under $LEERIE_STATE_HOST_DIR/remote/*.json for entries
     # whose recorded launcher_pid is still alive (kill -0). Exactly
@@ -6480,11 +6480,11 @@ except Exception:
 ' "${_active_records[0]}" 2>/dev/null || true)"
           export LEERIE_RUN_ID
           if [ -n "$LEERIE_RUN_ID" ]; then
-            remote_log "--resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+            remote_log "resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
           fi
           ;;
         *)
-          remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
+          remote_log "resume: multiple active launches — pass the run-id to disambiguate:"
           for _f in "${_active_records[@]}"; do
             python3 -c "
 import json, sys
@@ -6504,7 +6504,7 @@ except Exception:
     # the existing Fly Machine instead of provisioning a new one.
     # (DESIGN §6 Remote pause-on-failure.) Uses the dual-file resolver
     # at leerie:76 — fly-machine.json first, then run.json — to mirror
-    # the existing --stop/--kill/--finalize/--resume behavior. For
+    # the existing stop/kill/finalize/resume behavior. For
     # run_id IS the machine ID (DESIGN §6).
     _paused_mid=""
     if [ -n "$LEERIE_RUN_ID" ] && [ "$container_rc" -eq 0 ]; then
@@ -6529,21 +6529,21 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      # --resume against a run-id whose machine is not found. The
+      # resume against a run-id whose machine is not found. The
       # run_id IS the machine ID, so resume_machine would have found it
       # if it existed. Fail loudly.
-      remote_log "--resume: machine $LEERIE_RUN_ID not found or not resumable"
-      echo "  Run 'leerie list' to see known runs, or omit --resume to" >&2
+      remote_log "resume: machine $LEERIE_RUN_ID not found or not resumable"
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif [ "$IS_RESUME" = "true" ]; then
-      # --resume with no --run-id AND auto-discovery found zero active
+      # resume with no --run-id AND auto-discovery found zero active
       # records. Distinct from the per-id error above — no run to point
       # at, so list-style guidance is the right next step.
-      remote_log "--resume: no active remote launchers found"
+      remote_log "resume: no active remote launchers found"
       echo "  No records under $LEERIE_STATE_HOST_DIR/remote/ and" >&2
       echo "  no --run-id was given." >&2
-      echo "  Run 'leerie list' to see known runs, or omit --resume to" >&2
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif provision_machine; then
@@ -6639,7 +6639,7 @@ EARLY_PROBE_PY
         rm -f "$_early_probe_stderr"
 
         if [ "$_early_probe_rc" = "75" ]; then
-          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          remote_log "resume: early probe detected live orchestrator — skipping seed"
           _attach_to_live_orchestrator
           _skip_seed_launch=true
         fi
@@ -6691,7 +6691,7 @@ EARLY_PROBE_PY
         _work_probe="$(printf '%s' "$_work_probe" | tr -d '[:space:]')"
         if [ "$_work_probe_rc" -eq 0 ] && [ "$_work_probe" = "INVALID" ]; then
           # Confirmed round-trip + genuinely unseeded /work → self-heal.
-          remote_log "--resume: /work is not a valid seeded repo (initial seed never completed) — running full seed_repo to self-heal"
+          remote_log "resume: /work is not a valid seeded repo (initial seed never completed) — running full seed_repo to self-heal"
           if ! seed_repo; then
             remote_log "error: self-heal seed_repo failed — aborting remote run"
             container_rc=1
@@ -6703,7 +6703,7 @@ EARLY_PROBE_PY
           # that would obliterate the run branch + per-subtask branches).
           # Skipped when --no-re-seed was passed.
           if [ "$_work_probe_rc" -ne 0 ] || [ "$_work_probe" != "VALID" ]; then
-            remote_log "--resume: /work validity probe was inconclusive (rc=$_work_probe_rc); proceeding with dirty re_seed (not wiping)"
+            remote_log "resume: /work validity probe was inconclusive (rc=$_work_probe_rc); proceeding with dirty re_seed (not wiping)"
           fi
           # shellcheck disable=SC1091
           . "$LEERIE_REPO/scripts/remote/re-seed.sh"
@@ -6722,7 +6722,7 @@ EARLY_PROBE_PY
       # Inspect dirs: rsync each --inspect-dir host path to
       # /inspect/<basename> on the machine. Re-resolved on every run
       # (including resume) so the user can add an inspect dir at
-      # --resume time and expect it to land. The orchestrator already
+      # resume time and expect it to land. The orchestrator already
       # has the rewritten --inspect-dir /inspect/<basename> flags in
       # REWRITTEN_ARGS; this just makes the in-machine paths exist.
       # See docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io)
@@ -6908,8 +6908,8 @@ with open(log_path, "ab") as log_f:
 # *Single owner per run dir*), the child exits 75 within
 # milliseconds. Writing its pid to orchestrator.pid before the race
 # resolves would overwrite the winning orchestrator's pid with a
-# dead one — the stale-pid contagion that breaks --resume's tail
-# liveness check and --finalize --force's safety belt.
+# dead one — the stale-pid contagion that breaks resume's tail
+# liveness check and finalize --force's safety belt.
 #
 # Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
 # child's State.__init__ flock attempt is ~300-500 ms (Python
@@ -6933,7 +6933,7 @@ for _ in range(10):
 if p.poll() == 75:
     # Stillborn flock-loser — the winner still owns the run. Do not
     # touch the pid file. The launcher's existing rc=75 short-circuit
-    # (~30 lines below in the bash dispatcher) pivots the user's --resume
+    # (~30 lines below in the bash dispatcher) pivots the user's resume
     # to the live-orchestrator attach path via container_rc=130.
     sys.exit(75)
 with open(pid_path, "w") as pid_f:
@@ -7022,7 +7022,7 @@ $_tail_script"
       fi  # _skip_seed_launch
     else
       # Reached when neither resume_machine nor provision_machine
-      # produced a running machine (or --resume strict-fail set
+      # produced a running machine (or resume strict-fail set
       # container_rc=1 above). Surface a hint so the prior log lines
       # aren't the only signal — without this, a user reading the
       # tail sees `creating machine ...` followed by silence.
