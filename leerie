@@ -841,7 +841,7 @@ export LEERIE_STATE_HOST_DIR
 # — e.g. running leerie on /tmp/leerie would resolve to $HOME/.leerie/leerie).
 #
 # Called once after resolution and again from verb arms that need it
-# (skipped for --version, which exits before doing any I/O on the state
+# (skipped for version, which exits before doing any I/O on the state
 # dir). On any anomaly: die() with an actionable message naming the
 # --state-dir / LEERIE_STATE_DIR / leerie.toml overrides.
 _validate_state_ownership() {
@@ -930,18 +930,19 @@ _validate_state_ownership() {
 }
 
 # Verbs that don't touch the local state dir short-circuit the
-# ownership check: version reports version only; chain routes to the
-# chain Fly app over HTTP and may be invoked from any directory
-# (including non-repo dirs where claiming the basename is undesirable).
+# ownership check: version reports version only; the chain verb
+# routes to the chain Fly app over HTTP and may be invoked from any
+# directory (including non-repo dirs where claiming the basename is
+# undesirable).
 case "${1:-}" in
   version|config|chain) ;;
   *) _validate_state_ownership ;;
 esac
 
 # COUPLING: every verb arm below that `exit`s must also have a guard in
-# the two filter loops (IS_RESUME positional-run-id loop ~line 3709;
-# _value_flags skip-loop ~line 3743) so a misplaced verb errors clearly
-# instead of leaking to the orchestrator.
+# the two REWRITTEN_ARGS filter loops — the IS_RESUME positional-run-id
+# loop (~line 3756) and the _value_flags skip-loop (~line 3790) — so a
+# misplaced verb errors clearly instead of leaking to the orchestrator.
 case "${1:-}" in
   version)
     echo "leerie $LEERIE_VERSION"
@@ -1196,11 +1197,10 @@ PY
     # the original argv and lets execution continue past the case block;
     # the orchestrator's argparse handles plain `list`.
     #
-    # --list --chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # list --chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # groups by chain_id, and prints one row per chain. Used by users
-    # (and by the deprecated --list-chains alias) to see what chains
-    # exist in the local state dir.
-    # --list --groups iterates all $HOME/.leerie/*/runs/*/run.json across
+    # to see what chains exist in the local state dir.
+    # list --groups iterates all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, groups by group_id, and prints one row per
     # group. Used to see all run-groups across all repos.
     _list_runtime=""
@@ -1221,7 +1221,7 @@ PY
       esac
     done
 
-    # --list --chains: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # list --chains: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # group by chain_id, render one row per chain with run counts +
     # earliest-started + status breakdown. Under v5 Shape A there is no
     # Fly coordinator machine to query; the chain identity lives only
@@ -1291,7 +1291,7 @@ PY
       exit 0
     fi
 
-    # --list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
+    # list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, group by group_id, render one row per group.
     if [ "$_list_groups_only" = "1" ]; then
       python3 - "$HOME/.leerie" <<'PY'
@@ -1363,16 +1363,16 @@ PY
 
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
-        echo "leerie: --list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
+        echo "leerie: list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
         exit 1
       fi
       FLY_APP="$LEERIE_FLY_APP"
       USER_REPO="${USER_REPO:-$PWD}"
       if ! command -v flyctl >/dev/null 2>&1; then
-        echo "leerie: --list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
-        set -- --list "${_list_rest[@]:1}"
+        echo "leerie: list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
+        set -- "${_list_rest[@]}"
       elif ! _list_json="$(flyctl machines list --app "$FLY_APP" --json 2>&1)"; then
-        echo "leerie: --list --runtime fly: flyctl machines list failed:" >&2
+        echo "leerie: list --runtime fly: flyctl machines list failed:" >&2
         echo "$_list_json" >&2
         echo "  Falling back to local sidecars." >&2
         set -- --list "${_list_rest[@]:1}"
@@ -1388,7 +1388,7 @@ raw = os.environ.get("LEERIE_LIST_FLY_JSON", "")
 try:
     machines = json.loads(raw) if raw.strip() else []
 except ValueError as e:
-    print(f"leerie: --list --runtime fly: could not parse flyctl JSON: {e}", file=sys.stderr)
+    print(f"leerie: list --runtime fly: could not parse flyctl JSON: {e}", file=sys.stderr)
     sys.exit(1)
 
 m2r: dict[str, str] = {}
