@@ -2801,11 +2801,11 @@ PY
         sleep 5
       done
     fi
-    remote_log "--attach: run-id attach not yet implemented; use 'leerie resume $_at_id' to reattach"
+    remote_log "attach: run-id attach not yet implemented; use 'leerie resume $_at_id' to reattach"
     exit 1
     ;;
   resume)
-    # ID-dispatch fast-path: `--resume <uuid>` handles chain runs in two
+    # ID-dispatch fast-path: `resume <uuid>` handles chain runs in two
     # tiers: (1) auto-resume paused runs, (2) list running runs for the
     # user to reattach to. If the UUID is a group_id (no chain runs found),
     # dispatch group-scoped resume instead. Non-UUID args fall through to
@@ -2831,13 +2831,13 @@ PY
             if [ -n "$_rs_grp_paused" ]; then
               echo "$_rs_grp_paused" | while read -r _rid; do
                 [ -z "$_rid" ] && continue
-                remote_log "--resume: resuming paused run $_rid (group $_rs_chain)"
-                "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+                remote_log "resume: resuming paused run $_rid (group $_rs_chain)"
+                "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "resume: $_rid failed (continuing with next)"
               done
-              remote_log "--resume: group $_rs_chain resume pass complete"
+              remote_log "resume: group $_rs_chain resume pass complete"
             fi
             if [ -n "$_rs_grp_running" ]; then
-              remote_log "--resume: running group members (reattach with leerie resume <run-id>):"
+              remote_log "resume: running group members (reattach with leerie resume <run-id>):"
               echo "$_rs_grp_running" | while read -r _rid; do
                 echo "    $_rid"
               done
@@ -2845,20 +2845,20 @@ PY
             exit 0
           fi
         fi
-        remote_log "--resume: no resumable runs found for chain/group $_rs_chain"
+        remote_log "resume: no resumable runs found for chain/group $_rs_chain"
         exit 0
       fi
       # Tier 1: auto-resume paused runs.
       if [ -n "$_rs_paused" ]; then
         echo "$_rs_paused" | while read -r _rid; do
           [ -z "$_rid" ] && continue
-          remote_log "--resume: resuming paused run $_rid (chain $_rs_chain)"
-          "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+          remote_log "resume: resuming paused run $_rid (chain $_rs_chain)"
+          "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "resume: $_rid failed (continuing with next)"
         done
       fi
       # Tier 2: list running runs for the user to pick.
       if [ -n "$_rs_running" ]; then
-        remote_log "--resume: running chain runs (reattach with leerie resume <id>):"
+        remote_log "resume: running chain runs (reattach with leerie resume <id>):"
         echo "$_rs_running" | while read -r _rid; do
           [ -z "$_rid" ] && continue
           _rs_rj="$LEERIE_STATE_HOST_DIR/runs/$_rid/run.json"
@@ -2876,7 +2876,7 @@ except Exception:
         done
       fi
       if [ -n "$_rs_paused" ]; then
-        remote_log "--resume: chain $_rs_chain resume pass complete"
+        remote_log "resume: chain $_rs_chain resume pass complete"
         echo ""
         echo "Re-run 'leerie chain --wave ...' to resume the wave loop from where it paused."
       fi
@@ -2920,7 +2920,7 @@ except Exception:
         # always operates against $USER_REPO directly (the laptop's
         # cwd). cd into the target repo and re-run.
         --target|--target=*)
-          remote_log "--chain: --target is not supported; chains operate on \$USER_REPO directly."
+          remote_log "chain: --target is not supported; chains operate on \$USER_REPO directly."
           echo "  Cd into the target repo and re-run leerie chain --wave ..." >&2
           exit 1
           ;;
@@ -2934,11 +2934,11 @@ except Exception:
             _ch_passthrough+=("$1"); shift
           fi
           ;;
-        *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
+        *) remote_log "chain: unexpected argument: $1"; exit 1 ;;
       esac
     done
     if [ "${#_ch_waves[@]}" -eq 0 ]; then
-      remote_log "--chain: at least one --wave is required"
+      remote_log "chain: at least one --wave is required"
       echo "  Usage: leerie chain --wave <f1,f2,...> [--wave <f3,...>]" >&2
       exit 1
     fi
@@ -2953,7 +2953,7 @@ except Exception:
       # UUID" error pointing at the visibly-correct hex value).
       _ch_id_stripped="$(echo "$_ch_id_override" | tr -d '[:space:]')"
       if [ "$_ch_id_stripped" != "$_ch_id_override" ]; then
-        remote_log "--chain: --chain-id value had surrounding whitespace; stripped to '$_ch_id_stripped'"
+        remote_log "chain: --chain-id value had surrounding whitespace; stripped to '$_ch_id_stripped'"
         _ch_id_override="$_ch_id_stripped"
       fi
       unset _ch_id_stripped
@@ -2968,11 +2968,11 @@ except Exception:
       # uppercase letter silently bypasses idempotency and forks the
       # chain into a second chain_id (v8 audit finding S1).
       if ! echo "$_ch_id_override" | grep -qiE "$UUID_PATTERN"; then
-        remote_log "--chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        remote_log "chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _ch_id="$(echo "$_ch_id_override" | tr '[:upper:]' '[:lower:]')"
-      remote_log "--chain: pinning chain_id to $_ch_id (resuming prior chain)"
+      remote_log "chain: pinning chain_id to $_ch_id (resuming prior chain)"
     else
       _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
@@ -2986,17 +2986,17 @@ except Exception:
         _job_file="$(echo "$_job_file" | sed 's/^ *//;s/ *$//')"
         [ -z "$_job_file" ] && continue
         if [ ! -f "$_job_file" ]; then
-          remote_log "--chain: prompt file not found: $_job_file"; exit 1
+          remote_log "chain: prompt file not found: $_job_file"; exit 1
         fi
         if [ ! -s "$_job_file" ]; then
-          remote_log "--chain: prompt file is empty: $_job_file"; exit 1
+          remote_log "chain: prompt file is empty: $_job_file"; exit 1
         fi
         _ch_prompts+=("$(cat "$_job_file")")
         _ch_prompt_files+=("$_job_file")
         _w_count=$((_w_count + 1))
       done
       if [ "$_w_count" -eq 0 ]; then
-        remote_log "--chain: wave is empty (no prompt files)"; exit 1
+        remote_log "chain: wave is empty (no prompt files)"; exit 1
       fi
       _ch_jobs_per_wave+=("$_w_count")
     done
@@ -3053,7 +3053,7 @@ except Exception:
     # Wave loop. Each wave:
     #   - Idempotency: if every wave-N run (filtered by chain_id +
     #     wave_idx) is already pushed_at, skip fan-out (resume from
-    #     a prior --chain invocation that completed this wave).
+    #     a prior chain invocation that completed this wave).
     #   - Else: checkout current_base, fan out N background
     #     ./leerie --runtime fly --chain-id <id>, wait, tag each
     #     run.json with chain_id + wave_idx.
@@ -3079,7 +3079,7 @@ except Exception:
         # Ensure laptop HEAD = current_base so seed-repo.sh ships the
         # right starting state to each worker.
         git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
-          || { remote_log "--chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
+          || { remote_log "chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
 
         # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so
         # we can identify which fly-machine.json files belong to this
@@ -3111,7 +3111,7 @@ except Exception:
         # runs/*/fly-machine.json for matching launcher_pid (survives
         # pointer deletion by destroy_machine in older images). We tag
         # BEFORE the failure check so paused runs are discoverable by
-        # `leerie resume <chain-id>` / `--kill <chain-id>` / etc.
+        # `leerie resume <chain-id>` / `kill <chain-id>` / etc.
         for _cp in "${_ch_wave_child_pids[@]}"; do
           _ch_mid=""
           _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
@@ -3177,9 +3177,9 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         if git -C "$USER_REPO" ls-remote --exit-code origin "$_ch_next_stage" >/dev/null 2>&1; then
           remote_log "wave $_wave_idx → $((_wave_idx + 1)): stage branch $_ch_next_stage already on origin; skipping synth-merge"
           git -C "$USER_REPO" fetch origin "$_ch_next_stage" >/dev/null 2>&1 \
-            || { remote_log "--chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
+            || { remote_log "chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
           git -C "$USER_REPO" checkout -B "$_ch_next_stage" "origin/$_ch_next_stage" >/dev/null 2>&1 \
-            || { remote_log "--chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
+            || { remote_log "chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
           _ch_current_base="$_ch_next_stage"
           _ch_offset=$((_ch_offset + _n))
           continue
@@ -3228,7 +3228,7 @@ except SynthMergeConflict as exc:
         # workers can use it as their starting point (via seed-repo.sh
         # in their own ./leerie invocation).
         if ! git -C "$USER_REPO" push origin "$_ch_next_stage" >/dev/null 2>&1; then
-          remote_log "--chain: failed to push $_ch_next_stage to origin"
+          remote_log "chain: failed to push $_ch_next_stage to origin"
           exit 1
         fi
         _ch_current_base="$_ch_next_stage"
@@ -3260,7 +3260,7 @@ except SynthMergeConflict as exc:
     #     [--brief <file>] \
     #     [<per-member-flags>]
     #
-    # Modeled on the --chain arm (leerie:2033) but cd's into each member
+    # Modeled on the chain arm (leerie:2033) but cd's into each member
     # repo so each resolves its own USER_REPO and basename-keyed state
     # directory independently. See DESIGN.md §20 and IMPLEMENTATION.md
     # "Run-group verbs".
@@ -3276,14 +3276,14 @@ except SynthMergeConflict as exc:
           _grp_repo="${2:-}"
           _grp_prompt="${3:-}"
           if [ -z "$_grp_repo" ] || [ -z "$_grp_prompt" ]; then
-            remote_log "--group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
+            remote_log "group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
           fi
           _grp_repos+=("$_grp_repo")
           _grp_prompts+=("$_grp_prompt")
           shift 3
           ;;
         --repo=*)
-          remote_log "--group: --repo does not support = form; use: --repo <path> \"<prompt>\""; exit 1
+          remote_log "group: --repo does not support = form; use: --repo <path> \"<prompt>\""; exit 1
           ;;
         --brief) _grp_brief_file="${2:-}"; shift 2 ;;
         --brief=*) _grp_brief_file="${1#--brief=}"; shift ;;
@@ -3294,7 +3294,7 @@ except SynthMergeConflict as exc:
         # (single repo → shared dir is fine), a group needs each member
         # in its own basename-keyed state dir. Reject both forms.
         --state-dir|--state-dir=*)
-          remote_log "--group: --state-dir is not supported; each member uses its own \$HOME/.leerie/<basename> directory"
+          remote_log "group: --state-dir is not supported; each member uses its own \$HOME/.leerie/<basename> directory"
           echo "  Remove --state-dir or use per-member leerie invocations." >&2
           exit 1
           ;;
@@ -3307,19 +3307,19 @@ except SynthMergeConflict as exc:
             _grp_passthrough+=("$1"); shift
           fi
           ;;
-        *) remote_log "--group: unexpected argument: $1"; exit 1 ;;
+        *) remote_log "group: unexpected argument: $1"; exit 1 ;;
       esac
     done
 
     # State-dir guard: also reject LEERIE_STATE_DIR from the environment.
     if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-      remote_log "--group: LEERIE_STATE_DIR is set in the environment; this would pin all members to one state directory"
-      echo "  Unset LEERIE_STATE_DIR before running --group, or use per-member leerie invocations." >&2
+      remote_log "group: LEERIE_STATE_DIR is set in the environment; this would pin all members to one state directory"
+      echo "  Unset LEERIE_STATE_DIR before running group, or use per-member leerie invocations." >&2
       exit 1
     fi
 
     if [ "${#_grp_repos[@]}" -lt 2 ]; then
-      remote_log "--group: at least two --repo arguments are required"
+      remote_log "group: at least two --repo arguments are required"
       echo "  Usage: leerie group --repo <path> \"<prompt>\" --repo <path> \"<prompt>\" [--brief <file>]" >&2
       exit 1
     fi
@@ -3327,20 +3327,20 @@ except SynthMergeConflict as exc:
     # Validate each repo is a git repository before fan-out.
     for _gr in "${_grp_repos[@]}"; do
       if [ ! -d "$_gr" ]; then
-        remote_log "--group: repo path not found: $_gr"; exit 1
+        remote_log "group: repo path not found: $_gr"; exit 1
       fi
       if ! git -C "$_gr" rev-parse --git-dir >/dev/null 2>&1; then
-        remote_log "--group: not a git repository: $_gr"; exit 1
+        remote_log "group: not a git repository: $_gr"; exit 1
       fi
     done
 
     # Validate brief file if supplied.
     if [ -n "$_grp_brief_file" ]; then
       if [ ! -f "$_grp_brief_file" ]; then
-        remote_log "--group: brief file not found: $_grp_brief_file"; exit 1
+        remote_log "group: brief file not found: $_grp_brief_file"; exit 1
       fi
       if [ ! -s "$_grp_brief_file" ]; then
-        remote_log "--group: brief file is empty: $_grp_brief_file"; exit 1
+        remote_log "group: brief file is empty: $_grp_brief_file"; exit 1
       fi
       _grp_brief_content="$(cat "$_grp_brief_file")"
     else
@@ -3351,16 +3351,16 @@ except SynthMergeConflict as exc:
     if [ -n "$_grp_id_override" ]; then
       _grp_id_stripped="$(echo "$_grp_id_override" | tr -d '[:space:]')"
       if [ "$_grp_id_stripped" != "$_grp_id_override" ]; then
-        remote_log "--group: --group-id value had surrounding whitespace; stripped to '$_grp_id_stripped'"
+        remote_log "group: --group-id value had surrounding whitespace; stripped to '$_grp_id_stripped'"
         _grp_id_override="$_grp_id_stripped"
       fi
       unset _grp_id_stripped
       if ! echo "$_grp_id_override" | grep -qiE "$UUID_PATTERN"; then
-        remote_log "--group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        remote_log "group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _grp_id="$(echo "$_grp_id_override" | tr '[:upper:]' '[:lower:]')"
-      remote_log "--group: reusing group_id $_grp_id"
+      remote_log "group: reusing group_id $_grp_id"
     else
       _grp_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
