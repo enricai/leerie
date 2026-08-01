@@ -72,7 +72,7 @@
 #
 # Fly machines deliberately receive no GitHub credentials (DESIGN §6
 # *Finalization*: workers commit on the machine, the host pushes via
-# `leerie --finalize`; no long-lived push tokens on Fly). Bundling from
+# `leerie finalize`; no long-lived push tokens on Fly). Bundling from
 # the host satisfies the no-credentials constraint without an
 # in-machine `git clone` against origin.
 #

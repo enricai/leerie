@@ -249,7 +249,7 @@ decide_ec2_teardown() {
         echo "  The orchestrator finished cleanly but the run branch + state" >&2
         echo "  could not be pulled back. The instance is being LEFT RUNNING" >&2
         echo "  so your work is not lost. Recover manually, then:" >&2
-        echo "    leerie --kill ${LEERIE_RUN_ID:-<run-id>} --runtime ec2" >&2
+        echo "    leerie kill ${LEERIE_RUN_ID:-<run-id>} --runtime ec2" >&2
         echo "  Instance: $iid (still running on EC2)" >&2
         echo "================================================================" >&2
         # Intentionally NO stop_instance, NO terminate_instance. The user
@@ -265,9 +265,9 @@ decide_ec2_teardown() {
       remote_log "detached from run ${LEERIE_RUN_ID:-<unknown>} — orchestrator still running on EC2."
       echo "  You stopped watching. The orchestrator was NOT signalled and" >&2
       echo "  keeps making progress on the instance." >&2
-      echo "    leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
-      echo "    leerie --stop   ${LEERIE_RUN_ID:-<run-id>}" >&2
-      echo "    leerie --kill   ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "    leerie resume ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "    leerie stop   ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "    leerie kill   ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "  Instance: $iid (still running on EC2)" >&2
       echo "================================================================" >&2
       # Intentionally no stop/terminate — the orchestrator must keep running.
@@ -297,8 +297,8 @@ decide_ec2_teardown() {
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
         echo "  run-id:  $LEERIE_RUN_ID" >&2
       fi
-      echo "  resume:  leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
-      echo "  kill:    leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "  resume:  leerie resume ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "  kill:    leerie kill ${LEERIE_RUN_ID:-<run-id>}" >&2
       # Don't clear LEERIE_EC2_INSTANCE_ID — leave the pointer for the user.
       ;;
   esac

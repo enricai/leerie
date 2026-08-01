@@ -64,7 +64,7 @@ to all in-flight wave children, each of which runs its own
 When a wave fails or the user Ctrl-Cs mid-chain, the chain pauses.
 To resume:
 
-1. `leerie --resume <chain-id>` — resumes every paused single-run
+1. `leerie resume <chain-id>` — resumes every paused single-run
    in the chain. After each paused run completes, the wave it
    belongs to has all runs `pushed_at`.
 2. Re-submit the chain with `--chain-id` pinned to the prior UUID.
@@ -102,7 +102,7 @@ status, branch, notes). Status derived from run.json fields
 bash "${CLAUDE_PLUGIN_ROOT}/leerie" --list --chains
 ```
 
-Or via the deprecated alias `--list-chains`. Iterates run.json files,
+Iterates run.json files,
 groups by `chain_id`, and prints one row per chain
 (chain_id, status, pushed/total, wave count, started_at).
 
@@ -113,9 +113,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --stop <chain-id>
 ```
 
 Enumerates running runs in the chain (have `fly_machine_id`, no
-terminal state) and invokes `leerie --stop <run-id>` per run. Each
+terminal state) and invokes `leerie stop <run-id>` per run. Each
 paused run's machine is stopped (preserving filesystem) and run.json
-records `paused_at` + `pause_reason`. Resume with `--resume`.
+records `paused_at` + `pause_reason`. Resume with `resume`.
 
 ### `kill` — destroy a chain
 
@@ -124,7 +124,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --kill <chain-id>
 ```
 
 Enumerates non-killed runs in the chain and invokes
-`leerie --kill <run-id>` per run. Each run's Fly machine is destroyed
+`leerie kill <run-id>` per run. Each run's Fly machine is destroyed
 and `killed_at` is recorded. Idempotent — already-killed runs are
 skipped.
 
@@ -135,8 +135,8 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --resume <chain-id>
 ```
 
 Enumerates paused runs (`paused_at` set, not `killed_at`) and invokes
-`leerie --resume <run-id>` per run. After paused runs complete, the
-user re-invokes `leerie --chain --wave ...` and the wave loop's
+`leerie resume <run-id>` per run. After paused runs complete, the
+user re-invokes `leerie chain --wave ...` and the wave loop's
 idempotency check skips waves whose runs are all already `pushed_at`,
 continuing from where the chain stopped.
 
@@ -147,7 +147,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --finalize <chain-id>
 ```
 
 Enumerates runs with `pushed_at` unset (and not `killed_at`), invokes
-`leerie --finalize <run-id>` per run. Useful when the wave loop was
+`leerie finalize <run-id>` per run. Useful when the wave loop was
 interrupted between orchestrator finalize and laptop push.
 
 ### `attach` — poll until terminal

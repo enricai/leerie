@@ -475,9 +475,9 @@ prerequisites are `extent: external`, the worker will discover the external
 dependency is missing (e.g. no Postgres server in the container) and return
 `status: blocked`. Since the orchestrator does not gate dispatch on external
 preconditions — they are informational, not graph edges — the wave dies and
-`--resume` retries the same subtask, which blocks again. The `--accept-blocked
+`resume` retries the same subtask, which blocks again. The `--accept-blocked
 <run-id> <subtask-id>` verb lets the operator acknowledge an external block:
-it sets `subtask_status[sid]` to `complete` in state.json so `--resume` skips
+it sets `subtask_status[sid]` to `complete` in state.json so `resume` skips
 that subtask. This preserves the invariant that external preconditions are
 a human concern while giving the operator an escape hatch for runs that
 would otherwise loop indefinitely.
@@ -1420,7 +1420,7 @@ applies externally: a pre-existing user branch named exactly `leerie`
 (without any `/` suffix) occupies the path that `leerie/runs/…` and
 `leerie/subtasks/…` need as a directory. The orchestrator's `preflight()`
 checks for this and `die()`s with an actionable rename suggestion;
-`setup-run.sh` repeats the check as defense-in-depth for the `--resume`
+`setup-run.sh` repeats the check as defense-in-depth for the `resume`
 path, which skips `preflight()`.
 
 Integration is **incremental, one wave at a time**. Each wave's results are
@@ -1436,7 +1436,7 @@ into the run branch before exiting with the failure diagnostic.
 failed/blocked subtasks, so partial integration is a matter of
 invocation order: `integrate_wave` runs before `die()`. The wave
 counter (`completed_waves`) is **not** incremented for a
-partially-integrated wave, so `--resume` re-enters the wave.
+partially-integrated wave, so `resume` re-enters the wave.
 Already-integrated subtask branches produce a no-op `git merge
 --no-ff` ("Already up to date.", exit 0) — `integrate.sh` uses `git
 merge --no-ff`, which is idempotent on branches that are already
@@ -1445,7 +1445,7 @@ ancestors of the run branch.
 ### The run branch is the resume contract
 
 The run branch is also the durable record of everything completed so far:
-every integrated wave is a commit on it. This is what `--resume` is built on.
+every integrated wave is a commit on it. This is what `resume` is built on.
 Run state records *which wave* to resume from; the run branch holds *the
 work* every prior wave produced. The two together are the entire resume
 contract. Within a wave, `phase_execute` skips subtasks whose
@@ -1463,7 +1463,7 @@ missing everything before the interruption. "Create if absent, never reset"
 is not an implementation nicety; it is the invariant the resume guarantee
 depends on.
 
-When more than one run is in flight in the same repository, `--resume`
+When more than one run is in flight in the same repository, `resume`
 needs to know *which* run to resume; the discovery scans
 `<state-root>/runs/*/state.json`. An explicit run-id always wins and must
 match exactly (an unknown id fails closed — resume never falls back to a
@@ -1473,7 +1473,7 @@ only the runs that are actually resumable — those whose derived status is
 run that has finished (`done`, `done-pushed-pr`) has nothing to resume, and
 one that needs operator attention first (`seed-failed`, `sync-failed`) is
 never auto-picked: both are listed, not chosen. When no run is resumable,
-or the newest cannot be identified, `--resume` lists the candidates and
+or the newest cannot be identified, `resume` lists the candidates and
 requires an explicit id.
 
 Recency is read from `started_at`, falling back to the state file's mtime
@@ -1485,14 +1485,14 @@ directory's `flock` (see *Single owner per run dir*) rejects the second
 orchestrator, so the outcome is a clear "already running", not a
 double-drive.
 
-The resumable-status narrowing belongs to `--resume` alone. The read-only
+The resumable-status narrowing belongs to `resume` alone. The read-only
 verbs that share the same run-selection logic (`--report`, `--phase`) skip
 it: they act on a run's *records*, not its remaining work, and a finished
 run is the ordinary thing to report on.
 
 **The wave loop above is not the whole resume story.** Everything in this
 section describes resume *after* scheduling — once `waves` exists,
-`--resume` re-enters the wave loop and skips completed waves/subtasks.
+`resume` re-enters the wave loop and skips completed waves/subtasks.
 But a run's planning pipeline (classify → provision → plan → reconcile →
 overlap-judge → adherence-gate → off-tree/satisfied filters → schedule)
 can itself run for 30+ minutes and spend real budget before `waves` is
@@ -1505,7 +1505,7 @@ threw away everything before it, with no way to recover.
 Resume must not be gated *solely* on whether scheduling finished. Every
 planning phase that mutates the plan persists its output through `State`
 as it completes — the same "write to `state.json` only via `State.save()`"
-discipline this document requires everywhere else (§12) — and `--resume`
+discipline this document requires everywhere else (§12) — and `resume`
 re-enters at the first planning phase whose output has not yet been
 persisted, rather than either re-running the whole pipeline or refusing
 to resume at all.
@@ -1521,12 +1521,12 @@ these keys must be added to `STATE_FIELDS` (`orchestrator/leerie.py:259`).
 `STATE_FIELDS` is a static allowlist checked by `tests/test_state_fields.py`,
 not a runtime filter — `State.load()` reads the whole on-disk `state.json`
 unconditionally, so an undeclared key is not silently dropped on
-`--resume`. What actually happens is louder: a new `st.data[...]` write
+`resume`. What actually happens is louder: a new `st.data[...]` write
 without a matching `STATE_FIELDS` entry fails
 `test_state_fields.py::test_every_st_data_write_is_declared` immediately,
 before the checkpoint can ever ship uncovered.
 
-On `--resume`, the orchestrator walks the phase
+On `resume`, the orchestrator walks the phase
 sequence in order and **skips every phase whose output key is already
 present**, re-entering the pipeline at the first phase with no persisted
 output — reusing the persisted `plans` as that phase's input rather than
@@ -1600,16 +1600,16 @@ paused.
 **Budget-check resume.** Once plans are checkpointed per phase, a run
 that stopped at the post-`_schedule()` budget-feasibility gate (§13) is no
 longer a dead end: `subtasks`/`waves` are already recoverable from the
-`plan_snapshot` checkpoint, so `--resume` can rehydrate them and re-run
+`plan_snapshot` checkpoint, so `resume` can rehydrate them and re-run
 only the budget check — under a higher `--max-workers` or
 `--skip-budget-check` — instead of discarding the plan and forcing a
 from-scratch re-run.
 
 ### Single owner per run dir
 
-`--resume` picks a run; but `--resume` does not by itself prevent the
+`resume` picks a run; but `resume` does not by itself prevent the
 *same* run from being resumed twice. The hazard is concrete: a user
-invokes `--resume` while the original orchestrator is still alive, the
+invokes `resume` while the original orchestrator is still alive, the
 launcher dutifully spawns a second orchestrator, and two processes now
 race on the same `state.json` and the same run-branch worktrees — both
 spawn workers, both write conformance entries, both interleave log
@@ -1625,14 +1625,14 @@ by the kernel on process exit (clean, SIGTERM, or SIGKILL — no manual
 pidfile cleanup, no `/proc` liveness check, no PID-recycling false
 positives). A second orchestrator that tries to construct `State` on
 the same run dir gets `StateLockedError` and exits with `EXIT_LOCKED`,
-the launcher routes the user to `leerie --resume <run-id>` instead
+the launcher routes the user to `leerie resume <run-id>` instead
 (which, observing the live-orchestrator condition, attaches to its
 log stream rather than spawning a duplicate).
 
 Why the *directory* and not `state.json`: `State.save()`'s atomic
 `tmp + rename` swaps state.json's inode every save. A lock on
 state.json's fd would be orphaned from the new inode at every save,
-opening a window where a racing `--resume` could acquire on the
+opening a window where a racing `resume` could acquire on the
 unlocked replacement. Directory inodes are never replaced — the lock
 fd stays valid for the process lifetime.
 
@@ -1650,8 +1650,8 @@ orchestrator; on local runs the host is the user's workstation. There
 is no architectural path today by which two hosts could attach to the
 same state directory simultaneously.
 
-Concurrent-spawn race between two `--resume` launches and the
-stale-pid contagion: two `--resume` invocations against the same run
+Concurrent-spawn race between two `resume` launches and the
+stale-pid contagion: two `resume` invocations against the same run
 (an impatient user resuming a run whose orchestrator is still alive,
 a CI retry, etc.) each pass the launcher's fast-path probe — the
 probe is `LOCK_EX | LOCK_NB` then immediate `LOCK_UN`, so it tests
@@ -1663,9 +1663,9 @@ the launcher writes `orchestrator.pid` *between* `Popen` and the
 child's `State.__init__`. By the time B exits 75, B's pid is already
 in the file. The winner A's pid is overwritten with a dead pid —
 silently — and every downstream reader of `orchestrator.pid` is now
-wrong about A. `leerie --resume`'s in-machine tail watcher prints
+wrong about A. `leerie resume`'s in-machine tail watcher prints
 a false "orchestrator exited" banner the moment B's pid is checked
-with `kill -0`; `leerie --finalize --force`'s liveness gate sees
+with `kill -0`; `leerie finalize --force`'s liveness gate sees
 the same dead pid and would happily patch a `finished_at` onto A's
 state mid-run.
 
@@ -1673,7 +1673,7 @@ The fix is two-sided: the launcher's `_launch_script` polls `Popen`
 briefly for `rc=75` (B's flock-loser signal) before writing the
 pid file; if the child exited 75 the file is not touched. Readers
 do not trust the pid file as the sole liveness oracle — both the
-`--resume` tail watcher and `--finalize --force`'s liveness check
+`resume` tail watcher and `--finalize --force`'s liveness check
 cross-check via a `/proc` scan for any process whose argv contains
 `orchestrator/leerie.py` AND this run-id. Either anchor catching
 the live orchestrator is sufficient to declare "alive." This makes
@@ -1837,9 +1837,9 @@ push + PR sit between them on the host:
    the trap proceeds.
 4. **Only if push succeeds does the trap destroy the machine.** Push
    failure leaves the machine running and prints a recovery banner
-   pointing at `leerie --finalize <run-id>`; this mirrors the
+   pointing at `leerie finalize <run-id>`; this mirrors the
    sync-failure recovery path (work is preserved; the user destroys
-   manually via `leerie --kill <run-id>` when satisfied).
+   manually via `leerie kill <run-id>` when satisfied).
 
 **Controlled exits write `finished_at` eagerly.** `die()` raises
 `SystemExit`; `main()`'s `except SystemExit` handler writes
@@ -1847,7 +1847,7 @@ push + PR sit between them on the host:
 guarded by `st is not None`; `state.json` is additionally guarded by
 `st.data.get("task")` to avoid poisoning the host-side file with a
 bare `{"finished_at": …}` stub when the handler fires before state
-was loaded — e.g. a failed `--resume` against an incomplete
+was loaded — e.g. a failed `resume` against an incomplete
 host-side state) before re-raising. It also writes the exit code to
 `orchestrator.exit_code` in the run directory so the tail wrapper can
 propagate it to `decide_teardown`. Without the exit code file, the
@@ -1858,7 +1858,7 @@ The `finished_at` write remains necessary even with exit code
 propagation: `fetch_branch` needs `finished_at` to discover the run.
 Without this write, every post-setup `die()` (e.g. "unresolved
 subtasks") triggers the sync-failure banner. The value is idempotent
-on `--resume`: `phase_finalize` overwrites it with the real completion
+on `resume`: `phase_finalize` overwrites it with the real completion
 time if the run succeeds on retry.
 
 **`finished_at` is a discovery sentinel, not a completion signal.**
@@ -1868,7 +1868,7 @@ with `completed_waves < len(waves)` — `finished_at` alone does not mean
 the run finished its work. A run whose container was OOM-killed mid-wave
 (the orphan case above) can end up with `finished_at` set and only 1 of
 5 waves integrated. Treating `finished_at` as "done" is what makes
-`leerie --list` render such a run `done` and lets a stray finalize push
+`leerie list` render such a run `done` and lets a stray finalize push
 an incomplete run branch and open a premature PR. **The completion
 signal is `completed_waves == len(waves)`** (or the documented
 cleared-but-empty terminal state, which sets `waves = []`). `finished_at`
@@ -1880,7 +1880,7 @@ this, all reading the same signal:
 
 1. `_derive_run_status` returns `incomplete` (not `done`) when
    `finished_at` is set but `completed_waves < len(waves)` and the run is
-   neither killed nor paused — so `leerie --list` never mislabels a
+   neither killed nor paused — so `leerie list` never mislabels a
    crashed run.
 2. `phase_finalize`'s entry `die()`s rather than writing the real
    `finished_at` when `completed_waves < len(waves)` — a defensive guard,
@@ -1903,7 +1903,7 @@ uncontrolled exit — SIGKILL, OOM, power loss, or any crash that
 bypasses the `except SystemExit` handler — before `phase_finalize`
 leaves a run that `fetch-branch.sh` cannot discover (its predicate
 requires `finished_at` set + `pushed_at` unset). For these cases,
-`leerie --finalize <run-id>` SSHes into the machine, verifies the
+`leerie finalize <run-id>` SSHes into the machine, verifies the
 orchestrator process is dead (via the `orchestrator.pid` file and
 `/proc/<pid>/cmdline`), patches `finished_at` into `run.json` along with
 audit fields `recovered_at` and `recovered_via="force-finalize"`, and
@@ -1913,7 +1913,7 @@ live pid and suggests `--force`.
 
 **Subtree collection.** When the orchestrator dies mid-wave, subtask
 branches (`leerie/subtasks/<run-id>/<sid>`) may have committed work
-that was never integrated into the run branch. `--finalize` detects
+that was never integrated into the run branch. `finalize` detects
 un-integrated subtask branches on the machine, runs `setup-run.sh` to
 ensure the staging worktree exists, and merges each un-integrated
 branch via `integrate.sh`. Conflicts are resolved by spawning a
@@ -1933,7 +1933,7 @@ integration mechanism (merging subtask branches into the run branch
 before fetch). The two are complementary: collection integrates; the
 expanded bundle scope preserves.
 
-**`--force`: stop the orchestrator, then collect.** `leerie --finalize
+**`--force`: stop the orchestrator, then collect.** `leerie finalize
 <run-id> --force` extends the recovery path to runs where the
 orchestrator is still alive. It SIGTERMs the orchestrator process
 inside the machine (the *process*, not the machine — the machine must
@@ -1952,7 +1952,7 @@ trail of recovered runs.
 The local-runtime path runs the same `host_finalize` block inline in
 the launcher (no trap is needed; the launcher and the pusher are the
 same process). Both paths share `scripts/host-finalize.sh`; the
-recovery command `leerie --finalize <run-id>` also sources it. Three
+recovery command `leerie finalize <run-id>` also sources it. Three
 call sites, one finalize implementation.
 
 **`no_push`: intent vs mechanism.** The orchestrator inside the Machine
@@ -2128,7 +2128,7 @@ exactly what state things are in and exactly which branch holds the work
 to be resolved.
 
 **`pushed_at` gates re-finalize by branch position, not by mere presence.**
-A re-invoked finalize (`leerie --finalize`, a second launcher pass, or
+A re-invoked finalize (`leerie finalize`, a second launcher pass, or
 Fly's `decide_teardown`) must be idempotent, so a run whose `pushed_at` is
 already set is normally a no-op. But `pushed_at` records *that* a push
 happened, not *what* it pushed: a finalize that fired while the run was
@@ -2292,13 +2292,13 @@ be refreshed," or "not logged in" (measured against 611 historical
 false positives) never enters the backoff loop. It raises immediately
 into the same **resumable pause** leerie already uses for
 out-of-credits (`EXIT_LOCKED`, exit 75) — worktree-only cleanup, no
-purge of state or branches, a `leerie --resume <id>` hint logged. This
+purge of state or branches, a `leerie resume <id>` hint logged. This
 is the correct disposition for exactly the same reason out-of-credits
 is: like a billing shortfall, an expired session does not resolve on a
 clock, so auto-resume would spin uselessly; unlike a `die()` for a
 genuine configuration error, the run's completed work (78 successful
 workers, in the incident that motivated this) is fully preserved and
-picked back up on `--resume` once the operator runs `claude /login` or
+picked back up on `resume` once the operator runs `claude /login` or
 sets `CLAUDE_CODE_OAUTH_TOKEN` — the same long-lived-token launch this
 section already recommends structurally avoids the failure in the first
 place.
@@ -2422,7 +2422,7 @@ The resumable-planning cursor (§6 *Resumable planning*) checkpoints
 `phase_plan`'s output as a whole (`plans_after_plan`), so a pause
 mid-decomposition still re-runs the entire `phase_plan` invocation
 (including `_recursive_decompose`) on resume rather than rehydrating
-from `decompose_snapshot`'s partial leaves. Wiring `--resume` to that
+from `decompose_snapshot`'s partial leaves. Wiring `resume` to that
 finer granularity is a separate, not-yet-shipped capability. Overclaiming
 resumability this change does not implement would be worse than not
 documenting the snapshot at all.
@@ -2454,7 +2454,7 @@ against it fails identically to the first and backoff only burns the
 above). Terminal auth failures are therefore checked *before* the
 transient classifier and routed straight to the same resumable pause
 (`EXIT_LOCKED`, exit 75) used for out-of-credits below — worktree-only
-cleanup, state and branches preserved, `--resume` picks back up once
+cleanup, state and branches preserved, `resume` picks back up once
 the operator re-authenticates.
 
 **A mid-stream transport disconnect is a third transient class, and it
@@ -2495,7 +2495,7 @@ SIGTERM, SIGHUP, WorkerError, or any other exception:
 - Worktrees under `<state-root>/runs/<run-id>/worktrees/` are removed and
   `git worktree prune` clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
-  on `--resume` from the deterministic branch names.
+  on `resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
   branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
   checkpoints under `<state-root>/runs/<run-id>/checkpoints/` survive too,
@@ -2562,7 +2562,7 @@ host-session processes*, including the `nerdctl run` clients. The
 host CLI died (terminal shows `exit status 255`, finalize is skipped),
 but container PID 1 kept running as an **orphan**. Because the
 orchestrator is alive, it still holds the run-dir flock (§6 *Single
-owner per run dir*), so every subsequent `--resume` correctly loses
+owner per run dir*), so every subsequent `resume` correctly loses
 the flock race and exits `EXIT_LOCKED=75` — the run is wedged until
 the orphan is killed by hand. Three mechanisms close this gap, defense
 in depth:
@@ -2591,11 +2591,11 @@ in depth:
    above — so the trap is a complement to, not a substitute for, the
    reaper.
 3. **Stale-container reaper (recovery).** Before spawning on the local
-   `--resume` path, the launcher checks for an already-`Up` container
+   `resume` path, the launcher checks for an already-`Up` container
    for this run whose owning launcher PID is dead (identified via a
    `leerie.launcher_pid` label set at spawn) and `nerdctl kill`s it
    first. This is the load-bearing fix for the OOM case: it makes
-   `--resume` self-heal the orphaned-flock wedge instead of returning
+   `resume` self-heal the orphaned-flock wedge instead of returning
    75, regardless of *how* the orphan was created.
 
 The container boundary holds across both invocation modes:
@@ -2638,7 +2638,7 @@ EOF. On an **abnormal** exit (PID-1 crash under `set -e`, OOM SIGKILL,
 a mid-run `nerdctl kill`), the master **retains** the write-end — so
 `tee` never receives EOF, the launcher never returns, its EXIT trap
 never fires, and the `--rm` container is orphaned `Up` (holding the
-run-dir flock, wedging `--resume`). This is why clean runs never hang
+run-dir flock, wedging `resume`). This is why clean runs never hang
 and only abnormal exits do. The blast-radius-free fix is *decoupled
 streaming*: the launcher points `nerdctl`'s stdout/stderr at a run-log
 **file** (the master does not retain a plain-file fd), and streams that
@@ -2650,7 +2650,7 @@ pipeline, and no concurrent group/chain run is disturbed (contrast
 mid-stream). Gated to the piped (`-i`, non-TTY-stdout) case; the
 interactive `-it` path has a real pty, no `tee`, and thus no hang, and
 keeps its stdin attached for `--clarify`. The stale-container reaper on
-the next `--resume` (below) remains the backstop for the uncatchable
+the next `resume` (below) remains the backstop for the uncatchable
 SIGKILL case where even the trap cannot run.
 
 **Worker subtree termination — Memory containment via cgroup v2.**
@@ -3314,7 +3314,7 @@ sleep, then `os.execv` the orchestrator (`sys.executable __file__ --resume
 --run-id <id>`) into a fresh process. **Out-of-credits does not reset on a
 clock** — it clears only when a human tops up or the billing period rolls
 over — so it does *not* auto-resume: `main()` does worktree-only cleanup,
-logs a `leerie --resume <id>` hint, and exits `EXIT_LOCKED` (75). Looping a
+logs a `leerie resume <id>` hint, and exits `EXIT_LOCKED` (75). Looping a
 fixed backoff against genuine exhaustion would only spin against the wall,
 burn the persisted worker budget on retries that cannot succeed, and delay
 surfacing "you're out of credits" to the operator.
@@ -3327,17 +3327,17 @@ container. The `--max-workers` budget persists across the re-exec
 rate-limit still respects the cap and can never run away. Cleanup runs before
 the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
-dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate.
+dirs, then `git worktree prune` — the re-exec'd `resume` finds a clean slate.
 That is a convenience, not the guarantee: cleanup cannot run when the process is
 SIGKILLed (Fly `machine stop`), so `setup-run.sh` reclaims a stale staging
 directory itself rather than relying on a predecessor having tidied up.
-Ctrl-C during the sleep drops to a manual `--resume` (exit 130); a
-SIGTERM/SIGHUP during the sleep drops to a manual `--resume` with the
+Ctrl-C during the sleep drops to a manual `resume` (exit 130); a
+SIGTERM/SIGHUP during the sleep drops to a manual `resume` with the
 signal's exit code (128 + signum → 143 / 129), matching main()'s
 top-level signal arm; and the should-never-happen case of `os.execv`
 itself failing exits `EXIT_LOCKED` (75, EX_TEMPFAIL). In every one of
 these the worktree cleanup has already run, so state and the run branch
-are intact for the manual `--resume`.
+are intact for the manual `resume`.
 
 - If `reset_at` parsed cleanly from the literal message format, `wait_seconds`
   is the time until that moment + a small margin.
@@ -3348,7 +3348,7 @@ are intact for the manual `--resume`.
   and sleeps again — cheap, and bounded by the persisted worker budget.
 - If the exit is an **out-of-credits mid-stream kill**
   (`out_of_credits=True`), there is no auto-resume at all: it does not reset on
-  a clock, so `main()` cleans up worktrees, logs a `leerie --resume <id>` hint,
+  a clock, so `main()` cleans up worktrees, logs a `leerie resume <id>` hint,
   and exits `EXIT_LOCKED`. The operator adds credits, then resumes.
 
 Rationale for the fixed-backoff auto-resume on rate-limits (vs. the earlier
@@ -3417,7 +3417,7 @@ the run-id *before* starting the orchestrator (so it knows which
 `orchestrator.log` path to tail), but today's orchestrator generates
 its run-id internally during phase 1. The launcher therefore generates
 the slug + suffix host-side using the same pattern and passes it as
-`--run-id <id>` — reusing the plumbing that `--resume` already
+`--run-id <id>` — reusing the plumbing that `resume` already
 establishes. The orchestrator's `--run-id` short-circuit accepts the
 explicit value and skips auto-generation.
 
@@ -3468,10 +3468,10 @@ on Ctrl-C would be exactly the behavior the detach was introduced to
 prevent. The launcher therefore prints a small banner listing the
 reattach, pause, and destroy commands and exits without touching the
 machine. The user can then come back hours or days later and either
-`leerie --resume <run-id> --runtime fly` to watch progress (the
+`leerie resume <run-id> --runtime fly` to watch progress (the
 default tails the orchestrator log; `--shell` opens a bash shell
-instead), `leerie --stop --runtime fly` to pause cleanly, or
-`leerie --kill --runtime fly` to explicitly destroy.
+instead), `leerie stop --runtime fly` to pause cleanly, or
+`leerie kill --runtime fly` to explicitly destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s
 EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
@@ -3494,7 +3494,7 @@ Before `stop_machine`, the pause branch syncs the machine-side
 primitive that `fetch_branch` uses. This is best-effort (bounded by
 a 60 s timeout; failure is logged but does not block the pause) and
 serves two purposes: it gives the host a copy of `state.json` so a
-subsequent `--resume` against an auto-detected Fly run can read the
+subsequent `resume` against an auto-detected Fly run can read the
 task and wave state locally, and it surfaces logs and checkpoint
 artifacts for offline inspection without restarting the machine.
 
@@ -3572,17 +3572,17 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
   `flyctl machine run` succeeds, so a launcher that crashes before
   classifying still leaves a recoverable pointer to the machine.
 - `paused_at` — ISO timestamp written either by the EXIT trap on the
-  pause-on-failure branch or by an explicit `leerie --stop <run-id>`.
+  pause-on-failure branch or by an explicit `leerie stop <run-id>`.
 - `pause_reason` — short tag (`worker-error`, `orchestrator-exception`,
   `finalize-failed`, `user-requested`).
 - `killed_at` — ISO timestamp written by an explicit
-  `leerie --kill <run-id>`. Marks the run as terminated by user request;
+  `leerie kill <run-id>`. Marks the run as terminated by user request;
   the machine has been destroyed and the run is no longer resumable.
 - `sync_failed_at` — ISO timestamp written when the clean-exit branch
   of `decide_teardown` ran `fetch_branch` and it failed. The machine
   is left RUNNING (not stopped — see below); the user recovers by
-  running `leerie --finalize <id> --runtime fly` (retry sync + push)
-  or `leerie --kill <id> --runtime fly` (destroy after manually
+  running `leerie finalize <id> --runtime fly` (retry sync + push)
+  or `leerie kill <id> --runtime fly` (destroy after manually
   salvaging work).
 - `sync_fail_reason` — short tag accompanying `sync_failed_at`
   (`sync-failed-on-clean-exit`).
@@ -3592,7 +3592,7 @@ These fields live on `run.json`. Since the run_id is the machine ID
 after `flyctl machine run` succeeds. `provision.sh` writes
 `fly-machine.json` to the run directory as a crash-recovery pointer;
 `run.json` is written later by the orchestrator. Every verb that acts
-on a known run-id (`--stop`, `--kill`, `--finalize`, `--resume`) can
+on a known run-id (`stop`, `kill`, `finalize`, `resume`) can
 use the run_id directly as the machine ID — no lookup needed.
 
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
@@ -3605,7 +3605,7 @@ orchestrator's `_validate_run_json` enforces all invariants.
 
 **Sync-before-destroy (load-bearing — the "never lose work"
 contract).** The clean-exit branch (rc=0/10/75) does NOT destroy
-the machine first and hope the user runs `leerie --finalize` later.
+the machine first and hope the user runs `leerie finalize` later.
 That ordering is wrong: the orchestrator's committed work and the
 `.leerie/runs/<id>/` state directory live ONLY on the machine until
 they are streamed back. Destroying the machine while the user has
@@ -3619,16 +3619,16 @@ confirmed sync success does it destroy. On any sync failure
 LEFT RUNNING — not stopped — and a multi-line WARNING points the
 user at three recovery commands:
 
-  1. `leerie --finalize <run-id> --runtime fly`  (retry sync + push)
-  2. `leerie --resume <run-id> --runtime fly`    (manual inspection —
+  1. `leerie finalize <run-id> --runtime fly`  (retry sync + push)
+  2. `leerie resume <run-id> --runtime fly`    (manual inspection —
                                   attaches to the live orchestrator's
                                   log, or drops into a shell with `--shell`)
-  3. `leerie --kill <run-id> --runtime fly`      (destroy AFTER user
+  3. `leerie kill <run-id> --runtime fly`      (destroy AFTER user
                                   confirms work is safely on host)
 
 The user owns the machine in this state. leerie does NOT auto-
 destroy after a successful manual finalize either — the user must
-explicitly `--kill`. The reclassified table (line 893+) already
+explicitly `kill`. The reclassified table (line 893+) already
 documented the "destroy *after* stream-back" intent; this is the
 mechanism that enforces it.
 
@@ -3638,11 +3638,11 @@ remote run lifecycle, each doing exactly one thing:
 | Verb | Effect |
 |---|---|
 | `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
-| `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
-| `leerie --resume <id>` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
-| `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
+| `leerie stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
+| `leerie resume <id>` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
+| `leerie kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
-Plus `leerie --list` (unified across local and remote, with `--status
+Plus `leerie list` (unified across local and remote, with `--status
 <state>` and `--runtime <local|fly>` filtering as orthogonal axes).
 Status describes the run's lifecycle (`paused`, `killed`,
 `done`, `sync-failed`, `in-progress`, `done-pushed-pr`, ...); runtime
@@ -3659,30 +3659,30 @@ destructive verb was an artifact of the lifetime coupling — once the
 coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
-**Runtime auto-detection on run-id-bearing verbs.** When `--resume`,
-`--stop`, `--kill`, `--accept-blocked`, or `--finalize` targets a run
+**Runtime auto-detection on run-id-bearing verbs.** When `resume`,
+`stop`, `kill`, `accept-blocked`, or `finalize` targets a run
 whose state directory contains a `fly-machine.json` or
 `ec2-instance.json` sidecar and no explicit `--runtime` was given, the
 launcher auto-promotes to `fly` or `ec2` respectively via the shared
 `_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
-as a thin Fly-only wrapper for call sites not yet migrated). `--stop`,
-`--kill`, and `--accept-blocked` all wire real EC2 actions;
-`--finalize` still fails closed with a "does not support EC2 runs yet"
-message (a separate subtask), and `--resume` fails closed the same way
+as a thin Fly-only wrapper for call sites not yet migrated). `stop`,
+`kill`, and `accept-blocked` all wire real EC2 actions;
+`finalize` still fails closed with a "does not support EC2 runs yet"
+message (a separate subtask), and `resume` fails closed the same way
 rather than falling into the launcher's fresh-provision `RUNTIME=ec2`
-branch. `--accept-blocked`'s EC2 action mirrors the Fly path's
+branch. `accept-blocked`'s EC2 action mirrors the Fly path's
 wake-mutate-pause dance: it resolves AWS credentials, wakes the
 instance via `resume_instance()` if it is stopped, mutates
 `state.json` on the instance over SSM (`ec2_remote_exec` — no ssh
 keypair or hallpass wait needed, unlike Fly), mirrors the mutation
 onto the host copy when one exists, and re-pauses the instance only
-if this verb was the one that woke it. `--stop`'s EC2 action sources
+if this verb was the one that woke it. `stop`'s EC2 action sources
 `aws-credentials.sh` +
 `ec2-lib.sh` + `ec2-provision.sh`, resolves AWS credentials and gates
 on `require_aws()`, resolves `LEERIE_EC2_INSTANCE_ID` from the run's
 sidecar, and calls `stop_instance()` (`aws ec2 stop-instances` —
 stop-scoped, preserves the root EBS volume, same semantics as Fly's
-`machine stop`). `--kill`'s EC2 action resolves the run's
+`machine stop`). `kill`'s EC2 action resolves the run's
 `ec2_instance_id` from `ec2-instance.json`/`run.json`, resolves AWS
 credentials, re-resolves the instance's current SSH target (its public
 IP changes on every stop/start cycle), and calls
@@ -3693,22 +3693,22 @@ and state dir back to the host BEFORE calling `terminate_instance()`
 LLM work unrecoverable). A failed sync leaves the instance running
 rather than terminating it, mirroring `decide_ec2_teardown`'s own
 sync-failure behavior; `flyctl` is never invoked for an EC2 run. When
-no sidecar of either kind exists, `--stop` and `--kill` probe for a
+no sidecar of either kind exists, `stop` and `kill` probe for a
 live local nerdctl container via `_is_local_container` (`nerdctl
-inspect <run-id>`). `--stop` uses `nerdctl stop` (SIGTERM → grace →
+inspect <run-id>`). `stop` uses `nerdctl stop` (SIGTERM → grace →
 SIGKILL) so the orchestrator's signal handler can save state before
-exit, or `aws ec2 stop-instances` on the EC2 path; `--kill` uses
+exit, or `aws ec2 stop-instances` on the EC2 path; `kill` uses
 `nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
 (after the fetch-before-terminate sync) since the run is terminal.
-`--finalize` on a local run is inline (no separate verb needed). If
+`finalize` on a local run is inline (no separate verb needed). If
 the user explicitly sets `--runtime local` on a Fly-originated run,
-`--resume` warns but respects the choice.
+`resume` warns but respects the choice.
 
-**Smart resume in remote mode.** `--resume` is the single verb for
+**Smart resume in remote mode.** `resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.
 The launcher reads observed state and routes to the right behavior:
 
-| Machine state | Orchestrator state | `--resume` behavior |
+| Machine state | Orchestrator state | `resume` behavior |
 |---|---|---|
 | Stopped (paused) | n/a | Wake machine → re-seed → launch orchestrator → tail |
 | Running | Dead | (Re-)seed if needed → launch orchestrator → tail |
@@ -3752,7 +3752,7 @@ The orchestrator is unaware of attach — it's a launcher-host gesture
 (mirrors §6's "container/process isolation is the launcher's
 concern"). The same mechanism serves four roles:
 
-1. The "feels-local" interactive terminal — `leerie --resume <run-id>
+1. The "feels-local" interactive terminal — `leerie resume <run-id>
    --shell` drops a developer at `/work` to inspect what a worker is
    doing.
 2. The mid-run attach mechanism — open a session against a running
@@ -3761,10 +3761,10 @@ concern"). The same mechanism serves four roles:
    SSH session's own children.
 3. The failure-inspection surface — the paused-machine state from
    the pause-on-failure path is reachable via exactly the same
-   command (`--resume` wakes the machine, then tails). No second
+   command (`resume` wakes the machine, then tails). No second
    mechanism is needed.
 4. **The detached-run reattach surface** — after a Ctrl-C detach or
-   a closed-laptop disconnect, `leerie --resume <run-id>` picks
+   a closed-laptop disconnect, `leerie resume <run-id>` picks
    up the orchestrator log stream where it left off. The orchestrator
    never noticed; only the local view paused.
 
@@ -3774,17 +3774,17 @@ provisioning and copies it to
 `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` once the
 run-id is known. The pointer is retained after `destroy_machine` so
 the chain wave loop's tagging step can read it post-wait; the
-`--resume` auto-discovery path filters stale pointers via `kill -0`
-(dead-PID records are harmless). `leerie --resume` resolves the
+`resume` auto-discovery path filters stale pointers via `kill -0`
+(dead-PID records are harmless). `leerie resume` resolves the
 machine via either path. Multiple concurrent remote runs in the same
 repo are disambiguated by passing a run-id; with no `--run-id` and a
-single active launcher record, `--resume` resolves the run-id from
+single active launcher record, `resume` resolves the run-id from
 that record.
 
-Local mode keeps its inline `--resume` behavior by design. Local
+Local mode keeps its inline `resume` behavior by design. Local
 runs are synchronous foreground processes (`nerdctl run --rm` with no
 backgrounding), so there is no detached container to attach to —
-`--resume` just re-execs the orchestrator against `state.json`.
+`resume` just re-execs the orchestrator against `state.json`.
 
 **Shallow seeding for heavy repos.** The fresh-provision seed
 (`seed_repo_clone`) delivers the host's committed state as a
@@ -3857,7 +3857,7 @@ the branch — is the safe default for the rare exotic branch).
 
 Because `seed_repo_clone` always wipes and repopulates `/work`, this
 switch is confined to fresh provisions. Mid-run re-seed (below) never
-re-clones and is unchanged. A corollary robustness fix: `--resume`
+re-clones and is unchanged. A corollary robustness fix: `resume`
 now probes whether the initial seed actually produced a valid `/work`
 git repo; if a prior seed died before completing (leaving no run
 state on the machine), resume re-runs the full seed instead of
@@ -3868,8 +3868,8 @@ host's working tree keeps evolving — the user lands new commits,
 saves uncommitted edits, pulls in a new submodule. The remote machine
 needs a user-triggered way to pick that up without destroying its
 volume. leerie realises this as two surfaces sharing one mechanism:
-an explicit `leerie --re-seed <run-id>` subcommand and an implicit
-auto-re-seed step inside `leerie --resume <id> --runtime fly`.
+an explicit `leerie re-seed <run-id>` subcommand and an implicit
+auto-re-seed step inside `leerie resume <id> --runtime fly`.
 Both wake the machine if stopped, run a safety check, and call the
 same `seed_repo_dirty` helper used by the fresh-provision path.
 
@@ -3909,7 +3909,7 @@ host's current `.claude/` to the machine.
 Resume auto-re-seeds by default. `--no-re-seed` opts out for the
 rate-limit auto-resume case where no host edits happened. The
 trust model matches the spec: the user picks the moment (by typing
-`--resume`), so the seed is treated as authoritative.
+`resume`), so the seed is treated as authoritative.
 
 ### EC2 runtime lifecycle
 
@@ -4083,7 +4083,7 @@ plainly rather than default silently:
 
 **Transport substitution for `flyctl ssh console`.** Two roles need a
 replacement: (a) piping the detached-orchestrator launch wrapper to the
-instance, and (b) opening a session for `--resume`/`--shell` attach and
+instance, and (b) opening a session for `resume`/`--shell` attach and
 log tailing. AWS offers two candidate transports; this design picks SSM
 Session Manager over SSH and states why:
 
@@ -4126,8 +4126,8 @@ persistent ENI — a detail the provisioning subtask must pin down
 (likely: don't rely on the public IP surviving a stop/start cycle;
 resolve the instance's current address via `describe_instances` on every
 resume rather than caching it, mirroring how Fly resolves machine
-state fresh on every `--resume` rather than trusting a cached IP).
-`TerminateInstances` is the `--kill` / clean-exit-after-sync-success
+state fresh on every `resume` rather than trusting a cached IP).
+`TerminateInstances` is the `kill` / clean-exit-after-sync-success
 counterpart to `flyctl machine destroy`. The existing sidecar fields
 (`paused_at`, `pause_reason`, `killed_at`, `sync_failed_at`,
 `sync_fail_reason`) are runtime-agnostic in shape — they describe
@@ -4452,13 +4452,13 @@ carve-out is a deliberate trade.
 
 Provisioning runs inside the same fresh-run branch of `_orchestrate()`
 that runs classify, plan, and schedule — none of which re-execute on
-`--resume`. The resume path loads state and jumps to execution; the
+`resume`. The resume path loads state and jumps to execution; the
 recipe lives in state, the version-manager cache survives across
 runs on disk, and workers see the right toolchain without anyone
 re-running provisioning.
 
 A successfully finalized run (`finished_at` set AND `current_phase`
-== "phase 6: finalize") is terminal — `--resume` returns immediately
+== "phase 6: finalize") is terminal — `resume` returns immediately
 without re-executing phases 4→5→6. Without this guard, a resume of
 a completed run re-runs setup-run.sh + finalize.sh + cleanup.sh,
 creating a window where a concurrent `decide_teardown` (from the
@@ -4592,9 +4592,9 @@ differs, the decision-maker does not:
 
 - **Clean finish → finalize.** `capture_repo_deps` is called (with `await`)
   from `phase_finalize` after `finished_at` is written and run-branch
-  verification completes. On a `--resume` of an already-finished run the
+  verification completes. On a `resume` of an already-finished run the
   resume guard returns before finalize; capture does not re-fire. On a
-  `--resume` that reaches finalize (partial resume), capture re-runs — the
+  `resume` that reaches finalize (partial resume), capture re-runs — the
   union merge makes this a no-op when nothing new was found.
 - **Cancel / SIGTERM → cancel arm in `main()`.** Catchable signals
   (`KeyboardInterrupt` / `InterruptedBySignal`) surface in `main()` after
@@ -4730,11 +4730,11 @@ no benefit and would complicate the UX: the user is being asked to
 first inverts the sequence.
 
 **Why it is not in the four-verb remote-lifecycle table (§6 "verb
-surface").** That table (`leerie "task" --runtime fly`, `--stop`,
-`--resume`, `--kill`) is explicitly scoped to the remote *run* lifecycle —
+surface").** That table (`leerie "task" --runtime fly`, `stop`,
+`resume`, `kill`) is explicitly scoped to the remote *run* lifecycle —
 machine allocation, pausing, resuming, and destruction. `leerie config` has
 no run lifecycle; it never allocates a machine or a container. It is a
-host-side utility verb in the same family as `leerie --list`: fast, local,
+host-side utility verb in the same family as `leerie list`: fast, local,
 and orthogonal to run management.
 
 **Three modes:**
@@ -4781,7 +4781,7 @@ be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
 so its failure is converted into a handoff: a fresh implementer can continue.
 The **classifier, planner, reconciler, plan_overlap_judge, and provision** have no partial-progress
 artifact to hand off — there is nothing for a successor to continue from — so
-their hard failure aborts the run with state saved for `--resume`. The
+their hard failure aborts the run with state saved for `resume`. The
 **conformer** has commits but its phase is advisory, so a hard failure surfaces
 as a warning, not an abort. The rule is general: salvage if there is something
 to salvage; abort cleanly otherwise. When `planner_samples > 1`, a crashed
@@ -4803,7 +4803,7 @@ precisely the case worth salvaging.
 This distinction is between a *crash* and a *verdict*, and only the first is
 new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
 says nothing about whether the resolution was any good; the run rescues the
-work and pauses for `--resume`. A `design-conflict` or `failed` **verdict** is
+work and pauses for `resume`. A `design-conflict` or `failed` **verdict** is
 the integrator's considered judgment that the merge should not stand, and
 still aborts and discards, exactly as *When integration cannot succeed*
 describes. Salvaging a crash does not weaken that: a verdict is a fact about
@@ -4885,7 +4885,7 @@ schedule: there is no decomposition to feed phase 3, no work to execute
 in phase 5, no run branch to integrate or push in phase 6. The
 orchestrator records `no_work_required=true` in state.json with each
 domain's `confidence.basis` quoted, writes `finished_at`, skips phases
-3–6, and exits 0. The run renders as `done` in `leerie --list` (no
+3–6, and exits 0. The run renders as `done` in `leerie list` (no
 push, no PR — there is no commit to propose). A mixed outcome (some
 ready+empty, some ready+nonempty) proceeds normally; the empty domains
 simply contribute nothing (dead-subtask elimination can also produce a
@@ -5057,7 +5057,7 @@ reports `complete` with nothing to commit, and the no-commits backstop fails it.
 The base-tree probe never had a chance: the overlap did not exist at plan time.
 The retry then reproduces the identical no-op — the subtask cannot re-do work
 that already exists on the branch it is measured against — so the retry cap is
-exhausted and the wave dies. A `--resume` re-runs the same doomed subtask and
+exhausted and the wave dies. A `resume` re-runs the same doomed subtask and
 dies the same way: a deterministic loop, not a transient failure.
 
 The resolution is the post-execution analogue of the pre-schedule probe: on a
@@ -5569,7 +5569,7 @@ Two further disciplines apply, and they sit at the §12 axis:
   concretely-named defects gates the subtask: the found gaps become mandatory
   additional criteria and the subtask retries the implementer with them folded
   in (bounded by `completeness_retry_rounds`; on exhaustion the subtask blocks
-  with the residual defects named, fix + `--resume`). This is *independent* of
+  with the residual defects named, fix + `resume`). This is *independent* of
   `--strict-conformer`, which governs the advisory build/lint/test/residual
   axes above. It does not reintroduce the gameable bar because there is no bar
   to lower — the conformer cannot weaken a test to make a concrete
@@ -5612,7 +5612,7 @@ Two further disciplines apply, and they sit at the §12 axis:
   the conformer's commits are rolled back to the implementer HEAD **and
   the subtask is blocked** (the final-tree pass blocks the run) — a
   clobber is the severest residual, so it blocks like any other strict
-  residual (fix + `--resume`), even when the conformer's own build/lint/
+  residual (fix + `resume`), even when the conformer's own build/lint/
   test came back clean. It is *not* silently auto-rolled-back in advisory
   mode: a legitimate
   revert-to-base (the implementer's change was wrong and the conformer
@@ -5674,7 +5674,7 @@ worker's structured output is well-formed) is enforced in code.
 env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing
 with a blocking one: when conformer residuals remain after the round cap is
 exhausted, the subtask returns `blocked` instead of `complete`. The user
-fixes the residuals manually and runs `--resume`. The same check applies to
+fixes the residuals manually and runs `resume`. The same check applies to
 the final-tree pass — if residuals remain, the run pauses before the PR
 opens. This is an explicit trade-off: the operator accepts the risk described
 above (that the conformer may weaken work to clear the bar, or that
@@ -6380,7 +6380,7 @@ matches the same precedence chain as `--skip-smoke` and
 **This gate firing is not a dead end.** Because `_schedule()`'s output is
 one of the per-phase planning checkpoints (§6 *Resumable planning*), a
 run that stops here has its `subtasks`/`waves` already recoverable from
-`plan_snapshot` — `--resume` rehydrates them and re-runs only the budget
+`plan_snapshot` — `resume` rehydrates them and re-runs only the budget
 check, under a higher `--max-workers` or `--skip-budget-check`, rather
 than discarding the plan and forcing the operator to re-run from scratch.
 
@@ -6626,7 +6626,7 @@ this section is meant to surface.
 
 Chain orchestration (§19) is implemented as a **laptop-side wave
 sequencer** and **not yet observed in a live deploy**. The
-architecture is described in §19: each `leerie --chain` submission
+architecture is described in §19: each `leerie chain` submission
 runs a foreground bash loop on the laptop that, per wave, fans out
 N background `./leerie --runtime fly` invocations (one per prompt
 file) and waits for all to finalize on the laptop via the existing
@@ -6637,14 +6637,14 @@ waves, the laptop runs `chain.git_ops.synth_merge_branches` against
 `$USER_REPO` to build the next wave's staging branch and pushes it
 to origin.
 
-The launcher's `--chain` verb (and the deprecated `--chain-submit`
-alias) is wired end-to-end. The ID-dispatched single-run verbs
-(`--status`, `--stop`, `--kill`, `--resume`, `--finalize`,
-`--attach`, `--list --chains`) operate on chains by iterating
+The launcher's `chain` verb is wired end-to-end. The ID-dispatched
+single-run verbs (`status`, `stop`, `kill`, `resume`, `finalize`,
+`attach`, `list --chains`) operate on chains by iterating
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by the `chain_id`
 field, dispatching the existing single-run verb per discovered run.
-The deprecated chain-prefixed aliases continue to shim to the new
-verbs.
+The deprecated `--chain-submit`/`--chain-status`/`--chain-kill`/
+`--chain-attach`/`--list-chains` aliases have been hard-removed —
+there is no shim.
 
 **GitHub credentials are never on a Fly machine.** Each per-job
 `host_finalize` runs on the laptop using the user's `gh auth` and
@@ -6780,7 +6780,7 @@ Fly machines hold GitHub credentials at any point.
 
 ```
 laptop:
-  leerie --chain --wave a,b --wave c
+  leerie chain --wave a,b --wave c
     → mints chain_id (UUID)
     → current_base = $USER_REPO HEAD (typically main)
 
@@ -6807,9 +6807,9 @@ laptop:
         wave-N branch (on origin via host_finalize).
 
     If any job failed → laptop wave loop exits non-zero. User runs
-      `leerie --resume <chain-id>` to retry paused runs (and see
+      `leerie resume <chain-id>` to retry paused runs (and see
       any still-running runs), then re-invokes
-      `leerie --chain --wave ...` to continue (the wave loop skips
+      `leerie chain --wave ...` to continue (the wave loop skips
       waves whose runs are all already pushed).
 
     If wave N+1 exists:
@@ -6850,7 +6850,7 @@ laptop:
    completed earlier remain done.
 
 3. **Chain-scoped verbs operate by iteration, not coordination.**
-   `leerie --status <chain-id>`, `--kill <chain-id>`, `--stop <chain-id>`,
+   `leerie status <chain-id>`, `--kill <chain-id>`, `--stop <chain-id>`,
    `--resume <chain-id>`, `--finalize <chain-id>`, and
    `--list --chains` all work by iterating
    `$LEERIE_STATE_HOST_DIR/runs/*/run.json` and filtering by the
@@ -6866,7 +6866,7 @@ laptop:
    runs `chain.git_ops.synth_merge_branches` against `$USER_REPO`
    after each wave's branches reach origin. Conflicts pause the
    chain with a clear message; user resolves manually in
-   `$USER_REPO` and re-runs `leerie --chain --wave ...` to continue.
+   `$USER_REPO` and re-runs `leerie chain --wave ...` to continue.
 
 ### What this design deliberately rejects
 
@@ -6885,7 +6885,7 @@ laptop:
   detach mid-chain, they can Ctrl-C (the `_kill_wave_children` trap
   propagates SIGTERM to in-flight wave children, each of which
   invokes its own `decide_teardown` trap to clean up its Fly
-  machine). Resume re-invokes `leerie --chain --wave ...` and the
+  machine). Resume re-invokes `leerie chain --wave ...` and the
   wave loop's idempotency check (`pushed_at` set on all wave-N runs)
   skips already-done waves.
 
@@ -6958,7 +6958,7 @@ fully isolated leerie run:
   never reset") is untouched.
 - **Its own PR** — one GitHub pull request, opened by that member's
   `host_finalize` against its repo's main branch.
-- **Its own resume** — `./leerie --resume <run-id>` inside the member's repo
+- **Its own resume** — `./leerie resume <run-id>` inside the member's repo
   works exactly as it does for any standalone run.
 
 The group layer adds four thin capabilities on top:
@@ -6984,14 +6984,14 @@ The group layer adds four thin capabilities on top:
    the user already manages (e.g., with feature flags). Leerie surfaces the
    ordering; it cannot enforce it.
 
-4. **Group-scoped verbs.** `--status`, `--stop`, `--resume`, `--kill`,
-   `--finalize`, and `--list --groups` on a `group_id` discover members by
+4. **Group-scoped verbs.** `status`, `stop`, `resume`, `kill`,
+   `finalize`, and `--list --groups` on a `group_id` discover members by
    scanning for `group_id`-tagged `run.json` files across the members'
    *separate* state directories. Each verb dispatches to the existing per-run
    implementation for each discovered member. The scanning must iterate over
    the set of member state directories (one per member basename); unlike
    chain-scoped verbs (§19) it cannot assume a single state directory.
-   (`--stop` is Fly-runtime-only; it pauses running machines.)
+   (`stop` is Fly-runtime-only; it pauses running machines.)
 
 ### Why the lean shape
 

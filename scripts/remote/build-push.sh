@@ -277,7 +277,7 @@ _build_push_local() {
       echo "  got:      $entry" >&2
     fi
 
-    echo "[build-push] smoke: leerie --version (baked source, no bind mount) ..."
+    echo "[build-push] smoke: leerie version (baked source, no bind mount) ..."
     if run "$build_cmd" run --rm "$IMAGE_TAG" \
          python3 /opt/leerie-image/orchestrator/leerie.py --version; then
       echo "[build-push] smoke OK"

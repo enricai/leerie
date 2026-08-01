@@ -25,7 +25,7 @@
 #      Unknown distros always fall back to the hint.
 #   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
 #   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
-#   5. Verifies the install with `leerie --version`.
+#   5. Verifies the install with `leerie version`.
 #
 # Leerie runs entirely inside a container (DESIGN §6 / IMPLEMENTATION §0.5),
 # so Python is provisioned by the image at runtime — the host doesn't need
@@ -105,7 +105,7 @@ What this does, in order:
      auto-install (fall back to hint + exit 1).
   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
-  5. Verifies the install with `leerie --version`.
+  5. Verifies the install with `leerie version`.
 
 Flags:
   --dry-run                Print actions without executing.
@@ -143,7 +143,7 @@ run() {
 
 have_runnable() {
   # `command -v` returns success for shimmed entries (pyenv) that can't
-  # actually exec — invoke `--version` to confirm it really runs.
+  # actually exec — invoke `version` to confirm it really runs.
   "$1" --version >/dev/null 2>&1
 }
 
@@ -439,7 +439,7 @@ if [ "$DRY_RUN" = "false" ]; then
   if "$LINK" --version; then
     log "done. Run \`leerie \"your task\"\` from any git repository to start."
   else
-    err "leerie --version failed. The install completed but the binary is not runnable."
+    err "leerie version failed. The install completed but the binary is not runnable."
     exit 1
   fi
 else

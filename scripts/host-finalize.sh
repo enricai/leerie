@@ -2,7 +2,7 @@
 # scripts/host-finalize.sh — host-side finalize block (push + PR creation).
 #
 # Sourced by the `leerie` launcher's normal post-run path and by the
-# `leerie --finalize <run-id>` fast-path. Both code paths share the same
+# `leerie finalize <run-id>` fast-path. Both code paths share the same
 # push/PR mechanics — the discovery of *which* run to finalize differs.
 #
 # Exports: host_finalize <run-dir>
@@ -141,7 +141,7 @@ host_finalize() {
         if [ "$_no_work" != "true" ] && [ "$_completed" -lt "$_wave_total" ]; then
           echo "leerie: error — refusing to finalize run ${run_dir##*/}: only" \
                "$_completed of $_wave_total waves integrated (run crashed" \
-               "mid-wave). Resume to finish: leerie --resume ${run_dir##*/}" >&2
+               "mid-wave). Resume to finish: leerie resume ${run_dir##*/}" >&2
           return 1
         fi
         ;;

@@ -268,7 +268,7 @@ decide_teardown() {
       #
       # On sync failure we leave the machine RUNNING (not stopped) so
       # the user can investigate without first having to start a
-      # paused machine. They explicitly destroy via `leerie --kill`
+      # paused machine. They explicitly destroy via `leerie kill`
       # when they've recovered the work.
       if _try_fetch_branch_for_teardown; then
         remote_log "remote: run branch + state synced to host"
@@ -286,7 +286,7 @@ decide_teardown() {
         # leaves machine running (recovery). SIGINT during `gh pr
         # create` → push already succeeded → trap destroys machine;
         # the user can `gh pr create` manually using the URL hint
-        # host_finalize already printed. Matches `leerie --finalize`'s
+        # host_finalize already printed. Matches `leerie finalize`'s
         # existing behavior — work is preserved on origin.
         local run_dir=""
         if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
@@ -307,7 +307,7 @@ decide_teardown() {
         # branch fields. Fall through to the existing manual-hint
         # path: destroy the machine (work is on host either way) and
         # tell the user to re-run with --answers, after which
-        # `leerie --finalize <run-id>` is available.
+        # `leerie finalize <run-id>` is available.
         local _run_finished_at=""
         if [ -n "$run_dir" ] && [ -f "$run_dir/run.json" ]; then
           _run_finished_at="$(jq -r '.finished_at // ""' "$run_dir/run.json" 2>/dev/null || true)"
@@ -324,7 +324,7 @@ decide_teardown() {
           else
             remote_log "remote: run did not reach finalize (likely waiting for clarification); skipping auto-finalize"
             if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-              remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
+              remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
             fi
           fi
           destroy_machine
@@ -349,10 +349,10 @@ decide_teardown() {
               echo "  The run synced to host cleanly but git push failed." >&2
               echo "  Branch + state are on host; retry the push from here:" >&2
               echo "" >&2
-              echo "    leerie --finalize ${LEERIE_REMOTE_RUN_ID} --runtime fly" >&2
+              echo "    leerie finalize ${LEERIE_REMOTE_RUN_ID} --runtime fly" >&2
               echo "" >&2
               echo "  Machine is being LEFT RUNNING. When recovered, destroy:" >&2
-              echo "    leerie --kill ${LEERIE_REMOTE_RUN_ID} --runtime fly" >&2
+              echo "    leerie kill ${LEERIE_REMOTE_RUN_ID} --runtime fly" >&2
               echo "  Machine: $mid (still running on Fly)" >&2
               echo "================================================================" >&2
               # Intentionally NO destroy_machine.
@@ -360,14 +360,14 @@ decide_teardown() {
           else
             # Defensive: host-finalize.sh missing. Fall back to the old
             # behavior (print the hint, destroy). Work is on host.
-            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
+            remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
             destroy_machine
           fi
         else
           # Defensive: sync said success but the expected run dir
           # isn't where we look for it. Fall back to the manual hint.
           if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
+            remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
           fi
           destroy_machine
         fi
@@ -395,20 +395,20 @@ decide_teardown() {
         echo "  so your work is not lost. Recover manually:" >&2
         echo "" >&2
         echo "    1. Investigate / retry sync (most common):" >&2
-        echo "         leerie --finalize ${LEERIE_RUN_ID:-<run-id>} --runtime fly" >&2
+        echo "         leerie finalize ${LEERIE_RUN_ID:-<run-id>} --runtime fly" >&2
         echo "       (this calls fetch_branch + host push; safe to retry)" >&2
         echo "" >&2
         echo "       If that errors with \"no completed unpushed run\", the" >&2
         echo "       orchestrator died before writing finished_at. Recover with:" >&2
-        echo "         leerie --finalize ${LEERIE_RUN_ID:-<run-id>} --force --runtime fly" >&2
+        echo "         leerie finalize ${LEERIE_RUN_ID:-<run-id>} --force --runtime fly" >&2
         echo "       (--force refuses if the orchestrator is still alive.)" >&2
         echo "" >&2
         echo "    2. Or attach + inspect manually:" >&2
-        echo "         leerie --resume ${LEERIE_RUN_ID:-<run-id>} --shell --runtime fly" >&2
+        echo "         leerie resume ${LEERIE_RUN_ID:-<run-id>} --shell --runtime fly" >&2
         echo "" >&2
         echo "    3. When your work is safely on the host, destroy the" >&2
         echo "       machine:" >&2
-        echo "         leerie --kill ${LEERIE_RUN_ID:-<run-id>} --runtime fly" >&2
+        echo "         leerie kill ${LEERIE_RUN_ID:-<run-id>} --runtime fly" >&2
         echo "" >&2
         echo "  Machine: $mid (still running on Fly)" >&2
         echo "================================================================" >&2
@@ -430,24 +430,24 @@ decide_teardown() {
       echo "  you want to come back:" >&2
       echo "" >&2
       echo "    1. Reattach + resume tailing (most common):" >&2
-      echo "         leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "         leerie resume ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "" >&2
       if [ -n "${LEERIE_VOLUME_ID:-}" ]; then
         echo "    2. Pause the machine (graceful stop, keeps work on the" >&2
-        echo "       Fly volume; resume later with leerie --resume):" >&2
+        echo "       Fly volume; resume later with leerie resume):" >&2
       else
         echo "    2. Pause the machine (graceful stop; WARNING: no volume" >&2
         echo "       provisioned — stopping may lose /work. Set FLY_VM_DISK_GB" >&2
-        echo "       to persist across stops. Resume: leerie --resume):" >&2
+        echo "       to persist across stops. Resume: leerie resume):" >&2
       fi
-      echo "         leerie --stop ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "         leerie stop ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "" >&2
       echo "    3. Destroy the machine (drops it; only do this once your" >&2
       echo "       work is safely back on the host):" >&2
-      echo "         leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "         leerie kill ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "" >&2
       if [ -z "${LEERIE_RUN_ID:-}" ]; then
-        echo "  (run-id was not exported yet; check leerie --list to find it.)" >&2
+        echo "  (run-id was not exported yet; check leerie list to find it.)" >&2
       fi
       # Chain-aware addition: if this run is part of a chain, surface the
       # chain-scoped commands too so the user can act on the whole chain
@@ -455,10 +455,10 @@ decide_teardown() {
       if [ -n "${LEERIE_CHAIN_ID:-}" ]; then
         echo "" >&2
         echo "  This run is part of chain ${LEERIE_CHAIN_ID}. Chain-scoped:" >&2
-        echo "    leerie --status ${LEERIE_CHAIN_ID}      # status of all chain runs" >&2
-        echo "    leerie --attach ${LEERIE_CHAIN_ID}      # poll until chain done" >&2
-        echo "    leerie --stop   ${LEERIE_CHAIN_ID}      # pause all chain runs" >&2
-        echo "    leerie --kill   ${LEERIE_CHAIN_ID}      # destroy all chain workers" >&2
+        echo "    leerie status ${LEERIE_CHAIN_ID}      # status of all chain runs" >&2
+        echo "    leerie attach ${LEERIE_CHAIN_ID}      # poll until chain done" >&2
+        echo "    leerie stop   ${LEERIE_CHAIN_ID}      # pause all chain runs" >&2
+        echo "    leerie kill   ${LEERIE_CHAIN_ID}      # destroy all chain workers" >&2
       fi
       echo "  Machine: $mid (still running on Fly)" >&2
       echo "================================================================" >&2
@@ -530,8 +530,8 @@ decide_teardown() {
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
         echo "  run-id:  $LEERIE_RUN_ID" >&2
       fi
-      echo "  resume:  leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
-      echo "  kill:    leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "  resume:  leerie resume ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "  kill:    leerie kill ${LEERIE_RUN_ID:-<run-id>}" >&2
       if [ -n "${LEERIE_PAUSE_NOTIFY_CMD:-}" ]; then
         eval "$LEERIE_PAUSE_NOTIFY_CMD" || true
       fi
@@ -729,7 +729,7 @@ provision_machine() {
     fi
   fi
 
-  # PID-keyed pointer for `leerie --resume` auto-discovery (no run-id
+  # PID-keyed pointer for `leerie resume` auto-discovery (no run-id
   # available yet on
   # fresh runs because the orchestrator hasn't minted one). The file is
   # under $LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json and is removed
@@ -748,7 +748,7 @@ provision_machine() {
     mkdir -p "$remote_dir"
     local pid_record="$remote_dir/$$.json"
     # Record the USER's launch-time --no-push intent here so the host's
-    # `leerie --finalize` step can distinguish "user opted out of pushing"
+    # `leerie finalize` step can distinguish "user opted out of pushing"
     # from "the in-Fly orchestrator was told not to push because it
     # can't reach github" (the latter is a mechanism flag the launcher
     # forces, NOT a user-intent flag).

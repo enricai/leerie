@@ -368,13 +368,13 @@ leerie 'task' --runtime fly --fly-disk-gb 50
 ```
 
 The volume is created at machine-provision time and destroyed when the
-machine is destroyed (clean exit or `leerie --kill`), so steady-state
+machine is destroyed (clean exit or `leerie kill`), so steady-state
 storage cost is zero. While a paused run is on its volume, Fly charges
 per-GB-month — minimal at typical sizes but non-zero.
 
 **Recovery if an orchestrator dies mid-run.** If a run errors out and
 the post-run sync fails (e.g. the machine ran out of disk before the
-orchestrator could write `finished_at`), `leerie --finalize <run-id>
+orchestrator could write `finished_at`), `leerie finalize <run-id>
 --force` recovers the work. The launcher SSHes into the machine,
 verifies the orchestrator process is dead, patches `finished_at`, and
 proceeds with the normal fetch + push + PR flow. `--force` refuses if
@@ -525,7 +525,7 @@ When the container starts, the launcher mounts the following:
 | Host path | Container path | Mode | Purpose |
 |---|---|---|---|
 | `$(pwd)` (your repo) | `/work` | rw | Leerie operates on the repo here. Worktrees are written under the repo; the repo itself stays clean — no `.leerie/` directory accumulates inside it. |
-| `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | Per-repo run state (`state.json`, `runs/`, `logs/`, worktrees). Defaults to `$HOME/.leerie/<basename>/`; overridable via `LEERIE_STATE_DIR` env var, `state_dir =` in `leerie.toml`, or `--state-dir`. Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Lives outside the repo so target projects need no `.gitignore` entry. `--resume` works across container runs because state persists on the host at this path. |
+| `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | Per-repo run state (`state.json`, `runs/`, `logs/`, worktrees). Defaults to `$HOME/.leerie/<basename>/`; overridable via `LEERIE_STATE_DIR` env var, `state_dir =` in `leerie.toml`, or `--state-dir`. Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Lives outside the repo so target projects need no `.gitignore` entry. `resume` works across container runs because state persists on the host at this path. |
 | `$LEERIE_HOME` (leerie install) | `/opt/leerie-image` | ro | Leerie's source and Dockerfile. Edit `orchestrator/leerie.py` on the host; next run picks it up without rebuilding the image. |
 | Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude.json`) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with `projects[]` stripped. The shared host file is never directly mounted — it's a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop. Each container writes only its private copy. |
 | Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude/`) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/`, `settings.json`, `mcp-needs-auth-cache.json`, `local/`, `statsig/`, `cache/`) ride along. |

@@ -1,14 +1,14 @@
 """Tests for the launcher's ID-dispatched chain verbs (v5 Shape A).
 
-Under Shape A, chain-scoped verbs (--status, --kill, --stop, --resume,
---attach, --finalize) detect UUID-pattern positional ids and dispatch
+Under Shape A, chain-scoped verbs (status, kill, stop, resume,
+attach, finalize) detect UUID-pattern positional ids and dispatch
 by iterating ``$LEERIE_STATE_HOST_DIR/runs/*/run.json`` for runs with a
 matching ``chain_id`` field. There is no Fly coordinator; chains exist
 only as the set of single runs sharing a chain_id tag.
 
 These tests stub a run.json fixture per chain run and verify that the
-launcher correctly discovers, filters, and acts on them. ``$0 --kill``
-/ ``$0 --resume`` / etc. are replaced with a stub recorder so the
+launcher correctly discovers, filters, and acts on them. ``$0 kill``
+/ ``$0 resume`` / etc. are replaced with a stub recorder so the
 tests don't actually shell out to Fly.
 """
 from __future__ import annotations
@@ -115,9 +115,9 @@ def _run(tmp_path: Path, args: list[str], env_extra: dict | None = None,
 
 
 def test_list_chains_groups_by_chain_id(tmp_path: Path) -> None:
-    """--list --chains discovers chains by iterating run.json + grouping."""
+    """list --chains discovers chains by iterating run.json + grouping."""
     _fixture_two_run_chain(tmp_path)
-    result = _run(tmp_path, ["--list", "--chains"], use_self_stub=False)
+    result = _run(tmp_path, ["list", "--chains"], use_self_stub=False)
     assert result.returncode == 0, result.stderr
     assert CHAIN_ID in result.stdout
     assert "chain_id" in result.stdout  # header row
@@ -132,17 +132,9 @@ def test_list_chains_empty(tmp_path: Path) -> None:
     state_dir.mkdir(parents=True)
     # Non-chain run only.
     _write_run(state_dir, NON_CHAIN_RUN, {"run_id": NON_CHAIN_RUN})
-    result = _run(tmp_path, ["--list", "--chains"], use_self_stub=False)
+    result = _run(tmp_path, ["list", "--chains"], use_self_stub=False)
     assert result.returncode == 0
     assert "no chains" in result.stdout.lower()
-
-
-def test_list_chains_via_deprecated_alias(tmp_path: Path) -> None:
-    """--list-chains alias shims to --list --chains."""
-    _fixture_two_run_chain(tmp_path)
-    result = _run(tmp_path, ["--list-chains"], use_self_stub=False)
-    assert result.returncode == 0
-    assert CHAIN_ID in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +143,9 @@ def test_list_chains_via_deprecated_alias(tmp_path: Path) -> None:
 
 
 def test_status_uuid_enumerates_chain_runs(tmp_path: Path) -> None:
-    """--status <chain-id> lists every run with matching chain_id."""
+    """status <chain-id> lists every run with matching chain_id."""
     _fixture_two_run_chain(tmp_path)
-    result = _run(tmp_path, ["--status", CHAIN_ID], use_self_stub=False)
+    result = _run(tmp_path, ["status", CHAIN_ID], use_self_stub=False)
     assert result.returncode == 0, result.stderr
     assert RUN_ID_1 in result.stdout
     assert RUN_ID_2 in result.stdout
@@ -165,14 +157,14 @@ def test_status_uuid_no_matches_errors(tmp_path: Path) -> None:
     """UUID with no matching runs → non-zero exit with a clear message."""
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
-    result = _run(tmp_path, ["--status", CHAIN_ID], use_self_stub=False)
+    result = _run(tmp_path, ["status", CHAIN_ID], use_self_stub=False)
     assert result.returncode != 0
     assert "no runs found" in (result.stdout + result.stderr).lower()
 
 
 def test_status_non_uuid_falls_through_with_hint(tmp_path: Path) -> None:
     """A non-UUID id → routes the user to the single-run inspection verb."""
-    result = _run(tmp_path, ["--status", "not-a-uuid"], use_self_stub=False)
+    result = _run(tmp_path, ["status", "not-a-uuid"], use_self_stub=False)
     assert result.returncode != 0
     assert "looks like a run-id" in (result.stdout + result.stderr).lower()
 
@@ -183,25 +175,25 @@ def test_status_non_uuid_falls_through_with_hint(tmp_path: Path) -> None:
 
 
 def test_kill_uuid_dispatches_per_chain_run(tmp_path: Path) -> None:
-    """--kill <chain-id> invokes single-run --kill for each chain run."""
+    """kill <chain-id> invokes single-run kill for each chain run."""
     _fixture_two_run_chain(tmp_path)
-    result = _run(tmp_path, ["--kill", CHAIN_ID])
+    result = _run(tmp_path, ["kill", CHAIN_ID])
     assert result.returncode == 0, result.stderr
-    # The stub records every recursive ``$0 --kill <run-id>`` call.
+    # The stub records every recursive ``$0 kill <run-id>`` call.
     stub = result.stub_log
     # RUN_ID_2 is already pushed (no fly_machine_id matters? it's still
     # present); but our discovery filters out runs with no
     # fly_machine_id OR with killed_at set. Both fixture runs have
     # fly_machine_id and neither has killed_at, so both should be
     # dispatched.
-    assert f"--kill {RUN_ID_1}" in stub
-    assert f"--kill {RUN_ID_2}" in stub
+    assert f"kill {RUN_ID_1}" in stub
+    assert f"kill {RUN_ID_2}" in stub
     # Non-chain run never appears.
     assert NON_CHAIN_RUN not in stub
 
 
 def test_kill_uuid_skips_already_killed_runs(tmp_path: Path) -> None:
-    """--kill <chain-id> does not re-kill runs whose killed_at is set."""
+    """kill <chain-id> does not re-kill runs whose killed_at is set."""
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
     _write_run(state_dir, RUN_ID_1, {
@@ -213,18 +205,18 @@ def test_kill_uuid_skips_already_killed_runs(tmp_path: Path) -> None:
         "run_id": RUN_ID_2, "chain_id": CHAIN_ID, "wave_idx": 0,
         "fly_machine_id": RUN_ID_2,
     })
-    result = _run(tmp_path, ["--kill", CHAIN_ID])
+    result = _run(tmp_path, ["kill", CHAIN_ID])
     assert result.returncode == 0
     stub = result.stub_log
-    assert f"--kill {RUN_ID_1}" not in stub  # already killed
-    assert f"--kill {RUN_ID_2}" in stub
+    assert f"kill {RUN_ID_1}" not in stub  # already killed
+    assert f"kill {RUN_ID_2}" in stub
 
 
 def test_kill_uuid_no_runs_is_ok(tmp_path: Path) -> None:
-    """--kill <chain-id> with no matching live runs exits 0 cleanly."""
+    """kill <chain-id> with no matching live runs exits 0 cleanly."""
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
-    result = _run(tmp_path, ["--kill", CHAIN_ID])
+    result = _run(tmp_path, ["kill", CHAIN_ID])
     assert result.returncode == 0
     assert "no live runs found" in (result.stdout + result.stderr).lower()
 
@@ -234,7 +226,7 @@ def test_kill_non_uuid_falls_through(tmp_path: Path) -> None:
     # No fixtures — single-run kill will fail looking for the run dir,
     # but the important assertion is that the chain dispatch does NOT
     # consume the arg.
-    result = _run(tmp_path, ["--kill", "not-a-uuid"], use_self_stub=False)
+    result = _run(tmp_path, ["kill", "not-a-uuid"], use_self_stub=False)
     assert result.returncode != 0
     # The error should be about the run, not "no live runs found".
     out = result.stdout + result.stderr
@@ -247,15 +239,15 @@ def test_kill_non_uuid_falls_through(tmp_path: Path) -> None:
 
 
 def test_resume_uuid_dispatches_paused_runs_only(tmp_path: Path) -> None:
-    """--resume <chain-id> invokes single-run --resume for paused runs."""
+    """resume <chain-id> invokes single-run resume for paused runs."""
     _fixture_two_run_chain(tmp_path)  # RUN_ID_1 paused, RUN_ID_2 pushed
-    result = _run(tmp_path, ["--resume", CHAIN_ID])
+    result = _run(tmp_path, ["resume", CHAIN_ID])
     assert result.returncode == 0, result.stderr
     stub = result.stub_log
     # RUN_ID_1 is paused → resumed.
-    assert f"--resume {RUN_ID_1}" in stub
+    assert f"resume {RUN_ID_1}" in stub
     # RUN_ID_2 is pushed (done) → NOT resumed.
-    assert f"--resume {RUN_ID_2}" not in stub
+    assert f"resume {RUN_ID_2}" not in stub
 
 
 def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
@@ -267,7 +259,7 @@ def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
         "pushed_at": "2026-06-14T01:00:00Z",
         "fly_machine_id": RUN_ID_1,
     })
-    result = _run(tmp_path, ["--resume", CHAIN_ID])
+    result = _run(tmp_path, ["resume", CHAIN_ID])
     assert result.returncode == 0
     assert "no resumable runs found" in (result.stdout + result.stderr).lower()
 
@@ -278,7 +270,7 @@ def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
 
 
 def test_stop_uuid_dispatches_running_runs(tmp_path: Path) -> None:
-    """--stop <chain-id> invokes single-run --stop for runs that are
+    """stop <chain-id> invokes single-run stop for runs that are
     actively running (have fly_machine_id, no terminal state)."""
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
@@ -292,11 +284,11 @@ def test_stop_uuid_dispatches_running_runs(tmp_path: Path) -> None:
         "fly_machine_id": RUN_ID_2,
         "pushed_at": "2026-06-14T01:00:00Z",
     })
-    result = _run(tmp_path, ["--stop", CHAIN_ID])
+    result = _run(tmp_path, ["stop", CHAIN_ID])
     assert result.returncode == 0
     stub = result.stub_log
-    assert f"--stop {RUN_ID_1}" in stub
-    assert f"--stop {RUN_ID_2}" not in stub  # already pushed
+    assert f"stop {RUN_ID_1}" in stub
+    assert f"stop {RUN_ID_2}" not in stub  # already pushed
 
 
 # ---------------------------------------------------------------------------
@@ -305,11 +297,11 @@ def test_stop_uuid_dispatches_running_runs(tmp_path: Path) -> None:
 
 
 def test_finalize_uuid_dispatches_unpushed_runs(tmp_path: Path) -> None:
-    """--finalize <chain-id> invokes single-run --finalize for unpushed runs."""
+    """finalize <chain-id> invokes single-run finalize for unpushed runs."""
     _fixture_two_run_chain(tmp_path)  # RUN_ID_1 paused (unpushed), RUN_ID_2 pushed
-    result = _run(tmp_path, ["--finalize", CHAIN_ID])
+    result = _run(tmp_path, ["finalize", CHAIN_ID])
     assert result.returncode == 0, result.stderr
     stub = result.stub_log
-    assert f"--finalize {RUN_ID_1}" in stub
+    assert f"finalize {RUN_ID_1}" in stub
     # Already pushed → not finalized again.
-    assert f"--finalize {RUN_ID_2}" not in stub
+    assert f"finalize {RUN_ID_2}" not in stub

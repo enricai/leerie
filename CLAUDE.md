@@ -252,7 +252,7 @@ docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
 chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
                             N parallel `leerie --runtime fly` invocations per wave,
-                            sequenced by the launcher's `--chain` arm. `chain/git_ops.py`
+                            sequenced by the launcher's `chain` arm. `chain/git_ops.py`
                             provides `synth_merge_branches` (used between waves).
                             No Fly coordinator machine.
 tests/                      pytest suite
@@ -278,11 +278,11 @@ tests/                      pytest suite
 ./leerie "Fix the login timeout bug and add a regression test"
 
 # Resume after an interruption:
-./leerie --resume
+./leerie resume
 
 # Accept a blocked subtask so --resume skips it (e.g., E2E tests
 # that need external deps the container can't provide):
-./leerie --accept-blocked <run-id> <subtask-id>
+./leerie accept-blocked <run-id> <subtask-id>
 
 # Generate .leerie/config.toml with auto-detected BLT commands (host-only, no container):
 ./leerie config --init
@@ -536,9 +536,9 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # (no CLI flag or leerie.toml key — dep_capture is a post-run worker):
 export LEERIE_MODEL_DEP_CAPTURE=opus
 
-# Filter `--list` output by run status:
-./leerie --list --status paused
-./leerie --list --status seed-failed
+# Filter `list` output by run status:
+./leerie list --status paused
+./leerie list --status seed-failed
 
 # Verbosity: default is `stream` (one-line summary per worker event).
 # Per-worker logs are always written to <state-root>/logs/<sid>.log.
@@ -552,7 +552,7 @@ export LEERIE_VERBOSITY=normal  # override (default is stream)
 # (10 min) per bulk transfer. On rc 124/137 (timeout fired), seed_auth
 # runs its existing one-shot `flyctl agent restart` retry; if that also
 # stalls, the function returns 1 and leerie's existing PAUSED-on-failure
-# path takes over — `./leerie --resume` recovers the run normally:
+# path takes over — `./leerie resume` recovers the run normally:
 export LEERIE_SEED_TIMEOUT_S=900
 
 # Shallow-seed heavy repos (--runtime fly). For a repo with deep
@@ -577,10 +577,10 @@ export LEERIE_SEED_SHALLOW_THRESHOLD_MB=200
 export LEERIE_PROGRESS_INTERVAL_S=15
 
 # Pre-classify failures (seed_auth aborted before phase_classify) now
-# appear in `--list` with status `seed-failed` and are resumable via
+# appear in `list` with status `seed-failed` and are resumable via
 # `--resume <id>`. Previously these runs were invisible:
-./leerie --list --status seed-failed
-./leerie --resume <seed-failed-id>
+./leerie list --status seed-failed
+./leerie resume <seed-failed-id>
 
 # Chain verbs: submit + manage multi-run chains. A chain is N parallel
 # `./leerie --runtime fly` invocations per wave, with synth-merge between
@@ -591,7 +591,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # etc.) are forwarded to each wave invocation. No chain-specific env vars
 # required — the per-job `--runtime fly` invocations have their own env
 # requirements unchanged.
-./leerie --chain \
+./leerie chain \
   --effort high --dangerously-skip-permissions \
   --wave "prompts/fetch.md,prompts/lint.md" \
   --wave "prompts/publish.md"
@@ -600,24 +600,24 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # with --chain-id pinned to the prior chain's UUID. The wave loop
 # skips already-pushed waves AND skips synth-merge for transitions
 # whose staging branch is already on origin (idempotency probe via
-# `git ls-remote --exit-code`). Run `./leerie --resume <chain-id>`
+# `git ls-remote --exit-code`). Run `./leerie resume <chain-id>`
 # first to unpause any per-run paused machines.
-./leerie --resume <chain-id>
-./leerie --chain --chain-id <chain-id> \
+./leerie resume <chain-id>
+./leerie chain --chain-id <chain-id> \
   --wave "prompts/fetch.md,prompts/lint.md" \
   --wave "prompts/publish.md"
 
 # ID-dispatched verbs: UUID → chain scope (iterates run.json filtered by
-# chain_id); Fly machine id → existing single-run behavior. Deprecated
-# chain-prefixed aliases (--chain-submit, --chain-status, --chain-kill,
-# --chain-attach, --list-chains) shim to the new verbs.
-./leerie --status   <chain-id>        # render per-run states from run.json
-./leerie --attach   <chain-id>        # poll run.json files every 5s
-./leerie --stop     <chain-id>        # pause every running chain run
-./leerie --kill     <chain-id>        # destroy every chain run
-./leerie --resume   <chain-id>        # resume every paused chain run
-./leerie --finalize <chain-id>        # push + open PR for every unpushed run
-./leerie --list --chains              # group runs by chain_id
+# chain_id); Fly machine id → existing single-run behavior. The deprecated
+# --chain-submit/--chain-status/--chain-kill/--chain-attach/--list-chains
+# aliases have been hard-removed (no shim) — use the bare verbs below.
+./leerie status   <chain-id>        # render per-run states from run.json
+./leerie attach   <chain-id>        # poll run.json files every 5s
+./leerie stop     <chain-id>        # pause every running chain run
+./leerie kill     <chain-id>        # destroy every chain run
+./leerie resume   <chain-id>        # resume every paused chain run
+./leerie finalize <chain-id>        # push + open PR for every unpushed run
+./leerie list --chains              # group runs by chain_id
 
 # Group verbs: launch N single-repo runs together as a coordinated unit.
 # Each member runs in its own state dir (basename-keyed), its own branch,
@@ -625,23 +625,23 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # read-only view of siblings via --inspect-dir. The shared brief narrows
 # each planner to the joint intent; cross-repo prerequisites are rendered
 # as deploy-ordering notes in each member's PR body.
-./leerie --group \
+./leerie group \
   --repo ../api   "add /volumes endpoint" \
   --repo ../frontend "add-disk dialog" \
   --brief group-brief.md            # optional shared brief (prepended to each member's prompt)
 
 # Resubmit a prior group (reuse its group_id instead of minting a new one):
-./leerie --group --group-id <prior-group-id> \
+./leerie group --group-id <prior-group-id> \
   --repo ../api   "add /volumes endpoint" \
   --repo ../frontend "add-disk dialog"
 
 # Group-scoped verbs: UUID → group scope (scans each member's state dir).
-./leerie --status   <group-id>        # render per-member run states
-./leerie --stop     <group-id>        # pause every running member (Fly runtime only)
-./leerie --resume   <group-id>        # resume every paused member run
-./leerie --kill     <group-id>        # destroy every member run
-./leerie --finalize <group-id>        # push + open PR for every unpushed member
-./leerie --list --groups              # list all groups across state dirs
+./leerie status   <group-id>        # render per-member run states
+./leerie stop     <group-id>        # pause every running member (Fly runtime only)
+./leerie resume   <group-id>        # resume every paused member run
+./leerie kill     <group-id>        # destroy every member run
+./leerie finalize <group-id>        # push + open PR for every unpushed member
+./leerie list --groups              # list all groups across state dirs
 ```
 
 ## Testing
@@ -806,13 +806,13 @@ bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and
 diffs its BLT inference against `_infer_build_lint_test()` across a
-fixture matrix so the two can never silently diverge. The `--group`
+fixture matrix so the two can never silently diverge. The `group`
 launcher arm and group-scoped ID-dispatched verbs are tested in
 `tests/test_group_launcher.py` via the same bash-harness pattern
 (stubbed `./leerie`, multi-state-dir fixtures), modeled on
 `tests/test_chain_launcher_id_dispatch.py`. Group-scoped verb dispatch
 across two state dirs (combined paused/unpushed + pushed fixture, plus
-`--stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
+`stop` dispatch) is covered by `tests/test_group_launcher_verbs.py`.
 Fan-out core contract (cwd per member, `--inspect-dir` for siblings,
 brief prepend) is in `tests/test_group_launcher_fanout.py`.
 Python-layer `group_id` in `run.json` (`_validate_run_json`,
@@ -1310,7 +1310,7 @@ seven checkpoint keys populated at once (mirroring
 `test_plan_snapshot_wiring.py::TestSnapshotRoundTrips`), plus a
 `State.load()` round-trip proving the reloaded in-memory `.data` dict —
 not just the on-disk artifact — reproduces every key byte-equal, since
-that in-memory dict is what the real `--resume` path reads. Deliberately
+that in-memory dict is what the real `resume` path reads. Deliberately
 its own file rather than folded into either of the above two, per its
 narrow scope: pure state-surface assertions, no phase control flow, no
 stubbed workers, no async.
@@ -1318,7 +1318,7 @@ stubbed workers, no async.
 `STATE_FIELDS` (`orchestrator/leerie.py:259`) is a static allowlist
 checked by `tests/test_state_fields.py`, not a runtime filter —
 `State.load()` reads the whole on-disk `state.json` unconditionally, so
-an undeclared key is not silently dropped on `--resume`. What actually
+an undeclared key is not silently dropped on `resume`. What actually
 happens is louder: `test_state_fields.py::test_every_st_data_write_is_declared`
 fails the moment a new `st.data["x"] = ...` write lands without a
 matching `STATE_FIELDS` entry, and `test_state_fields_matches_spec_table`
@@ -1366,7 +1366,7 @@ written at phase entry, before the phase spends, would mark an incomplete
 phase done and resume with a half-built plan), kept intentionally small
 and separate so it can't be diluted by unrelated changes to the larger
 checkpoint-writing test file.
-The re-entry (`--resume`-consuming) half of the same mechanism — that a
+The re-entry (`resume`-consuming) half of the same mechanism — that a
 `state.json` checkpointed through phase K reloads and re-enters at phase
 K+1 without re-invoking any completed phase's worker — is pinned
 behaviorally in `tests/test_resume_planning_reentry.py`, distinct from
@@ -1423,7 +1423,7 @@ exact historical message, proving (a) exercises the fixed path rather
 than passing vacuously. (b) reruns a real `check_budget_feasibility` twice
 against the same seeded `plan_snapshot` — once under a low
 `max_total_workers` (dies, as expected) and once under a raised cap on a
-fresh `State` reload (mirroring a real second `--resume` invocation) —
+fresh `State` reload (mirroring a real second `resume` invocation) —
 and asserts `_write_plan` runs exactly once and no upstream planning phase
 re-runs. (c) asserts a `waves`-present resume reaches `phase_execute` with
 zero calls to every planning phase, `_filter_satisfied_subtasks`,
@@ -1956,7 +1956,7 @@ and `MERGE_HEAD` are untouched, the temp index is cleaned up, refs are
 namespaced per run+subtask so two crashes cannot clobber each other, and a
 tree identical to `HEAD^{tree}` returns `None` rather than a ref naming an
 empty diff.
-`tests/test_resolve_run_id_autopick.py` covers bare `--resume` auto-picking
+`tests/test_resolve_run_id_autopick.py` covers bare `resume` auto-picking
 the newest resumable run (`in-progress`/`paused`/`incomplete`), including
 the two traps found by running the design against a real 58-run state dir:
 `seed-failed` rows carry no `started_at` and sorted to the *top* of a naive
@@ -1966,7 +1966,7 @@ run-id stays exempt from the filter (so `--resume <seed-failed-id>` still
 works) and an unknown one still fails closed. The `seed-failed` exclusion
 is a deliberate behavior change with a UX cost, pinned by
 `test_resolve_run_id.py::test_resolve_lone_orphan_is_not_auto_resumed`:
-bare `--resume` used to auto-pick a *lone* orphan, and now dies instead —
+bare `resume` used to auto-pick a *lone* orphan, and now dies instead —
 a seed-failed run aborted before `phase_classify` and needs an operator
 decision (re-seed vs. kill), since resuming blind can re-trigger the same
 seed failure. The die is therefore required to stay actionable (names the
@@ -1975,9 +1975,9 @@ that escape hatch is the documented recovery path for the 2026-06-04
 hangs. `--report`/`--phase` still auto-pick a lone orphan — they are
 read-only.
 `tests/test_container_entry_run_id.py` covers `container-entry.sh` skipping
-its cidfile `--run-id` injection when `--resume` is present — a resume
+its cidfile `--run-id` injection when `resume` is present — a resume
 container is a *new* container whose id matches no run on disk, which is
-what made bare `--resume` die naming an id the user never typed. The
+what made bare `resume` die naming an id the user never typed. The
 injection block is extracted from the real script at test time (the
 `_extract_config_arm` pattern) so it cannot drift.
 
@@ -2005,12 +2005,12 @@ launcher's EC2 arms but previously untested here); `_EXPANSION_CALLSITES`
 gained `resume_instance`; and a new
 `test_ec2_launcher_verb_runs_cleanly_under_bash32` runs the real `leerie`
 binary itself (not just `scripts/remote/ec2-*.sh`) under bash 3.2 for
-`--stop`/`--kill`/`--accept-blocked` with `LEERIE_AWS_PROFILE`/
+`stop`/`kill`/`accept-blocked` with `LEERIE_AWS_PROFILE`/
 `LEERIE_AWS_REGION` unset, since each of those arms builds its own
 optional-arg array from those two vars directly in `leerie` before
 calling `resolve_aws_credentials`. This surfaced a real, previously
 unguarded instance of the class: all four call sites
-(`--accept-blocked`, `--stop`, `--kill`, and the main `RUNTIME=ec2`
+(`accept-blocked`, `stop`, `kill`, and the main `RUNTIME=ec2`
 dispatch) expanded their creds-args array as a bare `"${arr[@]}"`
 instead of `${arr[@]+"${arr[@]}"}` — fixed in the same change. The
 nameref ban was likewise extended to `leerie` itself
@@ -2021,7 +2021,7 @@ mirroring the `HAS_TREESITTER` pattern). Four modules —
 `test_host_finalize_sh.py` (19 tests), `test_decide_teardown_auto_finalize.py`
 (2), `test_launcher_finalize_no_work.py` (1), `test_launcher_no_push_skips.py`
 (1) — source bash the **host** owns: `scripts/host-finalize.sh`,
-`provision.sh`'s `decide_teardown`, and the launcher's `--finalize` /
+`provision.sh`'s `decide_teardown`, and the launcher's `finalize` /
 `no_push` paths. All parse `run.json` with real `jq`. The harnesses stub
 `git` and `gh` onto PATH but not `jq`, so jq is silently inherited from
 whichever machine runs pytest — it passes on a dev host and in CI (both ship
@@ -2124,10 +2124,10 @@ per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
 on every `start-instances` call, and an optional `status_ok` flag so
 `describe-instance-status` can report "initializing" instead of "ok"
 without an infinite/slow poll in tests.
-The launcher's `--stop` verb EC2 dispatch — the counterpart to
+The launcher's `stop` verb EC2 dispatch — the counterpart to
 `_auto_detect_fly_runtime` for EC2 runs, DESIGN §6 "Run identifier" —
 is tested in `tests/test_ec2_launcher_stop.py` by invoking the real
-`leerie` binary (not an extracted block, since `--stop` is an early
+`leerie` binary (not an extracted block, since `stop` is an early
 fast-path verb dispatched before container preflight) against the
 same resource-tracking `aws` stub: an `ec2-instance.json` sidecar
 auto-detects the EC2 runtime and `--stop <run-id>` drives the
@@ -2175,17 +2175,17 @@ explicit runtime short-circuits detection even when a sidecar for a
 different runtime is present; Fly wins when (never expected in practice)
 both sidecars co-exist; and the Fly-only wrapper returns nonzero for an EC2
 run. The second half invokes the real launcher end to end (mirroring
-`tests/test_accept_blocked.py`'s local-path pattern) across `--stop`,
-`--kill`, `--accept-blocked`, and `--finalize`: each accepts `ec2`
+`tests/test_accept_blocked.py`'s local-path pattern) across `stop`,
+`kill`, `accept-blocked`, and `finalize`: each accepts `ec2`
 alongside `local`/`fly` in its `--runtime` enum validation (rejects other
-bogus values with the updated three-way message). `--accept-blocked` and
-`--finalize` still fail closed with an explicit "does not support EC2 runs
+bogus values with the updated three-way message). `accept-blocked` and
+`finalize` still fail closed with an explicit "does not support EC2 runs
 yet" message — rather than silently falling through to the Fly path or
 defaulting to `local` — whether `ec2` was passed explicitly or
 auto-detected via the sidecar; the Fly auto-detect regression path (no
 sidecar override, `LEERIE_FLY_APP` unset) still reaches the pre-existing
 Fly-specific error, proving detection promoted to `fly` and reached the
-Fly branch. `--stop` and `--kill` both wire real EC2 actions (test-001 and
+Fly branch. `stop` and `kill` both wire real EC2 actions (test-001 and
 feat-006 respectively — see `tests/test_ec2_launcher_stop.py` and
 `tests/test_ec2_launcher_kill.py` above/below for their end-to-end
 coverage): passing `--runtime ec2` against a run dir with no
@@ -2193,24 +2193,24 @@ coverage): passing `--runtime ec2` against a run dir with no
 the old fail-closed message, and auto-detecting the `ec2-instance.json`
 sidecar proceeds past detection into AWS credential resolution (which
 fails in this test's env for unrelated reasons — no `aws` binary/credentials
-set up) rather than hitting the old fail-closed message. `--resume` is
+set up) rather than hitting the old fail-closed message. `resume` is
 covered separately: an `ec2-instance.json` sidecar fails closed with a
 resume-specific message instead of promoting `RUNTIME=ec2` (which would
 otherwise fall into the launcher's fresh-provision `RUNTIME=ec2` branch and
 die with an unrelated "not yet wired" message), while a `fly-machine.json`
-sidecar still promotes to `fly` as before. Neither `--accept-blocked` nor
-`--finalize` wire an EC2 verb *action* yet — that is feat-007/feat-008 (and
-a later `--resume` subtask); this subtask's scope for those two remains the
+sidecar still promotes to `fly` as before. Neither `accept-blocked` nor
+`finalize` wire an EC2 verb *action* yet — that is feat-007/feat-008 (and
+a later `resume` subtask); this subtask's scope for those two remains the
 detection helper and the `--runtime` enum validation it feeds.
 
-`--kill`'s EC2 action — resolving `ec2_instance_id` from the run dir,
+`kill`'s EC2 action — resolving `ec2_instance_id` from the run dir,
 resolving AWS credentials, re-resolving `LEERIE_EC2_SSH_TARGET`, and
 syncing state via `_try_fetch_state_for_ec2_teardown` BEFORE calling
 `terminate_instance()` (the one-way-ratchet invariant
 `ec2-provision.sh:262-272` documents) — is tested end to end in
 `tests/test_ec2_launcher_kill.py` against the real `leerie` launcher
 binary. The `aws` stub combines two behaviors behind one binary since
-`--kill`'s EC2 path exercises both surfaces in a single run: `ssm
+`kill`'s EC2 path exercises both surfaces in a single run: `ssm
 start-session` (the transport `ec2_remote_exec`/`fetch_state_ec2` use)
 decodes and execs the wrapped command locally against a real git repo
 standing in for the instance's `/work` (reusing
@@ -2239,7 +2239,7 @@ pinning that an EC2 run-id is never handed to `flyctl`; `run.json` gets
 doesn't exist yet; a sidecar with no resolvable `ec2_instance_id` dies
 with "no ec2_instance_id found" without ever calling `terminate-instances`
 or `flyctl`; and the confirmation prompt (bypassed by `--force`, same
-convention as the Fly/local `--kill` paths) rejects a wrong confirmation
+convention as the Fly/local `kill` paths) rejects a wrong confirmation
 and proceeds on the correct one.
 The phase 2¾ plan-overlap judge (DESIGN §5 *Cross-domain surface overlap*)
 is tested in `tests/test_phase_overlap_judge.py`. Beyond the schema and
@@ -2317,7 +2317,7 @@ first. A separate test pins that the `DUPLICATE_PAIR` string keeps the
 `LABEL: subject — detail` shape, since `_issue_signature` splits on the
 first em dash and the row count must not perturb the oscillation key.
 
-`--resume` must not bypass the phase-3 semantic wiring gate
+`resume` must not bypass the phase-3 semantic wiring gate
 (`tests/test_wiring_gate_resume.py`). `phase_wiring_gate` is
 detect-and-die, and its skip-on-resume used to key on `plan_snapshot` —
 which is written *earlier*, deliberately, so a die() at either terminal
@@ -2336,7 +2336,7 @@ degrade writes nothing, so it re-attempts rather than inheriting a verdict
 never reached. Two source-coupling guards pin the structure the stubs
 cannot see: the call sits behind its own `wiring_gate`-keyed guard
 *outside* the `plan_snapshot` if/else, and the die() text states that
-`--resume` re-runs it.
+`resume` re-runs it.
 `tests/test_phase_wiring_gate.py`'s
 `test_wiring_gate_is_not_re_invoked_on_budget_check_resume` was rewritten
 in the same change — it previously pinned the old structure by source
@@ -2399,7 +2399,7 @@ into a cycle. Two source-coupling guards close the loop: `_run_phases` must
 re-run `_schedule()` and rewrite `plan_snapshot` when repairs land (otherwise
 the budget preflight, `check_plan_wiring`, `_validate_plan` and `_write_plan` all
 see the pre-repair wave partition), and the `die()` must precede the
-`st.data["wiring_gate"]` write so a failing gate leaves no key for `--resume`
+`st.data["wiring_gate"]` write so a failing gate leaves no key for `resume`
 to skip on. **Note:** widening
 `_warn_test_subtask_missing_producer_edge` past its `test-` prefix was tried in
 the same change and reverted — it does not catch this class. Run 6146bd2f's
@@ -2530,12 +2530,12 @@ No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 The two read-mostly verbs that still assumed a two-runtime world —
-`--accept-blocked` (validated `--runtime` against only `fly`/`local` and
+`accept-blocked` (validated `--runtime` against only `fly`/`local` and
 defaulted anything non-fly to `local`, silently mislabeling an EC2 run)
-and `--list` (keyed its runtime-aware view on `fly-machine.json`/
+and `list` (keyed its runtime-aware view on `fly-machine.json`/
 `LEERIE_FLY_APP`, so an EC2 run rendered empty columns) — are pinned in
-`tests/test_ec2_launcher_readonly_verbs.py`. `--accept-blocked` now
-auto-detects EC2 the same way `--stop` already does
+`tests/test_ec2_launcher_readonly_verbs.py`. `accept-blocked` now
+auto-detects EC2 the same way `stop` already does
 (`_auto_detect_run_runtime`), accepts an explicit `--runtime ec2` (with
 a control that a genuinely bogus value is still rejected), and —
 mirroring the Fly path's wake-mutate-pause dance — wakes a stopped
@@ -2543,7 +2543,7 @@ instance, mutates state.json over SSM (`ec2_remote_exec`), mirrors the
 mutation onto the host copy if one exists, and re-pauses the instance
 only if this verb woke it (plus an already-running control that proves
 no pause fires when the instance was already up), and fails closed on a
-missing `ec2_instance_id`. The `--accept-blocked` tests invoke the real
+missing `ec2_instance_id`. The `accept-blocked` tests invoke the real
 `leerie` launcher binary against a stubbed `aws` that composes
 `tests/ec2_stub.py`'s stateful EC2 instance tracking with an `ssm
 start-session` handler that decodes `ec2_remote_exec`'s base64-wrapped
@@ -2554,14 +2554,14 @@ pipe the multi-line state-mutation Python program to the remote
 now track an `is_ec2` axis (`ec2_instance_id` in `run.json` or
 `ec2-instance.json` present) alongside the existing `is_fly`, so
 `--list --runtime ec2` filters correctly, `--list --runtime local`
-excludes both Fly and EC2 runs, a plain `--list` renders an EC2 run's
+excludes both Fly and EC2 runs, a plain `list` renders an EC2 run's
 status column without requiring `LEERIE_FLY_APP`, and an EC2 run is
 still detected via the `ec2-instance.json` sidecar alone when
-`run.json` doesn't exist yet. These `--list` tests exercise
+`run.json` doesn't exist yet. These `list` tests exercise
 `_list_runs()` directly (no launcher subprocess, no AWS stub), mirroring
 `tests/test_list_runs.py`'s pattern.
 
-`--resume` routing a paused EC2 run through `resume_instance()` — the
+`resume` routing a paused EC2 run through `resume_instance()` — the
 launcher-level seam distinct from `resume_instance()`'s own standalone
 coverage in `tests/test_ec2_resume_instance.py` — is pinned in
 `tests/test_ec2_launcher_resume.py`, reusing
@@ -2569,8 +2569,8 @@ coverage in `tests/test_ec2_resume_instance.py` — is pinned in
 `run_ec2_dispatch`/`stub_aws_env` harness and `tests/ec2_stub.py`'s
 resource-tracking `aws` stub (mirroring
 `tests/test_ec2_launcher_dispatch_e2e.py`'s import convention), since
-`--resume` for EC2 lives inside the deep `RUNTIME=ec2` elif dispatch
-block rather than the early fast-path verb dispatch `--stop` uses. It
+`resume` for EC2 lives inside the deep `RUNTIME=ec2` elif dispatch
+block rather than the early fast-path verb dispatch `stop` uses. It
 pins: a stopped instance named by an `ec2-instance.json` sidecar issues
 exactly one `start-instances` call and reaches `running`, with no
 duplicate `run-instances` provisioning a second instance; the
@@ -2760,7 +2760,7 @@ close the loop: an AST-based check (not a bare substring match, which
 would be satisfied by the handler's own explanatory comments even if the
 real assignment regressed) that `main()`'s `except TerminalAuthFailure`
 arm sets `exit_code = EXIT_LOCKED` and never `1`, and mentions
-`--resume`; `EXIT_LOCKED == 75`; `_is_terminal_auth_failure` is checked
+`resume`; `EXIT_LOCKED == 75`; `_is_terminal_auth_failure` is checked
 before `_is_auth_or_quota_failure` inside `claude_p`'s source; and
 `TerminalAuthFailure` subclasses `BaseException` (so it propagates
 through `asyncio.gather` and broad `except Exception` handlers, same as
@@ -2779,7 +2779,7 @@ TerminalAuthFailure` handler is checked by source-coupling
 (`inspect.getsource(leerie.main)`, mirroring `test_signal_cleanup.py`'s
 `_main_body` approach) to set `exit_code = EXIT_LOCKED`, call
 `_cleanup_on_abnormal_exit(st, full_purge=False)`, set `abnormal = False`,
-and surface a `--resume` hint; a control case pins that 401/429/529
+and surface a `resume` hint; a control case pins that 401/429/529
 envelopes whose auth/quota backoff budget exhausts still raise
 `WorkerError`, not `TerminalAuthFailure` — the doc-conformant behavior per
 `docs/IMPLEMENTATION.md` §3 "Auth/quota backoff" after commit `2652319`
@@ -2845,9 +2845,10 @@ Before marking a change complete:
       valid JSON with at least `call_type`, `system_prompt`, and
       `response_content` keys). Replace `<state-root>` with the resolved
       state directory (default: `$HOME/.leerie/<basename>/`).
-- [ ] `grep -q -- '--chain-submit)\|--chain-status)\|--list-chains)\|--chain-kill)\|--chain-attach)' leerie`
-      — if chain launcher verbs were touched, confirm all five deprecated-alias
-      case-arms are still present in the launcher (the aliases shim to the new
-      ID-dispatched verbs; see DESIGN.md §19 and IMPLEMENTATION.md "Chain
-      verbs"; `pytest tests/test_chain_launcher_id_dispatch.py` for the
-      ID-dispatch contract test).
+- [ ] `! grep -q -- '--chain-submit\|--chain-status\|--list-chains\|--chain-kill\|--chain-attach' leerie`
+      — if chain launcher verbs were touched, confirm the five deprecated
+      `--chain-*` aliases stay hard-removed (no shim). The launcher verbs
+      are bare subcommands (`chain`, `status`, `attach`, `kill`, `list`);
+      see DESIGN.md §19 and IMPLEMENTATION.md "Chain verbs";
+      `pytest tests/test_chain_launcher_id_dispatch.py` for the
+      ID-dispatch contract test.
