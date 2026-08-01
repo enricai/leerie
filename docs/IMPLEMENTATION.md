@@ -6928,7 +6928,7 @@ Two new launcher flags, routed at the top of `leerie` alongside
     <iso_now>` and `pause_reason = "user-requested"` on the sidecar
     (the EC2 path also writes `ec2_instance_id`, mirroring how the Fly
     path writes `fly_machine_id`). The run is resumable via `leerie
-    --resume <id>` — the `RUNTIME=ec2` dispatch branch resolves a
+    resume <id>` — the `RUNTIME=ec2` dispatch branch resolves a
     paused instance id from the sidecar and calls `resume_instance()`
     (see the `scripts/remote/ec2-resume-instance.sh` row above and
     `tests/test_ec2_launcher_resume.py`).
@@ -6983,7 +6983,7 @@ never carries `completed_waves`/`waves`):
   `incomplete` instead of `done`/`done-pushed-*`. The check fires after
   the push/PR-error checks (a real push/PR error still surfaces as
   itself) but before the `finished_at`→`done` check. `incomplete` is
-  added to the derived-status set and is a valid `--list --status`
+  added to the derived-status set and is a valid `list --status`
   filter value. The cleared-but-empty terminal state
   (`no_work_required`, `waves == []`) is exempt — `completed_waves (0)
   < len([]) (0)` is false, so it still reads `done`. This gates only the
@@ -7154,7 +7154,7 @@ Changes:
   restricts to rows with Fly artifacts; `ec2` restricts to rows with EC2
   artifacts; `local` restricts to rows with **neither** (not just
   "not fly").
-- `--list --runtime fly` is intercepted by the launcher (bash) before
+- `list --runtime fly` is intercepted by the launcher (bash) before
   the orchestrator dispatch and queries Fly directly via `flyctl
   machines list --app <FLY_APP> --json`. Renders a `machine_id |
   state | region | created_at | run_id (local)` table covering every
@@ -7163,7 +7163,7 @@ Changes:
   machine.json,run.json}` for the current repo; machines launched from
   another repo show `run_id=?`. Falls back to the orchestrator-side
   local-sidecar list when `flyctl` is missing or auth fails. Any other
-  `--list --runtime` value (including `ec2`) falls through unchanged
+  `list --runtime` value (including `ec2`) falls through unchanged
   into the orchestrator's argparse dispatch above. Plain `list` (no
   `--runtime fly`) is unchanged.
 
@@ -7175,14 +7175,14 @@ the `--runtime` flag for launching a new run. See "Explicit pause and
 destroy verbs" above and "Accept-blocked verb" above for their
 respective EC2 paths. `finalize` remains narrower: it still
 validates only `local`/`fly` (rejecting `ec2` with an error) since
-`--finalize --runtime ec2` has not shipped.
+`finalize --runtime ec2` has not shipped.
 
 The launcher's `RUNTIME=ec2` branch dispatches the full create → seed
 → launch → teardown cycle for *launching* a run (see "Runtime mode"
-above); `--stop --runtime ec2` routes to `stop_instance()` for pausing
-one; and `--kill --runtime ec2` routes to `terminate_instance()` with
+above); `stop --runtime ec2` routes to `stop_instance()` for pausing
+one; and `kill --runtime ec2` routes to `terminate_instance()` with
 fetch-before-terminate ordering (see "`kill`'s EC2 action" above).
-`--finalize --runtime ec2` has not shipped. Fly runs route to `flyctl
+`finalize --runtime ec2` has not shipped. Fly runs route to `flyctl
 machine stop`/`flyctl machine destroy`; EC2 runs route to `aws ec2
 stop-instances`/`terminate-instances` (via `stop_instance()`/
 `terminate_instance()`); local runs route to `nerdctl stop`/`nerdctl
