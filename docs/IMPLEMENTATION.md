@@ -2930,20 +2930,20 @@ parameters (no env interpolation into Python source).
 | `_wave_already_done <chain_id> <wave_idx> <n_expected>` | UUID, integer, integer | Exits 0 iff `n_expected` runs are tagged with `chain_id` + `wave_idx` AND every matching run has `pushed_at` set. Used by the `chain` wave loop to skip fan-out on a resume submission. |
 | `_wave_branches <chain_id> <wave_idx>` | UUID, integer | Emits one branch-name per line for every matching run. Used by the wave loop to gather wave-N branches for synth-merge (works for both the just-fanned path and the resume path). |
 | `_resolve_volume_id_from_run_dir <run-dir>` | Run directory | Emits the run's `volume_id` (or nothing). Reads `fly-machine.json` then `run.json`, **continuing when a file exists but carries no `volume_id`** — `provision.sh` writes `volume_id` to `fly-machine.json` only conditionally (`if vol_id:`) while always writing it to `run.json`, so returning on mere file existence skipped `run.json` and leaked the volume. |
-| `_resolve_volume_id_from_fly <machine-id> <app>` | Machine id + Fly app | Emits the volume mounted by that machine, by asking Fly: `flyctl machine list --app <app> --json` → `.[] \| select(.id==<mid>) \| .config.mounts[].volume`. The fallback for `--kill --machine-id <id>` when no sidecar exists (the orphan path the usage hint advertises); without it the machine is destroyed and its volume bills forever. **Must be called before `destroy_machine`** — the volume→machine link (`attached_machine_id`, and the machine's own `config.mounts`) vanishes with the machine. Uses `machine list --json` because `machine status` has **no** `--json` flag (only `-d/--display-config`, which embeds JSON in prose); verified to keep reporting mounts while the machine is `stopped` (the `stop`-then-`kill` path). Best-effort: any failure emits nothing and returns 0, so `kill` still destroys the machine. |
+| `_resolve_volume_id_from_fly <machine-id> <app>` | Machine id + Fly app | Emits the volume mounted by that machine, by asking Fly: `flyctl machine list --app <app> --json` → `.[] \| select(.id==<mid>) \| .config.mounts[].volume`. The fallback for `kill --machine-id <id>` when no sidecar exists (the orphan path the usage hint advertises); without it the machine is destroyed and its volume bills forever. **Must be called before `destroy_machine`** — the volume→machine link (`attached_machine_id`, and the machine's own `config.mounts`) vanishes with the machine. Uses `machine list --json` because `machine status` has **no** `--json` flag (only `-d/--display-config`, which embeds JSON in prose); verified to keep reporting mounts while the machine is `stopped` (the `stop`-then-`kill` path). Best-effort: any failure emits nothing and returns 0, so `kill` still destroys the machine. |
 | `_resolve_ec2_instance_id_from_run_dir <run-dir>` | Run directory | Emits the run's `ec2_instance_id` (or nothing). Reads `ec2-instance.json` then `run.json`, same "continue past a file that exists but carries no id" discipline as `_resolve_volume_id_from_run_dir`. Unlike Fly, the run-id is NOT the instance id for EC2 runs, so `kill`'s EC2 action always resolves it from a sidecar rather than assuming identity. |
 | `_chain_runs_filter <chain_id> <verb>` | UUID, one of `stop`/`kill`/`finalize`/`resume`/`running` | Emits matching run-ids one per line. The `verb` parameter selects a hardcoded filter inside the heredoc (`stop`: machine running; `kill`: not yet destroyed; `finalize`: not yet pushed; `resume`: paused; `running`: active with chain_id, no terminal state). Used by the chain-scoped verb arms (`stop`/`kill`/`finalize`/`resume`) to enumerate runs for per-run dispatch. Returns rc=2 + `remote_log` error on unknown verb (bash-side assert; Python heredoc has its own `sys.exit(2)` backstop). |
 
 The wave loop's tag-write step (`update_run_json … chain_id "$_ch_id"
 wave_idx "$_wave_idx"`) fires BEFORE the failure-pause check so
 runs that paused on failure still get tagged and are therefore
-discoverable by `leerie resume <chain-id>` / `--kill <chain-id>` /
+discoverable by `leerie resume <chain-id>` / `kill <chain-id>` /
 etc. The `_ch_wave_pids` / `_ch_wave_child_pids` arrays reset at
 the top of every wave iteration (above the `_wave_already_done`
 check) so the SIGINT trap handler never sees stale entries from a
 prior wave.
 
-##### Resuming a chain via `--chain --chain-id <uuid>`
+##### Resuming a chain via `chain --chain-id <uuid>`
 
 `leerie chain --chain-id <prior-uuid> --wave …` pins the chain_id
 to a prior chain's UUID instead of minting fresh. The wave loop's
@@ -3569,7 +3569,7 @@ A match raises immediately (never entering `_is_auth_or_quota_failure`'s
 tenacity loop) into the same resumable-pause arm out-of-credits already
 uses: `main()` runs `_cleanup_on_abnormal_exit(st, full_purge=False)`
 (worktree-only cleanup, state and branches preserved), logs a `leerie
---resume <id>` hint, and exits `EXIT_LOCKED` (75) rather than `WorkerError`
+resume <id>` hint, and exits `EXIT_LOCKED` (75) rather than `WorkerError`
 → exit 1. This also replaces the prior behavior at the auth-exhaustion
 exit point (§3 above, `claude_p()`'s budget-exhausted `WorkerError`):
 that path previously surfaced as "worker failed schema-valid output
