@@ -2262,6 +2262,42 @@ in the same change — it previously pinned the old structure by source
 order (gate call between the snapshot write and the `else:`); it now pins
 the audit-key guard while asserting the same cheap-resume property.
 
+The wiring gate's **constrained auto-repair** (DESIGN §5 *A wiring re-check on
+the fully-merged plan*) is pinned in `tests/test_wiring_gate_repair.py`. The
+commonest defect the `wiring_judge` finds is one no planner could have
+avoided: planners run blind, so a subtask in domain X cannot declare a
+`requires` on a tag domain Y's planner has not invented yet, and
+`phase_reconcile`'s charter is *declared-but-unmatched* tags — a subtask that
+declared nothing never enters its `unresolved_requires` input. Measured across
+the corpus (2026-08-01), **6 of the 9 runs that ever reached this gate died at
+it**, and the repair resolves 3 of those 6 outright. `_repair_missing_requires`
+adds an edge only when the defect is `missing_requires`, the tag has EXACTLY
+ONE in-plan provider that is not the subtask itself, the subtask does not
+already declare it, and the edge leaves the graph acyclic. Pinned: the incident
+shape repairs and reschedules producers strictly before the consumer (with an
+anti-vacuity control that the *un*repaired plan races them); zero providers
+declines (the plan lacks the work, not the edge); several providers declines
+(ambiguous); a non-`missing_requires` kind, an unknown sid, and a self-provider
+all decline; an already-declared tag is neither repaired nor gating. The cycle
+guard has its own group because it is load-bearing rather than defensive — a
+well-formed but WRONG edge was measured closing a cycle across an entire plan,
+so `test_plan_still_schedules_after_a_skipped_cycle` asserts both that the
+skipped edge leaves a schedulable plan AND that force-applying it makes
+`schedule()` die; `test_cycle_trials_are_cumulative` pins that trials run
+against the plan as already mutated, so individually-safe edges cannot combine
+into a cycle. Two source-coupling guards close the loop: `_run_phases` must
+re-run `schedule()` and rewrite `plan_snapshot` when repairs land (otherwise
+the budget preflight, `check_plan_wiring`, `validate_plan` and `write_plan` all
+see the pre-repair wave partition), and the `die()` must precede the
+`st.data["wiring_gate"]` write so a failing gate leaves no key for `--resume`
+to skip on. **Note:** widening
+`warn_test_subtask_missing_producer_edge` past its `test-` prefix was tried in
+the same change and reverted — it does not catch this class. Run 6146bd2f's
+under-wired subtask declared 3 `requires` and 3 `depends_on`; it was missing
+four *specific* edges, not all of them, so the advisory's both-empty condition
+never held regardless of prefix. Widening only added noise by flagging
+legitimate root producers.
+
 `plans_after_*` checkpoints must be snapshots, not live references
 (`tests/test_checkpoint_aliasing.py`). `_run_phases` assigned
 `st.data["plans_after_X"] = plans` and handed the SAME list to the next

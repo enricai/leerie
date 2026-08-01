@@ -319,12 +319,19 @@ It is reconciled by the orchestrator with three mechanisms:
   **Test subtasks must wire to their producers (planner discipline +
   advisory).** The registry above raises the *rate* at which two planners
   agree on a name, but an edge only forms when the consumer actually
-  *declares* it. The dominant real cause of a plan-time wiring failure is a
-  `testing`-domain subtask that exercises a file, symbol, or behavior another
-  subtask creates yet declares neither a `requires` capability tag nor a
-  `depends_on` id for it — so the scheduler may run the test before its
-  producer and the wiring gate (*A wiring re-check on the fully-merged plan*)
-  correctly rejects the plan. This includes *indirect* guards: a
+  *declares* it. One recurring shape is a `testing`-domain subtask that
+  exercises a file, symbol, or behavior another subtask creates yet declares
+  neither a `requires` capability tag nor a `depends_on` id for it — so the
+  scheduler may run the test before its producer and the wiring gate (*A
+  wiring re-check on the fully-merged plan*) rejects the plan.
+
+  It is not the *dominant* shape, and the advisory below only catches this
+  one. Measured across the run corpus (2026-08-01), the commoner failure is a
+  subtask that declares *several* edges and is missing a *specific* few — a
+  cross-cutting verifier wired to the code subtasks it follows but not to the
+  test-rewrite subtasks whose output it consumes. A both-channels-empty
+  advisory is blind to that by construction, which is why the gate's
+  constrained repair, not this discipline, is what closes the class. This includes *indirect* guards: a
   coverage-floor or parity test that must enumerate the new source files a
   feature subtask adds depends on that feature subtask even though the test
   file and the source file are different paths. The discipline is prompt-side
@@ -780,6 +787,35 @@ adversarial verification*) reviews the merged plan and attacks its wiring for th
 semantic dangles the structural check is blind to. The two are complementary: the
 deterministic check owns "does every declared edge resolve," the judge owns "is the
 set of declared edges the right one."
+
+**The judge repairs what is unambiguously repairable, and dies on the rest.**
+Detecting-and-dying alone was wrong, because the commonest defect this judge finds
+is one *no planner could have avoided*. Planners run blind and in parallel: a
+planner's context carries the task, the repo map, and the shared artifact registry
+— never a sibling domain's subtasks. So when subtask A in domain X needs a
+capability that domain Y's planner will invent a tag for, A cannot declare that
+`requires`; the tag does not exist yet. The reconciler cannot fix it either: its
+charter is *declared-but-unmatched* tags, and A declared nothing, so A never enters
+its input at all. No phase upstream of the judge owns this edge, which makes the
+judge's finding the first and only point at which the plan can be corrected.
+Measured across the run corpus, two thirds of the runs that reached this gate died
+at it, and half of those deaths were this exact shape.
+
+The repair is deliberately narrow. An edge is added only when the defect is a
+missing `requires`, the named tag resolves to **exactly one** in-plan provider that
+is not the subtask itself, and the resulting graph is still acyclic — trialled
+against a copy before it is applied, using the same cycle definition as every other
+site. Anything else is refused and the gate dies as before: a tag with *no*
+provider means the plan genuinely lacks the capability rather than the edge, and a
+tag with several providers is an ambiguity only a human can resolve. The cycle
+trial is load-bearing rather than defensive — a well-formed but wrong edge can
+close a cycle spanning the entire plan, so a repair that skipped the trial would
+convert a survivable planning defect into a dead run.
+
+Because added edges change the wave partition, the scheduler is re-run and the
+plan snapshot rewritten after a repair, so everything downstream — the budget
+preflight, the deterministic wiring re-check, `validate_plan`, `write_plan` — sees
+the repaired graph rather than the one the judge rejected.
 
 ### Migration-surface completeness
 

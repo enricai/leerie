@@ -160,14 +160,20 @@ def test_clean_wiring_passes(leerie, tmp_path, monkeypatch):
 
 
 def test_defect_dies(leerie, tmp_path, monkeypatch):
-    """A concrete, live wiring defect die()s immediately (detect-and-die,
-    no re-drive)."""
+    """A concrete, live wiring defect the gate CANNOT auto-repair die()s
+    immediately (single pass, no re-drive).
+
+    The tag names no in-plan provider, which is the principled refusal case:
+    the plan is missing the work, not just the edge, so inventing a
+    dependency on nothing would be worse than dying. A defect whose tag has
+    exactly one provider is repaired instead — see
+    `tests/test_wiring_gate_repair.py`."""
     st = _state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
         return {"plan_reviewed": True, "wiring_defects": [{
             "kind": "missing_requires", "sid": "feat-002",
-            "tag_or_dep": "schema",
+            "tag_or_dep": "nothing-provides-this",
             "concrete_reason": "reads the schema but declares no requires",
             "severity": "live_defect",
         }], "rationale": "missing edge"}
@@ -206,7 +212,11 @@ def test_mixed_severity_still_dies_on_the_live_defect(leerie, tmp_path,
                                                         monkeypatch):
     """A live_defect entry gates the whole plan even alongside a
     latent_risk entry — severity filtering narrows what counts as a
-    defect, it doesn't create a per-defect bypass for real ones."""
+    defect, it doesn't create a per-defect bypass for real ones.
+
+    The live defect names a tag with no in-plan provider so it is not
+    auto-repairable; the point being pinned is severity filtering, not the
+    repair rule."""
     st = _state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
@@ -219,7 +229,7 @@ def test_mixed_severity_still_dies_on_the_live_defect(leerie, tmp_path,
             },
             {
                 "kind": "missing_requires", "sid": "feat-002",
-                "tag_or_dep": "schema",
+                "tag_or_dep": "nothing-provides-this",
                 "concrete_reason": "reads the schema, no requires at all",
                 "severity": "live_defect",
             },

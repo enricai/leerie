@@ -7934,6 +7934,15 @@ def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     that declares NO cross-subtask edge at all (`requires` and `depends_on`
     both empty) while the plan contains code subtasks that produce artifacts.
 
+    Scope note (2026-08-01): widening this past the `test-` prefix was tried
+    and reverted. It does not catch the wiring-gate deaths it looks like it
+    should — run 6146bd2f's under-wired subtask, `refactor-005`, declared 3
+    `requires` and 3 `depends_on`; it was missing four *specific* edges, not
+    all of them, so the both-empty condition never held regardless of prefix.
+    Widening only added noise, flagging legitimate root producers that
+    correctly depend on nothing. The missing-specific-edge case is the
+    wiring gate's repair path, not this advisory's.
+
     This is the dominant real defect behind the two 2026-07-29 wiring-gate
     deaths: a testing planner, running blind to the code planners, authored a
     test whose success genuinely depends on a not-yet-created source file, but
@@ -7991,9 +8000,9 @@ def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     log(f"⚠  under-wired test subtask(s): {len(flagged)} `test-` subtask(s) "
         "declare no requires/depends_on while the plan has producing subtasks. "
         "A test that needs a not-yet-created source file but declares no edge "
-        "will be scheduled before its producer and the wiring gate will die() "
-        "on it. Ensure each test requires/depends_on the subtask that produces "
-        "every file or behavior it targets (DESIGN §5).")
+        "will be scheduled before its producer. The wiring gate repairs this "
+        "when the tag has exactly one in-plan provider and dies when it is "
+        "ambiguous, so this is an early warning, not a failure (DESIGN §5).")
     for sid in sorted(flagged):
         log(f"     {sid}: requires=[] depends_on=[]")
 
@@ -18688,6 +18697,131 @@ def _would_cycle_after(
     return bool(_tarjan_sccs(set(trial_subtasks), succ))
 
 
+def _live_wiring_defects(judge_result: dict) -> list[dict]:
+    """The `wiring_judge` defects that actually gate.
+
+    Anti-gaming: a defect counts only with a concrete reason and the
+    tag/dep it concerns named. `latent_risk` severity is excluded — the
+    judge itself is saying the plan is correct today and merely fragile
+    to a future edit, which is a warning, not a defect."""
+    out: list[dict] = []
+    for d in judge_result.get("wiring_defects") or []:
+        if not isinstance(d, dict):
+            continue
+        if not (d.get("concrete_reason") or "").strip():
+            continue
+        if not (d.get("tag_or_dep") or "").strip():
+            continue
+        if d.get("severity") == "latent_risk":
+            continue
+        out.append(d)
+    return out
+
+
+def _wiring_defect_label(d: dict) -> str:
+    """Human-facing one-liner for a wiring defect (shared by the gate's
+    warning path and its die() so the two never drift)."""
+    return (f"({d.get('kind', 'wiring_defect')}) "
+            f"{d.get('sid', '?')} / {(d.get('tag_or_dep') or '').strip()}: "
+            f"{(d.get('concrete_reason') or '').strip()}")
+
+
+def _add_requires_edge(tree: list[dict], sid: str, tag: str) -> None:
+    """Append an in-plan `requires` entry to `sid` inside `tree`.
+
+    Takes the whole plan list (not the subtask) so it can be handed to
+    `_would_cycle_after`, which runs its callable against a deep copy."""
+    for plan in tree:
+        for s in plan.get("subtasks", []) or []:
+            if s.get("id") == sid:
+                s.setdefault("requires", []).append(
+                    {"tag": tag, "extent": "in_plan"})
+                return
+
+
+def _repair_missing_requires(
+    plans: list[dict], defects: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Add the `requires` edges a `wiring_judge` defect names, where doing
+    so is unambiguous. Mutates *plans* in place. Returns
+    ``(repairs_applied, unrepaired_defects)``.
+
+    DESIGN §5 *A wiring re-check on the fully-merged plan*. The commonest
+    defect this judge finds is one no planner could have avoided: planners
+    run blind, so a subtask cannot declare a `requires` on a tag a sibling
+    domain's planner has not invented yet, and `phase_reconcile`'s charter
+    is *declared-but-unmatched* tags — a subtask that declared nothing
+    never enters its input. This gate is the first point at which the edge
+    can be created, which is why the repair lives here rather than
+    upstream.
+
+    Deliberately narrow. A defect is repaired only when every one of:
+
+    - `kind == "missing_requires"` (the only shape with a mechanical fix);
+    - the sid exists in the plan;
+    - the named tag has EXACTLY ONE in-plan provider, and it is not the
+      sid itself. Zero providers means the plan lacks the capability, not
+      the edge — a repair would be inventing a dependency on nothing. Two
+      or more is an ambiguity only a human can resolve;
+    - the sid does not already declare that tag (idempotence);
+    - the edge leaves the graph acyclic.
+
+    Everything else is returned unrepaired for the caller to die() on.
+
+    The cycle trial is load-bearing rather than defensive: a well-formed
+    but WRONG edge was measured closing a cycle across an entire plan, so
+    an unguarded repair turns a survivable planning defect into a dead
+    run. Trials are cumulative — each runs against `plans` as already
+    mutated by the repairs before it — so a set of individually-safe edges
+    cannot combine into a cycle."""
+    by_id: dict[str, dict] = {
+        s["id"]: s for plan in plans for s in plan.get("subtasks", []) or []
+    }
+    providers: dict[str, list[str]] = {}
+    for sid, s in by_id.items():
+        for tag in s.get("provides", []) or []:
+            providers.setdefault(tag, []).append(sid)
+
+    repairs: list[dict] = []
+    unrepaired: list[dict] = []
+    already: list[str] = []
+    for d in defects:
+        sid = d.get("sid")
+        tag = (d.get("tag_or_dep") or "").strip()
+        if d.get("kind") != "missing_requires" or sid not in by_id:
+            unrepaired.append(d)
+            continue
+        candidates = providers.get(tag, [])
+        if len(candidates) != 1 or candidates[0] == sid:
+            unrepaired.append(d)
+            continue
+        declared = {
+            e.get("tag") for e in (by_id[sid].get("requires") or [])
+            if isinstance(e, dict)
+        }
+        if tag in declared:
+            # Already wired — the judge misread the plan. Dropping it is
+            # right (a duplicate edge is worse, and dying over an edge that
+            # already exists is absurd), but log it: every other decision
+            # this function makes is either logged as a repair or surfaced
+            # as a residual, and a silently-discarded disagreement with the
+            # judge inside a correctness gate is exactly the kind of signal
+            # that should not vanish.
+            already.append(f"{sid} / {tag}")
+            continue
+        if _would_cycle_after(
+            plans, lambda tr, _s=sid, _t=tag: _add_requires_edge(tr, _s, _t)
+        ):
+            unrepaired.append(d)
+            continue
+        _add_requires_edge(plans, sid, tag)
+        repairs.append({"sid": sid, "tag": tag, "provider": candidates[0]})
+    if already:
+        log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
+            f"subtask already declares — ignored ({', '.join(already)})")
+    return repairs, unrepaired
+
+
 def _apply_overlap_collisions(plans: list[dict],
                               collisions: list[dict]) -> list[dict]:
     """Apply a validated list of overlap-judge collisions to `plans`
@@ -19454,32 +19588,24 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
         )
 
     def _check(judge_result: dict) -> list[str]:
-        issues: list[str] = []
+        # latent_risk: the judge itself doesn't believe this is a live
+        # defect (correct today, fragile to a future edit) — surface it as a
+        # warning, never as a gating issue. Only live_defect gates. (Run
+        # d8302c0d46d8..., 2026-07-31: a wiring_judge rationale explicitly
+        # called a flagged item "a latent fragility rather than a live
+        # defect... not a true missing edge," and the gate died anyway
+        # because this function only checked concrete_reason / tag_or_dep
+        # presence, never severity.)
         for d in judge_result.get("wiring_defects") or []:
-            if not isinstance(d, dict):
+            if not isinstance(d, dict) or d.get("severity") != "latent_risk":
                 continue
-            reason = (d.get("concrete_reason") or "").strip()
-            tag_or_dep = (d.get("tag_or_dep") or "").strip()
-            # Anti-gaming: a defect gates only with a concrete reason and the
-            # tag/dep it concerns named.
-            if not reason or not tag_or_dep:
+            if not (d.get("concrete_reason") or "").strip():
                 continue
-            label = (
-                f"({d.get('kind', 'wiring_defect')}) "
-                f"{d.get('sid', '?')} / {tag_or_dep}: {reason}")
-            # latent_risk: the judge itself doesn't believe this is a live
-            # defect (correct today, fragile to a future edit) — surface it
-            # as a warning, never as a gating issue. Only live_defect gates.
-            # (Run d8302c0d46d8..., 2026-07-31: a wiring_judge rationale
-            # explicitly called a flagged item "a latent fragility rather
-            # than a live defect... not a true missing edge," and the gate
-            # died anyway because this function only checked concrete_reason
-            # / tag_or_dep presence, never severity.)
-            if d.get("severity") == "latent_risk":
-                log(f"  wiring-gate: LATENT_RISK {label}")
+            if not (d.get("tag_or_dep") or "").strip():
                 continue
-            issues.append(f"WIRING_DEFECT {label}")
-        return issues
+            log(f"  wiring-gate: LATENT_RISK {_wiring_defect_label(d)}")
+        return [f"WIRING_DEFECT {_wiring_defect_label(d)}"
+                for d in _live_wiring_defects(judge_result)]
 
     # No make_feedback_prompt: this is a detect-and-die gate, not a re-drive
     # loop. _run_checked_loop still gives us the bounded fresh-session retry on
@@ -19497,7 +19623,21 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "plan preserved")
         return plans
 
-    remaining = _check(judge_result)
+    # Repair the unambiguous defects before deciding to die (DESIGN §5).
+    # `plans` is mutated in place; `_run_phases` re-runs schedule() and
+    # rewrites plan_snapshot when anything landed, so the wave partition
+    # downstream reflects the repaired graph.
+    repairs, unrepaired = _repair_missing_requires(
+        plans, _live_wiring_defects(judge_result))
+    for r in repairs:
+        log(f"  wiring-gate: repaired {r['sid']} -> requires "
+            f"{r['tag']!r} (sole in-plan provider: {r['provider']})")
+    if repairs:
+        log(f"phase 3: plan-wiring gate added {len(repairs)} missing "
+            f"edge(s); {len(unrepaired)} defect(s) not auto-repairable")
+
+    remaining = [f"WIRING_DEFECT {_wiring_defect_label(d)}"
+                 for d in unrepaired]
     if remaining:
         die(
             "plan-wiring gate found unresolved semantic wiring defect(s):\n" +
@@ -19505,7 +19645,12 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "\nAn independent review found the plan's declared dependency "
             "edges do not match the work the subtasks actually need (a subtask "
             "that should require a capability it never declares, or a merge/"
-            "drop that severed a real dependency). This is a correctness gate "
+            "drop that severed a real dependency). The gate already added "
+            "every edge it could resolve unambiguously; what remains names a "
+            "tag with NO in-plan provider (the plan is missing the work, not "
+            "just the edge), or with SEVERAL providers (ambiguous — only you "
+            "can say which), or would close a dependency cycle. This is a "
+            "correctness gate "
             "with no bypass flag: add the missing requires/provides/depends_on "
             "to the plan, or refine the task so the cross-subtask dependencies "
             "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
@@ -19515,9 +19660,12 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "on a verdict this run never reached.)"
         )
 
-    st.data["wiring_gate"] = judge_result
+    # Written ONLY on a clean pass (repairs included) — this key is the
+    # resume skip condition, so a run the gate killed must not carry it.
+    st.data["wiring_gate"] = {**judge_result, "repairs": repairs}
     st.save()
-    log("phase 3: plan-wiring gate clean")
+    log("phase 3: plan-wiring gate clean"
+        + (f" (after {len(repairs)} repair(s))" if repairs else ""))
     return plans
 
 
@@ -24175,11 +24323,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # mid-run satisfied rescue in settle_subtask is the actual
             # safety net.
             warn_provider_subset_subtasks(plans)
-            # Flag a test subtask that declares no cross-subtask edge while
-            # the plan has producing subtasks — the dominant real cause of the
-            # wiring-gate deaths (a test needing a not-yet-created source file
-            # but declaring no requires/depends_on). Advisory; the wiring gate
-            # is the enforcer (DESIGN §5).
+            # Flag a test subtask that declares NO cross-subtask edge at all
+            # while the plan has producing subtasks. Advisory, and narrow: the
+            # commoner wiring-gate death is a subtask that declares several
+            # edges and is missing a specific few, which this both-channels-
+            # empty condition cannot see. The wiring gate's constrained repair
+            # is what closes that class (DESIGN §5).
             warn_test_subtask_missing_producer_edge(plans)
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
@@ -24274,6 +24423,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if "wiring_gate" not in st.data:
             plans = await phase_wiring_gate(
                 plans, task, st, caps, models, efforts)
+            # A repair adds `requires` edges, which changes the wave
+            # partition — re-derive so the budget preflight,
+            # check_plan_wiring, validate_plan and write_plan below all see
+            # the repaired graph rather than the one the judge rejected,
+            # and rewrite plan_snapshot so a later resume rehydrates the
+            # repaired schedule (DESIGN §5).
+            if (st.data.get("wiring_gate") or {}).get("repairs"):
+                subtasks, waves = schedule(plans)
+                st.data["plan_snapshot"] = {
+                    "subtasks": subtasks, "waves": waves}
+                st.save()
 
         # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
         # fail fast at the cheapest moment*). Runs after schedule() so we
