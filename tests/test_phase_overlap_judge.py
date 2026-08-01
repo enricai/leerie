@@ -2423,3 +2423,256 @@ def test_prompt_input_example_lists_cofile_cluster():
         "_cofile_cluster as an example subtask field, not just "
         "reference it elsewhere in the prompt"
     )
+
+
+# --------------------------------------------------------------------- #
+# PHANTOM_ARTIFACT — `artifact` is a logical name, not necessarily a path
+#
+# Regression pins for run e2882da6 (2026-08-01). The judge named its
+# artifacts the way prompts/plan_overlap_judge.md asks ("the colliding
+# exported artifact"), which on a docs-heavy plan embeds a path inside
+# prose: 'docs/USAGE.md bare-verb rewrite'. The pre-fix check treated any
+# artifact containing '/' as a bare path, producing 6 spurious
+# PHANTOM_ARTIFACT issues on an emission that was otherwise valid and
+# applied cleanly. The retry those issues forced re-derived the collision
+# set from scratch, split one pair across its two overlapping files, and
+# tripped the duplicate-pair die() — killing the run after ~35 min and
+# ~$49 of planning spend.
+# --------------------------------------------------------------------- #
+
+def test_phantom_artifact_allows_descriptive_name_around_planned_path(
+        leerie, tmp_path):
+    """The exact shape that killed e2882da6: a real planned path with a
+    description appended. The path token resolves, so nothing is flagged."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("docs/USAGE.md bare-verb rewrite"),
+        _phantom_plans(["docs/USAGE.md"]),
+        tmp_path)
+    assert not [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_phantom_artifact_allows_multi_path_descriptive_name(
+        leerie, tmp_path):
+    """A pair overlapping on two files names both. Either resolving is
+    enough — this is one collision, not evidence of a hallucination."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output(
+            "commands/leerie.md and commands/chain.md bare-verb rewrite"),
+        _phantom_plans(["commands/leerie.md", "commands/chain.md"]),
+        tmp_path)
+    assert not [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_phantom_artifact_ignores_pure_logical_name(leerie, tmp_path):
+    """`prompts/plan_overlap_judge.md` gives 'AuthShell component' as the
+    canonical artifact. It contains no path-shaped token, so there is
+    nothing to resolve and it must never be flagged."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("AuthShell component"),
+        _phantom_plans(["src/auth-shell.tsx"]),
+        tmp_path)
+    assert not [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+def test_phantom_artifact_still_flags_invented_path_inside_prose(
+        leerie, tmp_path):
+    """Anti-vacuity: the fix must narrow the check, not disable it. A
+    descriptive name whose only path-shaped token resolves nowhere is
+    still a phantom."""
+    issues = leerie.check_overlap_judge_output(
+        _phantom_output("src/totally/invented.ts rewrite"),
+        _phantom_plans(["docs/USAGE.md"]),
+        tmp_path)
+    assert [i for i in issues if i.startswith("PHANTOM_ARTIFACT")]
+
+
+# --------------------------------------------------------------------- #
+# DUPLICATE_PAIR — effect, not resolution string
+# --------------------------------------------------------------------- #
+
+def _dup_merge_pair() -> list[dict]:
+    """The real e2882da6 round-1 shape: one pair, two overlapping files,
+    one row per file, both `merge`, endpoints in the same order."""
+    a = _valid_collision_merge()
+    a["a_sid"], a["b_sid"] = "refactor-005", "docs-006"
+    a["artifact"] = "commands/leerie.md"
+    b = dict(a)
+    b["artifact"] = "commands/chain.md"
+    b["merge_feasibility"] = "one edit to commands/chain.md satisfies both"
+    return [a, b]
+
+
+def test_effect_identical_duplicate_pair_is_coalesced(leerie):
+    """A pair colliding on two artifacts is coherent — `artifact` is a
+    single string, so per-artifact rows are the only encoding available.
+    The validator collapses them instead of dying."""
+    rows = _dup_merge_pair()
+    out = {"collisions": rows}
+    by_id = _by_id([{"id": "refactor-005"}, {"id": "docs-006"}])
+    leerie._validate_overlap_judge_output(out, by_id)
+    assert len(rows) == 1, "the two rows must collapse to one collision"
+    assert "commands/leerie.md" in rows[0]["artifact"]
+    assert "commands/chain.md" in rows[0]["artifact"], (
+        "both artifact names must survive the coalesce — the merged "
+        "subtask's unified intent records both overlapping surfaces")
+
+
+def test_effect_identical_duplicate_pair_is_not_flagged_as_an_issue(
+        leerie, tmp_path):
+    """The retry-loop check must stay silent on the legitimate shape,
+    otherwise the judge burns a round 'fixing' correct output."""
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "refactor-005", "files_likely_touched": ["commands/leerie.md"],
+         "provides": [], "requires": []},
+        {"id": "docs-006", "files_likely_touched": ["commands/leerie.md"],
+         "provides": [], "requires": []}]}]
+    issues = leerie.check_overlap_judge_output(
+        {"collisions": _dup_merge_pair()}, plans, tmp_path)
+    assert not [i for i in issues if i.startswith("DUPLICATE_PAIR")]
+
+
+def test_conflicting_duplicate_pair_is_a_retryable_issue(leerie, tmp_path):
+    """Swapped endpoints with the same resolution string drop DIFFERENT
+    sids — together they delete both subtasks. That is contradictory, and
+    must surface inside the retry loop so the judge gets another round."""
+    c1 = _valid_collision_drop_a()
+    c2 = dict(c1)
+    c2["a_sid"], c2["b_sid"] = c1["b_sid"], c1["a_sid"]
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "feat-008", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []},
+        {"id": "refactor-001", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []}]}]
+    issues = leerie.check_overlap_judge_output(
+        {"collisions": [c1, c2]}, plans, tmp_path)
+    assert [i for i in issues if i.startswith("DUPLICATE_PAIR")], (
+        "a pair whose rows resolve to different effects must be reported")
+
+
+def test_collision_effect_distinguishes_swapped_drops(leerie):
+    """The load-bearing distinction: `resolution` alone cannot tell the
+    legitimate repeat from the contradictory one."""
+    c1 = _valid_collision_drop_a()
+    c2 = dict(c1)
+    c2["a_sid"], c2["b_sid"] = c1["b_sid"], c1["a_sid"]
+    assert c1["resolution"] == c2["resolution"], "same resolution string"
+    assert leerie._collision_effect(c1) != leerie._collision_effect(c2), (
+        "but opposite effects — one drops feat-008, the other refactor-001")
+    dup = _dup_merge_pair()
+    assert leerie._collision_effect(dup[0]) == leerie._collision_effect(dup[1])
+
+
+# --------------------------------------------------------------------- #
+# Duplicate-pair matrix — the composition of two independent gates
+#
+# `check_overlap_judge_output` offers a retry round (DUPLICATE_PAIR) and
+# `_validate_overlap_judge_output` coalesces the legitimate shape, but the
+# TERMINAL refusal for a contradictory duplicate comes from a third place:
+# the pre-existing keep-and-delete gate (`_contradictory_drop_sids`). On a
+# two-sid pair any effect difference necessarily makes one sid both dropped
+# and surviving, so that gate covers every conflicting shape — which is why
+# relaxing the pair check did not open a hole.
+#
+# That safety is emergent, not stated anywhere in one place. Freeze the full
+# matrix so a future change to EITHER gate cannot silently make a
+# contradictory emission apply first-row-wins.
+# --------------------------------------------------------------------- #
+
+def _pair_rows(*specs):
+    """Build collisions on one pair (A, B) from (a_sid, b_sid, resolution)."""
+    rows = []
+    for i, (a, b, res) in enumerate(specs):
+        row = {"a_sid": a, "b_sid": b, "resolution": res,
+               "artifact": f"artifact-{i}", "reason": "r"}
+        if res == "merge":
+            row["merge_feasibility"] = "one implementation satisfies both"
+        rows.append(row)
+    return rows
+
+
+CONFLICTING_DUPLICATES = [
+    pytest.param([("A", "B", "drop_a"), ("B", "A", "drop_a")],
+                 id="drop_a+drop_a_swapped_deletes_both"),
+    pytest.param([("A", "B", "drop_a"), ("A", "B", "drop_b")],
+                 id="drop_a+drop_b_deletes_both"),
+    pytest.param([("A", "B", "drop_a"), ("A", "B", "merge")],
+                 id="drop_a+merge_keeps_and_deletes_A"),
+    pytest.param([("A", "B", "merge"), ("A", "B", "drop_b")],
+                 id="merge+drop_b_keeps_and_deletes_B"),
+]
+
+IDENTICAL_DUPLICATES = [
+    pytest.param([("A", "B", "merge"), ("A", "B", "merge")],
+                 id="merge+merge"),
+    pytest.param([("A", "B", "drop_a"), ("A", "B", "drop_a")],
+                 id="drop_a+drop_a_same_order"),
+    pytest.param([("A", "B", "merge"), ("B", "A", "merge")],
+                 id="merge+merge_swapped_endpoints"),
+]
+
+
+@pytest.mark.parametrize("specs", CONFLICTING_DUPLICATES)
+def test_conflicting_duplicate_pair_is_terminal(leerie, specs):
+    """No apply order satisfies these, so none may reach the apply loop —
+    where the second row would be silently absorbed as `skipped_redundant`
+    and the first-listed resolution would win by emission order."""
+    by_id = _by_id([{"id": "A"}, {"id": "B"}])
+    with pytest.raises(SystemExit):
+        leerie._validate_overlap_judge_output(
+            {"collisions": _pair_rows(*specs)}, by_id)
+
+
+@pytest.mark.parametrize("specs", IDENTICAL_DUPLICATES)
+def test_effect_identical_duplicate_pair_coalesces(leerie, specs):
+    """One decision stated once per overlapping artifact. Collapses to a
+    single collision and proceeds."""
+    rows = _pair_rows(*specs)
+    by_id = _by_id([{"id": "A"}, {"id": "B"}])
+    leerie._validate_overlap_judge_output({"collisions": rows}, by_id)
+    assert len(rows) == 1
+    assert "artifact-0" in rows[0]["artifact"]
+    assert "artifact-1" in rows[0]["artifact"], (
+        "every artifact name must survive the coalesce")
+
+
+@pytest.mark.parametrize("specs", CONFLICTING_DUPLICATES)
+def test_conflicting_duplicate_pair_is_offered_a_retry_first(
+        leerie, specs, tmp_path):
+    """Before the terminal die, the judge gets a round to fix it — the
+    whole point of moving the check into the retry loop."""
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "A", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []},
+        {"id": "B", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []}]}]
+    issues = leerie.check_overlap_judge_output(
+        {"collisions": _pair_rows(*specs)}, plans, tmp_path)
+    assert [i for i in issues if i.startswith("DUPLICATE_PAIR")]
+
+
+def test_duplicate_pair_issue_signature_is_stable_across_row_counts(leerie):
+    """`_issue_signature` splits on the first em dash for the oscillation
+    guard. The varying parts (row count, effect list) must sit after it, or
+    the same conflict recurring reads as a brand-new issue and the guard
+    never fires."""
+    from pathlib import Path
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "A", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []},
+        {"id": "B", "files_likely_touched": ["src/x.ts"],
+         "provides": [], "requires": []}]}]
+    two = leerie.check_overlap_judge_output(
+        {"collisions": _pair_rows(("A", "B", "drop_a"), ("B", "A", "drop_a"))},
+        plans, Path("/nonexistent"))
+    three = leerie.check_overlap_judge_output(
+        {"collisions": _pair_rows(("A", "B", "drop_a"), ("B", "A", "drop_a"),
+                                  ("A", "B", "drop_b"))},
+        plans, Path("/nonexistent"))
+    sig2 = [leerie._issue_signature(i) for i in two
+            if i.startswith("DUPLICATE_PAIR")]
+    sig3 = [leerie._issue_signature(i) for i in three
+            if i.startswith("DUPLICATE_PAIR")]
+    assert sig2 and sig3
+    assert sig2 == sig3, (
+        "the same pair conflicting must produce the same oscillation "
+        f"signature regardless of row count: {sig2} != {sig3}")

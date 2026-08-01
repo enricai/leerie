@@ -70,7 +70,8 @@ class TestDemotedSelfScoresDoNotGate:
         """The overlap judge is itself an adversarial check on the plan; a
         second self-score gate on ITS OWN judgment would be self-scoring one
         level removed. Its deterministic validators (PHANTOM_ARTIFACT,
-        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH) remain the sole gate."""
+        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH, DUPLICATE_PAIR) remain the
+        sole gate."""
         output = {"collisions": [],
                   "confidence": {"judgment": 1.0, "basis": "",
                                  "falsifiers_tested": [],

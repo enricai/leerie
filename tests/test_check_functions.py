@@ -787,9 +787,9 @@ class TestLowConfidenceGating:
         """DESIGN §8: the overlap judge's `judgment` self-score is NO LONGER
         a gating axis — this worker is already the independent adversarial
         check, so its own deterministic validators (PHANTOM_ARTIFACT,
-        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH) are authoritative. A low
-        self-score with otherwise-clean output must NOT produce
-        LOW_CONFIDENCE."""
+        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH, DUPLICATE_PAIR) are
+        authoritative. A low self-score with otherwise-clean output must
+        NOT produce LOW_CONFIDENCE."""
         output = {"collisions": [],
                   "confidence": _conf(judgment=1.0)}
         issues = leerie.check_overlap_judge_output(

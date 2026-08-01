@@ -6687,19 +6687,82 @@ def check_overlap_judge_output(
 
     _CODE_EXTS = frozenset(
         ".ts .tsx .py .go .rs .java .rb .js .jsx .css .scss".split())
+
+    def _path_shaped(token: str) -> bool:
+        return "/" in token or any(token.endswith(e) for e in _CODE_EXTS)
+
+    def _depunctuate(token: str) -> str:
+        """Strip the prose punctuation an artifact name accretes.
+
+        Trailing `.` and a trailing possessive are handled on the RIGHT
+        only: a two-sided `strip(".")` would eat the leading dot of
+        `./src/x.ts` and turn a repo-relative path into an absolute one,
+        which then resolves outside the repo root."""
+        token = token.strip("'\"`,;:()[]{}<>")
+        for suffix in ("'s", "’s"):
+            if token.endswith(suffix):
+                token = token[: -len(suffix)]
+                break
+        return token.rstrip(".,;:!?")
+
     for c in collisions:
         artifact = c.get("artifact", "")
-        if "/" in artifact or any(
-                artifact.endswith(ext) for ext in _CODE_EXTS):
-            normalized = _normalize_artifact_path(artifact)
-            if (normalized not in planned_files
-                    and not (repo_root / artifact).exists()):
-                issues.append(
-                    f"PHANTOM_ARTIFACT: collision "
-                    f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
-                    f"names artifact {artifact!r} which does not "
-                    "exist in the repo and is not in any subtask's "
-                    "files_likely_touched")
+        # `artifact` is a LOGICAL artifact name, not necessarily a bare
+        # path — the prompt asks for "the colliding exported artifact,
+        # e.g. 'AuthShell component'", and on a docs/config-heavy plan the
+        # natural name embeds a path inside prose ("docs/USAGE.md
+        # bare-verb rewrite"). Treating the whole string as one path
+        # false-positived every such name: run e2882da6 emitted 6 spurious
+        # issues on an otherwise-valid emission, and the retry those
+        # issues forced is what produced the duplicate-pair emission that
+        # killed the run. So tokenize, and only path-check the tokens that
+        # actually look like paths. No path-shaped token at all means a
+        # pure logical name — nothing to verify, never flagged.
+        candidates = [_depunctuate(t) for t in artifact.split()]
+        candidates = [t for t in candidates if _path_shaped(t)]
+        if not candidates:
+            continue
+        if any(_normalize_artifact_path(t) in planned_files
+               or (repo_root / t).exists() for t in candidates):
+            continue
+        issues.append(
+            f"PHANTOM_ARTIFACT: collision "
+            f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
+            f"names artifact {artifact!r} which does not "
+            "exist in the repo and is not in any subtask's "
+            "files_likely_touched")
+
+    # DUPLICATE_PAIR — the same pair emitted twice with *different*
+    # effects (see `_collision_effect`). Reported here, inside the retry
+    # loop, rather than at `_validate_overlap_judge_output`, which sits
+    # outside it and can only die(). Effect-identical repeats are the
+    # legitimate multi-artifact shape and are coalesced by the validator,
+    # so they are deliberately not flagged.
+    effects_by_pair: dict[tuple, list[dict]] = {}
+    for c in collisions:
+        pair = tuple(sorted(
+            s for s in (c.get("a_sid"), c.get("b_sid")) if s))
+        if len(pair) == 2:
+            effects_by_pair.setdefault(pair, []).append(c)
+    for pair, rows in sorted(effects_by_pair.items()):
+        if len(rows) < 2:
+            continue
+        effects = {_collision_effect(r) for r in rows}
+        if len(effects) < 2:
+            continue
+        # `LABEL: subject — detail`, matching every other issue string:
+        # `_issue_signature` splits on the first em dash to build the
+        # oscillation-guard key, so everything that can vary between
+        # rounds (the row count, the effect list) must sit AFTER it or a
+        # recurrence of the same conflict reads as a new issue.
+        issues.append(
+            f"DUPLICATE_PAIR: collision {pair[0]} <-> {pair[1]} — "
+            f"emitted {len(rows)} times with conflicting effects "
+            f"{sorted(str(e) for e in effects)}. A pair may appear more "
+            "than once ONLY when every row resolves the same way (one "
+            "row per overlapping artifact); rows that drop different "
+            "sids, or mix a drop with a merge, cannot all hold. Emit a "
+            "single resolution for this pair, or `unresolvable`")
 
     for c in collisions:
         a = by_id.get(c.get("a_sid", ""), {})
@@ -6771,8 +6834,9 @@ def check_overlap_judge_output(
     # adversarial judge grading its own judgment, the purest self-scoring
     # case, and a self-score cannot substitute for an independent check. The
     # authoritative gate is the deterministic PHANTOM_ARTIFACT /
-    # NO_FILE_OVERLAP / DROP_BREAKS_GRAPH checks above plus
-    # `_validate_overlap_judge_output`'s merge-feasibility backstop. The
+    # NO_FILE_OVERLAP / DROP_BREAKS_GRAPH / DUPLICATE_PAIR checks above
+    # plus `_validate_overlap_judge_output`'s merge-feasibility backstop
+    # and keep-and-delete gate. The
     # `confidence` object stays emitted and schema-required, just not gated
     # on here.
     return issues
@@ -17725,6 +17789,30 @@ def _collision_surviving_sids(c: dict) -> list[str]:
     return []
 
 
+def _collision_effect(c: dict) -> tuple[str, tuple[str, ...]]:
+    """The structural *effect* a collision has on the plan, independent of
+    endpoint ordering and of the artifact it names.
+
+    Two collisions on the same pair are only contradictory when their
+    effects differ. `resolution` alone is not that signal: `drop_a` on
+    (A, B) and `drop_a` on (B, A) share a resolution string but delete
+    different subtasks — together they delete both. Comparing the resolved
+    dropped sid (or, for a merge, the unordered endpoint pair) is what
+    distinguishes "the same decision stated twice, once per overlapping
+    artifact" from "two decisions that cannot both hold".
+
+    The sid component is always a tuple so both branches share one shape;
+    a drop names exactly the sid it removes, everything else names the
+    unordered pair."""
+    res = c.get("resolution")
+    dropped = _collision_dropped_sid(c)
+    if dropped:
+        return ("drop", (dropped,))
+    endpoints = tuple(sorted(
+        s for s in (c.get("a_sid"), c.get("b_sid")) if s))
+    return ("merge" if res == "merge" else (res or "?"), endpoints)
+
+
 def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
     """An *anchor* is a sid that appears in two or more non-
     `unresolvable` collisions — either side of the pair, any
@@ -17793,13 +17881,22 @@ def _contradictory_drop_sids(collisions: list[dict]) -> set[str]:
 
 def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]) -> None:
     """Apply the merge-feasibility backstop and structural sanity checks
-    on the judge's output, before any mutation. die()s on violation —
-    callers are expected to have deep-copied `plans` if they need clean
-    reversion. Per DESIGN §12 (prompts advisory, code enforces): the
-    prompt asks for a concrete merge_feasibility statement whenever
-    `merge` is emitted; Python rejects a `merge` without one rather
-    than trusting the prompt was followed."""
-    seen_pairs: set[tuple[str, str]] = set()
+    on the judge's output, before any mutation *of the plan*. die()s on
+    violation — callers are expected to have deep-copied `plans` if they
+    need clean reversion. Per DESIGN §12 (prompts advisory, code
+    enforces): the prompt asks for a concrete merge_feasibility statement
+    whenever `merge` is emitted; Python rejects a `merge` without one
+    rather than trusting the prompt was followed.
+
+    One deliberate exception to "no mutation": once every check has
+    passed, effect-identical duplicate rows on a single pair are coalesced
+    (DESIGN §5 *Multi-artifact pair*). That edits `output["collisions"]`
+    IN PLACE rather than rebinding it, because `phase_overlap_judge` binds
+    its own `collisions` name before calling this — rebinding would leave
+    the caller applying the un-coalesced list. Contradictory duplicates
+    are never coalesced; they die at the keep-and-delete gate above, after
+    `check_overlap_judge_output` has already offered the judge a retry
+    round via DUPLICATE_PAIR."""
     for c in output.get("collisions", []) or []:
         a_sid = c.get("a_sid")
         b_sid = c.get("b_sid")
@@ -17821,14 +17918,8 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
             die(f"plan-overlap judge referenced unknown subtask "
                 f"{b_sid!r} (collision with {a_sid!r}); refine the task "
                 "or re-run.")
-        # Order-independent pair dedup — two collisions on the same pair
-        # with different resolutions would be incoherent.
-        pair = tuple(sorted([a_sid, b_sid]))
-        if pair in seen_pairs:
-            die(f"plan-overlap judge emitted two collisions for the "
-                f"same pair {pair!r}; the model must pick one "
-                "resolution. Refine the task or re-run.")
-        seen_pairs.add(pair)
+        # (A repeated pair is not checked here — see the coalescing step
+        # at the end of this function.)
         if resolution == "merge":
             mf = (c.get("merge_feasibility") or "").strip()
             if not mf:
@@ -17886,6 +17977,56 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
                 "should emit `merge` (not `drop`) against the "
                 "anchor and `unresolvable` if the cluster cannot "
                 "be auto-resolved.")
+
+    # Coalesce effect-identical duplicate pairs (DESIGN §5 *Multi-artifact
+    # pair*). A repeated pair is COHERENT when the pair genuinely overlaps
+    # on more than one artifact — `artifact` is a single string, so
+    # per-artifact rows are the only encoding the judge has, and
+    # `_apply_overlap_collisions` already absorbs the repeat via
+    # `skipped_redundant`. What must agree is the resolved *effect*, not
+    # the `resolution` string: the same pair emitted twice as `drop_a`
+    # with the endpoints swapped drops BOTH subtasks.
+    #
+    # Contradictory duplicates are deliberately NOT handled here.
+    # `check_overlap_judge_output` reports them as DUPLICATE_PAIR inside
+    # the retry loop (which runs before this validator, so the judge gets
+    # a round to fix it), and the keep-and-delete gate above is the
+    # terminal refusal if it does not — on a two-sid pair any effect
+    # difference necessarily makes one sid both dropped and surviving.
+    # A contradictory duplicate therefore never reaches the apply loop.
+    #
+    # Mutates the list IN PLACE: `phase_overlap_judge` binds its own
+    # `collisions` name before calling this validator, so rebinding
+    # `output["collisions"]` would leave the caller applying the
+    # un-coalesced list.
+    by_pair: dict[tuple, dict] = {}
+    coalesced: list[dict] = []
+    for c in collisions:
+        pair = tuple(sorted(
+            s for s in (c.get("a_sid"), c.get("b_sid")) if s))
+        prev = by_pair.get(pair)
+        if prev is None or _collision_effect(prev) != _collision_effect(c):
+            by_pair.setdefault(pair, c)
+            coalesced.append(c)
+            continue
+        # Same pair, same effect, different artifact: one decision the
+        # judge had to state once per overlapping artifact. Keep every
+        # artifact name and every merge_feasibility statement, so the
+        # merged subtask's unified intent still records both surfaces.
+        for field in ("artifact", "merge_feasibility", "reason"):
+            extra = (c.get(field) or "").strip()
+            if not extra:
+                continue
+            base = (prev.get(field) or "").strip()
+            if not base:
+                prev[field] = extra
+            elif extra not in base:
+                prev[field] = f"{base}; {extra}"
+    if len(coalesced) != len(collisions):
+        log(f"phase 2¾: coalesced {len(collisions) - len(coalesced)} "
+            "duplicate collision row(s) naming the same pair with the "
+            "same effect (multi-artifact overlap)")
+        collisions[:] = coalesced
 
 
 def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
@@ -19131,7 +19272,9 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "to the plan, or refine the task so the cross-subtask dependencies "
             "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
             "bypass this gate — it only skips the phase 2¾ overlap judge, which "
-            "runs earlier and independently.)"
+            "runs earlier and independently. `--resume` does not bypass it "
+            "either: the gate re-runs until it passes, since its skip is keyed "
+            "on a verdict this run never reached.)"
         )
 
     st.data["wiring_gate"] = judge_result
@@ -19271,8 +19414,12 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
 
     # Persist the raw judge output for audit, even before applying —
     # if a later die() fires (unresolvable, or _validate_overlap_judge_output),
-    # the user can inspect what the judge said.
-    st.data["plan_overlap_judge"] = output
+    # the user can inspect what the judge said. Deep-copied because
+    # `_validate_overlap_judge_output` coalesces effect-identical duplicate
+    # rows in place: storing the live object would let that rewrite the
+    # "raw" audit on the next st.save(), which is exactly the aliasing
+    # class the plans_after_* checkpoints were fixed for.
+    st.data["plan_overlap_judge"] = copy.deepcopy(output)
     st.save()
 
     collisions = (output.get("collisions") or [])
@@ -23676,10 +23823,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # Resumable-planning checkpoint: post-recursive-decompose
             # `plans`, persisted so --resume can skip re-invoking
             # phase_plan (DESIGN §6).
-            st.data["plans_after_plan"] = plans
+            st.data["plans_after_plan"] = copy.deepcopy(plans)
             st.save()
         else:
-            plans = st.data["plans_after_plan"]
+            plans = copy.deepcopy(st.data["plans_after_plan"])
 
         if "plans_after_reconcile" not in st.data:
             # Bridge cross-domain capability-tag mismatches before the
@@ -23690,7 +23837,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # persisted BEFORE the no-work short-circuit below so a run
             # that turns out to have work is never left without this
             # checkpoint (DESIGN §6).
-            st.data["plans_after_reconcile"] = plans
+            st.data["plans_after_reconcile"] = copy.deepcopy(plans)
             st.save()
             # Cleared-but-empty terminal state (DESIGN §8): every planner
             # cleared its gate and confirmed the task is already satisfied
@@ -23711,7 +23858,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 _finish_no_work_run(st, no_work_map)
                 return
         else:
-            plans = st.data["plans_after_reconcile"]
+            plans = copy.deepcopy(st.data["plans_after_reconcile"])
 
         if "plans_after_overlap_judge" not in st.data:
             # Phase 2¾: detect cross-planner surface-overlap collisions
@@ -23730,10 +23877,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # `plans`, persisted so --resume can skip re-invoking
             # phase_overlap_judge (DESIGN §6 *Cross-domain surface
             # overlap*).
-            st.data["plans_after_overlap_judge"] = plans
+            st.data["plans_after_overlap_judge"] = copy.deepcopy(plans)
             st.save()
         else:
-            plans = st.data["plans_after_overlap_judge"]
+            plans = copy.deepcopy(st.data["plans_after_overlap_judge"])
 
         if "plans_after_adherence_gate" not in st.data:
             # Phase 2⅞: instruction-adherence gate (the deterministic
@@ -23753,10 +23900,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # Resumable-planning checkpoint: post-instruction-adherence-
             # gate `plans`, persisted so --resume can skip re-invoking
             # phase_adherence_gate (DESIGN §6).
-            st.data["plans_after_adherence_gate"] = plans
+            st.data["plans_after_adherence_gate"] = copy.deepcopy(plans)
             st.save()
         else:
-            plans = st.data["plans_after_adherence_gate"]
+            plans = copy.deepcopy(st.data["plans_after_adherence_gate"])
 
         if "plans_after_coverage_gate" not in st.data:
             # Phase 2⅞½: task-coverage gate — independent adversarial
@@ -23771,10 +23918,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # Resumable-planning checkpoint: post-task-coverage-gate
             # `plans`, persisted so --resume can skip re-invoking
             # phase_planning_coverage_gate (DESIGN §6).
-            st.data["plans_after_coverage_gate"] = plans
+            st.data["plans_after_coverage_gate"] = copy.deepcopy(plans)
             st.save()
         else:
-            plans = st.data["plans_after_coverage_gate"]
+            plans = copy.deepcopy(st.data["plans_after_coverage_gate"])
 
         if "plans_after_filters" not in st.data:
             # Surface cross-planner file-claim overlaps. Warning only —
@@ -23824,10 +23971,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # immediately before schedule() — the last plans_after_*
             # checkpoint before plan_snapshot/waves take over as the
             # resume cursor (DESIGN §6).
-            st.data["plans_after_filters"] = plans
+            st.data["plans_after_filters"] = copy.deepcopy(plans)
             st.save()
         else:
-            plans = st.data["plans_after_filters"]
+            plans = copy.deepcopy(st.data["plans_after_filters"])
 
         if "plan_snapshot" not in st.data:
             st.data["current_phase"] = "phase 3: scheduling"
@@ -23847,27 +23994,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # and write_plan().
             st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
             st.save()
-            # Independent SEMANTIC wiring verification (DESIGN §5 *A wiring
-            # re-check on the fully-merged plan*, §8) — the LLM complement to
-            # the deterministic check_plan_wiring below. The `wiring_judge`
-            # attacks the plan for semantic dangles a provider-existence scan
-            # cannot see (a subtask that should require a capability it never
-            # declares; a merge/drop that severed a real dependency the tags
-            # never encoded) and die()s on a concrete defect (detect-and-die,
-            # returns `plans` unchanged; audit persisted to
-            # st.data["wiring_gate"]). Runs HERE — after both soft-drop filters
-            # (earlier plans_after_filters block) and schedule() — so it attacks
-            # the truly-merged POST-DROP plan with a fully-populated
-            # `dropped_subtasks` audit (its broken_by_drop / broken_by_merge
-            # reasoning depends on that), matching its docstring + DESIGN §5.
-            # `plans` here is the post-drop plan (the filters mutated it in
-            # place). Deliberately INSIDE the fresh `plan_snapshot` branch (not
-            # the outer scope like the cheap deterministic check_plan_wiring):
-            # this is an LLM call, so a budget-check resume (plan_snapshot
-            # already persisted) must NOT re-invoke it — its verdict already
-            # cleared the run once and is captured in st.data["wiring_gate"].
-            plans = await phase_wiring_gate(
-                plans, task, st, caps, models, efforts)
         else:
             # Budget-check resume (DESIGN §6 "Budget-check resume"): a
             # prior attempt reached schedule() and persisted plan_snapshot,
@@ -23880,6 +24006,36 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # the snapshot is already the exact output.
             snap = st.data["plan_snapshot"]
             subtasks, waves = snap["subtasks"], snap["waves"]
+
+        # Independent SEMANTIC wiring verification (DESIGN §5 *A wiring
+        # re-check on the fully-merged plan*, §8) — the LLM complement to
+        # the deterministic check_plan_wiring below. The `wiring_judge`
+        # attacks the plan for semantic dangles a provider-existence scan
+        # cannot see (a subtask that should require a capability it never
+        # declares; a merge/drop that severed a real dependency the tags
+        # never encoded) and die()s on a concrete defect (detect-and-die,
+        # returns `plans` unchanged; audit persisted to
+        # st.data["wiring_gate"]). Runs HERE — after both soft-drop filters
+        # (earlier plans_after_filters block) and schedule() — so it attacks
+        # the truly-merged POST-DROP plan with a fully-populated
+        # `dropped_subtasks` audit (its broken_by_drop / broken_by_merge
+        # reasoning depends on that), matching its docstring + DESIGN §5.
+        # `plans` here is the post-drop plan (the filters mutated it in
+        # place).
+        #
+        # The resume skip is keyed on `wiring_gate` — written ONLY when the
+        # gate passes — not on `plan_snapshot`. The snapshot is written a
+        # few lines above, BEFORE the gate runs, so it is present even when
+        # the gate die()d; keying the skip on it made `--resume` a silent
+        # bypass of a gate the run had already failed (run 3a4abba3 reached
+        # phase_execute with zero gate invocations, executing the very plan
+        # the gate rejected). A clean-pass resume still skips, since
+        # `wiring_gate` is present. A `WorkerError` degrade deliberately
+        # writes nothing, so a resume re-attempts the gate rather than
+        # inheriting a verdict that was never actually reached.
+        if "wiring_gate" not in st.data:
+            plans = await phase_wiring_gate(
+                plans, task, st, caps, models, efforts)
 
         # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
         # fail fast at the cheapest moment*). Runs after schedule() so we

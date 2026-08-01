@@ -111,19 +111,38 @@ class TestWiring:
         assert src.count("await phase_wiring_gate(") == 1
 
     def test_wiring_gate_is_not_re_invoked_on_budget_check_resume(self, leerie):
-        """The LLM gate is expensive, so it lives INSIDE the fresh
-        `if "plan_snapshot" not in st.data:` branch — a budget-check resume
-        (plan_snapshot already persisted) rehydrates in the `else:` and must not
-        re-invoke it. Pin by source order: the gate call sits between the
-        `st.data["plan_snapshot"] = ` write and the `else:` of that if."""
+        """The LLM gate is expensive, so a budget-check resume must not
+        re-invoke it — but the skip is keyed on `st.data["wiring_gate"]`,
+        the audit record the gate writes ONLY when it passes, NOT on
+        `plan_snapshot`.
+
+        `plan_snapshot` is written a few lines *earlier*, deliberately, so a
+        die() at either terminal gate does not discard the planning spend.
+        That means it is present even when the gate FAILED, so keying the
+        skip on it made `--resume` a silent bypass of a gate the run had
+        already failed (run 3a4abba3, 2026-08-01: resumed straight to
+        `phase_execute` with zero gate invocations, executing the plan the
+        gate had rejected — while the die() message claimed the gate had "no
+        bypass flag"). The cheap-resume property this test was written to
+        protect is unchanged: after a clean pass `wiring_gate` is present and
+        the gate is skipped. See tests/test_wiring_gate_resume.py for the
+        behavioural pins on all three shapes.
+        """
         src = inspect.getsource(leerie._run_phases)
         i_snapshot_write = src.index('st.data["plan_snapshot"] = ')
         i_gate = src.index("await phase_wiring_gate(")
-        # The gate is after the snapshot write (same fresh branch).
+        # The gate still runs after the snapshot is safely persisted.
         assert i_snapshot_write < i_gate
-        # And before the budget-check-resume `else` rehydration.
+        # But it is guarded by the pass-only audit key, not the snapshot —
+        # and that guard is what makes the skip correct on a resume.
+        i_guard = src.index('if "wiring_gate" not in st.data:')
+        assert i_guard < i_gate, (
+            "phase_wiring_gate must be invoked from a wiring_gate-keyed "
+            "guard, so a resume after a gate die() re-runs it")
+        # It sits outside the plan_snapshot if/else, so both the fresh path
+        # and the rehydrate path reach the same guard.
         i_rehydrate = src.index('snap = st.data["plan_snapshot"]')
-        assert i_gate < i_rehydrate
+        assert i_rehydrate < i_guard
 
 
 def test_clean_wiring_passes(leerie, tmp_path, monkeypatch):

@@ -251,6 +251,22 @@ inbound dependencies fan out to all of them. Prefer this over forcing
 an artificial `merge` between siblings that do not actually overlap
 with each other.
 
+If a single *pair* overlaps on more than one artifact, you may emit one
+collision per artifact — provided every row resolves the **same way**
+(the same `merge`, or a `drop_*` naming the same subtask). The
+orchestrator coalesces them into one collision and keeps every artifact
+name and `merge_feasibility` statement. Naming several artifacts in one
+row is equally fine. What you must NOT do is emit the same pair twice
+with different outcomes: `drop_a(A, B)` together with `drop_a(B, A)`
+deletes both subtasks, and mixing a `drop` with a `merge` on one pair is
+self-contradictory. Pick one outcome for the pair, or `unresolvable`.
+
+`artifact` may be a plain logical name (`AuthShell component`), a path,
+or a path with a short description (`docs/USAGE.md bare-verb rewrite`) —
+whichever names the colliding surface most clearly. Any path you mention
+must be real (present in the repo, or in some subtask's
+`files_likely_touched`).
+
 Connected-cluster shapes (e.g. emitting `merge(A, B)`, `merge(A, C)`,
 *and* `merge(B, C)` when all three target the same artifact) are
 allowed. The orchestrator's apply loop will collapse them to a single

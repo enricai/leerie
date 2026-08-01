@@ -2191,6 +2191,82 @@ primary case — via a shared `_normalize_artifact_path` that
 `./x` and `x` must not read as disjoint; no case folding, since container
 checkouts are case-sensitive).
 
+The same file also covers the **multi-artifact pair** contract (DESIGN §5
+*Multi-artifact pair*) and the `artifact`-is-a-logical-name rule, both
+added after run `e2882da6…` (2026-08-01) died in phase 2¾ having written
+no code. `check_overlap_judge_output` treated any `artifact` containing
+`/` as a bare path, so the descriptive names the prompt actually asks for
+(`docs/USAGE.md bare-verb rewrite`) read as hallucinated files — 6
+spurious `PHANTOM_ARTIFACT` issues on an emission that replays clean. The
+retry those issues forced then expressed one pair's two-file overlap as
+two rows, which the bare pair-repetition gate refused. Pinned: an artifact
+is **tokenized** and only path-shaped tokens are resolved (trailing
+periods and possessives stripped on the right only — a two-sided
+`strip(".")` would turn `./src/x.ts` into an absolute path), a pure
+logical name is never flagged, and an invented path inside prose still is.
+For duplicates, what must agree is the resolved **effect**
+(`_collision_effect`: dropped sid, or unordered merge pair) — never the
+`resolution` string, since swapped-endpoint `drop_a` rows share a string
+and delete opposite subtasks. A 4×3 parametrized matrix freezes the
+composition of the three gates involved: every effect-differing shape is
+terminal (via the pre-existing `_contradictory_drop_sids` keep-and-delete
+gate — on a two-sid pair any effect difference makes one sid both dropped
+and surviving, which is *why* relaxing the pair check opened no hole),
+every effect-identical shape coalesces to one row keeping all artifacts,
+and each conflicting shape is offered a `DUPLICATE_PAIR` retry round
+first. A separate test pins that the `DUPLICATE_PAIR` string keeps the
+`LABEL: subject — detail` shape, since `_issue_signature` splits on the
+first em dash and the row count must not perturb the oscillation key.
+
+`--resume` must not bypass the phase-3 semantic wiring gate
+(`tests/test_wiring_gate_resume.py`). `phase_wiring_gate` is
+detect-and-die, and its skip-on-resume used to key on `plan_snapshot` —
+which is written *earlier*, deliberately, so a die() at either terminal
+gate does not discard the planning spend. The snapshot is therefore
+present even when the gate FAILED, so a resume skipped the whole branch,
+never re-invoked the gate, and executed the plan the gate had rejected —
+while the die() message claimed the gate had "no bypass flag" (run
+`3a4abba3…`, 2026-08-01: verified to reach `phase_execute` with zero gate
+invocations). The skip is now keyed on `st.data["wiring_gate"]`, written
+only on a clean pass. All three shapes are pinned behaviorally against the
+real `_run_phases` with every phase stubbed and counted (reusing
+`tests/test_resume_planning_reentry.py`'s harness): gate-died → re-runs,
+fresh run → runs (the anti-vacuity control), gate-passed → skips, so the
+budget-check resume this branch exists for stays cheap. A `WorkerError`
+degrade writes nothing, so it re-attempts rather than inheriting a verdict
+never reached. Two source-coupling guards pin the structure the stubs
+cannot see: the call sits behind its own `wiring_gate`-keyed guard
+*outside* the `plan_snapshot` if/else, and the die() text states that
+`--resume` re-runs it.
+`tests/test_phase_wiring_gate.py`'s
+`test_wiring_gate_is_not_re_invoked_on_budget_check_resume` was rewritten
+in the same change — it previously pinned the old structure by source
+order (gate call between the snapshot write and the `else:`); it now pins
+the audit-key guard while asserting the same cheap-resume property.
+
+`plans_after_*` checkpoints must be snapshots, not live references
+(`tests/test_checkpoint_aliasing.py`). `_run_phases` assigned
+`st.data["plans_after_X"] = plans` and handed the SAME list to the next
+phase — and `phase_reconcile`'s renames, `phase_overlap_judge`'s
+merges/drops, and both phase-3 soft-drop filters all mutate `plans` **in
+place**, so every later `st.save()` retroactively rewrote all earlier
+checkpoints. Measured on run `3a4abba3…` before the fix: all six of
+`plans_after_plan` … `plans_after_filters` were byte-identical, and
+`plans_after_reconcile` held 15 subtasks while the overlap judge's
+independently-recorded input (`calls.ndjson`) had 16 — a silent
+contradiction of the DESIGN §6 "Resumable planning" contract, which
+describes each key as that phase's output "as it stood immediately
+after". Pinned: an earlier checkpoint survives a later in-place drop AND
+field rewrite, adjacent checkpoints are neither the same object nor
+byte-identical across a mutating phase, the distinction survives a real
+`State.save()` round trip read back off disk (constructed by reading
+`state.json` directly, not a second `State` — `State.__init__` takes an
+exclusive flock the live instance still holds), and a source-coupling
+guard requires `copy.deepcopy(` on all six assignments so a newly added
+checkpoint cannot reintroduce the alias. The same aliasing class applies
+to `st.data["plan_overlap_judge"]`, deep-copied at its persist so the
+coalescing step cannot rewrite the "raw judge output" audit.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

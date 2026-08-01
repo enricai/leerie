@@ -637,6 +637,34 @@ The whole-cluster application is what makes the result independent of
 the order the judge happened to emit its pairs in — a determinism
 requirement the scheduler's contract depends on.
 
+**Multi-artifact pair.** The third coherent shape, alongside the anchor
+cluster and multi-drop above: one *pair* colliding on several artifacts.
+A collision carries a single `artifact` string, so a pair that overlaps
+on two files has no way to say so except one row per artifact. The
+distinguishing question is not whether the pair repeats but whether the
+rows agree on what they *do* to the plan: the resolved dropped sid for a
+`drop_*`, the unordered endpoint pair for a `merge`. Rows whose effect is
+identical are the same decision stated once per surface, and are
+coalesced into one collision that keeps every artifact name and every
+`merge_feasibility` statement (the carry-forward invariant below applies
+unchanged). Rows whose effect *differs* cannot all hold — the same pair
+emitted twice as `drop_a` with the endpoints swapped deletes both
+subtasks — and are fed back to the judge as a retryable issue. The retry
+is an opportunity to fix a contradiction, never an escape from one: a
+contradictory duplicate that survives the retry budget is still refused,
+because on a two-subtask pair any effect difference necessarily makes one
+sid both dropped and surviving, which the keep-and-delete rule above
+already forbids. No apply order satisfies it, so it never reaches the
+apply loop.
+
+`resolution` alone is the wrong signal here, and treating any repeated
+pair as incoherent is worse: it `die()`s correct output after the full
+planning spend, at a validator that runs *after* the retry loop and
+therefore cannot be recovered from. Both failure modes were observed
+together on one run (2026-08-01) — a spurious phantom-artifact issue
+forced a retry, the retry expressed a two-file overlap as two rows, and
+the pair gate killed the run.
+
 The anchor rule introduces one new invariant the orchestrator must
 preserve: **merge_feasibility carry-forward**. Each `merge_feasibility`
 statement is the load-bearing unified-intent record for the pair it
@@ -4948,8 +4976,8 @@ mis-wirings:
   pattern generalizes to (there is no "artifact" here that a fresh mind
   reviews with fresh eyes; the judge's own output IS the finding). Its
   existing deterministic validators — `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
-  `DROP_BREAKS_GRAPH` (`check_overlap_judge_output`, §5 *Cross-domain
-  surface overlap*), and `_validate_overlap_judge_output`'s
+  `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` (`check_overlap_judge_output`, §5
+  *Cross-domain surface overlap*), and `_validate_overlap_judge_output`'s
   `merge_feasibility`-presence backstop — already catch the concrete,
   checkable failure modes (a hallucinated artifact, a collision with no
   shared file evidence, a drop that orphans a still-required capability, a
