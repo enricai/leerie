@@ -1890,7 +1890,7 @@ this, all reading the same signal:
    `state.json` shows `completed_waves < len(waves)` and not
    `no_work_required`. The push is host-side, and *all three* host-side
    push paths — the launcher's auto-finalize block, the `leerie
-   --finalize <id>` verb, and Fly's `decide_teardown` — funnel through
+   finalize <id>` verb, and Fly's `decide_teardown` — funnel through
    `host_finalize`, so this single gate covers them all. It fails open
    when `state.json` is absent so a legitimately complete run is never
    blocked.
