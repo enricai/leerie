@@ -1673,7 +1673,7 @@ The fix is two-sided: the launcher's `_launch_script` polls `Popen`
 briefly for `rc=75` (B's flock-loser signal) before writing the
 pid file; if the child exited 75 the file is not touched. Readers
 do not trust the pid file as the sole liveness oracle — both the
-`resume` tail watcher and `--finalize --force`'s liveness check
+`resume` tail watcher and `finalize --force`'s liveness check
 cross-check via a `/proc` scan for any process whose argv contains
 `orchestrator/leerie.py` AND this run-id. Either anchor catching
 the live orchestrator is sufficient to declare "alive." This makes
