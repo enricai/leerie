@@ -1,5 +1,5 @@
 """Tests for `_derive_run_status` — the pure-function status taxonomy
-that `leerie --list` renders.
+that `leerie list` renders.
 
 Status table (in priority order):
   1. run.json invariant-invalid → `corrupt-sidecar`

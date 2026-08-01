@@ -1,4 +1,4 @@
-"""Tests for Phase 4: mid-run re-rsync (`leerie --re-seed` + auto-on-resume).
+"""Tests for Phase 4: mid-run re-rsync (`leerie re-seed` + auto-on-resume).
 
 Covers:
   - scripts/remote/seed-repo.sh refactor (seed_repo_clone / seed_repo_dirty / seed_repo)
@@ -392,7 +392,7 @@ def test_launcher_consumes_re_seed_flags():
 
 
 def test_launcher_re_seed_requires_run_id_arg():
-    """`leerie --re-seed` without <run-id> errors with usage."""
+    """`leerie re-seed` without <run-id> errors with usage."""
     result = _run_bash(
         f"{LAUNCHER} --re-seed",
     )

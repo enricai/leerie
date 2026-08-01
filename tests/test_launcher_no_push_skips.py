@@ -7,7 +7,7 @@ no-work case is the load-bearing one: no run branch was ever
 materialized, so attempting `git push` would error with "src refspec
 does not match any" and the launcher would write `push_error` to
 run.json — turning a successful no-op into a `push-failed` row in
-`leerie --list`.
+`leerie list`.
 
 The check lives entirely in the bash launcher (`leerie`), so this test
 invokes a minimal bash harness that mirrors the exact block from the

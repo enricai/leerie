@@ -1,4 +1,4 @@
-"""Tests for `_list_runs()` — the `leerie --list` rendering function.
+"""Tests for `_list_runs()` — the `leerie list` rendering function.
 
 Behavioral tests use `tmp_path` for filesystem isolation. The function
 reads `.leerie/runs/*/state.json` (via _discover_runs) and overlays

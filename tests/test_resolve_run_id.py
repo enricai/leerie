@@ -233,7 +233,7 @@ def test_resolve_multiple_runs_message_includes_status(leerie, tmp_path,
     """The disambiguation message must show the derived status of each
     run (from _derive_run_status) so the user can spot e.g. a
     `done-pushed-pr` run versus an `in-progress` one without an extra
-    `leerie --list` invocation."""
+    `leerie list` invocation."""
     _make_finished_run(tmp_path, "feat-a-aaaaaa",
                        "2026-05-26T10:00:00+00:00")
     _make_finished_run(tmp_path, "feat-b-bbbbbb",

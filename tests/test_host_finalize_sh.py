@@ -3,7 +3,7 @@
 Companion to tests/test_finalize_sh_behavior.py (which covers
 scripts/finalize.sh, the in-container verifier). This file covers
 scripts/host-finalize.sh, the host-side push+PR block extracted from
-the leerie launcher to make `leerie --finalize <run-id>` actually finalize
+the leerie launcher to make `leerie finalize <run-id>` actually finalize
 (Audit Drift 7).
 
 The tests source host-finalize.sh in a bash subprocess with stubbed

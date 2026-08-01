@@ -17,7 +17,7 @@ Invariants (mirrors orchestrator/leerie.py:_validate_run_json):
 8. If `volume_id` is set, `fly_machine_id` must also be set
    (a Fly volume without a machine to attach it to is invalid).
 
-Valid status combinations (leerie --list derives these via
+Valid status combinations (leerie list derives these via
 `_derive_run_status`):
 - `done`          — no push attempted, no PR.
 - `done-pushed-no-pr`   — pushed, PR not attempted (offline-pr case).
@@ -25,7 +25,7 @@ Valid status combinations (leerie --list derives these via
 - `push-failed`         — push attempted and failed.
 - `pr-failed`           — push succeeded, PR creation failed.
 - `paused`       — remote run paused on failure; resume via --resume.
-- `killed`       — terminal state via leerie --kill; not resumable.
+- `killed`       — terminal state via leerie kill; not resumable.
 - `sync-failed` — orchestrator finished but fetch_branch failed;
                           machine still up, recover via --finalize/--kill.
 - `corrupt-sidecar`     — run.json violates an invariant above.
