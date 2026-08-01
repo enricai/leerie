@@ -270,6 +270,10 @@ def test_judgment_workers_pinned_set(leerie):
         # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
         # worker*) — a judgment worker (decides tag/path per artifact).
         "artifact_registry",
+        # Finalize-time rebase-onto-base worker (DESIGN §6 *Finalization*
+        # "Rebase-onto-base before push") — judgment-adjacent (decides
+        # abort-vs-resolve per conflict), mirrors integrator's medium tier.
+        "rebaser",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'
