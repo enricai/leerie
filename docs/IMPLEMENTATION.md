@@ -1458,8 +1458,9 @@ leerie resume   <chain-id>        # resume paused + list running chain runs
 leerie finalize <chain-id>        # push + open PR for every unpushed run
 leerie list --chains               # group runs by chain_id
 
-# The deprecated chain-prefixed aliases have been hard-removed (no shim):
-#   --chain-submit, --chain-status, --chain-kill, --chain-attach, --list-chains
+# The five deprecated dash-prefixed chain-verb aliases (submit / status /
+# kill / attach, plus the separate list-chains flag) have been hard-removed
+# entirely — no shim, no back-compat. Use the bare verbs above.
 ```
 
 Requirements: the `claude` CLI on `PATH` and logged in interactively (no API
