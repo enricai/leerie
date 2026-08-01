@@ -7190,7 +7190,7 @@ kill` via the `_is_local_container` probe (`nerdctl inspect
 <run-id>`). `stop` uses `nerdctl stop` (SIGTERM first, allowing
 graceful state save) or `aws ec2 stop-instances`; `kill` uses
 `nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
-(after the fetch-before-terminate sync). `--finalize --runtime local`
+(after the fetch-before-terminate sync). `finalize --runtime local`
 still errors — local finalization is inline. Without the flag, the
 verbs infer the runtime from the sidecar (`fly-machine.json` presence
 for Fly, `ec2-instance.json` presence for EC2, `nerdctl inspect` for
@@ -7454,7 +7454,7 @@ discovery without parsing the full `state.json`):
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
-| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`--list --chains`, `status`, `kill`, `attach`, `resume`) to discover chain runs. |
+| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`list --chains`, `status`, `kill`, `attach`, `resume`) to discover chain runs. |
 | `wave_idx` | int \| null | Zero-based wave index within the chain (set alongside `chain_id`). Used by the chain wave-sequencer to group runs by wave for synth-merge between waves. Null when `chain_id` is null. |
 | `health` | dict \| null | Advisory run-health signals (DESIGN §9). Written by two seams and merged, never mutually exclusive: (1) `_capture_conformance_baseline` writes `base_suite` `{status: "green"\|"red", red_axes: list[str]}` at the start of `phase_execute` — the build/lint/test exit-code verdict on the unmodified base tree; (2) `_record_run_health` writes `slowest_worker_sid` (str \| null), `slowest_worker_min` (float — the largest summed per-worker `duration_ms`, in minutes), and `truncated_worker_count` (int — worker logs that ended a result with `terminal_reason="max_turns"`) at finalize, preserving any existing `base_suite`. Purely informational — never gates; `_validate_run_json` imposes no invariant on it. Null when neither seam ran (e.g. a no-work run, or `--skip-base-baseline` on a run that also never reached finalize). |
 
@@ -7482,7 +7482,7 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`, or the orchestrator exited via `die()` after the run directory was created (e.g. unresolved subtasks). In the latter case, `resume` re-enters `phase_execute` normally — `finished_at` is overwritten on success. |
 | `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie resume <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
 | `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie kill`. Not resumable; start a new run instead. |
-| `in-progress` | none of the above | the run is still active (or died very early); resume with `--resume <id>` |
+| `in-progress` | none of the above | the run is still active (or died very early); resume with `resume <id>` |
 
 `RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
