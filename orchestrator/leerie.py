@@ -972,6 +972,13 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
     # at the standard `medium` judgment effort.
     "artifact_registry": "medium",
+    # Finalize-time rebase-onto-base worker (DESIGN §6 *Finalization*
+    # "Rebase-onto-base before push"). Judgment-adjacent — it decides
+    # abort-vs-resolve on each conflict, not just resolution content — so it
+    # gets the same `medium` effort as `integrator`, which it mirrors in
+    # every other respect (sonnet via MODEL_DEFAULT fallback, absent from
+    # MODEL_DEFAULT_PER_WORKER).
+    "rebaser": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -987,7 +994,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
-                "integration_judge")
+                "integration_judge", "rebaser")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1529,6 +1536,29 @@ SCHEMAS: dict[str, dict] = {
                 "type": "string",
                 "enum": ["resolved", "design-conflict", "failed"],
             },
+            "resolution_summary": {"type": "string"},
+            "diagnosis": {"type": ["string", "null"]},
+            "confidence": _confidence_schema(["resolution"]),
+        },
+    },
+    # DESIGN §6 *Finalization* "Rebase-onto-base before push" — a scoped,
+    # fully-agentic exception to §12: the worker does the ENTIRE rebase
+    # workflow itself (fetch, rebase, per-hunk conflict resolution, and the
+    # abort-if-irreconcilable judgment call), not just conflict-resolution
+    # content layered on mechanical bash rebase/abort logic. Mirrors
+    # `integrator`'s resolved/design-conflict/failed trichotomy shape, with
+    # "irreconcilable" naming the abort outcome explicitly (distinct from
+    # "failed", which covers a worker-side error rather than a deliberate,
+    # reasoned abort).
+    "rebaser": {
+        "type": "object",
+        "required": ["status", "final_branch_state", "confidence"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["rebased", "irreconcilable", "failed"],
+            },
+            "final_branch_state": {"type": "string"},
             "resolution_summary": {"type": "string"},
             "diagnosis": {"type": ["string", "null"]},
             "confidence": _confidence_schema(["resolution"]),
@@ -9300,6 +9330,162 @@ def run_recapture_deps(
         log("recapture: all eligible runs already captured (use --force to re-run)")
 
 
+def run_rebaser(
+        leerie_root: Path,
+        repo_root: Path,
+        run_id: str,
+        worktree: Path,
+        run_branch: str,
+        working_branch: str,
+        pr_base_branch: str,
+) -> dict:
+    """Host-side entrypoint for the `rebaser` worker (DESIGN §6 *Finalization*
+    "Rebase-onto-base before push"). Same host-seam shape as
+    `run_recapture_deps` above: `scripts/host-finalize.sh` invokes this via
+    the `python3 -` heredoc pattern used by `./leerie config --recapture`
+    (leerie:1121-1163) — see that call site for the exact bash side.
+
+    `worktree` is a disposable `git worktree add` copy of `run_branch`,
+    created by the caller (`host-finalize.sh`) BEFORE this runs and removed
+    by the caller AFTER — this function only operates inside it via the
+    `rebaser` worker's own `cwd`.
+
+    This is a scoped, fully-agentic exception to §12 ("prompts are advisory,
+    code enforces"): the worker performs the entire rebase workflow itself —
+    fetch, rebase, per-hunk conflict resolution preserving both branches'
+    intent, and the abort-if-irreconcilable judgment call — rather than each
+    mechanical step being coded with only conflict-resolution *content*
+    delegated to a worker (contrast `integrator`, whose merge mechanics are
+    driven by `integrate_wave` in Python). Returns the worker's
+    schema-validated verdict dict (`status` / `final_branch_state` /
+    `resolution_summary` / `diagnosis` / `confidence`) UNVERIFIED — the
+    caller (`host-finalize.sh`) is responsible for the mechanical
+    post-hoc check (no conflict markers / not mid-rebase on a "rebased"
+    claim; worktree tip unchanged on an "irreconcilable"/"failed" claim)
+    before trusting this result, per the same "don't trust the self-report"
+    discipline used for `integrator`.
+
+    Runs `check_rebaser_worktree_state` itself before returning — the caller
+    can trust the returned `status`, it does not need to re-verify.
+
+    Never raises for an ordinary worker failure — swallows to a
+    `{"status": "failed", ...}` result — so the caller's push path is never
+    blocked by this being best-effort (DESIGN §6 hard requirement: never
+    pause/block finalize over the rebase)."""
+    caps = dict(DEFAULT_CAPS)
+
+    class _MinimalArgs:
+        model = None
+        pr_writer_model = None
+        effort = None
+
+    _args = _MinimalArgs()
+    models = resolve_models(repo_root, _args)
+    efforts = resolve_efforts(repo_root, _args)
+
+    try:
+        st = State(leerie_root, run_id, repo_root=repo_root)
+    except StateLockedError as e:
+        return {
+            "status": "failed",
+            "final_branch_state": "skipped",
+            "resolution_summary": "",
+            "diagnosis": f"run dir locked by another orchestrator: {e.run_dir}",
+            "confidence": {"resolution": 0.0},
+        }
+    st.load()
+
+    # Worker-budget pre-check (mirrors capture_repo_deps's identical guard
+    # above): the run has already spent its budget across the whole
+    # orchestrate loop by the time finalize runs, so a rebaser call must
+    # respect the same max_total_workers ceiling — CLAUDE.md "Caps are real
+    # Python counters," not a worker that bounds itself.
+    wc = st.data.get("worker_count", 0)
+    if wc >= caps["max_total_workers"]:
+        return {
+            "status": "failed",
+            "final_branch_state": "skipped",
+            "resolution_summary": "",
+            "diagnosis": (
+                f"rebaser skipped: worker budget exhausted "
+                f"({wc}/{caps['max_total_workers']})"
+            ),
+            "confidence": {"resolution": 0.0},
+        }
+
+    pre_rebase_sha_r = asyncio.run(
+        run_proc(["git", "rev-parse", "HEAD"], cwd=str(worktree)))
+    if pre_rebase_sha_r.returncode != 0:
+        return {
+            "status": "failed",
+            "final_branch_state": "could not resolve worktree HEAD",
+            "resolution_summary": "",
+            "diagnosis": "git rev-parse HEAD failed in the disposable worktree",
+            "confidence": {"resolution": 0.0},
+        }
+    pre_rebase_sha = pre_rebase_sha_r.stdout.strip()
+
+    sys_prompt = load_prompt("rebaser")
+    user_prompt = (
+        f"Current branch (this worktree's checkout): {run_branch}\n"
+        f"Base branch to rebase onto: {pr_base_branch}\n"
+        f"Only replay commits unique to {run_branch} — i.e. the range "
+        f"{working_branch}..{run_branch} — onto the fresh tip of "
+        f"{pr_base_branch}. Do not touch any other branch."
+    )
+    try:
+        st.bump_workers(caps)
+        result = asyncio.run(claude_p(
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            schema_key="rebaser",
+            cwd=str(worktree),
+            allowed_tools=ACT_TOOLS,
+            max_turns=60,
+            autonomous=True,
+            caps=caps,
+            st=st,
+            model=models.get("rebaser", MODEL_DEFAULT),
+            effort=efforts.get("rebaser"),
+            sid=f"rebaser-{run_id}",
+        ))
+    # See run_recapture_deps's identical guard above: TerminalAuthFailure /
+    # RateLimitedExit are BaseException subclasses a bare `except Exception`
+    # would miss, and this call must never propagate past host-finalize.sh's
+    # best-effort rebase step.
+    except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
+        return {
+            "status": "failed",
+            "final_branch_state": "worker invocation error",
+            "resolution_summary": "",
+            "diagnosis": str(exc),
+            "confidence": {"resolution": 0.0},
+        }
+    # claude_p() returns the already schema-validated structured_output dict
+    # directly (not an envelope) — it raises WorkerError, never returns a
+    # dict missing required fields, so `result` here is always well-formed
+    # per SCHEMAS["rebaser"].
+    structured = result
+    claimed_status = structured.get("status")
+    mismatch = asyncio.run(check_rebaser_worktree_state(
+        worktree, claimed_status, pre_rebase_sha))
+    if mismatch is not None:
+        # The worker's self-report doesn't match observable git state —
+        # per §12, do not trust the claim. Downgrade to "failed" so the
+        # caller's push path treats this exactly like any other rebase
+        # failure (push the original branch, leave working_branch alone).
+        return {
+            "status": "failed",
+            "final_branch_state": structured.get("final_branch_state", ""),
+            "resolution_summary": structured.get("resolution_summary", ""),
+            "diagnosis": (
+                f"rebaser mechanical checkpoint failed: {mismatch}"
+            ),
+            "confidence": structured.get("confidence", {"resolution": 0.0}),
+        }
+    return structured
+
+
 def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
     """Return [(line_index, header_text, body_until_next_header), ...] for
     text. Supports three header styles:
@@ -9962,6 +10148,58 @@ async def check_integrator_commit(staging: Path) -> str | None:
            if f and f.startswith(".leerie/")]
     if bad:
         return f"integrator commit touched coordination files: {bad}"
+    return None
+
+
+async def check_rebaser_worktree_state(
+        worktree: Path, status: str, pre_rebase_sha: str) -> str | None:
+    """Mechanically verify the `rebaser` worker's claimed outcome (DESIGN §6
+    *Finalization* "Rebase-onto-base before push"). Returns an error string
+    on a mismatch, `None` if the claim checks out.
+
+    Per §12 ("the orchestrator does not trust an integrator's 'resolved'
+    claim; it confirms the merge was actually completed"), applied to
+    rebaser: a "rebased" claim requires an actually-clean, not-mid-rebase
+    tree; an "irreconcilable"/"failed" claim requires the worktree's tip to
+    be byte-identical to its pre-rebase sha (the abort must have actually
+    happened, restoring the original state). This does not re-judge whether
+    the *resolution itself* was semantically correct — only that the claimed
+    git-level outcome is real, mirroring `check_integrator_commit`'s
+    state-not-content discipline above."""
+    if status == "rebased":
+        marker_scan = await run_proc(
+            ["git", "diff", "--check"], cwd=str(worktree))
+        # `git diff --check` on a clean working tree also flags trailing
+        # whitespace, so a nonzero rc alone is not proof of conflict markers.
+        # Grep the actual tracked content for the marker patterns instead.
+        grep = await run_proc(
+            ["git", "grep", "-l", "-E",
+             r"^(<{7}|={7}|>{7})", "--", "."],
+            cwd=str(worktree))
+        if grep.returncode == 0 and grep.stdout.strip():
+            return (f"rebaser claimed 'rebased' but conflict markers remain "
+                    f"in: {grep.stdout.strip().splitlines()}")
+        for mid_rebase_dir in (".git/rebase-merge", ".git/rebase-apply"):
+            if (worktree / mid_rebase_dir).exists():
+                return (f"rebaser claimed 'rebased' but worktree is still "
+                        f"mid-rebase ({mid_rebase_dir} present)")
+        return None
+
+    # irreconcilable / failed: the worktree must be back to its pre-rebase
+    # tip — nothing left mid-rebase, nothing partially applied.
+    for mid_rebase_dir in (".git/rebase-merge", ".git/rebase-apply"):
+        if (worktree / mid_rebase_dir).exists():
+            return (f"rebaser claimed {status!r} but worktree is still "
+                    f"mid-rebase ({mid_rebase_dir} present) — abort did not "
+                    f"complete")
+    r = await run_proc(["git", "rev-parse", "HEAD"], cwd=str(worktree))
+    if r.returncode != 0:
+        return f"could not verify worktree HEAD after rebaser claimed {status!r}"
+    current_sha = r.stdout.strip()
+    if current_sha != pre_rebase_sha:
+        return (f"rebaser claimed {status!r} but worktree HEAD "
+                f"({current_sha}) differs from its pre-rebase sha "
+                f"({pre_rebase_sha}) — abort did not restore original state")
     return None
 
 

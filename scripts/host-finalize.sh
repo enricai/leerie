@@ -209,6 +209,138 @@ host_finalize() {
     fi
   fi
 
+  # --- best-effort rebase onto the latest base (DESIGN §6 *Finalization*
+  # "Rebase-onto-base before push") ---------------------------------------
+  # A run whose base advanced while it ran opens a PR that conflicts at
+  # merge time or reviews against a stale diff. This is strictly
+  # best-effort: every branch of this logic (worktree-add failure, a
+  # successful rebase, a resolved conflict, an aborted rebase) falls
+  # through to the push below unchanged — never blocks or pauses finalize.
+  #
+  # This is a scoped, fully-agentic exception to §12 ("prompts are
+  # advisory, code enforces"): the `rebaser` worker (invoked via
+  # `run_rebaser`, the same host-side python3 seam `./leerie
+  # config --recapture` uses for `run_recapture_deps`) does the ENTIRE
+  # rebase workflow itself — fetch, rebase, per-hunk conflict resolution,
+  # and the abort-if-irreconcilable judgment call — rather than each
+  # mechanical step being coded here with only conflict-resolution content
+  # delegated to a worker. `run_rebaser` mechanically re-verifies the
+  # worker's claimed outcome before returning (see
+  # `check_rebaser_worktree_state` in orchestrator/leerie.py) — this shell
+  # function trusts the returned `status` as-is.
+  # rebase_diagnosis_note is folded into pr_body once it's composed in step 2
+  # below (pr_body does not exist yet at this point in the function).
+  local rebase_diagnosis_note=""
+  if git -C "$USER_REPO" rev-parse --verify "refs/heads/$pr_base_branch" \
+       >/dev/null 2>&1 || \
+     git -C "$USER_REPO" ls-remote --exit-code --heads origin \
+       "$pr_base_branch" >/dev/null 2>&1; then
+    local _rebase_scratch _rebase_worktree
+    _rebase_scratch="$(mktemp -d)"
+    _rebase_worktree="$_rebase_scratch/rebase-${run_id}"
+    if git -C "$USER_REPO" worktree add "$_rebase_worktree" "$run_branch" \
+         >/dev/null 2>&1; then
+      echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
+      # Write the python3 seam to a script file rather than a heredoc nested
+      # inside command substitution — bash 3.2 (macOS's /bin/bash; see
+      # CLAUDE.md "must run on bash 3.2") fails to parse a `<<'PY' ... PY`
+      # heredoc when its closing redirection sits on the same line as a
+      # command-substitution close-paren (`)"`), which capturing this
+      # worker's JSON stdout requires. `./leerie config --recapture`'s
+      # heredoc avoids this because it never captures stdout.
+      local _rebaser_py="$_rebase_scratch/rebaser.py"
+      cat > "$_rebaser_py" <<'PY'
+import json, sys, importlib.util, pathlib
+
+leerie_root, repo_root, run_id, worktree, run_branch, working_branch, \
+    pr_base_branch, orch_path = (
+        pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3],
+        pathlib.Path(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7],
+        pathlib.Path(sys.argv[8]),
+    )
+
+spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+result = m.run_rebaser(leerie_root, repo_root, run_id, worktree,
+                        run_branch, working_branch, pr_base_branch)
+print(json.dumps(result))
+PY
+      local _rebaser_json _rebaser_rc=0
+      _rebaser_json="$(python3 "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
+          "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
+          "$working_branch" "$pr_base_branch" \
+          "$LEERIE_REPO/orchestrator/leerie.py" 2>&1)" || _rebaser_rc=$?
+
+      local _rebaser_status=""
+      if [ "$_rebaser_rc" -eq 0 ] && [ -n "$_rebaser_json" ]; then
+        _rebaser_status="$(printf '%s' "$_rebaser_json" | jq -r '.status // ""' 2>/dev/null || true)"
+      else
+        echo "[leerie] finalize: rebaser python seam failed (rc=$_rebaser_rc); skipping rebase" >&2
+        echo "$_rebaser_json" >&2
+      fi
+
+      # Fetch the worktree's HEAD into a scratch ref BEFORE removing the
+      # worktree — git refuses to fetch into a branch checked out in a
+      # worktree, and the run branch is exactly that inside
+      # $_rebase_worktree, so the fetch must land somewhere else first and
+      # only update the real branch ref once the worktree (which pins the
+      # checkout) is gone. Done unconditionally (regardless of status) so a
+      # "rebased" claim always has a scratch-ref snapshot available; unused
+      # scratch refs are deleted below.
+      local _rebase_scratch_ref="refs/leerie-rebase-scratch/${run_id}"
+      git -C "$USER_REPO" fetch "$_rebase_worktree" \
+        "HEAD:$_rebase_scratch_ref" --force >/dev/null 2>&1 || true
+      git -C "$USER_REPO" worktree remove --force "$_rebase_worktree" \
+        >/dev/null 2>&1 || true
+      rm -rf "$_rebase_scratch" 2>/dev/null || true
+
+      case "$_rebaser_status" in
+        rebased)
+          # Advance the run branch's local ref to the scratch-ref snapshot,
+          # then advance working_branch to the fresh base — otherwise a
+          # later working_branch..run_branch diff (rev_range / DIFF_BASE)
+          # would silently pick up the base's own unrelated commits (the
+          # PROVEN pitfall: git rebase --onto replays only the old range,
+          # so the stale working_branch is no longer the merge-base of the
+          # rebased branch).
+          if git -C "$USER_REPO" rev-parse --verify \
+               "$_rebase_scratch_ref" >/dev/null 2>&1 && \
+             git -C "$USER_REPO" update-ref \
+               "refs/heads/$run_branch" "$_rebase_scratch_ref"; then
+            working_branch="origin/$pr_base_branch"
+            _host_finalize_update_run_json "$run_json" \
+              "working_branch=$working_branch"
+            echo "[leerie] finalize: rebased $run_branch onto $pr_base_branch; working_branch now $working_branch" >&2
+          else
+            echo "[leerie] finalize: rebaser reported 'rebased' but fetch-back failed; pushing original branch" >&2
+          fi
+          ;;
+        irreconcilable|failed)
+          local _diagnosis
+          _diagnosis="$(printf '%s' "$_rebaser_json" | jq -r '.diagnosis // ""' 2>/dev/null || true)"
+          if [ -n "$_diagnosis" ] && [ "$_diagnosis" != "null" ]; then
+            rebase_diagnosis_note="
+
+## ⚠ Rebase onto \`$pr_base_branch\` was not applied
+
+$_diagnosis"
+          fi
+          echo "[leerie] finalize: rebase not applied ($_rebaser_status); pushing $run_branch as-is" >&2
+          ;;
+        *)
+          echo "[leerie] finalize: rebaser returned no usable status; pushing $run_branch as-is" >&2
+          ;;
+      esac
+      git -C "$USER_REPO" update-ref -d "$_rebase_scratch_ref" \
+        >/dev/null 2>&1 || true
+    else
+      rm -rf "$_rebase_scratch" 2>/dev/null || true
+      echo "[leerie] finalize: could not create rebase worktree; skipping rebase" >&2
+    fi
+  fi
+
   # Note the re-push (DESIGN §6 *Finalization*). If pushed_at is set and we
   # reached here, the early short-circuit above already ruled out both the
   # equal-tips no-op AND the diverged-origin case — so origin is a strict
@@ -358,6 +490,12 @@ EOF
     if [ -n "$deploy_note" ]; then
       pr_body="$pr_body$deploy_note"
     fi
+  fi
+
+  # Fold in the rebaser's diagnosis (if the best-effort rebase above was
+  # not applied) regardless of which pr_body composition path ran.
+  if [ -n "$rebase_diagnosis_note" ]; then
+    pr_body="$pr_body$rebase_diagnosis_note"
   fi
 
   # The resolved PR base (pr_base_branch, or working_branch when no

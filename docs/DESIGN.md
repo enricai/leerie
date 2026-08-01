@@ -1783,6 +1783,82 @@ does not match an existing template is **not fatal** — leerie logs a
 warning and falls back to the alphabetical default rather than
 blocking finalize over a cosmetic preference.
 
+**Rebase-onto-base before push (`rebaser` worker) — a scoped, fully-agentic
+exception to §12.** A run that takes a while can finish against a
+`pr_base_branch` that has since moved, so the PR it opens conflicts at merge
+time or is stale by the time a human reviews it. `host_finalize` addresses this
+with a best-effort rebase step, inserted after the empty-branch guard and
+before the push, that is deliberately **not** driven by mechanical bash
+rebase/conflict/abort logic. Instead, a single autonomous worker (`rebaser`,
+Sonnet, `EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"` matching
+`integrator`) is handed a disposable `git worktree add` copy of the run branch
+and told, in natural language, to fetch the latest `pr_base_branch`, rebase the
+run's own commits (`working_branch..run_branch`) onto it, resolve any
+conflicts itself — preserving the intent of *both* the run's changes and the
+upstream changes — and, if a conflict is genuinely semantically irreconcilable
+(not merely textually messy), abort the rebase itself and leave the branch
+untouched. It reports a schema-validated verdict
+(`status ∈ {rebased, irreconcilable, failed}` + `diagnosis` — the same
+trichotomy shape as `SCHEMAS["integrator"]`).
+
+This is a **named, deliberately scoped exception** to §12 ("prompts are
+advisory, code enforces"), not a change to that principle. §12 already has one
+precedent for this shape of carve-out: `--dangerously-skip-permissions` is "a
+documented breach of the §12 contract for that single invocation, not a
+softening of the contract." The `rebaser` worker is the same kind of exception,
+narrower still — scoped to one worker acting inside one disposable worktree,
+not a global run-level flag. The reasoning for the carve-out here is that the
+*procedure itself* (switch branches, detect a conflict, judge whether it is
+resolvable, resolve or abort) is not usefully decomposable into mechanically
+checkable sub-steps the way, say, "did the merge commit complete" is for
+`integrator` — the abort-or-resolve judgment call *is* the task, not a
+judgment layered on top of otherwise-mechanical git plumbing. This was
+validated empirically before being adopted: two live trials (a resolvable
+adjacent-line conflict, and a genuinely irreconcilable same-function
+mutually-exclusive business-logic conflict) both produced the intended
+outcome on the first attempt, independently confirmed by inspecting the
+resulting git state rather than trusting the worker's self-report.
+
+What stays mechanical, because it is cheap, objective, and losing it would be
+a regression rather than "unnecessary brittleness":
+
+- **Isolation.** The worker never operates on the user's real checkout or the
+  run's primary worktree — only a disposable `git worktree add` copy, matching
+  the containment already used for every other `ACT_TOOLS` + `autonomous=True`
+  worker (`implementer`, `conformer`, `integrator` — see §6 above; none of
+  their call sites pass a real-repo `cwd`).
+- **Post-hoc mechanical verification of the claimed outcome**, not of the
+  reasoning behind it: on `status: "rebased"`, `host_finalize` confirms the
+  worktree has no conflict markers and is not mid-rebase (no
+  `.git/rebase-merge` / `.git/rebase-apply`); on `status ∈ {irreconcilable,
+  failed}`, it confirms the worktree's tip is unchanged from the pre-rebase run
+  branch. This mirrors the existing discipline that "the orchestrator does not
+  trust an integrator's 'resolved' claim; it confirms the merge was actually
+  completed" (§12) — applied here as a new, small, purpose-built check (no
+  existing integrator-side check is reusable: `check_integrator_output` is a
+  no-op stub today, delegated to a separate `integration_judge` LLM gate per
+  §8, and `check_integrator_commit` verifies an unrelated invariant — that the
+  integrator's commit never touches `.leerie/` coordination files).
+- **`working_branch` bookkeeping.** A rebase changes the run branch's parent
+  chain, so a naive `working_branch..run_branch` diff after rebasing would
+  silently pick up unrelated upstream commits (verified directly: `git rebase
+  --onto NEWBASE UPSTREAM BRANCH` replays only `UPSTREAM..BRANCH`, and if
+  `UPSTREAM` — `working_branch` — sits behind `NEWBASE`, a later two-dot diff
+  against the stale `working_branch` includes `NEWBASE`'s own delta too). Only
+  on a verified successful rebase does `host_finalize` advance `working_branch`
+  to `origin/<pr_base_branch>`, in both the git-ref sense and in `run.json`, so
+  `rev_range`/`DIFF_BASE` keep computing the PR diff correctly. On an aborted
+  or failed rebase, `working_branch` is left untouched.
+- **Routing the outcome to the right push path.** `host_finalize` reads the
+  worker's schema-validated verdict and branches on it — push the rebased
+  branch, or push the original branch with the worker's `diagnosis` folded into
+  the PR body — without re-deriving or second-guessing *how* the worker
+  reached that verdict.
+- **Never blocking the run.** Every branch of this logic (worktree-creation
+  failure, a successful rebase, a resolved conflict, an aborted rebase) falls
+  through to a push; the rebase step is strictly best-effort and never returns
+  non-zero, pauses, or blocks finalize.
+
 Two flags control push and PR independently of body composition:
 
 - `--no-push` skips both the push and the PR; the run completes with the

@@ -85,6 +85,24 @@ smarter" — that is the wrong direction. The reverse is correct: a
 prompt-level rule that turns out to matter should become a code check
 with the prompt downgraded to documentation.
 
+**Scoped exception — finalize-time rebase.** The `rebaser` worker
+(finalize, `scripts/host-finalize.sh` → `orchestrator/leerie.py`'s
+`run_rebaser()`) is a deliberate, narrow exception to this principle: it
+is trusted to perform the entire rebase-onto-base workflow itself
+(branch switching, conflict detection, conflict resolution, and the
+abort-if-irreconcilable decision) rather than having each mechanical
+step coded and the LLM confined to conflict-resolution content only —
+see DESIGN.md §6 *Finalization* "Rebase-onto-base before push" for the
+full rationale and the empirical validation behind it. This exception
+is scoped to that one worker and its disposable worktree; it does not
+license moving other mechanical checks into prompts elsewhere. Code
+still confines the worker to a disposable `git worktree add` copy (never
+the user's real checkout) and mechanically re-checks the claimed outcome
+(`check_rebaser_worktree_state` — clean tree vs. actually aborted)
+before trusting it, mirroring the existing "don't trust an integrator's
+self-report" discipline this principle already establishes for
+`integrator`.
+
 ## No subagent spawning
 
 Workers are headless `claude -p` subprocess invocations, not in-session
