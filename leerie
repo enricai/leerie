@@ -7132,7 +7132,7 @@ elif [ "$RUNTIME" = "ec2" ]; then
     # (DESIGN §6 EC2 runtime lifecycle, "Pause/resume semantics".) Unlike
     # the Fly branch's PID-record auto-discovery, bare `resume` with no
     # `--run-id` is not yet supported for EC2 — the operator passes
-    # `--run-id` explicitly, matching how `--resume <run-id> --runtime
+    # `--run-id` explicitly, matching how `resume <run-id> --runtime
     # ec2` is documented. `run_id` IS the instance id conceptually (DESIGN
     # §6 "Run identifier"), but unlike Fly the instance id is not known
     # until create time on a fresh launch, so the sidecar lookup (not the
@@ -7168,8 +7168,8 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      remote_log "--resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
-      echo "  Run 'leerie list' to see known runs, or omit --resume to" >&2
+      remote_log "resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif provision_instance; then
@@ -7246,7 +7246,7 @@ EARLY_PROBE_PY
               >/dev/null \
           || _ec2_early_probe_rc=$?
         if [ "$_ec2_early_probe_rc" = "75" ]; then
-          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          remote_log "resume: early probe detected live orchestrator — skipping seed"
           _attach_to_live_orchestrator_ec2
           _ec2_skip_seed_launch=true
         fi
@@ -7393,7 +7393,7 @@ else
   # --- local container execution path ----------------------------------
   # --rm: container is removed on exit. Worktrees persist on the host via
   #       the /work bind mount; run state persists via the /leerie-state
-  #       bind mount (LEERIE_STATE_HOST_DIR), so --resume still works.
+  #       bind mount (LEERIE_STATE_HOST_DIR), so `resume` still works.
   # Mount-table rationale lives in docs/IMPLEMENTATION.md §0.5.
   #
   # TTY flags adapt to whether the launcher itself has a controlling terminal:
@@ -7501,13 +7501,13 @@ else
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
   # process tears the container down instead of orphaning it (an orphaned,
-  # still-Up container keeps holding the run-dir flock and wedges --resume).
+  # still-Up container keeps holding the run-dir flock and wedges `resume`).
   # nerdctl run -i normally forwards the signal to PID 1, but this is the
   # backstop for signals that don't get forwarded across the Colima VM
   # boundary or that arrive before/after nerdctl owns the tty.
   #   Limitation, by design: SIGKILL (signal 9, what OOM delivers) is
   #   uncatchable — this trap never runs in the OOM case. The stale-container
-  #   reaper on the next --resume (Fix E) is the backstop for that.
+  #   reaper on the next `resume` (Fix E) is the backstop for that.
   # The EXIT arm reorders vs the outer host-scratch trap (set earlier) so the
   # kill happens BEFORE the cidfile is removed; it then chains the original
   # cleanup so $STAGE and the cidfile are still removed.
