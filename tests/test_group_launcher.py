@@ -446,10 +446,10 @@ class TestGroupResumeDispatch:
         """--resume <group-id> resumes only the paused member."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0, result.stderr
-        assert f"--resume {RUN_ID_A}" in result.stub_log
-        assert f"--resume {RUN_ID_B}" not in result.stub_log
+        assert f"resume {RUN_ID_A}" in result.stub_log
+        assert f"resume {RUN_ID_B}" not in result.stub_log
 
     def test_resume_group_id_no_paused_runs_ok(self, tmp_path: Path) -> None:
         """No paused runs → exit 0 with friendly message."""
@@ -461,7 +461,7 @@ class TestGroupResumeDispatch:
             "fly_machine_id": RUN_ID_A,
         })
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0
         assert "no resumable" in (result.stdout + result.stderr).lower()
 
@@ -493,10 +493,10 @@ class TestGroupKillDispatch:
         """--kill <group-id> kills only live (not already-killed) members."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" in result.stub_log
-        assert f"--kill {RUN_ID_B}" not in result.stub_log
+        assert f"kill {RUN_ID_A}" in result.stub_log
+        assert f"kill {RUN_ID_B}" not in result.stub_log
 
     def test_kill_group_id_no_live_runs_ok(self, tmp_path: Path) -> None:
         """No live runs → exit 0 with friendly message."""
@@ -508,7 +508,7 @@ class TestGroupKillDispatch:
             "killed_at": "2026-07-01T10:00:00Z",
         })
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0
         assert "no live runs found" in (result.stdout + result.stderr).lower()
 
@@ -542,10 +542,10 @@ class TestGroupFinalizeDispatch:
         """--finalize <group-id> finalizes only the unpushed member."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0, result.stderr
-        assert f"--finalize {RUN_ID_A}" in result.stub_log
-        assert f"--finalize {RUN_ID_B}" not in result.stub_log
+        assert f"finalize {RUN_ID_A}" in result.stub_log
+        assert f"finalize {RUN_ID_B}" not in result.stub_log
 
     def test_finalize_group_id_no_pending_runs_ok(self, tmp_path: Path) -> None:
         """All runs already pushed → exit 0."""
@@ -557,7 +557,7 @@ class TestGroupFinalizeDispatch:
             "pushed_at": "2026-07-01T10:00:00Z",
         })
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=stub_log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=stub_log)
         assert result.returncode == 0
 
 
@@ -582,10 +582,10 @@ class TestChainRegressions:
             "fly_machine_id": RUN_ID_A,
         })
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", CHAIN_ID_OTHER],
+        result = _run(tmp_path, ["kill", CHAIN_ID_OTHER],
                       stub=stub, stub_log=stub_log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" in result.stub_log
+        assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_resume_chain_id_still_works(self, tmp_path: Path) -> None:
         """--resume <chain-id> still dispatches paused chain runs normally."""
@@ -599,7 +599,7 @@ class TestChainRegressions:
             "fly_machine_id": RUN_ID_A,
         })
         stub, stub_log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", CHAIN_ID_OTHER],
+        result = _run(tmp_path, ["resume", CHAIN_ID_OTHER],
                       stub=stub, stub_log=stub_log)
         assert result.returncode == 0, result.stderr
-        assert f"--resume {RUN_ID_A}" in result.stub_log
+        assert f"resume {RUN_ID_A}" in result.stub_log
