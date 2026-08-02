@@ -305,3 +305,35 @@ def test_finalize_uuid_dispatches_unpushed_runs(tmp_path: Path) -> None:
     assert f"finalize {RUN_ID_1}" in stub
     # Already pushed → not finalized again.
     assert f"finalize {RUN_ID_2}" not in stub
+
+
+# ---------------------------------------------------------------------------
+# Deprecated --chain-* aliases are hard-removed (no shim)
+# ---------------------------------------------------------------------------
+
+
+def test_removed_chain_aliases_match_no_verb_arm(tmp_path: Path) -> None:
+    """The five deprecated --chain-* aliases (--chain-submit, --chain-status,
+    --list-chains, --chain-kill, --chain-attach) must not match any launcher
+    verb-dispatch arm anymore. None of them is a recognized bare verb or a
+    live flag, so each falls through identically to the generic
+    unrecognized-argument path — the same path a made-up bogus flag hits —
+    rather than being special-cased into chain-scoped behavior.
+    """
+    state_dir = tmp_path / ".leerie" / "myrepo"
+    state_dir.mkdir(parents=True)
+    control = _run(tmp_path, ["--totally-bogus-flag-xyz"], use_self_stub=False)
+    for alias in (
+        "--chain-submit", "--chain-status", "--list-chains",
+        "--chain-kill", "--chain-attach",
+    ):
+        result = _run(tmp_path, [alias], use_self_stub=False)
+        out = result.stdout + result.stderr
+        # None of the chain-dispatch machinery (run.json discovery,
+        # per-run recursive dispatch) is reachable through the alias.
+        assert CHAIN_ID not in out
+        assert "chain_id" not in out
+        # Falls through to the exact same code path as an arbitrary
+        # unrecognized flag would — proving the alias has no special
+        # dispatch arm left in the launcher.
+        assert result.returncode == control.returncode
