@@ -12,7 +12,7 @@ anywhere. The script is the orchestrator; each `claude -p` call is a leaf.
 
 Usage:
     leerie "<task description>"
-    leerie --resume
+    leerie resume
     leerie "<task>" --answers answers.json
     leerie "<task>" --clarify             # opt into surfacing intent questions
 
@@ -3215,14 +3215,14 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
     except BaseException as ce:
         log(f"  cleanup before sleep failed (non-fatal): {ce}")
     log(f"  {reason} — sleeping {wait_seconds}s then auto-resuming; "
-        f"Ctrl-C to stop and resume manually (leerie --resume {st.run_id})")
+        f"Ctrl-C to stop and resume manually (leerie resume {st.run_id})")
     try:
         time.sleep(wait_seconds)
     except KeyboardInterrupt:
         # User bailed on the wait — state + branches already preserved (cleanup
         # ran above), so a manual --resume picks up cleanly.
         log("interrupted by user (SIGINT) during rate-limit sleep — state "
-            f"preserved (resume with leerie --resume {st.run_id})")
+            f"preserved (resume with leerie resume {st.run_id})")
         return 130
     except InterruptedBySignal as e:
         # SIGTERM/SIGHUP during the wait (CI cancel, systemd stop, terminal
@@ -3230,7 +3230,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
         # main()'s top-level InterruptedBySignal arm does, instead of letting it
         # escape uncaught (a sibling except can't catch it) as a bare traceback.
         log(f"  interrupted by signal ({e}) during rate-limit sleep — state "
-            f"preserved (resume with leerie --resume {st.run_id})")
+            f"preserved (resume with leerie resume {st.run_id})")
         signum = getattr(signal, str(e), None)
         return (128 + int(signum)) if signum else 1
     log(f"  auto-resuming: exec orchestrator --resume {st.run_id}")
@@ -3243,7 +3243,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
         # sibling except arms as a bare traceback. Cleanup already ran, so fall
         # back to the manual-resume path with EX_TEMPFAIL.
         log(f"  auto-resume exec failed ({ex}); resume manually: "
-            f"leerie --resume {st.run_id}")
+            f"leerie resume {st.run_id}")
         return EXIT_LOCKED  # 75, EX_TEMPFAIL
     # Unreachable: a successful execv replaces the process.
     return None
@@ -3348,7 +3348,7 @@ def _validate_run_json(data: dict) -> None:
        (provision.sh writes the two together; the only way to violate
        this is external mutation).
 
-    Raises ValueError on any violation. Caller (e.g., `leerie --list`)
+    Raises ValueError on any violation. Caller (e.g., `leerie list`)
     decides whether to die, warn, or render as `status=corrupt-sidecar`."""
     if not isinstance(data, dict):
         raise ValueError("run.json must be a JSON object")
@@ -3393,7 +3393,7 @@ def _validate_run_json(data: dict) -> None:
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
-    # and the user is told to recover manually + then `leerie --kill`.
+    # and the user is told to recover manually + then `leerie kill`.
     # Orthogonal to paused/pushed/killed — the machine isn't paused or
     # killed, just has un-synced work — so no mutual exclusion with the
     # other terminal states. Mutex'd against pushed/killed (a synced+
@@ -3603,7 +3603,7 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
       with a default.
 
     Both shapes sort together by `started_at` descending (newest
-    first) for stable display in `leerie --list`.
+    first) for stable display in `leerie list`.
 
     Pure read; no writes. Returns [] if `leerie_root/runs` doesn't
     exist."""
@@ -3671,7 +3671,7 @@ _AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
 def _run_status_for(run: dict, leerie_root: Path) -> str:
     """Derived status for a `_discover_runs` row.
 
-    Reads the run.json sidecar (same source `leerie --list` consults) and
+    Reads the run.json sidecar (same source `leerie list` consults) and
     hands it to `_derive_run_status` alongside the state.json dict the
     discovery already parsed. Falls back to state.json alone when the
     sidecar is missing or unreadable — status is best-effort UX here, not
@@ -3736,7 +3736,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
             f"run-id {cli_run_id!r} does not match any known run. "
-            f"Available: {available}. Use `leerie --list` to enumerate."
+            f"Available: {available}. Use `leerie list` to enumerate."
         )
     if not runs:
         die(
@@ -3754,7 +3754,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
         die(
             "no resumable run found (every run is finished, killed, or needs "
             "attention first). Pass an explicit run-id to force one:\n  "
-            f"{available}\nUse `leerie --list` to see full details."
+            f"{available}\nUse `leerie list` to see full details."
         )
     candidates.sort(key=lambda r: _run_recency_key(r, leerie_root))
     picked = candidates[-1]
@@ -3772,10 +3772,10 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
     """Build the per-row hint string for `resolve_run_id`'s
     multiple-runs error message. Combines run_id, derived status,
     started_at, and a last-activity time so the user can tell which
-    run is live without an extra `leerie --list` invocation.
+    run is live without an extra `leerie list` invocation.
 
     Reads run.json from disk for `_derive_run_status` (same source
-    `leerie --list` consults). Falls back gracefully when sidecar or
+    `leerie list` consults). Falls back gracefully when sidecar or
     state.json is unreadable — disambiguation is best-effort UX, not
     a correctness boundary."""
     run_id = run["run_id"]
@@ -3824,7 +3824,7 @@ def _format_age(seconds: float) -> str:
     return f"{d}d{h}h ago" if h else f"{d}d ago"
 
 
-# --- run status (consumed by `leerie --list`) -------------------------
+# --- run status (consumed by `leerie list`) -------------------------
 
 # The derived statuses returned by `_derive_run_status`. Status is
 # *derived* from run.json + state.json fields, not stored, so the value
@@ -3873,7 +3873,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       5. pushed_at set             → `done-pushed-no-pr`.
       6. sync_failed_at set        → `sync-failed` (machine still up, work
                                      not on host yet — recover via
-                                     `leerie --finalize` then `--kill`).
+                                     `leerie finalize` then `kill`).
       6½. finished_at set but
           completed_waves <
           len(waves), and no
@@ -4016,7 +4016,7 @@ def _list_runs(
     runtime_filter: str | None = None,
 ) -> None:
     """Render a sortable columnar table of runs to stdout. Used by
-    `leerie --list`. Reads run.json sidecar (commit 4) for status
+    `leerie list`. Reads run.json sidecar (commit 4) for status
     derivation; falls back to state.json fields for runs without a
     sidecar.
 
@@ -20652,7 +20652,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     launcher polls `finished_at` as the "ready to push" sentinel, and
     there is no run branch to push (none was materialized). `_derive_
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
-    and renders the run as `done` in `leerie --list`.
+    and renders the run as `done` in `leerie list`.
 
     Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
     fail its non-empty-branch check and `cleanup.sh` has no subtask
@@ -24633,7 +24633,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     completed = st.data.get("completed_waves", 0)
     if isinstance(waves, list) and completed < len(waves):
         die(f"refusing to finalize: only {completed} of {len(waves)} waves "
-            f"complete. Resume to finish: leerie --resume {st.run_id}")
+            f"complete. Resume to finish: leerie resume {st.run_id}")
     proc = await _run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
@@ -24939,7 +24939,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 log(f"run id: {st.run_id}")
                 # Initialize run.json with the immutable run-identity
                 # fields (run_id, branch, working_branch, pr_base_branch,
-                # started_at, task) so `leerie --list` can enumerate this
+                # started_at, task) so `leerie list` can enumerate this
                 # run from the moment it has a stable identity — not only
                 # after finalize. Only needed once — a resumed run that
                 # reaches here (paused before phase_classify completed)
@@ -25838,7 +25838,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         log(f"another orchestrator already owns run {run_id!r} "
             f"(holding flock on {e.run_dir}). "
             f"Tail it without spawning a duplicate: "
-            f"`leerie --resume {run_id}`. "
+            f"`leerie resume {run_id}`. "
             f"If the holder is wedged, kill it and retry.")
         sys.exit(EXIT_LOCKED)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
@@ -26118,7 +26118,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         log(f"auth session locked — {e.raw_message}")
         log(f"  run `claude /login` (or refresh CLAUDE_CODE_OAUTH_TOKEN), "
-            f"then resume with: leerie --resume {st.run_id}")
+            f"then resume with: leerie resume {st.run_id}")
         abnormal = False
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
@@ -26174,7 +26174,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # doesn't re-run it. EXIT_LOCKED is the launcher's preserve-state
             # pause pivot — reuse it rather than minting a new code.
             log(f"out of credits — {e.raw_message}")
-            log(f"  add credits, then resume with: leerie --resume {st.run_id}")
+            log(f"  add credits, then resume with: leerie resume {st.run_id}")
             abnormal = False
             try:
                 _cleanup_on_abnormal_exit(st, full_purge=False)
@@ -26231,7 +26231,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log("interrupted by user (SIGINT) — worktree cleanup; "
-            f"state preserved (resume with leerie --resume {st.run_id})")
+            f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
         try:
@@ -26254,7 +26254,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log(f"interrupted by signal ({e}) — worktree cleanup; "
-            f"state preserved (resume with leerie --resume {st.run_id})")
+            f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal.
         try:
