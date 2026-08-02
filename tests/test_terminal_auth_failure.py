@@ -2,7 +2,7 @@
 `claude_p` into a resumable EXIT_LOCKED pause (DESIGN §6 credential
 strategy, bugfix-003).
 
-Run b57027d3… (funeralworks) died after 78 workers of successful planning
+Run b57027d3… (sibling-service) died after 78 workers of successful planning
 spend with:
 
     leerie: error: worker failed schema-valid output twice:
@@ -41,7 +41,7 @@ import pytest
 
 
 # The verbatim envelope shape from
-# ~/.leerie/funeralworks/runs/b57027d3.../logs/fit-judge-bugfix-016-1-d1.log
+# ~/.leerie/sibling-service/runs/b57027d3.../logs/fit-judge-bugfix-016-1-d1.log
 # (quoted verbatim in the task brief). api_error_status is null and
 # subtype is "success" — this is a session-level auth failure, not a
 # gateway rejection.

@@ -92,6 +92,27 @@ Do this extraction yourself, from the task prose — never leave it for a
 downstream regex or string match. If the task prescribes nothing beyond
 "do the work," leave `is_prescribed` false and `commands` empty.
 
+## Required items
+
+Some tasks state explicit, enumerable requirements — a numbered checklist,
+"must include steps 1 through 5," "cover every item in the spec below."
+Extract these as structured data in `required_items`, one entry per item:
+
+- `item` (string): the requirement itself, concise and specific enough
+  that a plan either covers it or doesn't — not a paraphrase of the whole
+  task.
+- `source_ref` (string, optional): where in the task this requirement
+  comes from (e.g. "item 3 of the checklist," "the Definition of done
+  section").
+
+This is deliberately narrow. Only extract items that are genuinely
+enumerable and explicit — a task that describes a goal in prose ("add
+pagination to the API") has no `required_items`; forcing a vague goal into
+a checklist item produces exactly the kind of unmovable false-positive a
+downstream mechanical check cannot resolve. When in doubt, omit the item
+rather than invent one. Most tasks have no `required_items` at all — leave
+the array empty or omit the field.
+
 If the task includes feature work, set `source_of_truth_question` to `true`.
 The orchestrator resolves the value from a preference (`--source-of-truth`
 CLI flag → `LEERIE_SOURCE_OF_TRUTH` env var → per-repo `leerie.toml`
@@ -140,6 +161,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "forbid_manual": false,
     "evidence": ""
   },
+  "required_items": [],
   "likely_already_satisfied": false,
   "likely_already_satisfied_evidence": ""
 }

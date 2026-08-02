@@ -118,7 +118,7 @@ case "$remote_cmd" in
   *"cat > /tmp/leerie-inspect-"*"-subs/"*)
     # Submodule bundle pipe. Extract <base>-subs/<bn> from the command.
     bn_with_subs="${{remote_cmd##*cat > /tmp/leerie-inspect-}}"
-    # bn_with_subs is now like "stackpulse-subs/vendor_foo.bundle'"
+    # bn_with_subs is now like "sibling-service-subs/vendor_foo.bundle'"
     bn_with_subs="${{bn_with_subs%\\'*}}"  # strip trailing quote
     _drain_to "$DEST/tmp-leerie-inspect-$bn_with_subs"
     exit 0

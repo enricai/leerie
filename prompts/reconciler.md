@@ -7,7 +7,7 @@ Each planner ran on a single domain (e.g., `testing`, `feature-implementation`,
 declared the abstract capabilities their subtasks `provides` and `requires`.
 The orchestrator wires cross-domain dependencies by matching `requires` against
 `provides` — but only as **literal string equality**. If one planner said
-`slm-capture-shim` and another said `capture-slm-call-implemented` for the
+`event-capture-shim` and another said `capture-call-implemented` for the
 *same thing*, the match fails and the run aborts.
 
 Your job is to reason over the full task + the merged subtasks + the list of
@@ -41,7 +41,7 @@ The orchestrator gives you, in your prompt, a JSON payload:
     ...
   ],
   "unresolved_requires": [
-    {"sid": "test-001", "tag": "capture-slm-call-implemented"},
+    {"sid": "test-001", "tag": "capture-call-implemented"},
     {"sid": "test-001", "tag": "events-ndjson-format"},
     ...
   ]
@@ -237,7 +237,7 @@ action from this priority order:
    the same capability as the unresolved tag (synonym, reordering, plural
    form, hyphenation difference, abbreviation), emit a rename to the existing
    `provides` value. Examples of "plausibly the same":
-   - `capture-slm-call-implemented` ⇄ `slm-capture-shim` (both describe the
+   - `capture-call-implemented` ⇄ `event-capture-shim` (both describe the
      same capture infrastructure).
    - `events-ndjson-format` ⇄ `events-ndjson-emitter` (the format produced by
      the emitter is the same artifact).
@@ -332,27 +332,27 @@ Input:
   "subtasks": [
     {"id": "feat-001", "title": "slm capture shim",
      "intent": "Wrap each claude_p call so envelopes flow to events.ndjson",
-     "provides": ["slm-capture-shim"], "requires": []},
+     "provides": ["event-capture-shim"], "requires": []},
     {"id": "feat-002", "title": "events.ndjson emitter",
      "intent": "Write captured envelopes to .leerie/runs/<id>/events.ndjson",
-     "provides": ["events-ndjson-emitter"], "requires": ["slm-capture-shim"]},
+     "provides": ["events-ndjson-emitter"], "requires": ["event-capture-shim"]},
     {"id": "test-001", "title": "Test slm capture",
      "intent": "Verify envelopes are captured for every claude_p call",
-     "provides": [], "requires": ["capture-slm-call-implemented"]},
+     "provides": [], "requires": ["capture-call-implemented"]},
     {"id": "test-002", "title": "Test ndjson format",
      "intent": "Verify ndjson line format matches the documented schema",
      "provides": [], "requires": ["events-ndjson-format"]}
   ],
   "unresolved_requires": [
-    {"sid": "test-001", "tag": "capture-slm-call-implemented"},
+    {"sid": "test-001", "tag": "capture-call-implemented"},
     {"sid": "test-002", "tag": "events-ndjson-format"}
   ]
 }
 ```
 
 Reasoning:
-- `capture-slm-call-implemented` is what `feat-001` provides as
-  `slm-capture-shim`. Same thing, different words → **rename**.
+- `capture-call-implemented` is what `feat-001` provides as
+  `event-capture-shim`. Same thing, different words → **rename**.
 - `events-ndjson-format` is the format produced by `feat-002`'s
   `events-ndjson-emitter`. Same thing → **rename**.
 
@@ -360,7 +360,7 @@ Output:
 ```json
 {
   "renames": [
-    {"sid": "test-001", "from": "capture-slm-call-implemented", "to": "slm-capture-shim"},
+    {"sid": "test-001", "from": "capture-call-implemented", "to": "event-capture-shim"},
     {"sid": "test-002", "from": "events-ndjson-format", "to": "events-ndjson-emitter"}
   ],
   "added_provides": [],
@@ -378,7 +378,7 @@ Output:
 Input (abridged):
 ```
 {
-  "task": "migrate this repo fully to AWS, just like stackpulse/navegando",
+  "task": "migrate this repo fully to AWS, just like our sibling service",
   "subtasks": [
     {"id": "deps-001", "intent": "Add AWS SDK runtime clients",
      "provides": ["aws-sdk-runtime-deps-present"], "requires": []},
@@ -438,7 +438,7 @@ Output (relevant arrays only):
 Input (abridged):
 ```
 {
-  "task": "migrate this repo fully to AWS, just like stackpulse/navegando",
+  "task": "migrate this repo fully to AWS, just like our sibling service",
   "subtasks": [
     {"id": "config-006",
      "intent": "Define the production env-var keyset (VITE_* build-time "

@@ -270,13 +270,11 @@ class TestSplitterCrashBarrier:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -320,13 +318,11 @@ class TestDecomposeSnapshotPersistence:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -360,13 +356,11 @@ class TestDecomposeSnapshotPersistence:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -392,13 +386,11 @@ class TestDecomposeSnapshotPersistence:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):

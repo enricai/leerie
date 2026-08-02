@@ -481,7 +481,7 @@ def test_gate_silent_on_acyclic_plan(leerie):
         ("config-002", ["c2"], ["f3"], []),
         ("docs-001", [], ["c1", "c2"], []),
     ]),
-    ("navegando-bugfix-no-recon", [
+    ("sibling-service-bugfix-no-recon", [
         ("bugfix-001", ["b1"], [], []),
         ("bugfix-002", ["b2"], ["b1"], []),
         ("feat-001", ["f1"], ["b2"], []),

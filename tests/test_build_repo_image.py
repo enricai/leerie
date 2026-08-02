@@ -752,21 +752,28 @@ def test_bundle_path_runtime_env_points_at_opt_when_baked():
 
 # ---------------------------------------------------------------------------
 # Regression guard: the already-shipped consumer-half functions
-# (_is_baked_ecosystem_command, _is_node_offline_relink,
-# _format_provision_recipe_section, _filter_residual_deps) must remain
-# untouched by this feature — per prompts/fix-dep-capture-bake.md's
-# explicit constraint.
+# (_is_baked_ecosystem_command, _format_provision_recipe_section,
+# _filter_residual_deps) must remain untouched by this feature — per
+# prompts/fix-dep-capture-bake.md's explicit constraint.
+#
+# `_is_node_offline_relink` was a fourth entry here and has been removed:
+# it had no callers anywhere. `_filter_residual_deps` tests the same
+# condition inline and deliberately more broadly (pnpm wants both
+# --offline and --frozen-lockfile; npm and yarn each stand on one), so the
+# pnpm-only helper was superseded rather than orphaned by a lost call
+# site. Pinning the existence of a function nothing calls only guarantees
+# it stays dead. The constraint above was scoped to that feature's work,
+# which shipped long ago.
 # ---------------------------------------------------------------------------
 
 def test_consumer_half_functions_present_and_unmodified_markers():
-    """These four functions must still exist with their documented
+    """These three functions must still exist with their documented
     docstrings/behavior — a byte-for-byte diff check belongs in `git diff`
     at review time (see the plan's Verification section), but this test
     guards that they were not accidentally deleted or renamed."""
     orch_text = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
     for fn in (
         "def _is_baked_ecosystem_command(",
-        "def _is_node_offline_relink(",
         "def _format_provision_recipe_section(",
         "def _filter_residual_deps(",
     ):

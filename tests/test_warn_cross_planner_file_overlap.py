@@ -52,7 +52,7 @@ def test_overlap_within_same_planner_does_not_warn(leerie, monkeypatch):
 
 
 def test_cross_planner_overlap_warns(leerie, monkeypatch):
-    """The stackpulse failure case: feat-001 and refactor-001 both
+    """The sibling-service failure case: feat-001 and refactor-001 both
     claim src/app/globals.css with contradictory criteria."""
     lines = _capture_logs(leerie, monkeypatch)
     plans = [

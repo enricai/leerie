@@ -174,13 +174,11 @@ class TestRecursionExpansion:
 
         with (
             patch.object(leerie, "load_prompt", return_value="system-prompt"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=fake_planner_result)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -219,14 +217,12 @@ class TestRecursionExpansion:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -268,14 +264,12 @@ class TestWellFitPassThrough:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -303,14 +297,12 @@ class TestWellFitPassThrough:
 
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
@@ -341,13 +333,11 @@ class TestExpansionRemapsDependsOn:
         efforts = {k: None for k in leerie.WORKER_TYPES}
         with (
             patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "extract_task_file_structure", return_value=[]),
             patch.object(leerie, "build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "check_task_file_coverage", return_value=[]),
             patch.object(leerie, "recursive_decompose",
                          new=AsyncMock(side_effect=fake_decompose)),
         ):

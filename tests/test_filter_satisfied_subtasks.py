@@ -260,7 +260,7 @@ def test_probe_payload_carries_surviving_siblings_excluding_self(
 
 def test_sibling_invalidation_verdict_keeps_the_dropped_test(
         leerie, tmp_path, monkeypatch):
-    """The funeralworks shape: test-007 passes on the base tree (would be
+    """The sibling-service shape: test-007 passes on the base tree (would be
     dropped) but feat-001 will invalidate it. When the probe returns
     satisfied=false (its sibling-invalidation guard firing), the test subtask
     is KEPT, not silently dropped."""
@@ -421,7 +421,7 @@ def _req(*tags):
 
 def test_dropped_provider_orphans_requires_tag_is_pruned(
         leerie, tmp_path, monkeypatch):
-    """Regression: the navegando 2026-07-17 failure. A consolidation subtask
+    """Regression: the sibling-service 2026-07-17 failure. A consolidation subtask
     `requires` a tag provided ONLY by a dropped subtask; the drop must prune
     that inbound `requires` (the tag channel), not just `depends_on` (the id
     channel). Without the tag prune validate_plan die()s with

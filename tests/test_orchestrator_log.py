@@ -5,7 +5,7 @@ user-visible contract that tests/test_remote_log.py guards for the
 host-side bash remote_log(). Both halves of the shell ↔ python boundary
 have to render the same `<repo>` tag, otherwise the prefix flips
 mid-stream when the launcher starts tailing the remote orchestrator
-(observed: bash prints `[stackpulse]`, python prints `[work]` because
+(observed: bash prints `[sibling-service]`, python prints `[work]` because
 cwd inside the Fly machine is /work).
 
 The critical property locked in here: USER_REPO wins over cwd, so
@@ -71,11 +71,11 @@ def test_log_uses_user_repo_basename(tmp_path):
     # USER_REPO, not the cwd basename.
     work = tmp_path / "work"
     work.mkdir()
-    line = _invoke_log("hello", user_repo="stackpulse", cwd=work)
+    line = _invoke_log("hello", user_repo="sibling-service", cwd=work)
     m = PREFIX_RE.match(line)
     assert m, f"no prefix match: {line!r}"
-    assert m.group("repo") == "stackpulse", (
-        f"expected [stackpulse], got [{m.group('repo')}] — "
+    assert m.group("repo") == "sibling-service", (
+        f"expected [sibling-service], got [{m.group('repo')}] — "
         "USER_REPO is not winning over cwd"
     )
     assert m.group("body") == "hello"
@@ -88,10 +88,10 @@ def test_log_uses_user_repo_basename_when_value_is_a_path(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     line = _invoke_log(
-        "hi", user_repo="/Users/andres/src/enric/stackpulse", cwd=work
+        "hi", user_repo="/Users/andres/src/enric/sibling-service", cwd=work
     )
     m = PREFIX_RE.match(line)
-    assert m and m.group("repo") == "stackpulse"
+    assert m and m.group("repo") == "sibling-service"
 
 
 def test_log_falls_back_to_cwd_basename_when_user_repo_unset(tmp_path):

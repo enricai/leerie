@@ -1,11 +1,16 @@
-"""Tests for task-referenced file extraction and coverage checking.
+"""Tests for task-referenced file resolution.
 
-Covers ``glob_task_references``, ``extract_task_file_structure``,
-``check_task_file_coverage``, and ``_format_task_file_structure``.
+Covers ``_expand_braces``, ``glob_task_references``, ``_repo_rel`` and
+``_format_task_file_references`` — all pure path arithmetic. leerie names
+the files a task points at; the planner and ``task_coverage_judge`` read
+them. Nothing here parses their contents, and ``TestProseHarvestAbsent``
+pins that the machinery which used to cannot return.
 """
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
 
 
 # --- glob_task_references ------------------------------------------------ #
@@ -84,248 +89,110 @@ class TestGlobTaskReferences:
 
 # --- extract_task_file_structure ---------------------------------------- #
 
-class TestExtractTaskFileStructure:
-    def test_no_files_returns_none(self, leerie, tmp_path):
-        assert leerie.extract_task_file_structure(
-            "fix the bug", tmp_path) is None
+class TestFormatTaskFileReferences:
+    """The planner is told WHICH files the task names; it reads them itself.
 
-    def test_markdown_headings_h3_plus(self, leerie, tmp_path):
-        (tmp_path / "spec.md").write_text(
-            "# Overview\n## Details\n### Deep\n#### Deeper\nSome text\n")
-        items = leerie.extract_task_file_structure(
-            "check spec.md", tmp_path)
-        assert items is not None
-        assert not any("Overview" in i for i in items)
-        assert not any("Details" in i for i in items)
-        assert any("Deep" in i for i in items)
-        assert any("Deeper" in i for i in items)
+    leerie used to harvest markdown headings and YAML keys out of those
+    files with regex (`extract_task_file_structure`), classify the
+    harvested prose (`_is_uncoverable_convention_item`), and
+    substring-match the result against the plan text
+    (`check_task_file_coverage`) — three layers of prose parsing, and the
+    mechanism that froze run 2026-07-19 for 33 identical feedback rounds
+    on a ratio no planner could move. Coverage of what those files require
+    is `task_coverage_judge`'s job (phase 2⅞½); its prompt now tells it to
+    read them. See `TestProseHarvestAbsent` below.
+    """
 
-    def test_numbered_items(self, leerie, tmp_path):
-        (tmp_path / "plan.md").write_text(
-            "1. First step\n2. Second step\nNot numbered\n")
-        items = leerie.extract_task_file_structure(
-            "implement plan.md", tmp_path)
-        assert items is not None
-        assert any("First step" in i for i in items)
-        assert any("Second step" in i for i in items)
+    def test_lists_referenced_files(self, leerie, tmp_path):
+        (tmp_path / "SPEC.md").write_text("# Spec\n\n### Do the thing\n")
+        (tmp_path / "conf.yaml").write_text("key: value\n")
+        files = leerie.glob_task_references(
+            "implement SPEC.md per conf.yaml", tmp_path)
+        out = leerie._format_task_file_references(files, tmp_path)
+        assert "SPEC.md" in out and "conf.yaml" in out
+        assert "Read each one" in out
 
-    def test_toc_links_excluded(self, leerie, tmp_path):
-        (tmp_path / "spec.md").write_text(
-            "1. [Overview](#overview)\n2. Real item\n"
-            "3. [Details](#details)\n")
-        items = leerie.extract_task_file_structure(
-            "review spec.md", tmp_path)
-        assert items is not None
-        assert not any("Overview" in i for i in items)
-        assert not any("Details" in i for i in items)
-        assert any("Real item" in i for i in items)
+    def test_none_when_no_files_referenced(self, leerie, tmp_path):
+        files = leerie.glob_task_references("just do the thing", tmp_path)
+        assert leerie._format_task_file_references(files, tmp_path) is None
 
-    def test_yaml_list_ids(self, leerie, tmp_path):
-        (tmp_path / "jobs.yaml").write_text(
-            "- id: wave-0\n  name: first\n- id: wave-1\n  name: second\n")
-        items = leerie.extract_task_file_structure(
-            "complete jobs.yaml", tmp_path)
-        assert items is not None
-        assert any("wave-0" in i for i in items)
-        assert any("wave-1" in i for i in items)
+    def test_lists_paths_only_never_file_contents(self, leerie, tmp_path):
+        """The whole point: the section names files, it does not digest
+        them. A heading inside the file must not appear in the section."""
+        (tmp_path / "SPEC.md").write_text(
+            "# Spec\n\n### Run `pnpm lint` - MUST pass\n\n1. First item\n")
+        files = leerie.glob_task_references("implement SPEC.md", tmp_path)
+        out = leerie._format_task_file_references(files, tmp_path)
+        assert "pnpm lint" not in out
+        assert "First item" not in out
+        assert "MUST" not in out
 
-    def test_yaml_top_level_keys(self, leerie, tmp_path):
-        (tmp_path / "config.yaml").write_text(
-            "database:\n  host: localhost\nredis:\n  port: 6379\n")
-        items = leerie.extract_task_file_structure(
-            "audit config.yaml", tmp_path)
-        assert items is not None
-        assert any("database" in i for i in items)
-        assert any("redis" in i for i in items)
-
-    def test_empty_file_returns_none(self, leerie, tmp_path):
-        (tmp_path / "empty.md").write_text("")
-        assert leerie.extract_task_file_structure(
-            "check empty.md", tmp_path) is None
+    def test_paths_are_repo_relative(self, leerie, tmp_path):
+        sub = tmp_path / "docs"
+        sub.mkdir()
+        (sub / "DESIGN.md").write_text("# D\n")
+        files = leerie.glob_task_references("see docs/DESIGN.md", tmp_path)
+        out = leerie._format_task_file_references(files, tmp_path)
+        assert "docs/DESIGN.md" in out
+        assert str(tmp_path) not in out, "absolute paths leak the sandbox"
 
 
-# --- check_task_file_coverage ------------------------------------------- #
+class TestRepoRel:
+    def test_relative_inside_repo(self, leerie, tmp_path):
+        (tmp_path / "a").mkdir()
+        f = tmp_path / "a" / "b.md"
+        f.write_text("x")
+        assert leerie._repo_rel(f, tmp_path) == "a/b.md"
 
-class TestCheckTaskFileCoverage:
-    def test_full_coverage(self, leerie):
-        extracted = ["spec.md: Overview", "spec.md: Details"]
-        subtasks = [
-            {"title": "Fix overview", "intent": "Overview fix",
-             "investigation_notes": ""},
-            {"title": "Fix details", "intent": "Details fix",
-             "investigation_notes": ""},
-        ]
-        assert leerie.check_task_file_coverage(extracted, subtasks) == []
-
-    def test_low_coverage(self, leerie):
-        extracted = ["spec.md: A", "spec.md: B", "spec.md: C",
-                     "spec.md: D"]
-        subtasks = [{"title": "Fix A", "intent": "A",
-                     "investigation_notes": ""}]
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE" in i for i in issues)
-
-    def test_empty_extracted(self, leerie):
-        assert leerie.check_task_file_coverage([], []) == []
-
-    def test_just_above_threshold(self, leerie):
-        extracted = ["a: X", "a: Y"]
-        subtasks = [{"title": "covers X", "intent": "X",
-                     "investigation_notes": ""}]
-        # 1/2 uncovered = 50%, which is the threshold — should not fire
-        assert leerie.check_task_file_coverage(extracted, subtasks) == []
-
-    def test_over_threshold(self, leerie):
-        extracted = ["a: X", "a: Y", "a: Z"]
-        subtasks = [{"title": "covers X", "intent": "X",
-                     "investigation_notes": ""}]
-        # 2/3 uncovered = 66% > 50%
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE" in i for i in issues)
-
-    def test_skipped_when_too_many_items(self, leerie):
-        extracted = [f"spec.md: item-{i}" for i in range(51)]
-        subtasks = [{"title": "fix one", "intent": "item-0",
-                     "investigation_notes": ""}]
-        assert leerie.check_task_file_coverage(extracted, subtasks) == []
-
-    def test_gates_when_under_cap(self, leerie):
-        extracted = [f"spec.md: item-{i}" for i in range(50)]
-        subtasks = [{"title": "fix one", "intent": "item-0",
-                     "investigation_notes": ""}]
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE" in i for i in issues)
-
-    def test_uncoverable_convention_items_excluded(self, leerie):
-        # 2026-07-19 incident shape: CLAUDE.md headings that are
-        # coding-standard imperatives (backtick-quoted command + MUST)
-        # cannot appear verbatim in a subtask title/intent, so they must
-        # not count toward the coverage ratio at all.
-        extracted = [
-            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
-            "CLAUDE.md: Run `pnpm run build` - MUST succeed",
-            "CLAUDE.md: Confirm TypeScript strict mode compliance",
-        ]
-        subtasks = [{"title": "Confirm TypeScript strict mode compliance",
-                     "intent": "", "investigation_notes": ""}]
-        # Only one coverable item (the non-imperative heading) remains,
-        # and it's covered — no LOW_COVERAGE despite 2/3 raw items being
-        # unmatchable by construction.
-        assert leerie.check_task_file_coverage(extracted, subtasks) == []
-
-    def test_all_uncoverable_yields_no_issue(self, leerie):
-        extracted = [
-            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
-            "CLAUDE.md: Run `pnpm run build` - MUST succeed",
-        ]
-        subtasks = [{"title": "unrelated", "intent": "",
-                     "investigation_notes": ""}]
-        assert leerie.check_task_file_coverage(extracted, subtasks) == []
-
-    def test_uncoverable_items_dont_inflate_denominator_for_real_gaps(
-            self, leerie):
-        # A genuine coverage gap among the coverable items still fires,
-        # with the ratio computed over the coverable subset only.
-        extracted = [
-            "CLAUDE.md: Run `pnpm run lint:fix` - MUST pass with no errors",
-            "CLAUDE.md: Real spec item A",
-            "CLAUDE.md: Real spec item B",
-        ]
-        subtasks = [{"title": "unrelated", "intent": "",
-                     "investigation_notes": ""}]
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE: 2/2" in i for i in issues)
-
-    def test_backtick_without_must_still_coverable(self, leerie):
-        # Backticks alone (no MUST) don't make an item uncoverable — only
-        # the combination is the uncoverable-by-construction signature.
-        extracted = ["spec.md: Run `pnpm test`", "spec.md: B", "spec.md: C"]
-        subtasks = [{"title": "unrelated", "intent": "",
-                     "investigation_notes": ""}]
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE: 3/3" in i for i in issues)
+    def test_falls_back_to_name_outside_repo(self, leerie, tmp_path):
+        from pathlib import Path
+        outside = Path("/etc/hostname")
+        assert leerie._repo_rel(outside, tmp_path) == "hostname"
 
 
-class TestIsUncoverableConventionItem:
-    def test_backtick_and_must(self, leerie):
-        assert leerie._is_uncoverable_convention_item(
-            "Run `pnpm run lint:fix` - MUST pass with no errors") is True
+class TestProseHarvestAbsent:
+    """Mirrors `TestRegexPathAbsent` in tests/test_capture_deps.py — the
+    precedent CLAUDE.md names for a migration off hand-parsing."""
 
-    def test_backtick_only(self, leerie):
-        assert leerie._is_uncoverable_convention_item(
-            "Run `pnpm test`") is False
+    @pytest.mark.parametrize("sym", [
+        "extract_task_file_structure",
+        "_is_uncoverable_convention_item",
+        "_BACKTICK_SPAN_RE",
+        "check_task_file_coverage",
+        "_format_task_file_structure",
+        "_MAX_COVERAGE_ITEMS",
+        "_dedup_frozen_coverage_issues",
+    ])
+    def test_deleted_symbols_stay_deleted(self, leerie, sym):
+        assert not hasattr(leerie, sym), (
+            f"{sym} is back — the prose-harvest path, and with it the "
+            "2026-07-19 coverage-freeze class, can silently resume")
 
-    def test_must_only(self, leerie):
-        assert leerie._is_uncoverable_convention_item(
-            "This MUST pass") is False
+    def test_planner_loop_has_no_coverage_gate(self, leerie):
+        """The LOW_COVERAGE issue is gone from the planner's check loop,
+        not merely silenced."""
+        import inspect
+        src = inspect.getsource(leerie.phase_plan)
+        assert "LOW_COVERAGE" not in src
+        assert "coverage_ratios" not in src
 
-    def test_neither(self, leerie):
-        assert leerie._is_uncoverable_convention_item(
-            "Plain heading") is False
+    def test_reference_section_does_not_read_file_contents(self, leerie):
+        """Banned by shape: the helper must not open the files it names."""
+        import inspect
+        src = inspect.getsource(leerie._format_task_file_references)
+        for banned in ("read_text", "open(", "finditer", "re."):
+            assert banned not in src, (
+                f"_format_task_file_references calls {banned!r} — naming "
+                "the files is mechanical, reading them is the planner's job")
 
-    def test_lowercase_must_not_matched(self, leerie):
-        # "MUST" as a rule-imperative marker is case-sensitive on purpose
-        # — lowercase "must" appears in ordinary prose too often to be a
-        # reliable uncoverable-by-construction signal.
-        assert leerie._is_uncoverable_convention_item(
-            "Run `pnpm test` - it must pass") is False
-
-
-# --- _dedup_frozen_coverage_issues --------------------------------------- #
-
-class TestDedupFrozenCoverageIssues:
-    def test_first_occurrence_passes_through(self, leerie):
-        seen: set[str] = set()
-        issues = ["LOW_COVERAGE: 15/15 items from task-referenced files "
-                  "not mentioned in plan. Sample: [...]"]
-        result = leerie._dedup_frozen_coverage_issues(issues, seen)
-        assert result == issues
-        assert seen == {"LOW_COVERAGE: 15/15"}
-
-    def test_repeated_ratio_dropped(self, leerie):
-        # Simulates the incident: the same 15/15 ratio fires every round.
-        seen: set[str] = set()
-        issue = ("LOW_COVERAGE: 15/15 items from task-referenced files "
-                 "not mentioned in plan. Sample: [...]")
-        first = leerie._dedup_frozen_coverage_issues([issue], seen)
-        second = leerie._dedup_frozen_coverage_issues([issue], seen)
-        third = leerie._dedup_frozen_coverage_issues([issue], seen)
-        assert first == [issue]
-        assert second == []
-        assert third == []
-
-    def test_changed_ratio_still_fires(self, leerie):
-        # A ratio that genuinely improves (or worsens) round over round is
-        # real signal and must still reach the planner as feedback.
-        seen: set[str] = set()
-        issue_a = ("LOW_COVERAGE: 15/15 items from task-referenced files "
-                   "not mentioned in plan. Sample: [...]")
-        issue_b = ("LOW_COVERAGE: 8/15 items from task-referenced files "
-                   "not mentioned in plan. Sample: [...]")
-        first = leerie._dedup_frozen_coverage_issues([issue_a], seen)
-        second = leerie._dedup_frozen_coverage_issues([issue_b], seen)
-        assert first == [issue_a]
-        assert second == [issue_b]
-
-    def test_empty_input(self, leerie):
-        seen: set[str] = set()
-        assert leerie._dedup_frozen_coverage_issues([], seen) == []
-        assert seen == set()
-
-    def test_mutates_seen_in_place(self, leerie):
-        seen: set[str] = set()
-        issue = ("LOW_COVERAGE: 4/6 items from task-referenced files "
-                 "not mentioned in plan. Sample: [...]")
-        leerie._dedup_frozen_coverage_issues([issue], seen)
-        assert "LOW_COVERAGE: 4/6" in seen
-
-
-# --- _format_task_file_structure ---------------------------------------- #
-
-class TestFormatTaskFileStructure:
-    def test_format(self, leerie):
-        items = ["spec.md: Overview", "spec.md: Details"]
-        result = leerie._format_task_file_structure(items)
-        assert "mechanically extracted" in result
-        assert "Overview" in result
-        assert "coverage checklist" in result
+    def test_coverage_judge_is_told_to_read_the_files(self):
+        """The job did not vanish, it moved. If the judge is not told to
+        read referenced files, this migration dropped a check instead of
+        relocating it."""
+        from pathlib import Path
+        text = (Path(__file__).resolve().parent.parent
+                / "prompts" / "task_coverage_judge.md").read_text()
+        assert "Read the files the task names" in text
+        assert "not the codebase" not in text, (
+            "the old scoping sentence still tells the judge it has no "
+            "files to read")

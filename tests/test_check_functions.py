@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import textwrap
+
 import pytest
 
 
@@ -715,39 +717,47 @@ class TestCheckImplementerOutput:
             result, {}, {"src/foo.ts"}) == []
 
 
-# --- _confidence_issues ------------------------------------------------- #
+# --- _confidence_issues (deleted) ---------------------------------------- #
 
-class TestConfidenceIssues:
-    def test_all_clear(self, leerie):
-        conf = {"root_cause": 9.5, "solution": 9.0}
-        assert leerie._confidence_issues(conf, ["root_cause", "solution"]) == []
+class TestConfidenceIssuesDeleted:
+    """`_confidence_issues` computed a LOW_CONFIDENCE issue from a worker's
+    own self-reported score. Every gate that consumed it was replaced by an
+    independent adversarial verifier (DESIGN §8) — after which
+    IMPLEMENTATION.md recorded that it had "zero remaining callers", but the
+    function itself was left behind along with these unit tests, which were
+    the only thing still calling it.
 
-    def test_one_below(self, leerie):
-        conf = {"root_cause": 8.9, "solution": 9.0}
-        issues = leerie._confidence_issues(conf, ["root_cause", "solution"])
-        assert len(issues) == 1
-        assert "root_cause" in issues[0]
-        assert "LOW_CONFIDENCE" in issues[0]
+    A self-score is exactly what leerie does not gate on, so this must not
+    come back by accident: an unused helper is an invitation to wire it up.
+    The absence-of-callers guards in
+    `tests/test_phase_planning_coverage_gate.py` and
+    `tests/test_integrate_wave_judge_gate.py` remain, and are stronger now
+    that there is no function to call."""
 
-    def test_all_axes_missing(self, leerie):
-        assert leerie._confidence_issues({}, ["classification"]) == []
+    def test_function_is_gone(self, leerie):
+        assert not hasattr(leerie, "_confidence_issues")
 
-    def test_one_axis_present_one_missing(self, leerie):
-        conf = {"root_cause": 9.5}
-        issues = leerie._confidence_issues(
-            conf, ["root_cause", "solution"])
-        assert len(issues) == 1
-        assert "solution" in issues[0]
+    def test_no_worker_gates_on_its_own_confidence(self, leerie):
+        """The property the deletion protects, asserted directly rather
+        than through the helper's absence.
 
-    def test_exactly_threshold(self, leerie):
-        conf = {"classification": 9.0}
-        assert leerie._confidence_issues(conf, ["classification"]) == []
-
-    def test_custom_threshold(self, leerie):
-        conf = {"x": 7.0}
-        assert leerie._confidence_issues(conf, ["x"], threshold=7.0) == []
-        issues = leerie._confidence_issues(conf, ["x"], threshold=7.1)
-        assert len(issues) == 1
+        Comments are stripped first: `check_overlap_judge_output` carries a
+        comment explaining why the LOW_CONFIDENCE threshold was removed, and
+        a naive substring test reads that explanation as the defect it
+        documents."""
+        import ast
+        import inspect
+        for fn in (leerie.check_planner_output,
+                   leerie.check_integrator_output,
+                   leerie.check_overlap_judge_output):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            emitted = {
+                n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            }
+            assert not any("LOW_CONFIDENCE" in s for s in emitted), (
+                f"{fn.__name__} emits a LOW_CONFIDENCE issue — no gate may "
+                "rest on a worker's score for its own output")
 
 
 # --- LOW_CONFIDENCE in check functions ---------------------------------- #

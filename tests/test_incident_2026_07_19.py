@@ -202,8 +202,33 @@ class TestRootCauseB_ArgvE2BIG:
 # ---------------------------------------------------------------------------
 
 class TestRootCauseA_CoverageFreeze:
+    """Root cause A is now structurally impossible, not merely guarded.
+
+    The freeze came from harvesting CLAUDE.md headings into coverage items
+    and gating on whether each appeared verbatim in the plan text. The
+    backtick+MUST convention headings cannot appear verbatim in a subtask
+    by construction, so the gate fired identically every round: 33/33
+    rounds at an unchanged 15/15 ratio, ~$39 of feedback calls that could
+    not converge.
+
+    The first fix excluded those items from the ratio and de-duplicated
+    repeated ratios. Both were guards on a mechanism that violated
+    CLAUDE.md *Language-to-JSON* three times over — regex-harvest the
+    headings, regex-classify the harvested prose, substring-match the
+    result against plan prose. The mechanism is deleted;
+    `task_coverage_judge` owns coverage and reads the referenced files
+    itself.
+
+    The fixture below is kept because it is the concrete shape any
+    reimplementation would break on again.
+    """
+
     def test_generated_headings_match_measured_item_count(
             self, leerie, generate, shape):
+        """The fixture still reproduces the incident's harvest shape. This
+        is a fact about the generated CLAUDE.md text, independent of what
+        leerie does with it — and it is what makes the assertions below
+        meaningful rather than vacuous."""
         claude_md_text = generate.build_claude_md_text(shape)
         extracted = [
             f"CLAUDE.md: {m.group(1).strip()}"
@@ -212,112 +237,37 @@ class TestRootCauseA_CoverageFreeze:
         ]
         assert len(extracted) == shape["coverage_gate"]["harvested_item_count"]
 
-    def test_extraction_reproduces_the_incident_harvest(
-            self, leerie, generate, shape, tmp_path):
-        """End-to-end through the real extraction path: a task that
-        incidentally mentions CLAUDE.md once (root cause A's trigger)
-        against a repo containing a CLAUDE.md file shaped like the
-        incident's harvested headings."""
-        (tmp_path / "CLAUDE.md").write_text(generate.build_claude_md_text(shape))
-        task = generate.build_task(shape)
-
-        extracted = leerie.extract_task_file_structure(task, tmp_path)
-        assert extracted is not None
-        assert len(extracted) == shape["coverage_gate"]["harvested_item_count"]
-
-    def test_pre_fix_shape_would_freeze_every_round(self, generate, shape):
-        """The load-bearing pre-fix fact about the fixture itself: the
-        harvested backtick+MUST headings cannot substring-match the
-        non-matching plan text, at the same 15/15-style ratio the
-        incident measured across 33/33 feedback rounds. This is a fact
-        about the fixture shape, independent of the fix."""
+    def test_uncoverable_headings_still_cannot_substring_match(
+            self, generate, shape):
+        """The property that made the freeze inevitable, preserved as a
+        fact about the shape: these headings can never be covered by a
+        substring test, whatever the plan says. Any future coverage check
+        that is substring-based will freeze on them again."""
         gate = shape["coverage_gate"]
-        extracted = [f"CLAUDE.md: {h}" for h in
-                     gate["uncoverable_backtick_must_headings"]]
         plan_text = generate.build_non_matching_plan_text()
-        uncovered = [item for item in extracted
-                     if item.split(": ", 1)[1].lower() not in plan_text]
-        assert len(uncovered) == len(extracted), (
-            "the generated backtick+MUST headings no longer reproduce "
-            "an all-uncovered ratio against the non-matching plan text")
+        uncovered = [h for h in gate["uncoverable_backtick_must_headings"]
+                     if h.lower() not in plan_text]
+        assert len(uncovered) == len(gate["uncoverable_backtick_must_headings"])
 
-    def test_coverage_gate_excludes_the_uncoverable_subset_post_fix(
-            self, leerie, generate, shape):
-        """The fix's first guard: check_task_file_coverage no longer
-        emits a blocking LOW_COVERAGE issue on the 3 backtick+MUST
-        convention headings alone, even though every one is textually
-        uncovered. Reverting bugfix-003's _is_uncoverable_convention_item
-        turns this red."""
-        gate = shape["coverage_gate"]
-        extracted = [f"CLAUDE.md: {h}" for h in
-                     gate["uncoverable_backtick_must_headings"]]
+    @pytest.mark.parametrize("sym", [
+        "extract_task_file_structure",
+        "_is_uncoverable_convention_item",
+        "check_task_file_coverage",
+        "_dedup_frozen_coverage_issues",
+    ])
+    def test_the_frozen_mechanism_is_deleted(self, leerie, sym):
+        assert not hasattr(leerie, sym), (
+            f"{sym} is back — root cause A is a property of this "
+            "mechanism, so reintroducing it reintroduces the incident")
 
-        plan_text = generate.build_non_matching_plan_text()
-        subtasks = [{"title": "unrelated subtask", "intent": plan_text,
-                     "investigation_notes": ""}]
+    def test_planner_loop_cannot_freeze_on_coverage(self, leerie):
+        """The freeze happened inside `phase_plan`'s CRITIC loop. No
+        coverage gate remains there to re-fire."""
+        import inspect
+        src = inspect.getsource(leerie.phase_plan)
+        assert "LOW_COVERAGE" not in src
+        assert "coverage_ratios" not in src
 
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert issues == [], (
-            "the 3 backtick+MUST convention headings produced a "
-            f"blocking LOW_COVERAGE issue post-fix: {issues}")
-
-    def test_coverage_gate_does_not_freeze_across_repeated_rounds(
-            self, leerie, generate, shape):
-        """The incident's defining symptom, reproduced via the full
-        harvested 15-item set (3 uncoverable + 12 other) exactly as
-        phase_plan's per-category feedback loop would see it: the fix's
-        second guard, _dedup_frozen_coverage_issues, stops re-emitting a
-        LOW_COVERAGE issue once its ratio has repeated — even though the
-        12 non-convention headings remain genuinely uncovered and the
-        first round's issue still fires once. Reverting
-        _dedup_frozen_coverage_issues turns this red (every round would
-        re-emit the same frozen ratio, as measured: 33/33 in the
-        incident run)."""
-        gate = shape["coverage_gate"]
-        extracted = [f"CLAUDE.md: {h}" for h in
-                     (gate["uncoverable_backtick_must_headings"] +
-                      gate["other_headings"])]
-        plan_text = generate.build_non_matching_plan_text()
-        subtasks = [{"title": "unrelated subtask", "intent": plan_text,
-                     "investigation_notes": ""}]
-
-        seen_ratios: set[str] = set()
-        fired_rounds = 0
-        for _ in range(gate["feedback_rounds_measured"] // 10):
-            issues = leerie.check_task_file_coverage(extracted, subtasks)
-            deduped = leerie._dedup_frozen_coverage_issues(
-                issues, seen_ratios)
-            if deduped:
-                fired_rounds += 1
-
-        assert fired_rounds <= 1, (
-            f"the frozen ratio re-fired across {fired_rounds} rounds "
-            "post-fix — _dedup_frozen_coverage_issues should suppress "
-            "every repeat after the first")
-
-    def test_genuinely_uncovered_item_still_gates(
-            self, leerie, generate, shape):
-        """Control: the fix must narrow the gate, not disable it — a
-        genuinely uncovered, coverable item mixed into the generated
-        heading set still produces LOW_COVERAGE signal."""
-        gate = shape["coverage_gate"]
-        extracted = ([f"CLAUDE.md: {h}" for h in
-                      gate["uncoverable_backtick_must_headings"]] +
-                     ["CLAUDE.md: Real spec item that should be covered",
-                      "CLAUDE.md: Another real spec item, also uncovered"])
-        plan_text = generate.build_non_matching_plan_text()
-        subtasks = [{"title": "unrelated subtask", "intent": plan_text,
-                     "investigation_notes": ""}]
-
-        issues = leerie.check_task_file_coverage(extracted, subtasks)
-        assert any("LOW_COVERAGE" in i for i in issues), (
-            f"a genuinely uncovered coverable item must still gate, got: "
-            f"{issues}")
-
-
-# ---------------------------------------------------------------------------
-# Both root causes together, on the single generated payload
-# ---------------------------------------------------------------------------
 
 class TestBothRootCausesComposeOnOnePayload:
     def test_both_fixes_hold_simultaneously(self, leerie, generate, shape,
@@ -328,23 +278,22 @@ class TestBothRootCausesComposeOnOnePayload:
         (tmp_path / "CLAUDE.md").write_text(generate.build_claude_md_text(shape))
         task = generate.build_task(shape)
 
-        # Root cause A: coverage extraction + gate. The uncoverable
-        # backtick+MUST subset alone (the harvest's most acute freeze
-        # trigger) must not gate at all; the dedup guard then prevents
-        # the full 15-item harvest from re-firing an unchanged ratio
-        # across repeated rounds — see TestRootCauseA_CoverageFreeze for
-        # the two guards pinned individually.
-        extracted = leerie.extract_task_file_structure(task, tmp_path)
-        assert extracted is not None
-        gate = shape["coverage_gate"]
-        uncoverable_only = [
-            f"CLAUDE.md: {h}"
-            for h in gate["uncoverable_backtick_must_headings"]]
-        plan_text = generate.build_non_matching_plan_text()
-        subtasks = [{"title": "unrelated subtask", "intent": plan_text,
-                     "investigation_notes": ""}]
-        issues = leerie.check_task_file_coverage(uncoverable_only, subtasks)
-        assert issues == []
+        # Root cause A: the coverage-freeze mechanism. It is deleted
+        # rather than guarded, so the composed assertion is that the
+        # incident's own CLAUDE.md text reaches no gate at all — leerie
+        # names the file for the planner and `task_coverage_judge` reads
+        # it, but nothing harvests headings out of it into a ratio.
+        assert leerie.glob_task_references(task, tmp_path), (
+            "the incident task should still resolve CLAUDE.md — otherwise "
+            "this composition tests nothing about root cause A")
+        section = leerie._format_task_file_references(
+            leerie.glob_task_references(task, tmp_path), tmp_path)
+        assert "CLAUDE.md" in section
+        for heading in shape["coverage_gate"][
+                "uncoverable_backtick_must_headings"]:
+            assert heading not in section, (
+                "a harvested convention heading reached the planner "
+                "prompt — the freeze mechanism is back")
 
         # Root cause B: transport.
         user_prompt = generate.build_user_prompt(shape)

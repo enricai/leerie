@@ -301,7 +301,7 @@ def test_refuses_when_proc_scan_finds_live_orchestrator(tmp_path):
 
     Fixture: pid file points to a dead pid, BUT a live process exists
     whose argv carries both the orchestrator path anchor and the
-    run-id. This simulates the bug we hit on funeralworks: launcher
+    run-id. This simulates the bug we hit on sibling-service: launcher
     wrote a stillborn child's pid (dead) while the real orchestrator
     (the flock winner) kept running.
 

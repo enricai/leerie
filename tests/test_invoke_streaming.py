@@ -185,7 +185,7 @@ def test_invoke_returns_synthetic_envelope_when_no_result_event(
 
 # ----- out-of-credits truncation → pause-and-surface -----------------------
 
-# A real out-of-credits kill (navegando run 60c68e71…): the exhaustion
+# A real out-of-credits kill (sibling-service run 60c68e71…): the exhaustion
 # reason is `overageDisabledReason:"out_of_credits"` while `status` is
 # still the benign "allowed". The latch keys on `overageDisabledReason`
 # being an exhaustion reason — NOT on `overageStatus:"rejected"`, which is
@@ -200,7 +200,7 @@ _OVERAGE_BLOCKED_EVENT = {
     },
 }
 
-# The false-positive shape (navegando run f77f7456…): an org that has
+# The false-positive shape (sibling-service run f77f7456…): an org that has
 # extra-usage (overage) turned OFF at the org level emits this in EVERY
 # rate_limit_event — `overageStatus:"rejected"` with
 # `overageDisabledReason:"org_level_disabled"` and `status:"allowed"`. It

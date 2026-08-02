@@ -237,7 +237,7 @@ def test_judge_crash_degrades_without_dying(leerie, tmp_path, monkeypatch):
 
 
 # === Fix 2: routing exhaustion to the cleared-but-empty terminal state ====
-# Root-cause fix for the funeralworks incident: a task whose deliverable is
+# Root-cause fix for the sibling-service incident: a task whose deliverable is
 # already on HEAD can make classification unable to converge on a category
 # set — the classifier's own investigation already explains why (the diff
 # doesn't exist), so exhaustion should route to the SAME terminal state
@@ -337,7 +337,7 @@ def test_exhaustion_still_dies_when_satisfied_true_but_evidence_empty(
 
 def test_exhaustion_routes_to_no_work_when_an_earlier_round_found_it_satisfied(
         leerie, tmp_path, monkeypatch):
-    """Root-cause fix for a SECOND occurrence of the funeralworks-shaped
+    """Root-cause fix for a SECOND occurrence of the sibling-service-shaped
     incident, after Fix 2 above already shipped: phase_classification_gate
     re-invokes phase_classify fresh on every re-classify round via
     _on_feedback, and each round's prompt is entirely focused on fixing
