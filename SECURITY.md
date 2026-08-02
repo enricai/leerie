@@ -57,7 +57,7 @@ Any defect that violates the documented isolation or enforcement boundary:
 - **State-write vulnerabilities** — `validate_resume_state()` or the
   `State.save()` write path being exploitable via a poisoned `.leerie/`
   directory (e.g., an attacker writing `.leerie/state.json` so the next
-  `--resume` does something unintended)
+  `resume` does something unintended)
 - **Command injection** — unquoted or unsanitized expansion in
   `scripts/*.sh` that lets a task description, repo name, or filename
   inject shell commands
