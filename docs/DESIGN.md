@@ -2436,7 +2436,7 @@ rate-limit / session-limit is hit mid-worker. In each case the
 orchestrator runs a cleanup pass before exiting, and the cleanup
 *scope* is uniformly conservative — **state and branches are always
 preserved**; only worktrees are torn down. The run is always
-resumable via `--resume <id>` after any abnormal exit.
+resumable via `resume <id>` after any abnormal exit.
 
 **Auth failures split into transient and terminal, and only one of
 them benefits from backoff.** 401/429/529 — a rejected request against
