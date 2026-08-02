@@ -1,6 +1,6 @@
-"""Tests for the --group launcher fan-out core contract (Verification §2).
+"""Tests for the group launcher fan-out core contract (Verification §2).
 
-Asserts that `leerie --group --repo A "pA" --repo B "pB" [--brief f]` spawns
+Asserts that `leerie group --repo A "pA" --repo B "pB" [--brief f]` spawns
 one child per member with:
   - cwd set to the member's own repo directory,
   - --group-id <uuid> in argv,

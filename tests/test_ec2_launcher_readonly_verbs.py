@@ -246,7 +246,7 @@ def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> Non
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     # The pre-fix 'local' path's error text ("no state.json at
     # <state_dir>/state.json") must never appear — that would mean the
@@ -270,7 +270,7 @@ def test_accept_blocked_ec2_writes_accept_record(tmp_path: Path) -> None:
     remote_state_path = _seed_remote_state(
         work_dest, RUN_ID, {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     remote = json.loads(remote_state_path.read_text())
@@ -295,7 +295,7 @@ def test_accept_blocked_ec2_explicit_runtime_flag_accepted(tmp_path: Path) -> No
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID, "--runtime", "ec2"], env)
+    result = _run(["accept-blocked", RUN_ID, SID, "--runtime", "ec2"], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     assert "must be 'local', 'fly', or 'ec2'" not in result.stderr
 
@@ -307,7 +307,7 @@ def test_accept_blocked_rejects_unknown_runtime_value(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
     env, _, _ = _env(tmp_path, aws_dir)
-    result = _run(["--accept-blocked", "some-run", "some-sid", "--runtime", "bogus"], env)
+    result = _run(["accept-blocked", "some-run", "some-sid", "--runtime", "bogus"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
 
@@ -326,7 +326,7 @@ def test_accept_blocked_ec2_wakes_stopped_instance_and_repauses(tmp_path: Path) 
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -355,7 +355,7 @@ def test_accept_blocked_ec2_already_running_not_paused_afterward(tmp_path: Path)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -381,7 +381,7 @@ def test_accept_blocked_ec2_missing_instance_id_fails_closed(tmp_path: Path) -> 
     }))
     (run_dir / "run.json").write_text(json.dumps({"run_id": RUN_ID}))
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 1
     assert "no ec2_instance_id found" in result.stderr
 
@@ -398,7 +398,7 @@ def test_accept_blocked_local_path_unchanged(tmp_path: Path) -> None:
     (run_dir / "state.json").write_text(json.dumps(
         {"subtask_status": {SID: "failed"}}))
 
-    result = _run(["--accept-blocked", run_id, SID], env)
+    result = _run(["accept-blocked", run_id, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     mutated = json.loads((run_dir / "state.json").read_text())
     assert mutated["subtask_status"][SID] == "complete"

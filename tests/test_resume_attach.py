@@ -15,7 +15,7 @@ Two surfaces pinned here:
      when `_do_auto="false"`, runs the tail payload via `flyctl ssh
      console -C "sh -s"` with LEERIE_TAIL_RUN_ID prefixed; when
      `_do_auto="true"`, wraps stderr through `tee` and grep-extracts
-     the AUTO_FINALIZE_TOKEN to drive `exec leerie --finalize <id>` on
+     the AUTO_FINALIZE_TOKEN to drive `exec leerie finalize <id>` on
      the host.
 
   3. Coupling: the launcher source must contain the auto-discovery
@@ -311,7 +311,7 @@ def test_tail_helper_autofinalize_sets_token_in_payload(tmp_path: Path):
     `HELPER_RC=...` line that the harness shell ran *after* the
     helper returned."""
     fake = _stub_flyctl(tmp_path, ssh_console_rc=1)  # non-zero so the
-    # exec leerie --finalize branch doesn't fire (would replace this
+    # exec leerie finalize branch doesn't fire (would replace this
     # process and kill the test).
     r = subprocess.run(
         ["bash", "-c", _TAIL_HARNESS, "_",
@@ -514,7 +514,7 @@ def test_lib_sh_helper_returns_does_not_exit():
 
     The only valid `exit*` in the helper is `exec` (which replaces
     the process, intentionally taking down the launcher to be
-    replaced by `leerie --finalize`)."""
+    replaced by `leerie finalize`)."""
     libsh = LIB_SH.read_text()
     import re
     match = re.search(

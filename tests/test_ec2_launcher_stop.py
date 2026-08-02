@@ -115,7 +115,7 @@ def test_stop_ec2_run_stops_instance_and_writes_sidecar(tmp_path: Path) -> None:
     run_dir = state_dir / "runs" / RUN_ID
     _write_ec2_sidecar(run_dir, RUN_ID, iid)
 
-    result = _run(tmp_path, ["--stop", RUN_ID], env)
+    result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     # The instance is stopped, not terminated.
@@ -141,7 +141,7 @@ def test_stop_ec2_run_explicit_runtime_flag(tmp_path: Path) -> None:
     run_dir = state_dir / "runs" / RUN_ID
     _write_ec2_sidecar(run_dir, RUN_ID, iid)
 
-    result = _run(tmp_path, ["--stop", RUN_ID, "--runtime", "ec2"], env)
+    result = _run(tmp_path, ["stop", RUN_ID, "--runtime", "ec2"], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -159,7 +159,7 @@ def test_stop_ec2_run_does_not_terminate_instance(tmp_path: Path) -> None:
     run_dir = state_dir / "runs" / RUN_ID
     _write_ec2_sidecar(run_dir, RUN_ID, iid)
 
-    result = _run(tmp_path, ["--stop", RUN_ID], env)
+    result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     from tests.ec2_stub import read_log
@@ -188,7 +188,7 @@ def test_stop_local_path_unchanged(tmp_path: Path) -> None:
     # No nerdctl on PATH — the local-container probe fails closed, and
     # with no fly-machine.json / ec2-instance.json sidecar the run falls
     # through to the existing error path.
-    result = _run(tmp_path, ["--stop", run_id], env)
+    result = _run(tmp_path, ["stop", run_id], env)
     assert result.returncode == 1
     assert "not a live Fly machine, local container, or EC2 instance" in result.stderr
 
@@ -198,7 +198,7 @@ def test_stop_runtime_flag_rejects_unknown_value(tmp_path: Path) -> None:
     aws_dir.mkdir()
     _stub_aws(aws_dir)
     env, _ = _env(tmp_path, aws_dir)
-    result = _run(tmp_path, ["--stop", "some-run", "--runtime", "bogus"], env)
+    result = _run(tmp_path, ["stop", "some-run", "--runtime", "bogus"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
 
@@ -224,7 +224,7 @@ def test_stop_ec2_run_missing_instance_id_fails_closed(tmp_path: Path) -> None:
     }))
     (run_dir / "run.json").write_text(json.dumps({"run_id": RUN_ID}))
 
-    result = _run(tmp_path, ["--stop", RUN_ID], env)
+    result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 1
     assert "no ec2_instance_id found" in result.stderr
 
@@ -250,7 +250,7 @@ def test_stop_ec2_run_credential_failure_does_not_call_stop_instances(tmp_path: 
     empty_home.mkdir()
     env["HOME"] = str(empty_home)
 
-    result = _run(tmp_path, ["--stop", RUN_ID], env)
+    result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 1
 
     state = read_state(aws_dir)

@@ -356,7 +356,7 @@ def test_terminal_auth_failure_maps_to_exit_locked(leerie):
     block = ast.unparse(handler)
     assert "exit_code = EXIT_LOCKED" in block
     assert "exit_code = 1" not in block
-    assert "--resume" in block
+    assert "resume" in block
 
 
 def test_exit_locked_is_75(leerie):

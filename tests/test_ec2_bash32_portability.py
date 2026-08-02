@@ -317,9 +317,9 @@ def _run_launcher_under_bash32(args: list[str], env: dict) -> subprocess.Complet
 
 
 @pytest.mark.parametrize("verb_args", [
-    pytest.param(["--stop", RUN_ID], id="stop"),
-    pytest.param(["--kill", RUN_ID, "--force"], id="kill"),
-    pytest.param(["--accept-blocked", RUN_ID, "feat-001"], id="accept-blocked"),
+    pytest.param(["stop", RUN_ID], id="stop"),
+    pytest.param(["kill", RUN_ID, "--force"], id="kill"),
+    pytest.param(["accept-blocked", RUN_ID, "feat-001"], id="accept-blocked"),
 ])
 def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
     """Run each newly wired EC2 launcher verb end to end under bash 3.2.

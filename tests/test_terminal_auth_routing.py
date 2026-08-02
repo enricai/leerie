@@ -198,7 +198,7 @@ def test_handler_sets_abnormal_false(leerie):
 
 def test_handler_gives_a_resume_hint(leerie):
     block = _terminal_auth_handler_block(leerie)
-    assert "--resume" in block
+    assert "resume" in block
 
 
 # ---------------------------------------------------------------------------

@@ -101,8 +101,8 @@ def test_integrity_gate_die_points_at_resume(leerie):
     leerie/subtasks/<run-id>/* and --resume retries integration."""
     src = inspect.getsource(leerie.phase_execute)
     gate_region = src[src.index("len(integrated) != expected"):]
-    assert "--resume" in gate_region, (
-        "the integrity gate die() must point the operator at --resume."
+    assert "resume" in gate_region, (
+        "the integrity gate die() must point the operator at resume."
     )
     assert "leerie/subtasks/" in gate_region, (
         "the integrity gate die() must name the subtask branches where the "

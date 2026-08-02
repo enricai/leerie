@@ -232,7 +232,7 @@ def test_drop_budget_exhaustion_raises_transport_worker_error(
         f"exhaustion message must name the transport cause, got: {exc!r}")
     assert "subscription" not in msg, (
         f"a transport drop must not be labeled a subscription cap: {exc!r}")
-    assert "--resume" in str(exc)
+    assert "resume" in str(exc)
     assert n > 1, "must have retried before exhausting"
 
 
