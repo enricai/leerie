@@ -1,7 +1,7 @@
-"""Tests for the --accept-blocked launcher verb.
+"""Tests for the accept-blocked launcher verb.
 
 The verb modifies state.json to mark a blocked/failed subtask as
-complete so --resume skips it. The local-path tests exercise the
+complete so `resume` skips it. The local-path tests exercise the
 Python mutation via the launcher directly. The Fly-path test stubs
 ``flyctl`` so the machine-wake + stdin-piped ``python3 -`` transport
 runs against a local fixture without touching Fly.io — this is the
@@ -26,7 +26,7 @@ def _run_accept(state_path: Path, sid: str) -> subprocess.CompletedProcess:
     env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
     run_id = state_path.parent.name
     return subprocess.run(
-        [str(REPO_ROOT / "leerie"), "--accept-blocked", run_id, sid,
+        [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, sid,
          "--runtime", "local"],
         env=env,
         capture_output=True,
@@ -111,7 +111,7 @@ def test_preserves_other_blocked_entries(tmp_path):
 
 def _make_fake_flyctl(tmp_path: Path, host_state_file: Path,
                       expected_remote_state: str) -> Path:
-    """Stub flyctl for the --accept-blocked Fly path.
+    """Stub flyctl for the accept-blocked Fly path.
 
     Routes the calls the verb makes:
       - `auth status`       → exit 0 (require_flyctl passes)
@@ -200,7 +200,7 @@ def _run_accept_fly(tmp_path: Path, state_path: Path, sid: str,
     env["PATH"] = f"{flyctl.parent}:{env.get('PATH', '')}"
     run_id = state_path.parent.name
     return subprocess.run(
-        [str(REPO_ROOT / "leerie"), "--accept-blocked", run_id, sid,
+        [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, sid,
          "--runtime", "fly"],
         env=env,
         capture_output=True,
@@ -276,7 +276,7 @@ def test_rejects_traversal_run_id(tmp_path):
     env = {k: v for k, v in os.environ.items()}
     env["LEERIE_STATE_DIR"] = str(sf.parent.parent.parent)
     r = subprocess.run(
-        [str(REPO_ROOT / "leerie"), "--accept-blocked",
+        [str(REPO_ROOT / "leerie"), "accept-blocked",
          "../../../etc", "s1", "--runtime", "local"],
         env=env, capture_output=True, text=True, timeout=30,
     )

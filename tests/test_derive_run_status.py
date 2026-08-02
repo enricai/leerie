@@ -75,7 +75,7 @@ def test_status_pr_failed(leerie):
 
 def test_status_corrupt_sidecar(leerie):
     """An invariant-violating run.json renders as corrupt-sidecar so the
-    user can spot it in --list and intervene."""
+    user can spot it in `list` and intervene."""
     rj = {
         "pushed_at": "2026-05-26T15:00:05+00:00",
         "push_error": "both set is a violation",
@@ -197,7 +197,7 @@ def test_status_table_lists_every_value_used(leerie):
 def test_status_incomplete_finished_at_but_waves_unintegrated(leerie):
     """A run whose die-path handler stamped finished_at mid-wave
     (completed_waves < len(waves)) reads as `incomplete`, NOT `done` — so
-    --list doesn't mislabel it and finalize doesn't push a partial branch.
+    `list` doesn't mislabel it and finalize doesn't push a partial branch.
     This is the exact run A / run B OOM-crash shape."""
     rj = {"finished_at": "2026-07-05T23:25:46+00:00"}
     sj = {"completed_waves": 1, "waves": [["a"], ["b"], ["c"], ["d"], ["e"]]}
