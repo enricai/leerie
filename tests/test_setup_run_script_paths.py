@@ -259,7 +259,7 @@ def test_finalize_honors_state_dir_env():
     instead of /leerie-state/runs/<id>/ and finalize.sh aborts with
     'working-branch missing' during phase 6 of every Fly run that
     reaches finalize. Regression cover for the bug observed
-    2026-06-06 on a resumed stackpulse run after wave 4 completed."""
+    2026-06-06 on a resumed sibling-service run after wave 4 completed."""
     src = _script("finalize.sh")
     assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
     assert 'RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"' in src

@@ -48,18 +48,18 @@ flag it.
 ## What is NOT a collision (do not flag)
 
 - **Same file, different surfaces.** E.g., one subtask adds method
-  `foo()` to `Bar.tsx`, another adds method `baz()` to `Bar.tsx`.
+  `foo()` to `Panel.tsx`, another adds method `baz()` to `Panel.tsx`.
   Different exports, no API conflict.
-- **Consumer + producer.** One subtask creates `EmptyState` primitive,
-  another redesigns the dashboard *using* `EmptyState`. They share
-  `dashboard.tsx` as a file but are not peers.
+- **Consumer + producer.** One subtask creates `PlaceholderPanel` primitive,
+  another redesigns the dashboard *using* `PlaceholderPanel`. They share
+  `overview.tsx` as a file but are not peers.
 - **Producer + adopter pair from the same planner.** Sometimes one
   planner emits `refactor-001: Extract X` and `refactor-002: Adopt X
   in pages`. These are designed to coexist (and the second often
   `depends_on` the first).
 - **Multiple primitive extractions in the same parent file.** Six
-  refactor subtasks each extracting a different primitive (StatCard,
-  Sparkline, SectionCard, etc.) from `dashboard.tsx` are peers in
+  refactor subtasks each extracting a different primitive (MetricTile,
+  TrendLine, SectionPanel, etc.) from `overview.tsx` are peers in
   *files* but produce *different* artifacts.
 - **Doc-syncs touching the same documentation file** with different
   sections.
@@ -102,7 +102,8 @@ required fields plus one conditional field:
     {
       "a_sid": "<one subtask id>",
       "b_sid": "<the other subtask id>",
-      "artifact": "<the colliding exported artifact, e.g. 'AuthShell component'>",
+      "artifact": "<the colliding exported artifact, e.g. 'WidgetFrame component'>",
+      "artifact_paths": ["<repo-relative path(s) the artifact lives in>"],
       "resolution": "merge | drop_a | drop_b | unresolvable",
       "reason": "<two-to-four sentences. Quote the specific intent excerpts that conflict.>",
       "merge_feasibility": "<REQUIRED when resolution=merge. See discipline below. Omit otherwise.>"
@@ -191,8 +192,8 @@ For each candidate pair, ask in order:
 
 1. **Same exported artifact?** Title/intent mention the same component
    or function name? `provides` tags name the same concept even with
-   different strings (e.g., `auth-shell-component` and
-   `auth-shell-adopted` both name the AuthShell extraction)?
+   different strings (e.g., `widget-frame-component` and
+   `widget-frame-adopted` both name the WidgetFrame extraction)?
 2. **Peer extractions, not consumer+producer?** If A says "create X"
    and B says "use X", they are NOT peers.
 3. **Strict supersedure? (Run BEFORE the merge-feasibility checks.)**
@@ -261,11 +262,24 @@ with different outcomes: `drop_a(A, B)` together with `drop_a(B, A)`
 deletes both subtasks, and mixing a `drop` with a `merge` on one pair is
 self-contradictory. Pick one outcome for the pair, or `unresolvable`.
 
-`artifact` may be a plain logical name (`AuthShell component`), a path,
-or a path with a short description (`docs/USAGE.md bare-verb rewrite`) —
-whichever names the colliding surface most clearly. Any path you mention
-must be real (present in the repo, or in some subtask's
-`files_likely_touched`).
+`artifact` is a **label**, not a path: write whatever names the colliding
+surface most clearly (`WidgetFrame component`, `docs/USAGE.md bare-verb
+rewrite`). Nothing parses it.
+
+`artifact_paths` is the **structured** companion and is required on every
+collision. List the repo-relative path(s) the artifact actually lives in —
+`["docs/USAGE.md"]`, or `["commands/leerie.md", "commands/chain.md"]` when
+the pair overlaps on several files. Each path must be real: present in the
+repo, or in some subtask's `files_likely_touched`.
+
+**Fill this in.** Nearly every collision you find has a home on disk: the two
+subtasks you are comparing both list `files_likely_touched`, and the artifact
+they collide on almost always lives in one of the files they share. Read those
+lists and name the shared file(s). `[]` is reserved for the rare artifact with
+no file at all — a cross-cutting convention, say — and an empty list means the
+orchestrator has nothing to verify, so a hallucinated collision on a file that
+does not exist will pass unnoticed. That check is worth keeping; do not empty
+it out of caution.
 
 Connected-cluster shapes (e.g. emitting `merge(A, B)`, `merge(A, C)`,
 *and* `merge(B, C)` when all three target the same artifact) are
@@ -278,16 +292,16 @@ your candidate `merge`s share an endpoint.
 ## Worked example — `merge`
 
 Input subtasks (abridged):
-- `feat-001: Add shared EmptyState primitive` —
-  intent: "Provide one reusable, brand-consistent empty-state component
+- `feat-001: Add shared PlaceholderPanel primitive` —
+  intent: "Provide one reusable, brand-consistent placeholder-panel component
   (icon + headline + description + single CTA slot)..."
-  provides: `["empty-state-primitive"]`
-  files: `[src/components/features/empty-state.tsx]`
-- `refactor-001: Extract shared EmptyState primitive` —
+  provides: `["placeholder-panel-primitive"]`
+  files: `[src/components/features/placeholder-panel.tsx]`
+- `refactor-001: Extract shared PlaceholderPanel primitive` —
   intent: "Replace the 3+ inline 'text-muted-foreground text-center'
-  empty-state paragraphs with one reusable EmptyState component..."
-  provides: `["empty-state-primitive"]`
-  files: `[src/components/features/empty-state.tsx]`
+  placeholder-panel paragraphs with one reusable PlaceholderPanel component..."
+  provides: `["placeholder-panel-primitive"]`
+  files: `[src/components/features/placeholder-panel.tsx]`
 
 Same exported artifact (✓), peer extractions (✓), API conflict checks:
 
@@ -304,45 +318,45 @@ Same exported artifact (✓), peer extractions (✓), API conflict checks:
   component file itself.
 
 All feasibility checks pass. Resolution: `merge`. `merge_feasibility`:
-*"Both can be satisfied by a brand-styled EmptyState with optional
+*"Both can be satisfied by a brand-styled PlaceholderPanel with optional
 icon/title/description/CTA props. feat-001's brand-consistency
 requirement holds because the component is brand-styled; refactor-001's
-deduplication requirement holds because every inline empty-state block
+deduplication requirement holds because every inline placeholder-panel block
 is replaced by the same component."*
 
 ## Worked example — `unresolvable`
 
 Input subtasks (abridged):
-- `feat-008: Add branded AuthShell and adopt it on auth pages` —
+- `feat-008: Add branded WidgetFrame and adopt it on auth pages` —
   intent: "Extract the duplicated 'min-h-screen flex items-center
-  justify-center bg-background p-4' wrapper into a single AuthShell
-  with consistent StackPulse branding... Pages render their own Card
-  inside `<AuthShell>{children}</AuthShell>`."
-  provides: `["auth-shell-adopted"]`
-  files: `[src/components/features/auth-shell.tsx,
+  justify-center bg-background p-4' wrapper into a single WidgetFrame
+  with consistent brand styling... Pages render their own Card
+  inside `<WidgetFrame>{children}</WidgetFrame>`."
+  provides: `["widget-frame-adopted"]`
+  files: `[src/components/features/widget-frame.tsx,
            src/app/[locale]/{login,register,forgot-password,
            reset-password,verify-email}/page.tsx]`
-- `refactor-001: Extract AuthShell brand-funnel wrapper component` —
+- `refactor-001: Extract WidgetFrame brand-funnel wrapper component` —
   intent: "Eliminate the auth-page shell + brand-header duplication
   so the redesign restyles one place. Component accepts a *required*
   `description: string` prop and renders the Card itself
   (Card/Header/Title/Description/Content); children go inside
   CardContent. No page wiring yet."
-  provides: `["auth-shell-component"]`
-  files: `[src/components/features/auth-shell.tsx,
-           src/components/features/auth-shell.test.tsx]`
+  provides: `["widget-frame-component"]`
+  files: `[src/components/features/widget-frame.tsx,
+           src/components/features/widget-frame.test.tsx]`
 
-Same exported artifact (✓ — both create AuthShell in the same file),
+Same exported artifact (✓ — both create WidgetFrame in the same file),
 peer extractions (✓), API conflict checks:
 
 - Required vs optional prop: feat-008 says pages pass only
   `{children}`; refactor-001 says `description` is **required**.
   Required-and-forbidden conflict. → FAIL.
 - Structural body: feat-008 says pages render their own Card *inside*
-  AuthShell; refactor-001 says AuthShell renders the Card itself.
+  WidgetFrame; refactor-001 says WidgetFrame renders the Card itself.
   Direct contradiction. → FAIL.
 - Adoption sites: feat-008 wires 5 pages with the `{children}`
-  contract; if AuthShell adopts refactor-001's contract, all 5 wired
+  contract; if WidgetFrame adopts refactor-001's contract, all 5 wired
   pages break (missing required `description`, double-nested Cards).
   → FAIL.
 
@@ -352,29 +366,29 @@ pages render their own Card) and refactor-001's component contract
 (required `description` prop, renders Card itself) are structurally
 incompatible: making `description` optional defeats refactor-001's
 spec; keeping it required breaks feat-008's five wired pages. No
-single AuthShell satisfies both."*
+single WidgetFrame satisfies both."*
 
 ## Worked example — SHOULD NOT flag (consumer+producer)
 
 Input subtasks (abridged):
-- `feat-001: Add shared EmptyState primitive` — creates `EmptyState`.
+- `feat-001: Add shared PlaceholderPanel primitive` — creates `PlaceholderPanel`.
 - `feat-006: Redesign Dashboard for at-a-glance clarity` —
   intent: "Recompose the dashboard using SectionHeading and
-  EmptyState..." touches `dashboard.tsx`.
+  PlaceholderPanel..." touches `overview.tsx`.
 
-`feat-006` *consumes* `EmptyState`. It does not create or rewrite it.
+`feat-006` *consumes* `PlaceholderPanel`. It does not create or rewrite it.
 Different surfaces, different exports. Do NOT flag.
 
 ## Worked example — SHOULD NOT flag (different artifacts in same file)
 
 Input subtasks (abridged):
 - `refactor-002: Extract Callout/Alert primitive` — creates `Callout`.
-- `refactor-003: Promote StatCard (KpiCard) to a shared primitive` —
-  creates `StatCard`.
-- `refactor-004: Extract Sparkline primitive from dashboard` —
-  creates `Sparkline`.
+- `refactor-003: Promote MetricTile (KpiCard) to a shared primitive` —
+  creates `MetricTile`.
+- `refactor-004: Extract TrendLine primitive from dashboard` —
+  creates `TrendLine`.
 
-All three touch `dashboard.tsx` because each removes inline markup
+All three touch `overview.tsx` because each removes inline markup
 during extraction, but each produces a **different** exported
 primitive. Different surfaces, no API conflict. Do NOT flag.
 

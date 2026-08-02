@@ -162,7 +162,7 @@ def test_resolve_explicit_orphan_id_accepted(leerie, tmp_path):
     """Orphan dirs (fly-machine.json without state.json) must resolve
     so the user can `--resume <orphan-id>` after seed_auth
     aborted before phase_classify. This is the live regression test for
-    the stackpulse/finalmemoriam hangs."""
+    the sibling-service/finalmemoriam hangs."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {
         "fly_machine_id": "287061da360d78",
         "started_at": "2026-06-04T19:20:58+00:00",

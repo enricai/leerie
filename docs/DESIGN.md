@@ -248,7 +248,7 @@ It is reconciled by the orchestrator with three mechanisms:
   adds a dependency edge from producer to consumer.
 - **Reconciler worker** — capability tags are a shared vocabulary with no
   enforced dictionary. Two planners can name the same capability with
-  different words (`slm-capture-shim` vs. `capture-slm-call-implemented`),
+  different words (`event-capture-shim` vs. `capture-call-implemented`),
   and a literal-string match would miss the equivalence. After all planners
   finish, the orchestrator computes the set of `requires` tags that no
   `provides` claims, and if that set is non-empty, spawns a single
@@ -506,8 +506,8 @@ subtasks that produce **the same exported artifact** (the same component,
 the same exported function, the same primitive extraction) with
 **incompatible APIs**. Because the reconciler's mandate is unresolved
 `requires` tags, and because each planner can legitimately declare its
-own `provides` tag for the artifact (`auth-shell-component` and
-`auth-shell-adopted` describe the same `AuthShell` extraction), this
+own `provides` tag for the artifact (`widget-frame-component` and
+`widget-frame-adopted` describe the same `WidgetFrame` extraction), this
 class slips past every check between planning and integration. The
 collision then surfaces as an integrator merge-conflict mid-run, with
 worker budget already spent across earlier waves.
@@ -538,7 +538,11 @@ re-detected them, and all 8 executed. Two subtasks did the same
 migration, the integrator merged both into one document section, and the
 integration gate refused the result — after 4.7 hours and 164 workers.
 The plan handed to execution was one the overlap judge had already
-rejected.
+rejected. (The same run's task — migrating this codebase's own
+regex-over-prose sites — independently surfaced a second, unrelated
+defect during planning: see the migration-surface false-positive numbers
+cited below. One run, two distinct bugs; neither citation is a
+mis-attribution of the other.)
 
 A **plan-overlap judge** worker runs between reconcile and schedule
 specifically to catch this. It reads the full reconciled subtask list
@@ -559,6 +563,14 @@ correct findings. Artifact existence is checked against the union of
 the plan's `files_likely_touched` as well as the repo, so a
 to-be-created file counts as real evidence and only a genuinely
 invented path is flagged.
+
+`artifact` is a free-text label — the judge's own description of what's
+colliding — and Python never parses it (CLAUDE.md *Language-to-JSON*: no
+tokenizing, no stripping punctuation, no testing tokens for path shape). A
+collision instead carries a separate, required `artifact_paths` field: the
+repo-relative paths the judge names explicitly, which is the only thing
+`PHANTOM_ARTIFACT`'s existence check reads. `artifact` stays purely
+descriptive for a human reading the plan.
 
 The judge is biased toward escalation. Before emitting `merge`, it must
 verify the two intents are compositionally consistent — no required-
@@ -674,15 +686,19 @@ requirement the scheduler's contract depends on.
 
 **Multi-artifact pair.** The third coherent shape, alongside the anchor
 cluster and multi-drop above: one *pair* colliding on several artifacts.
-A collision carries a single `artifact` string, so a pair that overlaps
-on two files has no way to say so except one row per artifact. The
-distinguishing question is not whether the pair repeats but whether the
-rows agree on what they *do* to the plan: the resolved dropped sid for a
-`drop_*`, the unordered endpoint pair for a `merge`. Rows whose effect is
+The judge may encode this either way — a single row whose `artifact_paths`
+lists every overlapping file, or one row per artifact — since
+`artifact_paths` is itself a list (`prompts/plan_overlap_judge.md`:
+"Naming several artifacts in one row is equally fine"). This section
+covers the split-row case: when the judge does emit one row per artifact,
+the distinguishing question is not whether the pair repeats but whether
+the rows agree on what they *do* to the plan: the resolved dropped sid for
+a `drop_*`, the unordered endpoint pair for a `merge`. Rows whose effect is
 identical are the same decision stated once per surface, and are
-coalesced into one collision that keeps every artifact name and every
-`merge_feasibility` statement (the carry-forward invariant below applies
-unchanged). Rows whose effect *differs* cannot all hold — the same pair
+coalesced into one collision that keeps every artifact name, every
+`artifact_paths` entry, and every `merge_feasibility` statement (the
+carry-forward invariant below applies unchanged). Rows whose effect
+*differs* cannot all hold — the same pair
 emitted twice as `drop_a` with the endpoints swapped deletes both
 subtasks — and are fed back to the judge as a retryable issue. The retry
 is an opportunity to fix a contradiction, never an escape from one: a
@@ -857,15 +873,65 @@ repeat the classification/planning cost.
 
 This is enforced mechanically at two levels:
 
-- **Intra-domain (CRITIC-enforced).** `check_planner_output()` scans
-  each subtask's `intent` and `investigation_notes` for migration
-  signals (regex-detected phrases like "replaces direct `X`" or
-  "extract `X` as the new seam"). For each detected old-pattern
-  string, the check greps the repo for call sites, cross-references
+- **Intra-domain (CRITIC-enforced).** The planner declares what a
+  subtask replaces as a structured `migration_targets: [{old_pattern,
+  replacement, is_real_identifier}]` field on its own schema — Python
+  never infers this from prose. `check_planner_output()` reads
+  `migration_targets` directly: for each declared `old_pattern`, the
+  check greps the repo for call sites (a symbol the planner named, not
+  one mined from `intent`/`investigation_notes`), cross-references
   against `files_likely_touched` across the domain's subtasks, and
   emits `UNCOVERED_MIGRATION_SURFACE` when > 5 files are uncovered.
-  The CRITIC loop feeds this back as structured feedback; multi-sample
-  selection deprioritizes samples that miss the surface.
+  This used to regex `intent`/`investigation_notes` for phrases like
+  "replaces direct `X`" — the extracted "old pattern" was whatever
+  token followed the verb, which mined ordinary English out of
+  sentences that merely described replacement (measured on run
+  `19a70d96`: every extraction was a stopword — `with` → 332 files,
+  `both` → 178, `task` → 168 — and not one was a real symbol). The
+  regex is deleted; the field is required-by-convention (the prompt
+  asks for it explicitly) though not schema-required, since most
+  subtasks replace nothing and omit it. The CRITIC loop feeds a
+  genuine finding back as structured feedback; multi-sample selection
+  deprioritizes samples that miss the surface.
+
+  Whether `old_pattern` is actually a real, grep-pastable identifier —
+  as opposed to a stopword like `with`/`both`/`task` restated from the
+  subtask's own prose — was initially enforced by a mechanical shape
+  check, `_BARE_LOWERCASE_WORD_RE` (`^[a-z]+$`), run against the
+  planner-populated field. That is itself a CLAUDE.md *Language-to-
+  Json* violation, just relocated: Python was still regex-classifying
+  an LLM's response, only the field being classified moved from
+  `intent`/`investigation_notes` to `old_pattern`. It is replaced by a
+  required sibling field on each `migration_targets` entry,
+  `is_real_identifier: bool` — the planner's own attestation that it
+  believes `old_pattern` will grep cleanly as a real symbol, made at
+  the same time it names the pattern. `_check_migration_surface` skips
+  any target where `is_real_identifier` is false or absent (a missing
+  attestation is never treated as implicit consent), and never
+  re-derives the judgment itself. This mirrors how `performs_replacement`
+  self-reports next to `migration_targets` and `artifact_paths`
+  self-reports next to `artifact` elsewhere in the plan-overlap judge:
+  when Python needs a fact that requires judging an LLM's own prose,
+  the LLM states the fact as structured output instead of Python
+  inferring it.
+
+  Because `migration_targets` is optional, a planner that omits it
+  entirely (rather than declaring a wrong entry) produces silent
+  agreement — `UNCOVERED_MIGRATION_SURFACE` has nothing to check. A
+  second, narrower mechanical check closes the common case of this:
+  the schema also carries a self-reported `performs_replacement: bool`
+  sibling field, and `_check_migration_targets_declared()` flags
+  `MIGRATION_TARGETS_MISSING` when a subtask sets it true but declares
+  no `migration_targets`. This is a same-worker, same-call internal-
+  consistency check (the same shape as the overlap judge's
+  `_contradictory_drop_sids`, not a self-graded confidence score — it
+  does not reintroduce the self-grading bias §8 warns against), and it
+  is explicitly **not an independent witness**: a planner that is wrong
+  on both fields in the same direction (false + omitted, for a subtask
+  that truly replaces something) defeats it the same way omitting
+  `migration_targets` alone always could. It narrows the silent-miss
+  window to "the planner is self-consistently wrong," not "the planner
+  forgot one field" — the two fields no longer disagree unnoticed.
 
 - **Cross-domain (advisory).** `warn_layer_gaps()` runs on the
   reconciled plan before scheduling and surfaces two heuristic warnings:
@@ -989,7 +1055,7 @@ symbols in the top-ranked subgraph in 0.92 s on a 450-node graph.
 
 The ranked subgraph is injected into the planner context (and, per subtask, into
 the splitter, re-ranked to each node's files). This generalizes the existing
-`extract_task_file_structure` seed — P6 is a structurally richer version of
+`glob_task_references` seed — P6 is a structurally richer version of
 what leerie already does in embryo. A `--skip-repo-map` flag
 (`LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml`) degrades to the
 current grep/glob-only planner for repos where tree-sitter cannot parse.
@@ -2564,7 +2630,7 @@ kernel OOM), and is indistinguishable from a bare crash; leerie's
 `_run_checked_loop` retries it, so it self-heals but wastes the killed
 attempt. Prefixing the cgroup name with a run-id discriminator makes each
 run's worker cgroups unreachable by any other run's teardown. (Reproduced
-live: run `stackpulse`'s classifier leader died at the exact second run
+live: run `example-repo`'s classifier leader died at the exact second run
 `summarizer`'s classifier tore down the shared `leerie-w-classifier`.)
 `--cgroupns=private` — which *would* give each container its own
 `leerie.slice` — is not an option: it breaks the broker's cross-scope PID
@@ -5095,6 +5161,37 @@ mis-wirings:
   (the deterministic floor + `adherence_judge`, §12) does not cover either,
   since a plan can honor every prescribed instruction and still omit
   unprescribed required work.
+
+  `task_coverage_judge` is pure judgment with no code-level floor of its
+  own — unlike the instruction-adherence gate's two-layer composition
+  (§12), it originally had no PRIMARY deterministic check, only this
+  SECONDARY judge. `check_required_items_coverage` closes that gap the
+  same way: the classifier's structured `required_items` (its own
+  language→JSON extraction of the task's explicit, enumerable
+  requirements — a numbered checklist, not a freeform goal) is set-
+  compared against each subtask's title/`success_criteria_seed` token set,
+  mirroring `check_prescribed_command_coverage`'s normalized token-subset
+  matching. This is model-independent evidence a `task_covered: true`
+  judge verdict cannot override — the judge can still gate on off-task
+  drift or an item the classifier never enumerated (what the floor
+  cannot see), but the floor alone is sufficient to force a re-plan, and
+  is still evaluated (and can still `die()`) even when the judge crashes
+  on every round. `required_items` stays deliberately narrow: an
+  ambiguous or freeform goal is not extracted as an item, since forcing
+  one reproduces the exact freeze class (IMPLEMENTATION.md
+  §"Freeze guard (2026-07-19 incident, root cause A)") that motivated
+  deleting the old mechanical task-file-coverage gate in the first
+  place. The common case —
+  `required_items` empty — costs nothing; the floor short-circuits to
+  `[]`.
+
+  The floor cannot be satisfied by a planner that never saw the
+  checklist: `phase_plan` injects `required_items` verbatim into every
+  planner's context (only when non-empty), mirroring the instruction-
+  adherence gate's `prescribed_procedure` injection above — the same
+  PREVENT-half pattern, so the planner can echo a required item's
+  wording into a subtask's `title`/`success_criteria_seed` at birth
+  instead of the floor discovering the omission only after the fact.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the
@@ -5128,9 +5225,9 @@ mis-wirings:
   defects in — the same reason the implementer's `solution` axis is
   verified by a *different-role* worker (the conformer) rather than a
   second implementer grading the first. The deterministic validators become
-  this worker's sole gate; `check_overlap_judge_output`'s `_confidence_issues`
-  call on `judgment` is removed, and the `confidence` object stays emitted
-  as an advisory record only.
+  this worker's sole gate; `check_overlap_judge_output` no longer gates on
+  the judge's self-reported `judgment` confidence, and the `confidence`
+  object stays emitted as an advisory record only.
 
 **Why this does not reintroduce the gameable bar §9 removed.** The old
 criteria-lock / "tests must pass" gate was gameable because the *same* worker
@@ -5174,27 +5271,25 @@ generic `_run_checked_loop` extends it to all workers.
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
-orchestrator mechanically extracts structural elements (H3+ markdown
-headings, YAML keys, numbered items — excluding H1/H2 section
-structure and table-of-contents anchor links) and injects them into the
-planner's prompt as an external coverage checklist. The extraction is
-a novel technique — an external reference the planner did not generate,
-grounded in files the user explicitly pointed to. It is inspired by but
-distinct from the executable-specification architecture of "The
-Specification as Quality Gate" (arxiv 2603.25773, 2026): that paper
-recommends BDD scenarios and contract tests (pass/fail deterministic
-checks), while our extraction uses document-structure parsing with
-substring matching — a weaker but pragmatically useful mechanism for
-coverage-oriented tasks.
+orchestrator mechanically resolves the paths (`glob_task_references`) and
+names them for the planner, which reads them itself; whether the plan
+covers what they require is the `task_coverage_judge`'s call (§8). This
+is deliberately just a list of paths — an external reference the planner
+did not generate, grounded in files the user explicitly pointed to —
+naming the files is mechanical, but judging whether a document's
+requirements are met is a judgment about meaning, which is a worker's
+job, not Python's.
 
-The coverage gating check (`check_task_file_coverage`) triggers
-re-invocation only when the extracted item count is ≤ 50
-(`_MAX_COVERAGE_ITEMS`). Above that threshold the signal is too dilute
-for meaningful gating — a planner with 5–15 subtasks cannot
-realistically cover half of 200+ spec items — so the check logs
-informationally but does not re-invoke. The prompt injection is
-unconditional: the planner always sees the full checklist regardless of
-item count. No-op when the task doesn't reference files.
+leerie used to harvest the referenced files' headings with regex (H3+
+markdown headings, YAML keys, numbered items), classify the harvested
+prose with another regex, and gate on substring overlap between the
+result and the plan text — three layers of prose parsing over one
+mechanism, and the mechanism behind the 2026-07-19 freeze (33 identical
+feedback rounds on a ratio no planner could move, because backtick+MUST
+convention headings like CLAUDE.md's own coding-standard imperatives
+cannot appear verbatim in a subtask by construction). It is deleted;
+`task_coverage_judge` reads the referenced files itself and judges
+substance rather than string overlap.
 
 ### Multi-sample planning
 
@@ -5731,14 +5826,17 @@ recurs everywhere in the design:
 
 - The orchestrator does not trust a worker's confidence score at face
   value; it runs deterministic structural checks (file existence, graph
-  cycles, lockfile consistency, task-file coverage) on the output **and**
-  gates on the confidence axes themselves (threshold 9.0 on every
-  schema-defined axis). Both are code-enforced: a worker that
-  hallucinates a file path and a worker that self-reports low confidence
-  both trigger re-invocation with structured feedback. The confidence
-  gate completes the "code enforces" principle — a number the model
-  produces is still externally verified by the orchestrator rather than
-  trusted at face value.
+  cycles, lockfile consistency) on the output **and** gates on the
+  confidence axes themselves (threshold 9.0 on every schema-defined axis).
+  Both are code-enforced: a worker that hallucinates a file path and a
+  worker that self-reports low confidence both trigger re-invocation with
+  structured feedback. The confidence gate completes the "code enforces"
+  principle — a number the model produces is still externally verified by
+  the orchestrator rather than trusted at face value. Task-file coverage is
+  the one axis this pattern doesn't fit: judging whether a task's
+  referenced files are substantively addressed needs judgment, not a
+  deterministic check, so it is verified by an independent LLM judge
+  (`task_coverage_judge`) instead — see §"Task-referenced file extraction".
 
 - The orchestrator does not trust the `dep_capture` worker to self-select
   what to write; it schema-validates the worker's structured output
@@ -5887,12 +5985,20 @@ a semver, a shell command, a fixed CLI output string, a file path — never
 prose a human wrote to communicate intent.
 
 This principle was not observed cleanly from the start: a targeted audit
-found several orchestrator sites that regex natural-language prose (task
+found several orchestrator sites that regexed natural-language prose (task
 text, planner intent, README/markdown section headings) to infer meaning
 from it, a pre-existing violation of the same class this section exists to
-prevent. Migrating those sites to LLM-extracted structured fields is
-tracked as follow-up work outside this change's scope; the principle
-governing new work is stated here so no new site repeats the pattern.
+prevent. Those sites have since been migrated: the task-file coverage
+harvest is deleted outright (coverage judgment now belongs entirely to
+`task_coverage_judge`, an LLM worker — see §"Task-referenced file
+extraction"), the migration-surface signal reads a planner-schema field
+instead of regexing `intent`/`investigation_notes` (see §"Migration-surface
+completeness"), the README
+section pre-filter is gone in favor of an unfiltered size-bounded slice the
+provision worker judges itself, and PHANTOM_ARTIFACT reads a structured
+`artifact_paths` field instead of hand-parsing the `artifact` prose label
+(see §5 *Cross-domain surface overlap*). The principle governing new work
+is stated here so no new site repeats the pattern.
 
 ### Opus-judgment, sonnet-workhorse (historical) — now sonnet for both
 

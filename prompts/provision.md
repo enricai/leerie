@@ -16,7 +16,13 @@ interest.
 
 The user prompt contains:
 
-- An install-relevant slice of the repo's README (header-aware extract).
+- The leading slice of the repo's README, size-bounded only. Nothing has
+  pre-selected the install-relevant parts for you — read it and decide.
+  Do not assume a section is irrelevant because of what it is called: a
+  project may put its setup steps under any heading, in any language, or
+  under none. If the slice was truncated (`hit_ceiling`), the install
+  facts may live further down, so lean harder on the manifests,
+  workflows and CONTRIBUTING you also receive.
 - The root manifest files present (`package.json`, `pyproject.toml`,
   `go.mod`, `Cargo.toml`, `Gemfile`, `Makefile`, `pom.xml`,
   `build.gradle*`).

@@ -22,8 +22,9 @@ def test_empty_repo_returns_empty_fixtures(leerie, tmp_path):
 
 
 def test_readme_is_included_via_extractor(leerie, tmp_path):
-    """A README with a recognized install section is sliced via the
-    header-aware extractor."""
+    """A README under the size budget passes through the extractor
+    verbatim — there is no header-based selection any more (the worker
+    itself judges relevance from the unfiltered slice)."""
     (tmp_path / "README.md").write_text(
         "# Foo\n\nWhatever marketing intro.\n\n"
         "## Installation\n\nRun `pip install foo`.\n"
@@ -109,9 +110,10 @@ def test_total_byte_ceiling_is_enforced(leerie, tmp_path):
 
 
 def test_extractor_falls_back_for_marketing_readme(leerie, tmp_path):
-    """A README with no install/setup-style headers should still produce
-    SOMETHING via the fallback chain (code-fence detector or final
-    top-6KB), even if it's the marketing-style 'Why' pitch."""
+    """A README with no install/setup-style headers still produces
+    SOMETHING — there's no header classification any more, so a
+    'marketing' README is no different from any other: it passes
+    through verbatim (under budget) same as every other README."""
     body = (
         "# Cool Project\n\n"
         "## Why\n\n"
@@ -121,6 +123,7 @@ def test_extractor_falls_back_for_marketing_readme(leerie, tmp_path):
     )
     (tmp_path / "README.md").write_text(body)
     out = leerie.gather_provision_fixtures(tmp_path)
-    # The fixture set isn't empty just because there's no install
-    # section — top-6KB fallback ensures the LLM still has signal.
+    # The fixture set isn't empty for content the old keyword filter
+    # would have skipped — there's no header-based filtering left to
+    # skip it with.
     assert len(out["readme"]) > 0

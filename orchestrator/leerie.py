@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -298,7 +299,8 @@ STATE_FIELDS = (
     "decompose_snapshot",
     "blocked",
     "worker_count", "telemetry",
-    "categories", "classifier_questions", "prescribed_procedure", "answers",
+    "categories", "classifier_questions", "prescribed_procedure",
+    "required_items", "answers",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -1178,6 +1180,31 @@ SCHEMAS: dict[str, dict] = {
                     "evidence": {"type": "string"},
                 },
             },
+            # Language→JSON extraction, same discipline as
+            # prescribed_procedure: the task's explicit, enumerable
+            # requirements (a numbered checklist, "must include X/Y/Z"),
+            # as structured data a deterministic coverage floor can
+            # set-compare against the plan without re-reading the task's
+            # prose. This is the PRIMARY layer of the two-layer coverage
+            # gate (DESIGN §5 *Migration-surface completeness*-style
+            # composition; the SECONDARY layer is task_coverage_judge's
+            # own judgment). Deliberately narrow: only genuinely
+            # enumerable items belong here — an ambiguous or freeform goal
+            # is not a "required item," and forcing one produces the exact
+            # freeze class the old mechanical gate was deleted for
+            # (IMPLEMENTATION.md §"Freeze guard"). Empty/absent is the
+            # common, correct case.
+            "required_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["item"],
+                    "properties": {
+                        "item": {"type": "string", "minLength": 1},
+                        "source_ref": {"type": "string"},
+                    },
+                },
+            },
             # Optional, additive signal from the classifier's own
             # investigation (it already reads the codebase to classify at
             # all — this just structures a claim it was previously only
@@ -1228,6 +1255,62 @@ SCHEMAS: dict[str, dict] = {
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string", "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
+                        # The old pattern(s) this subtask replaces, as
+                        # structured data — so the migration-surface check
+                        # can grep for a symbol the planner NAMED rather
+                        # than one inferred from its prose. Optional: most
+                        # subtasks replace nothing and omit it.
+                        #
+                        # `old_pattern` is a code identifier (a symbol, a
+                        # dotted access path, an import specifier) — the
+                        # literal string to grep for. `minLength: 3` keeps
+                        # out one- and two-character noise; the prompt
+                        # carries the "must be a real identifier" rule.
+                        # `is_real_identifier` is the planner's own
+                        # attestation that `old_pattern` is a grep-pastable
+                        # symbol rather than an English word from its own
+                        # sentence (`with`, `both`, `task`) — CLAUDE.md
+                        # *Language-to-JSON* forbids Python from
+                        # regex-classifying an LLM's response, so this can't
+                        # be a shape check the orchestrator runs after the
+                        # fact; the planner has to say so itself, the same
+                        # way `performs_replacement` self-reports next to
+                        # `migration_targets` and `artifact_paths`
+                        # self-reports next to `artifact` elsewhere in this
+                        # file. Required (not optional) so a planner cannot
+                        # silently skip the attestation for an entry it
+                        # already decided to declare.
+                        "migration_targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "old_pattern", "replacement",
+                                    "is_real_identifier"],
+                                "properties": {
+                                    "old_pattern": {
+                                        "type": "string", "minLength": 3},
+                                    "replacement": {
+                                        "type": "string", "minLength": 1},
+                                    "is_real_identifier": {"type": "boolean"},
+                                },
+                            },
+                        },
+                        # Self-reported companion to migration_targets: does
+                        # this subtask replace an existing pattern at all?
+                        # A same-worker, same-call mechanical contradiction
+                        # check (MIGRATION_TARGETS_MISSING, below) flags
+                        # `performs_replacement: true` with an empty/absent
+                        # `migration_targets` — catching the "planner forgot
+                        # to fill the optional field" case. It is NOT an
+                        # independent witness: a planner that gets both
+                        # fields wrong in the same consistent direction
+                        # (e.g. false + omitted, for a subtask that truly
+                        # replaces something) defeats this check, since both
+                        # signals come from the same self-report. Optional;
+                        # omit or leave false when nothing is replaced.
+                        "performs_replacement": {"type": "boolean"},
                         # The commands this subtask actually invokes, as
                         # structured data — so a prescribed-procedure
                         # coverage check can set-compare over runs_commands
@@ -1862,11 +1945,25 @@ SCHEMAS: dict[str, dict] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["a_sid", "b_sid", "artifact",
-                                 "resolution", "reason"],
+                                 "artifact_paths", "resolution", "reason"],
                     "properties": {
                         "a_sid": {"type": "string"},
                         "b_sid": {"type": "string"},
                         "artifact": {"type": "string"},
+                        # The repo-relative path(s) the colliding artifact
+                        # lives in, named by the judge rather than mined
+                        # out of `artifact` by Python. `artifact` is a
+                        # free-text label ("WidgetFrame component"), so
+                        # tokenizing it to find paths was hand-parsing an
+                        # LLM's response — the exact thing CLAUDE.md's
+                        # language-to-JSON rule forbids. Empty list is
+                        # legitimate: a purely logical artifact has no
+                        # path, and PHANTOM_ARTIFACT then has nothing to
+                        # verify.
+                        "artifact_paths": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                        },
                         "resolution": {
                             "type": "string",
                             "enum": ["merge", "drop_a", "drop_b",
@@ -2205,12 +2302,14 @@ SCHEMAS: dict[str, dict] = {
         },
     },
     "task_coverage_judge": {
-        # Attacks the reconciled plan's coverage of the task — handed only
-        # the task text plus the reconciled subtask set (titles, intents,
-        # success criteria — not the codebase), it asks whether the union of
-        # subtasks actually addresses what the user asked for. Distinct from
-        # fit_judge (per-subtask sizing) and wiring_judge (inter-subtask
-        # graph correctness): this is the one check for whole-plan-vs-task
+        # Attacks the reconciled plan's coverage of the task. Its JSON
+        # payload is only the task text plus the reconciled subtask set
+        # (titles, intents, success criteria), but it also runs with
+        # INSPECT_TOOLS and reads task-referenced files itself per its
+        # prompt — it asks whether the union of subtasks actually
+        # addresses what the user asked for. Distinct from fit_judge
+        # (per-subtask sizing) and wiring_judge (inter-subtask graph
+        # correctness): this is the one check for whole-plan-vs-task
         # coverage. A non-empty `coverage_gaps` gates.
         "type": "object",
         "required": ["task_covered", "coverage_gaps", "rationale"],
@@ -2450,7 +2549,7 @@ class TerminalAuthFailure(BaseException):
 
 
 # Literal Claude Code subscription rate-limit message format, observed
-# verbatim across three independent runs (barnacle/stackpulse/substack)
+# verbatim across three independent runs (three separate repos)
 # on 2026-05-27. Format:
 #   "You've hit your session limit · resets <h>:<mm><am|pm> (<IANA TZ>)"
 # Match case-insensitively but require the literal prefix — broader
@@ -5448,27 +5547,6 @@ _VALID_EXTENTS = frozenset({"in_plan", "external"})
 # feedback on re-invocation.  See _run_checked_loop.
 
 
-def _confidence_issues(
-    conf: dict, axes: list[str], threshold: float = 9.0,
-) -> list[str]:
-    """Return one LOW_CONFIDENCE issue per axis below *threshold*.
-
-    Returns empty when *conf* has no numeric axes at all — the schema
-    enforces their presence in real runs; an empty dict here means the
-    caller passed ``result.get("confidence") or {}`` on a dict that
-    lacked the field entirely (e.g. a test stub)."""
-    if not any(isinstance(conf.get(ax), (int, float)) for ax in axes):
-        return []
-    out: list[str] = []
-    for ax in axes:
-        val = conf.get(ax)
-        if not isinstance(val, (int, float)) or val < threshold:
-            out.append(
-                f"LOW_CONFIDENCE: axis {ax!r} is {val} (threshold "
-                f"{threshold})")
-    return out
-
-
 def check_classifier_output(
         result: dict, repo_root: Path,
         judge_confirmed: frozenset[str] = frozenset()) -> list[str]:
@@ -5581,14 +5659,6 @@ def check_classifier_output(
 # Migration-surface completeness (DESIGN §5)
 # ---------------------------------------------------------------------------
 
-_MIGRATION_SIGNAL_RE = re.compile(
-    r"replac(?:es?|ing)\s+(?:direct\s+)?[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?"
-    r"|migrat(?:es?|ing)\s+from\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?"
-    r"|extract(?:s|ing)\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?\s+(?:from|replacing|as\b)"
-    r"|new\s+(?:accessor|seam|helper|abstraction)\s+(?:for|replacing)\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?",
-    re.IGNORECASE,
-)
-
 _MIGRATION_SURFACE_THRESHOLD = 5
 
 
@@ -5628,10 +5698,34 @@ def _check_migration_surface(
 
     for s in subtasks:
         sid = s.get("id", "?")
-        text = (s.get("intent") or "") + " " + (s.get("investigation_notes") or "")
-        for m in _MIGRATION_SIGNAL_RE.finditer(text):
-            old_pattern = next((g for g in m.groups() if g), None)
-            if not old_pattern or len(old_pattern) < 4:
+        # The planner declares what it replaces in `migration_targets`;
+        # Python greps for a symbol it was HANDED, never one inferred from
+        # the subtask's prose (CLAUDE.md *Language-to-JSON*).
+        #
+        # This used to regex `intent` + `investigation_notes` for phrases
+        # like "replaces direct X". Because the pattern captured whatever
+        # token followed the verb, it mined ordinary English out of
+        # sentences that merely described replacement: measured on run
+        # 19a70d96, all 27 extractions were stopwords — 'with' (grepping
+        # to 332 files), 'both' (178), 'task' (168), 'when', 'that',
+        # 'only', 'selection' — and not one was a real symbol. Every
+        # resulting UNCOVERED_MIGRATION_SURFACE issue was false. The
+        # failure mode is worst on exactly the tasks that talk about
+        # replacing things.
+        for target in s.get("migration_targets") or []:
+            if not isinstance(target, dict):
+                continue
+            old_pattern = (target.get("old_pattern") or "").strip()
+            if not old_pattern:
+                continue
+            # Whether `old_pattern` is a real, grep-pastable identifier is
+            # the planner's own judgment call, self-attested in this
+            # required field — never a shape Python infers by regexing the
+            # LLM's response (CLAUDE.md *Language-to-JSON*). A missing/
+            # falsy attestation is treated the same as an explicit `false`:
+            # skip it, preserving the false-positive protection this field
+            # replaced without trusting an absent value as consent.
+            if not target.get("is_real_identifier"):
                 continue
             grep_hits = _grep_old_pattern(old_pattern, repo_root)
             if not grep_hits:
@@ -5645,6 +5739,40 @@ def _check_migration_surface(
                     f"of {len(grep_hits)} files containing the old pattern "
                     f"are not in any subtask's files_likely_touched. "
                     f"Uncovered sample: {sample}")
+    return issues
+
+
+def _check_migration_targets_declared(subtasks: list[dict]) -> list[str]:
+    """MIGRATION_TARGETS_MISSING check.
+
+    Same-worker, same-call mechanical contradiction check: a subtask that
+    self-reports `performs_replacement: true` but declares no
+    `migration_targets` gives `_check_migration_surface` nothing to grep
+    for, so a real migration silently produces zero
+    UNCOVERED_MIGRATION_SURFACE signal. This closes the "planner forgot to
+    fill the optional field" case.
+
+    It is NOT an independent witness (unlike `task_coverage_judge` or the
+    other adversarial-verifier gates DESIGN §8 documents) — both signals
+    are self-reported by the same planner call, so a planner that is wrong
+    on `performs_replacement` and `migration_targets` in the same
+    direction (false + omitted, for a subtask that truly replaces
+    something) defeats this check too. It only catches the inconsistent
+    case, not the consistently-wrong one.
+    """
+    issues: list[str] = []
+    for s in subtasks:
+        if not s.get("performs_replacement"):
+            continue
+        targets = s.get("migration_targets") or []
+        if targets:
+            continue
+        sid = s.get("id", "?")
+        issues.append(
+            f"MIGRATION_TARGETS_MISSING: {sid} declares "
+            "performs_replacement=true but names no migration_targets — "
+            "UNCOVERED_MIGRATION_SURFACE has nothing to check coverage "
+            "against for this subtask's replacement")
     return issues
 
 
@@ -5799,7 +5927,16 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
     silently gaining dependencies it never declared. Copying here makes the
     invariant structural instead of asking every future caller to remember to
     rebind rather than mutate. `requires` entries are dicts, so the copy is
-    deep enough to give each child its own entry dicts too."""
+    deep enough to give each child its own entry dicts too.
+
+    `migration_targets`/`performs_replacement` are carried forward the same
+    way: `check_planner_output` (and its `_check_migration_surface`/
+    `_check_migration_targets_declared` checks) runs on the planner's raw
+    sample before expansion, so these fields are inert for that gate's
+    purposes here — but a leaf child is still a subtask that replaces the
+    same pattern its parent did, and dropping the fields would silently
+    make that fact unrecoverable for anything that reads a leaf in
+    isolation later (a human reviewing the plan, or a future consumer)."""
     return {
         "id": cid,
         "title": title,
@@ -5812,6 +5949,9 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         "provides": list(subtask.get("provides", []) or []),
         "size": "medium",
         "investigation_notes": subtask.get("investigation_notes", ""),
+        "migration_targets": copy.deepcopy(
+            subtask.get("migration_targets", []) or []),
+        "performs_replacement": subtask.get("performs_replacement", False),
     }
 
 
@@ -6516,6 +6656,69 @@ def check_prescribed_command_coverage(
     return issues
 
 
+def check_required_items_coverage(
+    required_items: list[dict] | None, subtasks: list[dict],
+) -> list[str]:
+    """Deterministic JSON→verdict PRIMARY floor for the task-coverage gate.
+
+    Sibling to `check_prescribed_command_coverage` (same composition
+    pattern: a deterministic floor as the PRIMARY layer, `task_coverage_judge`
+    as the SECONDARY/judgment layer — DESIGN §5 *Migration-surface
+    completeness*, §8 *Independent adversarial verification*). Closes the
+    gap left by `task_coverage_judge` being pure judgment with no code-level
+    floor (a plan can be schema-valid and judged `task_covered: true` while
+    still dropping an item the task explicitly enumerated, if the judge
+    simply misses it).
+
+    Computes `required_items` − ⋃(subtask.title + subtask.success_criteria_seed)
+    under the same normalized (lowercased, stopword-filtered token-SUBSET)
+    matching `check_prescribed_command_coverage` uses — planner-authored
+    structured-ish strings, never the task's own free prose and never
+    `intent`/`investigation_notes` (CLAUDE.md *Language-to-JSON*: Python
+    never re-interprets an LLM's free-text explanation of its own
+    reasoning). A required item is "covered" when some subtask's
+    title+success_criteria_seed token set is a SUPERSET of the item's own
+    salient tokens.
+
+    Short-circuits to `[]` (free) when `required_items` is empty — the
+    common case; the classifier is deliberately instructed to leave this
+    narrow and empty rather than force an ambiguous goal into a checklist
+    entry, since that is exactly the freeze class (IMPLEMENTATION.md
+    §"Freeze guard") the old mechanical task-file-coverage gate was
+    deleted for. This check
+    has no re-plan retry budget of its own tied to a fixed ratio — it feeds
+    into the coverage gate's existing `_run_checked_loop`, which re-plans
+    the whole task on ANY remaining issue (floor or judge), so a stuck
+    floor issue surfaces as ordinary gate exhaustion, not a silent freeze.
+    """
+    items = required_items or []
+    if not items:
+        return []
+
+    subtask_token_sets = [
+        _command_tokens(f"{s.get('title', '')} {s.get('success_criteria_seed', '')}")
+        for s in subtasks
+    ]
+
+    issues: list[str] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        item = (entry.get("item") or "").strip()
+        if not item:
+            continue
+        item_tokens = _command_tokens(item)
+        covered = bool(item_tokens) and any(
+            item_tokens <= st_tokens for st_tokens in subtask_token_sets)
+        if not covered:
+            source_ref = entry.get("source_ref") or ""
+            suffix = f" ({source_ref})" if source_ref else ""
+            issues.append(
+                f"REQUIRED_ITEM_UNCOVERED: required item {item!r}{suffix} "
+                "is not covered by any subtask's title/success_criteria_seed")
+    return issues
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:
@@ -6627,6 +6830,7 @@ def check_planner_output(
             f"this domain ({domain})")
 
     issues.extend(_check_migration_surface(subtasks, repo_root))
+    issues.extend(_check_migration_targets_declared(subtasks))
 
     # `decomposition_quality` and `task_understanding` are retained in the
     # planner schema as advisory self-reports, but neither is a gating axis
@@ -6715,51 +6919,36 @@ def check_overlap_judge_output(
             for f in s.get("files_likely_touched", []) or []:
                 planned_files.add(_normalize_artifact_path(f))
 
-    _CODE_EXTS = frozenset(
-        ".ts .tsx .py .go .rs .java .rb .js .jsx .css .scss".split())
-
-    def _path_shaped(token: str) -> bool:
-        return "/" in token or any(token.endswith(e) for e in _CODE_EXTS)
-
-    def _depunctuate(token: str) -> str:
-        """Strip the prose punctuation an artifact name accretes.
-
-        Trailing `.` and a trailing possessive are handled on the RIGHT
-        only: a two-sided `strip(".")` would eat the leading dot of
-        `./src/x.ts` and turn a repo-relative path into an absolute one,
-        which then resolves outside the repo root."""
-        token = token.strip("'\"`,;:()[]{}<>")
-        for suffix in ("'s", "’s"):
-            if token.endswith(suffix):
-                token = token[: -len(suffix)]
-                break
-        return token.rstrip(".,;:!?")
-
     for c in collisions:
-        artifact = c.get("artifact", "")
-        # `artifact` is a LOGICAL artifact name, not necessarily a bare
-        # path — the prompt asks for "the colliding exported artifact,
-        # e.g. 'AuthShell component'", and on a docs/config-heavy plan the
-        # natural name embeds a path inside prose ("docs/USAGE.md
-        # bare-verb rewrite"). Treating the whole string as one path
-        # false-positived every such name: run e2882da6 emitted 6 spurious
-        # issues on an otherwise-valid emission, and the retry those
-        # issues forced is what produced the duplicate-pair emission that
-        # killed the run. So tokenize, and only path-check the tokens that
-        # actually look like paths. No path-shaped token at all means a
-        # pure logical name — nothing to verify, never flagged.
-        candidates = [_depunctuate(t) for t in artifact.split()]
-        candidates = [t for t in candidates if _path_shaped(t)]
-        if not candidates:
+        # `artifact` is a LOGICAL name the prompt asks for in prose ("the
+        # colliding exported artifact, e.g. 'WidgetFrame component'"), so
+        # Python must not mine paths out of it. The judge names the paths
+        # itself in `artifact_paths` and this check does plain set
+        # membership on already-structured data — CLAUDE.md's
+        # language-to-JSON rule ("never regex or hand-parsing in Python...
+        # never on an LLM's response").
+        #
+        # History: this used to path-check `artifact` directly, which
+        # false-positived every descriptive name — run e2882da6 emitted 6
+        # spurious issues on an otherwise-valid emission, and the retry
+        # they forced produced the duplicate-pair emission that killed the
+        # run. Tokenizing the string fixed the false positives but was
+        # still hand-parsing an LLM's prose; this replaces it.
+        #
+        # An empty `artifact_paths` is legitimate, not a defect: a purely
+        # logical artifact has no path, and there is then nothing to
+        # verify.
+        paths = c.get("artifact_paths") or []
+        if not paths:
             continue
-        if any(_normalize_artifact_path(t) in planned_files
-               or (repo_root / t).exists() for t in candidates):
+        if any(_normalize_artifact_path(p) in planned_files
+               or (repo_root / p).exists() for p in paths):
             continue
         issues.append(
             f"PHANTOM_ARTIFACT: collision "
             f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
-            f"names artifact {artifact!r} which does not "
-            "exist in the repo and is not in any subtask's "
+            f"names artifact path(s) {sorted(paths)!r} which do not "
+            "exist in the repo and are not in any subtask's "
             "files_likely_touched")
 
     # DUPLICATE_PAIR — the same pair emitted twice with *different*
@@ -6957,11 +7146,15 @@ def check_implementer_output(
 
 # ---- Task-referenced file extraction (CRITIC correlated-error breaker) - #
 # When the task string references files (glob patterns or explicit paths),
-# the orchestrator mechanically extracts structural elements (headings,
-# YAML keys, numbered items) and injects them as an external coverage
-# reference into the planner's prompt.  This breaks the correlated-error
-# ceiling identified by "The Specification as Quality Gate" (Mar 2026,
-# arxiv 2603.25773).
+# the orchestrator mechanically resolves the paths and names them for the
+# planner and task_coverage_judge, which read the files themselves and
+# judge coverage as substance rather than string overlap. This breaks the
+# correlated-error ceiling identified by "The Specification as Quality
+# Gate" (Mar 2026, arxiv 2603.25773). Naming the files is mechanical;
+# judging whether their requirements are met is a judgment about meaning,
+# which used to be done here via regex-harvested headings substring-
+# matched against plan text — see docs/DESIGN.md "Task-referenced file
+# extraction" for why that mechanism was deleted (the 2026-07-19 freeze).
 
 _GLOB_CHARS = frozenset("*?[{")
 _BRACE_RE = re.compile(r'\{([^}]+)\}')
@@ -6981,6 +7174,36 @@ def _expand_braces(pattern: str) -> list[str]:
     for alt in m.group(1).split(","):
         expanded.extend(_expand_braces(prefix + alt.strip() + suffix))
     return expanded
+
+
+def _repo_rel(path: Path, repo_root: Path) -> str:
+    """Repo-relative string for *path*, falling back to its name when it
+    resolves outside *repo_root*. Pure path arithmetic."""
+    try:
+        return str(path.resolve().relative_to(repo_root.resolve()))
+    except (ValueError, OSError):
+        return path.name
+
+
+def _format_task_file_references(
+    files: list[Path], repo_root: Path,
+) -> str | None:
+    """Name the files the task references so the planner reads them.
+
+    Deliberately just a list of paths. leerie used to harvest headings and
+    YAML keys out of these files with regex and inject them as a coverage
+    checklist — parsing prose to decide what a document requires, which is
+    the planner's job and, for the plan as a whole, `task_coverage_judge`'s
+    (CLAUDE.md *Language-to-JSON*). Returns None when the task names no
+    files, so the section is omitted rather than empty."""
+    if not files:
+        return None
+    listing = "\n".join(f"- {_repo_rel(f, repo_root)}" for f in files)
+    return (
+        "FILES THIS TASK REFERENCES\n"
+        "Read each one before decomposing — they carry requirements the "
+        "task text only gestures at:\n" + listing
+    )
 
 
 def glob_task_references(task: str, repo_root: Path) -> list[Path]:
@@ -7013,175 +7236,6 @@ def glob_task_references(task: str, repo_root: Path) -> list[Path]:
                     seen.add(str(p))
                     matched.append(p)
     return matched
-
-
-def extract_task_file_structure(
-    task: str, repo_root: Path,
-) -> list[str] | None:
-    """Extract structural elements from files referenced in the task.
-
-    Returns a list of ``"filename: heading/key"`` strings, or ``None``
-    if no files matched or no structure could be extracted."""
-    matched = glob_task_references(task, repo_root)
-    if not matched:
-        return None
-    items: list[str] = []
-    for f in matched:
-        try:
-            text = f.read_text(errors="replace")
-        except OSError:
-            continue
-        ext = f.suffix.lower()
-        name = f.name
-        if ext in (".md", ".txt"):
-            for m in re.finditer(r'^#{3,6}\s+(.+)', text, re.MULTILINE):
-                items.append(f"{name}: {m.group(1).strip()}")
-            for m in re.finditer(r'^\d+\.\s+(.+)', text, re.MULTILINE):
-                raw = m.group(1).strip()
-                if not re.match(r'^\[.+\]\(#', raw):
-                    items.append(f"{name}: {raw[:80]}")
-        elif ext in (".yaml", ".yml"):
-            # Stdlib-only: extract list-item IDs and top-level mapping
-            # keys via regex.  Full YAML parsing would require PyYAML
-            # which is not a runtime dep (stdlib-preferred per CLAUDE.md).
-            for m in re.finditer(r'^- id:\s*(.+)', text, re.MULTILINE):
-                items.append(f"{name}: {m.group(1).strip()}")
-            for m in re.finditer(
-                    r'^([a-zA-Z_][\w-]*):', text, re.MULTILINE):
-                items.append(f"{name}: {m.group(1)}")
-    return items if items else None
-
-
-_MAX_COVERAGE_ITEMS = 50
-
-# Matches a backtick-quoted span, e.g. the `` `pnpm run lint:fix` `` in
-# ``Run `pnpm run lint:fix` - MUST pass with no errors``.
-_BACKTICK_SPAN_RE = re.compile(r'`[^`]+`')
-
-
-def _is_uncoverable_convention_item(key: str) -> bool:
-    """True when *key* is a repo-convention imperative that cannot appear
-    verbatim in a subtask title/intent by construction.
-
-    Root cause A (2026-07-19 incident): headings like ``Run `pnpm run
-    lint:fix` - MUST pass with no errors`` are harvested from files like
-    CLAUDE.md as coverage items, but the literal-substring check
-    (``key.lower() not in plan_text``) can never match them — no planner
-    restates a backtick-quoted command plus "MUST" verbatim in a subtask
-    title or intent. Excluding these from the coverage denominator (not
-    from the prompt injection, which stays unconditional) is what stops
-    the gate from re-driving an unwinnable planner feedback round on a
-    signal that cannot move — 33/33 feedback rounds froze at an identical
-    15/15 ratio in the incident run."""
-    has_backtick_span = bool(_BACKTICK_SPAN_RE.search(key))
-    has_imperative = bool(re.search(r'\bMUST\b', key))
-    return has_backtick_span and has_imperative
-
-
-def check_task_file_coverage(
-    extracted: list[str], subtasks: list[dict],
-) -> list[str]:
-    """Check which extracted items are NOT referenced by any subtask.
-
-    Returns a LOW_COVERAGE issue when >50% of items are uncovered AND the
-    item count is ≤ ``_MAX_COVERAGE_ITEMS``.  Above the cap the signal is
-    too dilute for meaningful gating — a planner with 5–15 subtasks cannot
-    realistically cover half of 200+ spec items.  The prompt injection
-    (``_format_task_file_structure``) is unconditional regardless of this
-    cap.
-
-    Items that are uncoverable by construction — repo-convention
-    imperatives combining a backtick-quoted command with "MUST", which can
-    never appear verbatim in a subtask title/intent — are dropped from
-    both the numerator and denominator before the ratio is computed (see
-    ``_is_uncoverable_convention_item``). This is what keeps the gate from
-    firing forever on files like CLAUDE.md whose headings are coding-
-    standard rules rather than spec items a plan could restate."""
-    if not extracted:
-        return []
-    coverable = [
-        item for item in extracted
-        if not _is_uncoverable_convention_item(
-            item.split(": ", 1)[1] if ": " in item else item)
-    ]
-    if not coverable:
-        return []
-    if len(coverable) > _MAX_COVERAGE_ITEMS:
-        return []
-    plan_text = " ".join(
-        (s.get("intent", "") + " " +
-         s.get("investigation_notes", "") + " " +
-         s.get("title", ""))
-        for s in subtasks
-    ).lower()
-    uncovered = []
-    for item in coverable:
-        key = item.split(": ", 1)[1] if ": " in item else item
-        if key.lower() not in plan_text:
-            uncovered.append(item)
-    if uncovered and len(uncovered) > len(coverable) * 0.5:
-        return [
-            f"LOW_COVERAGE: {len(uncovered)}/{len(coverable)} items "
-            f"from task-referenced files not mentioned in plan. "
-            f"Sample: {uncovered[:5]}"]
-    return []
-
-
-def _dedup_frozen_coverage_issues(
-    coverage_issues: list[str], seen_ratios: set[str],
-) -> list[str]:
-    """Drop LOW_COVERAGE issues whose ratio prefix (e.g. ``"LOW_COVERAGE:
-    15/15"``) was already seen in a prior round of the same planner loop.
-
-    Mutates *seen_ratios* in place (adds every new ratio seen). A ratio
-    that repeats round-over-round means the gate's feedback isn't moving
-    the planner — re-sending it would just re-drive an unwinnable
-    feedback round (root cause A, 2026-07-19 incident: 33/33 feedback
-    rounds froze at an identical 15/15). The first occurrence of a given
-    ratio still passes through, so a genuinely new (even if numerically
-    coincidental across categories) gate still fires once."""
-    fresh = []
-    for issue in coverage_issues:
-        ratio = issue.split(" items ", 1)[0]
-        if ratio in seen_ratios:
-            continue
-        seen_ratios.add(ratio)
-        fresh.append(issue)
-    return fresh
-
-
-def _format_task_file_structure(items: list[str]) -> str:
-    """Format extracted structure as an external coverage reference
-    for the planner prompt."""
-    lines = "\n".join(f"- {item}" for item in items[:100])
-    return (
-        "TASK-REFERENCED FILE STRUCTURE (mechanically extracted by the "
-        "orchestrator — not generated by an LLM):\n\n"
-        f"{lines}\n\n"
-        "Use this as a coverage checklist. Verify your plan addresses "
-        "each item or explicitly notes why it's out of scope for your "
-        "domain."
-    )
-
-
-# ---------------------------------------------------------------------------
-# P6 repo-map — build_repo_map + rank_repo_map (DESIGN §5½ (P6))
-# ---------------------------------------------------------------------------
-# tree_sitter and tree_sitter_language_pack are lazy-imported inside each
-# function (same pattern as tenacity inside claude_p) so that orchestrator/
-# leerie.py loads on a bare host python3 that lacks requirements.txt deps.
-# The config --recapture host seam exec_module()s this file on the host where
-# neither tree-sitter package is guaranteed; a module-scope import would crash
-# before the fast-path guards can print their diagnostic.
-
-
-def _repo_map_cache_key(path: Path) -> str:
-    """Return a stable cache key: '<abs_path>@<mtime_ns>'.
-
-    The mtime_ns component means that touching a file produces a new key
-    and forces a re-parse, while leaving it untouched hits the cached
-    result — the Aider diskcache pattern."""
-    return f"{path}@{path.stat().st_mtime_ns}"
 
 
 def _walk_calls(node: "object") -> list[str]:
@@ -8753,40 +8807,6 @@ def validate_provision_recipe(recipe: list[dict]) -> None:
 # The two known misses (Supabase, esbuild) are marketing-style READMEs
 # that delegate install to external docs — those repos route through
 # .leerie-setup.sh.
-_README_SECTION_RE = re.compile(
-    r"(?i)\b("
-    r"install"
-    r"|getting[\s-]?started"
-    r"|quick[\s-]?start"
-    r"|setup"
-    r"|usage"
-    r"|\brun\b"
-    r"|develop"
-    r"|build(ing)?( from source| instructions)?"
-    r"|compil(e|ing)( from source)?"
-    r"|download"
-    r"|from source"
-    r"|requirements"
-    r"|prerequisites"
-    r"|dependenc(y|ies)"
-    r")\b"
-)
-
-# Strip leading markdown-decoration glyphs (emoji, bullets, punctuation)
-# from a header line before keyword matching. Handles `## 🚀 Getting
-# Started` and `## • Install` without losing the keyword. The character
-# class is intentionally permissive — emoji span several Unicode blocks,
-# so we whitelist ASCII word characters / spaces instead and strip
-# everything else from the left.
-_HEADER_DECOR_RE = re.compile(r"^[^\w]+", flags=re.UNICODE)
-
-# Code-fence content heuristics for the fallback layer. Used when no
-# header matches: keep code fences that contain recognizable install
-# commands so the LLM still sees the project's documented invocation.
-_INSTALL_CMD_HINT_RE = re.compile(
-    r"\b(pip|pip3|npm|pnpm|yarn|uv|poetry|cargo|brew|apt|apt-get|dnf|"
-    r"yum|pacman|go install|make|bundle install|gem install|mise install)\b"
-)
 
 # Byte budget for the dep_capture command extraction. Extracted Bash
 # commands from logs/*.log (deduped, newest-first) are admitted until this
@@ -9059,6 +9079,12 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
+# Node subcommands that install from an existing lockfile. `add`/`remove`/
+# `up`/`dlx` are deliberately absent: they change what is installed, so they
+# are never the per-worktree relink residual however they are flagged.
+_NODE_INSTALL_SUBCOMMANDS = frozenset({"install", "i", "ci"})
+
+
 def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
     """Filter language_installs to only the residual that cannot be baked.
 
@@ -9093,9 +9119,29 @@ def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
         # For Node managers, keep only offline-relink commands
         if manager in NODE_MANAGERS:
             # The irreducible residual is the offline/frozen-lockfile relink
-            # (e.g., "pnpm install --offline --frozen-lockfile")
-            # Filter out full network installs
-            if "--offline" in command or "--frozen-lockfile" in command:
+            # of an *install* — e.g. "pnpm install --offline
+            # --frozen-lockfile". Two independent conditions, both needed:
+            #
+            #   subcommand  the flags alone are not enough. "pnpm add
+            #               left-pad --frozen-lockfile" carries a pinned
+            #               flag but mutates the dependency set over the
+            #               network; re-running it per worktree is the
+            #               opposite of a relink. Same for remove/up/dlx.
+            #   flag        OR, not AND: the three managers spell this
+            #               differently (pnpm wants both, "npm install
+            #               --offline" and "yarn install --frozen-lockfile"
+            #               each stand alone), so requiring both would
+            #               drop two of the three.
+            #
+            # Token membership, not substring: "--offline" appearing
+            # inside a package name or a path must not count.
+            try:
+                toks = shlex.split(command)
+            except ValueError:      # unbalanced quotes in a captured line
+                continue
+            if len(toks) < 2 or toks[1] not in _NODE_INSTALL_SUBCOMMANDS:
+                continue
+            if "--offline" in toks or "--frozen-lockfile" in toks:
                 residual.append(entry)
             continue
 
@@ -9611,125 +9657,57 @@ def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
     return sections
 
 
-def _is_install_section(header: str) -> bool:
-    """True if a header (after decoration-strip) matches the section
-    regex. Empty header (the intro) is not an install section by
-    definition."""
-    if not header:
-        return False
-    cleaned = _HEADER_DECOR_RE.sub("", header)
-    return bool(_README_SECTION_RE.search(cleaned))
-
-
-def _slice_code_fences_with_install_hints(text: str, ctx_lines: int = 10) -> str:
-    """Fallback layer: scan for fenced code blocks containing recognized
-    install commands and return them with ±ctx_lines of surrounding
-    context. Used when the header-aware extractor finds no install
-    section."""
-    lines = text.split("\n")
-    n = len(lines)
-    in_fence = False
-    fence_start = -1
-    fence_marker = ""
-    kept_ranges: list[tuple[int, int]] = []  # inclusive [start, end] line indices
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                in_fence = True
-                fence_start = i
-                fence_marker = stripped[:3]
-        else:
-            if stripped.startswith(fence_marker):
-                # Fence closed at line i.
-                fence_text = "\n".join(lines[fence_start: i + 1])
-                if _INSTALL_CMD_HINT_RE.search(fence_text):
-                    lo = max(0, fence_start - ctx_lines)
-                    hi = min(n - 1, i + ctx_lines)
-                    kept_ranges.append((lo, hi))
-                in_fence = False
-                fence_start = -1
-                fence_marker = ""
-    if not kept_ranges:
-        return ""
-    # Merge overlapping ranges in order.
-    merged: list[tuple[int, int]] = []
-    for lo, hi in sorted(kept_ranges):
-        if merged and lo <= merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-    pieces = ["\n".join(lines[lo: hi + 1]) for lo, hi in merged]
-    return "\n\n…\n\n".join(pieces)
-
-
-# Per-extract budgets, in bytes. README ≤1KB intro + matched sections
-# under an 8KB total cap. The fixture set as a whole is capped at 24KB
-# by gather_provision_fixtures().
-_README_INTRO_BUDGET = 1024
-_README_EXTRACT_BUDGET = 8192
-_README_FALLBACK_BUDGET = 6144  # final top-of-file fallback
+# Size budgets for the provision-worker README fixture. The worker
+# decides which parts describe installation; these only bound how much it
+# sees (DESIGN §6½).
+# 12KB, not 8: measured against this repo's own 75KB / 89-section README,
+# an 8KB slice cut `### Manual container-runtime setup` (byte 8701) and the
+# `brew install colima` prerequisite (9009) — content the keyword filter this
+# replaced would have reached at any depth. 16KB was tried and rejected: it
+# pushes the fixture set past `_FIXTURE_TOTAL_BUDGET` and silently drops
+# CONTRIBUTING, which is a higher-signal install source than a README's tail.
+_README_EXTRACT_BUDGET = 12288  # per-README slice handed to the worker
 _FIXTURE_TOTAL_BUDGET = 24576   # 24KB hard ceiling per repo
 
 
 def extract_readme_sections(text: str) -> str:
-    """Extract the install/setup-relevant slice of a README.
+    """Return the leading slice of a README, cut at a section boundary.
 
-    Fallback chain (DESIGN §6½):
-      1. Header-aware: ≤1KB intro + sections whose header matches
-         _README_SECTION_RE, under an 8KB total cap.
-      2. Code-fence hint: if no section header matches, scan for code
-         fences containing install commands (pip/npm/cargo/etc.) and
-         keep them with ±10 lines of surrounding context.
-      3. Final: top-6KB of the README verbatim.
+    Size-bounding only. WHICH parts of a README describe installation is a
+    judgment about prose, so the provision worker makes it — this function
+    just decides how much text it gets to see.
 
-    Returns the extracted text (≤8KB). Empty input → empty output.
+    It used to pre-select "install-ish" sections by keyword-matching each
+    header against `_README_SECTION_RE` (`install|setup|usage|build|…`),
+    which is regex over prose to classify it — CLAUDE.md
+    *Language-to-JSON*. The keyword list was also a permanent maintenance
+    tax: every project that names the section something the list had not
+    anticipated silently fell through to a cruder fallback.
+
+    The cut is section-aware so the worker never receives a header with
+    its body sheared off mid-sentence, but that is presentation, not
+    selection: nothing here reads what a header *means*. A README longer
+    than the budget is truncated from the bottom, and
+    `gather_provision_fixtures` flags that through `hit_ceiling`; the
+    worker also sees manifests, workflows and CONTRIBUTING, which is
+    where install facts usually live when a README is that long.
     """
     if not text:
         return ""
-    sections = _split_readme_headers(text)
-    out_parts: list[str] = []
-    used = 0
+    if len(text) <= _README_EXTRACT_BUDGET:
+        return text
 
-    # Intro budget: first section body, whether labeled or not. A README
-    # that starts with `# Project\n\nElevator pitch.\n\n## Install` has
-    # its first section named "Project" (not ""), but the elevator pitch
-    # is still the intro from the user's point of view. Including the
-    # first section's body (up to the intro budget) keeps that signal
-    # without making the whole top-level section count as an install
-    # section.
-    if sections:
-        first_body = sections[0][2][:_README_INTRO_BUDGET]
-        if first_body.strip():
-            out_parts.append(first_body)
-            used += len(first_body)
-
-    matched_any = False
-    for _idx, hdr, body in sections:
-        if not _is_install_section(hdr):
-            continue
-        matched_any = True
-        if used >= _README_EXTRACT_BUDGET:
-            break
-        room = _README_EXTRACT_BUDGET - used
-        out_parts.append(body[:room])
-        used += min(len(body), room)
-
-    if matched_any:
-        return "\n\n".join(out_parts)
-
-    # Fallback 2: code-fence install-hint slicer.
-    fence_slice = _slice_code_fences_with_install_hints(text)
-    if fence_slice:
-        intro_part = out_parts[0] if out_parts else ""
-        fence_room = max(0, _README_EXTRACT_BUDGET - len(intro_part))
-        fence_part = fence_slice[:fence_room]
-        if intro_part:
-            return intro_part + "\n\n" + fence_part
-        return fence_part
-
-    # Fallback 3: top-6KB.
-    return text[:_README_FALLBACK_BUDGET]
+    cut = text[:_README_EXTRACT_BUDGET]
+    # Back up to the last section boundary, but never discard more than a
+    # quarter of the budget chasing one — a README with no headers in its
+    # first three-quarters of the budget should still get that much.
+    floor = int(_README_EXTRACT_BUDGET * 0.75)
+    boundary = -1
+    for start, _hdr, _body in _split_readme_headers(cut):
+        offset = len("\n".join(cut.split("\n")[:start]))
+        if floor <= offset < len(cut):
+            boundary = max(boundary, offset)
+    return cut[:boundary] if boundary > 0 else cut
 
 
 def _read_file_safely(path: Path, budget: int) -> str:
@@ -9795,7 +9773,11 @@ def _sample_workspace_manifests(repo_root: Path, pkg_json_text: str,
 def gather_provision_fixtures(repo_root: Path) -> dict:
     """Assemble the LLM-fallback worker's input set. Returns a dict with
     keys:
-      - readme: header-aware extract (≤8KB)
+      - readme: leading slice of the README (≤_README_EXTRACT_BUDGET);
+        the worker decides which parts are install-relevant
+      - readme_bytes_unseen / readme_sections_unseen: how much of the
+        README fell outside that slice, so the worker knows when to lean
+        on the manifests instead
       - manifests: dict[rel_path -> text] of root manifest files present
       - workspace_manifests: list[(rel_path, text)] sampled child
         manifests for monorepos (≤3 files, 1KB each)
@@ -9811,6 +9793,8 @@ def gather_provision_fixtures(repo_root: Path) -> dict:
     """
     out: dict = {
         "readme": "",
+        "readme_bytes_unseen": 0,
+        "readme_sections_unseen": 0,
         "manifests": {},
         "workspace_manifests": [],
         "workflows": [],
@@ -9842,6 +9826,33 @@ def gather_provision_fixtures(repo_root: Path) -> dict:
             extract = extract_readme_sections(raw)
             if add_bytes(len(extract)):
                 out["readme"] = extract
+                # How much of the README the worker is NOT seeing. The
+                # slice is the head of the file, so anything past the
+                # budget is invisible — and on a long README that is
+                # exactly where a late "Prerequisites" or "Troubleshooting"
+                # section lives. Reporting the size of the gap (not
+                # guessing at its contents, which would be back to
+                # classifying prose) lets the worker weight the manifests
+                # and workflows accordingly.
+                try:
+                    full = rp.stat().st_size
+                except OSError:
+                    full = len(raw)
+                out["readme_bytes_unseen"] = max(0, full - len(extract))
+                # Header count must come from the WHOLE file, not `raw`
+                # (itself capped at 4x the extract budget) — otherwise any
+                # section past that cap is invisible to the count, not
+                # merely "unseen." `readme_bytes_unseen` above already
+                # gets this right via `rp.stat().st_size`; mirror it here
+                # rather than deriving from the same truncated buffer used
+                # for the extract itself.
+                try:
+                    full_text = rp.read_text(errors="replace")
+                except (OSError, UnicodeError):
+                    full_text = raw
+                out["readme_sections_unseen"] = max(
+                    0, len(_split_readme_headers(full_text))
+                    - len(_split_readme_headers(extract)))
             break
 
     # --- Root manifests ---
@@ -14577,6 +14588,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
+    st.data["required_items"] = result.get("required_items") or []
     # Optional, additive (DESIGN §8): persisted so phase_classification_gate
     # can consult it on exhaustion without threading the raw classifier
     # result through the gate's own re-invocation loop.
@@ -15003,8 +15015,20 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
         "",
     ]
     if fixtures["readme"]:
-        parts += ["=== README (install-relevant slice) ===",
-                  fixtures["readme"], ""]
+        # Header says UNFILTERED so the worker does not assume something
+        # upstream already picked the install-relevant parts out — it did
+        # not, and it deliberately does not (CLAUDE.md *Language-to-JSON*).
+        header = "=== README (leading slice, UNFILTERED — you decide what matters) ==="
+        parts += [header, fixtures["readme"]]
+        unseen = fixtures.get("readme_bytes_unseen") or 0
+        if unseen:
+            parts.append(
+                f"[TRUNCATED: {unseen} more bytes and "
+                f"{fixtures.get('readme_sections_unseen') or 0} more "
+                "section(s) of this README were not included. Install "
+                "steps may live in them — weight the manifests, workflows "
+                "and CONTRIBUTING below accordingly.]")
+        parts.append("")
     for name, text in fixtures["manifests"].items():
         parts += [f"=== {name} ===", text, ""]
     for rel, text in fixtures["workspace_manifests"]:
@@ -15456,15 +15480,23 @@ async def phase_plan(task: str, st: State, caps: dict,
 
     repo_root = Path(os.getcwd())
 
-    # Task-referenced file extraction (CRITIC correlated-error breaker).
-    # Injects a mechanically-extracted coverage checklist into the planner
-    # prompt when the task string references files.  No-op otherwise.
-    task_file_items = extract_task_file_structure(task, repo_root)
-    task_file_section = (_format_task_file_structure(task_file_items)
-                         if task_file_items else None)
-    if task_file_section:
-        log(f"  extracted {len(task_file_items)} structural items "
-            "from task-referenced files")
+    # Files the task string names, resolved by glob (a mechanical
+    # path operation). The planner is TOLD which files these are and
+    # reads them itself — leerie does not pre-digest their contents.
+    #
+    # It used to: `extract_task_file_structure` regexed markdown headings
+    # and YAML keys out of them into a "coverage checklist", which
+    # `check_task_file_coverage` then substring-matched against the plan
+    # text. Three layers of prose parsing (CLAUDE.md *Language-to-JSON*),
+    # and the mechanism that froze run 2026-07-19 for 33 identical
+    # feedback rounds on a ratio no planner could move. Coverage of the
+    # task's actual requirements is `task_coverage_judge`'s job (phase
+    # 2⅞½), which reads these files itself.
+    task_files = glob_task_references(task, repo_root)
+    task_file_section = _format_task_file_references(task_files, repo_root)
+    if task_files:
+        log(f"  task references {len(task_files)} file(s); "
+            "planner will read them")
 
     # P6 repo-map injection (DESIGN §5½ (P6)). Build the ranked subgraph seeded
     # from the task-referenced files identified above, and inject it into the
@@ -15489,6 +15521,17 @@ async def phase_plan(task: str, st: State, caps: dict,
     prescribed_procedure = st.data.get("prescribed_procedure") or {}
     if prescribed_procedure.get("is_prescribed"):
         ctx_dict["prescribed_procedure"] = prescribed_procedure
+    # PRIMARY floor for the task-coverage gate (DESIGN §8 sibling to the
+    # instruction-adherence gate above): feed the classifier's
+    # required_items checklist into the planner context so it can echo
+    # each item's wording into a subtask's title/success_criteria_seed at
+    # birth — check_required_items_coverage() cannot mechanically verify
+    # coverage of a checklist the planner never saw. Omitted entirely when
+    # the classifier found nothing genuinely enumerable, so the common
+    # case carries no false framing.
+    required_items = st.data.get("required_items") or []
+    if required_items:
+        ctx_dict["required_items"] = required_items
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
     # A pre-planning canonical {description, tag, path} list, injected into
     # EVERY planner's ctx (built once, shared across all plan_one calls) so
@@ -15507,10 +15550,7 @@ async def phase_plan(task: str, st: State, caps: dict,
     if not st.data.get("skip_repo_map"):
         try:
             repo_map = build_repo_map(repo_root, st.leerie_root)
-            seed_files = (
-                [str(Path(item.split(": ", 1)[0])) for item in task_file_items]
-                if task_file_items else []
-            )
+            seed_files = [_repo_rel(f, repo_root) for f in task_files]
             ranked = rank_repo_map(repo_map, seed_files, [])
             if ranked:
                 ctx_dict["repo_map"] = ranked
@@ -15562,25 +15602,8 @@ async def phase_plan(task: str, st: State, caps: dict,
                 feedback_slot.append(fb)
                 return {}
 
-            # LOW_COVERAGE freeze guard (root cause A, 2026-07-19 incident):
-            # even after excluding uncoverable-by-construction convention
-            # items (see _is_uncoverable_convention_item), a coverage ratio
-            # can still fail to converge round over round for other reasons
-            # (e.g. a genuinely hard-to-restate spec file). Once the same
-            # ratio repeats across rounds of this loop, the coverage issue
-            # is dropped (the gate goes advisory-silent for this loop, not
-            # the planner run) so _run_checked_loop still retries on any
-            # *other* issue instead of re-driving on a frozen signal.
-            seen_coverage_ratios: set[str] = set()
-
             def _check_planner(r: dict) -> list[str]:
-                issues = check_planner_output(r, repo_root, category)
-                if task_file_items:
-                    coverage_issues = check_task_file_coverage(
-                        task_file_items, r.get("subtasks", []))
-                    issues.extend(_dedup_frozen_coverage_issues(
-                        coverage_issues, seen_coverage_ratios))
-                return issues
+                return check_planner_output(r, repo_root, category)
 
             result, gate_warnings = await _run_checked_loop(
                 invoke=_invoke,
@@ -18227,8 +18250,9 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
 
     # Coalesce effect-identical duplicate pairs (DESIGN §5 *Multi-artifact
     # pair*). A repeated pair is COHERENT when the pair genuinely overlaps
-    # on more than one artifact — `artifact` is a single string, so
-    # per-artifact rows are the only encoding the judge has, and
+    # on more than one artifact — the judge may encode this either way, a
+    # single row whose `artifact_paths` lists every overlapping file, or
+    # one row per artifact. When it emits one row per artifact,
     # `_apply_overlap_collisions` already absorbs the repeat via
     # `skipped_redundant`. What must agree is the resolved *effect*, not
     # the `resolution` string: the same pair emitted twice as `drop_a`
@@ -18258,8 +18282,9 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
             continue
         # Same pair, same effect, different artifact: one decision the
         # judge had to state once per overlapping artifact. Keep every
-        # artifact name and every merge_feasibility statement, so the
-        # merged subtask's unified intent still records both surfaces.
+        # artifact name, every merge_feasibility statement, and every
+        # artifact_paths entry, so the merged subtask's unified intent
+        # still records both surfaces.
         for field in ("artifact", "merge_feasibility", "reason"):
             extra = (c.get(field) or "").strip()
             if not extra:
@@ -18269,6 +18294,11 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
                 prev[field] = extra
             elif extra not in base:
                 prev[field] = f"{base}; {extra}"
+        prev_paths = prev.get("artifact_paths") or []
+        for p in c.get("artifact_paths") or []:
+            if p not in prev_paths:
+                prev_paths.append(p)
+        prev["artifact_paths"] = prev_paths
     if len(coalesced) != len(collisions):
         log(f"phase 2¾: coalesced {len(collisions) - len(coalesced)} "
             "duplicate collision row(s) naming the same pair with the "
@@ -18292,9 +18322,9 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
     artifact. We union the dropped subtask's `provides` into the
     survivor so downstream `requires` that matched the dropped
     subtask's tags resolve cleanly against the survivor — without this
-    union, dropping `feat-008` (provides `auth-shell-adopted`) in
-    favor of `refactor-001` (provides `auth-shell-component`) would
-    orphan every `feat-011 requires auth-shell-adopted` edge into a
+    union, dropping `feat-008` (provides `widget-frame-adopted`) in
+    favor of `refactor-001` (provides `widget-frame-component`) would
+    orphan every `feat-011 requires widget-frame-adopted` edge into a
     `validate_plan` error that doesn't trace back to the judge's drop.
     `phase_overlap_judge` runs after the reconciler's unresolved-retry
     loop, so leaving orphans for "the next pass" is not an option.
@@ -19370,26 +19400,41 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     been reconciled and overlap-judged, exactly like `phase_wiring_gate`
     attacks the merged plan's graph correctness.
 
+    Two-layer composition, same shape as `phase_adherence_gate`'s
+    `check_prescribed_command_coverage` + `adherence_judge`:
+
+    - PRIMARY (deterministic floor): `check_required_items_coverage`
+      set-compares the classifier's structured `required_items` against
+      the plan's own structured subtask fields. Model-independent, code-
+      enforced (CLAUDE.md §12 "prompts advisory, code enforces").
+    - SECONDARY (judgment): `task_coverage_judge`, whose JSON payload is
+      only the task text and the reconciled subtask set but who also runs
+      with `INSPECT_TOOLS` and reads task-referenced files itself (per its
+      prompt), attacks the union of subtasks for missing work or off-task
+      drift the floor cannot see (an item the classifier never enumerated,
+      or off-task drift, which is not a coverage-of-an-item question at
+      all) and gates on a non-empty `coverage_gaps` array.
+
     The planner self-grades its own `task_understanding` confidence axis,
     but that self-grade is anchored to the decomposition the planner already
     committed to — it cannot see a whole required piece of work that simply
     never became a subtask, because there is no subtask whose self-review
-    would surface the omission. So an independent `task_coverage_judge`,
-    handed only the task text and the reconciled subtask set (not the
-    codebase), attacks the union of subtasks for missing work or off-task
-    drift and gates on a non-empty `coverage_gaps` array. The self-score is
-    now advisory (`check_planner_output` no longer gates on it).
+    would surface the omission. The self-score is now advisory
+    (`check_planner_output` no longer gates on it).
 
     The planner CAN mechanically re-plan on a coverage gap (unlike the
     overlap-judge or integrator's semantic findings), so this gate re-drives
     `phase_plan` through the *existing* checked-loop feedback path — fresh
-    planner calls per domain with the found gaps folded into the task —
-    bounded by `judgment_check_rounds`, and `die()`s on exhaustion exactly
-    like the adherence/reconciler/wiring gates.
+    planner calls per domain with the found gaps (floor issues and/or judge
+    gaps) folded into the task — bounded by `judgment_check_rounds`, and
+    `die()`s on exhaustion exactly like the adherence/reconciler/wiring
+    gates.
 
     A `task_coverage_judge` `WorkerError` (infrastructure crash) degrades:
-    the assembled plan is preserved, never discarded, consistent with
-    `_run_checked_loop`'s WorkerError→retry-then-degrade handling.
+    the floor is still fully evaluated (mirrors `phase_adherence_gate`'s
+    degrade path) and the assembled plan is preserved, never discarded,
+    consistent with `_run_checked_loop`'s WorkerError→retry-then-degrade
+    handling.
 
     Returns the (possibly re-planned) `plans` list, ready for the soft-drop
     filters and `schedule()`."""
@@ -19399,6 +19444,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
 
     repo_root = Path(os.getcwd())
     sys_prompt = load_prompt("task_coverage_judge")
+    required_items = st.data.get("required_items") or []
 
     def _build_payload(cur_plans: list[dict]) -> dict:
         subtasks = [s for plan in cur_plans for s in plan.get("subtasks", []) or []]
@@ -19441,7 +19487,11 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         )
 
     def _check_coverage(judge_result: dict) -> list[str]:
-        issues: list[str] = []
+        floor_issues = check_required_items_coverage(
+            required_items,
+            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
+        )
+        issues = list(floor_issues)
         for g in judge_result.get("coverage_gaps") or []:
             if not isinstance(g, dict):
                 continue
@@ -19522,10 +19572,29 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         log(f"  coverage-gate: {w}")
 
     if judge_result is None:
-        # task_coverage_judge crashed every round — degrade: keep the
-        # assembled plan, never discard it.
+        # task_coverage_judge crashed every round — degrade the JUDGMENT
+        # layer only. The floor is model-independent and still fully
+        # evaluated (mirrors phase_adherence_gate's own degrade path):
+        # a crashed judge must never silently waive the deterministic
+        # floor, or a worker-infrastructure failure becomes a way to skip
+        # required-item enforcement.
+        floor_issues = check_required_items_coverage(
+            required_items,
+            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
+        )
+        if floor_issues:
+            die(
+                "task-coverage gate: task_coverage_judge crashed on every "
+                "round, but the deterministic required-items-coverage "
+                f"floor still found {len(floor_issues)} unaddressed "
+                "issue(s):\n" +
+                "\n".join(f"  • {i}" for i in floor_issues) +
+                "\nThis is model-independent evidence the plan drops "
+                "work the task explicitly enumerated. Refine the task so "
+                "the missing item is unambiguous, then --resume."
+            )
         log("  coverage-gate: task_coverage_judge crashed every round; "
-            "degrading to the assembled plan (unchanged)")
+            "floor is clean, degrading to the assembled plan (unchanged)")
         return cur_plans[0]
 
     remaining_issues = _check_coverage(judge_result)
@@ -20434,20 +20503,6 @@ def _is_baked_ecosystem_command(command: list[str]) -> bool:
         return True
 
     return False
-
-
-def _is_node_offline_relink(command: list[str]) -> bool:
-    """Return True if this is the Node/pnpm offline relink command —
-    the single irreducible residual for Node repos (DESIGN §6½).
-
-    Pattern: `pnpm install --offline --frozen-lockfile`
-    """
-    if not command or command[0] != "pnpm":
-        return False
-    # Must have "install" subcommand and both --offline and --frozen-lockfile
-    return ("install" in command and
-            "--offline" in command and
-            "--frozen-lockfile" in command)
 
 
 def _format_provision_recipe_section(recipe: list[dict],

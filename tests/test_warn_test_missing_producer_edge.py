@@ -88,8 +88,8 @@ def test_non_test_subtask_never_flagged(leerie, capsys):
     assert not _fired(_warn_out(leerie, capsys, plans))
 
 
-def test_navegando_shape_fires(leerie, capsys):
-    """The real navegando shape: test-007 (coverage-floors) declares no edge
+def test_disjoint_paths_shape_fires(leerie, capsys):
+    """The real disjoint-path shape: test-007 (coverage-floors) declares no edge
     to the feat subtasks whose files it must register. Disjoint paths — the
     exact case a mechanical file-overlap rule misses but this declaration-
     absence check catches."""

@@ -475,6 +475,40 @@ class TestFilterResidualDeps:
         assert all("--offline" in e["command"] or "--frozen-lockfile" in e["command"]
                    for e in result), "All kept entries must have offline/frozen-lockfile"
 
+    def test_drops_node_mutations_that_carry_a_lockfile_flag(self, leerie):
+        """A pinned flag is not enough — the command must be an install.
+
+        `pnpm add left-pad --frozen-lockfile` carries `--frozen-lockfile`
+        and so passed the flag-only test, landing in .leerie/config.toml as
+        an "irreducible residual" that every worktree then re-runs. An
+        `add` mutates the dependency set over the network; that is the
+        opposite of the offline relink the residual exists for. Same for
+        remove/up/dlx."""
+        mutations = [
+            {"manager": "pnpm", "command": "pnpm add left-pad --frozen-lockfile"},
+            {"manager": "pnpm", "command": "pnpm remove left-pad --offline"},
+            {"manager": "yarn", "command": "yarn up --frozen-lockfile"},
+            {"manager": "pnpm", "command": "pnpm dlx codemod --offline"},
+        ]
+        assert leerie._filter_residual_deps(mutations) == []
+
+    def test_keeps_npm_ci_which_is_an_install(self, leerie):
+        """The subcommand check must not be so narrow it drops a real
+        install: `npm ci` is the lockfile-exact install form."""
+        entries = [{"manager": "npm", "command": "npm ci --offline"}]
+        assert len(leerie._filter_residual_deps(entries)) == 1
+
+    def test_flag_must_be_a_token_not_a_substring(self, leerie):
+        """`--offline` inside a package name is not the flag."""
+        entries = [{"manager": "pnpm", "command": "pnpm add my--offline-pkg"}]
+        assert leerie._filter_residual_deps(entries) == []
+
+    def test_malformed_command_is_dropped_not_raised(self, leerie):
+        """Commands are captured from logs, so an unbalanced quote is
+        reachable input; `shlex.split` raises on it."""
+        entries = [{"manager": "pnpm", "command": 'pnpm install --offline "x'}]
+        assert leerie._filter_residual_deps(entries) == []
+
     def test_preserves_unknown_managers(self, leerie):
         """Unknown managers preserved as-is (conservative)."""
         language_installs = [

@@ -90,6 +90,52 @@ class TestChildrenOwnTheirLists:
         assert a["depends_on"] is not b["depends_on"]
 
 
+class TestMigrationTargetsPropagation:
+    """`migration_targets`/`performs_replacement` must survive expansion.
+
+    `check_planner_output`'s migration-surface checks run on the planner's
+    raw sample before `recursive_decompose` expands it, so these fields are
+    inert for that gate's own purposes here — but a leaf child still
+    replaces the same pattern its parent did, and dropping the fields would
+    make that fact unrecoverable for anything that reads a leaf later."""
+
+    def _parent_with_migration(self) -> dict:
+        p = _parent()
+        p["migration_targets"] = [
+            {"old_pattern": "old_helper", "replacement": "new_helper"}
+        ]
+        p["performs_replacement"] = True
+        return p
+
+    def test_children_inherit_migration_targets_by_value(self, leerie):
+        p = self._parent_with_migration()
+        a = leerie._migration_child(p, ["a.py"], "config-003-1", "T", "C")
+        assert a["migration_targets"] == [
+            {"old_pattern": "old_helper", "replacement": "new_helper"}
+        ]
+        assert a["performs_replacement"] is True
+
+    def test_children_do_not_share_the_parent_list_object(self, leerie):
+        p = self._parent_with_migration()
+        a = leerie._migration_child(p, ["a.py"], "config-003-1", "T", "C")
+        assert a["migration_targets"] is not p["migration_targets"]
+        assert a["migration_targets"][0] is not p["migration_targets"][0]
+
+    def test_siblings_do_not_share_migration_targets(self, leerie):
+        p = self._parent_with_migration()
+        a = leerie._migration_child(p, ["a.py"], "config-003-1", "T", "C")
+        b = leerie._migration_child(p, ["b.py"], "config-003-2", "T", "C")
+        assert a["migration_targets"] is not b["migration_targets"]
+        a["migration_targets"].append({"old_pattern": "x", "replacement": "y"})
+        assert len(b["migration_targets"]) == 1
+
+    def test_missing_parent_fields_default_to_empty_and_false(self, leerie):
+        p = _parent()
+        a = leerie._migration_child(p, ["a.py"], "config-003-1", "T", "C")
+        assert a["migration_targets"] == []
+        assert a["performs_replacement"] is False
+
+
 class TestOverlapDropDoesNotLeakTagsToSiblings:
     """The live path where the aliasing bites: `_apply_overlap_drop` unions
     the dropped subtask's `provides` into the survivor in place."""

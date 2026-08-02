@@ -281,7 +281,7 @@ def test_coverage_gap_triggers_replan_then_converges(
 def test_replan_with_cross_category_tag_drift_gets_reconciled(
     leerie, monkeypatch, tmp_path
 ):
-    """Regression fixture reproducing the funeralworks incident shape: a
+    """Regression fixture reproducing the sibling-service incident shape: a
     coverage gap triggers a re-plan, and the re-plan's two categories
     (bug-fixing / testing) invent DIFFERENT tag strings for the same
     capability — `bugfix-006` provides `events-create-contract-fixed`,
@@ -427,7 +427,7 @@ def test_replan_with_cross_category_tag_drift_gets_reconciled(
                     assert req["tag"] in all_provides, (
                         f"{s['id']} requires {req['tag']!r} but no "
                         "subtask provides it — the exact dangle "
-                        "phase_wiring_gate died on in the funeralworks "
+                        "phase_wiring_gate died on in the sibling-service "
                         "incident"
                     )
 
@@ -508,6 +508,141 @@ def test_worker_error_every_round_degrades(leerie, monkeypatch, tmp_path):
         plans, "task", st, _caps(leerie), MODELS, EFFORTS))
 
     assert result == plans
+
+
+# ===========================================================================
+# 2b. required_items PRIMARY floor (gap #2 close-out)
+# ===========================================================================
+
+def test_floor_clean_and_judge_clean_passes_unchanged(
+        leerie, monkeypatch, tmp_path):
+    st = _minimal_state(leerie, tmp_path)
+    st.data["required_items"] = [{"item": "add rate limiting to the API"}]
+    plans = [_plan("feature-implementation", _subtask(
+        "feat-001", title="Add rate limiting to the API"))]
+
+    async def fake_claude_p(**kwargs):
+        return {"task_covered": True, "coverage_gaps": [],
+                "rationale": "covered"}
+
+    async def fake_phase_plan(*args, **kwargs):
+        pytest.fail("phase_plan must not be re-invoked on a clean gate")
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+
+    result = asyncio.run(leerie.phase_planning_coverage_gate(
+        plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+    assert result == plans
+
+
+def test_floor_uncovered_item_triggers_replan_even_when_judge_says_covered(
+        leerie, monkeypatch, tmp_path):
+    """The judge can be schema-valid and say task_covered=True while the
+    deterministic floor still finds an unaddressed required item — the
+    floor's whole purpose is to catch what judgment alone misses."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["required_items"] = [{"item": "add rate limiting to the API"}]
+    bad_plans = [_plan("feature-implementation", _subtask(
+        "feat-001", title="Add pagination"))]
+    good_plans = [_plan("feature-implementation", _subtask(
+        "feat-001", title="Add rate limiting to the API"))]
+
+    async def fake_claude_p(**kwargs):
+        # The judge itself never objects — only the floor does.
+        return {"task_covered": True, "coverage_gaps": [],
+                "rationale": "judge missed it"}
+
+    replanned = [False]
+
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
+        replanned[0] = True
+        return good_plans
+
+    async def fake_phase_reconcile(plans, *a, **k):
+        return plans
+
+    async def fake_phase_overlap_judge(plans, *a, **k):
+        return plans
+
+    async def fake_phase_adherence_gate(plans, *a, **k):
+        return plans
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+    monkeypatch.setattr(leerie, "phase_reconcile", fake_phase_reconcile)
+    monkeypatch.setattr(leerie, "phase_overlap_judge", fake_phase_overlap_judge)
+    monkeypatch.setattr(leerie, "phase_adherence_gate", fake_phase_adherence_gate)
+
+    result = asyncio.run(leerie.phase_planning_coverage_gate(
+        bad_plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+    assert replanned[0], "the floor issue must have forced a re-plan"
+    assert result == good_plans
+
+
+def test_floor_still_evaluated_and_dies_when_judge_crashes_every_round(
+        leerie, monkeypatch, tmp_path, capsys):
+    """The bug this close-out fixes: a crashed judge used to skip the
+    floor entirely (`if judge_result is None: return cur_plans[0]` with
+    no floor check), so a WorkerError became a way to bypass required-item
+    enforcement. The floor must still be evaluated and still die()."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["required_items"] = [{"item": "add rate limiting to the API"}]
+    plans = [_plan("feature-implementation", _subtask(
+        "feat-001", title="Add pagination"))]
+
+    async def fake_claude_p(**kwargs):
+        raise leerie.WorkerError("task_coverage_judge crashed")
+
+    async def fake_phase_plan(*args, **kwargs):
+        pytest.fail("phase_plan must not be invoked when the judge only "
+                     "ever crashes")
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_planning_coverage_gate(
+            plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+    captured = capsys.readouterr()
+    assert "task-coverage gate" in captured.err
+    assert "rate limiting" in captured.err
+
+
+def test_floor_silent_and_judge_crashes_every_round_still_degrades(
+        leerie, monkeypatch, tmp_path):
+    """No required_items at all (the common case) — a crashed judge must
+    still degrade to the assembled plan, not die() on an empty floor."""
+    st = _minimal_state(leerie, tmp_path)
+    plans = [_plan("feature-implementation", _subtask("feat-001"))]
+
+    async def fake_claude_p(**kwargs):
+        raise leerie.WorkerError("task_coverage_judge crashed")
+
+    async def fake_phase_plan(*args, **kwargs):
+        pytest.fail("phase_plan must not be invoked when the judge only "
+                     "ever crashes")
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+
+    result = asyncio.run(leerie.phase_planning_coverage_gate(
+        plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+    assert result == plans
+
+
+class TestWiringFloorInvoked:
+    def test_source_calls_check_required_items_coverage(self, leerie):
+        src = inspect.getsource(leerie.phase_planning_coverage_gate)
+        assert "check_required_items_coverage(" in src
+
+    def test_source_reads_required_items_from_state(self, leerie):
+        src = inspect.getsource(leerie.phase_planning_coverage_gate)
+        assert 'st.data.get("required_items")' in src
 
 
 # ===========================================================================

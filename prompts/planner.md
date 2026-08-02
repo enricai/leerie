@@ -95,15 +95,42 @@ The orchestrator gives you, in your prompt:
    an old one (a new accessor, a new seam, a new abstraction), quantify
    the migration surface:
 
-   - Identify the old pattern being replaced (from the subtask's intent).
-   - `grep -rn` for the old pattern across the codebase.
+   - Identify the old pattern being replaced.
+   - `grep -rn` for it across the codebase.
    - Count the total call sites and files.
    - Ensure your plan includes subtasks covering ALL files that use the
      old pattern, batched into groups of ~15–25 files each.
+   - **Declare it in that subtask's `migration_targets`**, one entry per
+     old pattern: `{"old_pattern": "<the literal string you grepped
+     for>", "replacement": "<what replaces it>", "is_real_identifier":
+     true}`.
 
-   The orchestrator runs a mechanical `UNCOVERED_MIGRATION_SURFACE` check
-   that will flag plans where the migration surface is not covered.
-   Addressing it proactively in your decomposition avoids CRITIC retries.
+   `old_pattern` must be a **code identifier you could paste into
+   `grep`** — a symbol, a dotted access path, an import specifier, taken
+   verbatim from *this* repository. Never an English word from your own
+   sentence. If you catch yourself writing `{"old_pattern": "with"}` or
+   `"both"` or `"the old helper"`, you are describing the migration
+   rather than naming it — either name the symbol or omit the entry.
+   `is_real_identifier` is your own confirmation of this — set it
+   `false` (never just omit the entry) if you are unsure the string will
+   grep cleanly as a real symbol.
+
+   Omit `migration_targets` entirely when a subtask replaces nothing.
+   Most do. An empty or absent array is the normal case and is never
+   penalised; a wrong entry sends the orchestrator grepping for noise.
+
+   The orchestrator greps each declared `old_pattern` and runs a
+   mechanical `UNCOVERED_MIGRATION_SURFACE` check flagging plans where
+   the files containing it are not covered by any subtask's
+   `files_likely_touched`. Declaring the targets and covering them
+   proactively avoids CRITIC retries.
+
+   **Set `performs_replacement: true`** on any subtask that replaces an
+   existing pattern — this must always agree with whether you declared
+   `migration_targets`. A subtask with `performs_replacement: true` and no
+   `migration_targets` triggers `MIGRATION_TARGETS_MISSING`, a mechanical
+   check with no CRITIC ambiguity: either name the pattern in
+   `migration_targets` or leave `performs_replacement` false/absent.
 
    **A prescribed command is run, never reimplemented.** When the task
    text names a specific command, script, or tool invocation the work
@@ -240,6 +267,15 @@ The orchestrator gives you, in your prompt:
 4. **Seed success criteria.** For each subtask, write a concrete, checkable
    `success_criteria_seed` — describe an automated test wherever possible.
 
+   If your CONTEXT includes `required_items` (the task's explicit,
+   enumerable requirements, extracted upstream — absent when the task has
+   none), and one of them is something a subtask satisfies, echo that
+   item's own wording into that subtask's `title` or
+   `success_criteria_seed`. The orchestrator checks required-item coverage
+   by comparing `required_items` against your subtasks'
+   `title`/`success_criteria_seed` text, so a subtask that covers a
+   required item but describes it in unrelated words reads as uncovered.
+
 5. **Evidence gate.** Before you emit the plan, self-gate on two axes. The
    gate, the score floor, and the three disciplines below are the planning
    analogue of the implementer's evidence gate. Each of the four fields
@@ -335,11 +371,31 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "provides": ["capability-tag-produced"],
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",
-      "investigation_notes": "What you found that materially helps the implementer."
+      "investigation_notes": "What you found that materially helps the implementer.",
+      "migration_targets": [
+        {"old_pattern": "<literal symbol grepped from this repo>",
+         "replacement": "<what supersedes it>",
+         "is_real_identifier": true}
+      ],
+      "performs_replacement": true
     }
   ]
 }
 ```
+
+`migration_targets` is optional — omit it unless this subtask replaces an
+existing pattern, and see *Migration sweep* above for what belongs in
+`old_pattern`. `performs_replacement` must agree with it — see *Migration
+sweep* above.
+
+Each `migration_targets` entry requires `is_real_identifier`: your own
+attestation that `old_pattern` is the real, grep-pastable symbol you
+found in this repo — never a shape the orchestrator infers on your
+behalf. Set it `true` only when you are confident `old_pattern` is a
+genuine identifier; set it `false` if you are declaring the entry for
+visibility but are not sure it will grep cleanly. An entry with
+`is_real_identifier: false` is recorded but not used to compute
+`UNCOVERED_MIGRATION_SURFACE` coverage.
 
 `status` is `ready` when both confidence scores are ≥ 9.0. When blocked,
 emit `status: "blocked"`, `subtasks: []`, and the gap analysis in

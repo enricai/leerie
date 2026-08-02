@@ -698,14 +698,14 @@ for line in sys.stdin.read().splitlines():
 # Adapts seed_repo_clone's bundle pipeline (parent bundle + per-
 # submodule bundles + machine-side `git clone`) but scoped to
 # /tmp/leerie-inspect-<base>.{bundle,subs/} and a per-dir target
-# instead of /work. <base> = basename($remote), e.g. "stackpulse".
+# instead of /work. <base> = basename($remote), e.g. "example-repo".
 #
 # Why: shipping the working tree via plain rsync over flyctl ssh
 # fails for non-trivial repos (the v1 path: a 1.7 GB / 120k-file
-# tree like stackpulse with node_modules/.next/.pnpm-store hung
+# tree like example-repo with node_modules/.next/.pnpm-store hung
 # indefinitely). The bundle is committed-state-only — gitignored
 # build artifacts stay on the host where they belong. For a 1.7 GB
-# stackpulse working tree, the bundle is ~600 KB and ships in one
+# example-repo working tree, the bundle is ~600 KB and ships in one
 # pipe (measured 2026-06-02).
 # ---------------------------------------------------------------------------
 _seed_one_inspect_dir_clone() {

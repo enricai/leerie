@@ -320,7 +320,7 @@ def test_worker_sid_distinct_across_concurrent_runs(leerie):
     """The load-bearing property: the same worker sid in two different runs
     produces two DIFFERENT cgroup names — so one run's cgroup.kill cannot
     reach the other run's worker. This is the regression that reproduced as
-    the stackpulse/summarizer classifier collision."""
+    the sibling-service/summarizer classifier collision."""
     a = leerie._cgroup_worker_sid("aaaaaaaaaaaa1111", "classifier")
     b = leerie._cgroup_worker_sid("bbbbbbbbbbbb2222", "classifier")
     assert a != b

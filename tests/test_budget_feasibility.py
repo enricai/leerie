@@ -111,7 +111,7 @@ def test_die_message_names_the_per_subtask_upstream_phases(leerie, capsys):
     `satisfied_probe`, not just the once-per-run phases.
 
     Both are per-subtask and routinely dominate upstream spend. Measured on a
-    real failed run (navegando, 2026-07-18): of 25 upstream calls, fit_judge
+    real failed run (sibling-service, 2026-07-18): of 25 upstream calls, fit_judge
     was 10 and satisfied_probe was 10 — the message's original list
     (classifier / planner / reconciler / overlap-judge / provision)
     accounted for only the remaining 5, sending the operator to look in

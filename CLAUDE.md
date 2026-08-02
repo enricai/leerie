@@ -103,6 +103,27 @@ before trusting it, mirroring the existing "don't trust an integrator's
 self-report" discipline this principle already establishes for
 `integrator`.
 
+## Prompts must not name another project's code
+
+`prompts/*.md` and `commands/*.md` are **product surface**: every one is sent
+verbatim to a worker running against *whatever repository leerie was pointed
+at*. An identifier from some other codebase in there teaches the model that
+another project's domain model is the canonical example, on a repo where that
+symbol does not exist.
+
+Examples in a prompt must use **this repository's own symbols**
+(`gather_provision_fixtures`, `_run_checked_loop`) or an **obviously synthetic
+placeholder**. Never a name taken from another project — including one you
+found in a task file, a run log, or an existing test fixture. A fixture is
+contained; a prompt ships.
+
+Enforced by `tests/test_prompts_have_no_foreign_identifiers.py`, which applies
+two independent rules: every backticked identifier in a shipped prompt must
+exist elsewhere in this repo or be listed in its `GENERIC_PLACEHOLDERS`
+allowlist, and a seeded denylist of known-foreign names is rejected on sight
+(that second rule exists because a foreign name that also leaked into a test
+fixture passes the first).
+
 ## No subagent spawning
 
 Workers are headless `claude -p` subprocess invocations, not in-session
@@ -1111,6 +1132,45 @@ gates (`PRESCRIBED_CMD_UNRUN`), a goal-only task and a fully-covered
 command never gate, and `check_planner_output` itself carries no separate
 adherence axis to demote to advisory, since the floor is wired only into
 `phase_adherence_gate`, not the planner check loop.
+The task-coverage gate's own PRIMARY deterministic floor —
+`check_required_items_coverage(required_items, subtasks) -> list[str]`,
+sibling to `check_prescribed_command_coverage` and added specifically
+because `phase_planning_coverage_gate` originally had no code-level floor,
+only the `task_coverage_judge` judgment layer — is tested in
+`tests/test_required_items_coverage.py`: uncovered/covered/partial-coverage
+cases, an empty `required_items` staying silent (the common case — 0 false
+positives by construction), paraphrase coverage via the same normalized
+token-SUBSET matching `check_prescribed_command_coverage` uses (matched
+against subtask `title`+`success_criteria_seed`, never `intent` or
+`investigation_notes` — CLAUDE.md *Language-to-JSON*), no-subtasks-at-all
+firing for every item, tolerance of missing fields and non-dict/blank
+entries, case-insensitivity, a negative control against shared-stopword-only
+false coverage, and schema shape pins (`SCHEMAS["classifier"]["required_items"]`
+optional, `item` `minLength: 1`, `required_items` registered in
+`STATE_FIELDS`). The gate's own composition — the floor is still fully
+evaluated (and can still `die()`) even when `task_coverage_judge` crashes
+on every round, closing the same "WorkerError silently waives the floor"
+trap `phase_adherence_gate`'s own degrade path already avoided — is pinned
+in `tests/test_phase_planning_coverage_gate.py`: floor-clean-and-judge-clean
+passes unchanged, a floor issue forces a re-plan even when the judge itself
+says `task_covered: true` (the floor's whole reason to exist), and the
+crash-every-round path both still dies when the floor has issues and still
+degrades cleanly when it doesn't. `migration_targets`' own sibling gap —
+optional and silently no-op on omission — gets a narrower, same-worker
+mechanical cross-check: `performs_replacement: bool` on the subtask schema
+(alongside, not nested inside, `migration_targets` — that object's
+`additionalProperties: False` forces this), and
+`_check_migration_targets_declared(subtasks)` flags `MIGRATION_TARGETS_MISSING`
+when `performs_replacement=true` but `migration_targets` is empty. Tested in
+`tests/test_migration_surface.py`'s `TestCheckMigrationTargetsDeclared` (the
+contradiction fires, both-empty and both-populated stay silent, independent
+per-subtask evaluation) and `TestPerformsReplacementSchema` (field shape,
+optional, sibling-not-nested). This is explicitly **not an independent
+witness** — documented as such in DESIGN §8 and in the check function's own
+docstring — since both signals come from the same non-adversarial planner
+self-report; it closes the "forgot to fill the field" case, not the
+"consistently wrong on both fields" case.
+
 The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
 gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
 composing the deterministic floor and the `adherence_judge` behind
@@ -1409,7 +1469,7 @@ A pause mid-sweep silently lost every already-decided verdict.
 `test_verdict_reaches_disk_before_the_sweep_completes` pins the fix (an
 `st.save()` immediately after the `cache[sid] = {...}` write); the falsifier
 is verified live — reverting the added save fails the test.
-The funeralworks half of that same incident batch — a satisfied-probe drop
+The sibling-service half of that same incident batch — a satisfied-probe drop
 blind to a surviving sibling's pending work invalidating the criterion it
 just judged met — is pinned by two new tests in
 `tests/test_filter_satisfied_subtasks.py`:
@@ -1418,7 +1478,7 @@ just judged met — is pinned by two new tests in
 `surviving_siblings` contains every other subtask with a non-empty `provides`
 or `files_likely_touched`, and never the probed subtask itself) and
 `test_sibling_invalidation_verdict_keeps_the_dropped_test` (a
-funeralworks-shape regression: a test subtask the base tree already
+sibling-service-shape regression: a test subtask the base tree already
 satisfies is NOT dropped when the probe, given `surviving_siblings` context,
 judges a sibling's still-pending work would break it). The guidance lives in
 `prompts/satisfied_probe.md`'s "A sibling's pending work can invalidate an
@@ -1436,8 +1496,8 @@ not-yet-created output it targets — is pinned in
 (`provides` or `files_likely_touched` non-empty), and stays silent when the
 subtask declares either edge, when no other subtask is a producer, on a
 single-subtask plan, and on a non-`test-` subtask (never the advisory's
-target). `test_navegando_shape_fires` is a regression pin reproducing the
-real navegando failure shape (a coverage-floors test subtask with disjoint
+target). `test_disjoint_paths_shape_fires` is a regression pin reproducing the
+real sibling-service failure shape (a coverage-floors test subtask with disjoint
 file paths from the feature subtasks it must register — the case a mechanical
 file-overlap rule would miss, but a declaration-absence check catches). The
 fix is deliberately advisory, not auto-wiring: research proved no mechanical
@@ -2230,11 +2290,19 @@ no code. `check_overlap_judge_output` treated any `artifact` containing
 (`docs/USAGE.md bare-verb rewrite`) read as hallucinated files — 6
 spurious `PHANTOM_ARTIFACT` issues on an emission that replays clean. The
 retry those issues forced then expressed one pair's two-file overlap as
-two rows, which the bare pair-repetition gate refused. Pinned: an artifact
-is **tokenized** and only path-shaped tokens are resolved (trailing
-periods and possessives stripped on the right only — a two-sided
-`strip(".")` would turn `./src/x.ts` into an absolute path), a pure
-logical name is never flagged, and an invented path inside prose still is.
+two rows, which the bare pair-repetition gate refused. `artifact` is now a
+prose **label** Python never parses: the judge names the files in a
+required `artifact_paths` array and `PHANTOM_ARTIFACT` does set membership
+on that (CLAUDE.md *Language-to-JSON* — never hand-parse an LLM's
+response). Pinned by `TestProsePathParsingAbsent`: `_depunctuate` /
+`_path_shaped` are gone, the check calls no `.split()`/`.strip()` on
+`artifact`, the schema requires the field with `minLength: 1` items, and
+the prompt actively asks the judge to fill it — a pathless collision
+silently disables the check, and 84% of the 64 collisions ever emitted
+carry a path. The behavioural pair is
+`test_prose_in_artifact_is_never_parsed_for_paths`: the same invented path
+must be invisible in the label and flagged in the field, so neither half
+can pass vacuously.
 For duplicates, what must agree is the resolved **effect**
 (`_collision_effect`: dropped sid, or unordered merge pair) — never the
 `resolution` string, since swapped-endpoint `drop_a` rows share a string
@@ -2333,6 +2401,46 @@ guard requires `copy.deepcopy(` on all six assignments so a newly added
 checkpoint cannot reintroduce the alias. The same aliasing class applies
 to `st.data["plan_overlap_judge"]`, deep-copied at its persist so the
 coalescing step cannot rewrite the "raw judge output" audit.
+
+`tests/test_no_dead_functions.py` is a whole-module guard that no
+**private** module-level function in `orchestrator/leerie.py` is defined
+but never referenced. It is deliberately not a list of names: pinning
+specific ones catches a regression on exactly those and nothing else. It
+scopes to underscore-prefixed helpers because public names are API surface
+invoked from outside the module — `run_rebaser` from
+`scripts/host-finalize.sh`, `run_recapture_deps` from the launcher's
+`config --recapture` arm, `compose_pr_body` / `compute_subtask_branch` /
+`resolve_token_probe_cache_sec` from bash or tests — none of which appear
+as references inside `leerie.py` itself, so a module-scoped scan calls all
+five dead. It found three real ones (2026-08-01 audit), all pre-existing:
+`_confidence_issues` (IMPLEMENTATION.md had already recorded it as having
+"zero remaining callers" after DESIGN §8 replaced every self-score gate
+with an independent verifier — the function and its unit tests, the only
+remaining callers, were left behind), `_repo_map_cache_key` (described a
+cache key nothing computed), and `_is_node_offline_relink` (superseded by
+`_filter_residual_deps`, which tests the same condition inline and
+deliberately more broadly — pnpm needs both `--offline` and
+`--frozen-lockfile`, while `npm install --offline` and `yarn install
+--frozen-lockfile` each stand alone, so the pnpm-only helper could not
+replace it). That third one had a test pinning its *existence*, which only
+guaranteed it stayed dead; retiring that pin is what let it go. Dead code
+matters more here than in a normal repo because the stated design goal is
+that the whole control flow reads top-to-bottom in one sitting, and an
+unused helper reads as live — two of these three were removed gates, where
+a leftover helper is an invitation to wire it back up.
+
+Auditing that third one surfaced a real defect in the live path it had been
+superseded by: `_filter_residual_deps` tested only for the *flags*, so
+`pnpm add left-pad --frozen-lockfile` was kept as an "irreducible residual"
+and re-run in every worktree — an `add` mutates the dependency set over the
+network, which is the opposite of the offline relink the residual exists
+for. It now also requires an install-shaped subcommand
+(`_NODE_INSTALL_SUBCOMMANDS` = `install`/`i`/`ci`, deliberately excluding
+`add`/`remove`/`up`/`dlx`) and matches flags as `shlex` tokens rather than
+substrings, so `--offline` inside a package name no longer counts. The OR
+between the two flags is unchanged and is load-bearing — requiring both
+would drop the npm and yarn forms, which
+`tests/test_capture_deps.py::test_keeps_node_offline_relink_only` pins.
 
 No coverage
 target is set — the suite was introduced from scratch and a number
@@ -2617,15 +2725,16 @@ through a stubbed `_invoke`, no live `claude` binary required —
 constructs no argv element over that ceiling for it, routes the user
 prompt over stdin, and routes the appended system prompt through
 `--append-system-prompt-file`. `TestRootCauseA_CoverageFreeze` pins
-that `extract_task_file_structure` reproduces the incident's exact
-15-item harvest from the generated CLAUDE.md text, that
-`check_task_file_coverage` does not gate on the 3 uncoverable
-backtick+MUST headings alone, and that a genuinely uncoverable item
-mixed into the set still gates (the fix narrows the gate rather than
-disabling it). `TestBothRootCausesComposeOnOnePayload` runs both
-halves against the same generated fixtures in one test, matching the
-incident note's claim that the two fixes compose on one realistic
-payload.
+that the fixture still reproduces the incident's exact 15-item
+harvest shape, and that the mechanism which froze on it —
+`extract_task_file_structure`, `_is_uncoverable_convention_item`,
+`check_task_file_coverage`, `_dedup_frozen_coverage_issues` — is
+deleted rather than guarded. Coverage of a task's referenced files is
+`task_coverage_judge`'s job; the freeze class cannot recur because
+there is no substring gate left to freeze.
+`TestBothRootCausesComposeOnOnePayload` runs both halves against the
+same generated fixtures in one test, matching the incident note's
+claim that the two fixes compose on one realistic payload.
 
 ## Task completion checklist
 

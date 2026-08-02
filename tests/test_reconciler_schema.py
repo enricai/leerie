@@ -21,8 +21,8 @@ def _full_valid_output() -> dict:
     baseline; individual tests mutate copies of this."""
     return {
         "renames": [
-            {"sid": "test-001", "from": "capture-slm-call-implemented",
-             "to": "slm-capture-shim"},
+            {"sid": "test-001", "from": "capture-call-implemented",
+             "to": "event-capture-shim"},
         ],
         "added_provides": [
             {"sid": "feat-002", "tag": "judge-rubric-defined"},

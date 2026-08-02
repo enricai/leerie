@@ -107,7 +107,7 @@ _ARGV_HARNESS = r"""
 set -euo pipefail
 
 # Stub every var the array interpolates; USER_REPO is the one under test.
-USER_REPO=/Users/andres/src/enric/stackpulse
+USER_REPO=/Users/andres/src/enric/sibling-service
 LEERIE_REPO=/opt/leerie
 LEERIE_STATE_HOST_DIR=/tmp/state
 TTY_FLAGS=""
@@ -160,8 +160,8 @@ def test_user_repo_delivered_to_container():
         "USER_REPO is not passed to the container — log() will fall back to "
         "cwd (/work) and every line will render [leerie] [work]"
     )
-    assert pairs["USER_REPO"] == "stackpulse", (
-        f"expected the basename 'stackpulse', got {pairs['USER_REPO']!r} — "
+    assert pairs["USER_REPO"] == "sibling-service", (
+        f"expected the basename 'sibling-service', got {pairs['USER_REPO']!r} — "
         "the host path does not exist inside the container (repo is at /work), "
         "so a path value would be misleading to any future reader"
     )

@@ -400,7 +400,7 @@ def test_loop_breaks_early_on_exact_repeat(leerie):
 
 
 def test_loop_breaks_on_two_round_cycle(leerie):
-    """Reproduces the exact funeralworks incident shape: round 0 flags A,
+    """Reproduces the exact sibling-service incident shape: round 0 flags A,
     round 1's fix drops A but introduces B, round 2's fix re-introduces A
     (with different LLM-regenerated evidence prose than round 0's A, as a
     real re-classify call would produce) — a 2-cycle that never converges.
