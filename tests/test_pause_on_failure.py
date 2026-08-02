@@ -285,9 +285,9 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     assert data.get("fly_machine_id") == "mach-test"
     # Recovery guidance must be printed.
     assert "sync from machine to host FAILED" in result.stderr
-    assert "leerie --finalize my-run" in result.stderr
-    assert "leerie --resume my-run" in result.stderr
-    assert "leerie --kill my-run" in result.stderr
+    assert "leerie finalize my-run" in result.stderr
+    assert "leerie resume my-run" in result.stderr
+    assert "leerie kill my-run" in result.stderr
 
 
 def test_decide_teardown_rc130_detaches(tmp_path: Path):
@@ -310,9 +310,9 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     assert data.get("killed_at") is None
     # Detach hints must appear in stderr.
     assert "detached from run my-run-abc" in result.stderr
-    assert "leerie --resume my-run-abc" in result.stderr
-    assert "leerie --stop my-run-abc" in result.stderr
-    assert "leerie --kill my-run-abc" in result.stderr
+    assert "leerie resume my-run-abc" in result.stderr
+    assert "leerie stop my-run-abc" in result.stderr
+    assert "leerie kill my-run-abc" in result.stderr
 
 
 def test_decide_teardown_rc143_detaches(tmp_path: Path):
@@ -353,7 +353,7 @@ def test_decide_teardown_rc2_pauses(tmp_path: Path):
 def test_decide_teardown_prints_resume_command(tmp_path: Path):
     """The pause notification includes the resume command verbatim."""
     result, _ = _decide_teardown_with_rc(tmp_path, "1", run_id="my-run-abc")
-    assert "leerie --resume my-run-abc" in result.stderr
+    assert "leerie resume my-run-abc" in result.stderr
 
 
 def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
@@ -674,6 +674,6 @@ def test_launcher_resume_command_format_matches_decide_teardown():
     positional run-id, matching the launcher's positional-arg parsing.
     """
     provision = PROVISION_SH.read_text()
-    assert "leerie --resume ${LEERIE_RUN_ID:-<run-id>}" in provision, (
+    assert "leerie resume ${LEERIE_RUN_ID:-<run-id>}" in provision, (
         "decide_teardown's resume hint string drifted"
     )

@@ -466,8 +466,8 @@ def test_lib_sh_exports_tail_with_optional_autofinalize():
     )
     # The host-side exec is what makes auto-finalize work — must use
     # ${LEERIE_REPO}/leerie, not just `leerie`.
-    assert "exec \"${LEERIE_REPO}/leerie\" --finalize" in libsh, (
-        "Helper must exec leerie --finalize via $LEERIE_REPO"
+    assert "exec \"${LEERIE_REPO}/leerie\" finalize" in libsh, (
+        "Helper must exec leerie finalize via $LEERIE_REPO"
     )
 
 
