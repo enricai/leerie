@@ -6,7 +6,7 @@ Covers:
     runs safety check, calls seed_repo_dirty
   - Safety check: refuse re-seed when remote /work has uncommitted tracked
     changes (unless --force)
-  - Launcher: --re-seed fast-path
+  - Launcher: re-seed fast-path
   - Launcher: --no-re-seed and --force are consumed (not forwarded to orchestrator)
 """
 from __future__ import annotations
@@ -372,13 +372,13 @@ def test_re_seed_force_bypasses_safety_check(tmp_path: Path):
 # --- launcher fast-path ----------------------------------------------------
 
 def test_launcher_re_seed_fastpath_present():
-    """The launcher has a --re-seed fast-path before runtime preflight."""
+    """The launcher has a re-seed fast-path before runtime preflight."""
     text = LAUNCHER.read_text()
-    assert "--re-seed)" in text
-    re_seed_idx = text.find("--re-seed)")
+    assert "re-seed)" in text
+    re_seed_idx = text.find("re-seed)")
     preflight_idx = text.find("# --- platform preflight")
     assert re_seed_idx < preflight_idx, (
-        "--re-seed fast-path must run before runtime preflight"
+        "re-seed fast-path must run before runtime preflight"
     )
 
 
@@ -394,7 +394,7 @@ def test_launcher_consumes_re_seed_flags():
 def test_launcher_re_seed_requires_run_id_arg():
     """`leerie re-seed` without <run-id> errors with usage."""
     result = _run_bash(
-        f"{LAUNCHER} --re-seed",
+        f"{LAUNCHER} re-seed",
     )
     assert result.returncode != 0
     assert "requires a <run-id>" in result.stderr

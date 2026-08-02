@@ -243,7 +243,7 @@ def test_decide_teardown_rc11_destroys(tmp_path: Path):
     assert data.get("paused_at") is None
     # Recovery hint coupling test: the rc=11 path must print the
     # budget-specific message, not the rc=10 finalize hint that
-    # would mislead the user into running `leerie --finalize` on a
+    # would mislead the user into running `leerie finalize` on a
     # run with nothing to push.
     assert "budget preflight rejected the plan" in result.stderr
     assert "re-run from the host with the recommended --max-workers" in result.stderr
@@ -267,8 +267,8 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     orchestrator exit, if the sync step that pulls the run branch +
     state back to the host can't succeed, the machine must NOT be
     destroyed — the user's paid LLM work is still on it. The user
-    sees a multi-line WARNING and recovers via `leerie --finalize`,
-    `leerie --resume`, or finally `leerie --kill` once work is safe."""
+    sees a multi-line WARNING and recovers via `leerie finalize`,
+    `leerie resume`, or finally `leerie kill` once work is safe."""
     result, sidecar = _decide_teardown_with_rc(
         tmp_path, "0", run_id="my-run", fetch_branch_succeeds=False,
     )
@@ -278,7 +278,7 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     # whole point is to leave it running so the user can recover.
     assert "machine destroy" not in invocations
     assert "machine stop" not in invocations
-    # Sidecar must record the failure for `leerie --list` to surface.
+    # Sidecar must record the failure for `leerie list` to surface.
     data = json.loads(sidecar.read_text())
     assert data.get("sync_failed_at") is not None
     assert data.get("sync_fail_reason") == "sync-failed-on-clean-exit"

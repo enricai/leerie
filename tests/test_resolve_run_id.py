@@ -1,16 +1,16 @@
 """Tests for `resolve_run_id()` — pick the run_id to operate on for
-`--resume` / `--list`.
+`resume` / `list`.
 
 An explicit run-id is fails-closed: it must match exactly, and an unknown
 one dies rather than falling back to a guess. Without one, the caller
-chooses the policy (DESIGN §6): `--resume` passes `resumable_only=True`
+chooses the policy (DESIGN §6): `resume` passes `resumable_only=True`
 and gets the most recent run that still has work
 (`in-progress`/`paused`/`incomplete`); the read-only verbs (`--report`,
 `--phase`) omit it and get the most recent run of any status, since
 reporting on a finished run is the ordinary case.
 
 This file used to pin "ambiguity is a hard error, never a heuristic
-guess". That policy made bare `--resume` unusable the moment a second run
+guess". That policy made bare `resume` unusable the moment a second run
 existed — on a real repo, 58 runs, 47 of them finished. DESIGN §6 was
 amended; see `test_resolve_run_id_autopick.py` for the auto-pick contract
 in full.
@@ -18,7 +18,7 @@ in full.
 Cases:
 - Zero runs → die.
 - Exactly one run → auto-pick (common case for single-run users).
-- Multiple runs, no --run-id → newest (filtered by status for --resume).
+- Multiple runs, no --run-id → newest (filtered by status for resume).
 - No *resumable* run and resumable_only → die with the available list.
 - Multiple runs, --run-id matches → use it.
 - Multiple runs, --run-id doesn't match → die with the available list.
@@ -87,7 +87,7 @@ def test_resolve_single_run_wrong_explicit_dies(leerie, tmp_path):
 
 def test_resolve_multiple_runs_no_run_id_picks_newest(leerie, tmp_path):
     """Multiple in-flight runs resolve to the most recent one rather than
-    dying — for both the --resume path and the read-only verbs."""
+    dying — for both the resume path and the read-only verbs."""
     _make_run(tmp_path, "feat-a-aaaaaa",
               {"task": "a", "started_at": "2026-05-26T10:00:00+00:00"})
     _make_run(tmp_path, "feat-b-bbbbbb",
@@ -99,7 +99,7 @@ def test_resolve_multiple_runs_no_run_id_picks_newest(leerie, tmp_path):
 
 def test_resolve_no_resumable_run_dies(leerie, tmp_path):
     """The fails-closed path survives: when every run is finished there is
-    nothing to resume, so `--resume` dies rather than picking one."""
+    nothing to resume, so `resume` dies rather than picking one."""
     _make_finished_run(tmp_path, "feat-a-aaaaaa",
                        "2026-05-26T10:00:00+00:00")
     _make_finished_run(tmp_path, "feat-b-bbbbbb",
@@ -160,7 +160,7 @@ def _make_orphan(leerie_root: Path, run_id: str, fly: dict) -> None:
 
 def test_resolve_explicit_orphan_id_accepted(leerie, tmp_path):
     """Orphan dirs (fly-machine.json without state.json) must resolve
-    so the user can `--resume <orphan-id>` after seed_auth
+    so the user can `resume <orphan-id>` after seed_auth
     aborted before phase_classify. This is the live regression test for
     the sibling-service/finalmemoriam hangs."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {
@@ -183,7 +183,7 @@ def test_resolve_orphan_single_auto_picks_for_readonly_verbs(leerie, tmp_path):
 
 
 def test_resolve_lone_orphan_is_not_auto_resumed(leerie, tmp_path, capsys):
-    """Deliberate behavior change: bare `--resume` no longer auto-picks a
+    """Deliberate behavior change: bare `resume` no longer auto-picks a
     lone `seed-failed` orphan (it used to, when it was the only run).
 
     A seed-failed run aborted before `phase_classify` and needs an
@@ -191,7 +191,7 @@ def test_resolve_lone_orphan_is_not_auto_resumed(leerie, tmp_path, capsys):
     re-trigger the same seed failure. So it is surfaced, not chosen. The
     die must remain actionable: it names the run, its status, and the
     explicit-id escape hatch, which is the documented recovery path for
-    the 2026-06-04 hangs (CLAUDE.md: "resumable via `--resume <id>`")."""
+    the 2026-06-04 hangs (CLAUDE.md: "resumable via `resume <id>`")."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {
         "fly_machine_id": "287061da360d78",
         "started_at": "2026-06-04T19:20:58+00:00",
@@ -209,7 +209,7 @@ def test_resolve_lone_orphan_is_not_auto_resumed(leerie, tmp_path, capsys):
 
 def test_resolve_orphan_with_healthy_runs_prefers_the_healthy_run(
         leerie, tmp_path):
-    """When an orphan and a healthy run coexist, bare `--resume` picks the
+    """When an orphan and a healthy run coexist, bare `resume` picks the
     healthy one: a `seed-failed` orphan needs an operator decision first
     (re-seed vs. kill), so it is listed but never auto-picked.
 
