@@ -7482,7 +7482,7 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`, or the orchestrator exited via `die()` after the run directory was created (e.g. unresolved subtasks). In the latter case, `resume` re-enters `phase_execute` normally — `finished_at` is overwritten on success. |
 | `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie resume <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
 | `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie kill`. Not resumable; start a new run instead. |
-| `in-progress` | none of the above | the run is still active (or died very early); resume with `resume <id>` |
+| `in-progress` | none of the above | the run is still active (or died very early); resume with `leerie resume <id>` |
 
 `RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
