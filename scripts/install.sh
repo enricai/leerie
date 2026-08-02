@@ -29,7 +29,7 @@
 #
 # Leerie runs entirely inside a container (DESIGN §6 / IMPLEMENTATION §0.5),
 # so Python is provisioned by the image at runtime — the host doesn't need
-# Python or `uv` anymore. The launcher's --version fast path returns
+# Python or `uv` anymore. The launcher's `version` fast path returns
 # without spinning up a container.
 #
 # Flags:
@@ -143,7 +143,9 @@ run() {
 
 have_runnable() {
   # `command -v` returns success for shimmed entries (pyenv) that can't
-  # actually exec — invoke `version` to confirm it really runs.
+  # actually exec — invoke `--version` to confirm it really runs. (Generic
+  # helper for git/curl/claude/colima/nerdctl — never leerie itself, whose
+  # own bare `version` verb is checked separately below.)
   "$1" --version >/dev/null 2>&1
 }
 
@@ -436,13 +438,13 @@ log "verifying install"
 if [ "$DRY_RUN" = "false" ]; then
   # Run the launcher we just symlinked, not whatever `leerie` already
   # exists on PATH — proves *this* install works end-to-end.
-  if "$LINK" --version; then
+  if "$LINK" version; then
     log "done. Run \`leerie \"your task\"\` from any git repository to start."
   else
     err "leerie version failed. The install completed but the binary is not runnable."
     exit 1
   fi
 else
-  printf '  $ %s\n' "$LINK --version"
+  printf '  $ %s\n' "$LINK version"
   log "dry-run complete."
 fi

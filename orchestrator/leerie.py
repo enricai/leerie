@@ -13239,7 +13239,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                             "Claude API connection dropped mid-response "
                             f"after ~{auth_retry_max_sec}s of retries — a "
                             "transient network/gateway transport error. Run "
-                            "--resume to retry.")
+                            f"`leerie resume {st.run_id}` to retry.")
                     # A 529 is transient gateway overload, not a subscription
                     # cap — don't misattribute it. 401/429 (and the text-marker
                     # path) stay on the rolling-usage-cap message.
@@ -13248,12 +13248,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                             "Claude API returned an overloaded (529) error "
                             f"after ~{auth_retry_max_sec}s of retries — the "
                             "Anthropic gateway is under transient load. Run "
-                            "--resume to retry.")
+                            f"`leerie resume {st.run_id}` to retry.")
                     raise WorkerError(
                         "Claude API returned auth/quota error after "
                         f"~{auth_retry_max_sec}s of retries — your Claude "
                         "Code subscription likely hit its rolling usage "
-                        "cap. Run --resume once the window clears.")
+                        f"cap. Run `leerie resume {st.run_id}` once the "
+                        "window clears.")
 
             if envelope.get("is_error"):
                 last_problem = str(envelope.get("api_error_status")

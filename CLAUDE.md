@@ -2130,7 +2130,7 @@ is tested in `tests/test_ec2_launcher_stop.py` by invoking the real
 `leerie` binary (not an extracted block, since `stop` is an early
 fast-path verb dispatched before container preflight) against the
 same resource-tracking `aws` stub: an `ec2-instance.json` sidecar
-auto-detects the EC2 runtime and `--stop <run-id>` drives the
+auto-detects the EC2 runtime and `stop <run-id>` drives the
 stub-tracked instance to `stopped` (never `terminate-instances`) and
 writes `paused_at`/`pause_reason`/`ec2_instance_id` onto `run.json`;
 explicit `--runtime ec2` works without autodetection; the local/Fly

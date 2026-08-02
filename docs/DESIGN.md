@@ -475,7 +475,7 @@ prerequisites are `extent: external`, the worker will discover the external
 dependency is missing (e.g. no Postgres server in the container) and return
 `status: blocked`. Since the orchestrator does not gate dispatch on external
 preconditions — they are informational, not graph edges — the wave dies and
-`resume` retries the same subtask, which blocks again. The `--accept-blocked
+`resume` retries the same subtask, which blocks again. The `accept-blocked
 <run-id> <subtask-id>` verb lets the operator acknowledge an external block:
 it sets `subtask_status[sid]` to `complete` in state.json so `resume` skips
 that subtask. This preserves the invariant that external preconditions are

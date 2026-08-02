@@ -31,7 +31,7 @@ git clone https://github.com/enricai/leerie.git
 cd leerie
 pip install -r requirements.txt   # runtime deps — the test suite imports them
 pip install pytest jsonschema     # pytest is the only dev (host-side) dependency
-./leerie --version           # smoke-check; uses the launcher's fast path —
+./leerie version           # smoke-check; uses the launcher's fast path —
                            # does NOT require the container runtime, so
                            # it works on a fresh clone with no Colima.
 ```

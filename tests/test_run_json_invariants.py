@@ -24,10 +24,10 @@ Valid status combinations (leerie list derives these via
 - `done-pushed-pr`      — pushed + PR opened.
 - `push-failed`         — push attempted and failed.
 - `pr-failed`           — push succeeded, PR creation failed.
-- `paused`       — remote run paused on failure; resume via --resume.
+- `paused`       — remote run paused on failure; resume via `leerie resume`.
 - `killed`       — terminal state via leerie kill; not resumable.
 - `sync-failed` — orchestrator finished but fetch_branch failed;
-                          machine still up, recover via --finalize/--kill.
+                          machine still up, recover via `leerie finalize`/`leerie kill`.
 - `corrupt-sidecar`     — run.json violates an invariant above.
 - `in-progress`         — finalize hasn't run yet (no fields set).
 """

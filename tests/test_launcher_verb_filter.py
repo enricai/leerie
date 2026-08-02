@@ -13,10 +13,13 @@ it to the orchestrator, which rejects it with "unrecognized arguments".
 The guard arm emits an actionable error and ``exit 1``s.
 
 Dual-purpose verbs that the orchestrator also handles are excluded:
-``list`` (falls through to orchestrator on non-fly path), ``status``
-(orchestrator uses as ``list`` filter), ``version`` (handled by
-argparse version action), ``resume`` (already forwarded with special
-``_prev_was_resume`` handling).
+``list`` (its non-exiting fallback paths restore `$@` with `list` back
+at position 1 and fall through to REWRITTEN_ARGS, which translates it
+to `--list` via the same index-1 special case `resume` uses — see
+test_launcher_list_verb_dispatch.py for the direct behavioral pin of
+this translation), ``status`` (orchestrator uses as ``list`` filter),
+``version`` (handled by argparse version action), ``resume`` (already
+forwarded with special ``_prev_was_resume`` handling).
 """
 from __future__ import annotations
 

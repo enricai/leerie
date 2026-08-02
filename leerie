@@ -1193,9 +1193,14 @@ PY
     # `list --runtime fly` is a runtime-aware view: query Fly directly
     # for every machine under FLY_APP, then best-effort cross-reference
     # `$LEERIE_STATE_HOST_DIR/runs/*/{fly-machine.json,run.json}` for the
-    # current repo to fill in run-id columns. Without --runtime fly, this arm restores
-    # the original argv and lets execution continue past the case block;
-    # the orchestrator's argparse handles plain `list`.
+    # current repo to fill in run-id columns. Without --runtime fly (or
+    # on a flyctl failure/absence fallback), this arm restores the
+    # original argv via `set -- "${_list_rest[@]}"` and lets execution
+    # continue past the case block with `list` back at position 1 of
+    # `$@`. The REWRITTEN_ARGS filter loop (~line 5354) special-cases
+    # that position (mirroring `resume`) to translate it into `--list`
+    # for the orchestrator's argparse, which only ever understands the
+    # `--list` flag form, never a bare positional `list`.
     #
     # list --chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # groups by chain_id, and prints one row per chain. Used by users
@@ -1375,7 +1380,7 @@ PY
         echo "leerie: list --runtime fly: flyctl machines list failed:" >&2
         echo "$_list_json" >&2
         echo "  Falling back to local sidecars." >&2
-        set -- --list "${_list_rest[@]:1}"
+        set -- "${_list_rest[@]}"
       else
         LEERIE_LIST_FLY_JSON="$_list_json" python3 - "$USER_REPO" "$FLY_APP" "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
@@ -1438,7 +1443,7 @@ PY
         exit 0
       fi
     else
-      set -- --list "${_list_rest[@]:1}"
+      set -- "${_list_rest[@]}"
     fi
     ;;
   accept-blocked)
@@ -5438,6 +5443,22 @@ for arg in "$@"; do
     _prev_was_resume=true
     continue
   fi
+  # The bare `list` verb reaches here only via its own non-exiting
+  # fallback paths (plain `list`, or `list --runtime fly` when flyctl
+  # is unavailable/fails — see the `list)` case arm above, which
+  # restores the original argv with `set -- "${_list_rest[@]}"` and
+  # falls through past the top-level case block instead of exiting).
+  # Same index-1 discipline as `resume` above: checked by position, not
+  # token, so a later positional/value equal to the literal word "list"
+  # is never mistaken for the verb. Translate it to the orchestrator's
+  # `--list` flag it actually understands — without this, bare `list`
+  # falls into the verb-rejection arm below and dies with "must be the
+  # first argument" (bugfix, 2026-08-02: reproduced live, `leerie list`
+  # with no flags at all was completely broken on this branch).
+  if [ "$_rw_argi" -eq 1 ] && [ "$arg" = "list" ]; then
+    REWRITTEN_ARGS+=("--list")
+    continue
+  fi
   if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
     _prev_was_state_dir_rewrite=false
     continue
@@ -5574,13 +5595,6 @@ for arg in "$@"; do
       remote_log "error: '$arg' is not a recognized flag — leerie verbs are now bare (e.g. '${arg#--}', not '$arg')."
       remote_log "  Run: leerie ${arg#--} [args...]"
       exit 1
-      ;;
-    --resume)
-      # Forward --resume to the orchestrator and mark that the next
-      # non-flag positional token is the run-id (not the task).
-      REWRITTEN_ARGS+=("$arg")
-      _prev_was_resume=true
-      continue
       ;;
     *)
       REWRITTEN_ARGS+=("$arg")
