@@ -433,7 +433,7 @@ def test_attach_case_arm_is_id_dispatched():
     silently bring back the old attach.sh-driven SSH path.
     """
     launcher = LEERIE.read_text()
-    assert "attach)" in launcher, (
+    assert "  attach)" in launcher, (
         "attach) case-arm missing from launcher (expected the new "
         "ID-dispatched chain attach verb)"
     )
