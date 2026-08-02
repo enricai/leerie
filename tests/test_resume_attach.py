@@ -419,26 +419,26 @@ def test_launcher_strips_submode_flags_from_rewritten_args():
 
 
 def test_attach_case_arm_is_id_dispatched():
-    """The --attach case-arm exists and dispatches by ID type.
+    """The attach case-arm exists and dispatches by ID type.
 
     Previously --attach was an out-of-band launcher verb that just
     SSH'd into a Fly machine. That one was removed. Under v5 Shape A
-    --attach is an ID-dispatched verb: UUID → poll
+    attach is an ID-dispatched verb: UUID → poll
     $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by chain_id until
     every chain run reaches a terminal state; non-UUID → not-yet-
-    implemented for run-mode (the existing --resume reattaches
+    implemented for run-mode (the existing resume reattaches
     single runs).
 
     This test pins the behavior so a future regression doesn't
     silently bring back the old attach.sh-driven SSH path.
     """
     launcher = LEERIE.read_text()
-    assert "--attach)" in launcher, (
-        "--attach) case-arm missing from launcher (expected the new "
+    assert "attach)" in launcher, (
+        "attach) case-arm missing from launcher (expected the new "
         "ID-dispatched chain attach verb)"
     )
     assert "ID-dispatched attach verb" in launcher, (
-        "--attach case-arm exists but is not the new chain-mode "
+        "attach case-arm exists but is not the new chain-mode "
         "implementation — check whether the old SSH-style attach has "
         "been reintroduced."
     )
