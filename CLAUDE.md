@@ -608,9 +608,9 @@ export LEERIE_PROGRESS_INTERVAL_S=15
   --wave "prompts/publish.md"
 
 # ID-dispatched verbs: UUID → chain scope (iterates run.json filtered by
-# chain_id); Fly machine id → existing single-run behavior. The deprecated
-# --chain-submit/--chain-status/--chain-kill/--chain-attach/--list-chains
-# aliases have been hard-removed (no shim) — use the bare verbs below.
+# chain_id); Fly machine id → existing single-run behavior. The five
+# deprecated dash-prefixed chain aliases have been hard-removed (no
+# shim) — use the bare verbs below.
 ./leerie status   <chain-id>        # render per-run states from run.json
 ./leerie attach   <chain-id>        # poll run.json files every 5s
 ./leerie stop     <chain-id>        # pause every running chain run
@@ -2845,10 +2845,10 @@ Before marking a change complete:
       valid JSON with at least `call_type`, `system_prompt`, and
       `response_content` keys). Replace `<state-root>` with the resolved
       state directory (default: `$HOME/.leerie/<basename>/`).
-- [ ] `! grep -q -- '--chain-submit\|--chain-status\|--list-chains\|--chain-kill\|--chain-attach' leerie`
-      — if chain launcher verbs were touched, confirm the five deprecated
-      `--chain-*` aliases stay hard-removed (no shim). The launcher verbs
-      are bare subcommands (`chain`, `status`, `attach`, `kill`, `list`);
+- [ ] `grep -qE '^\s*chain\)|^\s*status\)|^\s*attach\)|^\s*kill\)|^\s*list\)' leerie`
+      — if chain launcher verbs were touched, confirm the bare-verb arms
+      (`chain`, `status`, `attach`, `kill`, `list`) are present and the five
+      deprecated dash-prefixed chain aliases stay hard-removed (no shim);
       see DESIGN.md §19 and IMPLEMENTATION.md "Chain verbs";
       `pytest tests/test_chain_launcher_id_dispatch.py` for the
       ID-dispatch contract test.

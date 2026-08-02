@@ -6642,9 +6642,8 @@ single-run verbs (`status`, `stop`, `kill`, `resume`, `finalize`,
 `attach`, `list --chains`) operate on chains by iterating
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by the `chain_id`
 field, dispatching the existing single-run verb per discovered run.
-The deprecated `--chain-submit`/`--chain-status`/`--chain-kill`/
-`--chain-attach`/`--list-chains` aliases have been hard-removed —
-there is no shim.
+The five deprecated dash-prefixed chain aliases have been
+hard-removed — there is no shim.
 
 **GitHub credentials are never on a Fly machine.** Each per-job
 `host_finalize` runs on the laptop using the user's `gh auth` and

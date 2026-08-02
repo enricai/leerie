@@ -31,9 +31,8 @@ The single-run verbs (`status`, `kill`, `stop`, `resume`, `finalize`,
 the chain (iterates `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by
 the `chain_id` field, dispatches the single-run verb per discovered
 run); a Fly machine id operates on a single run (historical behavior).
-UUID format: `8-4-4-4-12` hyphenated. The deprecated `--chain-submit` /
-`--chain-status` / `--list-chains` / `--chain-kill` / `--chain-attach`
-aliases have been hard-removed (no shim) — use the bare verbs below.
+UUID format: `8-4-4-4-12` hyphenated. The five deprecated dash-prefixed
+chain aliases have been hard-removed (no shim) — use the bare verbs below.
 
 ## Steps
 
