@@ -74,7 +74,7 @@ dependencies on the user's behalf.
    Then resume:
 
    ```
-   bash "${CLAUDE_PLUGIN_ROOT}/leerie" --clarify --resume --answers .leerie/answers.json
+   bash "${CLAUDE_PLUGIN_ROOT}/leerie" --clarify resume --answers .leerie/answers.json
    ```
 
    (If `resume` reports the run had not reached scheduling, re-run without

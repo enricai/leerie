@@ -31,8 +31,9 @@ The single-run verbs (`status`, `kill`, `stop`, `resume`, `finalize`,
 the chain (iterates `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by
 the `chain_id` field, dispatches the single-run verb per discovered
 run); a Fly machine id operates on a single run (historical behavior).
-UUID format: `8-4-4-4-12` hyphenated. The deprecated `--chain-*` aliases
-continue to work via the launcher's shim arms.
+UUID format: `8-4-4-4-12` hyphenated. The deprecated `--chain-submit` /
+`--chain-status` / `--list-chains` / `--chain-kill` / `--chain-attach`
+aliases have been hard-removed (no shim) — use the bare verbs below.
 
 ## Steps
 
@@ -47,7 +48,7 @@ and passes its contents as the run prompt to a background
 `--wave` flag order (0, 1, 2, …).
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain \
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" chain \
   --wave <path/to/a1.md,path/to/a2.md> \
   --wave <path/to/b1.md>
 ```
@@ -73,7 +74,7 @@ To resume:
    first incomplete wave:
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain \
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" chain \
   --chain-id <prior-uuid> \
   --wave <same --wave args as the original submission>
 ```
@@ -88,7 +89,7 @@ for that wave transition, resuming at the next wave.
 ### `status` — print a chain snapshot
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --status <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" status <chain-id>
 ```
 
 Iterates `$LEERIE_STATE_HOST_DIR/runs/*/run.json`, filters by the
@@ -99,7 +100,7 @@ status, branch, notes). Status derived from run.json fields
 ### `list` — list chains
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --list --chains
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" list --chains
 ```
 
 Iterates run.json files,
@@ -109,7 +110,7 @@ groups by `chain_id`, and prints one row per chain
 ### `stop` — pause a chain
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --stop <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" stop <chain-id>
 ```
 
 Enumerates running runs in the chain (have `fly_machine_id`, no
@@ -120,7 +121,7 @@ records `paused_at` + `pause_reason`. Resume with `resume`.
 ### `kill` — destroy a chain
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --kill <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" kill <chain-id>
 ```
 
 Enumerates non-killed runs in the chain and invokes
@@ -131,7 +132,7 @@ skipped.
 ### `resume` — resume paused chain runs
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --resume <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" resume <chain-id>
 ```
 
 Enumerates paused runs (`paused_at` set, not `killed_at`) and invokes
@@ -143,7 +144,7 @@ continuing from where the chain stopped.
 ### `finalize` — push + open PRs for unpushed chain runs
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --finalize <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" finalize <chain-id>
 ```
 
 Enumerates runs with `pushed_at` unset (and not `killed_at`), invokes
@@ -153,7 +154,7 @@ interrupted between orchestrator finalize and laptop push.
 ### `attach` — poll until terminal
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --attach <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" attach <chain-id>
 ```
 
 Polls `$LEERIE_STATE_HOST_DIR/runs/*/run.json` every 5s. Exits 0 when
