@@ -200,7 +200,7 @@ class TestStateDirGuard:
         # _run() sets LEERIE_STATE_DIR by default — that's what we test.
         result = _run(
             tmp_path,
-            ["--group", "--repo", str(repo_a), "task a",
+            ["group", "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             stub=stub, stub_log=stub_log,
         )
@@ -217,7 +217,7 @@ class TestStateDirGuard:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group", "--state-dir", "/tmp/custom",
+            ["group", "--state-dir", "/tmp/custom",
              "--repo", str(repo_a), "task"],
             env_extra={"LEERIE_STATE_DIR": ""},
             stub=stub, stub_log=stub_log,
@@ -245,7 +245,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", GROUP_ID,
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
@@ -268,7 +268,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", GROUP_ID,
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b",
@@ -290,7 +290,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             env_extra={"LEERIE_STATE_DIR": ""},
@@ -312,7 +312,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", GROUP_ID,
              "--brief", str(brief),
              "--repo", str(repo_a), "task a",
@@ -334,7 +334,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_group_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", GROUP_ID,
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
@@ -352,7 +352,7 @@ class TestGroupFanOut:
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", GROUP_ID,
              "--repo", str(not_a_repo), "task"],
             env_extra={"LEERIE_STATE_DIR": ""},
@@ -392,7 +392,7 @@ class TestGroupStatusDispatch:
     def test_status_group_id_lists_members(self, tmp_path: Path) -> None:
         """--status <group-id> enumerates members across state dirs."""
         self._fixture(tmp_path)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert RUN_ID_A in result.stdout
         assert RUN_ID_B in result.stdout
@@ -405,7 +405,7 @@ class TestGroupStatusDispatch:
             "run_id": NON_GROUP_RUN,
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stdout
 
@@ -413,7 +413,7 @@ class TestGroupStatusDispatch:
         """Unknown UUID → non-zero exit."""
         state_dir = tmp_path / ".leerie" / "myrepo"
         state_dir.mkdir(parents=True)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode != 0
 
 

@@ -139,7 +139,7 @@ class TestStatusDispatch:
     def test_status_lists_both_members(self, tmp_path: Path) -> None:
         """Both run-ids appear in --status output."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert RUN_ID_A in result.stdout
         assert RUN_ID_B in result.stdout
@@ -152,7 +152,7 @@ class TestStatusDispatch:
             "run_id": NON_GROUP_RUN,
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stdout
 
@@ -160,13 +160,13 @@ class TestStatusDispatch:
         """UUID with no matching group members → non-zero exit."""
         state_dir = tmp_path / ".leerie" / "myrepo"
         state_dir.mkdir(parents=True)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode != 0
 
     def test_status_shows_member_count(self, tmp_path: Path) -> None:
         """Output mentions the group has 2 members."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         out = result.stdout + result.stderr
         assert "2" in out

@@ -124,7 +124,7 @@ def test_two_children_spawned(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "prompt for a",
          "--repo", str(repo_b), "prompt for b"],
         stub=stub, log=log,
@@ -178,7 +178,7 @@ def test_each_child_cds_into_its_repo(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "prompt for a",
          "--repo", str(repo_b), "prompt for b"],
         stub=stub, log=log,
@@ -200,7 +200,7 @@ def test_each_child_receives_group_id(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -221,7 +221,7 @@ def test_each_child_receives_group_id_minted_when_absent(tmp_path: Path) -> None
 
     result = _run(
         tmp_path,
-        ["--group",
+        ["group",
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -243,7 +243,7 @@ def test_child_a_receives_inspect_dir_for_b(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -273,7 +273,7 @@ def test_child_b_receives_inspect_dir_for_a(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -297,7 +297,7 @@ def test_three_members_each_get_two_inspect_dirs(tmp_path: Path) -> None:
         _make_git_repo(r)
     stub, log = _stub_recorder(tmp_path)
 
-    cli = ["--group", "--group-id", GROUP_ID]
+    cli = ["group", "--group-id", GROUP_ID]
     for r in repos:
         cli += ["--repo", str(r), f"task {r.name}"]
 
@@ -326,7 +326,7 @@ def test_brief_prepended_to_each_childs_prompt(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--brief", str(brief),
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
@@ -350,7 +350,7 @@ def test_brief_prepended_before_member_prompt(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--brief", str(brief),
          "--repo", str(repo_a), "PROMPT_A",
          "--repo", str(repo_b), "PROMPT_B"],

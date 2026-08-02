@@ -367,7 +367,7 @@ class TestGroupLauncherStateDirGuard:
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group", "--repo", str(repo_a), "task a",
+            ["group", "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             env_extra={"LEERIE_STATE_DIR": str(tmp_path / "shared-state")},
             stub=stub, stub_log=stub_log,
@@ -384,7 +384,7 @@ class TestGroupLauncherStateDirGuard:
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group",
+            ["group",
              "--state-dir", str(tmp_path / "custom"),
              "--repo", str(repo_a), "task"],
             stub=stub, stub_log=stub_log,
@@ -403,7 +403,7 @@ class TestGroupLauncherStateDirGuard:
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", "deadbeef-1234-4abc-8def-0123456789ab",
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
@@ -424,7 +424,7 @@ class TestGroupLauncherStateDirGuard:
         stub, _ = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group", "--repo", str(repo_a), "task a",
+            ["group", "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             env_extra={"LEERIE_STATE_DIR": str(tmp_path / "shared-state")},
             stub=stub,
