@@ -1,16 +1,16 @@
-"""Tests for `leerie --finalize <run-id>` against a no-work run.
+"""Tests for `leerie finalize <run-id>` against a no-work run.
 
-Regression cover for the bug where the launcher's `--finalize`
+Regression cover for the bug where the launcher's `finalize`
 recovery path could not finalize a cleared-but-empty terminal-state
 run (DESIGN §8). For such runs `_finish_no_work_run` writes
 `no_push=true` to run.json on the Fly machine; the auto-sync path
-should preserve that intent host-side, and `--finalize` should
+should preserve that intent host-side, and `finalize` should
 recognize the run as already synced without requiring a local run
 branch.
 
-The launcher's `--finalize` handler is a case-statement arm that
+The launcher's `finalize` handler is a case-statement arm that
 runs before any container/runtime setup (leerie:127), so it can be
-exercised directly with `bash leerie --finalize <id>` against a
+exercised directly with `bash leerie finalize <id>` against a
 synthesized host-side run dir.
 
 The companion bash-harness tests cover the script-level mechanics:
@@ -19,7 +19,7 @@ The companion bash-harness tests cover the script-level mechanics:
 - `tests/test_fetch_branch_sh.py::test_fetch_branch_skips_bundle_when_branch_missing`
   for Fix A (fetch-branch.sh's conditional stripper preserves intent).
 
-This test focuses on Fix B (the --finalize arm of `leerie` itself).
+This test focuses on Fix B (the finalize arm of `leerie` itself).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ import pytest
 
 from tests.conftest import HAS_JQ
 
-# Exercises the launcher's own `--finalize` path, which is host-side and reads
+# Exercises the launcher's own `finalize` path, which is host-side and reads
 # run.json with real `jq` — the launcher in fact hard-fails at preflight when
 # jq is missing. See `tests/conftest.py`'s HAS_JQ.
 pytestmark = pytest.mark.skipif(
@@ -95,12 +95,12 @@ def _make_no_work_run_dir(state_dir: Path, run_id: str) -> Path:
 
 
 def test_finalize_no_work_run_exits_cleanly(tmp_path):
-    """The user's exact failure mode: `leerie --finalize <id>` on a
+    """The user's exact failure mode: `leerie finalize <id>` on a
     no-work run that auto-synced to host should exit 0 cleanly,
     recognize it as already synced (Fix B1), preserve no_push=true
     (Fix B2), and short-circuit host_finalize on the no_push gate.
 
-    Without Fix B1, --finalize takes the `else` arm at leerie:423 and
+    Without Fix B1, finalize takes the `else` arm at leerie:423 and
     dies with "no fly_machine_id and is not already synced."
     Without Fix B2, the stripper at leerie:499-533 would clear
     no_push=true, host_finalize would attempt `git push` on the
@@ -113,7 +113,7 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
 
     # Run from inside the user repo, as the user does.
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", run_id],
+        ["bash", str(LEERIE), "finalize", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
@@ -121,13 +121,13 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
     )
 
     assert result.returncode == 0, (
-        f"--finalize on a no-work run should exit 0.\n"
+        f"finalize on a no-work run should exit 0.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
     # Fix B1: recognized as already-synced; fetch_branch is skipped.
     assert "already synced to host" in combined, (
-        "--finalize should recognize the no-work run as already "
+        "finalize should recognize the no-work run as already "
         "synced (Fix B1).\nstderr:\n" + result.stderr
     )
     # host_finalize hits the no_push gate at host-finalize.sh:70.
@@ -157,7 +157,7 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
 def test_finalize_already_pushed_short_circuits(tmp_path):
     """When pushed_at is set and the run branch is ABSENT locally (a Fly
     run not yet fetched, or a no-work run — nothing local to compare or
-    re-push), --finalize keeps the original idempotent "already pushed"
+    re-push), finalize keeps the original idempotent "already pushed"
     short-circuit (exit 0). The tip-aware gate (DESIGN §6 *Finalization*)
     only falls through to re-finalize when the branch is present locally
     AND origin is behind it; branch-absent must NOT regress into a
@@ -176,7 +176,7 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
     (run_dir / "state.json").write_text("{}")
 
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", run_id],
+        ["bash", str(LEERIE), "finalize", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
@@ -189,7 +189,7 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
 def test_finalize_repushes_when_local_branch_ahead_of_origin(tmp_path):
     """Partial-push recovery (DESIGN §6 *Finalization*, the PR-#22 wedge):
     when pushed_at is set but the run branch is present locally and AHEAD
-    of origin (a prior finalize pushed a partial branch), --finalize must
+    of origin (a prior finalize pushed a partial branch), finalize must
     NOT short-circuit — it falls through to re-finalize so host_finalize
     can re-push the complete branch. Here origin has no such ref at all
     (the partial push was rewound / never landed the full branch), which
@@ -213,7 +213,7 @@ def test_finalize_repushes_when_local_branch_ahead_of_origin(tmp_path):
     (run_dir / "state.json").write_text("{}")
 
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", run_id],
+        ["bash", str(LEERIE), "finalize", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
@@ -229,9 +229,9 @@ def test_finalize_repushes_when_local_branch_ahead_of_origin(tmp_path):
 # --- Strict argparse: typos and extra positionals fail loudly --------------
 #
 # Regression cover for the silent-typo class where the launcher's
-# `--finalize` argparse (leerie:682–717) accepted any unknown `--*`
+# `finalize` argparse (leerie:682–717) accepted any unknown `--*`
 # flag without error. The original incident: a user ran
-# `leerie --finalize <id> --foorce` (typo for --force), the launcher
+# `leerie finalize <id> --foorce` (typo for --force), the launcher
 # silently dropped --foorce, _FINALIZE_FORCE stayed false,
 # force_finalize_remote was never invoked, fetch_branch correctly
 # reported "no completed unpushed run on machine," and the user thought
@@ -239,21 +239,21 @@ def test_finalize_repushes_when_local_branch_ahead_of_origin(tmp_path):
 # adds a `--*) error; exit 1` catch-all plus a strict positional check.
 
 def test_finalize_rejects_unknown_flag(tmp_path):
-    """`leerie --finalize <id> --foorce` exits non-zero with a clear
+    """`leerie finalize <id> --foorce` exits non-zero with a clear
     'unknown flag' error and the Usage line — instead of silently
     dropping the typo and taking the non-force fetch path."""
     user_repo = _make_user_repo(tmp_path)
     state_dir = tmp_path / "leerie-state"
     state_dir.mkdir()
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", "some-run-id", "--foorce"],
+        ["bash", str(LEERIE), "finalize", "some-run-id", "--foorce"],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
              "LEERIE_STATE_DIR": str(state_dir)},
     )
     assert result.returncode != 0, (
-        f"--finalize should reject unknown flag --foorce.\n"
+        f"finalize should reject unknown flag --foorce.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
@@ -270,11 +270,11 @@ def test_finalize_accepts_force_correctly_spelled(tmp_path):
     user_repo = _make_user_repo(tmp_path)
     state_dir = tmp_path / "leerie-state"
     state_dir.mkdir()
-    # Pass a run-id that doesn't exist locally to make --finalize fail
+    # Pass a run-id that doesn't exist locally to make finalize fail
     # after argparse but before any remote call. The point is to confirm
     # argparse does not reject --force itself.
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", "nonexistent-run", "--force"],
+        ["bash", str(LEERIE), "finalize", "nonexistent-run", "--force"],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
@@ -290,7 +290,7 @@ def test_finalize_accepts_force_correctly_spelled(tmp_path):
 
 
 def test_finalize_rejects_extra_positional(tmp_path):
-    """`leerie --finalize id1 id2` — the second positional argument is
+    """`leerie finalize id1 id2` — the second positional argument is
     not a recognized flag and shouldn't be silently ignored. Previously
     the argparse loop would have iterated past `id2` as just-another-arg
     that doesn't match the case statement."""
@@ -298,14 +298,14 @@ def test_finalize_rejects_extra_positional(tmp_path):
     state_dir = tmp_path / "leerie-state"
     state_dir.mkdir()
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", "run-id-1", "run-id-2"],
+        ["bash", str(LEERIE), "finalize", "run-id-1", "run-id-2"],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
              "LEERIE_STATE_DIR": str(state_dir)},
     )
     assert result.returncode != 0, (
-        f"--finalize should reject an extra positional argument.\n"
+        f"finalize should reject an extra positional argument.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
@@ -316,7 +316,7 @@ def test_finalize_rejects_extra_positional(tmp_path):
 
 
 def test_finalize_rejects_dangling_runtime_flag(tmp_path):
-    """`leerie --finalize <id> --runtime` (no value after the flag) is
+    """`leerie finalize <id> --runtime` (no value after the flag) is
     a partial invocation — without this guard, the _fin_prev state
     machine leaves _fin_runtime empty, the downstream
     [ -n "$_fin_runtime" ] validator passes, and the launcher silently
@@ -327,14 +327,14 @@ def test_finalize_rejects_dangling_runtime_flag(tmp_path):
     state_dir = tmp_path / "leerie-state"
     state_dir.mkdir()
     result = subprocess.run(
-        ["bash", str(LEERIE), "--finalize", "some-run-id", "--runtime"],
+        ["bash", str(LEERIE), "finalize", "some-run-id", "--runtime"],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={**os.environ, "PATH": os.environ.get("PATH", ""),
              "LEERIE_STATE_DIR": str(state_dir)},
     )
     assert result.returncode != 0, (
-        f"--finalize should reject a dangling --runtime flag.\n"
+        f"finalize should reject a dangling --runtime flag.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
@@ -345,7 +345,7 @@ def test_finalize_rejects_dangling_runtime_flag(tmp_path):
 
 
 def test_finalize_accepts_no_verify_and_no_push(tmp_path):
-    """Sanity check: --no-verify and --no-push are valid --finalize
+    """Sanity check: --no-verify and --no-push are valid finalize
     flags (consumed by the post-fetch block at leerie:899–906) and must
     pass the strict argparse without 'unknown flag' errors."""
     user_repo = _make_user_repo(tmp_path)
@@ -353,7 +353,7 @@ def test_finalize_accepts_no_verify_and_no_push(tmp_path):
     state_dir.mkdir()
     for flag in ("--no-verify", "--no-push"):
         result = subprocess.run(
-            ["bash", str(LEERIE), "--finalize", "nonexistent-run", flag],
+            ["bash", str(LEERIE), "finalize", "nonexistent-run", flag],
             cwd=str(user_repo),
             capture_output=True, text=True,
             env={**os.environ, "PATH": os.environ.get("PATH", ""),
@@ -361,6 +361,6 @@ def test_finalize_accepts_no_verify_and_no_push(tmp_path):
         )
         combined = result.stdout + result.stderr
         assert f"unknown flag: {flag}" not in combined, (
-            f"{flag} must be a recognized --finalize flag.\n"
+            f"{flag} must be a recognized finalize flag.\n"
             f"stderr:\n{result.stderr}"
         )

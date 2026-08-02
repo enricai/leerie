@@ -5,7 +5,7 @@ leaking to the orchestrator's argparse.
 The verb dispatch (``case "${1:-}" in``) handles verbs when they appear
 as ``$1`` and ``exit``s before REWRITTEN_ARGS runs.  But if a verb
 appears in a non-$1 position (e.g. ``leerie <id> --finalize --runtime
-fly`` instead of ``leerie --finalize <id> --runtime fly``), the verb
+fly`` instead of ``leerie finalize <id> --runtime fly``), the verb
 dispatch does not match and the token falls through to the
 REWRITTEN_ARGS loop.  Without a guard arm, the ``*)`` default forwards
 it to the orchestrator, which rejects it with "unrecognized arguments".
@@ -13,9 +13,9 @@ it to the orchestrator, which rejects it with "unrecognized arguments".
 The guard arm emits an actionable error and ``exit 1``s.
 
 Dual-purpose verbs that the orchestrator also handles are excluded:
-``list`` (falls through to orchestrator on non-fly path), ``--status``
+``list`` (falls through to orchestrator on non-fly path), ``status``
 (orchestrator uses as ``list`` filter), ``version`` (handled by
-argparse version action), ``--resume`` (already forwarded with special
+argparse version action), ``resume`` (already forwarded with special
 ``_prev_was_resume`` handling).
 """
 from __future__ import annotations
@@ -30,9 +30,9 @@ LEERIE_BASH = REPO_ROOT / "leerie"
 # too, or forwarded with special logic.
 _DUAL_PURPOSE_VERBS: frozenset[str] = frozenset({
     "list",
-    "--status",
+    "status",
     "version",
-    "--resume",
+    "resume",
 })
 
 # Top-level verb dispatch arms. Extracted from the ``case "${1:-}" in``

@@ -7,9 +7,9 @@ Contract verified here:
      from LEERIE_STATE_HOST_DIR/runs/<id>/, not USER_REPO/.leerie/runs/.
   2. The launcher's sidecar-write block (fly-machine.json, run.json,
      task.txt) lands under LEERIE_STATE_HOST_DIR, not USER_REPO/.leerie.
-  3. The `--finalize` verb looks up run dirs from LEERIE_STATE_HOST_DIR,
+  3. The `finalize` verb looks up run dirs from LEERIE_STATE_HOST_DIR,
      not USER_REPO/.leerie.
-  4. The `--stop` and `--kill` verbs look up run dirs from
+  4. The `stop` and `--kill` verbs look up run dirs from
      LEERIE_STATE_HOST_DIR.
   5. fetch_branch streams state back to LEERIE_STATE_HOST_DIR/runs/,
      not USER_REPO/.leerie/runs/.
@@ -79,10 +79,10 @@ def test_launcher_local_finalize_uses_state_host_dir():
 
 
 def test_launcher_stop_verb_uses_state_host_dir():
-    """The --stop verb must look up the run dir from LEERIE_STATE_HOST_DIR."""
+    """The stop verb must look up the run dir from LEERIE_STATE_HOST_DIR."""
     launcher = LEERIE.read_text()
     assert '$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id' in launcher, (
-        "--stop verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
+        "stop verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
     )
 
 
@@ -95,13 +95,13 @@ def test_launcher_kill_verb_uses_state_host_dir():
 
 
 def test_launcher_finalize_verb_uses_state_host_dir():
-    """The --finalize verb must look up run dirs from LEERIE_STATE_HOST_DIR."""
+    """The finalize verb must look up run dirs from LEERIE_STATE_HOST_DIR."""
     launcher = LEERIE.read_text()
     assert '$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id' in launcher, (
-        "--finalize verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
+        "finalize verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
     )
     assert '$LEERIE_STATE_HOST_DIR/runs' in launcher, (
-        "--finalize bootstrap fallback must scan LEERIE_STATE_HOST_DIR/runs/"
+        "finalize bootstrap fallback must scan LEERIE_STATE_HOST_DIR/runs/"
     )
 
 
@@ -122,7 +122,7 @@ def test_fetch_branch_uses_state_host_dir():
     )
 
 
-# --- Behavioral tests: --stop/--kill/--finalize find state_dir fixtures ------
+# --- Behavioral tests: stop/kill/finalize find state_dir fixtures ------
 
 def _make_user_repo(tmp_path: Path) -> Path:
     user_repo = tmp_path / "user-repo"
@@ -156,7 +156,7 @@ def _make_flyctl_stub_auth_only(tmp_path: Path) -> Path:
 
 
 def test_stop_resolves_run_dir_from_state_host_dir(tmp_path: Path):
-    """leerie --stop must find the run dir under LEERIE_STATE_HOST_DIR/runs/,
+    """leerie stop must find the run dir under LEERIE_STATE_HOST_DIR/runs/,
     not USER_REPO/.leerie/runs/. When a fixture is placed in state_dir
     (not user_repo/.leerie), the verb must succeed the dir-existence check."""
     import json
@@ -185,7 +185,7 @@ def test_stop_resolves_run_dir_from_state_host_dir(tmp_path: Path):
     (tmp_path / "flyctl").chmod(0o755)
 
     result = subprocess.run(
-        ["bash", str(LEERIE), "--stop", run_id],
+        ["bash", str(LEERIE), "stop", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={
@@ -196,14 +196,14 @@ def test_stop_resolves_run_dir_from_state_host_dir(tmp_path: Path):
     )
     # The run dir was found in state_dir → must not error with "no run dir".
     assert "no run dir" not in result.stderr, (
-        "--stop should NOT report 'no run dir' when fixture is in state_dir.\n"
+        "stop should NOT report 'no run dir' when fixture is in state_dir.\n"
         f"stderr:\n{result.stderr}"
     )
 
 
 def test_stop_does_not_find_run_dir_under_user_repo(tmp_path: Path):
     """Negative: if the fixture is placed only under USER_REPO/.leerie/runs/
-    (old layout) and LEERIE_STATE_DIR points elsewhere, --stop must NOT
+    (old layout) and LEERIE_STATE_DIR points elsewhere, stop must NOT
     find it — confirming the verb really uses the new state dir."""
     import json
     user_repo = _make_user_repo(tmp_path)
@@ -219,7 +219,7 @@ def test_stop_does_not_find_run_dir_under_user_repo(tmp_path: Path):
     }))
 
     result = subprocess.run(
-        ["bash", str(LEERIE), "--stop", run_id],
+        ["bash", str(LEERIE), "stop", run_id],
         cwd=str(user_repo),
         capture_output=True, text=True,
         env={
@@ -230,7 +230,7 @@ def test_stop_does_not_find_run_dir_under_user_repo(tmp_path: Path):
     )
     # Must fail because state_dir has no such run (old layout is not searched).
     assert result.returncode != 0, (
-        "--stop must NOT find run dirs in USER_REPO/.leerie/runs/ "
+        "stop must NOT find run dirs in USER_REPO/.leerie/runs/ "
         "when LEERIE_STATE_DIR points elsewhere.\n"
         f"stderr:\n{result.stderr}"
     )
