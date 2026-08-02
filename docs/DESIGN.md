@@ -3646,7 +3646,7 @@ Plus `leerie list` (unified across local and remote, with `--status
 <state>` and `--runtime <local|fly>` filtering as orthogonal axes).
 Status describes the run's lifecycle (`paused`, `killed`,
 `done`, `sync-failed`, `in-progress`, `done-pushed-pr`, ...); runtime
-describes where it ran (`local` or `fly`). `--list --runtime fly`
+describes where it ran (`local` or `fly`). `list --runtime fly`
 short-circuits in the launcher and queries Fly directly via `flyctl
 machines list --json`, so it surfaces machines launched from any host
 repo (not just the cwd).
