@@ -337,3 +337,32 @@ def test_removed_chain_aliases_match_no_verb_arm(tmp_path: Path) -> None:
         # unrecognized flag would — proving the alias has no special
         # dispatch arm left in the launcher.
         assert result.returncode == control.returncode
+
+
+def test_deprecated_chain_aliases_have_no_dispatch_arm() -> None:
+    """The five deprecated --chain-* aliases must not survive as a live
+    launcher case arm. They were hard-removed in favor of the bare verbs
+    (status/kill/attach/list --chains); there is no back-compat shim.
+    """
+    source = LAUNCHER.read_text()
+    for alias in (
+        "--chain-submit",
+        "--chain-status",
+        "--list-chains",
+        "--chain-kill",
+        "--chain-attach",
+    ):
+        assert f"{alias})" not in source, (
+            f"found a live case arm for deprecated alias {alias!r} in {LAUNCHER}"
+        )
+
+
+def test_list_chains_via_deprecated_alias_errors(tmp_path: Path) -> None:
+    """--list-chains no longer shims to `list --chains` — it falls through
+    as an unrecognized invocation rather than dispatching successfully.
+    """
+    _fixture_two_run_chain(tmp_path)
+    result = _run(tmp_path, ["--list-chains"], use_self_stub=False)
+    assert result.returncode != 0
+    # It must not produce the successful `list --chains` output shape.
+    assert CHAIN_ID not in result.stdout
