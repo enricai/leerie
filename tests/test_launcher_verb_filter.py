@@ -4,7 +4,7 @@ leaking to the orchestrator's argparse.
 
 The verb dispatch (``case "${1:-}" in``) handles verbs when they appear
 as ``$1`` and ``exit``s before REWRITTEN_ARGS runs.  But if a verb
-appears in a non-$1 position (e.g. ``leerie <id> --finalize --runtime
+appears in a non-$1 position (e.g. ``leerie <id> finalize --runtime
 fly`` instead of ``leerie finalize <id> --runtime fly``), the verb
 dispatch does not match and the token falls through to the
 REWRITTEN_ARGS loop.  Without a guard arm, the ``*)`` default forwards
@@ -113,7 +113,7 @@ def test_verb_guard_covers_dispatch_verbs() -> None:
         f"verb (e.g. `leerie <task> {sorted(missing)[0]}`) will leak to "
         f"the orchestrator's argparse. Add the verb(s) to the guard arm "
         f"in `leerie` (the combined case pattern between --auto-finalize "
-        f"and --resume in the REWRITTEN_ARGS filter)."
+        f"and resume in the REWRITTEN_ARGS filter)."
     )
 
 

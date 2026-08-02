@@ -3,13 +3,13 @@ target LEERIE_STATE_HOST_DIR rather than USER_REPO/.leerie.
 
 Contract verified here:
 
-  1. The `--resume --runtime fly` lookup resolves the machine pointer
+  1. The `resume --runtime fly` lookup resolves the machine pointer
      from LEERIE_STATE_HOST_DIR/runs/<id>/, not USER_REPO/.leerie/runs/.
   2. The launcher's sidecar-write block (fly-machine.json, run.json,
      task.txt) lands under LEERIE_STATE_HOST_DIR, not USER_REPO/.leerie.
   3. The `finalize` verb looks up run dirs from LEERIE_STATE_HOST_DIR,
      not USER_REPO/.leerie.
-  4. The `stop` and `--kill` verbs look up run dirs from
+  4. The `stop` and `kill` verbs look up run dirs from
      LEERIE_STATE_HOST_DIR.
   5. fetch_branch streams state back to LEERIE_STATE_HOST_DIR/runs/,
      not USER_REPO/.leerie/runs/.
@@ -32,7 +32,7 @@ FETCH_SH = REPO_ROOT / "scripts" / "remote" / "fetch-branch.sh"
 # --- Coupling tests: source-level assertions ---------------------------------
 
 def test_launcher_paused_mid_uses_run_id_directly():
-    """The _paused_mid resolver in the --resume fly dispatch must set
+    """The _paused_mid resolver in the resume fly dispatch must set
     _paused_mid from LEERIE_RUN_ID directly (run_id IS the machine ID)."""
     launcher = LEERIE.read_text()
     assert (
@@ -87,10 +87,10 @@ def test_launcher_stop_verb_uses_state_host_dir():
 
 
 def test_launcher_kill_verb_uses_state_host_dir():
-    """The --kill verb must look up the run dir from LEERIE_STATE_HOST_DIR."""
+    """The kill verb must look up the run dir from LEERIE_STATE_HOST_DIR."""
     launcher = LEERIE.read_text()
     assert '$LEERIE_STATE_HOST_DIR/runs/$_kill_run_id' in launcher, (
-        "--kill verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
+        "kill verb must resolve run dir from LEERIE_STATE_HOST_DIR/runs/"
     )
 
 
