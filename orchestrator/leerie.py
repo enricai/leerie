@@ -10917,6 +10917,32 @@ def _format_payload_for_log(payload: object) -> str | None:
     return text
 
 
+def _format_blocked_gap(confidence: object) -> str:
+    """Render a blocked planner's stated gap for `phase_plan`'s summary line.
+
+    The gap lives in `confidence.basis` — `gap_to_close` was removed from the
+    schema (DESIGN §8) and the prompts now direct a blocked planner to state
+    the missing artifact there instead.
+
+    Two transforms, both because `basis` is free prose rather than the compact
+    dict this line used to render. Whitespace is collapsed so an embedded
+    newline cannot break a one-line per-category summary into several, and the
+    result is truncated with a visible marker — never a silent cut, matching
+    `_format_payload_for_log` above. Measured across real planner submissions,
+    `basis` runs a median of ~1.1k characters and up to 4.3k, so an
+    untruncated line would put multiple KB on one row of the operator's
+    terminal; the full text stays in the per-worker log.
+
+    Returns `""` (not None) for absent, empty or malformed input, so the
+    caller interpolates an empty gap rather than the string "None"."""
+    if not isinstance(confidence, dict):
+        return ""
+    gap = " ".join((confidence.get("basis") or "").split())
+    if len(gap) > _BLOCKED_GAP_LOG_MAX:
+        gap = gap[:_BLOCKED_GAP_LOG_MAX] + "… [truncated; see log]"
+    return gap
+
+
 # Substrings that identify a *schema* rejection of a structured submission, as
 # opposed to any other errored tool result. Measured against real worker
 # streams: the CLI emits "Output does not match required schema: …" for a
@@ -16066,23 +16092,7 @@ async def phase_plan(task: str, st: State, caps: dict,
         n = len(plan.get("subtasks", []))
         status = plan.get("status", "ready")
         if status == "blocked":
-            # The gap analysis now lives in `basis` — `gap_to_close` was
-            # removed from the confidence schema (DESIGN §8), and the
-            # prompts direct a blocked planner to state the missing
-            # artifact there instead.
-            #
-            # Truncated because `basis` is prose, not the compact dict this
-            # line used to print: measured across real planner submissions it
-            # runs a median of ~1.1k characters and up to 4.3k, which would put
-            # a multi-KB paragraph on one line. Same discipline as
-            # `_format_payload_for_log` (explicit marker, never a silent cut)
-            # and `last_bash_cmd` (first line only) — the untruncated text
-            # stays in the per-worker log, which the operator messages at the
-            # scheduling gate already point at.
-            gap = " ".join(
-                ((plan.get("confidence", {}) or {}).get("basis") or "").split())
-            if len(gap) > _BLOCKED_GAP_LOG_MAX:
-                gap = gap[:_BLOCKED_GAP_LOG_MAX] + "… [truncated; see log]"
+            gap = _format_blocked_gap(plan.get("confidence"))
             log(f"  {category}: BLOCKED (planner gate) — {n} subtask(s); "
                 f"gap: {gap}")
         else:
