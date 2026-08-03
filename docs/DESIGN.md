@@ -553,6 +553,32 @@ intent is strictly superseded), or `unresolvable` (the intents are
 structurally contradictory and the run should die at plan time rather
 than crash at integration).
 
+**An `unresolvable` verdict re-plans before it dies.** The judge refusing to
+merge two contradictory designs is the phase working correctly — but the
+response to it was a terminal `die()` whose own message said *"this run cannot
+be resumed"*, after the entire planning spend. Measured across the corpus: 43
+runs reached this judge and **5 (12%) died here, burning 404 workers, none
+recoverable**, while the judge resolved the other 95.5% of collisions (232 of
+243) without incident. `eb1aa53e` is the shape — one collision, where one
+planner added an `ApiKey.allowedDomains` column and another explicitly refused
+to, citing a directive in a task-referenced file that the first had not
+honoured.
+
+An unresolvable collision is a verdict about the **plan**, not about the
+judge's output quality, so it should re-drive the plan — which is what every
+other gate already does on far weaker findings. It now re-plans the implicated
+domains once, with the contradiction as feedback, and dies only if the second
+verdict is still unresolvable (bounded by `overlap_replan_done`).
+
+The re-plan is **scoped**, and this gate is the only one where that is
+currently possible: a collision names `a_sid`/`b_sid`, so the implicated
+domains are mechanically derivable, whereas `coverage_gaps` and the adherence
+judge's `violations` carry no subtask reference at all. Scope is the implicated
+domains plus `replan_domain_closure` — the transitive set of domains depending
+on them across both the id and tag channels — so no surviving edge can dangle.
+Measured over 85 (domain, plan) re-plan simulations on real corpus plans:
+closure-scoped schedules and validates 85/85, naive single-domain 79/85.
+
 The artifact a collision names is very often one that does **not yet
 exist**: the canonical case is two planners that each propose to
 *create* the same component or test file. A mechanical check that

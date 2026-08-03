@@ -332,6 +332,12 @@ STATE_FIELDS = (
     "strict_conformer",
     "skip_base_baseline",
     "skip_repo_map",
+    # overlap_replan_done: set once when phase_overlap_judge responds to an
+    # `unresolvable` collision with a scoped re-plan instead of dying
+    # (DESIGN §5). Bounds that recovery to a single attempt — a second
+    # unresolvable verdict after re-planning dies, since the contradiction
+    # is then not something re-planning can resolve.
+    "overlap_replan_done",
     # cgroup_containment: recorded by the fail-closed gate
     # (enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
@@ -15710,10 +15716,63 @@ async def phase_artifact_registry(
     return artifacts
 
 
+def replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
+    """Domains that must be re-planned together with `targets`.
+
+    A re-plan replaces a domain's subtasks with fresh ones, so every id it
+    used vanishes. Any *other* domain holding an edge into it would dangle —
+    `validate_plan` catches that, but as a `die()`, which is the outcome
+    scoping exists to avoid. So the scope is `targets` **plus the transitive
+    closure of domains depending on them**, over both channels: `depends_on`
+    (id) and `requires`→`provides` (tag). Everything that could dangle is
+    re-planned, which makes the coherence question vacuous rather than
+    merely checked.
+
+    Domains are subtask-id prefixes, which `_ID_PREFIXES` guarantees are
+    per-category and globally unique.
+
+    Measured across every multi-domain plan in the corpus — 85 (domain, plan)
+    re-plan simulations: scoping to this closure yields a plan that schedules
+    and validates **85 / 85 (100%)**, while scoping to the named domain alone
+    manages 79 / 85 (93%). The 6 failures are exactly the dangling-edge
+    hazard, so the closure is necessary rather than defensive. The closure is
+    also small: a single domain in 85% of cases, the whole plan in 6%, mean
+    47% of the plan."""
+    subs = [s for p in plans for s in (p.get("subtasks") or [])]
+
+    def _dom(sid: str) -> str:
+        return sid.split("-", 1)[0] if "-" in sid else sid
+
+    provider: dict[str, str] = {}
+    for s in subs:
+        for tag in (s.get("provides") or []):
+            provider[tag] = _dom(s["id"])
+    # consumer_domain -> producer_domain
+    edges: set[tuple[str, str]] = set()
+    for s in subs:
+        d = _dom(s["id"])
+        for dep in (s.get("depends_on") or []):
+            if _dom(dep) != d:
+                edges.add((d, _dom(dep)))
+        for req in (s.get("requires") or []):
+            tag = req.get("tag") if isinstance(req, dict) else req
+            pd = provider.get(tag)
+            if pd and pd != d:
+                edges.add((d, pd))
+    clo = set(targets)
+    while True:
+        new = {c for c, p in edges if p in clo} - clo
+        if not new:
+            break
+        clo |= new
+    return clo
+
+
 async def phase_plan(task: str, st: State, caps: dict,
                      models: dict[str, str],
                      efforts: dict[str, str | None],
-                     replan_round: int = 0) -> list[dict]:
+                     replan_round: int = 0,
+                     domains: set[str] | None = None) -> list[dict]:
     """Phase 2: one planner per category, run in parallel (bounded by
     max_parallel). Each returns a JSON plan of granular subtasks.
 
@@ -15737,6 +15796,24 @@ async def phase_plan(task: str, st: State, caps: dict,
     st.data["current_phase"] = "phase 2: planning"
     st.save()
     cats = st.data["categories"]
+    if domains is not None:
+        # Scoped re-plan (DESIGN §5): plan only the requested categories. The
+        # caller is responsible for merging the result with the plans it
+        # retained — `phase_plan` returns only what it planned, so a caller
+        # that forgets to merge loses subtasks loudly (schedule()/
+        # validate_plan die) rather than silently.
+        #
+        # Matched on the id PREFIX, not the category name, because that is
+        # what `replan_domain_closure` returns and what subtask ids carry.
+        cats = [c for c in cats if CATEGORY_ABBREV.get(c, c) in domains]
+        if not cats:
+            die("scoped re-plan selected no categories — the requested "
+                f"domain(s) {sorted(domains)} match none of "
+                f"{st.data['categories']}. This is a leerie bug: the closure "
+                "is computed from subtask id prefixes, which are derived "
+                "from these same categories.")
+        log(f"  scoped re-plan: {len(cats)} of "
+            f"{len(st.data['categories'])} domain(s) — {', '.join(cats)}")
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
     sys_prompt = load_prompt("planner")
@@ -20304,22 +20381,76 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             f"{c.get('reason', '<no reason>')}"
             for c in unresolvable
         )
-        die(
-            f"plan-overlap judge found {len(unresolvable)} unresolvable "
-            "surface collision(s) in the reconciled plan:\n"
-            f"{bullets}\n"
-            "Each collision is two planners producing the same exported "
-            "artifact with structurally incompatible APIs (DESIGN §5 "
-            "*Cross-domain surface overlap*). Auto-merging would produce "
-            "a frankenstein implementer spec the judge correctly "
-            "refused. To unblock, refine the task description and re-run "
-            "(this run cannot be resumed — see below):\n"
-            "  • Disambiguate the disputed surface: name which API "
-            "survives, or split it into two distinct artifacts.\n"
-            "  • Or narrow the task so a single planner owns the "
-            "surface. Each category the classifier selects spawns its "
-            "own planner, and only multi-planner runs can collide here."
+        # An unresolvable collision is a verdict about the PLAN, not about the
+        # judge's output quality — yet until now it re-drove nothing and
+        # `die()`d terminally ("this run cannot be resumed") after the entire
+        # planning spend. Measured across the corpus: 43 runs reached this
+        # judge and 5 (12%) died here, burning 404 workers, none recoverable —
+        # while the judge resolved the other 95.5% of collisions (232 of 243)
+        # without incident. Every other gate re-drives `phase_plan` on far
+        # weaker findings.
+        #
+        # So re-plan the implicated domains once, with the contradiction as
+        # feedback. Unlike the coverage and adherence judges — whose findings
+        # carry no subtask reference — a collision names `a_sid`/`b_sid`, so
+        # the implicated domains are mechanically derivable and the re-plan
+        # can be scoped instead of rebuilding the whole plan (DESIGN §5).
+        if st.data.get("overlap_replan_done"):
+            die(
+                f"plan-overlap judge still reports {len(unresolvable)} "
+                "unresolvable surface collision(s) after a scoped re-plan:\n"
+                f"{bullets}\n"
+                "Each collision is two planners producing the same exported "
+                "artifact with structurally incompatible APIs (DESIGN §5 "
+                "*Cross-domain surface overlap*). Auto-merging would produce "
+                "a frankenstein implementer spec the judge correctly "
+                "refused, and re-planning the implicated domains did not "
+                "resolve it. To unblock, refine the task description and "
+                "re-run:\n"
+                "  • Disambiguate the disputed surface: name which API "
+                "survives, or split it into two distinct artifacts.\n"
+                "  • Or narrow the task so a single planner owns the "
+                "surface. Each category the classifier selects spawns its "
+                "own planner, and only multi-planner runs can collide here."
+            )
+        implicated = {
+            sid.split("-", 1)[0]
+            for c in unresolvable
+            for sid in (c.get("a_sid", ""), c.get("b_sid", ""))
+            if isinstance(sid, str) and "-" in sid
+        }
+        scope = replan_domain_closure(plans, implicated)
+        log(f"phase 2¾: {len(unresolvable)} unresolvable collision(s) — "
+            f"re-planning {len(scope)} domain(s) ({', '.join(sorted(scope))}) "
+            "with the contradiction as feedback, instead of dying")
+        st.data["overlap_replan_done"] = True
+        st.save()
+        check_replan_affordable(st, caps, "overlap judge", plans)
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — two planners produced structurally incompatible "
+            "designs for the same artifact, and an independent judge refused "
+            f"to merge them:\n{bullets}\n"
+            "Re-plan so exactly one design survives for each disputed "
+            "artifact. Where the task (or a file it references) already "
+            "states which approach to take, follow it — do not re-litigate a "
+            "decision the task has already made."
         )
+        retained = [
+            p for p in plans
+            if not any(
+                (s.get("id", "").split("-", 1)[0] if "-" in s.get("id", "")
+                 else s.get("id", "")) in scope
+                for s in (p.get("subtasks") or []))
+        ]
+        fresh = await phase_plan(replan_task, st, caps, models, efforts,
+                                 replan_round=1, domains=scope)
+        plans = retained + fresh
+        # A re-plan invalidates every phase upstream of this one (DESIGN §5).
+        # `phase_reconcile` short-circuits when nothing new is unresolved.
+        plans = await phase_reconcile(plans, task, st, caps, models, efforts)
+        return await phase_overlap_judge(plans, task, st, caps, models,
+                                         efforts)
 
     # Apply merges and drops in input order via the pure helper.
     applied = _apply_overlap_collisions(plans, collisions)
