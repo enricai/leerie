@@ -20,8 +20,6 @@ behaviour a careless "just reject empty plans" fix would break.
 """
 from __future__ import annotations
 
-import pytest
-
 
 def _plan(n_subtasks: int = 1, status: str = "ready", **overrides) -> dict:
     """A plan dict shaped like real planner output.

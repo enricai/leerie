@@ -240,6 +240,18 @@ DEFAULT_CAPS = {
     # case plus one completeness re-drive per subtask while still flagging
     # the truly-unwinnable large runs that motivated the preflight.
     "budget_safety_margin": 1.15,
+    # `claude -p` calls a RE-PLAN spends per already-known subtask, on top of
+    # the planners themselves — consumed by `check_replan_affordable()` only,
+    # never by `bump_workers()`. A re-plan re-runs the whole P1 decomposition,
+    # not just the planners, which is the larger half: measured on run
+    # `d8a764f3…` the re-plan issued 80 `fit_judge` + 5 `splitter` calls
+    # against a subtask set that grew 35 → 65, i.e. ~1.3 decomposition calls
+    # per subtask. Rounded up to 1.5 so the preflight errs toward declaring a
+    # marginal re-plan unaffordable — the failure it exists to prevent (dying
+    # mid-decomposition at the worker cap, having written no code) costs far
+    # more than an early, actionable die() the operator answers with
+    # `--max-workers`.
+    "replan_decompose_estimate": 1.5,
     # Repo-map token budget for the personalized-PageRank-ranked subgraph
     # injected into the planner and splitter (DESIGN §5½ (P6) *Codebase structural
     # map*). The subgraph is binary-searched to fit within this many tokens;
@@ -15586,7 +15598,7 @@ def _select_best_planner_sample(
         # with plan size and turns the primary key into a plan-size penalty:
         # a large plan would have to be flawless to beat a small plan with one
         # flaw (DESIGN §"Findings carry a severity").
-        issues, _advisory = partition_issues_by_severity(
+        issues, _advisory = _partition_issues_by_severity(
             check_planner_output(sample, repo_root, domain))
         n_subtasks = len(sample.get("subtasks", []))
         # Index into the ORIGINAL `samples`, not into `ranked` — the gate above
@@ -19616,7 +19628,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         replan_round[0] += 1
         # A re-plan is the largest budget event in a run and was previously
         # authorised with no budget check at all (DESIGN §13).
-        check_replan_affordable(st, caps, "adherence gate")
+        check_replan_affordable(st, caps, "adherence gate", cur_plans[0])
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — your previous plan did not honor the prescribed "
@@ -19840,7 +19852,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         replan_round[0] += 1
         # A re-plan is the largest budget event in a run and was previously
         # authorised with no budget check at all (DESIGN §13).
-        check_replan_affordable(st, caps, "coverage gate")
+        check_replan_affordable(st, caps, "coverage gate", cur_plans[0])
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — an independent review of your previous plan found "
@@ -20638,18 +20650,8 @@ def check_budget_feasibility(st: State, caps: dict,
         )
 
 
-# `claude -p` calls a re-plan spends per already-known subtask, on top of the
-# planners themselves. Measured on run `d8a764f3…`: the re-plan issued 80
-# `fit_judge` + 5 `splitter` calls against a subtask set that grew 35 → 65,
-# i.e. ~1.3 decomposition calls per subtask. Rounded up to 1.5 so the
-# preflight errs toward declaring a marginal re-plan unaffordable — the
-# failure it exists to prevent (dying mid-decomposition at the worker cap,
-# having written no code) is far more expensive than an early, actionable
-# die() the operator can answer with `--max-workers`.
-_REPLAN_DECOMPOSE_CALLS_PER_SUBTASK = 1.5
-
-
-def check_replan_affordable(st: State, caps: dict, gate: str) -> None:
+def check_replan_affordable(st: State, caps: dict, gate: str,
+                            plans: list[dict]) -> None:
     """Pre-flight a re-plan against the remaining worker budget.
 
     `check_budget_feasibility` runs once, after `schedule()`. But a re-plan is
@@ -20664,6 +20666,17 @@ def check_replan_affordable(st: State, caps: dict, gate: str) -> None:
     run then died of budget exhaustion mid-decomposition, having written no
     code. Dying here instead costs nothing and names the real cause.
 
+    **`plans` is a parameter, not read from state, and that is load-bearing.**
+    The first version of this function sized the re-plan from
+    `st.data["plan_snapshot"]` — which `_run_phases` does not write until
+    *after* `schedule()`, while both re-planning gates run *before* it. On a
+    fresh run the snapshot was therefore absent, `n_subtasks` was 0, the
+    estimate collapsed to the planner count alone, and the check never fired:
+    replaying `d8a764f3`'s real call-site state (160 of 200 spent, 3 domains,
+    no snapshot) produced no die at all. Its unit tests passed only because
+    they seeded a `plan_snapshot` that cannot exist at that call site. The
+    caller already holds the live plans, so they are passed in.
+
     `die()`s with EXIT_BUDGET_INFEASIBLE when the projected re-plan cannot fit
     in what is left. Honours the same `skip_budget_check` opt-out, and the
     runtime backstop in `State.bump_workers()` remains the load-bearing
@@ -20673,28 +20686,31 @@ def check_replan_affordable(st: State, caps: dict, gate: str) -> None:
     cap = caps["max_total_workers"]
     spent = st.data.get("worker_count", 0)
     remaining = cap - spent
-    # A re-plan's cost is dominated by per-subtask decomposition, so scale the
-    # estimate by the plan size we already know about rather than a constant.
-    # `plan_snapshot` is the post-schedule subtask set when present; fall back
-    # to the planner count alone on an early gate that runs before it.
-    snapshot = st.data.get("plan_snapshot") or {}
-    n_subtasks = len(snapshot.get("subtasks") or {})
+    # A re-plan's cost is dominated by per-subtask decomposition, so scale on
+    # the live subtask count rather than a constant.
+    n_subtasks = sum(len(p.get("subtasks") or []) for p in (plans or []))
     n_domains = max(1, len(st.data.get("categories") or []))
     estimate = (
         n_domains * caps["planner_samples"]
-        + n_subtasks * _REPLAN_DECOMPOSE_CALLS_PER_SUBTASK
+        + n_subtasks * caps["replan_decompose_estimate"]
     )
     if estimate <= remaining:
         return
+    # int() so the recommendation is a value `--max-workers` actually accepts:
+    # the estimate is fractional by construction (n_subtasks × 1.5), and the
+    # flag is `type=_positive_int`, so a bare f-string emitted e.g.
+    # "--max-workers 241.5" — advice the CLI rejects. Mirrors
+    # `check_budget_feasibility`'s own `int(...) + 5`.
+    recommended = int(spent + estimate) + 20
     die(
         f"re-plan from the {gate} is not affordable: {spent} of {cap} "
         f"`claude -p` call(s) already spent, leaving {remaining}. Re-planning "
         f"{n_domains} domain(s) at {caps['planner_samples']} sample(s) each, "
         f"plus re-decomposing {n_subtasks} subtask(s), is an estimated "
-        f"{estimate} more calls — a re-plan re-runs the whole P1 "
+        f"{estimate:g} more calls — a re-plan re-runs the whole P1 "
         f"decomposition (per-subtask fit_judge), not just the planners, which "
         f"is typically the larger half of planning spend. Re-run with "
-        f"--max-workers {spent + estimate + 20}, narrow the task, or use "
+        f"--max-workers {recommended}, narrow the task, or use "
         f"--skip-budget-check to push through (the runtime backstop in "
         f"State.bump_workers() will still fire).",
         code=EXIT_BUDGET_INFEASIBLE,
@@ -21792,7 +21808,7 @@ def _issue_is_advisory(issue: str) -> bool:
         in _ADVISORY_ISSUE_LABELS
 
 
-def partition_issues_by_severity(
+def _partition_issues_by_severity(
         issues: list[str]) -> tuple[list[str], list[str]]:
     """Split check findings into `(gating, advisory)`, order preserved."""
     gating, advisory = [], []
@@ -21939,7 +21955,7 @@ async def _run_checked_loop(
         # subset — so an unsatisfiable piece of advice cannot consume a round,
         # trip the oscillation guard, or become feedback the worker is asked
         # to act on. `warnings` still carries both, so nothing is hidden.
-        issues, advisory = partition_issues_by_severity(all_issues)
+        issues, advisory = _partition_issues_by_severity(all_issues)
 
         for issue in all_issues:
             warnings.append(f"{name} round {rnd}: {issue}")

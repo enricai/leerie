@@ -92,7 +92,7 @@ def test_non_strings_are_gating_not_crashes(leerie):
 # ----- partition ------------------------------------------------------------
 
 def test_partition_splits_and_preserves_order(leerie):
-    gating, advisory = leerie.partition_issues_by_severity([
+    gating, advisory = leerie._partition_issues_by_severity([
         "PHANTOM_PATH: a — x",
         "DANGLING_DEP: b — y",
         "INTRA_DOMAIN_OVERLAP: c — z",
@@ -103,12 +103,12 @@ def test_partition_splits_and_preserves_order(leerie):
 
 
 def test_partition_of_empty_is_two_empties(leerie):
-    assert leerie.partition_issues_by_severity([]) == ([], [])
+    assert leerie._partition_issues_by_severity([]) == ([], [])
 
 
 def test_partition_loses_nothing(leerie):
     issues = ["PHANTOM_PATH: a", "DANGLING_DEP: b", "OVERSIZED: c"]
-    gating, advisory = leerie.partition_issues_by_severity(issues)
+    gating, advisory = leerie._partition_issues_by_severity(issues)
     assert sorted(gating + advisory) == sorted(issues)
 
 

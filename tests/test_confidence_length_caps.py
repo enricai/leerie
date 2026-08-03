@@ -26,6 +26,7 @@ needs a DESIGN change and better evidence than that.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -104,12 +105,24 @@ def test_prompt_numbers_track_the_constants(leerie):
     stating a stale number is worse than none, since a worker that obeys it is
     still rejected."""
     frag = (leerie.PROMPTS / "_confidence.md").read_text()
-    assert str(leerie._CONFIDENCE_BASIS_MAX_LENGTH) in frag
-    assert str(leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH) in frag
-    # No stale values left behind from the previous sizing.
-    assert "2000 characters" not in frag or \
-        leerie._CONFIDENCE_BASIS_MAX_LENGTH == 2000 or \
-        leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH == 2000
+    lines = frag.splitlines()
+
+    def _numbers_on_line_mentioning(word: str) -> set[int]:
+        out: set[int] = set()
+        for ln in lines:
+            if word in ln:
+                out |= {int(n) for n in re.findall(r"\*\*(\d+) characters\*\*", ln)}
+        return out
+
+    # Checked per-line, against the specific field each line describes. An
+    # earlier version asserted `"2000 characters" not in frag or <cap> == 2000`,
+    # which the list-item cap of 2000 made ALWAYS TRUE — it could never fail,
+    # so it guarded nothing.
+    assert _numbers_on_line_mentioning("`basis`") == {
+        leerie._CONFIDENCE_BASIS_MAX_LENGTH}
+    for field in ("falsifiers_tested", "contradictions_reconciled"):
+        assert _numbers_on_line_mentioning(field) == {
+            leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH}, field
 
 
 def test_a_realistic_submission_fits(leerie):
