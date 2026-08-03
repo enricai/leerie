@@ -6271,6 +6271,26 @@ feasibility check at this point can estimate the remaining cost
 with no free variables beyond the per-subtask call multiplier, which
 is well-bounded empirically.
 
+**A re-plan needs its own preflight.** The gate above runs *once*, after
+`schedule()`. But a gate that re-plans (`phase_adherence_gate`,
+`phase_planning_coverage_gate`) authorises the single largest budget event
+in a run, and did so with no budget check at all. A re-plan is also far more
+expensive than "re-running the planners": `phase_plan` re-runs the entire P1
+decomposition behind them, and that decomposition is the larger half.
+Measured on run `d8a764f3…`, `fit_judge` was 118 of 201 spawns (59%) against
+the planners' 62 (31%), and the adherence-gate re-plan cost ~125 of 201 —
+almost twice the entire first planning pass, against a subtask set the
+re-plan itself had inflated 35 → 65. The run then died of budget exhaustion
+mid-decomposition, having written no code and produced nothing recoverable.
+
+So `check_replan_affordable` runs before each re-plan, projecting the
+re-plan's cost from the domain count and the *already-known* subtask count
+(the decomposition term dominates, so subtask count is what it scales on) and
+`die()`ing early when it cannot fit. Dying at the gate costs nothing and names
+the real cause; dying at worker 200 costs the whole run. It honours the same
+`skip_budget_check` opt-out, and `State.bump_workers()` remains the
+load-bearing backstop either way.
+
 **Why the gate cannot move earlier, even though the satisfied-probe
 spends first.** The probe runs before `schedule()`, so its per-subtask
 calls are billed before this gate can fire — which reads oddly against

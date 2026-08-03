@@ -19614,6 +19614,9 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # `_run_checked_loop`'s existing retry semantics exactly like the
         # reconciler and overlap-judge do.
         replan_round[0] += 1
+        # A re-plan is the largest budget event in a run and was previously
+        # authorised with no budget check at all (DESIGN §13).
+        check_replan_affordable(st, caps, "adherence gate")
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — your previous plan did not honor the prescribed "
@@ -19835,6 +19838,9 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         # this reuses `_run_checked_loop`'s existing retry semantics exactly
         # like the reconciler/adherence/overlap-judge gates do.
         replan_round[0] += 1
+        # A re-plan is the largest budget event in a run and was previously
+        # authorised with no budget check at all (DESIGN §13).
+        check_replan_affordable(st, caps, "coverage gate")
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — an independent review of your previous plan found "
@@ -20630,6 +20636,69 @@ def check_budget_feasibility(st: State, caps: dict,
             f"still fire if the estimate was correct).",
             code=EXIT_BUDGET_INFEASIBLE,
         )
+
+
+# `claude -p` calls a re-plan spends per already-known subtask, on top of the
+# planners themselves. Measured on run `d8a764f3…`: the re-plan issued 80
+# `fit_judge` + 5 `splitter` calls against a subtask set that grew 35 → 65,
+# i.e. ~1.3 decomposition calls per subtask. Rounded up to 1.5 so the
+# preflight errs toward declaring a marginal re-plan unaffordable — the
+# failure it exists to prevent (dying mid-decomposition at the worker cap,
+# having written no code) is far more expensive than an early, actionable
+# die() the operator can answer with `--max-workers`.
+_REPLAN_DECOMPOSE_CALLS_PER_SUBTASK = 1.5
+
+
+def check_replan_affordable(st: State, caps: dict, gate: str) -> None:
+    """Pre-flight a re-plan against the remaining worker budget.
+
+    `check_budget_feasibility` runs once, after `schedule()`. But a re-plan is
+    the single largest budget event in a run and was authorised with no budget
+    check at all — and it is far more expensive than "re-running the
+    planners", because `phase_plan` also re-runs the entire P1 decomposition
+    behind it (`recursive_decompose`'s per-subtask `fit_judge`, which measured
+    59% of one run's spend against the planners' 31%).
+
+    Run `d8a764f3…` is the shape this prevents: an adherence-gate re-plan cost
+    ~125 of 201 spawns — almost twice the entire first planning pass — and the
+    run then died of budget exhaustion mid-decomposition, having written no
+    code. Dying here instead costs nothing and names the real cause.
+
+    `die()`s with EXIT_BUDGET_INFEASIBLE when the projected re-plan cannot fit
+    in what is left. Honours the same `skip_budget_check` opt-out, and the
+    runtime backstop in `State.bump_workers()` remains the load-bearing
+    enforcement either way."""
+    if st.data.get("skip_budget_check"):
+        return
+    cap = caps["max_total_workers"]
+    spent = st.data.get("worker_count", 0)
+    remaining = cap - spent
+    # A re-plan's cost is dominated by per-subtask decomposition, so scale the
+    # estimate by the plan size we already know about rather than a constant.
+    # `plan_snapshot` is the post-schedule subtask set when present; fall back
+    # to the planner count alone on an early gate that runs before it.
+    snapshot = st.data.get("plan_snapshot") or {}
+    n_subtasks = len(snapshot.get("subtasks") or {})
+    n_domains = max(1, len(st.data.get("categories") or []))
+    estimate = (
+        n_domains * caps["planner_samples"]
+        + n_subtasks * _REPLAN_DECOMPOSE_CALLS_PER_SUBTASK
+    )
+    if estimate <= remaining:
+        return
+    die(
+        f"re-plan from the {gate} is not affordable: {spent} of {cap} "
+        f"`claude -p` call(s) already spent, leaving {remaining}. Re-planning "
+        f"{n_domains} domain(s) at {caps['planner_samples']} sample(s) each, "
+        f"plus re-decomposing {n_subtasks} subtask(s), is an estimated "
+        f"{estimate} more calls — a re-plan re-runs the whole P1 "
+        f"decomposition (per-subtask fit_judge), not just the planners, which "
+        f"is typically the larger half of planning spend. Re-run with "
+        f"--max-workers {spent + estimate + 20}, narrow the task, or use "
+        f"--skip-budget-check to push through (the runtime backstop in "
+        f"State.bump_workers() will still fire).",
+        code=EXIT_BUDGET_INFEASIBLE,
+    )
 
 
 def _write_subtask_artifacts(leerie_dir: Path, sid: str,
