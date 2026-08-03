@@ -1,6 +1,6 @@
 """Tests for scripts/remote/force-finalize.sh.
 
-force-finalize.sh is sourced by the leerie launcher's `--finalize --force`
+force-finalize.sh is sourced by the leerie launcher's `finalize --force`
 fast-path. It SSHes into the Fly Machine, verifies the orchestrator
 process is dead, and patches `finished_at` into run.json so the normal
 `fetch_branch` discovery loop can pick the run up. These tests exercise

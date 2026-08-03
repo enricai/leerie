@@ -252,7 +252,7 @@ decide_teardown() {
       #         fail fast at the cheapest moment*). The orchestrator
       #         die()d at check_budget_feasibility() with a recommended
       #         --max-workers value, before any implementer spawned. The
-      #         run is unrecoverable (--resume would die at the guard
+      #         run is unrecoverable (resume would die at the guard
       #         since waves was never written), so destroy the machine
       #         like the other terminal exits and let the user re-run
       #         with the recommended cap. Falls through to the
@@ -316,7 +316,7 @@ decide_teardown() {
           if [ "$rc" = "11" ]; then
             # EXIT_BUDGET_INFEASIBLE: orchestrator dies pre-execute
             # with a recommended --max-workers value in stderr (which
-            # the user already saw above this banner). --resume is not
+            # the user already saw above this banner). resume is not
             # an option — the resume guard rejects (no waves field).
             # The fix is to re-run with the cap raised.
             remote_log "remote: budget preflight rejected the plan; see the recommended --max-workers value above"
@@ -413,7 +413,7 @@ decide_teardown() {
         echo "  Machine: $mid (still running on Fly)" >&2
         echo "================================================================" >&2
         # Intentionally NO stop_machine, NO destroy_machine. The user
-        # owns this machine until they explicitly --kill it.
+        # owns this machine until they explicitly kill it.
       fi
       ;;
     130|143)
@@ -484,7 +484,7 @@ decide_teardown() {
           fly_machine_id "$mid" || true
       fi
       # Sync the run state directory from the machine BEFORE stopping it
-      # so the host has up-to-date state.json for subsequent --resume.
+      # so the host has up-to-date state.json for subsequent resume.
       # Best-effort: failure is logged but does not block the pause —
       # the machine-side state is preserved on the volume.
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
@@ -512,7 +512,7 @@ decide_teardown() {
             remote_log "remote: state synced to $_sync_target/$LEERIE_RUN_ID"
             # The tar extraction overwrites run.json with the machine-side
             # copy (which lacks paused_at/pause_reason/fly_machine_id).
-            # Re-apply the pause metadata so --list and --resume see it.
+            # Re-apply the pause metadata so list and resume see it.
             if [ -n "$sidecar" ]; then
               update_run_json "$sidecar" \
                 paused_at "$(iso_now)" \
@@ -734,7 +734,7 @@ provision_machine() {
   # fresh runs because the orchestrator hasn't minted one). The file is
   # under $LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json and is removed
   # by destroy_machine on teardown. Also written immediately as
-  # runs/<run-id>/fly-machine.json (below) so --resume survives a Ctrl-C
+  # runs/<run-id>/fly-machine.json (below) so resume survives a Ctrl-C
   # between provision_machine() returning and the launcher's copy.
   # (Phase 3: PTY-over-SSH attach.)
   local _state_base=""
@@ -769,7 +769,7 @@ with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PY
-    # Write run-keyed pointer immediately so --resume survives a Ctrl-C
+    # Write run-keyed pointer immediately so resume survives a Ctrl-C
     # between provision_machine() returning and the launcher's deferred copy.
     # The launcher's copy (leerie:2645-2651) is guarded by [ ! -f ] so
     # it becomes a no-op when this write succeeds.

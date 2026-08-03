@@ -83,7 +83,7 @@ def test_setup_run_idempotency_check_uses_fixed_string():
     pattern `grep -q "worktree .*/${STAGING_WT}$"` expands to a double slash
     when $STAGING_WT is absolute — `worktree .*/` + `/leerie-state/...` — which
     `git worktree list` never emits. The guard never matched, so `git worktree
-    add` ran unconditionally and every --resume over a stale staging dir died
+    add` ran unconditionally and every resume over a stale staging dir died
     with "fatal: '...' already exists". Measured: the old pattern scores 0
     matches against real porcelain output where -xF scores 1.
 
@@ -142,7 +142,7 @@ def test_setup_run_reclaims_orphaned_staging_dir():
 
 def test_setup_run_checks_external_leerie_branch():
     """setup-run.sh must check for a pre-existing 'leerie' branch.
-    This is defense-in-depth for the --resume path, which skips
+    This is defense-in-depth for the resume path, which skips
     preflight(). Without it, a user branch named 'leerie' crashes
     `git branch leerie/runs/<id>` with 'cannot lock ref'."""
     src = _script("setup-run.sh")

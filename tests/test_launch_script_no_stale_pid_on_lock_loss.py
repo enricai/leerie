@@ -3,7 +3,7 @@
 The launcher's `_launch_script` (a Python heredoc inside the `leerie`
 bash) spawns the orchestrator on the Fly Machine, then writes its pid
 to `<run-dir>/orchestrator.pid`. Without the post-`Popen` poll, a
-stillborn flock-loser child (a duplicate `--resume` that lost the
+stillborn flock-loser child (a duplicate `resume` that lost the
 `State.__init__` flock race and exits 75) would have its dead pid
 written to the file — clobbering the winning orchestrator's pid and
 breaking every downstream liveness check (DESIGN §6 *Single owner

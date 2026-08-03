@@ -40,9 +40,9 @@
 # Verification after push (either mode):
 #   flyctl machine run registry.fly.io/<APP>:<VERSION> \
 #     --app <APP> \
-#     -- python3 /opt/leerie-image/orchestrator/leerie.py --version
+#     -- python3 /opt/leerie-image/orchestrator/leerie.py version
 #
-# The --version fast path reads /opt/leerie-image/.claude-plugin/plugin.json
+# The version fast path reads /opt/leerie-image/.claude-plugin/plugin.json
 # without starting the full orchestrator; success confirms the source is
 # present at the expected path inside the image.
 set -euo pipefail
@@ -162,7 +162,7 @@ run() {
 # build step → deploy fails with "Could not find image". flyctl#1686
 # documents this confusing interaction. Workaround: cp fly.toml to a tmp
 # file with the `image = ...` line stripped from the [build] section,
-# pass --config $tmp.
+# pass config $tmp.
 _build_push_remote() {
   local tmp_toml
   tmp_toml="$(mktemp -t leerie-build.XXXXXX.toml)"
@@ -263,7 +263,7 @@ _build_push_local() {
 
   echo "[build-push] local build complete: $IMAGE_TAG"
 
-  # Verify entrypoint + smoke test --version on the built image.
+  # Verify entrypoint + smoke test version on the built image.
   if [ "$DRY_RUN" = "false" ]; then
     local entry
     entry="$("$build_cmd" inspect "$IMAGE_TAG" \
@@ -279,10 +279,10 @@ _build_push_local() {
 
     echo "[build-push] smoke: leerie version (baked source, no bind mount) ..."
     if run "$build_cmd" run --rm "$IMAGE_TAG" \
-         python3 /opt/leerie-image/orchestrator/leerie.py --version; then
+         python3 /opt/leerie-image/orchestrator/leerie.py version; then
       echo "[build-push] smoke OK"
     else
-      echo "build-push: WARNING — --version smoke failed (baked source not working)" >&2
+      echo "build-push: WARNING — version smoke failed (baked source not working)" >&2
     fi
   fi
 
@@ -318,4 +318,4 @@ echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP"
 echo ""
 echo "To verify inside the machine:"
 echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP \\"
-echo "    -- python3 /opt/leerie-image/orchestrator/leerie.py --version"
+echo "    -- python3 /opt/leerie-image/orchestrator/leerie.py version"

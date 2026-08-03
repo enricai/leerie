@@ -6,7 +6,7 @@ The risk this guards against: a future refactor (or AI rewrite) of
 either function removes a load-bearing call site, the unit tests for
 each helper still pass (because they call the helper directly), and
 the regression ships unnoticed. That's exactly the shape of the P5-1
-bug — the documented `--resume --answers` flow was broken because
+bug — the documented `resume --answers` flow was broken because
 nobody had pinned the `gather_answers` call to the resume path.
 
 Pattern mirrors `test_state_fields.py`'s code-vs-spec coupling.
@@ -47,7 +47,7 @@ def _function_body(name: str) -> str:
 def test_orchestrate_calls_absorb_supplied_answers_on_resume():
     """The documented user flow for a deferred non-interactive
     clarification (Phase-1 OR DESIGN §11 mid-execution) requires that
-    `--answers FILE` is re-read on `--resume`. The P5-1 fix wired this
+    `--answers FILE` is re-read on `resume`. The P5-1 fix wired this
     by adding `_absorb_supplied_answers(args, st, leerie_dir)` inside
     the `if args.resume:` branch. Pin that call so a future refactor
     that removes it fails this test instead of silently re-breaking
@@ -61,7 +61,7 @@ def test_orchestrate_calls_absorb_supplied_answers_on_resume():
     # _absorb_supplied_answers is called somewhere in the function.
     assert "_absorb_supplied_answers(" in body, (
         "_orchestrate() must call _absorb_supplied_answers() — without "
-        "it, --resume --answers FILE silently drops the answers "
+        "it, resume --answers FILE silently drops the answers "
         "(P5-1). Add the call back to the `if args.resume:` block.")
     # And specifically, the call must be BEFORE the `else:` branch
     # that handles the initial-run path — i.e. on the resume path.
@@ -73,7 +73,7 @@ def test_orchestrate_calls_absorb_supplied_answers_on_resume():
         "`if args.resume:` block, not on the initial-run path "
         "(the initial path is already handled by gather_answers + "
         "_write_plan, which writes specs fresh after the merge). "
-        "Without the resume-path call, --resume --answers silently "
+        "Without the resume-path call, resume --answers silently "
         "drops the answers (P5-1).")
 
 

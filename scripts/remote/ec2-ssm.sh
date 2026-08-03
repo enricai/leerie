@@ -205,11 +205,11 @@ ec2_attach() {
 # in remote mode").
 _attach_to_live_orchestrator_ec2() {
   if [ "${RESUME_SHELL:-false}" = "true" ]; then
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
     local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
     printf '%s' "$_shell_payload" | ec2_attach || true
   else
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
     local _tail_script _tail_invocation
     _tail_script="$(render_tail_wrapper)"
     _tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID

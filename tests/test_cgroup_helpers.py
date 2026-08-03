@@ -224,7 +224,7 @@ def test_gate_merges_into_existing_state(leerie, monkeypatch):
     """Regression for the resume-corruption bug: the gate must MERGE the
     outcome into an already-populated st.data, never replace it. The
     earlier design blind-saved an empty dict + one key in main() before
-    st was loaded, discarding task/waves/etc. and bricking --resume — so
+    st was loaded, discarding task/waves/etc. and bricking resume — so
     the gate now runs in _run_phases after st.data is populated and merges."""
     monkeypatch.setattr(leerie, "_cgroup_probe", lambda: True)
     monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", "v2")

@@ -96,9 +96,9 @@ def test_integrity_gate_precedes_completed_waves_increment(leerie):
 
 
 def test_integrity_gate_die_points_at_resume(leerie):
-    """The gate's die() must be resumable — name --resume and the subtask
+    """The gate's die() must be resumable — name resume and the subtask
     branches, since the per-subtask work survives on
-    leerie/subtasks/<run-id>/* and --resume retries integration."""
+    leerie/subtasks/<run-id>/* and resume retries integration."""
     src = inspect.getsource(leerie.phase_execute)
     gate_region = src[src.index("len(integrated) != expected"):]
     assert "resume" in gate_region, (

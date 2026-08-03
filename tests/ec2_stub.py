@@ -5,7 +5,7 @@ records invocations but tracks no state), this stub models EC2 as a
 persistent state machine: `run-instances` creates a resource that
 `stop-instances` / `start-instances` / `terminate-instances` transition
 through, and `create-volume` / `delete-volume` do the same for volumes.
-Downstream lifecycle tests (provisioning, teardown, --kill) can then
+Downstream lifecycle tests (provisioning, teardown, kill) can then
 assert on resource *leaks* — "is anything still running after teardown?"
 — rather than merely inspecting which commands were invoked.
 

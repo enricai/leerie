@@ -98,7 +98,7 @@ def test_adjacent_checkpoints_are_not_the_same_object(
 def test_checkpoints_round_trip_through_a_real_save(
         leerie, monkeypatch, run_dirs):  # noqa: F811
     """Anti-vacuity: the distinction must survive serialization, since
-    `--resume` reads these back off disk, not out of memory."""
+    `resume` reads these back off disk, not out of memory."""
     calls: dict = {}
     st = _seed(leerie, run_dirs, calls, monkeypatch)
     st.save()
@@ -112,7 +112,7 @@ def test_checkpoints_round_trip_through_a_real_save(
     n_after = sum(len(p.get("subtasks", []))
                   for p in on_disk["plans_after_reconcile"])
     assert (n_before, n_after) == (2, 1), (
-        "the distinction must survive serialization — --resume reads these "
+        "the distinction must survive serialization — resume reads these "
         "back off disk, not out of memory")
 
 

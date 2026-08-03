@@ -295,14 +295,14 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
 
 
 def test_orchestrate_resume_guard_for_no_work_required():
-    """A `--resume` of a finished no-work run must short-circuit
+    """A `resume` of a finished no-work run must short-circuit
     before phase_execute. Without this guard, phase_execute would
     call setup-run.sh (creating a fresh empty run branch that didn't
     exist before), iterate zero waves, then phase_finalize's
     finalize.sh would fail its non-empty-branch check and die with
     `finalize failed: nothing to finalize`. Pin the guard so a future
     refactor that removes it fails THIS test instead of breaking
-    every `--resume` of a no-work run.
+    every `resume` of a no-work run.
 
     Mirrors the existing source-text coupling pattern from
     test_orchestrate_call_sites.py."""

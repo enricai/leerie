@@ -1,7 +1,7 @@
 """Tests for _validate_resume_state().
 
 Covers the structural shape checks applied to a loaded state.json
-before a `--resume` proceeds.
+before a `resume` proceeds.
 """
 from __future__ import annotations
 

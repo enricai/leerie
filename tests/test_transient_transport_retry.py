@@ -220,7 +220,7 @@ def test_drop_budget_exhaustion_raises_transport_worker_error(
     """When the drop persists past the backoff budget, claude_p raises a
     WorkerError that names the transport disconnect (not a subscription cap)
     and points at the bare `leerie resume <run-id>` verb (not the retired
-    `--resume` flag). Uses auth_retry_max_sec=1 to exhaust after one ~15s
+    `resume` flag). Uses auth_retry_max_sec=1 to exhaust after one ~15s
     sleep (same convention as test_terminal_auth_routing.py)."""
     tiny_caps = dict(leerie.DEFAULT_CAPS)
     tiny_caps["auth_retry_max_sec"] = 1
@@ -236,7 +236,7 @@ def test_drop_budget_exhaustion_raises_transport_worker_error(
         f"a transport drop must not be labeled a subscription cap: {exc!r}")
     # _FakeState.run_id is "r1" — pin the bare-verb positional-run-id form,
     # not just a bare "resume" substring, so a regression to the retired
-    # `--resume` flag form is caught.
+    # `resume` flag form is caught.
     assert "leerie resume r1" in str(exc), (
         f"must point at the bare `leerie resume <run-id>` verb, got: {exc!r}")
     assert "--resume" not in str(exc), (

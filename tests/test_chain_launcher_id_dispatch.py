@@ -68,7 +68,7 @@ def _fixture_two_run_chain(tmp_path: Path) -> Path:
 
 def _stub_self_cmd(tmp_path: Path) -> tuple[Path, Path]:
     """Build a stub binary that records its argv. Exposed to the launcher
-    via the ``LEERIE_SELF_CMD`` env override so chain-id dispatch invokes
+    via the ``LEERIE_SELF_CMD`` env override so --chain-id dispatch invokes
     the stub instead of the real launcher for per-run recursion.
 
     Returns ``(stub_path, log_path)``.
@@ -110,14 +110,14 @@ def _run(tmp_path: Path, args: list[str], env_extra: dict | None = None,
 
 
 # ---------------------------------------------------------------------------
-# --list --chains
+# list chains
 # ---------------------------------------------------------------------------
 
 
 def test_list_chains_groups_by_chain_id(tmp_path: Path) -> None:
-    """list --chains discovers chains by iterating run.json + grouping."""
+    """list chains discovers chains by iterating run.json + grouping."""
     _fixture_two_run_chain(tmp_path)
-    result = _run(tmp_path, ["list", "--chains"], use_self_stub=False)
+    result = _run(tmp_path, ["list", "chains"], use_self_stub=False)
     assert result.returncode == 0, result.stderr
     assert CHAIN_ID in result.stdout
     assert "chain_id" in result.stdout  # header row
@@ -132,13 +132,13 @@ def test_list_chains_empty(tmp_path: Path) -> None:
     state_dir.mkdir(parents=True)
     # Non-chain run only.
     _write_run(state_dir, NON_CHAIN_RUN, {"run_id": NON_CHAIN_RUN})
-    result = _run(tmp_path, ["list", "--chains"], use_self_stub=False)
+    result = _run(tmp_path, ["list", "chains"], use_self_stub=False)
     assert result.returncode == 0
     assert "no chains" in result.stdout.lower()
 
 
 # ---------------------------------------------------------------------------
-# --status <chain-id>
+# status <chain-id>
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +170,7 @@ def test_status_non_uuid_falls_through_with_hint(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --kill <chain-id>
+# kill <chain-id>
 # ---------------------------------------------------------------------------
 
 
@@ -234,7 +234,7 @@ def test_kill_non_uuid_falls_through(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --resume <chain-id>
+# resume <chain-id>
 # ---------------------------------------------------------------------------
 
 
@@ -265,7 +265,7 @@ def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --stop <chain-id>
+# stop <chain-id>
 # ---------------------------------------------------------------------------
 
 
@@ -292,7 +292,7 @@ def test_stop_uuid_dispatches_running_runs(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --finalize <chain-id>
+# finalize <chain-id>
 # ---------------------------------------------------------------------------
 
 
@@ -308,17 +308,19 @@ def test_finalize_uuid_dispatches_unpushed_runs(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deprecated --chain-* aliases are hard-removed (no shim)
+# Deprecated chain-* aliases are hard-removed (no shim)
 # ---------------------------------------------------------------------------
 
 
-def test_removed_chain_aliases_match_no_verb_arm(tmp_path: Path) -> None:
+def test_removed_chain_aliases_get_no_special_treatment(tmp_path: Path) -> None:
     """The five deprecated --chain-* aliases (--chain-submit, --chain-status,
-    --list-chains, --chain-kill, --chain-attach) must not match any launcher
-    verb-dispatch arm anymore. None of them is a recognized bare verb or a
-    live flag, so each falls through identically to the generic
-    unrecognized-argument path — the same path a made-up bogus flag hits —
-    rather than being special-cased into chain-scoped behavior.
+    --list-chains, --chain-kill, --chain-attach) get ZERO special
+    recognition — no dedicated rejection arm, no "these used to be verbs"
+    memory, no custom hint message. They must behave byte-for-byte
+    identically to any other unrecognized flag (e.g. a plain typo like
+    --totally-bogus): same returncode, same fall-through path, same
+    generic failure. There is no back-compat shim of any kind, including
+    a helpful "did you mean" one.
     """
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
@@ -329,20 +331,36 @@ def test_removed_chain_aliases_match_no_verb_arm(tmp_path: Path) -> None:
     ):
         result = _run(tmp_path, [alias], use_self_stub=False)
         out = result.stdout + result.stderr
+        control_out = control.stdout + control.stderr
+        assert result.returncode == control.returncode, (
+            f"{alias}: expected the same returncode as an arbitrary bogus "
+            f"flag ({control.returncode}), got {result.returncode}: {out!r}"
+        )
+        # No special "is not a recognized flag" / "leerie verbs are now
+        # bare" hint — that would be recognizing the old form, which is
+        # exactly the back-compat behavior that must not exist.
+        assert "is not a recognized flag" not in out
+        assert "leerie verbs are now bare" not in out
         # None of the chain-dispatch machinery (run.json discovery,
         # per-run recursive dispatch) is reachable through the alias.
         assert CHAIN_ID not in out
         assert "chain_id" not in out
-        # Falls through to the exact same code path as an arbitrary
-        # unrecognized flag would — proving the alias has no special
-        # dispatch arm left in the launcher.
-        assert result.returncode == control.returncode
+
+
+
+# ---------------------------------------------------------------------------
+# Deprecated --chain-* aliases: hard-removed, no shim, no special-casing
+# ---------------------------------------------------------------------------
+
 
 
 def test_deprecated_chain_aliases_have_no_dispatch_arm() -> None:
     """The five deprecated --chain-* aliases must not survive as a live
-    launcher case arm. They were hard-removed in favor of the bare verbs
-    (status/kill/attach/list --chains); there is no back-compat shim.
+    launcher case arm, and no other case arm anywhere in the launcher
+    may special-case them by name either (that would itself be a form
+    of back-compat — recognizing the old spelling to react differently
+    to it). They were hard-removed in favor of the bare verbs
+    (status/kill/attach/list --chains); there is no shim of any kind.
     """
     source = LAUNCHER.read_text()
     for alias in (
@@ -352,14 +370,16 @@ def test_deprecated_chain_aliases_have_no_dispatch_arm() -> None:
         "--chain-kill",
         "--chain-attach",
     ):
-        assert f"{alias})" not in source, (
-            f"found a live case arm for deprecated alias {alias!r} in {LAUNCHER}"
+        assert alias not in source, (
+            f"found a live reference to deprecated alias {alias!r} in "
+            f"{LAUNCHER} — it must get zero special-case recognition"
         )
 
 
 def test_list_chains_via_deprecated_alias_errors(tmp_path: Path) -> None:
     """--list-chains no longer shims to `list --chains` — it falls through
-    as an unrecognized invocation rather than dispatching successfully.
+    as an unrecognized invocation rather than dispatching successfully,
+    with no special handling distinguishing it from any other bogus flag.
     """
     _fixture_two_run_chain(tmp_path)
     result = _run(tmp_path, ["--list-chains"], use_self_stub=False)

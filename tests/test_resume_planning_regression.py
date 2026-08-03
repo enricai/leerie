@@ -368,7 +368,7 @@ def test_budget_check_resume_reruns_only_budget_check_under_raised_cap(
         st_low.release_lock()
 
     # Re-resume with a raised cap (the documented remediation) — reload a
-    # fresh State (mirrors a real second `--resume` invocation) so nothing
+    # fresh State (mirrors a real second `resume` invocation) so nothing
     # from the failed attempt's in-memory st leaks in.
     calls.clear()
     st2 = leerie.State(run_dirs[0], run_dirs[1])

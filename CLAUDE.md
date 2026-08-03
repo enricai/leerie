@@ -280,7 +280,7 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./leerie resume
 
-# Accept a blocked subtask so --resume skips it (e.g., E2E tests
+# Accept a blocked subtask so resume skips it (e.g., E2E tests
 # that need external deps the container can't provide):
 ./leerie accept-blocked <run-id> <subtask-id>
 
@@ -483,12 +483,12 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # §9 *The one gating axis: solution completeness*) to advisory: found defects
 # surface as warnings but never re-drive the implementer, block a subtask, or
 # die() the final-tree pass. Use when a false-positive completeness defect is
-# blocking finalize on every --resume. Also LEERIE_SKIP_COMPLETENESS_CHECK=1
+# blocking finalize on every resume. Also LEERIE_SKIP_COMPLETENESS_CHECK=1
 # or `skip_completeness_check = true` in leerie.toml. Default: off.
 ./leerie "task" --skip-completeness-check
 
 # Make the conformer phase blocking instead of advisory.
-# Residuals cause subtasks to return 'blocked' (fix + --resume).
+# Residuals cause subtasks to return 'blocked' (fix + resume).
 # Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in
 # leerie.toml:
 ./leerie "task" --strict-conformer
@@ -537,8 +537,8 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 export LEERIE_MODEL_DEP_CAPTURE=opus
 
 # Filter `list` output by run status:
-./leerie list --status paused
-./leerie list --status seed-failed
+./leerie list status paused
+./leerie list status seed-failed
 
 # Verbosity: default is `stream` (one-line summary per worker event).
 # Per-worker logs are always written to <state-root>/logs/<sid>.log.
@@ -578,8 +578,8 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 # Pre-classify failures (seed_auth aborted before phase_classify) now
 # appear in `list` with status `seed-failed` and are resumable via
-# `--resume <id>`. Previously these runs were invisible:
-./leerie list --status seed-failed
+# `resume <id>`. Previously these runs were invisible:
+./leerie list status seed-failed
 ./leerie resume <seed-failed-id>
 
 # Chain verbs: submit + manage multi-run chains. A chain is N parallel
@@ -617,7 +617,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie kill     <chain-id>        # destroy every chain run
 ./leerie resume   <chain-id>        # resume every paused chain run
 ./leerie finalize <chain-id>        # push + open PR for every unpushed run
-./leerie list --chains              # group runs by chain_id
+./leerie list chains              # group runs by chain_id
 
 # Group verbs: launch N single-repo runs together as a coordinated unit.
 # Each member runs in its own state dir (basename-keyed), its own branch,
@@ -703,7 +703,7 @@ conditionally, the latter always); `_resolve_volume_id_from_fly` reading
 `config.mounts[].volume` out of `machine list --json` (the stub emits the
 shape measured against a live machine — `machine status` has no `--json`
 flag, so it is deliberately unused); and end-to-end that
-`--kill --machine-id <id>` with **no run dir** still reaps, with the
+`kill --machine-id <id>` with **no run dir** still reaps, with the
 load-bearing ordering asserted by call index: **Fly lookup → machine
 destroy → volume destroy** (the volume→machine link vanishes with the
 machine, but Fly refuses to destroy a still-attached volume, so the reap
@@ -1962,7 +1962,7 @@ the two traps found by running the design against a real 58-run state dir:
 `seed-failed` rows carry no `started_at` and sorted to the *top* of a naive
 newest-first sort (they are now list-only, never auto-picked), and a
 missing `started_at` must never outrank a real timestamp. An explicit
-run-id stays exempt from the filter (so `--resume <seed-failed-id>` still
+run-id stays exempt from the filter (so `resume <seed-failed-id>` still
 works) and an unknown one still fails closed. The `seed-failed` exclusion
 is a deliberate behavior change with a UX cost, pinned by
 `test_resolve_run_id.py::test_resolve_lone_orphan_is_not_auto_resumed`:
@@ -2553,7 +2553,7 @@ pipe the multi-line state-mutation Python program to the remote
 `python3 -`. `_collect_run_rows`/`_list_runs` in `orchestrator/leerie.py`
 now track an `is_ec2` axis (`ec2_instance_id` in `run.json` or
 `ec2-instance.json` present) alongside the existing `is_fly`, so
-`--list --runtime ec2` filters correctly, `--list --runtime local`
+`list --runtime ec2` filters correctly, `list --runtime local`
 excludes both Fly and EC2 runs, a plain `list` renders an EC2 run's
 status column without requiring `LEERIE_FLY_APP`, and an EC2 run is
 still detected via the `ec2-instance.json` sidecar alone when

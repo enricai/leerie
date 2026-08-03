@@ -1641,7 +1641,7 @@ probe before invoking the orchestrator subprocess (fast-path refusal,
 saves the cost of spawning a Python process that would just die in
 startup). The orchestrator's `State.__init__` flock acquire is the
 load-bearing enforcement and catches anything the launcher misses
-(manual `python3 leerie.py --resume`, future verbs, debugging).
+(manual `python3 leerie.py resume`, future verbs, debugging).
 
 What this does *not* prevent: cross-host races. The lock is per-host.
 This is fine in practice: on Fly each run is pinned to a specific
@@ -3310,7 +3310,7 @@ above). Then:
 A **rate-limit** resets on a clock — wait long enough and it clears on its
 own — so the session-limit and terminal-`status` cases auto-resume via the
 shared `_sleep_then_reexec(st, wait_seconds, reason)`: worktree-only cleanup,
-sleep, then `os.execv` the orchestrator (`sys.executable __file__ --resume
+sleep, then `os.execv` the orchestrator (`sys.executable __file__ resume
 --run-id <id>`) into a fresh process. **Out-of-credits does not reset on a
 clock** — it clears only when a human tops up or the billing period rolls
 over — so it does *not* auto-resume: `main()` does worktree-only cleanup,
@@ -3642,7 +3642,7 @@ remote run lifecycle, each doing exactly one thing:
 | `leerie resume <id>` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
 | `leerie kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
-Plus `leerie list` (unified across local and remote, with `--status
+Plus `leerie list` (unified across local and remote, with `status
 <state>` and `--runtime <local|fly>` filtering as orthogonal axes).
 Status describes the run's lifecycle (`paused`, `killed`,
 `done`, `sync-failed`, `in-progress`, `done-pushed-pr`, ...); runtime
@@ -6639,7 +6639,7 @@ to origin.
 
 The launcher's `chain` verb is wired end-to-end. The ID-dispatched
 single-run verbs (`status`, `stop`, `kill`, `resume`, `finalize`,
-`attach`, `list --chains`) operate on chains by iterating
+`attach`, `list chains`) operate on chains by iterating
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by the `chain_id`
 field, dispatching the existing single-run verb per discovered run.
 The five deprecated dash-prefixed chain aliases have been
@@ -6851,7 +6851,7 @@ laptop:
 3. **Chain-scoped verbs operate by iteration, not coordination.**
    `leerie status <chain-id>`, `leerie kill <chain-id>`, `leerie stop <chain-id>`,
    `leerie resume <chain-id>`, `leerie finalize <chain-id>`, and
-   `leerie list --chains` all work by iterating
+   `leerie list chains` all work by iterating
    `$LEERIE_STATE_HOST_DIR/runs/*/run.json` and filtering by the
    `chain_id` field. For per-run action, they dispatch to the
    existing single-run verb implementation per discovered run.

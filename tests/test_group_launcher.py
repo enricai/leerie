@@ -1,9 +1,9 @@
-"""Tests for the launcher's --group arm and group-scoped ID-dispatched verbs.
+"""Tests for the launcher's group arm and group-scoped ID-dispatched verbs.
 
---group fans out one child per member repo, each cd'd into the right repo
+group fans out one child per member repo, each cd'd into the right repo
 with --group-id <uuid>, --inspect-dir for all siblings, and an optional
-shared brief prepended. Group-scoped verbs (--status, --resume, --kill,
---stop, --finalize) fall through the chain-id scan and dispatch by matching
+shared brief prepended. Group-scoped verbs (status, resume, kill,
+stop, finalize) fall through the --chain-id scan and dispatch by matching
 group_id across all ~/.leerie/*/ state dirs.
 
 Test layout mirrors tests/test_chain_launcher_id_dispatch.py: bash
@@ -123,15 +123,15 @@ def _run(
 
 
 # ---------------------------------------------------------------------------
-# _group_runs_filter via --list --groups
+# _group_runs_filter via list --groups
 # ---------------------------------------------------------------------------
 
 
 class TestGroupRunsFilter:
-    """Exercise _group_runs_filter indirectly via --list --groups."""
+    """Exercise _group_runs_filter indirectly via list --groups."""
 
     def test_groups_by_group_id(self, tmp_path: Path) -> None:
-        """--list --groups collects run.json files across state dirs and
+        """list --groups collects run.json files across state dirs and
         groups them by group_id, rendering one row per group."""
         sd_a = tmp_path / ".leerie" / "repo-a"
         sd_b = tmp_path / ".leerie" / "repo-b"
@@ -188,10 +188,10 @@ class TestGroupRunsFilter:
 
 
 class TestStateDirGuard:
-    """--group must reject LEERIE_STATE_DIR env and --state-dir arg."""
+    """group must reject LEERIE_STATE_DIR env and --state-dir arg."""
 
     def test_rejects_state_dir_env(self, tmp_path: Path) -> None:
-        """LEERIE_STATE_DIR in env is forbidden inside --group."""
+        """LEERIE_STATE_DIR in env is forbidden inside group."""
         repo_a = tmp_path / "repo-a"
         repo_b = tmp_path / "repo-b"
         _make_git_repo(repo_a)
@@ -211,7 +211,7 @@ class TestStateDirGuard:
         assert result.stub_log == ""
 
     def test_rejects_state_dir_arg(self, tmp_path: Path) -> None:
-        """--state-dir CLI arg is forbidden inside --group."""
+        """--state-dir CLI arg is forbidden inside group."""
         repo_a = tmp_path / "repo-a"
         _make_git_repo(repo_a)
         stub, stub_log = _stub_self_cmd(tmp_path)
@@ -229,12 +229,12 @@ class TestStateDirGuard:
 
 
 # ---------------------------------------------------------------------------
-# --group fan-out args
+# group fan-out args
 # ---------------------------------------------------------------------------
 
 
 class TestGroupFanOut:
-    """--group passes correct flags to each member child."""
+    """group passes correct flags to each member child."""
 
     def test_each_member_gets_group_id(self, tmp_path: Path) -> None:
         """Each member child receives --group-id <uuid>."""
@@ -363,12 +363,12 @@ class TestGroupFanOut:
 
 
 # ---------------------------------------------------------------------------
-# Group-scoped --status UUID dispatch
+# Group-scoped status UUID dispatch
 # ---------------------------------------------------------------------------
 
 
 class TestGroupStatusDispatch:
-    """--status <group-id> falls through chain scan and renders group members."""
+    """status <group-id> falls through chain scan and renders group members."""
 
     def _fixture(self, tmp_path: Path) -> None:
         sd_a = tmp_path / ".leerie" / "repo-a"
@@ -390,7 +390,7 @@ class TestGroupStatusDispatch:
         })
 
     def test_status_group_id_lists_members(self, tmp_path: Path) -> None:
-        """--status <group-id> enumerates members across state dirs."""
+        """status <group-id> enumerates members across state dirs."""
         self._fixture(tmp_path)
         result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
@@ -398,7 +398,7 @@ class TestGroupStatusDispatch:
         assert RUN_ID_B in result.stdout
 
     def test_status_group_id_excludes_non_members(self, tmp_path: Path) -> None:
-        """--status <group-id> does not include unrelated runs."""
+        """status <group-id> does not include unrelated runs."""
         self._fixture(tmp_path)
         sd_c = tmp_path / ".leerie" / "repo-c"
         _write_run(sd_c, NON_GROUP_RUN, {
@@ -418,12 +418,12 @@ class TestGroupStatusDispatch:
 
 
 # ---------------------------------------------------------------------------
-# Group-scoped --resume UUID dispatch
+# Group-scoped resume UUID dispatch
 # ---------------------------------------------------------------------------
 
 
 class TestGroupResumeDispatch:
-    """--resume <group-id> falls through chain scan and dispatches paused members."""
+    """resume <group-id> falls through chain scan and dispatches paused members."""
 
     def _fixture(self, tmp_path: Path) -> None:
         sd_a = tmp_path / ".leerie" / "repo-a"
@@ -443,7 +443,7 @@ class TestGroupResumeDispatch:
         })
 
     def test_resume_group_id_dispatches_paused_only(self, tmp_path: Path) -> None:
-        """--resume <group-id> resumes only the paused member."""
+        """resume <group-id> resumes only the paused member."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=stub_log)
@@ -467,12 +467,12 @@ class TestGroupResumeDispatch:
 
 
 # ---------------------------------------------------------------------------
-# Group-scoped --kill UUID dispatch
+# Group-scoped kill UUID dispatch
 # ---------------------------------------------------------------------------
 
 
 class TestGroupKillDispatch:
-    """--kill <group-id> falls through chain scan and kills live members."""
+    """kill <group-id> falls through chain scan and kills live members."""
 
     def _fixture(self, tmp_path: Path) -> None:
         sd_a = tmp_path / ".leerie" / "repo-a"
@@ -490,7 +490,7 @@ class TestGroupKillDispatch:
         })
 
     def test_kill_group_id_dispatches_live_runs(self, tmp_path: Path) -> None:
-        """--kill <group-id> kills only live (not already-killed) members."""
+        """kill <group-id> kills only live (not already-killed) members."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=stub_log)
@@ -514,12 +514,12 @@ class TestGroupKillDispatch:
 
 
 # ---------------------------------------------------------------------------
-# Group-scoped --finalize UUID dispatch
+# Group-scoped finalize UUID dispatch
 # ---------------------------------------------------------------------------
 
 
 class TestGroupFinalizeDispatch:
-    """--finalize <group-id> falls through chain scan and finalizes unpushed members."""
+    """finalize <group-id> falls through chain scan and finalizes unpushed members."""
 
     def _fixture(self, tmp_path: Path) -> None:
         sd_a = tmp_path / ".leerie" / "repo-a"
@@ -539,7 +539,7 @@ class TestGroupFinalizeDispatch:
         })
 
     def test_finalize_group_id_dispatches_unpushed_runs(self, tmp_path: Path) -> None:
-        """--finalize <group-id> finalizes only the unpushed member."""
+        """finalize <group-id> finalizes only the unpushed member."""
         self._fixture(tmp_path)
         stub, stub_log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=stub_log)
@@ -573,7 +573,7 @@ class TestChainRegressions:
     """Existing chain-verb behavior must not be broken by group fallback."""
 
     def test_kill_chain_id_still_works(self, tmp_path: Path) -> None:
-        """--kill <chain-id> still dispatches normally."""
+        """kill <chain-id> still dispatches normally."""
         state_dir = tmp_path / ".leerie" / "myrepo"
         _write_run(state_dir, RUN_ID_A, {
             "run_id": RUN_ID_A,
@@ -588,7 +588,7 @@ class TestChainRegressions:
         assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_resume_chain_id_still_works(self, tmp_path: Path) -> None:
-        """--resume <chain-id> still dispatches paused chain runs normally."""
+        """resume <chain-id> still dispatches paused chain runs normally."""
         state_dir = tmp_path / ".leerie" / "myrepo"
         _write_run(state_dir, RUN_ID_A, {
             "run_id": RUN_ID_A,

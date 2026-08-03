@@ -34,7 +34,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `destroy_volume()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. `destroy_volume()` reaps `$LEERIE_VOLUME_ID` **independently of any machine id** and is deliberately not nested inside `destroy_machine`'s `[ -z "$mid" ]` early return: Fly volumes outlive their machines by design (*"a Machine can be destroyed without destroying its volume"* — Fly docs; the leftover is a documented "unattached volume"), and there is no platform-side lifecycle hook, so the machine already being gone is precisely when a known volume still needs reaping. `destroy_machine` calls it last, preserving the machine-then-volume order (Fly refuses to destroy an attached volume: *"in use by machine X"*). Best-effort: a failed volume destroy logs a warning and returns 0 — an orphan volume is a billing issue, a teardown that aborts is a correctness issue. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — note: `EXIT_LOCKED=75` from the orchestrator is remapped to `container_rc=130` by the launcher's rc=75 branch before `LEERIE_REMOTE_EXIT_RC` is exported, so the only `rc=75` that *does* reach `decide_teardown` is genuine EX_TEMPFAIL from worker rate-limit / parse-fail surfaces, not the single-owner-per-run-dir refusal; see §Single-owner-per-run-dir enforcement below — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie finalize <run-id> --runtime fly`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: sync run state directory from machine to host via tar-pipe bounded by a 60 s timeout, then stop machine, write `paused_at`/`pause_reason` to the run sidecar; the state sync is best-effort — failure is logged but does not block the pause, and the machine-side state is preserved on the volume). With the tail wrapper now propagating the orchestrator's exit code via `orchestrator.exit_code`, `die()` exits (rc=1) reach the pause branch rather than the clean-exit branch, so partial-failure runs are paused (machine stopped, filesystem preserved) rather than destroyed. |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `_extract_flyctl_remote_rc()` (parses the actual remote exit code from a captured `flyctl ssh console` stderr file — flyctl returns 1 for any non-zero remote exit; the real code is in stderr as `Error: ssh shell: Process exited with status <N>`; falls back to the original flyctl rc when the pattern is absent), `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated), `render_tail_wrapper()` (emits a POSIX-sh wrapper script that tails `orchestrator.log` and watches orchestrator liveness via OR of pid-file `kill -0` and `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py`+run-id — the cross-check closes the stale-pid contagion of DESIGN §6 *Single owner per run dir*; when the orchestrator exits, the wrapper reads `orchestrator.exit_code` from the run directory — written by `main()`'s `except SystemExit` handler before every controlled exit — and uses it as its own exit code so `decide_teardown` can route failed runs to the pause branch; when the file is absent (OOM, SIGKILL, crash before the handler ran), the wrapper falls back to exit 0 for backward compatibility), and `tail_with_optional_autofinalize()` (wraps `render_tail_wrapper` + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, captures stderr through `tee`, greps for the token to extract the final run-id, then `exec`s `leerie finalize <id>` on the host — used by both the fresh-launch tail and the `resume` rc=75 pivot). Replaces four duplicated detection blocks across the remote scripts. |
-| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch — the run-id IS the machine ID, so no lookup is needed). Exports `resume_machine()`: compares the `image_tag` stored in the run sidecar against the current `$FLY_IMAGE_TAG` — if they differ (leerie was upgraded between provision and resume), runs `flyctl machine update --image $FLY_IMAGE_TAG --skip-start -y` to update the stopped machine's image before starting it (volumes at `/work` survive the update; `seed_auth` re-provisions the ephemeral rootfs on every resume); fail-open — if the update fails, logs a warning and proceeds with the old image. Then runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `--resume <id>` (the orchestrator's own internal argparse flag — unaffected by the launcher's bare-verb dispatch). When `image_tag` is absent from `run.json` (runs provisioned before the field existed), the update always fires (empty stored tag != current tag), ensuring legacy machines pick up the latest image on resume. |
+| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch — the run-id IS the machine ID, so no lookup is needed). Exports `resume_machine()`: compares the `image_tag` stored in the run sidecar against the current `$FLY_IMAGE_TAG` — if they differ (leerie was upgraded between provision and resume), runs `flyctl machine update --image $FLY_IMAGE_TAG --skip-start -y` to update the stopped machine's image before starting it (volumes at `/work` survive the update; `seed_auth` re-provisions the ephemeral rootfs on every resume); fail-open — if the update fails, logs a warning and proceeds with the old image. Then runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `resume <id>` (the orchestrator's own internal argparse flag — unaffected by the launcher's bare-verb dispatch). When `image_tag` is absent from `run.json` (runs provisioned before the field existed), the update always fires (empty stored tag != current tag), ensuring legacy machines pick up the latest image on resume. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `leerie re-seed <run-id>` fast-path and by the auto-re-seed step in the `leerie resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local`, `.claude/plugins/cache`, and `.claude/plugins/marketplaces` skipped; `~/.aws/` also included when Bedrock mode is enabled — see `$STAGE/.aws` mount row above; `.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, and `.config` are explicitly excluded from the tar — those are git/push auth that lives on the host per DESIGN §6 *Finalization* — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary, plus the bulky plugin cache that's rebuilt on the remote post-tar via `claude plugin marketplace add` + `claude plugin install` from the seeded `installed_plugins.json` / `known_marketplaces.json`) to `/home/leerie/` via `flyctl ssh console -C "tar -xzC /home/leerie"` (gzip on both ends). The tar pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts that have GNU `timeout`; no-op fallback otherwise) so a stalled `flyctl ssh console` session — observed mode where flyctl never exits even though the remote tar made progress — produces a clean rc 124/137 instead of hanging forever. rc 124/137 triggers a one-shot `flyctl agent restart` retry; if the retry also stalls, the function returns 1 and leerie's existing PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*). A background heartbeat (`_seed_progress_bg`) logs "seed_auth: still streaming (Ns elapsed)" every `LEERIE_PROGRESS_INTERVAL_S` seconds (default 10) so the user sees activity rather than a silent multi-minute wait. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. The parent-bundle pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts with GNU `timeout`; no-op fallback otherwise) and surrounded by a `_seed_progress_bg` background heartbeat; on rc 124/137 (timeout fired) the function returns 1 with a "flyctl ssh console likely stalled" diagnosis so leerie's PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*) matching the seed_auth pattern. A second `_seed_progress_bg` covers the submodule-bundle `git submodule foreach --recursive` batch so the user sees activity across multi-submodule transfers instead of a silent pause. **Shallow-seed path (heavy repos, DESIGN §6 *Shallow seeding for heavy repos*):** when the host repo's `.git` exceeds `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (default `200`) AND the resolved seed depth is non-zero, `seed_repo_clone` skips the full `--all` bundle for the *parent* and instead: makes a throwaway `git clone --depth="$LEERIE_SEED_DEPTH" --no-local --branch <cur-branch> "file://$USER_REPO"`; `tar -cf -`s **only that clone's `.git`**; pipes the tar over the identical `$(_seed_timeout_prefix)`-wrapped `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-seed-git.tar'"` channel (same heartbeat, same `PIPESTATUS[1]` + rc 124/137 handling); and the machine-side heredoc script (same pattern as `_seed_one_inspect_dir_clone`) empties `/work` inode-preservingly, untars `.git`, `git checkout -f`s the branch, `git remote remove origin` (the stale `file://<laptop>` origin is inert but removed defensively), runs the **unchanged** per-submodule bundle wiring, and `chown -R leerie: /work` last. Tarring `.git`-only (never the working tree) preserves the NFC→NFD safety property. `git bundle` cannot ship a shallow repo (grafted parents), which is why the shallow path uses tar rather than a shallow bundle. `LEERIE_SEED_DEPTH=0` (or a `.git` under threshold) keeps the full-bundle path. The shallow checkout yields a byte-identical tracked tree to the bundle clone, so `seed_repo_dirty` layers on unchanged. The shallow path additionally requires a shell-safe working-branch name (`_seed_branch_shallow_safe`: `^[A-Za-z0-9/._-]+$`, no placeholder tokens) because the branch is interpolated into the machine-side `git checkout -f <branch>` inside a `sh -c '…'` wrapper; a branch with `'`/`$`/backtick/space falls back to the full-bundle path (which never interpolates the branch). Detached HEAD likewise falls back. |
@@ -554,7 +554,7 @@ default it uses Fly's remote builder (no host Docker daemon required):
 # Verify the baked source works inside a Machine:
 flyctl machine run registry.fly.io/<fly-app-name>:<VERSION> \
   --app <fly-app-name> \
-  -- python3 /opt/leerie-image/orchestrator/leerie.py --version
+  -- python3 /opt/leerie-image/orchestrator/leerie.py version
 ```
 
 Internally, the remote-builder path runs:
@@ -562,7 +562,7 @@ Internally, the remote-builder path runs:
 ```bash
 flyctl deploy --build-only --push --remote-only \
   --app <fly-app-name> \
-  --config <tmp-fly.toml> \
+  config <tmp-fly.toml> \
   --dockerfile <DOCKERFILE> \
   [--build-arg KEY=VAL ...] \
   --image-label <VERSION>
@@ -1273,9 +1273,7 @@ leerie/
 │   ├── __init__.py                exports __version__ = "0.1.0"
 │   ├── _log.py                    log()/die() helpers — shared with git_ops.
 │   └── git_ops.py                 synth_merge_branches (used between waves) +
-│                                  clone_target / fetch_branch / push_branch / open_pr /
-│                                  finalize_run / write_audit_artifact (kept for tests
-│                                  and future automated paths).
+│                                  create_stage_branch.
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
@@ -1456,10 +1454,10 @@ leerie stop     <chain-id>        # pause every running chain run
 leerie kill     <chain-id>        # destroy every chain run's machine
 leerie resume   <chain-id>        # resume paused + list running chain runs
 leerie finalize <chain-id>        # push + open PR for every unpushed run
-leerie list --chains               # group runs by chain_id
+leerie list chains               # group runs by chain_id
 
 # The five deprecated dash-prefixed chain-verb aliases (submit / status /
-# kill / attach, plus the separate list-chains flag) have been hard-removed
+# kill / attach, plus the separate --list-chains flag) have been hard-removed
 # entirely — no shim, no back-compat. Use the bare verbs above.
 ```
 
@@ -1734,7 +1732,7 @@ probe on `run_dir` before invoking the orchestrator subprocess. On
 `BlockingIOError` the probe exits 75. The probe is advisory — the
 orchestrator's `State.__init__` flock acquire is the load-bearing
 enforcement that catches any path bypassing the launcher (manual
-`python3 leerie.py --resume`, future verbs, debugging).
+`python3 leerie.py resume`, future verbs, debugging).
 
 Host-side rc=75 branch (`leerie:~3563`) sets `container_rc=130`
 (not 1, not 75). decide_teardown's classifier treats `rc=130|143` as
@@ -2849,7 +2847,7 @@ matching `chain_id`.
 | `leerie stop <chain-id>` | Enumerates runs that are actively running (have `fly_machine_id`, no terminal state), invokes `leerie stop <run-id>` per discovered run. |
 | `leerie resume <chain-id>` | Two tiers: (1) auto-resumes paused runs (`paused_at` set, not `killed_at`) by invoking `leerie resume <run-id>` per discovered run; (2) lists still-running runs (have `fly_machine_id` + `chain_id`, no terminal state) with machine IDs so the user can reattach via `leerie resume <machine-id>`. Running runs are discoverable because the child writes `chain_id` into host-side `run.json` immediately after provisioning (early-write), before the orchestrator starts. After paused runs complete, the user re-invokes `leerie chain --chain-id <chain-id> --wave ...` to continue the wave loop from where it stopped. |
 | `leerie finalize <chain-id>` | Enumerates runs that haven't been pushed yet (`pushed_at` null, not `killed_at`), invokes `leerie finalize <run-id>` per discovered run. |
-| `leerie list --chains` | Iterates run.json files, groups by `chain_id`, renders one row per chain (chain_id, status, pushed/total, wave count, started_at). |
+| `leerie list chains` | Iterates run.json files, groups by `chain_id`, renders one row per chain (chain_id, status, pushed/total, wave count, started_at). |
 
 Non-UUID positional ids fall through unchanged to the existing
 single-run code paths. UUID detection uses the `8-4-4-4-12` hyphen
@@ -3034,7 +3032,7 @@ touches happen on the laptop using its existing `gh auth` and
 | Function | Purpose |
 |----------|---------|
 | `synth_merge_branches(repo, base_branch, dep_branches, stage_name)` | Build a stage branch by merging each dep branch into a fresh checkout of `base_branch`; raises `SynthMergeConflict` on any conflict. Used by the wave loop between waves. Passes `-c user.email=leerie-chain@bot.invalid -c user.name=leerie-chain` to `git merge` defensively so the merge commit succeeds even when the laptop's global git identity is unset (otherwise the merge would fail with "Committer identity unknown"). |
-| `clone_target(url, pat, dest)`, `fetch_branch`, `push_branch`, `open_pr`, `finalize_run`, `write_audit_artifact` | Kept for compatibility with existing tests and any future automated paths; the wave loop MVP uses only `synth_merge_branches`. |
+| `create_stage_branch(repo, chain_id, base_branch)` | Create (or check out, idempotently) the `stage-<chain_id>` branch off `base_branch`. |
 
 Maps to `DESIGN.md`: §19 *Chain orchestration*.
 
@@ -4474,12 +4472,12 @@ Either source produces a `reset_at: datetime | None`
 (parse failure → `None`, never a wrong-time guess) and the raw
 message. `main()`'s `except RateLimitedExit` arm: when `reset_at` is
 set, run worktree cleanup, sleep until the moment + 30s margin, then
-`os.execv(sys.executable, [sys.executable, __file__, "--resume",
+`os.execv(sys.executable, [sys.executable, __file__, "resume",
 "--run-id", <id>])` to re-exec the orchestrator itself (NOT the
 launcher — the launcher is not baked into the container image and
 its `resume` path would attempt to spawn a new container; the
 orchestrator already runs inside the container with state on disk
-and accepts `--resume --run-id`). The `--max-workers` budget is NOT
+and accepts `resume --run-id`). The `--max-workers` budget is NOT
 reset across the re-exec: `worker_count` persists in state.json,
 so a run that repeatedly hits the rate-limit still respects the
 user's cap;
@@ -4517,7 +4515,7 @@ clock-based reset, so it takes the surface-and-pause disposition rather
 than `_sleep_then_reexec`'s auto-resume path.
 
 **Auto-resume override persistence.** The re-exec passes only
-`--resume <id>` as argv — any CLI overrides on the original
+`resume <id>` as argv — any CLI overrides on the original
 launch (`--model`, `--max-workers`, `--max-parallel`, `--confidence-rounds`,
 `--source-of-truth`, `--clarify`, `--no-push`) are **not** propagated
 to the fresh process. They fall back to env vars (`LEERIE_*`) and
@@ -6984,7 +6982,7 @@ never carries `completed_waves`/`waves`):
   `incomplete` instead of `done`/`done-pushed-*`. The check fires after
   the push/PR-error checks (a real push/PR error still surfaces as
   itself) but before the `finished_at`→`done` check. `incomplete` is
-  added to the derived-status set and is a valid `list --status`
+  added to the derived-status set and is a valid `list status`
   filter value. The cleared-but-empty terminal state
   (`no_work_required`, `waves == []`) is exempt — `completed_waves (0)
   < len([]) (0)` is false, so it still reads `done`. This gates only the
@@ -7146,7 +7144,7 @@ Changes:
   started_at, status, cost, branch` (the filter-only `is_fly`/`is_ec2`
   are not columns). The `cost` column is right-aligned; widths
   auto-size.
-- `--status <state>` argparse flag on `list` filters rows to only
+- `status <state>` argparse flag on `list` filters rows to only
   those whose derived status matches. `<state>` accepts any value in
   `RUN_STATUSES` (see list above). Invalid values produce an
   argparse error listing the allowed set.
@@ -7455,7 +7453,7 @@ discovery without parsing the full `state.json`):
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
-| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`list --chains`, `status`, `kill`, `attach`, `resume`) to discover chain runs. |
+| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`list chains`, `status`, `kill`, `attach`, `resume`) to discover chain runs. |
 | `wave_idx` | int \| null | Zero-based wave index within the chain (set alongside `chain_id`). Used by the chain wave-sequencer to group runs by wave for synth-merge between waves. Null when `chain_id` is null. |
 | `health` | dict \| null | Advisory run-health signals (DESIGN §9). Written by two seams and merged, never mutually exclusive: (1) `_capture_conformance_baseline` writes `base_suite` `{status: "green"\|"red", red_axes: list[str]}` at the start of `phase_execute` — the build/lint/test exit-code verdict on the unmodified base tree; (2) `_record_run_health` writes `slowest_worker_sid` (str \| null), `slowest_worker_min` (float — the largest summed per-worker `duration_ms`, in minutes), and `truncated_worker_count` (int — worker logs that ended a result with `terminal_reason="max_turns"`) at finalize, preserving any existing `base_suite`. Purely informational — never gates; `_validate_run_json` imposes no invariant on it. Null when neither seam ran (e.g. a no-work run, or `--skip-base-baseline` on a run that also never reached finalize). |
 
@@ -7487,7 +7485,7 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 
 `RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
-`leerie list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `list` short-circuits before any git/CLI preflight.
+`leerie list status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `list` short-circuits before any git/CLI preflight.
 
 `state.json` fields. This table is canonical: every field the orchestrator
 writes to `st.data` must appear here, and every field listed here must be

@@ -7,7 +7,7 @@ because a terminal auth envelope (`Failed to authenticate: OAuth session
 expired and could not be refreshed`) matched none of
 `_is_auth_or_quota_failure`'s markers, fell through to the generic
 2-attempt schema loop, and raised a WorkerError blaming schema validation
-at exit 1 — with no `--resume` hint honored, despite `--resume` being the
+at exit 1 — with no `resume` hint honored, despite `resume` being the
 correct recovery.
 
 This file drives `claude_p` directly with a stubbed `_invoke` (the only
@@ -184,7 +184,7 @@ def test_handler_sets_exit_code_locked(leerie):
 
 def test_handler_calls_cleanup_on_abnormal_exit_worktree_only(leerie):
     """Worktree-only cleanup (full_purge=False) — state and branches must
-    survive so --resume can pick the run back up."""
+    survive so resume can pick the run back up."""
     block = _terminal_auth_handler_block(leerie)
     assert "_cleanup_on_abnormal_exit(st, full_purge=False)" in block
 

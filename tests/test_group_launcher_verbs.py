@@ -2,7 +2,7 @@
 
 Two-member group fixture: member A is paused/unpushed (in ~/.leerie/repo-a/),
 member B is pushed/done (in ~/.leerie/repo-b/).  Tests assert that every
-group-scoped verb (--status, --resume, --finalize, --kill, --stop) dispatches
+group-scoped verb (status, resume, finalize, kill, stop) dispatches
 across both dirs and applies the correct eligibility filter.
 
 Mirror of tests/test_chain_launcher_id_dispatch.py: bash subprocess harness
@@ -11,7 +11,7 @@ with LEERIE_SELF_CMD stub to record recursive single-run invocations.
 Key distinction from test_group_launcher.py (test-003):
   - Uses a single shared fixture (paused/unpushed + pushed) across two dirs
     to exercise all verbs against the same state in one place.
-  - Adds --stop dispatch tests (missing from test_group_launcher.py).
+  - Adds stop dispatch tests (missing from test_group_launcher.py).
   - Verifies dual-purpose-verb handling: a UUID that is a group_id (not a
     chain_id) still dispatches correctly via the chain→group fallback path.
 """
@@ -129,15 +129,15 @@ def _run(
 
 
 # ---------------------------------------------------------------------------
-# --status <group-id> across two state dirs
+# status <group-id> across two state dirs
 # ---------------------------------------------------------------------------
 
 
 class TestStatusDispatch:
-    """--status <group-id> renders both members from separate state dirs."""
+    """status <group-id> renders both members from separate state dirs."""
 
     def test_status_lists_both_members(self, tmp_path: Path) -> None:
-        """Both run-ids appear in --status output."""
+        """Both run-ids appear in status output."""
         _two_member_fixture(tmp_path)
         result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
@@ -173,15 +173,15 @@ class TestStatusDispatch:
 
 
 # ---------------------------------------------------------------------------
-# --list --groups across two state dirs
+# list --groups across two state dirs
 # ---------------------------------------------------------------------------
 
 
 class TestListGroupsDispatch:
-    """--list --groups groups members across all per-repo state dirs."""
+    """list --groups groups members across all per-repo state dirs."""
 
     def test_list_groups_shows_group_id(self, tmp_path: Path) -> None:
-        """--list --groups renders the shared group_id."""
+        """list --groups renders the shared group_id."""
         _two_member_fixture(tmp_path)
         result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
@@ -195,7 +195,7 @@ class TestListGroupsDispatch:
         assert "2" in result.stdout
 
     def test_list_groups_excludes_non_group_run(self, tmp_path: Path) -> None:
-        """Runs without group_id are excluded from --list --groups."""
+        """Runs without group_id are excluded from list --groups."""
         _two_member_fixture(tmp_path)
         sd_c = tmp_path / ".leerie" / "repo-c"
         _write_run(sd_c, NON_GROUP_RUN, {
@@ -216,15 +216,15 @@ class TestListGroupsDispatch:
 
 
 # ---------------------------------------------------------------------------
-# --resume <group-id> eligibility filtering
+# resume <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestResumeDispatch:
-    """--resume <group-id> dispatches single-run --resume for paused members only."""
+    """resume <group-id> dispatches single-run resume for paused members only."""
 
     def test_resume_dispatches_paused_member_only(self, tmp_path: Path) -> None:
-        """Only the paused member (A) gets --resume; pushed member (B) does not."""
+        """Only the paused member (A) gets resume; pushed member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
@@ -279,15 +279,15 @@ class TestResumeDispatch:
 
 
 # ---------------------------------------------------------------------------
-# --finalize <group-id> eligibility filtering
+# finalize <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestFinalizeDispatch:
-    """--finalize <group-id> dispatches single-run --finalize for unpushed members."""
+    """finalize <group-id> dispatches single-run finalize for unpushed members."""
 
     def test_finalize_dispatches_unpushed_member_only(self, tmp_path: Path) -> None:
-        """Only the unpushed member (A) gets --finalize; pushed member (B) does not."""
+        """Only the unpushed member (A) gets finalize; pushed member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=log)
@@ -329,15 +329,15 @@ class TestFinalizeDispatch:
 
 
 # ---------------------------------------------------------------------------
-# --kill <group-id> eligibility filtering
+# kill <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestKillDispatch:
-    """--kill <group-id> dispatches single-run --kill for live (fly) members."""
+    """kill <group-id> dispatches single-run kill for live (fly) members."""
 
     def test_kill_dispatches_fly_member_only(self, tmp_path: Path) -> None:
-        """Only fly member (A, has fly_machine_id) gets --kill; local member (B) does not."""
+        """Only fly member (A, has fly_machine_id) gets kill; local member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
@@ -383,12 +383,12 @@ class TestKillDispatch:
 
 
 # ---------------------------------------------------------------------------
-# --stop <group-id> eligibility filtering
+# stop <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestStopDispatch:
-    """--stop <group-id> dispatches single-run --stop for running fly members.
+    """stop <group-id> dispatches single-run stop for running fly members.
 
     'Running' means: fly_machine_id set, no pushed_at, no killed_at, no paused_at.
     The two-member fixture has A as paused (not running) and B as pushed (not running),
@@ -419,7 +419,7 @@ class TestStopDispatch:
         return run_a, run_b
 
     def test_stop_dispatches_running_member_only(self, tmp_path: Path) -> None:
-        """--stop <group-id> stops only the running member, not the paused one."""
+        """stop <group-id> stops only the running member, not the paused one."""
         run_a, run_b = self._running_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
         result = _run(tmp_path, ["stop", GROUP_ID], stub=stub, stub_log=log)
@@ -504,7 +504,7 @@ class TestDualPurposeVerbFallback:
         assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_resume_group_id_not_chain_id_dispatches(self, tmp_path: Path) -> None:
-        """A group_id-only UUID is dispatched for --resume via group fallback."""
+        """A group_id-only UUID is dispatched for resume via group fallback."""
         sd_a = tmp_path / ".leerie" / "repo-a"
         _write_run(sd_a, RUN_ID_A, {
             "run_id": RUN_ID_A,
@@ -533,7 +533,7 @@ class TestDualPurposeVerbFallback:
         assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_finalize_group_id_not_chain_id_dispatches(self, tmp_path: Path) -> None:
-        """A group_id-only UUID is dispatched for --finalize via group fallback."""
+        """A group_id-only UUID is dispatched for finalize via group fallback."""
         sd_a = tmp_path / ".leerie" / "repo-a"
         _write_run(sd_a, RUN_ID_A, {
             "run_id": RUN_ID_A,

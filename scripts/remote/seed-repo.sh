@@ -329,7 +329,7 @@ seed_repo_clone() {
   # detached orchestrator we'll launch later) holding a stale fd and
   # causes getcwd() to fail downstream. Common symptom: `shell-init:
   # error retrieving current directory` from sub-shells, and claude
-  # --version timing out (its node runtime tries to stat ".").
+  # version timing out (its node runtime tries to stat ".").
   #
   # Also reset the bundle/tar staging paths in case a prior paused run
   # left them behind.

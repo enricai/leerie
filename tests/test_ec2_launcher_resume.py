@@ -1,4 +1,4 @@
-"""Pins `--resume` routing a paused EC2 run through `resume_instance()`
+"""Pins `resume` routing a paused EC2 run through `resume_instance()`
 in the `leerie` launcher's `RUNTIME=ec2` dispatch block.
 
 scripts/remote/ec2-resume-instance.sh ships `resume_instance()` and is
@@ -8,15 +8,15 @@ run-id's sidecar names an instance — but that seam (sidecar lookup ->
 resume_instance vs. provision_instance, and the IP-reassignment
 re-resolution surfacing all the way out to LEERIE_EC2_SSH_TARGET) had no
 launcher-level test. tests/test_ec2_launcher_stop.py pins the analogous
-`--stop` seam but through the early fast-path verb dispatch (before
-container preflight); `--resume` for EC2 instead lives inside the deep
+`stop` seam but through the early fast-path verb dispatch (before
+container preflight); `resume` for EC2 instead lives inside the deep
 `RUNTIME=ec2` elif dispatch block (leerie:6151+), so this file reuses
 tests/test_ec2_e2e_provision.py's `extract_ec2_dispatch_block` /
 `run_ec2_dispatch` / `stub_aws_env` harness and tests/ec2_stub.py's
 resource-tracking `aws` stub, mirroring
 tests/test_ec2_launcher_dispatch_e2e.py's import convention.
 
-The load-bearing risk here — distinct from --stop, which has no analogue
+The load-bearing risk here — distinct from stop, which has no analogue
 for it — is IP reassignment: EC2 hands out a new public IP on every
 stop/start cycle absent an attached Elastic IP (tests/ec2_stub.py's
 `_ip_gen` counter models this), so a launcher that cached the
@@ -110,7 +110,7 @@ def _write_ec2_sidecar(state_dir: Path, run_id: str, instance_id: str,
 
 
 def _resume_env(aws_dir: Path, run_id: str) -> tuple[dict, Path]:
-    """Build the env for a --resume dispatch: stub_aws_env's usual
+    """Build the env for a resume dispatch: stub_aws_env's usual
     provisioning env, plus IS_RESUME=true / LEERIE_RUN_ID set so the
     dispatch block's sidecar lookup (leerie:6251) actually fires, and
     stub_transport=True (stub_aws_env's default) so a successful resume

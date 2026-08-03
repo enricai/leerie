@@ -541,7 +541,7 @@ def test_resolve_volume_id_from_fly_reads_machine_mounts(tmp_path):
 
     Shape pinned against a live Fly machine: `machine list --json` carries
     `.config.mounts[].volume`, and still does while `state=stopped` (the
-    --stop-then-kill path). `machine status` has no --json flag, so it is
+    stop-then-kill path). `machine status` has no --json flag, so it is
     deliberately not used.
     """
     stub, log = _make_recording_flyctl(tmp_path)

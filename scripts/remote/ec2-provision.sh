@@ -253,7 +253,7 @@ decide_ec2_teardown() {
         echo "  Instance: $iid (still running on EC2)" >&2
         echo "================================================================" >&2
         # Intentionally NO stop_instance, NO terminate_instance. The user
-        # owns this instance until they explicitly --kill it.
+        # owns this instance until they explicitly kill it.
       fi
       ;;
     130|143)
@@ -461,7 +461,7 @@ provision_instance() {
   # DESIGN §6 "Run identifier": an ec2-instance.json sidecar (instance
   # id, region, created-at) is the EC2 analog of provision.sh's
   # fly-machine.json crash-recovery pointer — written unconditionally
-  # (not gated on LEERIE_RUN_ID) so --resume survives a Ctrl-C between
+  # (not gated on LEERIE_RUN_ID) so resume survives a Ctrl-C between
   # provision_instance() returning and the launcher minting a run id.
   if [ -n "$_state_base" ]; then
     local remote_dir="$_state_base/remote"

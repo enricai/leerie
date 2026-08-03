@@ -13,7 +13,7 @@
 # `integrate_wave`).  Branches the integrator cannot resolve are skipped
 # and reported.
 #
-# Usage (sourced by the leerie launcher's --finalize path):
+# Usage (sourced by the leerie launcher's finalize path):
 #
 #   source scripts/remote/collect-subtrees.sh
 #   collect_subtrees_remote "$FLY_APP" "$LEERIE_MACHINE_ID"

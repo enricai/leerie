@@ -225,7 +225,7 @@ def test_decide_teardown_rc11_destroys(tmp_path: Path):
     """rc=11 (EXIT_BUDGET_INFEASIBLE, DESIGN §13 *Budget feasibility —
     fail fast at the cheapest moment*) → destroy, not pause.
 
-    A budget-infeasible run is unrecoverable: --resume would die at
+    A budget-infeasible run is unrecoverable: resume would die at
     `_run_phases`'s resume guard (no `waves` field), and the run made
     no commits to finalize. Routing rc=11 to the pause arm would leave
     the user paying for a Fly volume indefinitely. The correct
@@ -297,7 +297,7 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     the user stopped watching the local tail — not that they want to destroy
     the run. The orchestrator on the machine is still running. The trap
     must neither destroy nor stop the machine, and must print the hints
-    that point to --resume / --stop / --kill."""
+    that point to resume / stop / kill."""
     result, sidecar = _decide_teardown_with_rc(tmp_path, "130", run_id="my-run-abc")
     assert result.returncode == 0, result.stderr
     # No flyctl invocations at all — the stub never gets called.

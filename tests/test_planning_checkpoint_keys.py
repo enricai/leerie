@@ -63,7 +63,7 @@ class TestCheckpointKeysDeclaredAndDocumented:
 class TestCheckpointKeysRoundTrip:
     """Behavioral: all seven keys survive a real State.save() to disk,
     byte-equal via json. A checkpoint that cannot be read back post-mortem
-    is worthless — this is the guarantee `--resume` rehydration depends on."""
+    is worthless — this is the guarantee `resume` rehydration depends on."""
 
     def test_all_checkpoint_keys_survive_state_save(self, leerie):
         plans_payload = [
@@ -106,7 +106,7 @@ class TestCheckpointKeysRoundTrip:
     def test_reloaded_state_is_byte_equal_via_load(self, leerie):
         """State.load() (not just a bare json.loads of the file) must
         reproduce the exact same in-memory dict for every checkpoint key —
-        this is the real `--resume` path, not just the on-disk artifact."""
+        this is the real `resume` path, not just the on-disk artifact."""
         payload = {k: {"n": i} for i, k in enumerate(CHECKPOINT_KEYS)}
 
         with tempfile.TemporaryDirectory() as d:

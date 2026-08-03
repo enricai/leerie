@@ -75,13 +75,13 @@ def test_current_phase_stamped_after_finalize_sh_succeeds(leerie):
     current_phase were stamped on phase entry (before finalize.sh), a
     *died* finalize would leave state byte-identical to a *succeeded* one
     (finished_at set AND current_phase == "phase 6: finalize"), and the
-    --resume completion guard in _run_phases would declare the run
+    resume completion guard in _run_phases would declare the run
     "already completed" and hand the host launcher an empty run branch to
     push — which then fails at `gh pr create` with "No commits between …".
 
     Stamping AFTER the finalize.sh success check keeps a died finalize
     resumable: current_phase stays at its pre-finalize value, the resume
-    guard falls through, and --resume re-runs finalize.sh's non-empty
+    guard falls through, and resume re-runs finalize.sh's non-empty
     check. This test pins the ordering by source position."""
     src = inspect.getsource(leerie.phase_finalize)
     finalize_call = src.index('_run_script("finalize.sh"')
@@ -90,7 +90,7 @@ def test_current_phase_stamped_after_finalize_sh_succeeds(leerie):
         'phase_finalize must set current_phase="phase 6: finalize" AFTER '
         'the _run_script("finalize.sh") call, not before it. Stamping before '
         "makes a died finalize indistinguishable from a successful one to "
-        "the --resume completion guard, which then pushes an empty branch."
+        "the resume completion guard, which then pushes an empty branch."
     )
     # And specifically after the die-on-nonzero check, so a nonzero
     # finalize.sh never reaches the stamp.
@@ -103,7 +103,7 @@ def test_current_phase_stamped_after_finalize_sh_succeeds(leerie):
 
 
 def test_resume_completion_guard_keys_on_current_phase(leerie):
-    """The --resume completion guard (in _run_phases) treats a run as
+    """The resume completion guard (in _run_phases) treats a run as
     terminal when finished_at is set AND current_phase == "phase 6:
     finalize". This test pins that the guard reads current_phase — the
     discriminator the Fix-1 ordering change relies on. If the guard stopped

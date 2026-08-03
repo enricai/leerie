@@ -99,7 +99,7 @@ status, branch, notes). Status derived from run.json fields
 ### `list` — list chains
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" list --chains
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" list chains
 ```
 
 Iterates run.json files,

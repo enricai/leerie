@@ -506,4 +506,4 @@ def test_gate_audit_key_written_only_on_a_clean_pass(leerie):
     write_at = src.index('st.data["wiring_gate"] =')
     assert die_at < write_at, (
         "the die() must precede the audit write, so a failing gate leaves "
-        "no key behind for --resume to skip on")
+        "no key behind for resume to skip on")

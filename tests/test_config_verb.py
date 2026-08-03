@@ -56,7 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # at leerie line ~558.  Key invariants the harness encodes:
 #
 #  1. `config` is listed in the ownership-short-circuit guard (alongside
-#     --version) so it never claims a state directory.
+#     version) so it never claims a state directory.
 #  2. After the case arm runs, `exit 0` fires before any container path.
 #  3. Bare mode shells out to python3 inline (no subprocess to leerie.py).
 #  4. --init writes .leerie/config.toml via python3 inline snippet.

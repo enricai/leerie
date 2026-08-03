@@ -14,7 +14,7 @@ from a worker's Bash tool would fall through to system PATH, where
 Go isn't installed.
 
 `phase_provision` exports `MISE_OVERRIDE_CONFIG_FILENAMES` into
-`os.environ` directly, and the `--resume` branch re-exports from
+`os.environ` directly, and the `resume` branch re-exports from
 persisted state. Worker subprocesses spawned by `_invoke` inherit the
 parent env (no `env=` passed), so they pick the var up automatically.
 """
@@ -24,7 +24,7 @@ import os
 
 
 def test_resume_reexports_override_env_when_set(leerie, tmp_path, monkeypatch):
-    """On `--resume`, the orchestrator must re-export
+    """On `resume`, the orchestrator must re-export
     MISE_OVERRIDE_CONFIG_FILENAMES from persisted state so downstream
     implementer/conformer workers inherit it. Without this, mise's
     worker-side discovery wouldn't find the synthesized go pin."""

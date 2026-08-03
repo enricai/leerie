@@ -58,7 +58,7 @@ _runtime_run() {
 
 _runtime_have_runnable() {
   # `command -v` returns success for shimmed entries (pyenv) that can't
-  # actually exec — invoke `version` to confirm it really runs.
+  # actually exec — invoke `--version` to confirm it really runs.
   "$1" --version >/dev/null 2>&1
 }
 

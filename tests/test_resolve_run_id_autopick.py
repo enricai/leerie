@@ -1,6 +1,6 @@
-"""Tests for `resolve_run_id`'s bare-`--resume` auto-pick (DESIGN §6).
+"""Tests for `resolve_run_id`'s bare-`resume` auto-pick (DESIGN §6).
 
-Bare `--resume` used to require an explicit run-id as soon as a second run
+Bare `resume` used to require an explicit run-id as soon as a second run
 existed — unusable on a repo with dozens of finished runs. It now picks the
 most recent *resumable* run: `in-progress` / `paused` / `incomplete`.
 
@@ -133,13 +133,13 @@ def test_report_picks_newest_regardless_of_status(leerie, tmp_path):
             run_json={"pushed_at": "2026-06-01T02:00:00+00:00",
                       "pr_url": "https://example.com/pr/1"})
     assert leerie.resolve_run_id(tmp_path, None) == "b" * 64
-    # …while --resume skips it for the older run that still has work.
+    # …while resume skips it for the older run that still has work.
     assert leerie.resolve_run_id(
         tmp_path, None, resumable_only=True) == "a" * 64
 
 
 def test_resume_caller_opts_into_the_filter(leerie):
-    """Source-coupling guard: the filter only helps if --resume passes it.
+    """Source-coupling guard: the filter only helps if resume passes it.
     The other two call sites (--report, --phase) must NOT."""
     import inspect
     src = inspect.getsource(leerie.main)

@@ -186,7 +186,7 @@ def test_sync_failure_on_clean_exit_leaves_instance_running_no_terminate_call(tm
 
 
 def test_sync_failure_on_clean_exit_records_sync_fail_reason(tmp_path):
-    """The sidecar gets sync_failed_at + sync_fail_reason so --list/--status
+    """The sidecar gets sync_failed_at + sync_fail_reason so list/status
     can surface the failure."""
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)

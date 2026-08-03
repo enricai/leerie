@@ -126,7 +126,7 @@ except Exception:
   fi
 
   # Clear the pause sentinels so the run no longer renders as
-  # paused in `leerie list --status paused` once the resume succeeds.
+  # paused in `leerie list status paused` once the resume succeeds.
   if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
     update_run_json "$sidecar" \
       paused_at "" \

@@ -144,8 +144,8 @@ run() {
 have_runnable() {
   # `command -v` returns success for shimmed entries (pyenv) that can't
   # actually exec — invoke `--version` to confirm it really runs. (Generic
-  # helper for git/curl/claude/colima/nerdctl — never leerie itself, whose
-  # own bare `version` verb is checked separately below.)
+  # helper for git/curl/claude/colima/nerdctl, none of which are leerie's
+  # own bare-verb CLI.)
   "$1" --version >/dev/null 2>&1
 }
 

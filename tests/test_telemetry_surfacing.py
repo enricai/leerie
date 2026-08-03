@@ -2,7 +2,7 @@
 
   - `_classify_failure_kind` taxonomy (Part 4): every branch, incl. the
     real-world is_error/parsed_ok anomaly and the {401,429,529} split.
-  - `--list` cost column (Part 3): rendered from state.json telemetry,
+  - `list` cost column (Part 3): rendered from state.json telemetry,
     "—" for runs with no telemetry (orphans), right-aligned.
   - `compose_pr_body` cost line (Part 2): present when telemetry exists,
     omitted otherwise.
@@ -177,7 +177,7 @@ def test_failure_kind_incomplete(leerie):
 
 
 # ---------------------------------------------------------------------------
-# Part 3 — --list cost column
+# Part 3 — list cost column
 # ---------------------------------------------------------------------------
 
 def test_list_runs_cost_column_header(leerie, tmp_path, capsys):

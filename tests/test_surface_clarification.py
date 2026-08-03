@@ -157,7 +157,7 @@ def test_non_tty_exit_code_is_exit_needs_answers(leerie, state, monkeypatch):
 def test_non_tty_does_not_modify_answers(leerie, state, monkeypatch):
     """The non-TTY path defers the answer — it shouldn't pre-populate
     anything in st.data['answers']. (The answer arrives later via
-    --resume --answers FILE, handled by _absorb_supplied_answers.)
+    resume --answers FILE, handled by _absorb_supplied_answers.)
     Pin this so a future change that, say, writes a stub answer to
     avoid the re-ask doesn't accidentally land."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)

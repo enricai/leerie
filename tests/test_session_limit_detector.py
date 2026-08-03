@@ -5,7 +5,7 @@ The detector is the single load-bearing surface for the rate-limit
 auto-resume contract (DESIGN §6 *Cleanup on abnormal exit*): if it
 returns a `RateLimitedExit` with a parseable `reset_at`, main() will
 sleep until that moment and `os.execv` the orchestrator into
-`--resume` (sys.executable __file__ --resume --run-id <id>). A wrong
+`resume` (sys.executable __file__ resume --run-id <id>). A wrong
 parse here would produce a wrong-time sleep — strictly worse than no
 auto-resume — so the detector must be conservative: only return a
 non-None `reset_at` when every step of the parse (regex match,
@@ -129,7 +129,7 @@ def test_general_rate_limit_mention_returns_none(leerie):
 
 def test_unknown_timezone_returns_exit_with_none_reset(leerie):
     """An unparseable timezone name must produce a clean fallback to
-    manual --resume, not a wrong-time sleep."""
+    manual resume, not a wrong-time sleep."""
     text = "You've hit your session limit · resets 3:10am (Mars/Olympus)"
     exc = leerie._detect_session_limit(text)
     assert exc is not None
@@ -215,7 +215,7 @@ def test_main_rate_limit_arm_appears_before_keyboard_interrupt():
 
 # --- _sleep_then_reexec (auto-resume tail) --------------------------------
 # Shared by the clock-based rate-limit arms: cleanup → sleep → os.execv
-# --resume. A reset_at=None rate-limit (unparseable session-limit message)
+# resume. A reset_at=None rate-limit (unparseable session-limit message)
 # auto-resumes on a fixed backoff instead of exiting 75 — these pin that
 # behavior. Out-of-credits does NOT route through this helper (it
 # pauses-and-surfaces); see test_main_out_of_credits_pauses_and_surfaces.
@@ -229,7 +229,7 @@ def _fake_st(run_id="run-abc"):
 
 def test_sleep_then_reexec_cleans_sleeps_and_reexecs(leerie, monkeypatch):
     """Happy path: cleanup runs, time.sleep gets the wait, os.execv is
-    invoked with `--resume --run-id <id>` (and never returns)."""
+    invoked with `resume --run-id <id>` (and never returns)."""
     calls = {}
     monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit",
                         lambda st, **k: calls.setdefault("cleanup", True))
@@ -250,13 +250,13 @@ def test_sleep_then_reexec_cleans_sleeps_and_reexecs(leerie, monkeypatch):
     assert calls.get("slept") == 300
     argv = calls.get("execv")
     assert argv is not None
-    assert "--resume" in argv and "--run-id" in argv
+    assert "resume" in argv and "--run-id" in argv
     assert argv[argv.index("--run-id") + 1] == "run-xyz"
 
 
 def test_sleep_then_reexec_ctrl_c_during_sleep_returns_130(leerie, monkeypatch):
     """Ctrl-C during the sleep → returns 130 (caller sets exit_code) and does
-    NOT os.execv — state is preserved for a manual --resume."""
+    NOT os.execv — state is preserved for a manual resume."""
     execv_called = {"v": False}
     monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
 
@@ -293,7 +293,7 @@ def test_sleep_then_reexec_sigterm_during_sleep_returns_128_plus_signum(
 def test_sleep_then_reexec_execv_failure_returns_75(leerie, monkeypatch):
     """If os.execv itself fails (should-never-happen), the helper catches the
     OSError and returns 75 (EX_TEMPFAIL) rather than letting a bare traceback
-    escape past the sibling except arms. State preserved for a manual --resume."""
+    escape past the sibling except arms. State preserved for a manual resume."""
     monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
     monkeypatch.setattr(leerie.time, "sleep", lambda _s: None)
 
@@ -322,7 +322,7 @@ def test_rate_limit_no_reset_uses_fixed_backoff_not_exit_75(leerie):
 def test_main_out_of_credits_pauses_and_surfaces(leerie):
     """Source-pin the pause-and-surface contract: the RateLimitedExit arm
     checks `e.out_of_credits` and, for that case, exits EXIT_LOCKED with a
-    --resume hint instead of calling _sleep_then_reexec (out-of-credits has
+    resume hint instead of calling _sleep_then_reexec (out-of-credits has
     no reset clock, so auto-resuming would spin against the wall). The check
     must sit inside the RateLimitedExit arm and before the reset_at branch."""
     import inspect

@@ -1,4 +1,4 @@
-"""Regression for the --resume self-heal probe.
+"""Regression for the resume self-heal probe.
 
 DESIGN §6 *Shallow seeding for heavy repos* (resume corollary). When
 the initial seed dies before completing, /work is left partial/absent

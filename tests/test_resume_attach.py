@@ -1,10 +1,10 @@
-"""Invariants for the `--resume` smart router (DESIGN §6 *Smart resume
+"""Invariants for the `resume` smart router (DESIGN §6 *Smart resume
 in remote mode*).
 
 Two surfaces pinned here:
 
   1. Auto-discovery from $LEERIE_STATE_HOST_DIR/remote/*.json when
-     `--resume` is given without `--run-id`. Mirrors the Strategy B
+     `resume` is given without `--run-id`. Mirrors the Strategy B
      PID-scan that used to live in `scripts/remote/attach.sh:119-166`.
      Single live record → resolves LEERIE_RUN_ID and continues; multiple
      → list and exit; zero → fall through to existing "no Fly machine
@@ -20,7 +20,7 @@ Two surfaces pinned here:
 
   3. Coupling: the launcher source must contain the auto-discovery
      block, the rc=75 pivot, and the four sub-mode flags. The
-     `--attach` case-arm and `scripts/remote/attach.sh` must be gone.
+     `attach` case-arm and `scripts/remote/attach.sh` must be gone.
 
 The auto-discovery harness mirrors the launcher dispatch verbatim
 (same pattern as test_launcher_resume_fly_lookup.py). The
@@ -106,11 +106,11 @@ except Exception:
 ' "${_active_records[0]}" 2>/dev/null || true)"
       export LEERIE_RUN_ID
       if [ -n "$LEERIE_RUN_ID" ]; then
-        remote_log "--resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+        remote_log "resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
       fi
       ;;
     *)
-      remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
+      remote_log "resume: multiple active launches — pass the run-id to disambiguate:"
       for _f in "${_active_records[@]}"; do
         python3 -c "
 import json, sys
@@ -341,7 +341,7 @@ def test_tail_helper_autofinalize_sets_token_in_payload(tmp_path: Path):
 
 
 # =========================================================================
-# Coupling: launcher source pins for the new --resume surface
+# Coupling: launcher source pins for the new resume surface
 # =========================================================================
 
 def test_launcher_contains_auto_discovery_block():
@@ -413,7 +413,7 @@ def test_launcher_strips_submode_flags_from_rewritten_args():
     for flag in ("--shell)", "--auto-finalize)"):
         assert flag in launcher, f"Missing case-arm: {flag}"
     # Spot-check that the strip-comment is present.
-    assert "opts into bash shell on the --resume rc=75 pivot" in launcher, (
+    assert "opts into bash shell on the resume rc=75 pivot" in launcher, (
         "--shell filter arm's launcher-only marker missing"
     )
 
@@ -421,7 +421,7 @@ def test_launcher_strips_submode_flags_from_rewritten_args():
 def test_attach_case_arm_is_id_dispatched():
     """The attach case-arm exists and dispatches by ID type.
 
-    Previously --attach was an out-of-band launcher verb that just
+    Previously attach was an out-of-band launcher verb that just
     SSH'd into a Fly machine. That one was removed. Under v5 Shape A
     attach is an ID-dispatched verb: UUID → poll
     $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by chain_id until
@@ -636,7 +636,7 @@ finally:
   rm -f "$_early_probe_stderr"
 
   if [ "$_early_probe_rc" = "75" ]; then
-    remote_log "--resume: early probe detected live orchestrator — skipping seed"
+    remote_log "resume: early probe detected live orchestrator — skipping seed"
     _attach_to_live_orchestrator
     _skip_seed_launch=true
   fi

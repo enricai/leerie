@@ -92,7 +92,7 @@ def _build_self_stub(
         mkdir -p "$_state/remote" "$_state/runs/$_mid"
         # Capture prompt (first positional arg before --runtime).
         _prompt="$1"
-        # Find chain-id (passed as --chain-id <uuid>).
+        # Find --chain-id (passed as --chain-id <uuid>).
         _cid=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
@@ -306,7 +306,7 @@ def test_multi_wave_chain_id_threaded_to_each_job(tmp_path: Path) -> None:
     p1 = _write_prompt(tmp_path, "b.md")
     result = _run_chain(tmp_path, [[p0], [p1]])
     assert result.returncode == 0, result.stderr
-    # Extract the chain-id used in each invocation.
+    # Extract the --chain-id used in each invocation.
     chain_ids = []
     for line in result.self_log.splitlines():
         if "--chain-id" in line:
@@ -663,7 +663,7 @@ def test_chain_runs_filter_rejects_unknown_verb(tmp_path: Path) -> None:
          f"source '{log_sh}'; "
          f"source <(awk '/^_chain_runs_filter\\(\\)/,/^}}$/' '{LAUNCHER}'); "
          f"LEERIE_STATE_HOST_DIR=/tmp USER_REPO=/tmp "
-         f"_chain_runs_filter 'fake-chain-id' 'stopp'"],  # typo: stopp
+         f"_chain_runs_filter 'fake---chain-id' 'stopp'"],  # typo: stopp
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 2, (

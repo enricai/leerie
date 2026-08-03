@@ -5,13 +5,13 @@ Background: two multi-worker runs sharing one 8 GB Colima VM exhausted
 all memory; the kernel's global OOM-killer killed the host `nerdctl`
 clients (every in-container process is oom_score_adj:-998), orphaning the
 still-alive orchestrators, which kept holding the run-dir flock — so every
-`--resume` exited EXIT_LOCKED=75. Four fixes close this:
+`resume` exited EXIT_LOCKED=75. Four fixes close this:
 
   A — aggregate container memory cap (container-entry.sh sets
       leerie.slice/memory.max from VM MemTotal).
   D — INT/TERM/EXIT trap on the local run path kills the container via
       the cidfile before the launcher exits.
-  E — stale-container reaper on --resume kills an orphaned Up container
+  E — stale-container reaper on resume kills an orphaned Up container
       whose owning launcher (leerie.launcher_pid label) is dead.
   I — completion gate (tested in test_derive_run_status.py + below).
 

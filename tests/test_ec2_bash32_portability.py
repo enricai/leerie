@@ -21,7 +21,7 @@ array empty) and asserts the shell does not complain. A new
 macOS.
 
 Every EC2 launcher arm wired after this guard was first written
-(test-001..test-005: `--stop`, `--kill`, `--accept-blocked`, `--resume`,
+(test-001..test-005: `stop`, `kill`, `accept-blocked`, `resume`,
 and the full `RUNTIME=ec2` dispatch) builds its own `LEERIE_AWS_PROFILE`/
 `LEERIE_AWS_REGION`-derived optional-arg array
 (`_ab_aws_creds_args`/`_stop_aws_creds_args`/`_kill_ec2_creds_args`/
@@ -84,8 +84,8 @@ def _requires_bash32():
 
 # Every EC2 shell file that the runtime sources. `ec2-lib.sh` is sourced
 # by the others, so it is covered transitively as well as directly.
-# `ec2-resume-instance.sh` is sourced by the launcher's `--stop`/`--kill`/
-# `--accept-blocked`/`--resume` arms (all wired by test-001..test-005);
+# `ec2-resume-instance.sh` is sourced by the launcher's `stop`/`kill`/
+# `accept-blocked`/`resume` arms (all wired by test-001..test-005);
 # `ec2-fetch-branch.sh` and `ec2-seed-auth.sh` are sourced by the full
 # `RUNTIME=ec2` dispatch path.
 _EC2_SCRIPTS = [
@@ -236,7 +236,7 @@ def test_no_namerefs_in_launcher():
 # --- Launcher-arm coverage --------------------------------------------------
 #
 # test-001..test-005 wired real bash directly into the `leerie` launcher
-# for the EC2 arms (`--stop`, `--kill`, `--accept-blocked`, and the full
+# for the EC2 arms (`stop`, `kill`, `accept-blocked`, and the full
 # `RUNTIME=ec2` dispatch), each building its own optional-arg array from
 # LEERIE_AWS_PROFILE/LEERIE_AWS_REGION and expanding it into
 # resolve_aws_credentials. That is new bash on the same class of surface

@@ -1,6 +1,6 @@
 """Tests for scripts/remote/collect-subtrees.sh.
 
-collect-subtrees.sh is sourced by the leerie launcher's --finalize path.
+collect-subtrees.sh is sourced by the leerie launcher's finalize path.
 It SSHes a bash payload to the Fly Machine that runs setup-run.sh +
 integrate.sh for un-merged subtask branches. These tests exercise the
 payload logic in isolation via subprocess, with flyctl and claude stubbed

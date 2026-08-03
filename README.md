@@ -268,7 +268,7 @@ leerie stop     <chain-id>   # pause every running chain run
 leerie kill     <chain-id>   # destroy every chain run's machine
 leerie resume   <chain-id>   # resume every paused chain run
 leerie finalize <chain-id>   # push + open PR for every unpushed run
-leerie list --chains         # group runs by chain_id
+leerie list chains         # group runs by chain_id
 
 # Run-groups: launch N single-repo leerie runs together as a coordinated
 # unit. Each member runs in its own state dir (basename-keyed), its own
@@ -347,7 +347,6 @@ Complete reference for every CLI flag, environment variable, and
 | `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
-| `--version` | — | Print `leerie <version>` and exit. |
 | `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
 | `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
@@ -384,6 +383,14 @@ below for full details and modifier flags.
 | `kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
 | `finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
 | `re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
+| `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
+| `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
+| `accept-blocked <run-id> <subtask-id>` | Accept a blocked subtask so `resume` skips it. |
+| `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see `docs/IMPLEMENTATION.md` "Chain verbs"). |
+| `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see `docs/IMPLEMENTATION.md` "Run-group verbs"). |
+| `version` | Print `leerie <version>` and exit. |
+
+`resume` and `list` are documented in the "CLI flags" table above (they interact with the `task` positional and `--run-id`/`--phase`); the rest of the bare verbs are listed here.
 
 **Resume modifiers (used with `resume`):**
 
@@ -640,7 +647,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
 | `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
 | `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |
-| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch --config chain/fly.toml`. |
+| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch config chain/fly.toml`. |
 | `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |

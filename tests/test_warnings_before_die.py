@@ -92,7 +92,7 @@ def test_integrate_wave_logs_warnings_before_die(leerie):
 
 def test_integrate_wave_records_blocked_before_die(leerie):
     """The other half of the local convention its own neighbor documents:
-    record the block to state before dying, so `--resume` and the operator
+    record the block to state before dying, so `resume` and the operator
     can see why the run stopped."""
     src = inspect.getsource(leerie.integrate_wave)
     blocked_at = src.index('setdefault("blocked", {})[sid]')
