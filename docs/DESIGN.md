@@ -5371,12 +5371,38 @@ investigation found `check_prescribed_command_coverage` gating on
 `runs_commands`, a planner self-report field populated on **4.9%** of subtasks
 (24 of 486 across 38 plans; 74% of plans have none at all). Being pure Python
 made it deterministic, not independent — it reads a field the planner can
-simply omit, so it fired almost always and no re-plan could satisfy it. This
+simply omit, so it fires on nearly every task that prescribes a command. This
 repeats the trap already documented for `migration_targets` in §8 (*"both
 signals come from the same non-adversarial planner self-report"*). Generalised:
 a floor must either read something the planner cannot omit — the repository,
 the diff, the dependency graph — or repair the omission itself rather than
 re-driving the worker that made it.
+
+**Repairing an omitted self-report beats re-driving for it.** The floor above
+*is* satisfiable: told explicitly, planners do fill the field — run
+`d8a764f3…` went from 0 of 35 subtasks carrying `runs_commands` (8 floor
+issues) to 14 of 36 (0 issues) after its re-plan. What is wrong is the price.
+That re-plan cost ~125 of the run's 201 spawns — twice the entire first
+planning pass — and the run then died of budget exhaustion having written no
+code.
+
+leerie already holds the prescribed commands as structured classifier output,
+so `repair_prescribed_commands` synthesises a subtask that runs them, at zero
+worker cost, before the floor is evaluated. A repairable gap therefore never
+reaches the re-plan path. This is the wiring gate's *detect → repair what is
+unambiguous → re-drive only what is not* contract applied to the gate whose
+remedy was the most expensive in the system.
+
+The repair **synthesises rather than picking an owner**. Attaching the
+commands to "the subtask that owns verification" was prototyped and rejected:
+against `d8a764f3`'s real plan a verification-shaped matcher hits 32 of 36
+subtasks, so an exactly-one-owner rule would never fire and a looser one would
+attach arbitrarily. A dedicated subtask whose entire content is running the
+prescribed commands cannot be wrong about intent. It depends on the plan's
+current sinks, so it is acyclic by construction and schedules alone in the
+final wave. Validated across every corpus run carrying a prescribed procedure:
+5 of 5 repaired to a clean floor with `schedule()` and `validate_plan()`
+passing, 3 already-clean runs correctly untouched.
 
 ### Task-referenced file extraction
 

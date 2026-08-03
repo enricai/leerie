@@ -19597,6 +19597,18 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
 
     def _check_adherence(judge_result: dict) -> list[str]:
         last_judge_result[0] = judge_result
+        # Repair BEFORE evaluating the floor (DESIGN §5 *detect → repair what
+        # is unambiguous → re-drive only what is not*). The floor reads
+        # `runs_commands`, a planner self-report filled on 4.9% of subtasks,
+        # so it fires on nearly every prescribed-procedure task and its only
+        # remedy was a ~125-spawn re-plan. Attaching the commands leerie
+        # already holds costs zero workers, so a repairable gap never reaches
+        # the re-plan path at all.
+        repaired = repair_prescribed_commands(
+            cur_plans[0], prescribed_procedure)
+        if repaired:
+            log(f"  adherence-gate: synthesised {repaired} to run the task's "
+                f"prescribed commands (mechanical repair — no re-plan)")
         floor_issues = check_prescribed_command_coverage(
             prescribed_procedure,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
@@ -20648,6 +20660,95 @@ def check_budget_feasibility(st: State, caps: dict,
             f"still fire if the estimate was correct).",
             code=EXIT_BUDGET_INFEASIBLE,
         )
+
+
+def repair_prescribed_commands(plans: list[dict],
+                               prescribed: dict) -> str | None:
+    """Attach the task's prescribed commands to the plan mechanically.
+
+    Returns the synthesised subtask's id, or None when nothing was repaired
+    (the floor is already clean, or the plan is too degenerate to host a
+    subtask). Mutates `plans` in place, mirroring `_repair_missing_requires`'
+    contract: never raises, and declines rather than guessing.
+
+    **Why repair rather than re-drive.** `check_prescribed_command_coverage`
+    reads `runs_commands`, a planner self-report field populated on **4.9% of
+    subtasks** (24 of 486 across 38 real plans; 74% of plans have none at all).
+    So on any task that prescribes a command the floor fires almost
+    everywhere, and its only remedy was a full re-plan. Measured on run
+    `d8a764f3…`: the first plan had 0 of 35 subtasks carrying `runs_commands`
+    and 8 floor issues; the re-plan fixed it (14 of 36, 0 issues) but cost
+    ~125 of the run's 201 spawns — twice the entire first planning pass — and
+    the run then died of budget exhaustion having written no code.
+
+    The re-plan works. It is the *price* that is wrong: leerie already holds
+    the prescribed commands as structured classifier output, so attaching them
+    is a mechanical plan repair costing zero workers. This is the same
+    detect-repair-then-die contract the wiring gate already established
+    (DESIGN §5), applied to the gate whose remedy was most expensive.
+
+    **Synthesise, don't guess an owner.** Picking "the subtask that owns
+    verification" was tried and rejected: against `d8a764f3`'s real plan a
+    verification-shaped matcher hits 32 of 36 subtasks, so an
+    "exactly-one-owner" rule would essentially never fire and a looser one
+    would attach the commands somewhere arbitrary. A dedicated subtask whose
+    entire content is running the prescribed commands cannot be wrong about
+    intent.
+
+    The synthesised subtask depends on the plan's current sinks, so it is
+    acyclic by construction (nothing depends on it) and schedules alone in the
+    final wave. Validated against every corpus run carrying a prescribed
+    procedure: 5 of 5 repaired to a clean floor with `schedule()` and
+    `validate_plan()` passing, and 3 already-clean runs correctly untouched."""
+    subs = [s for p in plans for s in (p.get("subtasks") or [])]
+    if not check_prescribed_command_coverage(prescribed, subs):
+        return None
+    cmds = [c for c in (prescribed.get("commands") or [])
+            if isinstance(c, str) and c.strip()]
+    if not cmds:
+        return None
+    host = next((p for p in plans if p.get("subtasks")), None)
+    if host is None:
+        # No subtask anywhere to hang a dependency on, and no domain to derive
+        # an id prefix from. Decline; the floor still gates.
+        return None
+    prefix = CATEGORY_ABBREV.get(host.get("domain"), "")
+    if not prefix:
+        # A synthetic plan (e.g. the reconciler's) whose `domain` is not a real
+        # category cannot supply a valid id prefix, and `validate_plan` rejects
+        # ids without one. Decline rather than emit an invalid subtask.
+        return None
+    prefix += "-"
+    ids = {s["id"] for s in subs if isinstance(s.get("id"), str)}
+    # Sinks: nothing depends on them, so depending on all of them puts the
+    # verifier strictly last without inventing an ordering opinion.
+    depended = {d for s in subs for d in (s.get("depends_on") or [])}
+    sinks = sorted(i for i in ids if i not in depended)
+    n = 1
+    while f"{prefix}{900 + n:03d}" in ids:
+        n += 1
+    sid = f"{prefix}{900 + n:03d}"
+    host["subtasks"].append({
+        "id": sid,
+        "title": "Run the task's prescribed verification commands",
+        "intent": (
+            "Run every command the task prescribes, in the order given, and "
+            "fix whatever they surface. This subtask exists because the task "
+            "explicitly prescribed these commands as its verification "
+            "procedure."),
+        "scope_note": "Verification only — no feature work.",
+        "files_likely_touched": [],
+        "depends_on": sinks,
+        "requires": [],
+        "provides": [],
+        "success_criteria_seed": (
+            "every prescribed command has been run and passes: "
+            + "; ".join(cmds)),
+        "size": "small",
+        "investigation_notes": "",
+        "runs_commands": list(cmds),
+    })
+    return sid
 
 
 def check_replan_affordable(st: State, caps: dict, gate: str,
