@@ -146,25 +146,38 @@ def test_all_valid_samples_are_unaffected(leerie, tmp_path):
     assert len(best["subtasks"]) == 5, "most subtasks still wins the tiebreak"
 
 
-def test_selection_is_biased_toward_smaller_plans_when_issues_scale(
-        leerie, tmp_path):
-    """Documents a live consequence of the primary sort key, beyond the empty
-    case this gate fixes.
+def test_selection_no_longer_penalises_plan_size(leerie, tmp_path):
+    """The general case of the same defect the validity gate fixes at its
+    extreme.
 
-    Per-subtask findings (`PHANTOM_PATH` here) make issue count grow with plan
-    size, so a LARGER plan loses on the primary key to a smaller one — the
-    same unfalsifiability that made the empty plan win, just less extreme. The
-    validity gate deliberately does NOT address this: correcting it needs a
-    severity channel (so advisory per-subtask findings stop counting as
-    defects), which is a separate, larger change. Pinned here so the residual
-    bias is recorded rather than mistaken for fixed."""
+    Per-subtask ADVISORY findings (`PHANTOM_PATH` here, one per subtask) used
+    to make issue count grow ~1:1 with plan size, so a larger plan lost on the
+    primary key to a smaller one — a large plan had to be flawless to beat a
+    small plan with one flaw. Ranking on gating findings only removes the
+    coupling, and the subtask-count tiebreak then decides as intended.
+
+    Note `src/` is deliberately NOT created here, so the paths are phantom and
+    the advisory findings really do fire — otherwise this would pass with no
+    advisory findings present at all and prove nothing."""
     small, large = _plan(2), _plan(5)
+    assert leerie.check_planner_output(
+        large, tmp_path, "feature-implementation"), (
+        "fixture must actually produce findings or this test is vacuous")
     best = leerie._select_best_planner_sample(
         [small, large], tmp_path, "feature-implementation")
-    assert best is small, (
-        "if this now selects the larger plan, the issue-count/plan-size "
-        "coupling has changed — re-check the severity work before removing "
-        "this test")
+    assert best is large, (
+        "advisory per-subtask findings must not count toward selection")
+
+
+def test_gating_findings_still_decide_selection(leerie, tmp_path):
+    """The control for the test above: a GATING finding must still lose a
+    sample the ranking, or the severity split would have disarmed selection
+    rather than de-biased it. `EMPTY_CRITERIA` is gating."""
+    clean, broken = _plan(2), _plan(2)
+    broken["subtasks"][0]["success_criteria_seed"] = ""
+    best = leerie._select_best_planner_sample(
+        [broken, clean], tmp_path, "feature-implementation")
+    assert best is clean
 
 
 def test_blocked_sample_still_selectable_against_an_empty_ready(

@@ -5325,6 +5325,59 @@ The conformer loop (`_run_conformance_phase`) is the original instance
 of this pattern — it loops on observable build/lint/test signals. The
 generic `_run_checked_loop` extends it to all workers.
 
+#### Findings carry a severity; only gating findings re-invoke
+
+A check function's findings are not all the same kind of thing. Some name a
+defect that makes the output **unusable** — a dependency on a subtask that
+does not exist, a cycle, a subtask with no success criteria. Others are
+**advice** about a judgement call that is frequently correct as it stands: two
+subtasks touching one file is often legitimate, and a path with no existing
+ancestor directory is exactly what a subtask that *creates* a new module looks
+like.
+
+Treating both as retry triggers is a mistake with two distinct costs, both
+measured on the 2026-08-03 runs:
+
+- **Advice cannot converge, so it burns the whole retry budget.**
+  `INTRA_DOMAIN_OVERLAP`'s own text is *"consider merging or splitting"*. It
+  went 43 → 12 → 6 across every planner in both runs and never reached zero,
+  exhausting the round cap every time — because there was frequently nothing
+  wrong to fix.
+- **Per-subtask advice turns the retry count into a proxy for plan size.**
+  Findings like `PHANTOM_PATH` fire once per offending subtask, so issue count
+  scales ~1:1 with subtask count. Since multi-sample selection ranks on fewest
+  issues, a large plan must be flawless to beat a small plan with one flaw —
+  and an *empty* plan, having nothing to inspect, scores a perfect zero. That
+  is the same defect the sample validity gate addresses at its extreme; the
+  severity split addresses the general case.
+
+So each finding declares a severity. `_run_checked_loop` re-invokes only on
+**gating** findings; **advisory** findings are surfaced once, in the returned
+warnings, without costing a round. Multi-sample selection likewise ranks on
+gating findings only, so plan size stops being a scoring penalty.
+
+**The default is gating.** A finding whose severity nobody declared keeps
+today's behaviour, so the classification can be incomplete without silently
+weakening a real gate — an advisory misfiling is a deliberate act, not an
+omission. The advisory set is an explicit allowlist for exactly this reason.
+
+This does not weaken enforcement, because advisory findings were never
+enforcing anything: a check that cannot be satisfied is not a gate, it is a
+tax on every run that trips it. Where a genuine guarantee is wanted, §12
+applies unchanged — write a real check with a satisfiable condition.
+
+**A mechanical floor is not thereby an independent one.** The same
+investigation found `check_prescribed_command_coverage` gating on
+`runs_commands`, a planner self-report field populated on **4.9%** of subtasks
+(24 of 486 across 38 plans; 74% of plans have none at all). Being pure Python
+made it deterministic, not independent — it reads a field the planner can
+simply omit, so it fired almost always and no re-plan could satisfy it. This
+repeats the trap already documented for `migration_targets` in §8 (*"both
+signals come from the same non-adversarial planner self-report"*). Generalised:
+a floor must either read something the planner cannot omit — the repository,
+the diff, the dependency graph — or repair the omission itself rather than
+re-driving the worker that made it.
+
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
