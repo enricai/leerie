@@ -10824,6 +10824,70 @@ def _tool_result_outcome(event: dict) -> bool | None:
     return None
 
 
+# Cap on the rejected-payload diagnostic (`_format_payload_for_log`). Large
+# enough that a truncated planner submission — the shape this exists to
+# diagnose — is shown whole, since the useful signal is precisely WHICH fields
+# are absent, and a mid-cut payload cannot answer that. Small enough that a
+# complete 100-subtask plan does not flood the inline log; the per-worker .log
+# file carries the raw stream regardless.
+_REJECTED_PAYLOAD_LOG_MAX = 4000
+
+
+def _format_payload_for_log(payload: object) -> str | None:
+    """Render a `StructuredOutput` submission for the rejection diagnostic.
+
+    Returns None for an absent payload so the caller's `and` guard skips the
+    log line entirely rather than printing "None". Serialisation is
+    best-effort: `json.dumps` on an arbitrary worker payload can raise, and a
+    diagnostic that crashes the stream reader would convert a recoverable
+    schema failure into a dead run — so any failure degrades to `repr`."""
+    if payload is None:
+        return None
+    try:
+        text = json.dumps(payload, sort_keys=True)
+    except Exception:
+        text = repr(payload)
+    if len(text) > _REJECTED_PAYLOAD_LOG_MAX:
+        text = (text[:_REJECTED_PAYLOAD_LOG_MAX]
+                + f"… [truncated at {_REJECTED_PAYLOAD_LOG_MAX} chars]")
+    return text
+
+
+# Substrings that identify a *schema* rejection of a structured submission, as
+# opposed to any other errored tool result. Measured against real worker
+# streams: the CLI emits "Output does not match required schema: …" for a
+# parseable-but-invalid payload, and "InputValidationError" when the payload
+# could not be parsed as JSON at all.
+_SCHEMA_REJECTION_MARKERS = (
+    "does not match required schema",
+    "inputvalidationerror",
+)
+
+
+def _is_schema_rejection(event: dict) -> bool:
+    """True when this stream event is a tool_result rejecting a structured
+    submission on schema grounds.
+
+    Deliberately narrow. `_read_stream` uses this to decide whether to print
+    the latched payload, and an ordinary tool failure (a failing test, a
+    missing file) must never drag an unrelated structured payload into the log
+    beside it."""
+    if not isinstance(event, dict) or event.get("type") != "user":
+        return False
+    for b in (event.get("message") or {}).get("content") or []:
+        # `isinstance` rather than a bare `.get`: this runs on every event of
+        # a live stream, and a single malformed block would otherwise raise
+        # AttributeError out of _read_stream and kill the run.
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") != "tool_result" or not b.get("is_error"):
+            continue
+        text = _extract_tool_result_text(b).lower()
+        if any(m in text for m in _SCHEMA_REJECTION_MARKERS):
+            return True
+    return False
+
+
 def _tag_each_line(prefix: str, content: str) -> str:
     """Prefix the first non-empty line of `content` with `prefix`;
     subsequent lines get a width-matched continuation prefix that
@@ -11958,10 +12022,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # this is the only way to tell the operator *what* was running when the
     # kernel OOM-killed the cgroup (DESIGN §6 *Detecting memory OOM*).
     last_bash_cmd: str | None = None
+    # Last payload the worker submitted to `StructuredOutput`. Latched for the
+    # same reason as `last_bash_cmd`: when the submission is REJECTED, the
+    # error names the offending fields but never echoes what was actually
+    # sent, and the payload lives in a preceding event the error text cannot
+    # reach. Without this, the commonest worker failure signature (a schema
+    # mismatch) is undiagnosable from a log — the 2026-08-03 investigation had
+    # to re-run workers under `--output-format stream-json` by hand to recover
+    # these, which is also what disproved the leading hypothesis about their
+    # cause. `InputValidationError` (unparseable JSON) already logs its
+    # payload; this closes the gap for the parseable-but-invalid case.
+    last_structured_payload: str | None = None
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
         nonlocal pids_events_baseline, last_bash_cmd
+        nonlocal last_structured_payload
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -12000,13 +12076,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     if t == "assistant":
                         for b in (event.get("message", {})
                                   .get("content", []) or []):
-                            if (b.get("type") == "tool_use"
-                                    and b.get("name") == "Bash"):
+                            if b.get("type") != "tool_use":
+                                continue
+                            if b.get("name") == "Bash":
                                 cmd_lines = (
                                     (b.get("input", {}) or {})
                                     .get("command") or "").splitlines()
                                 if cmd_lines:
                                     last_bash_cmd = cmd_lines[0]
+                            elif b.get("name") == "StructuredOutput":
+                                last_structured_payload = _format_payload_for_log(
+                                    b.get("input"))
                     # Latch credit-exhaustion state (see `overage_blocked`
                     # declaration above for why this keys on
                     # `overageDisabledReason`, NOT `overageStatus`).
@@ -12038,6 +12118,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # window still leaves an ordinary failing test (≤1 error)
                     # below the threshold — and the cgroup read is the final
                     # authority regardless.
+                    # Surface the rejected payload alongside the rejection.
+                    # Gated on the schema-mismatch signature specifically so
+                    # ordinary tool errors (a failing test, a missing file)
+                    # never drag an unrelated structured payload into the log.
+                    if _is_schema_rejection(event) and last_structured_payload:
+                        log(f"  [{sid} tool-fail] rejected payload was: "
+                            f"{last_structured_payload}")
+                        # Cleared so a later, unrelated error cannot re-print a
+                        # stale payload from an earlier submission.
+                        last_structured_payload = None
                     _outcome = _tool_result_outcome(event)
                     if _outcome is not None:
                         tool_result_window.append(_outcome)
@@ -15423,28 +15513,80 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     log("phase 1½: provision recipe gate clean")
 
 
+def _planner_sample_is_empty_ready(sample: dict) -> bool:
+    """True for a `ready` plan carrying no subtasks.
+
+    Deliberately NOT called "invalid" on its own: this exact shape is the
+    planner's legitimate way to say *this domain has no work*, and
+    `detect_no_work` routes a run on it. It is only a defect **relative to a
+    sibling sample that found work** — see `_select_best_planner_sample`."""
+    return (sample.get("status") == "ready"
+            and not sample.get("subtasks"))
+
+
 def _select_best_planner_sample(
     samples: list[dict], repo_root: Path, domain: str,
 ) -> dict:
     """Mechanically select the best planner sample for a domain.
 
+    Validity gate (DESIGN §5 *Selection separates validity from quality*),
+    applied BEFORE scoring:
+      0. Drop empty-`ready` samples — but only while a non-empty sibling
+         survives.
+
     Selection criteria (no LLM — avoids self-bias per ACL 2024):
       1. Fewest mechanical-check issues
       2. Tiebreak: most subtasks (more investigation = better coverage)
       3. Tiebreak: first sample (determinism device)
-    """
+
+    Why the gate has to precede the scoring rather than join it as another
+    sort key: the criteria above rank samples by *what is wrong with them*,
+    and an empty plan is *unfalsifiable* — `check_planner_output` inspects
+    subtasks, so with none to inspect it returns `[]` and the sample scores a
+    perfect zero. It therefore beat every sibling that had real content to
+    critique. Measured across the two 2026-08-03 runs: **2 of 21 selections
+    (9.5%) chose a 0-subtask sample**, silently discarding the whole domain,
+    and every winner logged "0 issues". Demoting the empty sample by tiebreak
+    could not fix this — it loses on the PRIMARY key, so no tiebreak is ever
+    consulted.
+
+    The gate is relative, never absolute. If every sample is empty-`ready`
+    the domain genuinely has no work, so the full set is ranked unchanged and
+    `detect_no_work`'s terminal route still fires."""
+    ranked = [s for s in samples if not _planner_sample_is_empty_ready(s)]
+    if ranked and len(ranked) < len(samples):
+        log(f"  {domain}: dropped {len(samples) - len(ranked)} empty sample(s) "
+            f"before ranking — {len(ranked)} sibling(s) found work, so an "
+            f"empty plan is not a usable answer for this domain")
+    elif not ranked:
+        # Every sample is empty: a real no-work verdict, not a degenerate one.
+        ranked = samples
+
     scored: list[tuple[int, int, int, dict]] = []
-    for i, sample in enumerate(samples):
+    for sample in ranked:
         issues = check_planner_output(sample, repo_root, domain)
         n_subtasks = len(sample.get("subtasks", []))
+        # Index into the ORIGINAL `samples`, not into `ranked` — the gate above
+        # can drop entries, and renumbering would make the logged sample id
+        # disagree with the per-sample worker sids (`planner-<domain>-s<N>`)
+        # this line exists to be cross-referenced against.
+        idx = next(i for i, s in enumerate(samples) if s is sample)
         # Lower issue count is better; higher subtask count is better.
-        scored.append((len(issues), -n_subtasks, i, sample))
+        scored.append((len(issues), -n_subtasks, idx, sample))
     scored.sort()
     winner = scored[0]
     if len(samples) > 1:
+        # Log EVERY ranked sample's score, not just the winner's. The winner
+        # line alone cannot show why it won — a run that selected
+        # "(0 issues, 0 subtasks)" looks like a domain with no work, when in
+        # fact the alternatives held 16 and 13 subtasks and lost only because
+        # having content to critique earned them issues. That distinction is
+        # the whole diagnostic, and it was invisible.
+        roster = ", ".join(
+            f"#{i}({n_iss}i/{-neg_n}s)" for n_iss, neg_n, i, _ in scored)
         log(f"  {domain}: multi-sample selected sample {winner[2]} "
             f"({winner[0]} issues, {-winner[1]} subtasks) from "
-            f"{len(samples)} samples")
+            f"{len(samples)} samples — ranked: {roster}")
     return winner[3]
 
 

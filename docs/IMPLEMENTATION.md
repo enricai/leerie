@@ -2275,6 +2275,32 @@ complete — two workers logging at the same wall-clock instant agree on
 the count instead of carrying frozen snapshots from their respective
 spawn moments.
 
+#### Rejected-payload diagnostic
+
+`_read_stream` latches the input of every `StructuredOutput` tool_use into
+`last_structured_payload` (rendered by `_format_payload_for_log`, capped at
+`_REJECTED_PAYLOAD_LOG_MAX = 4000` chars, degrading to `repr` if
+`json.dumps` raises — a diagnostic must never kill the run it is explaining).
+When a subsequent tool_result is an errored **schema** rejection —
+`_is_schema_rejection`, matching `does not match required schema` or
+`inputvalidationerror` case-insensitively — the latched payload is logged
+beside the rejection, then cleared so a later unrelated failure cannot
+re-print a stale payload.
+
+Emitted at every verbosity (it is a failure diagnostic, not per-event
+activity). The gate is deliberately narrow: an ordinary tool failure (a
+failing test, a missing file) must never drag an unrelated structured payload
+into the log beside it.
+
+Why this exists: the rejection text names the offending fields but never
+echoes what was submitted, and the payload lives in a preceding event the
+error text cannot reach — so the commonest worker failure signature was
+undiagnosable from a log. The `InputValidationError` (unparseable JSON) path
+already logged its payload; this closes the gap for the parseable-but-invalid
+case. Recovering these by hand under `--output-format stream-json` is what
+disproved the 2026-08-03 investigation's leading hypothesis about their cause.
+Pinned by `tests/test_rejected_payload_logging.py`.
+
 Resolution order (highest priority first):
 
 1. **`--verbosity LEVEL`** CLI flag, values `quiet` / `normal` /
@@ -4854,6 +4880,36 @@ subtask count (more = better coverage), tiebreak on first sample
 (determinism). No LLM merge judge — avoids self-bias. A crashed sample
 (worker returned `None`) is dropped from the candidate set before
 selection. If all samples for a domain crash, the run aborts.
+
+**Validity gate (runs before scoring).**
+`_planner_sample_is_empty_ready(sample)` returns True for a `status ==
+"ready"` plan with no subtasks. `_select_best_planner_sample` drops those
+samples **before** ranking — but only while at least one non-empty sibling
+survives; if every sample is empty the full set is ranked unchanged, so
+`detect_no_work`'s terminal route still fires.
+
+The gate must precede the scoring rather than join it as another sort key:
+`check_planner_output` inspects subtasks, so a plan with none to inspect
+returns `[]` and scores a perfect zero on the **primary** criterion. An empty
+plan is therefore unfalsifiable and beats every sibling with real content to
+critique — no tiebreak is ever consulted. Measured across two 2026-08-03 runs:
+2 of 21 selections (9.5%) chose a 0-subtask sample, discarding the whole
+domain, with every winner logging "0 issues". Scoped to `ready` only: an empty
+`blocked` plan is a planner verdict `schedule()` must still act on.
+
+Pinned by `tests/test_planner_sample_validity_gate.py`, which includes an
+anti-vacuity control (`test_falsifier_empty_sample_would_win_without_the_gate`)
+asserting the incident still reproduces without the gate, and
+`test_selection_is_biased_toward_smaller_plans_when_issues_scale`, which
+records the residual bias the gate does **not** fix: per-subtask findings make
+issue count grow with plan size, so a larger plan can still lose to a smaller
+one. Correcting that needs the severity channel, not this gate.
+
+The selection log line lists **every ranked sample**, not just the winner
+(`… — ranked: #0(2i/2s), #2(3i/3s)`), using each sample's index in the
+ORIGINAL `samples` list so the number cross-references the
+`planner-{category}-s{idx}` worker sid. A winner line alone cannot show why it
+won.
 
 ### Cap resolvers
 
