@@ -101,7 +101,7 @@ object (required by schema):
   claiming `irreconcilable`.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements in this session; name any contradictions.
-- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name what
+- **Gap surfacing:** if the score is below 9.0, name what
   would close the gap.
 
 The orchestrator does not trust this self-report: it mechanically re-checks

@@ -1119,65 +1119,52 @@ _REQUIRES_ITEM = {
 }
 
 
-# _confidence_schema()'s free-text fields are length-capped as a mitigation
-# for anthropics/claude-code#49747 (open, unfixed as of 2026-07-31): the
-# `claude` CLI intermittently corrupts a StructuredOutput tool call — valid
-# JSON switching mid-payload into legacy XML `<parameter name="...">` tags —
-# correlated with the length of a single tool-call string argument. Observed
-# directly in leerie run d8302c0d46d8... (barnacle, 2026-07-31): the raw
-# `__unparsedToolInput` capture showed the switch happening exactly where the
-# (uncapped) `confidence.basis` field's ~16KB of prose began. This is a CLI
-# decoder-level bug leerie cannot fix; the cap only reduces how often a
-# worker's own output is long enough to trigger it. Revisit once #49747
-# closes upstream.
-# Sized against the MEASURED output distribution, not guessed. Captured across
-# real planner submissions (2026-08-03): `basis` ran 463–1321 chars and list
-# items 130–502. The previous values (2000 / 500) sat directly on that
-# distribution's shoulder, so overflow was routine rather than exceptional —
-# 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8
-# `contradictions_reconciled`), including one live reproduction that missed by
-# TWO characters (502 against the 500 cap) and resubmitted at 260.
-#
-# A cap set at the top of the natural distribution does not shorten output; it
-# converts the tail into rejected work. These values sit ~4x above the measured
-# maximum — clear of normal output — while remaining an order of magnitude
-# below the ~16KB single-argument length at which the #49747 corruption was
-# actually observed, so the mitigation above is intact.
-#
-# The limits are also stated to the workers (`prompts/_confidence.md`). They
-# were previously in no prompt at all, so a worker had no way to comply with a
-# bound it was never told about while being asked for detailed evidence.
-_CONFIDENCE_BASIS_MAX_LENGTH = 8000
-_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 2000
-
-
 def _confidence_schema(axes: list[str]) -> dict:
     """Build the §8 confidence sub-schema for the given score axes.
 
     Every worker that self-gates on confidence uses the same structural
-    discipline (DESIGN §8 / §12): numeric score axes, basis, falsifiers,
-    contradictions, gap-to-close.  This helper DRYs the nine occurrences
-    across SCHEMAS."""
+    discipline (DESIGN §8 / §12).  This helper DRYs the ten occurrences
+    across SCHEMAS.
+
+    FLATTENED 2026-08-03.  Only the numeric axes and `basis` are required;
+    falsifiers and contradictions are asked for by the prompts and kept as
+    optional properties, and `gap_to_close` is gone entirely.  The prior
+    shape — five required fields comprising two arrays, a paragraph-length
+    string and a nested object — is field-for-field the trigger profile in
+    anthropics/claude-code#49747 (open, unfixed), where the decoder flips
+    from JSON to legacy XML `<parameter name="...">` mid-argument on tool
+    calls with many required parameters and verbose string/array mixes.
+
+    A controlled A/B against the live CLI (real fit_judge schema, same
+    prompt and model, n=8 per arm) measured 8/8 first attempts corrupted
+    with the block present and 0/8 without it; corpus-wide, 48.9% of all
+    worker calls (3,778/7,723) were wasted retries.  Requiring the fields
+    bought no enforcement — it destroyed the whole payload including the
+    score the gate reads.  `gap_to_close` went rather than merely being
+    relaxed because it was the only nested object here (the sharpest edge
+    of that profile) and nothing decided anything on it — its sole consumer
+    was a diagnostic log line naming a blocked planner's gap, which now
+    reads `confidence.basis`.
+
+    The `maxLength` caps that used to sit on these fields are gone too:
+    measured non-binding at 0.00% across 6,526 `basis` values and 30,719
+    list items (observed maxima 4,342 and 1,362, against caps of
+    8,000/2,000).  Do NOT "restore" the older 2000/500 pair — those bound
+    on 2.38%/6.32% of real values, i.e. pure rejection pressure.
+    """
     return {
         "type": "object",
-        "required": [*axes, "basis", "falsifiers_tested",
-                     "contradictions_reconciled", "gap_to_close"],
+        "required": [*axes, "basis"],
         "properties": {
             **{ax: {"type": "number"} for ax in axes},
-            "basis": {"type": "string",
-                      "maxLength": _CONFIDENCE_BASIS_MAX_LENGTH},
+            "basis": {"type": "string"},
+            # Optional: the §8 disciplines are carried by the prompts, which
+            # still ask for both.  A missing one costs a judgment; requiring
+            # one cost the entire answer.
             "falsifiers_tested": {
-                "type": "array",
-                "items": {"type": "string",
-                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
+                "type": "array", "items": {"type": "string"}},
             "contradictions_reconciled": {
-                "type": "array",
-                "items": {"type": "string",
-                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
-            "gap_to_close": {
-                "type": "object",
-                "properties": {ax: {"type": "string"} for ax in axes},
-            },
+                "type": "array", "items": {"type": "string"}},
         },
     }
 
@@ -1262,7 +1249,7 @@ SCHEMAS: dict[str, dict] = {
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
             # clear within confidence_rounds emits status="blocked" with an
             # empty subtasks list and the gap analysis in
-            # confidence.gap_to_close. The orchestrator surfaces a blocked
+            # confidence.basis. The orchestrator surfaces a blocked
             # planner as a fatal run condition (the run cannot proceed with
             # no plan); confidence itself remains worker-internal.
             "status": {
@@ -1979,8 +1966,22 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
+                    # `artifact_paths` is asked for by the prompt but NOT
+                    # required (2026-08-03). Requiring it was far more
+                    # destructive than the false positives it was added to
+                    # prevent: this worker produced valid output on only
+                    # 40.9% of its corpus invocations (27/66) while every
+                    # other worker sat at 99.6-100%, and 84 of its 85
+                    # validation failures were the single error
+                    # "'artifact_paths' is a required property" — a
+                    # whole-payload rejection of sound collision analysis in
+                    # the phase runs most often die in. Absence was already
+                    # the designed-for case (see PHANTOM_ARTIFACT's
+                    # `if not paths: continue`), so requiring it bought no
+                    # extra verification — it turned a graceful skip into a
+                    # discarded plan.
                     "required": ["a_sid", "b_sid", "artifact",
-                                 "artifact_paths", "resolution", "reason"],
+                                 "resolution", "reason"],
                     "properties": {
                         "a_sid": {"type": "string"},
                         "b_sid": {"type": "string"},
@@ -2093,7 +2094,7 @@ SCHEMAS: dict[str, dict] = {
         # Read-only (INSPECT_TOOLS), fed the subtask spec and its P6
         # ranked subgraph. Reuses _confidence_schema for the score axis
         # so the same evidence-gate discipline (falsifiers, contradictions,
-        # gap_to_close) applies.
+        # and the gap stated in basis) applies.
         "type": "object",
         "required": ["score", "rationale", "diffuse", "confidence"],
         "properties": {
@@ -2126,7 +2127,15 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "children": {
                 "type": "array",
-                "minItems": 1,
+                # No `minItems` (2026-08-03): an empty array is the valid
+                # answer "this subtask does not split", and
+                # _recursive_decompose already accepts it as a leaf,
+                # deliberately and with its own log line. `minItems: 1` made
+                # that answer unrepresentable — across the corpus the
+                # splitter returned [] 43 times and exactly ONE child 43
+                # more (a single-child split being a no-op), and every empty
+                # return was rejected and retried before the consumer that
+                # already handled it could ever see it.
                 "items": {
                     "type": "object",
                     "required": ["id", "title", "success_criteria_seed"],
@@ -2172,7 +2181,7 @@ SCHEMAS: dict[str, dict] = {
         #
         # Deliberately carries NO _confidence_schema sub-object (unlike
         # fit_judge): the §8 evidence-gate discipline (falsifiers,
-        # contradictions, gap_to_close) is designed for iterative
+        # contradictions, gap stated in basis) is designed for iterative
         # implementer/planner self-assessment: this worker is itself the
         # independent check that replaces a self-report, so a nested
         # self-confidence axis would reintroduce the self-grading bias the
@@ -2273,8 +2282,20 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    # `severity` is asked for but NOT required (2026-08-03).
+                    # Requiring it defeated its own purpose: a judge that
+                    # omitted it produced no schema-valid payload at all, so
+                    # phase_wiring_gate never ran and caught NOTHING. Measured
+                    # across the corpus, every wiring_judge invocation that
+                    # never produced valid output (9 of 66) failed on this one
+                    # field — all 18 of its failing submissions. Both consumers
+                    # already tolerate absence (the `latent_risk` comparisons
+                    # in _live_wiring_defects and in phase_wiring_gate's own
+                    # latent-risk loop), so an unlabelled entry gates:
+                    # the conservative direction, matching DESIGN §8 *Findings
+                    # carry a severity* ("the default is gating").
                     "required": ["kind", "sid", "tag_or_dep",
-                                 "concrete_reason", "severity"],
+                                 "concrete_reason"],
                     "properties": {
                         "kind": {"type": "string",
                                  "enum": ["missing_requires",
@@ -10867,6 +10888,14 @@ def _tool_result_outcome(event: dict) -> bool | None:
 # file carries the raw stream regardless.
 _REJECTED_PAYLOAD_LOG_MAX = 4000
 
+# Cap on the blocked-planner gap shown inline by `phase_plan`. Much smaller
+# than the payload cap above because this is one line inside a per-category
+# summary rather than a standalone diagnostic dump, and because the value it
+# renders (`confidence.basis`) is prose: measured across real planner
+# submissions it runs a median of ~1.1k characters and up to 4.3k. Enough to
+# see what the planner was missing; the full text is in the per-worker log.
+_BLOCKED_GAP_LOG_MAX = 400
+
 
 def _format_payload_for_log(payload: object) -> str | None:
     """Render a `StructuredOutput` submission for the rejection diagnostic.
@@ -16037,7 +16066,23 @@ async def phase_plan(task: str, st: State, caps: dict,
         n = len(plan.get("subtasks", []))
         status = plan.get("status", "ready")
         if status == "blocked":
-            gap = (plan.get("confidence", {}) or {}).get("gap_to_close", {})
+            # The gap analysis now lives in `basis` — `gap_to_close` was
+            # removed from the confidence schema (DESIGN §8), and the
+            # prompts direct a blocked planner to state the missing
+            # artifact there instead.
+            #
+            # Truncated because `basis` is prose, not the compact dict this
+            # line used to print: measured across real planner submissions it
+            # runs a median of ~1.1k characters and up to 4.3k, which would put
+            # a multi-KB paragraph on one line. Same discipline as
+            # `_format_payload_for_log` (explicit marker, never a silent cut)
+            # and `last_bash_cmd` (first line only) — the untruncated text
+            # stays in the per-worker log, which the operator messages at the
+            # scheduling gate already point at.
+            gap = " ".join(
+                ((plan.get("confidence", {}) or {}).get("basis") or "").split())
+            if len(gap) > _BLOCKED_GAP_LOG_MAX:
+                gap = gap[:_BLOCKED_GAP_LOG_MAX] + "… [truncated; see log]"
             log(f"  {category}: BLOCKED (planner gate) — {n} subtask(s); "
                 f"gap: {gap}")
         else:
@@ -20703,7 +20748,7 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
         if blocked_domains:
             die("planners produced no subtasks — all relevant domains exited "
                 f"blocked at the evidence gate: {', '.join(blocked_domains)}. "
-                "See each planner's confidence.gap_to_close for what evidence "
+                "See each planner's confidence.basis for what evidence "
                 "would unblock; raise --confidence-rounds or supply the "
                 "missing information and re-run.")
         die("planners produced no subtasks")
@@ -20717,7 +20762,7 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
             f"the planner evidence gate and contributed no subtasks: "
             f"{', '.join(blocked_domains)}. Proceeding with the ready "
             "domains; see the per-category log lines above for each "
-            "blocked planner's gap_to_close.")
+            "blocked planner's stated gap.")
 
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 

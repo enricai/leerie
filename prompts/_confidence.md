@@ -1,15 +1,18 @@
-## Length limits on the confidence block
+## Keep the confidence block tight
 
-Your `confidence` block is schema-validated, and these limits are enforced —
-a submission that exceeds one is **rejected outright** and you have to redo
-the whole response:
+Only the numeric score axes and `basis` are required. `falsifiers_tested` and
+`contradictions_reconciled` are optional — still fill them in when you have real
+falsifiers or reconciled contradictions, because that is what makes the score
+mean anything (§8), but a missing one costs a judgment, not the response.
 
-- `basis` — at most **8000 characters**
-- each item in `falsifiers_tested` — at most **2000 characters**
-- each item in `contradictions_reconciled` — at most **2000 characters**
+There is no length limit and nothing is truncated. What matters is that the
+block stays *compact*: an oversized confidence block measurably raises the
+chance the whole tool call is corrupted in transport and your entire answer is
+thrown away — including the parts that were right. Real submissions run about
+400–1400 characters for `basis` and 130–500 per list item; that is plenty for
+specific, cited evidence.
 
-These are generous: real submissions typically run 400–1400 characters for
-`basis` and 130–500 per list item, so ordinary detailed evidence fits with
-room to spare. Write the evidence you actually have. The limits exist only to
-bound pathological cases, not to make you terse — if you find yourself near
-one, prefer several focused list items over one very long item.
+So: write the evidence you actually have, cite it concretely, and stop. Prefer
+several focused list items over one sprawling one. Do not pad the basis with
+restatement or narration of your process — a long block is not a stronger
+block, and past some point it is a lost one.

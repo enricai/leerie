@@ -71,8 +71,7 @@ A subtask is **well-fit** when ALL of the following hold:
     "fit": 8.5,
     "basis": "files_likely_touched count + intent coherence",
     "falsifiers_tested": ["checked if intent implies hidden broad surface: no"],
-    "contradictions_reconciled": [],
-    "gap_to_close": {}
+    "contradictions_reconciled": []
   }
 }
 ```
@@ -84,8 +83,8 @@ A subtask is **well-fit** when ALL of the following hold:
 
 Apply the §8 evidence gate: state the `basis` for your score, list at least
 one `falsifiers_tested` entry (e.g., "checked whether intent implies
-unmapped broad surface: no"), and populate `gap_to_close` only when
-`confidence.fit < 9.0`.
+unmapped broad surface: no"), and when `confidence.fit < 9.0` name in
+`basis` what would close the gap.
 
 Read-only analysis only — you have INSPECT_TOOLS access to the codebase
 to verify claims in the subtask spec against actual file contents when

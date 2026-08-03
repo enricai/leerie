@@ -593,10 +593,25 @@ invented path is flagged.
 `artifact` is a free-text label — the judge's own description of what's
 colliding — and Python never parses it (CLAUDE.md *Language-to-JSON*: no
 tokenizing, no stripping punctuation, no testing tokens for path shape). A
-collision instead carries a separate, required `artifact_paths` field: the
+collision instead carries a separate `artifact_paths` field: the
 repo-relative paths the judge names explicitly, which is the only thing
 `PHANTOM_ARTIFACT`'s existence check reads. `artifact` stays purely
 descriptive for a human reading the plan.
+
+`artifact_paths` is **asked for but not schema-required**, because requiring it
+was measured to be far more destructive than the false positives it was
+introduced to prevent. Across the run corpus this phase produced valid output
+on only **40.9% of its invocations** while every other worker sat at 99.6–100%,
+and **84 of its 85 validation failures were the single error
+`'artifact_paths' is a required property`** — a whole-payload rejection of an
+otherwise-sound collision analysis, in the phase runs most often die in.
+
+Absence was already the designed-for case: the check reads
+`paths = c.get("artifact_paths") or []` and skips the collision when empty,
+precisely because a purely logical artifact has no path and there is then
+nothing to verify. Requiring the field therefore bought no additional
+verification — it converted "this collision cannot be path-checked" from a
+graceful skip into a discarded plan.
 
 The judge is biased toward escalation. Before emitting `merge`, it must
 verify the two intents are compositionally consistent — no required-
@@ -944,6 +959,24 @@ plan snapshot rewritten after a repair, so everything downstream — the budget
 preflight, the deterministic wiring re-check, `_validate_plan`, `_write_plan` — sees
 the repaired graph rather than the one the judge rejected.
 
+**Each defect declares a severity, and the severity is asked for rather than
+required.** A `live_defect` gates; a `latent_risk` is logged as a warning only.
+The field exists because the judge could already express "this isn't really a
+defect" — but only in free-text `rationale`, which the gate never reads, so a
+run died on a finding the judge itself had called "a latent fragility rather
+than a live defect" (§12: a judgment must reach code as structured JSON, never
+be stranded in prose).
+
+Making it a *required* field did not serve that purpose; it defeated it. A
+judge that omitted the field produced no schema-valid payload at all, so the
+gate did not run and caught **nothing** — measured across the corpus, every
+`wiring_judge` invocation that never produced valid output failed on exactly
+this one field. The severity channel is therefore optional, and an unlabelled
+defect gates, per *Findings carry a severity* above: **the default is gating**,
+so an incomplete classification keeps the conservative behaviour instead of
+silently weakening a real gate. One conservatively-gated defect is a recoverable
+false positive; a gate that never runs is not.
+
 ### Migration-surface completeness
 
 When a plan introduces a new pattern replacing an old one — a new
@@ -1262,6 +1295,17 @@ Bounds: `DEFAULT_CAPS["decompose_max_depth"] = 5`,
 `DEFAULT_CAPS["decompose_fit_threshold"] = 0.70` (measured),
 `DEFAULT_CAPS["decompose_noprogress_rounds"] = 2`. Every judge/split call
 passes through `st.bump_workers` — a runaway tree hits the worker-cap backstop.
+
+**"This does not split" is a valid answer.** The splitter may return an empty
+`children` array, and that reaches the same leaf disposition as the depth cap
+and the no-progress guard. The schema previously forbade it (`minItems: 1`),
+which made the honest answer unrepresentable: across the corpus the splitter
+returned an empty array 43 times and exactly *one* child 43 more times — and a
+"split" into a single child is a no-op wearing a costume. Every one of those 43
+empty returns was rejected and retried, even though `_recursive_decompose`
+already accepted "no children" as a leaf, deliberately and with its own log
+line. The consumer was correct; the schema rejected the payload before the
+consumer could ever see it.
 
 **A `WorkerError` from either the `fit_judge` call or the coupled-minority
 `splitter` call degrades that node to leaf**, the same disposition the
@@ -4861,6 +4905,45 @@ subtask stops and reports itself as *blocked*, stating precisely what evidence
 is missing and whether obtaining it needs something only the user can supply —
 for example a credential that exists nowhere in the codebase. This is the
 narrow, legitimate exception to "never ask the user" (see §11).
+
+**The disciplines are asked for; they are not schema-required.** All three
+disciplines above are carried by the prompts. Falsification and drift
+reconciliation keep an optional property each (`falsifiers_tested`,
+`contradictions_reconciled`); gap surfacing keeps none — the gap is stated in
+`basis`, which is required, so a below-bar score still has to say in writing
+what would raise it. What the schema does not do is list any of the three in
+`required`. That is a deliberate reversal of the original design, forced by
+measurement.
+
+Requiring them made the confidence block a five-required-field object
+containing two arrays, a paragraph-length string, and a nested object — which
+is, field for field, the trigger profile in upstream
+[anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747):
+the model's decoder flips from JSON to legacy XML *mid-argument* on tool calls
+with many required parameters and verbose string/array mixes. A controlled A/B
+against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per
+arm) measured **8 of 8 first attempts corrupted with the block present, 0 of 8
+without it** — every with-block run needing exactly one retry. Corpus-wide,
+**48.9% of all worker calls were wasted retries**.
+
+The trade is therefore not "discipline versus laxity." Requiring the field did
+not buy enforcement — it destroyed the entire payload, *including* the score
+the gate reads, and the worker's correct answer was discarded wholesale. A
+constraint that reliably annihilates the response it is validating enforces
+nothing. Leerie keeps the numeric score axes and `basis` required, so every §8
+gate still reads a real number anchored to a stated evidential basis, and asks
+for falsifiers, contradictions and gaps in the prompt where a missing one costs
+a judgment rather than the whole answer.
+
+`gap_to_close` is removed outright rather than merely relaxed: it was the
+block's only nested object — the sharpest edge of the #49747 profile — and its
+sole consumer was a diagnostic log line naming a blocked planner's gap, which
+now reads `confidence.basis` instead. Nothing decided anything on it.
+
+This is not a retreat from "code enforces" (§12). It is the recognition that a
+*schema* is not the enforcement layer for a discipline whose absence Python can
+check directly on the returned object, at a moment when the object still
+exists.
 
 ### The planner gate
 

@@ -72,8 +72,10 @@ well-wired plan. A fabricated defect triggers a wasted re-reconcile.
 
 ## Severity: `live_defect` vs `latent_risk`
 
-Every entry in `wiring_defects` carries a `severity`. This is not optional
-detail — it decides whether the entry stops the run.
+Classify every entry in `wiring_defects` with a `severity`. It decides whether
+the entry stops the run, and an entry you leave unclassified is treated as
+`live_defect` — so omitting it is not a way to soften a finding, only a way to
+lose the distinction you meant to draw.
 
 - **`live_defect`**: the plan *as written* will actually misbehave. The
   scheduler can order work wrong, a consumer can run and find nothing there,
