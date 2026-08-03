@@ -1,4 +1,4 @@
-"""Tests for `gather_provision_fixtures` — assembles the input set the
+"""Tests for `_gather_provision_fixtures` — assembles the input set the
 LLM-fallback worker sees. Bounded by a 24KB total ceiling and a few
 sub-budgets (workspace child manifest cap, workflow-file cap, etc.).
 
@@ -11,7 +11,7 @@ import json
 
 
 def test_empty_repo_returns_empty_fixtures(leerie, tmp_path):
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert out["readme"] == ""
     assert out["manifests"] == {}
     assert out["workspace_manifests"] == []
@@ -29,7 +29,7 @@ def test_readme_is_included_via_extractor(leerie, tmp_path):
         "# Foo\n\nWhatever marketing intro.\n\n"
         "## Installation\n\nRun `pip install foo`.\n"
     )
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert "Installation" in out["readme"]
     assert "pip install foo" in out["readme"]
 
@@ -37,7 +37,7 @@ def test_readme_is_included_via_extractor(leerie, tmp_path):
 def test_root_manifests_are_collected(leerie, tmp_path):
     (tmp_path / "package.json").write_text('{"name": "x"}')
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert "package.json" in out["manifests"]
     assert "pyproject.toml" in out["manifests"]
     assert "x" in out["manifests"]["package.json"]
@@ -52,7 +52,7 @@ def test_workspace_children_capped_at_three(leerie, tmp_path):
         (tmp_path / "packages" / f"pkg-{i}").mkdir(parents=True)
         (tmp_path / "packages" / f"pkg-{i}" / "package.json").write_text(
             json.dumps({"name": f"pkg-{i}"}))
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert len(out["workspace_manifests"]) == 3
     paths = [rel for rel, _ in out["workspace_manifests"]]
     assert all(p.startswith("packages/pkg-") for p in paths)
@@ -66,7 +66,7 @@ def test_workspace_object_form_is_handled(leerie, tmp_path):
     }))
     (tmp_path / "pkgs" / "a").mkdir(parents=True)
     (tmp_path / "pkgs" / "a" / "package.json").write_text('{"name":"a"}')
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert len(out["workspace_manifests"]) == 1
     assert out["workspace_manifests"][0][0] == "pkgs/a/package.json"
 
@@ -82,7 +82,7 @@ def test_workflows_capped_at_two_with_preference(leerie, tmp_path):
     (wf_dir / "test.yml").write_text("test config\n")
     (wf_dir / "deploy.yml").write_text("deploy config\n")
 
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     names = [n for n, _ in out["workflows"]]
     assert len(names) == 2
     assert "codeql.yml" not in names
@@ -95,7 +95,7 @@ def test_workflows_capped_at_two_with_preference(leerie, tmp_path):
 def test_contributing_is_picked_up(leerie, tmp_path):
     (tmp_path / "CONTRIBUTING.md").write_text(
         "Setup: run `pnpm install`, then `pnpm dev`.\n")
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert "pnpm install" in out["contributing"]
 
 
@@ -105,7 +105,7 @@ def test_total_byte_ceiling_is_enforced(leerie, tmp_path):
     (tmp_path / "README.md").write_text("install\n" * 4000)
     # Add a manifest too so the ceiling is exercised across sections.
     (tmp_path / "package.json").write_text('{"name":"x"}' + ("\n" * 100))
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     assert out["total_bytes"] <= 24576
 
 
@@ -122,7 +122,7 @@ def test_extractor_falls_back_for_marketing_readme(leerie, tmp_path):
         "All these companies sponsor us.\n"
     )
     (tmp_path / "README.md").write_text(body)
-    out = leerie.gather_provision_fixtures(tmp_path)
+    out = leerie._gather_provision_fixtures(tmp_path)
     # The fixture set isn't empty for content the old keyword filter
     # would have skipped — there's no header-based filtering left to
     # skip it with.

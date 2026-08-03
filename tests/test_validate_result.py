@@ -1,4 +1,4 @@
-"""Tests for validate_result() — cross-field invariant checks on
+"""Tests for _validate_result() — cross-field invariant checks on
 worker results.
 
 Returns `(failure_kind, message)` when the result is missing a required
@@ -19,17 +19,17 @@ from __future__ import annotations
 
 def test_complete_with_empty_criteria_results_returns_none(leerie):
     """Empty criteria_results no longer rejects `complete`."""
-    assert leerie.validate_result(
+    assert leerie._validate_result(
         {"status": "complete", "criteria_results": []}) is None
 
 
 def test_complete_with_missing_criteria_results_returns_none(leerie):
     """Missing criteria_results no longer rejects `complete`."""
-    assert leerie.validate_result({"status": "complete"}) is None
+    assert leerie._validate_result({"status": "complete"}) is None
 
 
 def test_complete_with_all_met_criteria_returns_none(leerie):
-    assert leerie.validate_result({
+    assert leerie._validate_result({
         "status": "complete",
         "criteria_results": [
             {"criterion": "tests pass", "met": True, "evidence": "ran them"},
@@ -42,7 +42,7 @@ def test_complete_with_failing_criteria_returns_none(leerie):
     """`met:false` entries are recorded as warnings but do not reject
     `complete` (DESIGN §8 — confidence gate is the only load-bearing
     signal)."""
-    assert leerie.validate_result({
+    assert leerie._validate_result({
         "status": "complete",
         "criteria_results": [
             {"criterion": "tests pass", "met": True, "evidence": "ok"},
@@ -54,14 +54,14 @@ def test_complete_with_failing_criteria_returns_none(leerie):
 # --- incomplete-handoff status ---------------------------------------------
 
 def test_incomplete_handoff_without_checkpoint_path_returns_error(leerie):
-    err = leerie.validate_result({"status": "incomplete-handoff"})
+    err = leerie._validate_result({"status": "incomplete-handoff"})
     assert err is not None
     assert err[0] == "broken"
     assert "checkpoint_path" in err[1]
 
 
 def test_incomplete_handoff_with_null_checkpoint_path_returns_error(leerie):
-    err = leerie.validate_result(
+    err = leerie._validate_result(
         {"status": "incomplete-handoff", "checkpoint_path": None}
     )
     assert err is not None
@@ -74,7 +74,7 @@ def test_incomplete_handoff_with_nonexistent_checkpoint_returns_error(leerie, tm
     Claude Code session-limit no-op and the --max-turns-with-no-checkpoint
     cases both land here, and a fresh worker can plausibly do better.
     See `_RETRYABLE_FAILURE_KINDS`."""
-    err = leerie.validate_result(
+    err = leerie._validate_result(
         {"status": "incomplete-handoff",
          "checkpoint_path": str(tmp_path / "nonexistent.md")}
     )
@@ -86,7 +86,7 @@ def test_incomplete_handoff_with_nonexistent_checkpoint_returns_error(leerie, tm
 def test_incomplete_handoff_with_existing_checkpoint_returns_none(leerie, tmp_path):
     cp = tmp_path / "checkpoint.md"
     cp.write_text("# checkpoint\n")
-    assert leerie.validate_result(
+    assert leerie._validate_result(
         {"status": "incomplete-handoff", "checkpoint_path": str(cp)}
     ) is None
 
@@ -94,21 +94,21 @@ def test_incomplete_handoff_with_existing_checkpoint_returns_none(leerie, tmp_pa
 # --- blocked status --------------------------------------------------------
 
 def test_blocked_without_blocker_returns_error(leerie):
-    err = leerie.validate_result({"status": "blocked"})
+    err = leerie._validate_result({"status": "blocked"})
     assert err is not None
     assert err[0] == "broken"
     assert "blocker" in err[1]
 
 
 def test_blocked_with_empty_blocker_returns_error(leerie):
-    err = leerie.validate_result({"status": "blocked", "blocker": "   "})
+    err = leerie._validate_result({"status": "blocked", "blocker": "   "})
     assert err is not None
     assert err[0] == "broken"
     assert "blocker" in err[1]
 
 
 def test_blocked_with_blocker_returns_none(leerie):
-    assert leerie.validate_result(
+    assert leerie._validate_result(
         {"status": "blocked", "blocker": "missing API key XYZ"}
     ) is None
 
@@ -123,12 +123,12 @@ def test_failed_with_empty_summary_returns_error(leerie):
         {"status": "failed", "summary": ""},
         {"status": "failed", "summary": "   "},
     ):
-        err = leerie.validate_result(res)
+        err = leerie._validate_result(res)
         assert err is not None
         assert err[0] == "broken"
 
 
 def test_failed_with_summary_returns_none(leerie):
-    assert leerie.validate_result(
+    assert leerie._validate_result(
         {"status": "failed", "summary": "tests still red after 5 iterations"}
     ) is None

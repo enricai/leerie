@@ -35,7 +35,7 @@ PLANS = [_plan("refactoring",
                _subtask("test-005"),
                _subtask("test-006"))]
 
-# `schedule()` returns subtasks as a sid→subtask DICT, and that is what
+# `_schedule()` returns subtasks as a sid→subtask DICT, and that is what
 # plan_snapshot persists (verified against a real run's state.json) — the
 # rehydrate path feeds it straight to `check_plan_wiring`, which calls
 # `.keys()` on it.

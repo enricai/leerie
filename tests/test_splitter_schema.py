@@ -173,7 +173,7 @@ def test_splitter_schema_is_json_serializable(leerie):
 # --- wiring checks ----------------------------------------------------------
 
 def test_splitter_in_worker_types(leerie):
-    """splitter must be in WORKER_TYPES so load_prompt / claude_p accept it."""
+    """splitter must be in WORKER_TYPES so _load_prompt / claude_p accept it."""
     assert "splitter" in leerie.WORKER_TYPES
 
 
@@ -190,7 +190,7 @@ def test_splitter_effort_default_is_medium(leerie):
 
 
 def test_splitter_prompt_file_exists(leerie):
-    """prompts/splitter.md must exist — load_prompt() reads it at call time."""
+    """prompts/splitter.md must exist — _load_prompt() reads it at call time."""
     from pathlib import Path
     leerie_path = Path(leerie.__file__)
     prompt = leerie_path.parent.parent / "prompts" / "splitter.md"

@@ -4,7 +4,7 @@ attempt's `new-worktree.sh` reaches its "fresh subtask" path.
 
 Without this reset, a corrective retry after a "complete with no commits"
 failure hits `fatal: a branch ... already exists`, the WorkerError escapes
-settle_subtask, and gather_or_cancel takes down the whole wave.
+_settle_subtask, and _gather_or_cancel takes down the whole wave.
 """
 from __future__ import annotations
 

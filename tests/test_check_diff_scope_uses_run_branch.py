@@ -28,9 +28,9 @@ def test_check_diff_scope_uses_run_branch(leerie):
         "branch, which does not exist under per-run. The "
         "protected-path enforcement is silently disabled."
     )
-    assert "compute_run_branch(st.run_id)" in src, (
+    assert "_compute_run_branch(st.run_id)" in src, (
         "check_diff_scope must derive its diff base from "
-        "compute_run_branch(st.run_id) so the check fires against the "
+        "_compute_run_branch(st.run_id) so the check fires against the "
         "actual per-run branch."
     )
 
@@ -45,9 +45,9 @@ def test_phase_finalize_divergence_uses_run_branch(leerie):
         "phase_finalize is referencing the bare 'leerie/staging' "
         "branch for the divergence check. The warning would never fire."
     )
-    assert "compute_run_branch(st.run_id)" in src, (
+    assert "_compute_run_branch(st.run_id)" in src, (
         "phase_finalize must compute the divergence diff against "
-        "compute_run_branch(st.run_id)."
+        "_compute_run_branch(st.run_id)."
     )
 
 

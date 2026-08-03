@@ -1,11 +1,11 @@
-"""Tests for filter_offtree_subtasks() — the soft-drop check that removes
+"""Tests for _filter_offtree_subtasks() — the soft-drop check that removes
 subtasks whose `files_likely_touched` resolves outside the run's primary
 worktree (most commonly into an inspect-dir mount).
 
 The check is a soft drop, never a hard fail: a `die()` here would leave
 the run unrecoverable because the resume contract requires
 `state.json["waves"]` to exist, and `waves` is only written by
-`write_plan` which runs after this check.
+`_write_plan` which runs after this check.
 
 Tests use real `tmp_path` directories so symlink resolution and
 `.resolve().is_relative_to(...)` behave like the production code.
@@ -41,7 +41,7 @@ def test_happy_path_no_drop(leerie, tmp_path, monkeypatch):
         {"id": "feat-002", "files_likely_touched": ["src/b.py"]},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-001", "feat-002"]
     assert "dropped_subtasks" not in st.data
@@ -65,13 +65,13 @@ def test_inspect_dir_leak_drops_subtask(leerie, tmp_path, monkeypatch):
          "files_likely_touched": ["src/lib/messages.ts"]},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["bugfix-006"]
     assert "bugfix-005" in st.data["dropped_subtasks"]
     reasons = st.data["dropped_subtasks"]["bugfix-005"]["reasons"]
     assert any("resolves under inspect-dir" in r for r in reasons)
-    assert any("filter_offtree_subtasks: dropped 1 subtask(s)" in l for l in lines)
+    assert any("_filter_offtree_subtasks: dropped 1 subtask(s)" in l for l in lines)
 
 
 def test_generic_offtree_path_drops_with_generic_reason(leerie, tmp_path, monkeypatch):
@@ -86,7 +86,7 @@ def test_generic_offtree_path_drops_with_generic_reason(leerie, tmp_path, monkey
         {"id": "feat-001", "files_likely_touched": ["/tmp/foo.py"]},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert plans[0]["subtasks"] == []
     reasons = st.data["dropped_subtasks"]["feat-001"]["reasons"]
@@ -106,7 +106,7 @@ def test_empty_files_likely_touched_is_ok(leerie, tmp_path, monkeypatch):
         {"id": "config-002", "files_likely_touched": []},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["config-001", "config-002"]
     assert "dropped_subtasks" not in st.data
@@ -136,7 +136,7 @@ def test_mixed_plans_filter_independently(leerie, tmp_path, monkeypatch):
         ]},
     ]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-001"]
     assert [s["id"] for s in plans[1]["subtasks"]] == ["bugfix-002"]
@@ -144,7 +144,7 @@ def test_mixed_plans_filter_independently(leerie, tmp_path, monkeypatch):
 
 
 def test_schedule_after_filter_has_no_dropped_sid(leerie, tmp_path, monkeypatch):
-    """Integration with schedule(): after filter drops a sid, the schedule
+    """Integration with _schedule(): after filter drops a sid, the _schedule
     waves do not reference it. This is the load-bearing spot-check from
     the plan."""
     _capture_logs(leerie, monkeypatch)
@@ -162,8 +162,8 @@ def test_schedule_after_filter_has_no_dropped_sid(leerie, tmp_path, monkeypatch)
          "depends_on": [], "requires": [], "provides": []},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
-    subtasks, waves = leerie.schedule(plans)
+    leerie._filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    subtasks, waves = leerie._schedule(plans)
 
     assert "feat-002" not in subtasks
     flat = [sid for w in waves for sid in w]
@@ -174,7 +174,7 @@ def test_schedule_after_filter_has_no_dropped_sid(leerie, tmp_path, monkeypatch)
 def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkeypatch):
     """Cross-subtask interaction: when a dropped subtask provides a tag a
     survivor requires, the drop must prune that inbound `requires` (the tag
-    channel), so the survivor does NOT dangle and validate_plan survives.
+    channel), so the survivor does NOT dangle and _validate_plan survives.
 
     Previously this die()d with 'requires X but nothing provides it' — the
     id channel was pruned but the tag channel was not (DESIGN §5 *Id-vanishing
@@ -203,12 +203,12 @@ def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkey
          "size": "small"},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
     # the orphaned requires-tag is pruned from the survivor
     surv = {s["id"]: s for s in plans[0]["subtasks"]}
     assert surv["feat-002"]["requires"] == []
-    subtasks, _ = leerie.schedule(plans)
-    leerie.validate_plan(subtasks)   # must NOT die() now
+    subtasks, _ = leerie._schedule(plans)
+    leerie._validate_plan(subtasks)   # must NOT die() now
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +218,8 @@ def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkey
 
 def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
     """A dropped id can no longer satisfy any dependent, so inbound
-    `depends_on` references to it must be pruned — otherwise schedule()
-    drops the edge silently and validate_plan die()s the run."""
+    `depends_on` references to it must be pruned — otherwise _schedule()
+    drops the edge silently and _validate_plan die()s the run."""
     _capture_logs(leerie, monkeypatch)
     st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
@@ -234,7 +234,7 @@ def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
          "depends_on": ["feat-001", "feat-002"]},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [], st)
 
     surv = plans[0]["subtasks"]
     ids = {s["id"] for s in surv}
@@ -261,7 +261,7 @@ def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
          "depends_on": ["feat-001"]},
     ]}]
 
-    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie._filter_offtree_subtasks(plans, repo_root, [], st)
 
     surv = plans[0]["subtasks"]
     assert [s["id"] for s in surv] == ["feat-001", "feat-002"]

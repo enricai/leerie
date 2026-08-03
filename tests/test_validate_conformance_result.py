@@ -1,4 +1,4 @@
-"""Tests for validate_conformance_result() — cross-field invariants on
+"""Tests for _validate_conformance_result() — cross-field invariants on
 the conformer worker's structured output (DESIGN §9 *Post-work
 conformance*).
 
@@ -30,14 +30,14 @@ def _good_result(subtask_id="t1", **overrides):
 
 
 def test_empty_well_formed_result_passes(leerie, tmp_path):
-    err = leerie.validate_conformance_result(_good_result(), str(tmp_path))
+    err = leerie._validate_conformance_result(_good_result(), str(tmp_path))
     assert err is None
 
 
 def test_non_dict_result_rejected(leerie, tmp_path):
-    assert leerie.validate_conformance_result([], str(tmp_path)) is not None
-    assert leerie.validate_conformance_result(None, str(tmp_path)) is not None
-    assert leerie.validate_conformance_result("oops", str(tmp_path)) is not None
+    assert leerie._validate_conformance_result([], str(tmp_path)) is not None
+    assert leerie._validate_conformance_result(None, str(tmp_path)) is not None
+    assert leerie._validate_conformance_result("oops", str(tmp_path)) is not None
 
 
 def test_residual_without_files_read_rejected(leerie, tmp_path):
@@ -47,7 +47,7 @@ def test_residual_without_files_read_rejected(leerie, tmp_path):
         rules_files_read=[],
         rule_violations_residual=[{"rule": "x", "why_not_fixed": "y"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
     assert "rule_violations_residual" in err
     assert "rules_files_read" in err
@@ -58,7 +58,7 @@ def test_residual_with_files_read_accepted(leerie, tmp_path):
         rules_files_read=["CLAUDE.md"],
         rule_violations_residual=[{"rule": "x", "why_not_fixed": "y"}],
     )
-    assert leerie.validate_conformance_result(res, str(tmp_path)) is None
+    assert leerie._validate_conformance_result(res, str(tmp_path)) is None
 
 
 def test_fixed_violation_with_empty_rule_rejected(leerie, tmp_path):
@@ -68,7 +68,7 @@ def test_fixed_violation_with_empty_rule_rejected(leerie, tmp_path):
             {"rule": "", "fix": "added a hint", "evidence": "src/x.py:1"},
         ],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
     assert "rule_violations_fixed[0]" in err
 
@@ -80,7 +80,7 @@ def test_fixed_violation_with_whitespace_rule_rejected(leerie, tmp_path):
             {"rule": "   \n  ", "fix": "x", "evidence": "y"},
         ],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
 
 
@@ -88,7 +88,7 @@ def test_docs_update_path_must_exist(leerie, tmp_path):
     res = _good_result(
         docs_updates=[{"path": "docs/UNKNOWN.md", "reason": "stale"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
     assert "docs_updates[0]" in err
     assert "docs/UNKNOWN.md" in err
@@ -100,14 +100,14 @@ def test_docs_update_with_existing_path_accepted(leerie, tmp_path):
     res = _good_result(
         docs_updates=[{"path": "docs/API.md", "reason": "added new flag"}],
     )
-    assert leerie.validate_conformance_result(res, str(tmp_path)) is None
+    assert leerie._validate_conformance_result(res, str(tmp_path)) is None
 
 
 def test_tests_update_path_must_exist(leerie, tmp_path):
     res = _good_result(
         tests_updates=[{"path": "tests/test_missing.py", "reason": "added"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
     assert "tests_updates[0]" in err
 
@@ -118,14 +118,14 @@ def test_tests_update_with_existing_path_accepted(leerie, tmp_path):
     res = _good_result(
         tests_updates=[{"path": "tests/test_new.py", "reason": "new coverage"}],
     )
-    assert leerie.validate_conformance_result(res, str(tmp_path)) is None
+    assert leerie._validate_conformance_result(res, str(tmp_path)) is None
 
 
 def test_empty_path_string_rejected(leerie, tmp_path):
     res = _good_result(
         docs_updates=[{"path": "", "reason": "stale"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None
     assert "empty 'path'" in err
 
@@ -144,7 +144,7 @@ def test_docs_update_with_traversal_path_rejected(leerie, tmp_path):
     res = _good_result(
         docs_updates=[{"path": "../sibling.md", "reason": "drift"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None, "traversal path must be rejected"
     assert "escapes the worktree" in err
     assert "../sibling.md" in err
@@ -160,7 +160,7 @@ def test_tests_update_with_absolute_outside_path_rejected(leerie, tmp_path):
     res = _good_result(
         tests_updates=[{"path": str(outside), "reason": "added"}],
     )
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is not None, "absolute outside-worktree path must be rejected"
     assert "escapes the worktree" in err
 
@@ -181,6 +181,6 @@ def test_nested_traversal_to_legitimate_subtree_still_rejected(leerie, tmp_path)
                        "reason": "round-trip path"}],
     )
     # Document the current behavior: resolved-inside-worktree is accepted.
-    err = leerie.validate_conformance_result(res, str(tmp_path))
+    err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is None, \
         f"path that resolves inside worktree should be accepted, got: {err}"

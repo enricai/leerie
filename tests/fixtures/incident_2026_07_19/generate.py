@@ -128,7 +128,7 @@ def build_system_prompt(shape: dict | None = None) -> str:
 
 def build_coverage_task(shape: dict | None = None) -> str:
     """A task string that mentions CLAUDE.md once (root cause A's
-    trigger token) so glob_task_references/extract_task_file_structure
+    trigger token) so _glob_task_references/extract_task_file_structure
     harvest it exactly as the incident run did."""
     return build_task(shape)
 

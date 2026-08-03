@@ -28,7 +28,7 @@ import pytest
 _CALL_TYPE = "classifier"
 _ANCHOR = "ORIGINAL_ANCHOR_TEXT_HERE"
 
-# Call IDs must differ in their first 8 characters because judge_capture()
+# Call IDs must differ in their first 8 characters because _judge_capture()
 # builds sid as `judge-{call_type}-{call_id[:8]}` — the fake _invoke stubs
 # key on that sid to determine pass/fail per record.
 _ID_PASS = "passrec0-0000-0000-0000-000000000001"
@@ -110,7 +110,7 @@ def _make_capture_records() -> list[dict]:
     """3 synthetic capture records: 2 failing (call_type=classifier), 1 passing.
 
     Call IDs are chosen so their first 8 characters are all distinct — this
-    matters because judge_capture() builds `sid = judge-{call_type}-{call_id[:8]}`
+    matters because _judge_capture() builds `sid = judge-{call_type}-{call_id[:8]}`
     and our fake _invoke stubs key on that sid to produce per-record verdicts.
     """
     return [
@@ -193,7 +193,7 @@ def _make_state(leerie, run_dir: Path):
 def _make_judge_invoke():
     """Return a fake _invoke that yields pass for _ID_PASS, fail for the others.
 
-    judge_capture() builds sid = `judge-{call_type}-{call_id[:8]}`.
+    _judge_capture() builds sid = `judge-{call_type}-{call_id[:8]}`.
     _ID_PASS[:8] == "passrec0", _ID_FAIL_A[:8] == "failreca", _ID_FAIL_B[:8]
     == "failrecb" — all distinct, so the sid uniquely identifies the record.
     """
@@ -218,7 +218,7 @@ def _make_heal_judge_invoke(n_baseline_calls: int = 2):
     n_baseline_calls should equal n (the replays-per-sample count) * 2 records.
     Default 2 = n=1 replays × 2 failing records.
 
-    judge_capture() builds sid = `judge-{call_type}-{call_id[:8]}`.
+    _judge_capture() builds sid = `judge-{call_type}-{call_id[:8]}`.
     _ID_FAIL_A[:8] == "failreca", _ID_FAIL_B[:8] == "failrecb".
     """
     call_counter = [0]
@@ -238,7 +238,7 @@ def _make_heal_judge_invoke(n_baseline_calls: int = 2):
 
 
 def _request_patch_stub(hs, iter_n: int):
-    """Stub request_patch: returns a fixed anchor+replacement patch."""
+    """Stub _request_patch: returns a fixed anchor+replacement patch."""
     return (_ANCHOR, f"PATCHED_CONTENT_iter{iter_n}")
 
 
@@ -355,7 +355,7 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
         monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
@@ -396,7 +396,7 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
         monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
@@ -433,7 +433,7 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
         monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
@@ -475,7 +475,7 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
         monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
@@ -532,7 +532,7 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
         monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 

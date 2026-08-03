@@ -28,7 +28,7 @@ LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 def test_interrupted_by_signal_is_base_exception(leerie):
     """Must subclass BaseException (not Exception) so the broad
-    `except Exception` handlers inside orchestrate() don't swallow it."""
+    `except Exception` handlers inside _orchestrate() don't swallow it."""
     assert issubclass(leerie.InterruptedBySignal, BaseException)
     assert not issubclass(leerie.InterruptedBySignal, Exception)
 

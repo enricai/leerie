@@ -1,4 +1,4 @@
-"""Tests for `detect_session_limit()` — the Claude Code subscription
+"""Tests for `_detect_session_limit()` — the Claude Code subscription
 session-limit / rate-limit message detector.
 
 The detector is the single load-bearing surface for the rate-limit
@@ -30,7 +30,7 @@ VERBATIM = "You've hit your session limit · resets 3:10am (America/Bogota)"
 # --- positive cases -------------------------------------------------------
 
 def test_verbatim_message_returns_exit_with_parsed_reset_at(leerie):
-    exc = leerie.detect_session_limit(VERBATIM)
+    exc = leerie._detect_session_limit(VERBATIM)
     assert exc is not None
     assert exc.raw_message == VERBATIM
     assert exc.reset_at is not None
@@ -42,7 +42,7 @@ def test_verbatim_message_returns_exit_with_parsed_reset_at(leerie):
 
 def test_pm_time_normalizes_correctly(leerie):
     text = "You've hit your session limit · resets 7:30pm (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 19
     assert exc.reset_at.minute == 30
@@ -50,27 +50,27 @@ def test_pm_time_normalizes_correctly(leerie):
 
 def test_midnight_12am_normalizes_to_hour_zero(leerie):
     text = "You've hit your session limit · resets 12:00am (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 0
 
 
 def test_noon_12pm_stays_hour_twelve(leerie):
     text = "You've hit your session limit · resets 12:00pm (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 12
 
 
 def test_case_insensitive_prefix(leerie):
     text = "YOU'VE HIT YOUR SESSION LIMIT · resets 3:10am (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
 
 
 def test_case_insensitive_ampm(leerie):
     text = "You've hit your session limit · resets 3:10AM (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 3
 
@@ -89,7 +89,7 @@ def test_reset_time_in_past_rolls_to_tomorrow(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "datetime", _FrozenDateTime)
 
     text = "You've hit your session limit · resets 1:00am (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is not None
     # Tomorrow's 1am, not today's
@@ -100,11 +100,11 @@ def test_reset_time_in_past_rolls_to_tomorrow(leerie, monkeypatch):
 # --- negative cases — must NOT match --------------------------------------
 
 def test_empty_text_returns_none(leerie):
-    assert leerie.detect_session_limit("") is None
+    assert leerie._detect_session_limit("") is None
 
 
 def test_unrelated_text_returns_none(leerie):
-    assert leerie.detect_session_limit("The user asked a question.") is None
+    assert leerie._detect_session_limit("The user asked a question.") is None
 
 
 def test_workers_discussing_rate_limit_code_returns_none(leerie):
@@ -117,12 +117,12 @@ def test_workers_discussing_rate_limit_code_returns_none(leerie):
             'debug. `logger.warn` at line ~211: "hot path rate-limited '
             'for ${siteId}... not falling back" — this duplicates the '
             'event content.')
-    assert leerie.detect_session_limit(text) is None
+    assert leerie._detect_session_limit(text) is None
 
 
 def test_general_rate_limit_mention_returns_none(leerie):
     text = "The API was rate-limited, but we caught the 429 and retried."
-    assert leerie.detect_session_limit(text) is None
+    assert leerie._detect_session_limit(text) is None
 
 
 # --- parse-failure cases — must match but with reset_at=None --------------
@@ -131,7 +131,7 @@ def test_unknown_timezone_returns_exit_with_none_reset(leerie):
     """An unparseable timezone name must produce a clean fallback to
     manual --resume, not a wrong-time sleep."""
     text = "You've hit your session limit · resets 3:10am (Mars/Olympus)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
@@ -139,7 +139,7 @@ def test_unknown_timezone_returns_exit_with_none_reset(leerie):
 def test_no_reset_clause_returns_exit_with_none_reset(leerie):
     """The prefix matches but there's no `resets ...` clause."""
     text = "You've hit your session limit — please try again later."
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
@@ -147,14 +147,14 @@ def test_no_reset_clause_returns_exit_with_none_reset(leerie):
 def test_malformed_time_returns_exit_with_none_reset(leerie):
     """Hour out of range (25:xx) must fall back to None, not crash."""
     text = "You've hit your session limit · resets 25:00am (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
 
 def test_malformed_minute_returns_exit_with_none_reset(leerie):
     text = "You've hit your session limit · resets 3:99am (UTC)"
-    exc = leerie.detect_session_limit(text)
+    exc = leerie._detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
@@ -163,7 +163,7 @@ def test_malformed_minute_returns_exit_with_none_reset(leerie):
 
 def test_rate_limited_exit_is_baseexception(leerie):
     """Must subclass BaseException (not Exception) so the broad
-    `except Exception` handlers inside orchestrate() don't swallow it
+    `except Exception` handlers inside _orchestrate() don't swallow it
     — same pattern as InterruptedBySignal."""
     assert issubclass(leerie.RateLimitedExit, BaseException)
     assert not issubclass(leerie.RateLimitedExit, Exception)

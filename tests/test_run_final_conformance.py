@@ -1,4 +1,4 @@
-"""Tests for run_final_conformance() — the whole-tree conformer pass on
+"""Tests for _run_final_conformance() — the whole-tree conformer pass on
 the integrated staging worktree (DESIGN §6 *Worktree and integration
 model*, final-tree pass paragraph).
 
@@ -149,7 +149,7 @@ def test_skipped_when_staging_worktree_absent(env):
     # Remove the staging worktree to trigger the skip branch.
     subprocess.run(["git", "worktree", "remove", "-f", str(env["staging"])],
                    cwd=env["repo"], capture_output=True, text=True)
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
     # No conformance block was written.
@@ -160,7 +160,7 @@ def test_skipped_when_working_branch_absent(env):
     c = env["leerie"]
     env["st"].data["working_branch"] = ""
     env["st"].save()
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
     assert "_final" not in (env["st"].data.get("conformance") or {})
@@ -180,7 +180,7 @@ def test_skipped_on_resume_when_already_complete(env):
     env["st"].save()
     state = _stub_claude_p(c, [_clean_result()])
 
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -197,7 +197,7 @@ def test_clean_result_writes_final_block(env):
     c = env["leerie"]
     state = _stub_claude_p(c, [_clean_result()])
 
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -218,7 +218,7 @@ def test_malformed_result_surfaces_warning(env):
     )
     state = _stub_claude_p(c, [bad])
 
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -237,7 +237,7 @@ def test_worker_error_does_not_raise(env):
     c.claude_p = _stub
 
     # Must not raise — advisory framing.
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -268,7 +268,7 @@ def test_protected_path_commit_is_rolled_back(env):
         ["git", "rev-parse", "HEAD"], cwd=env["staging"],
         capture_output=True, text=True).stdout.strip()
 
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -292,7 +292,7 @@ def test_failing_axis_summarized_into_warnings(env):
     )
     _stub_claude_p(c, [failing] * env["caps"]["conformance_rounds"])
 
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
@@ -405,16 +405,16 @@ def test_payload_truncates_when_over_cap(leerie):
 # ---------------------------------------------------------------------------
 
 def test_run_final_conformance_called_between_execute_and_finalize(leerie):
-    """Coupling test: `_run_phases` must call `run_final_conformance`
+    """Coupling test: `_run_phases` must call `_run_final_conformance`
     *after* `phase_execute` and *before* `phase_finalize`. If anyone
     moves the call, this test surfaces it as a real change."""
     import inspect
     src = inspect.getsource(leerie._run_phases)
     exec_idx = src.find("await phase_execute(")
-    final_idx = src.find("await run_final_conformance(")
+    final_idx = src.find("await _run_final_conformance(")
     finalize_idx = src.find("await phase_finalize(")
     assert exec_idx != -1, "phase_execute call missing"
-    assert final_idx != -1, "run_final_conformance call missing"
+    assert final_idx != -1, "_run_final_conformance call missing"
     assert finalize_idx != -1, "phase_finalize call missing"
     assert exec_idx < final_idx < finalize_idx, (
         "ordering broken: final conformance must run between execute "

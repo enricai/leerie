@@ -1,4 +1,4 @@
-"""Tests for phase_judge() and judge_capture() — the LLM judge phase.
+"""Tests for phase_judge() and _judge_capture() — the LLM judge phase.
 
 Covers:
   - phase_judge() with a stubbed _invoke returning a fixed judge envelope:
@@ -324,13 +324,13 @@ def test_phase_judge_empty_ndjson(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_phase_judge_importable(leerie):
-    """phase_judge and judge_capture must be importable from leerie."""
+    """phase_judge and _judge_capture must be importable from leerie."""
     assert hasattr(leerie, "phase_judge"), (
         "phase_judge is not defined in orchestrator/leerie.py")
     assert callable(leerie.phase_judge)
-    assert hasattr(leerie, "judge_capture"), (
-        "judge_capture is not defined in orchestrator/leerie.py")
-    assert callable(leerie.judge_capture)
+    assert hasattr(leerie, "_judge_capture"), (
+        "_judge_capture is not defined in orchestrator/leerie.py")
+    assert callable(leerie._judge_capture)
 
 
 def test_judge_schema_in_schemas(leerie):

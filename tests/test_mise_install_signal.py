@@ -1,5 +1,5 @@
 """Tests for the no-version-signals short-circuit in
-`run_mise_install` (DESIGN §6½).
+`_run_mise_install` (DESIGN §6½).
 
 A repo with no version files at all (no `mise.toml`, no
 `.tool-versions`, no idiomatic files, no `.go-version`) should NOT
@@ -10,7 +10,7 @@ the design promises. Without this guard, mise's exact behavior for
 "no tools to install" error and break unversioned repos.
 
 The signal detection itself is a pure file-presence check; we test it
-directly. The async run_mise_install no-signals path is tested by
+directly. The async _run_mise_install no-signals path is tested by
 verifying it does NOT shell out (no mise binary needed in CI).
 """
 from __future__ import annotations
@@ -86,5 +86,5 @@ def test_run_mise_install_no_signals_short_circuits(leerie, tmp_path):
     # If it tried to invoke mise, the test would either find a real
     # mise binary (and install something — bad) or fail with
     # FileNotFoundError. The early return prevents both.
-    asyncio.run(leerie.run_mise_install(tmp_path, log_dir, st, None))
+    asyncio.run(leerie._run_mise_install(tmp_path, log_dir, st, None))
     assert st.data["provision"]["mise_versions"] == {}

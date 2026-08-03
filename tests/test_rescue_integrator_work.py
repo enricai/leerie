@@ -1,4 +1,4 @@
-"""Tests for `rescue_integrator_work` (DESIGN §12 *salvage if there is
+"""Tests for `_rescue_integrator_work` (DESIGN §12 *salvage if there is
 something to salvage*).
 
 Run 879defae's wave-2 integrator resolved six conflict hunks correctly, then
@@ -65,7 +65,7 @@ def test_rescues_uncommitted_resolution(leerie, conflicted_repo):
     The content must survive `git merge --abort`."""
     (conflicted_repo / "f.txt").write_text("RESOLVED-BY-INTEGRATOR\n")
 
-    ref = _run(leerie.rescue_integrator_work(
+    ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref, "a resolved-but-uncommitted tree must be rescuable"
 
@@ -89,7 +89,7 @@ def test_rescue_does_not_require_a_merge_commit(leerie, conflicted_repo):
     err = _run(leerie.check_merge_committed(conflicted_repo))
     assert err, "fixture sanity: this tree IS mid-merge"
 
-    ref = _run(leerie.rescue_integrator_work(
+    ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref, "rescue must not be gated on the merge having been committed"
 
@@ -100,7 +100,7 @@ def test_rescue_captures_untracked_files(leerie, conflicted_repo):
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
     (conflicted_repo / "new.txt").write_text("added-by-integrator\n")
 
-    ref = _run(leerie.rescue_integrator_work(
+    ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref
 
@@ -116,7 +116,7 @@ def test_rescue_leaves_real_index_and_worktree_untouched(leerie,
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
     before = _git("status", "--porcelain", cwd=conflicted_repo).stdout
 
-    _run(leerie.rescue_integrator_work(conflicted_repo, "feat-006", "run1"))
+    _run(leerie._rescue_integrator_work(conflicted_repo, "feat-006", "run1"))
 
     after = _git("status", "--porcelain", cwd=conflicted_repo).stdout
     assert before == after, "rescue must not mutate the index or working tree"
@@ -128,7 +128,7 @@ def test_rescue_leaves_real_index_and_worktree_untouched(leerie,
 def test_rescue_cleans_up_its_temp_index(leerie, conflicted_repo):
     """The throwaway index must not be left behind in .git/."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    _run(leerie.rescue_integrator_work(conflicted_repo, "feat-006", "run1"))
+    _run(leerie._rescue_integrator_work(conflicted_repo, "feat-006", "run1"))
     leftovers = list((conflicted_repo / ".git").glob("leerie-rescue-index-*"))
     assert leftovers == [], f"temp index left behind: {leftovers}"
 
@@ -146,7 +146,7 @@ def test_rescue_returns_none_when_nothing_to_save(leerie, tmp_path):
     _git("add", ".", cwd=repo)
     _git("commit", "-qm", "base", cwd=repo)
 
-    ref = _run(leerie.rescue_integrator_work(repo, "feat-006", "run1"))
+    ref = _run(leerie._rescue_integrator_work(repo, "feat-006", "run1"))
     assert ref is None
 
 
@@ -155,7 +155,7 @@ def test_rescue_returns_none_outside_a_git_repo(leerie, tmp_path):
     rather than raising), not via the exception handler."""
     not_a_repo = tmp_path / "nope"
     not_a_repo.mkdir()
-    ref = _run(leerie.rescue_integrator_work(not_a_repo, "feat-006", "run1"))
+    ref = _run(leerie._rescue_integrator_work(not_a_repo, "feat-006", "run1"))
     assert ref is None
 
 
@@ -175,7 +175,7 @@ def test_rescue_swallows_an_exception(leerie, conflicted_repo, monkeypatch):
         raise FileNotFoundError("git: command not found")
 
     monkeypatch.setattr(leerie, "run_proc", boom)
-    ref = _run(leerie.rescue_integrator_work(
+    ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref is None, "a raising git must degrade to None, not propagate"
 
@@ -196,7 +196,7 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
         raise FileNotFoundError("git vanished mid-rescue")
 
     monkeypatch.setattr(leerie, "run_proc", boom_after_seed)
-    ref = _run(leerie.rescue_integrator_work(
+    ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref is None
     leftovers = list((conflicted_repo / ".git").glob("leerie-rescue-index-*"))
@@ -206,10 +206,10 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
 def test_rescue_ref_is_namespaced_by_run_and_subtask(leerie, conflicted_repo):
     """Two crashed integrators in one run must not clobber each other."""
     (conflicted_repo / "f.txt").write_text("A\n")
-    ref_a = _run(leerie.rescue_integrator_work(
+    ref_a = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-005", "run1"))
     (conflicted_repo / "f.txt").write_text("B\n")
-    ref_b = _run(leerie.rescue_integrator_work(
+    ref_b = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
 
     assert ref_a != ref_b

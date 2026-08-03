@@ -457,7 +457,7 @@ Rules:
     `.claude/commands/`, and `.claude/skills/` ARE allowed as legitimate
     Claude Code deliverable subtrees.
 
-  `validate_plan` rejects any subtask naming a protected path here, and
+  `_validate_plan` rejects any subtask naming a protected path here, and
   the implementer's `check_diff_scope` would reject the commit anyway.
 - When a subtask's deliverable is a **coordination artifact** that a later
   subtask consumes — a research spec, a design summary, generated

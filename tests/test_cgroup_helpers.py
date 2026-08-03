@@ -194,7 +194,7 @@ def test_gate_records_and_passes_when_enforced(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_probe", lambda: True)
     monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", "v2")
     st = _FakeState({"task": "t"})
-    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+    leerie._enforce_and_record_cgroup_containment(st, allow_uncapped=False)
     assert st.data["cgroup_containment"] == {"enforced": True,
                                              "hierarchy": "v2"}
     assert st.saved
@@ -207,7 +207,7 @@ def test_gate_dies_when_unenforced_and_not_waived(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_probe", lambda: False)
     st = _FakeState({"task": "t"})
     with pytest.raises(SystemExit):
-        leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+        leerie._enforce_and_record_cgroup_containment(st, allow_uncapped=False)
     assert st.data["cgroup_containment"]["enforced"] is False
 
 
@@ -216,7 +216,7 @@ def test_gate_warns_and_continues_when_waived(leerie, monkeypatch):
     warning and lets the run proceed."""
     monkeypatch.setattr(leerie, "_cgroup_probe", lambda: False)
     st = _FakeState({"task": "t"})
-    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=True)
+    leerie._enforce_and_record_cgroup_containment(st, allow_uncapped=True)
     assert st.data["cgroup_containment"]["enforced"] is False
 
 
@@ -230,7 +230,7 @@ def test_gate_merges_into_existing_state(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", "v2")
     st = _FakeState({"task": "do a thing", "waves": [["a"]],
                      "worker_count": 3})
-    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+    leerie._enforce_and_record_cgroup_containment(st, allow_uncapped=False)
     # Existing keys survive.
     assert st.data["task"] == "do a thing"
     assert st.data["waves"] == [["a"]]
@@ -244,7 +244,7 @@ def test_gate_takes_state_and_flag(leerie):
     """Pins the unified signature (st, allow_uncapped) — the gate now
     lives with the state recording, not as a state-free main() call."""
     import inspect
-    sig = inspect.signature(leerie.enforce_and_record_cgroup_containment)
+    sig = inspect.signature(leerie._enforce_and_record_cgroup_containment)
     assert list(sig.parameters) == ["st", "allow_uncapped"]
 
 

@@ -75,12 +75,12 @@ def test_finish_no_work_run_preserves_existing_run_json_fields(leerie, tmp_path)
     at run start (`run_id`, `branch`, `working_branch`, `started_at`,
     `task`)."""
     st = _bootstrap_run_dir(tmp_path, leerie)
-    # Pre-write a run.json the way `orchestrate` does after the
+    # Pre-write a run.json the way `_orchestrate` does after the
     # run.json initialization after phase_classify.
     leerie._write_run_json(
         st.run_dir,
         run_id=st.run_id,
-        branch=leerie.compute_run_branch(st.run_id),
+        branch=leerie._compute_run_branch(st.run_id),
         working_branch="main",
         started_at=st.data["started_at"],
         task=st.data["task"],
@@ -90,7 +90,7 @@ def test_finish_no_work_run_preserves_existing_run_json_fields(leerie, tmp_path)
     rj = json.loads((st.run_dir / "run.json").read_text())
     # The run-identity fields are still there.
     assert rj["run_id"] == st.run_id
-    assert rj["branch"] == leerie.compute_run_branch(st.run_id)
+    assert rj["branch"] == leerie._compute_run_branch(st.run_id)
     assert rj["working_branch"] == "main"
     assert rj["started_at"] == st.data["started_at"]
     assert rj["task"] == st.data["task"]
@@ -112,7 +112,7 @@ def test_finish_no_work_run_logs_per_domain_basis(leerie, tmp_path, capsys):
     leerie._finish_no_work_run(st, reasons)
     out = capsys.readouterr().out
     # The summary line names the trigger.
-    assert "nothing to schedule" in out.lower()
+    assert "nothing to _schedule" in out.lower()
     # Each domain + basis is quoted.
     assert "bug-fixing" in out
     assert "ff2e97f" in out

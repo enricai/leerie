@@ -6,7 +6,7 @@ any log line — only its fingerprint (`_token_fingerprint`). `state.json`
 is the one sanctioned exception (local-orchestrator-owned, never
 published) via the single `active_oauth_token` field.
 
-Drives both the start-of-run selection path (`select_active_oauth_token`)
+Drives both the start-of-run selection path (`_select_active_oauth_token`)
 and the mid-run failover path (`claude_p`'s rotation arm) against real
 on-disk state.json / calls.ndjson, plus captured log output, and greps
 all three for the literal token strings used in the scenario.
@@ -85,7 +85,7 @@ class TestStartOfRunSelectionHygiene:
             "CLAUDE_CODE_OAUTH_TOKENS", f"{_RAW_TOKEN_A},{_RAW_TOKEN_B}")
         leerie._TOKEN_PROBE_CACHE.clear()
 
-        asyncio.run(leerie.select_active_oauth_token(
+        asyncio.run(leerie._select_active_oauth_token(
             st, dict(leerie.DEFAULT_CAPS)))
 
         # active_oauth_token IS allowed to hold the raw token in state.json

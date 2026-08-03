@@ -7,7 +7,7 @@ fails the subtask. All failure modes (malformed conformer output,
 WorkerError, protected-path violations on conformer commits,
 criteria-lock mismatch, exhausted rounds) surface as `warnings` entries.
 
-The tests stub `run_conformer` with a queue of canned results and use a
+The tests stub `_run_conformer` with a queue of canned results and use a
 real git worktree on disk so the criteria-lock and check_diff_scope
 re-runs against the conformer's commits exercise the real code paths.
 """
@@ -40,19 +40,19 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _restore_run_conformer(leerie):
-    """Snapshot `leerie.run_conformer` before each test and restore after.
+    """Snapshot `leerie._run_conformer` before each test and restore after.
 
-    `_stub_run_conformer` below rebinds `leerie.run_conformer = _stub`
+    `_stub_run_conformer` below rebinds `leerie._run_conformer = _stub`
     directly (not via monkeypatch). Without this autouse fixture, the
     stub leaks into the shared session-scoped `leerie` fixture and
-    breaks any later test that calls `inspect.getsource(leerie.run_conformer)`
+    breaks any later test that calls `inspect.getsource(leerie._run_conformer)`
     — it sees the stub's source, not the real one. This caught
     `tests/test_worker_timeout_handoff.py::test_run_conformer_*`
     failing under full-suite collection but passing when run in
     isolation."""
-    original = leerie.run_conformer
+    original = leerie._run_conformer
     yield
-    leerie.run_conformer = original
+    leerie._run_conformer = original
 
 
 def _run(cmd, cwd, check=True):
@@ -85,7 +85,7 @@ def env(leerie, tmp_path):
 
     # Set up .leerie coordination state first so the subtask worktree
     # can live under run_dir/worktrees/<sid> — the canonical location
-    # settle_subtask uses (`worktree = str(leerie_dir / "worktrees" / sid)`).
+    # _settle_subtask uses (`worktree = str(leerie_dir / "worktrees" / sid)`).
     sid = "t1"
     subtask_branch = f"leerie/subtasks/{run_id}/{sid}"
     leerie_root = repo / ".leerie"
@@ -128,7 +128,7 @@ def env(leerie, tmp_path):
 
 
 def _stub_run_conformer(leerie_mod, results_queue, *, commits=None):
-    """Patch leerie.run_conformer to return queued results in order. If
+    """Patch leerie._run_conformer to return queued results in order. If
     `commits` is provided, the matching index's stub also writes a file
     and commits it to the worktree before returning."""
     commits = commits or {}
@@ -145,7 +145,7 @@ def _stub_run_conformer(leerie_mod, results_queue, *, commits=None):
             action(Path(worktree))
         return results_queue[i] if i < len(results_queue) else None
 
-    leerie_mod.run_conformer = _stub
+    leerie_mod._run_conformer = _stub
     return state
 
 
@@ -403,7 +403,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     `bump_workers` raises WorkerError. The conformance phase must catch
     that and surface it as a `conformance_warnings` entry — it must NOT
     propagate up and crash the subtask. This pins the fix for the
-    third-pass audit bug: bump_workers placement inside run_conformer's
+    third-pass audit bug: bump_workers placement inside _run_conformer's
     try block."""
     c = env["leerie"]
     # Force the cap to a value already exceeded by st.data["worker_count"].
@@ -417,9 +417,9 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
         raise AssertionError("claude_p was called despite budget exhaustion")
     monkeypatch.setattr(c, "claude_p", _should_not_be_called)
 
-    # Call run_conformer directly. It should catch the budget WorkerError
+    # Call _run_conformer directly. It should catch the budget WorkerError
     # raised by bump_workers and return None.
-    result = asyncio.run(c.run_conformer(
+    result = asyncio.run(c._run_conformer(
         env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
         env["st"], env["models"], env["efforts"],
         rules_files=[], blt_commands={"build": "", "lint": "", "test": ""},
@@ -437,17 +437,17 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
         "budget exhaustion should surface as a 'crashed' advisory warning"
 
 
-# --- outer contract: settle_subtask never escalates conformance failures --
+# --- outer contract: _settle_subtask never escalates conformance failures --
 
 def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):
-    """The outer contract — settle_subtask must NEVER return a result
+    """The outer contract — _settle_subtask must NEVER return a result
     with status `failed` or `blocked` due to a conformance failure. This
     tightens the contract verification beyond the inner-helper tests:
     those verify _run_conformance_phase returns advisory warnings; this
     verifies the caller actually honors that and doesn't re-escalate."""
     c = env["leerie"]
 
-    # Stub run_implementer to return a clean `complete` result without
+    # Stub _run_implementer to return a clean `complete` result without
     # actually spawning a worker. The worktree already has the implementer's
     # commit from the env fixture, so the per-subtask gates will pass.
     async def _stub_implementer(sid, leerie_dir, caps, st, models, efforts,
@@ -459,13 +459,13 @@ def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):
                 {"criterion": "f() exists", "met": True, "evidence": "src.py"},
             ],
         }
-    monkeypatch.setattr(c, "run_implementer", _stub_implementer)
+    monkeypatch.setattr(c, "_run_implementer", _stub_implementer)
 
     # Conformer crashes (returns None). _run_conformance_phase surfaces
-    # this as a warning; settle_subtask must still return `complete`.
+    # this as a warning; _settle_subtask must still return `complete`.
     _stub_run_conformer(c, [None])
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete", \
@@ -491,7 +491,7 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
                 {"criterion": "f() exists", "met": True, "evidence": "src.py"},
             ],
         }
-    monkeypatch.setattr(c, "run_implementer", _stub_implementer)
+    monkeypatch.setattr(c, "_run_implementer", _stub_implementer)
 
     failing = _clean_result(
         rules_files_read=["README.md"],
@@ -501,7 +501,7 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
     )
     _stub_run_conformer(c, [failing] * 10)
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete"
@@ -514,13 +514,13 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
 def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkeypatch):
     """The conformance phase is documented as 'never raises a workflow
     error.' But underlying `run_proc` calls `asyncio.create_subprocess_exec`,
-    which raises FileNotFoundError when cwd is missing. The settle_subtask
+    which raises FileNotFoundError when cwd is missing. The _settle_subtask
     splice has a broad try/except specifically to honor the advisory
     contract for any unexpected exception — including this one. Verify the
     subtask still returns `complete` with a warning."""
     c = env["leerie"]
 
-    # Stub run_implementer to short-circuit to a clean complete result.
+    # Stub _run_implementer to short-circuit to a clean complete result.
     async def _stub_implementer(sid, leerie_dir, caps, st, models, efforts,
                                 continuation=False, note=""):
         return {
@@ -530,7 +530,7 @@ def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkey
                 {"criterion": "f() exists", "met": True, "evidence": "src.py"},
             ],
         }
-    monkeypatch.setattr(c, "run_implementer", _stub_implementer)
+    monkeypatch.setattr(c, "_run_implementer", _stub_implementer)
 
     # Stub _run_conformance_phase to raise a synthetic unexpected exception
     # that mimics the realistic FileNotFoundError-from-missing-worktree case.
@@ -539,7 +539,7 @@ def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkey
                                 "/nonexistent/worktree")
     monkeypatch.setattr(c, "_run_conformance_phase", _explode)
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete", \

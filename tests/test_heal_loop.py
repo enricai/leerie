@@ -1,11 +1,11 @@
-"""Tests for HealState, heal_baseline, heal_apply_patch, heal_replay_patched.
+"""Tests for HealState, _heal_baseline, _heal_apply_patch, _heal_replay_patched.
 
 Covers:
-  (a) heal_baseline against 2 fake failing captures and n=3 writes state.json
+  (a) _heal_baseline against 2 fake failing captures and n=3 writes state.json
       with baseline arm-results for both captures, plus 6 judge verdicts
-  (b) heal_apply_patch writes one patched prompt per failing capture under
+  (b) _heal_apply_patch writes one patched prompt per failing capture under
       iter-1/patched-prompts/
-  (c) heal_replay_patched updates state.json with an iteration record
+  (c) _heal_replay_patched updates state.json with an iteration record
   (d) HealState round-trips via save/load
 """
 from __future__ import annotations
@@ -117,11 +117,11 @@ def _patch_invoke_for_judge(leerie, monkeypatch, judge_envelope=_JUDGE_ENVELOPE)
 
 
 def _patch_replay_and_judge(leerie, monkeypatch):
-    """Patch both replay_capture and _invoke (for judge) without network I/O."""
+    """Patch both _replay_capture and _invoke (for judge) without network I/O."""
     async def fake_replay(record, *, override_system_prompt=None, cwd=None):
         return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
@@ -177,11 +177,11 @@ def test_heal_state_load_missing(leerie, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Criterion (a): heal_baseline writes state.json + 6 judge verdicts
+# Criterion (a): _heal_baseline writes state.json + 6 judge verdicts
 # ---------------------------------------------------------------------------
 
 def test_heal_baseline_writes_state_json(leerie, tmp_path, monkeypatch):
-    """heal_baseline with 2 failing captures, n=3 writes state.json."""
+    """_heal_baseline with 2 failing captures, n=3 writes state.json."""
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
     st = _make_state(leerie, run_dir)
@@ -189,11 +189,11 @@ def test_heal_baseline_writes_state_json(leerie, tmp_path, monkeypatch):
     _patch_replay_and_judge(leerie, monkeypatch)
 
     hs = asyncio.run(
-        leerie.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     state_path = heal_dir / "classifier" / "state.json"
-    assert state_path.exists(), "state.json not written by heal_baseline"
+    assert state_path.exists(), "state.json not written by _heal_baseline"
 
     loaded = json.loads(state_path.read_text())
     assert "failing_samples" in loaded
@@ -202,7 +202,7 @@ def test_heal_baseline_writes_state_json(leerie, tmp_path, monkeypatch):
 
 
 def test_heal_baseline_baseline_covers_both_samples(leerie, tmp_path, monkeypatch):
-    """heal_baseline baseline dict contains entries for both call_ids."""
+    """_heal_baseline baseline dict contains entries for both call_ids."""
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
     st = _make_state(leerie, run_dir)
@@ -210,7 +210,7 @@ def test_heal_baseline_baseline_covers_both_samples(leerie, tmp_path, monkeypatc
     _patch_replay_and_judge(leerie, monkeypatch)
 
     hs = asyncio.run(
-        leerie.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert len(hs.baseline) == 2, f"Expected 2 baseline entries, got {len(hs.baseline)}"
@@ -225,7 +225,7 @@ def test_heal_baseline_baseline_covers_both_samples(leerie, tmp_path, monkeypatc
 
 
 def test_heal_baseline_writes_6_verdict_files(leerie, tmp_path, monkeypatch):
-    """heal_baseline with 2 records and n=3 writes exactly 6 verdict files."""
+    """_heal_baseline with 2 records and n=3 writes exactly 6 verdict files."""
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
     st = _make_state(leerie, run_dir)
@@ -233,7 +233,7 @@ def test_heal_baseline_writes_6_verdict_files(leerie, tmp_path, monkeypatch):
     _patch_replay_and_judge(leerie, monkeypatch)
 
     asyncio.run(
-        leerie.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     verdicts_dir = heal_dir / "classifier" / "baseline" / "verdicts"
@@ -243,7 +243,7 @@ def test_heal_baseline_writes_6_verdict_files(leerie, tmp_path, monkeypatch):
 
 
 def test_heal_baseline_sets_best_so_far(leerie, tmp_path, monkeypatch):
-    """heal_baseline sets best_so_far from the baseline pass_rate."""
+    """_heal_baseline sets best_so_far from the baseline pass_rate."""
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
     st = _make_state(leerie, run_dir)
@@ -251,7 +251,7 @@ def test_heal_baseline_sets_best_so_far(leerie, tmp_path, monkeypatch):
     _patch_replay_and_judge(leerie, monkeypatch)
 
     hs = asyncio.run(
-        leerie.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert "pass_rate" in hs.best_so_far, "best_so_far missing pass_rate"
@@ -259,7 +259,7 @@ def test_heal_baseline_sets_best_so_far(leerie, tmp_path, monkeypatch):
 
 
 def test_heal_baseline_history_is_empty(leerie, tmp_path, monkeypatch):
-    """heal_baseline does not write any iteration history (that's for replay)."""
+    """_heal_baseline does not write any iteration history (that's for replay)."""
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
     st = _make_state(leerie, run_dir)
@@ -267,22 +267,22 @@ def test_heal_baseline_history_is_empty(leerie, tmp_path, monkeypatch):
     _patch_replay_and_judge(leerie, monkeypatch)
 
     hs = asyncio.run(
-        leerie.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert hs.history == [], f"Expected empty history, got {hs.history}"
 
 
 # ---------------------------------------------------------------------------
-# Criterion (b): heal_apply_patch writes patched prompts under iter-1/
+# Criterion (b): _heal_apply_patch writes patched prompts under iter-1/
 # ---------------------------------------------------------------------------
 
 def test_heal_apply_patch_writes_two_prompt_files(leerie, tmp_path):
-    """heal_apply_patch writes one .txt file per failing record."""
+    """_heal_apply_patch writes one .txt file per failing record."""
     heal_dir = tmp_path / "heal"
     records = _make_failing_records(2)
 
-    written = leerie.heal_apply_patch(
+    written = leerie._heal_apply_patch(
         "classifier", 1, "REPLACEMENT_TEXT", "ANCHOR_POINT_HERE",
         heal_dir, records
     )
@@ -301,7 +301,7 @@ def test_heal_apply_patch_anchor_replacement(leerie, tmp_path):
     anchor = "ANCHOR_POINT_HERE"
     replacement = "REPLACED_CONTENT"
 
-    leerie.heal_apply_patch("classifier", 1, replacement, anchor, heal_dir, records)
+    leerie._heal_apply_patch("classifier", 1, replacement, anchor, heal_dir, records)
 
     for rec in records:
         call_id = rec["call_id"]
@@ -312,20 +312,20 @@ def test_heal_apply_patch_anchor_replacement(leerie, tmp_path):
 
 
 def test_heal_apply_patch_creates_dir(leerie, tmp_path):
-    """heal_apply_patch creates the patched-prompts directory if absent."""
+    """_heal_apply_patch creates the patched-prompts directory if absent."""
     heal_dir = tmp_path / "heal"
     records = _make_failing_records(1)
     out_dir = heal_dir / "classifier" / "iter-1" / "patched-prompts"
     assert not out_dir.exists()
 
-    leerie.heal_apply_patch("classifier", 1, "new", "ANCHOR_POINT_HERE",
+    leerie._heal_apply_patch("classifier", 1, "new", "ANCHOR_POINT_HERE",
                                heal_dir, records)
 
     assert out_dir.exists()
 
 
 # ---------------------------------------------------------------------------
-# Criterion (c): heal_replay_patched updates state.json with iteration record
+# Criterion (c): _heal_replay_patched updates state.json with iteration record
 # ---------------------------------------------------------------------------
 
 def _setup_for_replay(leerie, tmp_path, monkeypatch, n_replays: int = 2):
@@ -337,9 +337,9 @@ def _setup_for_replay(leerie, tmp_path, monkeypatch, n_replays: int = 2):
     _patch_replay_and_judge(leerie, monkeypatch)
 
     asyncio.run(
-        leerie.heal_baseline("classifier", records, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_baseline("classifier", records, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
-    leerie.heal_apply_patch(
+    leerie._heal_apply_patch(
         "classifier", 1, "REPLACEMENT_TEXT", "ANCHOR_POINT_HERE",
         heal_dir, records
     )
@@ -347,13 +347,13 @@ def _setup_for_replay(leerie, tmp_path, monkeypatch, n_replays: int = 2):
 
 
 def test_heal_replay_patched_updates_history(leerie, tmp_path, monkeypatch):
-    """heal_replay_patched appends one iteration record to state.json history."""
+    """_heal_replay_patched appends one iteration record to state.json history."""
     run_dir, heal_dir, st, records = _setup_for_replay(
         leerie, tmp_path, monkeypatch
     )
 
     hs = asyncio.run(
-        leerie.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert len(hs.history) == 1, f"Expected 1 history entry, got {len(hs.history)}"
@@ -363,13 +363,13 @@ def test_heal_replay_patched_updates_history(leerie, tmp_path, monkeypatch):
 
 
 def test_heal_replay_patched_state_persisted(leerie, tmp_path, monkeypatch):
-    """After heal_replay_patched, state.json on disk contains the history entry."""
+    """After _heal_replay_patched, state.json on disk contains the history entry."""
     run_dir, heal_dir, st, records = _setup_for_replay(
         leerie, tmp_path, monkeypatch
     )
 
     asyncio.run(
-        leerie.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     state_path = heal_dir / "classifier" / "state.json"
@@ -393,7 +393,7 @@ def test_heal_replay_patched_best_so_far_updated(leerie, tmp_path, monkeypatch):
     hs_pre.save()
 
     hs = asyncio.run(
-        leerie.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie._heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     # Judge always returns passed=True, so pass_rate=1.0 > 0.0 → best updated.
@@ -406,12 +406,12 @@ def test_heal_replay_patched_best_so_far_updated(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_heal_symbols_importable(leerie):
-    """HealState, heal_baseline, heal_apply_patch, heal_replay_patched must exist."""
+    """HealState, _heal_baseline, _heal_apply_patch, _heal_replay_patched must exist."""
     assert hasattr(leerie, "HealState"), "HealState not in leerie"
-    assert hasattr(leerie, "heal_baseline"), "heal_baseline not in leerie"
-    assert hasattr(leerie, "heal_apply_patch"), "heal_apply_patch not in leerie"
-    assert hasattr(leerie, "heal_replay_patched"), "heal_replay_patched not in leerie"
+    assert hasattr(leerie, "_heal_baseline"), "_heal_baseline not in leerie"
+    assert hasattr(leerie, "_heal_apply_patch"), "_heal_apply_patch not in leerie"
+    assert hasattr(leerie, "_heal_replay_patched"), "_heal_replay_patched not in leerie"
     assert callable(leerie.HealState)
-    assert callable(leerie.heal_baseline)
-    assert callable(leerie.heal_apply_patch)
-    assert callable(leerie.heal_replay_patched)
+    assert callable(leerie._heal_baseline)
+    assert callable(leerie._heal_apply_patch)
+    assert callable(leerie._heal_replay_patched)

@@ -1,10 +1,10 @@
 """Unit tests for the conformer's gating solution-completeness axis
 (DESIGN §9 *The one gating axis: solution completeness*):
 
-- `actionable_solution_defects` — the anti-gaming filter (only defects with a
+- `_actionable_solution_defects` — the anti-gaming filter (only defects with a
   concrete_case AND where gate).
 - `_format_solution_defects` — the mandatory-criteria retry feedback block.
-- `validate_conformance_result`'s solution_defects cross-field invariant.
+- `_validate_conformance_result`'s solution_defects cross-field invariant.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _defect(kind="unhandled_input", case="empty list", where="foo.py:10",
 class TestSolutionDefectsSchemaMinLength:
     """F4: concrete_case/where/why_ships_a_defect carry minLength:1 so an empty
     string is rejected at the JSON layer (worker retries via claude_p) instead
-    of tripping validate_conformance_result's cross-field break, which would
+    of tripping _validate_conformance_result's cross-field break, which would
     break the whole conformance loop early. Mirrors dep_capture's discipline."""
 
     def test_defect_fields_have_min_length(self, leerie):
@@ -33,33 +33,33 @@ class TestSolutionDefectsSchemaMinLength:
 
 class TestActionableSolutionDefects:
     def test_none_result_is_empty(self, leerie):
-        assert leerie.actionable_solution_defects(None) == []
+        assert leerie._actionable_solution_defects(None) == []
 
     def test_missing_field_is_empty(self, leerie):
-        assert leerie.actionable_solution_defects({"subtask_id": "x"}) == []
+        assert leerie._actionable_solution_defects({"subtask_id": "x"}) == []
 
     def test_actionable_defect_survives(self, leerie):
         res = {"solution_defects": [_defect()]}
-        out = leerie.actionable_solution_defects(res)
+        out = leerie._actionable_solution_defects(res)
         assert len(out) == 1
 
     def test_defect_missing_concrete_case_is_dropped(self, leerie):
         """The anti-gaming guard: a defect without a concrete case is
         non-actionable and must NOT gate."""
         res = {"solution_defects": [_defect(case="")]}
-        assert leerie.actionable_solution_defects(res) == []
+        assert leerie._actionable_solution_defects(res) == []
 
     def test_defect_missing_where_is_dropped(self, leerie):
         res = {"solution_defects": [_defect(where="  ")]}
-        assert leerie.actionable_solution_defects(res) == []
+        assert leerie._actionable_solution_defects(res) == []
 
     def test_mixed_keeps_only_actionable(self, leerie):
         res = {"solution_defects": [_defect(), _defect(case=""), _defect()]}
-        assert len(leerie.actionable_solution_defects(res)) == 2
+        assert len(leerie._actionable_solution_defects(res)) == 2
 
     def test_non_dict_defect_is_skipped(self, leerie):
         res = {"solution_defects": ["not a dict", _defect()]}
-        assert len(leerie.actionable_solution_defects(res)) == 1
+        assert len(leerie._actionable_solution_defects(res)) == 1
 
 
 class TestFormatSolutionDefects:
@@ -101,22 +101,22 @@ class TestValidateConformanceSolutionDefects:
         with tempfile.TemporaryDirectory() as wt:
             res = self._base()
             res["solution_defects"] = [_defect()]
-            assert leerie.validate_conformance_result(res, wt) is None
+            assert leerie._validate_conformance_result(res, wt) is None
 
     def test_empty_concrete_case_is_rejected(self, leerie):
         with tempfile.TemporaryDirectory() as wt:
             res = self._base()
             res["solution_defects"] = [_defect(case="")]
-            err = leerie.validate_conformance_result(res, wt)
+            err = leerie._validate_conformance_result(res, wt)
             assert err is not None and "concrete_case" in err
 
     def test_empty_where_is_rejected(self, leerie):
         with tempfile.TemporaryDirectory() as wt:
             res = self._base()
             res["solution_defects"] = [_defect(where="")]
-            err = leerie.validate_conformance_result(res, wt)
+            err = leerie._validate_conformance_result(res, wt)
             assert err is not None and "where" in err
 
     def test_empty_array_passes(self, leerie):
         with tempfile.TemporaryDirectory() as wt:
-            assert leerie.validate_conformance_result(self._base(), wt) is None
+            assert leerie._validate_conformance_result(self._base(), wt) is None

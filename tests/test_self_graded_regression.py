@@ -60,7 +60,7 @@ _BUGFIX_002_DEFECTS = {
 def test_bugfix_002_shallow_diff_is_caught_by_completeness_gate(leerie):
     """The incident shape produces actionable defects — the gate would send it
     back, not ship it complete."""
-    actionable = leerie.actionable_solution_defects(_BUGFIX_002_DEFECTS)
+    actionable = leerie._actionable_solution_defects(_BUGFIX_002_DEFECTS)
     assert len(actionable) == 3
     # And the retry feedback names each concrete site (mandatory criteria).
     note = leerie._format_solution_defects(actionable)
@@ -70,7 +70,7 @@ def test_bugfix_002_shallow_diff_is_caught_by_completeness_gate(leerie):
 
 def test_bugfix_002_clean_variant_does_not_gate(leerie):
     """A genuinely complete diff (empty solution_defects) ships unimpeded."""
-    assert leerie.actionable_solution_defects({"solution_defects": []}) == []
+    assert leerie._actionable_solution_defects({"solution_defects": []}) == []
 
 
 # === Fixture 2: 0-vs-10 classification (landing page as documentation) ======
@@ -122,7 +122,7 @@ def test_correct_classification_does_not_gate(leerie, tmp_path, monkeypatch):
 def test_dropped_provider_dangle_is_caught_by_check_plan_wiring(leerie):
     """The satisfied-probe/drop tag-channel dangle: a surviving subtask
     requires a tag whose only provider was dropped. check_plan_wiring catches
-    it deterministically before validate_plan burns the plan spend."""
+    it deterministically before _validate_plan burns the plan spend."""
     # feat-001 (the provider of 'shared-schema') was dropped; feat-002 survives
     # requiring it.
     plan = {

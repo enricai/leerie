@@ -13,7 +13,7 @@ on the primary key, so no tiebreak is ever consulted. Hence a gate that runs
 
 The gate is **relative, never absolute**: an empty `ready` plan is also the
 planner's legitimate way to say "this domain has no work", which
-`detect_no_work` routes a run on. It is a defect only when a sibling sample
+`_detect_no_work` routes a run on. It is a defect only when a sibling sample
 found work. The all-empty case must therefore pass through untouched — that
 is what `test_all_empty_samples_are_all_kept` protects, and it is the one
 behaviour a careless "just reject empty plans" fix would break.
@@ -68,7 +68,7 @@ def test_non_empty_ready_plan_is_not_flagged(leerie):
 
 def test_empty_blocked_plan_is_not_flagged(leerie):
     """Scoped deliberately to `ready`. A `blocked` plan is a planner verdict
-    the run must still see — `schedule()` owns the all-blocked die(). Widening
+    the run must still see — `_schedule()` owns the all-blocked die(). Widening
     the gate to swallow it would convert a diagnosable stop into a silent
     one."""
     assert leerie._planner_sample_is_empty_ready(_plan(0, status="blocked")) \
@@ -113,7 +113,7 @@ def test_falsifier_empty_sample_would_win_without_the_gate(leerie, tmp_path):
 
 def test_all_empty_samples_are_all_kept(leerie, tmp_path):
     """The load-bearing negative. Every sample empty means the domain really
-    has no work, so the set must pass through and `detect_no_work` must still
+    has no work, so the set must pass through and `_detect_no_work` must still
     be able to route on the result."""
     samples = [_plan(0), _plan(0), _plan(0)]
     best = leerie._select_best_planner_sample(
@@ -181,7 +181,7 @@ def test_gating_findings_still_decide_selection(leerie, tmp_path):
 def test_blocked_sample_still_selectable_against_an_empty_ready(
         leerie, tmp_path):
     """The gate drops the empty `ready`; the `blocked` sample is untouched and
-    remains available for `schedule()` to act on."""
+    remains available for `_schedule()` to act on."""
     empty_ready, blocked = _plan(0), _plan(0, status="blocked")
     best = leerie._select_best_planner_sample(
         [empty_ready, blocked], tmp_path, "bug-fixing")

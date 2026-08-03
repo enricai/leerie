@@ -26,7 +26,7 @@ def test_phase_finalize_invokes_cleanup_with_run_id(leerie):
     no-arg mode, reads EOF from the orchestrator's non-tty stdin, and
     silently aborts — leaving every subtask worktree on disk."""
     src = inspect.getsource(leerie.phase_finalize)
-    assert 'run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")' in src, (
+    assert '_run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")' in src, (
         "phase_finalize must invoke cleanup.sh with --run-id st.run_id and "
         "--subtask-branches. The --run-id avoids the interactive no-arg "
         "path (which silently aborts non-interactively); the "
@@ -39,7 +39,7 @@ def test_phase_finalize_invokes_cleanup_with_run_id(leerie):
 def test_phase_finalize_does_not_use_bare_cleanup(leerie):
     """Defensive pin: the bare invocation must not reappear via refactor."""
     src = inspect.getsource(leerie.phase_finalize)
-    assert 'run_script("cleanup.sh")' not in src, (
+    assert '_run_script("cleanup.sh")' not in src, (
         "phase_finalize must not invoke cleanup.sh with no args. "
         "The no-arg mode is the operator-facing y/N path and aborts "
         "non-interactively."
@@ -59,9 +59,9 @@ def test_phase_finalize_has_completion_gate(leerie):
     # The gate must come BEFORE the finalize.sh invocation (else a partial
     # run would already have run finalize/cleanup before the check fires).
     gate_pos = src.index("refusing to finalize")
-    finalize_pos = src.index('run_script("finalize.sh"')
+    finalize_pos = src.index('_run_script("finalize.sh"')
     assert gate_pos < finalize_pos, (
-        "the completion gate must fire before run_script('finalize.sh')"
+        "the completion gate must fire before _run_script('finalize.sh')"
     )
 
 
@@ -84,11 +84,11 @@ def test_current_phase_stamped_after_finalize_sh_succeeds(leerie):
     guard falls through, and --resume re-runs finalize.sh's non-empty
     check. This test pins the ordering by source position."""
     src = inspect.getsource(leerie.phase_finalize)
-    finalize_call = src.index('run_script("finalize.sh"')
+    finalize_call = src.index('_run_script("finalize.sh"')
     stamp = src.index('st.data["current_phase"] = "phase 6: finalize"')
     assert finalize_call < stamp, (
         'phase_finalize must set current_phase="phase 6: finalize" AFTER '
-        'the run_script("finalize.sh") call, not before it. Stamping before '
+        'the _run_script("finalize.sh") call, not before it. Stamping before '
         "makes a died finalize indistinguishable from a successful one to "
         "the --resume completion guard, which then pushes an empty branch."
     )

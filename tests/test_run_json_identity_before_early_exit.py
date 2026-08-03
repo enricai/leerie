@@ -10,7 +10,7 @@ init block (`run_id`, `branch`, `working_branch`, `pr_base_branch`,
 `started_at`, `task`) ran strictly AFTER `phase_classification_gate` in
 `_run_phases`, so a run routed to the no-work terminal state via that
 gate's exhaustion path produced a run.json permanently missing all
-identity fields — unlike the pre-existing `detect_no_work` post-plan
+identity fields — unlike the pre-existing `_detect_no_work` post-plan
 route, whose call site always sits downstream of that init block. The
 launcher's local-runtime auto-finalize scan (`leerie:7124-7150`)
 explicitly treats a run.json missing `branch`/`working_branch` as "died

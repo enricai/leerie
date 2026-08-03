@@ -113,7 +113,7 @@ def test_wave_index_advances_with_completed_waves(leerie):
 
 def test_post_wave_loop_returns_none(leerie):
     """When `completed_waves >= len(waves)`, the wave loop has finished
-    and post-wave workers (summarizer, pr_writer, run_final_conformance)
+    and post-wave workers (summarizer, pr_writer, _run_final_conformance)
     run. There is no in-flight wave; return None so those workers emit
     no prefix (rather than the absurd `wave 3/2` overflow the old
     `+ 1`-without-bound code produced)."""

@@ -3,7 +3,7 @@
 Covers:
 - `CATEGORY_ABBREV` coverage of every entry in `CATEGORIES` (drift guard).
 - `_ID_PREFIXES` derivation from `CATEGORY_ABBREV`.
-- `compute_run_branch` and `compute_subtask_branch` shape.
+- `_compute_run_branch` and `_compute_subtask_branch` shape.
 """
 from __future__ import annotations
 
@@ -51,31 +51,31 @@ def test_id_prefixes_derive_from_category_abbrev(leerie):
     category. Drift between these two maps is what aborted the
     bug-fixing run that motivated commit 6b824c4's follow-up: the
     planner faithfully used the injected `ID_PREFIX` (`fix-`) but
-    validate_plan only accepted `bugfix-`. They are now derived from
+    _validate_plan only accepted `bugfix-`. They are now derived from
     one source; this test fails if a future contributor restates the
     set by hand and forgets a category."""
     expected = frozenset(f"{v}-" for v in leerie.CATEGORY_ABBREV.values())
     assert leerie._ID_PREFIXES == expected
 
 
-# --- compute_run_branch ----------------------------------------------------
+# --- _compute_run_branch ----------------------------------------------------
 
 def test_compute_run_branch_shape(leerie):
-    assert leerie.compute_run_branch("feat-foo-abc123") == "leerie/runs/feat-foo-abc123"
+    assert leerie._compute_run_branch("feat-foo-abc123") == "leerie/runs/feat-foo-abc123"
 
 
 def test_compute_run_branch_is_pure(leerie):
     """Same input → same output. Trivial but pinning the contract."""
     rid = "fix-bar-def456"
-    assert leerie.compute_run_branch(rid) == leerie.compute_run_branch(rid)
+    assert leerie._compute_run_branch(rid) == leerie._compute_run_branch(rid)
 
 
 def test_compute_subtask_branch_shape(leerie):
-    assert (leerie.compute_subtask_branch("feat-foo-abc123", "feat-001")
+    assert (leerie._compute_subtask_branch("feat-foo-abc123", "feat-001")
             == "leerie/subtasks/feat-foo-abc123/feat-001")
 
 
 def test_compute_subtask_branch_is_pure(leerie):
     rid, sid = "fix-bar-def456", "fix-002"
-    assert (leerie.compute_subtask_branch(rid, sid)
-            == leerie.compute_subtask_branch(rid, sid))
+    assert (leerie._compute_subtask_branch(rid, sid)
+            == leerie._compute_subtask_branch(rid, sid))

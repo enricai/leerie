@@ -93,7 +93,7 @@ def test_every_confidence_worker_is_told_the_limits(leerie, name):
     """The caps were previously stated in NO prompt, so a worker had no way to
     comply with a bound it was never told about while being asked for detailed
     evidence. A rejection the model could not have avoided is not a gate."""
-    text = leerie.load_prompt(name)
+    text = leerie._load_prompt(name)
     assert str(leerie._CONFIDENCE_BASIS_MAX_LENGTH) in text, (
         f"{name} does not state the basis limit")
     assert str(leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH) in text, (

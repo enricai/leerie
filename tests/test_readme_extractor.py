@@ -1,4 +1,4 @@
-"""`extract_readme_sections` bounds the README fixture's SIZE, nothing more.
+"""`_extract_readme_sections` bounds the README fixture's SIZE, nothing more.
 
 Which parts of a README describe installation is a judgment about prose, so
 the provision worker makes it. This function only decides how much text the
@@ -35,11 +35,11 @@ def test_short_readme_is_returned_verbatim(leerie):
     reordering, no truncation."""
     text = ("# Project\n\nPitch.\n\n## Install\n\n```\npip install x\n```\n"
             "\n## Licence\n\nMIT\n")
-    assert leerie.extract_readme_sections(text) == text
+    assert leerie._extract_readme_sections(text) == text
 
 
 def test_over_budget_readme_is_truncated_to_budget(leerie):
-    out = leerie.extract_readme_sections(_long())
+    out = leerie._extract_readme_sections(_long())
     assert 0 < len(out) <= leerie._README_EXTRACT_BUDGET
 
 
@@ -47,14 +47,14 @@ def test_truncation_is_a_prefix_of_the_original(leerie):
     """Bounding only: whatever survives is the head of the document, in
     document order. Nothing is selected out of the middle."""
     text = _long()
-    out = leerie.extract_readme_sections(text)
+    out = leerie._extract_readme_sections(text)
     assert text.startswith(out)
 
 
 def test_headerless_document_still_yields_content(leerie):
     """A README with no markdown headers in its first 8KB must not be
     emptied by the section-boundary backoff."""
-    out = leerie.extract_readme_sections("x" * 20000)
+    out = leerie._extract_readme_sections("x" * 20000)
     assert len(out) > leerie._README_EXTRACT_BUDGET * 0.75
 
 
@@ -63,7 +63,7 @@ def test_boundary_backoff_never_discards_most_of_the_budget(leerie):
     header with its body sheared off — but a single early header must not
     cost the rest of the slice."""
     text = "# Project\n\n" + ("filler line\n" * 3000)
-    out = leerie.extract_readme_sections(text)
+    out = leerie._extract_readme_sections(text)
     assert len(out) >= leerie._README_EXTRACT_BUDGET * 0.75
 
 
@@ -73,13 +73,13 @@ def test_boundary_backoff_never_discards_most_of_the_budget(leerie):
 
 @pytest.mark.parametrize("text", ["", "\n", "   ", "#", "# Only a header\n"])
 def test_degenerate_inputs_do_not_crash(leerie, text):
-    out = leerie.extract_readme_sections(text)
+    out = leerie._extract_readme_sections(text)
     assert isinstance(out, str)
     assert len(out) <= max(len(text), leerie._README_EXTRACT_BUDGET)
 
 
 def test_empty_text_returns_empty(leerie):
-    assert leerie.extract_readme_sections("") == ""
+    assert leerie._extract_readme_sections("") == ""
 
 
 # --------------------------------------------------------------------- #
@@ -97,7 +97,7 @@ def test_unconventionally_named_sections_are_kept(leerie, header):
     its install section something the list did not anticipate is no longer
     penalised for it."""
     text = f"# Project\n\nPitch.\n\n{header}\n\n```\npip install x\n```\n"
-    out = leerie.extract_readme_sections(text)
+    out = leerie._extract_readme_sections(text)
     assert header in out
     assert "pip install x" in out
 
@@ -107,7 +107,7 @@ def test_sections_the_old_filter_called_irrelevant_are_kept(leerie):
     budget they now reach the worker, which decides what matters."""
     text = ("# Project\n\nPitch.\n\n## Licence\n\nMIT\n\n"
             "## Code of Conduct\n\nBe nice.\n")
-    out = leerie.extract_readme_sections(text)
+    out = leerie._extract_readme_sections(text)
     assert "Licence" in out and "Code of Conduct" in out
 
 
@@ -136,12 +136,12 @@ class TestKeywordSelectionAbsent:
         """Banned by shape, not just by name: the function must not test a
         header's text against anything."""
         import inspect
-        src = inspect.getsource(leerie.extract_readme_sections)
+        src = inspect.getsource(leerie._extract_readme_sections)
         body = src[src.index('"""', src.index('"""') + 3) + 3:]
         for banned in ("install", "setup", "usage", "getting started",
                        "search(", "match(", "fullmatch("):
             assert banned not in body.lower(), (
-                f"extract_readme_sections looks at {banned!r} — deciding "
+                f"_extract_readme_sections looks at {banned!r} — deciding "
                 "which sections matter is the worker's job")
 
     def test_provision_prompt_owns_the_selection(self):
@@ -180,7 +180,7 @@ class TestBudgetSizing:
         text = _repo_readme()
         if len(text) < leerie._README_EXTRACT_BUDGET:
             pytest.skip("this repo's README no longer exceeds the budget")
-        out = leerie.extract_readme_sections(text)
+        out = leerie._extract_readme_sections(text)
         for marker in ("### Manual container-runtime setup",
                        "brew install colima"):
             at = text.find(marker)
@@ -196,7 +196,7 @@ class TestBudgetSizing:
         other fixtures. CONTRIBUTING is the one that goes first, and it is
         a better install source than a long README's tail."""
         from pathlib import Path
-        fixtures = leerie.gather_provision_fixtures(
+        fixtures = leerie._gather_provision_fixtures(
             Path(__file__).resolve().parent.parent)
         assert fixtures["total_bytes"] <= leerie._FIXTURE_TOTAL_BUDGET
         assert not fixtures["hit_ceiling"], (
@@ -218,7 +218,7 @@ class TestTruncationIsReported:
 
     def test_unseen_counts_are_reported(self, leerie):
         from pathlib import Path
-        fixtures = leerie.gather_provision_fixtures(
+        fixtures = leerie._gather_provision_fixtures(
             Path(__file__).resolve().parent.parent)
         text = _repo_readme()
         if len(text) <= len(fixtures["readme"]):
@@ -249,7 +249,7 @@ class TestTruncationIsReported:
         assert len(text) > cap, "fixture must exceed the raw-read cap"
 
         (tmp_path / "README.md").write_text(text)
-        fixtures = leerie.gather_provision_fixtures(tmp_path)
+        fixtures = leerie._gather_provision_fixtures(tmp_path)
 
         true_total = len(leerie._split_readme_headers(text))
         extract_sections = len(
@@ -262,7 +262,7 @@ class TestTruncationIsReported:
 
     def test_short_readme_reports_nothing_unseen(self, leerie, tmp_path):
         (tmp_path / "README.md").write_text("# P\n\n## Install\n\npip x\n")
-        fixtures = leerie.gather_provision_fixtures(tmp_path)
+        fixtures = leerie._gather_provision_fixtures(tmp_path)
         assert fixtures["readme_bytes_unseen"] == 0
         assert fixtures["readme_sections_unseen"] == 0
 
@@ -270,7 +270,7 @@ class TestTruncationIsReported:
         """Anti-vacuity: the counts are inert unless they reach the
         worker."""
         from pathlib import Path
-        fixtures = leerie.gather_provision_fixtures(
+        fixtures = leerie._gather_provision_fixtures(
             Path(__file__).resolve().parent.parent)
         prompt = leerie._format_provision_user_prompt(fixtures, "task")
         assert "UNFILTERED" in prompt, (

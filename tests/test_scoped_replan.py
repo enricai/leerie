@@ -2,9 +2,9 @@
 
 Two changes tested together because the second depends on the first.
 
-**`replan_domain_closure`.** A re-plan replaces a domain's subtasks with fresh
+**`_replan_domain_closure`.** A re-plan replaces a domain's subtasks with fresh
 ones, so every id it used vanishes and any other domain holding an edge into it
-dangles. `validate_plan` catches that — as a `die()`, which is the outcome
+dangles. `_validate_plan` catches that — as a `die()`, which is the outcome
 scoping exists to avoid. So the scope is the targets plus the transitive
 closure of domains depending on them, over both the id (`depends_on`) and tag
 (`requires`/`provides`) channels.
@@ -41,13 +41,13 @@ def _plan(domain, subs):
     return {"domain": domain, "status": "ready", "subtasks": subs}
 
 
-# ----- replan_domain_closure ------------------------------------------------
+# ----- _replan_domain_closure ------------------------------------------------
 
 def test_isolated_domain_closes_to_itself(leerie):
     """85% of real cases: nothing depends on the target."""
     plans = [_plan("bug-fixing", [_sub("bugfix-001")]),
              _plan("testing", [_sub("test-001")])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
 
 
 def test_id_channel_dependent_is_pulled_in(leerie):
@@ -55,7 +55,7 @@ def test_id_channel_dependent_is_pulled_in(leerie):
     dangle that edge."""
     plans = [_plan("bug-fixing", [_sub("bugfix-001")]),
              _plan("testing", [_sub("test-001", deps=["bugfix-001"])])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {"bugfix", "test"}
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {"bugfix", "test"}
 
 
 def test_tag_channel_dependent_is_pulled_in(leerie):
@@ -63,7 +63,7 @@ def test_tag_channel_dependent_is_pulled_in(leerie):
     a capability only bugfix provides."""
     plans = [_plan("bug-fixing", [_sub("bugfix-001", provides=["api"])]),
              _plan("testing", [_sub("test-001", requires=["api"])])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {"bugfix", "test"}
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {"bugfix", "test"}
 
 
 def test_closure_is_transitive(leerie):
@@ -71,7 +71,7 @@ def test_closure_is_transitive(leerie):
              _plan("feature-implementation",
                    [_sub("feat-001", requires=["a"], provides=["b"])]),
              _plan("testing", [_sub("test-001", requires=["b"])])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {
         "bugfix", "feat", "test"}
 
 
@@ -81,23 +81,23 @@ def test_direction_matters_producers_are_not_pulled_in(leerie):
     would inflate every scope back toward a full re-plan."""
     plans = [_plan("bug-fixing", [_sub("bugfix-001", provides=["api"])]),
              _plan("testing", [_sub("test-001", requires=["api"])])]
-    assert leerie.replan_domain_closure(plans, {"test"}) == {"test"}
+    assert leerie._replan_domain_closure(plans, {"test"}) == {"test"}
 
 
 def test_intra_domain_edges_are_ignored(leerie):
     plans = [_plan("bug-fixing", [_sub("bugfix-001", provides=["a"]),
                                   _sub("bugfix-002", requires=["a"],
                                        deps=["bugfix-001"])])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
 
 
 def test_multiple_targets_and_empty_inputs(leerie):
     plans = [_plan("bug-fixing", [_sub("bugfix-001")]),
              _plan("testing", [_sub("test-001")])]
-    assert leerie.replan_domain_closure(plans, {"bugfix", "test"}) == {
+    assert leerie._replan_domain_closure(plans, {"bugfix", "test"}) == {
         "bugfix", "test"}
-    assert leerie.replan_domain_closure(plans, set()) == set()
-    assert leerie.replan_domain_closure([], {"bugfix"}) == {"bugfix"}
+    assert leerie._replan_domain_closure(plans, set()) == set()
+    assert leerie._replan_domain_closure([], {"bugfix"}) == {"bugfix"}
 
 
 def test_unresolvable_tag_does_not_invent_an_edge(leerie):
@@ -105,7 +105,7 @@ def test_unresolvable_tag_does_not_invent_an_edge(leerie):
     not silently widen the scope."""
     plans = [_plan("bug-fixing", [_sub("bugfix-001")]),
              _plan("testing", [_sub("test-001", requires=["nope"])])]
-    assert leerie.replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
+    assert leerie._replan_domain_closure(plans, {"bugfix"}) == {"bugfix"}
 
 
 # ----- the property the corpus sweep measured -------------------------------
@@ -119,7 +119,7 @@ def test_closure_scope_leaves_no_dangling_edge(leerie):
              _plan("feature-implementation",
                    [_sub("feat-001", requires=["a"])]),
              _plan("testing", [_sub("test-001", deps=["feat-001"])])]
-    scope = leerie.replan_domain_closure(plans, {"bugfix"})
+    scope = leerie._replan_domain_closure(plans, {"bugfix"})
     for p in plans:
         for s in p["subtasks"]:
             dom = s["id"].split("-", 1)[0]
@@ -159,7 +159,7 @@ def test_gate_replans_instead_of_dying(leerie):
     the old 'cannot be resumed' wording is gone from that path."""
     import inspect
     src = inspect.getsource(leerie.phase_overlap_judge)
-    assert "replan_domain_closure(" in src
+    assert "_replan_domain_closure(" in src
     assert "domains=scope" in src
     # Comments are stripped first: the code *explains* the old terminal
     # behaviour in a comment, and matching that would pass while the die
@@ -185,7 +185,7 @@ def test_recovery_is_bounded_to_one_attempt(leerie):
     assert 'st.data.get("overlap_replan_done")' in src
     assert 'st.data["overlap_replan_done"] = True' in src
     assert src.index('st.data.get("overlap_replan_done")') < src.index(
-        "replan_domain_closure("), (
+        "_replan_domain_closure("), (
         "the bound must be checked BEFORE spending on a re-plan")
 
 
@@ -271,3 +271,139 @@ def test_first_unresolvable_verdict_replans_rather_than_dies(
     assert replans[0] == {"feat", "bugfix"}
     assert st.data.get("overlap_replan_done") is True
     assert out is not None, "a resolved second verdict must return a plan"
+
+
+def test_budget_die_does_not_consume_the_recovery(leerie, monkeypatch):
+    """The flag must record an ATTEMPT, not an intention.
+
+    `check_replan_affordable` can `die()`. Setting `overlap_replan_done`
+    before it persisted the flag to disk while `plans_after_overlap_judge` was
+    never written — so `./leerie resume --max-workers N`, the remedy that very
+    die() recommends, re-entered the gate, saw the flag, and died immediately
+    **without ever attempting the re-plan the raised budget now afforded** —
+    with a message claiming re-planning had failed to resolve the
+    contradiction when no re-plan had run.
+
+    Note this test deliberately does NOT stub `check_replan_affordable`. Its
+    sibling above does, which is exactly why that test could not catch this: a
+    guard stubbed out of the path cannot reveal an ordering bug involving it.
+    """
+    import asyncio
+
+    plans = [
+        _plan("feature-implementation", [_sub("feat-001", provides=["x"])]),
+        _plan("bug-fixing", [_sub("bugfix-001", requires=["x"])]),
+    ]
+
+    class _St:
+        def __init__(self):
+            # Budget all but exhausted, so the real preflight dies.
+            self.data = {"categories": ["feature-implementation",
+                                        "bug-fixing"],
+                         "worker_count": 199}
+            self.saved = None
+        def save(self):
+            import copy as _c
+            self.saved = _c.deepcopy(self.data)
+
+    async def _fake_loop(**kw):
+        return ({"collisions": [
+            {"a_sid": "feat-001", "b_sid": "bugfix-001", "artifact": "x.ts",
+             "resolution": "unresolvable", "reason": "contradictory"}]}, [])
+
+    replans: list = []
+
+    async def _fake_plan(task, st, caps, models, efforts,
+                         replan_round=0, domains=None):
+        replans.append(domains)
+        return plans
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    monkeypatch.setattr(leerie, "check_overlap_judge_output",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(leerie, "phase_plan", _fake_plan)
+
+    caps = {"judgment_check_rounds": 1, "max_total_workers": 200,
+            "planner_samples": 3, "replan_decompose_estimate": 1.5}
+    st = _St()
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(leerie.phase_overlap_judge(
+            plans, "task", st, caps, {}, {}))
+    assert exc.value.code == leerie.EXIT_BUDGET_INFEASIBLE
+    assert not replans, "no re-plan should have been attempted"
+    # The load-bearing assertions: the flag must be neither in memory nor on
+    # disk, so a resume with a raised budget can still recover.
+    assert st.data.get("overlap_replan_done") is None, (
+        "the flag was set despite no re-plan being attempted — a resume would "
+        "skip the recovery permanently")
+    assert (st.saved or {}).get("overlap_replan_done") is None, (
+        "the flag was PERSISTED despite no re-plan being attempted")
+
+
+def test_recovery_survives_a_budget_die_and_a_resume(leerie, monkeypatch):
+    """End-to-end of the same defect: die on budget, then re-enter with the
+    same state and a raised cap, and the re-plan must actually happen."""
+    import asyncio
+
+    plans = [
+        _plan("feature-implementation", [_sub("feat-001", provides=["x"])]),
+        _plan("bug-fixing", [_sub("bugfix-001", requires=["x"])]),
+    ]
+
+    class _St:
+        def __init__(self):
+            self.data = {"categories": ["feature-implementation",
+                                        "bug-fixing"],
+                         "worker_count": 199}
+        def save(self):
+            pass
+
+    verdicts = [
+        {"collisions": [
+            {"a_sid": "feat-001", "b_sid": "bugfix-001", "artifact": "x.ts",
+             "resolution": "unresolvable", "reason": "contradictory"}]},
+        {"collisions": []},
+    ]
+    idx = {"i": 0}
+
+    async def _fake_loop(**kw):
+        v = verdicts[min(idx["i"], len(verdicts) - 1)]
+        idx["i"] += 1
+        return (v, [])
+
+    replans: list = []
+
+    async def _fake_plan(task, st, caps, models, efforts,
+                         replan_round=0, domains=None):
+        replans.append(domains)
+        return plans
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    monkeypatch.setattr(leerie, "check_overlap_judge_output",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(leerie, "phase_plan", _fake_plan)
+    monkeypatch.setattr(leerie, "phase_reconcile",
+                        lambda p, *a, **k: _async_id(p))
+
+    st = _St()
+    base = {"judgment_check_rounds": 1, "planner_samples": 3,
+            "replan_decompose_estimate": 1.5}
+
+    # Attempt 1: budget exhausted -> dies, recovery NOT consumed.
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_overlap_judge(
+            plans, "task", st, dict(base, max_total_workers=200), {}, {}))
+    assert not replans
+
+    # Attempt 2: same state, raised cap (the documented remedy).
+    idx["i"] = 0
+    out = asyncio.run(leerie.phase_overlap_judge(
+        plans, "task", st, dict(base, max_total_workers=400), {}, {}))
+    assert replans == [{"feat", "bugfix"}], (
+        "resume with a raised budget must actually attempt the re-plan")
+    assert out is not None
+
+
+async def _async_id(x):
+    return x

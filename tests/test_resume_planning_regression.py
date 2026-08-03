@@ -11,17 +11,17 @@ sweep (every phase stubbed, asserting call-count skip semantics phase by
 phase) and NOT `tests/test_filter_satisfied_subtasks.py`'s unit-level
 cache coverage — both stay the authoritative source for those. This file
 instead drives `_run_phases` through the REAL (unstubbed)
-`filter_satisfied_subtasks` / `schedule` / `check_budget_feasibility` /
-`write_plan` for the two named incident shapes, so the assertions are
+`_filter_satisfied_subtasks` / `_schedule` / `check_budget_feasibility` /
+`_write_plan` for the two named incident shapes, so the assertions are
 end-to-end proof the reported die() strings are gone and the fix
 composes, not merely that each phase's skip-flag is individually wired.
 
 Four scenarios:
   (a) satisfied-probe-sweep resume: partial `satisfied_probe_cache`,
-      probes ONLY the uncached sids, reaches schedule() with no die().
+      probes ONLY the uncached sids, reaches _schedule() with no die().
   (b) budget-check resume: rehydrates subtasks/waves from `plan_snapshot`,
       re-runs only check_budget_feasibility under a raised
-      max_total_workers, proceeds to write_plan.
+      max_total_workers, proceeds to _write_plan.
   (c) post-scheduling resume unchanged: `waves` present -> straight to
       phase_execute, zero planning-phase calls.
   (d) the finished_at+finalize guard and the no_work_required guard still
@@ -130,7 +130,7 @@ def _make_state(leerie, run_dirs, data: dict):
 
 
 def _init_git_repo(path: Path) -> str:
-    """A minimal real git repo — filter_satisfied_subtasks scopes the
+    """A minimal real git repo — _filter_satisfied_subtasks scopes the
     cache to `_branch_head_sha`, so scenario (a) needs a real HEAD."""
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -146,16 +146,16 @@ def _init_git_repo(path: Path) -> str:
 
 
 def _stub_upstream_phases(leerie, monkeypatch, calls: dict):
-    """Stub only the phases upstream of filter_satisfied_subtasks/schedule
-    (classify..adherence_gate) plus phase_execute — schedule(),
-    check_budget_feasibility(), write_plan(), and
-    filter_satisfied_subtasks() itself are deliberately left REAL for
+    """Stub only the phases upstream of _filter_satisfied_subtasks/_schedule
+    (classify..adherence_gate) plus phase_execute — _schedule(),
+    check_budget_feasibility(), _write_plan(), and
+    _filter_satisfied_subtasks() itself are deliberately left REAL for
     this file's end-to-end scenarios."""
     monkeypatch.setattr(
-        leerie, "enforce_and_record_cgroup_containment",
+        leerie, "_enforce_and_record_cgroup_containment",
         lambda st, allow_uncapped: None)
     monkeypatch.setattr(
-        leerie, "absorb_supplied_answers", lambda args, st, leerie_dir: None)
+        leerie, "_absorb_supplied_answers", lambda args, st, leerie_dir: None)
 
     async def _backstop(*a, **kw):
         pass
@@ -195,15 +195,15 @@ def _stub_upstream_phases(leerie, monkeypatch, calls: dict):
     monkeypatch.setattr(leerie, "phase_adherence_gate", _adherence_gate)
 
     monkeypatch.setattr(
-        leerie, "warn_cross_planner_file_overlap", lambda plans: None)
-    monkeypatch.setattr(leerie, "warn_layer_gaps", lambda plans: None)
+        leerie, "_warn_cross_planner_file_overlap", lambda plans: None)
+    monkeypatch.setattr(leerie, "_warn_layer_gaps", lambda plans: None)
     monkeypatch.setattr(
-        leerie, "warn_provider_subset_subtasks", lambda plans: None)
+        leerie, "_warn_provider_subset_subtasks", lambda plans: None)
 
     def _offtree(plans, repo_root, inspect_dirs, st):
-        calls["filter_offtree_subtasks"] = calls.get(
-            "filter_offtree_subtasks", 0) + 1
-    monkeypatch.setattr(leerie, "filter_offtree_subtasks", _offtree)
+        calls["_filter_offtree_subtasks"] = calls.get(
+            "_filter_offtree_subtasks", 0) + 1
+    monkeypatch.setattr(leerie, "_filter_offtree_subtasks", _offtree)
 
     async def _execute(*a, **kw):
         calls["phase_execute"] = calls.get("phase_execute", 0) + 1
@@ -220,8 +220,8 @@ def _drive(leerie, args, run_dir, st, caps):
 # ===========================================================================
 # (a) THE REPORTED FAILURE, end to end: paused mid satisfied-probe sweep
 # with a partial cache resumes, probes ONLY the uncached sids (via the
-# REAL filter_satisfied_subtasks against a real git repo — claude_p is
-# the only thing stubbed), and reaches schedule() with no die().
+# REAL _filter_satisfied_subtasks against a real git repo — claude_p is
+# the only thing stubbed), and reaches _schedule() with no die().
 # ===========================================================================
 
 def test_satisfied_sweep_resume_probes_only_uncached_and_reaches_schedule(
@@ -268,7 +268,7 @@ def test_satisfied_sweep_resume_probes_only_uncached_and_reaches_schedule(
 
     # Only the two uncached subtasks trigger a fresh satisfied-probe call —
     # the cached feat-001 is never re-probed. (This resume reaches scheduling
-    # for the first time, so the post-schedule `wiring_judge` gate also
+    # for the first time, so the post-_schedule `wiring_judge` gate also
     # legitimately fires once — DESIGN §5 *A wiring re-check on the fully-merged
     # plan*; it is a downstream gate, not a re-run of the satisfied sweep, so
     # we assert on the probe calls specifically.)
@@ -309,7 +309,7 @@ def test_reverting_the_fix_fails_scenario_a(leerie, monkeypatch, run_dirs,
 # (b) Budget-check resume: a run stopped at check_budget_feasibility
 # rehydrates subtasks/waves from plan_snapshot, re-runs ONLY the budget
 # check (real check_budget_feasibility) under a raised max_total_workers,
-# and proceeds to write_plan — instead of dying "Plans are not persisted".
+# and proceeds to _write_plan — instead of dying "Plans are not persisted".
 # ===========================================================================
 
 def test_budget_check_resume_reruns_only_budget_check_under_raised_cap(
@@ -322,16 +322,16 @@ def test_budget_check_resume_reruns_only_budget_check_under_raised_cap(
     calls: dict = {}
     _stub_upstream_phases(leerie, monkeypatch, calls)
 
-    # write_plan writes real subtask spec files to leerie_dir/subtasks —
+    # _write_plan writes real subtask spec files to leerie_dir/subtasks —
     # let it run for real (it's cheap, and it's the deliverable this
     # scenario claims is reached) but count invocations.
     write_plan_calls = {"n": 0}
-    orig_write_plan = leerie.write_plan
+    orig_write_plan = leerie._write_plan
 
     def _counting_write_plan(leerie_dir, task, st, subtasks, waves):
         write_plan_calls["n"] += 1
         return orig_write_plan(leerie_dir, task, st, subtasks, waves)
-    monkeypatch.setattr(leerie, "write_plan", _counting_write_plan)
+    monkeypatch.setattr(leerie, "_write_plan", _counting_write_plan)
 
     persisted_plans = [_plan("bug-fixing", _subtask("feat-001"))]
     snapshot_subtasks = {"feat-001": _subtask("feat-001")}
@@ -381,7 +381,7 @@ def test_budget_check_resume_reruns_only_budget_check_under_raised_cap(
         for phase in (
             "phase_classify", "phase_plan", "phase_reconcile",
             "phase_overlap_judge", "phase_adherence_gate",
-            "filter_offtree_subtasks",
+            "_filter_offtree_subtasks",
         ):
             assert phase not in calls, (
                 f"{phase} must not re-run on a budget-check resume — plans "
@@ -406,24 +406,24 @@ def test_post_scheduling_resume_unchanged_zero_planning_calls(
     _stub_upstream_phases(leerie, monkeypatch, calls)
 
     async def _satisfied_should_not_run(*a, **kw):
-        calls["filter_satisfied_subtasks"] = calls.get(
-            "filter_satisfied_subtasks", 0) + 1
+        calls["_filter_satisfied_subtasks"] = calls.get(
+            "_filter_satisfied_subtasks", 0) + 1
         return None
     monkeypatch.setattr(
-        leerie, "filter_satisfied_subtasks", _satisfied_should_not_run)
+        leerie, "_filter_satisfied_subtasks", _satisfied_should_not_run)
     monkeypatch.setattr(
         leerie, "check_budget_feasibility",
         lambda st, caps, subtasks, waves: calls.__setitem__(
             "check_budget_feasibility",
             calls.get("check_budget_feasibility", 0) + 1))
     monkeypatch.setattr(
-        leerie, "validate_plan",
+        leerie, "_validate_plan",
         lambda subtasks: calls.__setitem__(
-            "validate_plan", calls.get("validate_plan", 0) + 1))
+            "_validate_plan", calls.get("_validate_plan", 0) + 1))
     monkeypatch.setattr(
-        leerie, "write_plan",
+        leerie, "_write_plan",
         lambda leerie_dir, task, st, subtasks, waves: calls.__setitem__(
-            "write_plan", calls.get("write_plan", 0) + 1))
+            "_write_plan", calls.get("_write_plan", 0) + 1))
 
     st = _make_state(leerie, run_dirs, {
         "task": "test task", "worker_count": 42,
@@ -447,8 +447,8 @@ def test_post_scheduling_resume_unchanged_zero_planning_calls(
     for phase in (
         "phase_classify", "phase_plan", "phase_reconcile",
         "phase_overlap_judge", "phase_adherence_gate",
-        "filter_offtree_subtasks", "filter_satisfied_subtasks",
-        "check_budget_feasibility", "validate_plan", "write_plan",
+        "_filter_offtree_subtasks", "_filter_satisfied_subtasks",
+        "check_budget_feasibility", "_validate_plan", "_write_plan",
     ):
         assert phase not in calls, (
             f"{phase} must not run on a post-scheduling resume ('waves' "
@@ -458,8 +458,8 @@ def test_post_scheduling_resume_unchanged_zero_planning_calls(
 
 # ===========================================================================
 # (d) The finished_at+finalize guard and the no_work_required guard return
-# early, unchanged, ahead of any rehydration — no phase, no schedule(),
-# no write_plan call of any kind.
+# early, unchanged, ahead of any rehydration — no phase, no _schedule(),
+# no _write_plan call of any kind.
 # ===========================================================================
 
 def test_completed_run_guard_returns_early_unchanged(leerie, run_dirs):

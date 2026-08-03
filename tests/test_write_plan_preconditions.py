@@ -1,7 +1,7 @@
-"""Tests for `write_plan()`'s `preconditions` surface (DESIGN §5
+"""Tests for `_write_plan()`'s `preconditions` surface (DESIGN §5
 `requires.extent`).
 
-`write_plan` reads `st.data["external_preconditions"]` (populated by
+`_write_plan` reads `st.data["external_preconditions"]` (populated by
 `phase_reconcile`) and writes it as the `preconditions` field in
 `plan.json` alongside `{task, waves, subtasks}`. These tests pin the
 read/write contract so a future refactor of either side can't silently
@@ -42,7 +42,7 @@ def test_write_plan_includes_preconditions_section(leerie, tmp_path):
                      "success_criteria_seed": "y", "size": "small",
                      "provides": [], "requires": [], "depends_on": []},
     }
-    leerie.write_plan(st.run_dir, "the task", st, subtasks, [["feat-001"]])
+    leerie._write_plan(st.run_dir, "the task", st, subtasks, [["feat-001"]])
     plan = json.loads((st.run_dir / "plan.json").read_text())
     assert "preconditions" in plan
     assert len(plan["preconditions"]) == 1
@@ -62,6 +62,6 @@ def test_write_plan_preconditions_empty_when_none_declared(leerie, tmp_path):
                      "success_criteria_seed": "y", "size": "small",
                      "provides": [], "requires": [], "depends_on": []},
     }
-    leerie.write_plan(st.run_dir, "the task", st, subtasks, [["feat-001"]])
+    leerie._write_plan(st.run_dir, "the task", st, subtasks, [["feat-001"]])
     plan = json.loads((st.run_dir / "plan.json").read_text())
     assert plan["preconditions"] == []

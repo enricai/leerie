@@ -15,7 +15,7 @@ under disjoint sub-prefixes (`leerie/runs/...` vs.
 `leerie/subtasks/...`) so neither is an ancestor of the other.
 
 This test pins that invariant: for every pair of run / subtask branches
-produced by `compute_run_branch` and `compute_subtask_branch`, neither
+produced by `_compute_run_branch` and `_compute_subtask_branch`, neither
 is a strict path-prefix of the other (when split on `/`). A future
 refactor that "simplifies" the prefixes back into a parent/child shape
 will fail this test instead of mysteriously crashing on the first run.
@@ -73,8 +73,8 @@ def test_run_branch_is_not_subtask_branch_ancestor(leerie, run_id, sid):
     """The canonical invariant: the run branch must never be a path-
     ancestor of any subtask branch (or vice versa). Violating this
     crashes git worktree add with `cannot lock ref`."""
-    run_branch = leerie.compute_run_branch(run_id)
-    subtask_branch = leerie.compute_subtask_branch(run_id, sid)
+    run_branch = leerie._compute_run_branch(run_id)
+    subtask_branch = leerie._compute_subtask_branch(run_id, sid)
     assert not _is_ref_ancestor(run_branch, subtask_branch), (
         f"run branch {run_branch!r} is a git-ref ancestor of subtask "
         f"branch {subtask_branch!r} — this will fail `git worktree add` "
@@ -92,8 +92,8 @@ def test_subtask_branches_for_same_run_dont_collide(leerie, run_id, sid):
     """Two subtask branches for the same run must not be ancestors of
     each other either. Otherwise the second worktree add in a wave
     would fail."""
-    branch_a = leerie.compute_subtask_branch(run_id, sid)
-    branch_b = leerie.compute_subtask_branch(run_id, sid + "-other")
+    branch_a = leerie._compute_subtask_branch(run_id, sid)
+    branch_b = leerie._compute_subtask_branch(run_id, sid + "-other")
     assert not _is_ref_ancestor(branch_a, branch_b)
     assert not _is_ref_ancestor(branch_b, branch_a)
 
@@ -105,8 +105,8 @@ def test_namespaces_are_explicitly_disjoint(leerie):
     that uses, say, `leerie/run/<id>` and `leerie/run/<id>/<sid>`
     fails fast at this test rather than slipping past the ancestor
     check on some adversarial input."""
-    run_branch = leerie.compute_run_branch("any-id-aaaaaa")
-    subtask_branch = leerie.compute_subtask_branch("any-id-aaaaaa", "feat-001")
+    run_branch = leerie._compute_run_branch("any-id-aaaaaa")
+    subtask_branch = leerie._compute_subtask_branch("any-id-aaaaaa", "feat-001")
     assert run_branch.split("/")[:2] == ["leerie", "runs"]
     assert subtask_branch.split("/")[:2] == ["leerie", "subtasks"]
 

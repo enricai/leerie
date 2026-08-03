@@ -1,7 +1,7 @@
 """Tests for the orchestrator memory sampler.
 
 `_memory_sampler` is a background coroutine that writes one ndjson line
-per ~30s to `.leerie/runs/<run-id>/memory.ndjson` while orchestrate() is
+per ~30s to `.leerie/runs/<run-id>/memory.ndjson` while _orchestrate() is
 alive. Each line records RSS, current phase, worker count, open FDs,
 and thread count — the four axes we need to tell "natural heavy run"
 from "real orchestrator leak."

@@ -1,5 +1,5 @@
 """Pins the RUNTIME=ec2 dispatch continuing past preflight into the full
-create -> seed -> orchestrate -> teardown lifecycle, with the old
+create -> seed -> _orchestrate -> teardown lifecycle, with the old
 not-yet-wired abort gone (leerie:6064 historically).
 
 tests/test_ec2_provision.py, tests/test_ec2_seed_repo.py, and
@@ -66,7 +66,7 @@ def test_not_yet_wired_abort_string_is_gone_from_launcher():
 
 
 # ---------------------------------------------------------------------------
-# A full launch: provision -> seed -> orchestrate -> teardown, zero leaks
+# A full launch: provision -> seed -> _orchestrate -> teardown, zero leaks
 # ---------------------------------------------------------------------------
 
 

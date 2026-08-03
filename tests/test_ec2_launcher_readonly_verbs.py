@@ -20,7 +20,7 @@ pause dance — wakes a stopped instance, mutates state.json over SSM
 (`ec2_remote_exec`, DESIGN §6 "Transport substitution for `flyctl ssh
 console`"), mirrors the mutation onto the host copy if one exists, and
 re-pauses the instance only if this verb woke it. `_collect_run_rows`/
-`list_runs` in `orchestrator/leerie.py` now track an `is_ec2` axis
+`_list_runs` in `orchestrator/leerie.py` now track an `is_ec2` axis
 (`ec2_instance_id` in run.json or `ec2-instance.json` present) so
 `--runtime ec2` filters correctly and `--runtime local` excludes both
 Fly and EC2 runs.
@@ -34,7 +34,7 @@ executes it with the invoking process's stdin drained through — the
 same mechanism `--accept-blocked`'s EC2 branch relies on to pipe the
 multi-line state-mutation Python program to the remote `python3 -`
 (mirroring `flyctl ssh console -C "python3 -"` on the Fly path).
-`--list` tests exercise `orchestrator/leerie.py`'s `list_runs()`
+`--list` tests exercise `orchestrator/leerie.py`'s `_list_runs()`
 directly (no launcher subprocess, no AWS stub — pure filesystem
 fixtures), mirroring `tests/test_list_runs.py`'s pattern.
 """
@@ -436,7 +436,7 @@ def test_list_ec2_run_renders_populated_status_without_fly_app(leerie, tmp_path,
                   "branch": f"leerie/runs/{RUN_ID}"},
         ec2_sidecar={"ec2_instance_id": "i-0000000000000000a"},
     )
-    leerie.list_runs(tmp_path)
+    leerie._list_runs(tmp_path)
     out = capsys.readouterr().out
     assert RUN_ID in out
     assert "in-progress" in out
@@ -461,7 +461,7 @@ def test_list_runtime_ec2_filters_to_ec2_runs_only(leerie, tmp_path, capsys):
               run_json={"ec2_instance_id": "i-0000000000000000a"},
               ec2_sidecar={"ec2_instance_id": "i-0000000000000000a"})
 
-    leerie.list_runs(tmp_path, runtime_filter="ec2")
+    leerie._list_runs(tmp_path, runtime_filter="ec2")
     out = capsys.readouterr().out
     assert RUN_ID in out
     assert "fly-run-aaaaaa" not in out
@@ -479,7 +479,7 @@ def test_list_runtime_local_excludes_ec2_runs(leerie, tmp_path, capsys):
               run_json={"ec2_instance_id": "i-0000000000000000a"},
               ec2_sidecar={"ec2_instance_id": "i-0000000000000000a"})
 
-    leerie.list_runs(tmp_path, runtime_filter="local")
+    leerie._list_runs(tmp_path, runtime_filter="local")
     out = capsys.readouterr().out
     assert "local-run-cccccc" in out
     assert RUN_ID not in out
@@ -493,6 +493,6 @@ def test_list_ec2_run_detected_via_sidecar_only(leerie, tmp_path, capsys):
               {"started_at": "2026-07-01T00:00:00+00:00", "task": "z"},
               ec2_sidecar={"ec2_instance_id": "i-0000000000000000a"})
 
-    leerie.list_runs(tmp_path, runtime_filter="ec2")
+    leerie._list_runs(tmp_path, runtime_filter="ec2")
     out = capsys.readouterr().out
     assert RUN_ID in out

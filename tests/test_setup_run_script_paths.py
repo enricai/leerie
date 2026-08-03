@@ -273,7 +273,7 @@ def test_finalize_honors_state_dir_env():
 def test_cleanup_honors_state_dir_env():
     """cleanup.sh derives LEERIE_ROOT from LEERIE_STATE_DIR (or .leerie fallback)
     — same pattern as finalize.sh and setup-run.sh. Without this, the
-    in-container post-finalize cleanup invocation (run_script call at
+    in-container post-finalize cleanup invocation (_run_script call at
     orchestrator/leerie.py:13085) silently no-ops because /work/.leerie/runs/
     doesn't exist, leaving subtask branches behind."""
     src = _script("cleanup.sh")

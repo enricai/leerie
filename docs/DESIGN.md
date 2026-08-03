@@ -221,7 +221,7 @@ text-per-file density all fail the same way — they are proxies for a quantity
 Fit*: whether a subtask's scope and context are co-minimized (minimum necessary
 complexity, maximum relevance). That judgment is tractable; size prediction is
 not. Per §12, a signal that cannot be checked mechanically without misfiring
-belongs in the prompt, not in code, so no `validate_plan` reject or
+belongs in the prompt, not in code, so no `_validate_plan` reject or
 `DEFAULT_CAPS` threshold is added for it. The structural mechanism that gives
 the planner the codebase knowledge needed to make this judgment well — and the
 recursive fit-judge that becomes the authoritative decomposition-quality gate,
@@ -342,7 +342,7 @@ It is reconciled by the orchestrator with three mechanisms:
   edge (raw file overlap is explicitly an unreliable dependency signal;
   *Provider-subset subtasks*), and §12 assigns such prose-only facts to a
   worker rather than to a Python inference. A deterministic
-  `warn_test_subtask_missing_producer_edge` surfaces the high-risk shape (a
+  `_warn_test_subtask_missing_producer_edge` surfaces the high-risk shape (a
   `test-` subtask with no declared edge while producing subtasks exist) one
   phase earlier as an advisory; the wiring gate remains the enforcer. This is
   the consumer-side half the artifact registry (a producer/name-agreement aid)
@@ -382,7 +382,7 @@ It is reconciled by the orchestrator with three mechanisms:
   subtasks — it does not weaken the reconciler's `unresolvable` verdict
   in the general case. After pruning, surviving subtasks with no
   unresolvable requires proceed normally. If all domains end up empty,
-  `detect_no_work` fires. If unresolvable entries remain after pruning,
+  `_detect_no_work` fires. If unresolvable entries remain after pruning,
   the run dies as before.
 
   Acyclicity is a first-class output property — the reconciler's job is to
@@ -574,7 +574,7 @@ The re-plan is **scoped**, and this gate is the only one where that is
 currently possible: a collision names `a_sid`/`b_sid`, so the implicated
 domains are mechanically derivable, whereas `coverage_gaps` and the adherence
 judge's `violations` carry no subtask reference at all. Scope is the implicated
-domains plus `replan_domain_closure` — the transitive set of domains depending
+domains plus `_replan_domain_closure` — the transitive set of domains depending
 on them across both the id and tag channels — so no surviving edge can dangle.
 Measured over 85 (domain, plan) re-plan simulations on real corpus plans:
 closure-scoped schedules and validates 85/85, naive single-domain 79/85.
@@ -615,7 +615,7 @@ collision flagged including the run that motivated this phase), with
 the merge-feasibility discipline correctly downgrading incompatible-API
 pairs to `drop_*` and `unresolvable`. Skip is automatic on single-
 planner runs; opt-out via `--skip-overlap-judge`. The complementary
-file-overlap warning (`warn_cross_planner_file_overlap`) remains in
+file-overlap warning (`_warn_cross_planner_file_overlap`) remains in
 place but stays advisory — the judge handles the load-bearing case;
 the warning surfaces the deliberately-permissive same-file-different-
 surface cases.
@@ -802,7 +802,7 @@ resolutions, because `_apply_overlap_drop` likewise unions the dropped subtask's
 **Id-vanishing operations must rewrite inbound references.** The rewriting above is
 not a merge-specific courtesy; it is an invariant every operation that removes a
 subtask id from the plan owes. Merge, drop, the phase-3 soft-drop filters
-(`filter_offtree_subtasks`, `filter_satisfied_subtasks`), and P1 recursive expansion
+(`_filter_offtree_subtasks`, `_filter_satisfied_subtasks`), and P1 recursive expansion
 all vanish an id. Each owes the plan two things: the vanishing subtask's
 `provides`/`requires`/`depends_on` must be carried by its successor(s), *and* every
 subtask referencing the vanishing id via `depends_on` must be rewritten to reference
@@ -812,8 +812,8 @@ The second half is easy to forget because the two dependency channels do not fai
 alike *under expansion*. On **expansion** the tag channel self-heals: `provides` is
 inherited by successors and `_build_predecessor_graph` resolves a `requires` tag to
 *every* provider, so a tag-expressed edge survives an id vanishing untouched. Only the
-id-expressed `depends_on` channel dangles — silently at `schedule()`, which drops an
-unknown predecessor without a word, and then fatally at `validate_plan`. An operation
+id-expressed `depends_on` channel dangles — silently at `_schedule()`, which drops an
+unknown predecessor without a word, and then fatally at `_validate_plan`. An operation
 that gets this wrong therefore looks correct under tag-based plans and dies only when a
 planner happens to express the same intent by id.
 
@@ -821,17 +821,17 @@ planner happens to express the same intent by id.
 above holds only because a successor inherits the vanishing subtask's `provides`. A
 **drop** has no successor, so its `provides` are simply gone — nothing inherits them,
 and any surviving subtask whose `requires` names a tag *only* the dropped subtask
-provided is now orphaned. That orphan dies at `validate_plan` exactly like a dangling
+provided is now orphaned. That orphan dies at `_validate_plan` exactly like a dangling
 `depends_on` (`requires 'X' but nothing provides it`). Therefore a drop owes the plan a
 prune of **both** channels: the inbound `depends_on` (id) references, *and* the inbound
 `requires` (tag) references whose only provider was dropped. The prune is gated on the
 dropped subtasks' `provides`: a tag still provided by a *surviving* subtask is kept, and
-a tag no subtask ever provided is left intact so `validate_plan` still surfaces it as a
+a tag no subtask ever provided is left intact so `_validate_plan` still surfaces it as a
 genuine planner error rather than having it silently masked. "Surviving" is evaluated
 **across the whole merged plan, not per-domain** — capability tags are cross-domain
 (§*Cross-domain capability tags*), so a `requires` in one domain's plan may be satisfied
 by a `provides` in another; the prune must see every plan at once, matching how
-`validate_plan` checks provider-existence globally.
+`_validate_plan` checks provider-existence globally.
 
 Where an id vanishes into **several** successors (expansion), the rewrite fans out to
 all of them — matching what the tag channel already does, and costing no additional
@@ -859,7 +859,7 @@ with per-resolution avoidance in place it must never fire, so a surviving cycle
 is treated as an orchestrator logic bug (the tentative check and the real apply
 path disagreed), not a user-recoverable condition.
 
-**A wiring re-check on the fully-merged plan, before `validate_plan`.** The
+**A wiring re-check on the fully-merged plan, before `_validate_plan`.** The
 per-operation rewrite discipline above is applied at each vanishing site — the
 drop filters prune both channels, expansion fans out. But the discipline is
 distributed across many operations (reconciler merge/rename/drop, both phase-3
@@ -867,14 +867,14 @@ soft-drop filters, P1 expansion), and each is an independent opportunity to leav
 a dangle: a reconciler `merged_subtasks`/`renames` that rewired the id channel but
 not an inbound `requires`, an expansion whose successor inheritance missed a tag,
 or a *chained* vanishing that `_remap_vanished_deps`'s single-pass flatten does not
-fully resolve. `validate_plan` is the terminal backstop that catches any survivor —
+fully resolve. `_validate_plan` is the terminal backstop that catches any survivor —
 but it fires *after* the full planner/reconciler spend, so a dangle it catches
 throws that spend away. So a deterministic `check_plan_wiring` runs on the
-fully-merged post-drop plan (after both soft-drop filters and `schedule()`, before
-`validate_plan`): it replays `validate_plan`'s own provider-existence and
+fully-merged post-drop plan (after both soft-drop filters and `_schedule()`, before
+`_validate_plan`): it replays `_validate_plan`'s own provider-existence and
 `depends_on`-existence logic and, on a dangle, dies with a wiring-specific message
 that names the vanishing operation when derivable — front-running the generic
-`validate_plan` die with an actionable one, while `validate_plan` stays the
+`_validate_plan` die with an actionable one, while `_validate_plan` stays the
 backstop. This is the §12 boundary: the structural guarantee (every surviving
 `requires`/`depends_on` resolves) is a code check, not spread across per-operation
 prompt discipline alone.
@@ -941,7 +941,7 @@ defects are then all genuine missing work.
 
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget
-preflight, the deterministic wiring re-check, `validate_plan`, `write_plan` — sees
+preflight, the deterministic wiring re-check, `_validate_plan`, `_write_plan` — sees
 the repaired graph rather than the one the judge rejected.
 
 ### Migration-surface completeness
@@ -1016,14 +1016,14 @@ This is enforced mechanically at two levels:
   window to "the planner is self-consistently wrong," not "the planner
   forgot one field" — the two fields no longer disagree unnoticed.
 
-- **Cross-domain (advisory).** `warn_layer_gaps()` runs on the
+- **Cross-domain (advisory).** `_warn_layer_gaps()` runs on the
   reconciled plan before scheduling and surfaces two heuristic warnings:
   (1) a subtask modifies `schema.prisma` but no subtask touches seed
   or migration files (database initialization gap); (2) a subtask's
   `provides` tags contain env/bootstrap/secret/credential keywords but
   no subtask touches `.env.example` or env documentation (env-contract
   gap). These are advisory `log()` warnings following the same pattern
-  as `warn_cross_planner_file_overlap()`.
+  as `_warn_cross_planner_file_overlap()`.
 
 ### Provider-subset subtasks (advisory)
 
@@ -1036,7 +1036,7 @@ whole surface is that same test file — reaches its worker with nothing left
 to commit. The mechanical no-commits gate then fails it, and (before the
 mid-run satisfied rescue, §8) the run loops to a wave death.
 
-`warn_provider_subset_subtasks()` surfaces this one phase earlier. Reusing
+`_warn_provider_subset_subtasks()` surfaces this one phase earlier. Reusing
 `_build_predecessor_graph` (so "predecessor" matches the scheduler exactly),
 it flags any subtask whose entire `files_likely_touched` set is a subset of
 the union of its **direct** ordered predecessors' files (predecessors via
@@ -1122,14 +1122,14 @@ before the LLM acts, so shallow splits are structurally impossible. The
 mechanism is a **repo-map** — a tree-sitter symbol/reference graph computed
 once and mtime-cached at `<state-root>/repo-map-cache/`.
 
-**`build_repo_map(repo_root) → RepoMap`** extracts definitions, references,
+**`_build_repo_map(repo_root) → RepoMap`** extracts definitions, references,
 and signatures per source file via tree-sitter `tags.scm` queries (multi-language
 via prebuilt parsers; `universal-ctags`/`ast-grep` fallback for long-tail
 languages). It builds a file/symbol reference graph (defs→refs edges), caching
 by file mtime so only changed files re-parse. Measured on a real Python repo:
 4 ms/file, 450-node graph, warm re-parse negligible.
 
-**`rank_repo_map(repo_map, seed_files, seed_symbols) → ranked_subgraph`** runs
+**`_rank_repo_map(repo_map, seed_files, seed_symbols) → ranked_subgraph`** runs
 personalized PageRank biased toward the current task's files and symbols,
 emits a k-hop ego-graph, and binary-search-fits the result to a token budget
 (default ~1 k tokens, a new `DEFAULT_CAPS["repo_map_tokens"]` entry), ranking
@@ -1138,7 +1138,7 @@ symbols in the top-ranked subgraph in 0.92 s on a 450-node graph.
 
 The ranked subgraph is injected into the planner context (and, per subtask, into
 the splitter, re-ranked to each node's files). This generalizes the existing
-`glob_task_references` seed — P6 is a structurally richer version of
+`_glob_task_references` seed — P6 is a structurally richer version of
 what leerie already does in embryo. A `--skip-repo-map` flag
 (`LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml`) degrades to the
 current grep/glob-only planner for repos where tree-sitter cannot parse.
@@ -1168,7 +1168,7 @@ lesson). Migration files are empirically independent: a 29-file sweep had only
 3 import edges and 4/29 coupled pairs — a DAG → embarrassingly parallel. The
 split mechanism therefore separates by structural type:
 
-- **Migrations (dominant case, 84% of truncations):** `partition_files(exhaustive_list, ~8)`
+- **Migrations (dominant case, 84% of truncations):** `_partition_files(exhaustive_list, ~8)`
   — a *deterministic* chunker that achieves 100% coverage and 0 overlap by
   construction. The exhaustive file list comes from P6 / `_grep_old_pattern`. A
   `splitter` worker only **titles and writes success criteria** for each
@@ -1192,7 +1192,7 @@ split mechanism therefore separates by structural type:
   file, deterministically, in two tiers:
   - **Tier 1 — function boundaries.** Tree-sitter symbol spans
     (`_extract_symbol_ranges`, reading `item.span.start_line`/`end_line`) tile
-    `[1, EOF]` with no gaps or overlap by construction — the `partition_files`
+    `[1, EOF]` with no gaps or overlap by construction — the `_partition_files`
     guarantee applied to ordered line spans (inter-symbol gaps attach to the
     preceding region so the union stays exhaustive). Adjacent functions group
     until a region approaches `subfile_split_max_span`.
@@ -1204,7 +1204,7 @@ split mechanism therefore separates by structural type:
     is also the whole-file fallback when tree-sitter yields no ranges.
 
   Each child owns a region of the same file, so N children co-own it. This is
-  already legitimate everywhere downstream: `schedule()` derives waves only from
+  already legitimate everywhere downstream: `_schedule()` derives waves only from
   `depends_on`/`requires` (never `files_likely_touched`), so co-owners run the
   same wave in parallel; the phase 2¾ overlap judge's charter is *same exported
   artifact with incompatible APIs* and it explicitly excludes "multiple primitive
@@ -1238,9 +1238,9 @@ split mechanism therefore separates by structural type:
     files is nothing to peel, and ≥2 oversized files is genuinely coupled
     multi-file work the LLM splitter should own — both fall through unchanged. The
     peeled children inherit the parent's edges exactly as the migration/tier
-    children do, so `schedule()`/overlap/integration are unaffected.
+    children do, so `_schedule()`/overlap/integration are unaffected.
 
-**`recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
+**`_recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
 
 ```
 conf = fit_judge(subtask)                         # P1 confidence, measured discriminating
@@ -1272,14 +1272,14 @@ establish a confident split: an infrastructure failure mid-decomposition
 has already paid for elsewhere in the tree. The migration-path splitter
 (label-only mode, invoked from `_label_migration_chunks`) already carried
 this guard — a crash there keeps the code-computed file partition and
-falls back to deterministic per-chunk labels, since `partition_files`
+falls back to deterministic per-chunk labels, since `_partition_files`
 already owns the split and the splitter is only titling it. See
 *Credential strategy* in §6 for why this crash barrier matters in
 practice — decomposition routinely accounts for a large share of a run's
 total planning spend, so losing it to a single transient worker failure
 is expensive. `phase_plan` snapshots decomposition progress into state as
 each top-level subtask finishes expanding, mirroring how `plan_snapshot`
-already persists the plan after `schedule()`; like `plan_snapshot`, this
+already persists the plan after `_schedule()`; like `plan_snapshot`, this
 is diagnostic only — nothing reads it back. The resumable-planning cursor
 (§6 *Resumable planning*) checkpoints at the coarser `phase_plan`
 granularity (`plans_after_plan`, written only after the whole phase
@@ -1289,10 +1289,10 @@ returns), so a resume that lands mid-decomposition still re-invokes
 
 ### Wire-in to `phase_plan`
 
-After each per-category planner returns its first-pass subtasks, `recursive_decompose`
+After each per-category planner returns its first-pass subtasks, `_recursive_decompose`
 runs over each subtask; the union of all leaves is the flat set. The **existing**
 path then continues unchanged: `phase_reconcile` → `phase_overlap_judge` →
-`schedule()` → `validate_plan` → `write_plan` → `phase_execute`. The existing
+`_schedule()` → `_validate_plan` → `_write_plan` → `phase_execute`. The existing
 self-scored `decomposition_quality` axis is demoted to a non-gating advisory
 self-report: the independent `fit_judge` is now the authoritative
 decomposition-quality gate (removing the self-grading bias BAGEN documents).
@@ -1321,11 +1321,11 @@ falsification.)
 **Expansion vanishes the parent's id, so it owes the inbound-reference rewrite**
 (§5 *Id-vanishing operations*). A first-pass sibling that declared
 `depends_on: [parent]` must come out depending on every leaf the parent became;
-otherwise the edge dangles and `validate_plan` kills the run after the full
+otherwise the edge dangles and `_validate_plan` kills the run after the full
 planner/fit_judge/splitter spend. The rewrite happens at **two** levels, because
 neither alone sees every vanished id:
 
-- **Intra-generation, inside `recursive_decompose`.** The splitter is told it may
+- **Intra-generation, inside `_recursive_decompose`.** The splitter is told it may
   give a child `depends_on` on a *sibling* child. When that sibling then recurses
   and splits again, its id vanishes mid-tree — visible only to the frame that
   created it, never to `phase_plan`, which sees fully-flattened leaves and so never
@@ -1333,7 +1333,7 @@ neither alone sees every vanished id:
   children's sibling edges before returning. On the migration path this is provably
   a no-op: `_migration_child` builds children in code and no child can name a
   sibling.
-- **Cross-subtask, in `phase_plan`.** `recursive_decompose` takes a single subtask
+- **Cross-subtask, in `phase_plan`.** `_recursive_decompose` takes a single subtask
   and has no access to its siblings — the same structural reason the merge rewrite
   lives in the plan-level apply and not inside a per-pair helper. `phase_plan` holds
   every plan, so it records parent → leaf-ids across the expansion loop and applies
@@ -1515,7 +1515,7 @@ its result to a phase-named key in `state.json` immediately after the
 phase completes — e.g. `plans_after_reconcile` after `phase_reconcile`,
 `plans_after_overlap_judge` after `phase_overlap_judge` — mirroring how
 `plan_snapshot` already persists `{"subtasks", "waves"}` right after
-`schedule()` and `decompose_snapshot` already persists the flattened leaf
+`_schedule()` and `decompose_snapshot` already persists the flattened leaf
 list as each top-level subtask finishes expanding (§5½). Every one of
 these keys must be added to `STATE_FIELDS` (`orchestrator/leerie.py:259`).
 `STATE_FIELDS` is a static allowlist checked by `tests/test_state_fields.py`,
@@ -1531,7 +1531,7 @@ sequence in order and **skips every phase whose output key is already
 present**, re-entering the pipeline at the first phase with no persisted
 output — reusing the persisted `plans` as that phase's input rather than
 re-deriving it. A phase that already ran is never billed again; only the
-phases still needed to reach `schedule()`/`write_plan()` spend further
+phases still needed to reach `_schedule()`/`_write_plan()` spend further
 budget.
 
 **Why the resume cursor is the *presence of an output key*, and not
@@ -1553,7 +1553,7 @@ persisted," full stop, with no exception for a phase that merely began.
 phase was interrupted) but is never the resume cursor itself.
 
 This makes the checkpoint approach safe by construction, not merely
-convenient: `schedule()` re-sorts every wave by subtask id, so the wave
+convenient: `_schedule()` re-sorts every wave by subtask id, so the wave
 partition is a pure function of the dependency graph and lexicographic
 ids, independent of the order in which the persisted-and-reloaded `plans`
 list happens to iterate. A fresh run and a checkpoint-then-resume of the
@@ -1598,7 +1598,7 @@ not depend on nothing else having touched the repository while it was
 paused.
 
 **Budget-check resume.** Once plans are checkpointed per phase, a run
-that stopped at the post-`schedule()` budget-feasibility gate (§13) is no
+that stopped at the post-`_schedule()` budget-feasibility gate (§13) is no
 longer a dead end: `subtasks`/`waves` are already recoverable from the
 `plan_snapshot` checkpoint, so `--resume` can rehydrate them and re-run
 only the budget check — under a higher `--max-workers` or
@@ -2406,7 +2406,7 @@ exhaustion) discards every fit/split judgment already paid for on that
 planning pass, not just the one node being judged — this is the same
 class of loss D3 measured in the motivating incident, where
 decomposition was 27.8% of the run's total spend. The remedy mirrors
-two disciplines `recursive_decompose` already applies: a `WorkerError`
+two disciplines `_recursive_decompose` already applies: a `WorkerError`
 from either call degrades that node to a **leaf**, exactly as the
 existing depth-cap and no-progress-guard cases already resolve
 uncertainty by accepting the node as-is rather than raising (the
@@ -2416,12 +2416,12 @@ to deterministic per-chunk labels since the file partition itself is
 code-computed and unaffected by a labeling crash); and `phase_plan`
 snapshots decomposition progress into state as each top-level subtask
 finishes expanding, the same way `plan_snapshot`
-already persists the post-`schedule()` plan. Like `plan_snapshot`, this
+already persists the post-`_schedule()` plan. Like `plan_snapshot`, this
 decomposition snapshot is **diagnostic only** — nothing reads it back.
 The resumable-planning cursor (§6 *Resumable planning*) checkpoints
 `phase_plan`'s output as a whole (`plans_after_plan`), so a pause
 mid-decomposition still re-runs the entire `phase_plan` invocation
-(including `recursive_decompose`) on resume rather than rehydrating
+(including `_recursive_decompose`) on resume rather than rehydrating
 from `decompose_snapshot`'s partial leaves. Wiring `--resume` to that
 finer granularity is a separate, not-yet-shipped capability. Overclaiming
 resumability this change does not implement would be worse than not
@@ -2802,7 +2802,7 @@ as — see *Rootless exception* below for how the same broker still works
 there.)
 
 **Fail-closed gate.** Because a silently-uncapped run is what caused the
-crash, `enforce_and_record_cgroup_containment` runs once per run just
+crash, `_enforce_and_record_cgroup_containment` runs once per run just
 before the first worker spawns — in `_run_phases`, *after* the resume
 short-circuits so an already-completed / no-work resume (which spawns
 zero workers — the "host launcher pushes + opens the PR" flow) is not
@@ -3003,7 +3003,7 @@ tool-result for `_read_stream`'s window detector to key on: `claude -p`
 is often reaped mid-turn, before it can emit any `result` event at all.
 That symptom lands in `_invoke`'s no-envelope path indistinguishable from
 a session-limit no-op or a `--max-turns` exhaustion; downstream,
-`validate_result` tags it `empty_handoff`, and once a run with no
+`_validate_result` tags it `empty_handoff`, and once a run with no
 committed work burns the retry cap the operator sees only *"checkpoint
 ... does not exist on disk"* — no mention of memory. On a real run this
 drove an operator through a default → 6G → 12G → 16G
@@ -3024,14 +3024,14 @@ first line only) and the cgroup's `memory.max` cap, with the same
 actionable suggestion the operator's escalation ladder already
 discovered by hand — *"worker OOM-killed on `<cmd>` (memory.max=N GiB) —
 raise `--worker-memory-max` or lower `--max-parallel`."* That message
-threads through `run_implementer`'s existing `except WorkerError` handler
+threads through `_run_implementer`'s existing `except WorkerError` handler
 into the synthesized `incomplete-handoff` envelope's `summary` field.
 
-`settle_subtask`'s `empty_handoff` handling already branches on whether
+`_settle_subtask`'s `empty_handoff` handling already branches on whether
 the worktree holds committed work (see the rescue above): when it does,
 the named-OOM `summary` was already preserved verbatim. The remaining
 gap is the no-commits branch, which previously discarded the worker's
-`summary` in favor of `validate_result`'s generic checkpoint-missing
+`summary` in favor of `_validate_result`'s generic checkpoint-missing
 `message` before calling `fail()`. That branch now prefers the worker's
 own `summary` when present — falling back to the generic message only
 when no worker output exists — so a genuinely OOM-killed build is named
@@ -3191,7 +3191,7 @@ The fix routes those orphans to the orchestrator and reaps them there.
 issues `prctl(PR_SET_CHILD_SUBREAPER)` so orphaned descendants in the
 orchestrator's subtree reparent to **it** instead of climbing to PID 1;
 `_zombie_reaper()` — a background asyncio task with the same lifecycle as
-`_memory_sampler` (spawned in `orchestrate()`, cancelled in its `finally`) —
+`_memory_sampler` (spawned in `_orchestrate()`, cancelled in its `finally`) —
 reaps them roughly once a second, keeping `pids.current` flat (live processes
 only) instead of climbing. `prctl` is Linux-only and a logged no-op elsewhere
 (the orchestrator only runs for real inside the Linux container).
@@ -4007,7 +4007,7 @@ table above and nothing more:
 - `ec2:StopInstances`, `ec2:StartInstances`, `ec2:TerminateInstances`
   (teardown, pause/resume)
 - `ec2:CreateTags` (tagging the instance with the run id for
-  `discover_runs`-style orphan recovery, mirroring how Fly machine
+  `_discover_runs`-style orphan recovery, mirroring how Fly machine
   metadata carries the run id)
 - `ssm:StartSession`, `ssm:SendCommand`, `ssm:TerminateSession`,
   `ssm:DescribeSessions`, plus the SSM Agent's own instance-side role
@@ -4146,7 +4146,7 @@ on. Two coupling points that hardcode the Fly-specific sidecar name will
 need generalizing when EC2 provisioning actually lands (out of scope for
 this subtask, flagged here so the next one doesn't have to rediscover
 it): `scripts/remote/provision.sh` writes `fly-machine.json` as the
-crash-recovery pointer, and `orchestrator/leerie.py`'s `discover_runs`
+crash-recovery pointer, and `orchestrator/leerie.py`'s `_discover_runs`
 (DESIGN §6 multi-run resume) looks for that exact filename to recognize
 a pre-`state.json` crash-recoverable orphan run.
 The natural generalization is a same-shaped `ec2-instance.json` sidecar
@@ -4450,7 +4450,7 @@ carve-out is a deliberate trade.
 
 ### Resume
 
-Provisioning runs inside the same fresh-run branch of `orchestrate()`
+Provisioning runs inside the same fresh-run branch of `_orchestrate()`
 that runs classify, plan, and schedule — none of which re-execute on
 `--resume`. The resume path loads state and jumps to execution; the
 recipe lives in state, the version-manager cache survives across
@@ -4483,7 +4483,7 @@ it is not consumed by BLT resolution.
 
 Resolution is handled by `resolve_blt(repo_root)` (calls
 `_load_blt_config()` first, then fills missing axes from inference),
-which is what both `_run_conformance_phase` and `run_final_conformance`
+which is what both `_run_conformance_phase` and `_run_final_conformance`
 call — neither calls `_infer_build_lint_test` directly any longer.
 
 ### Per-repo container image
@@ -4895,7 +4895,7 @@ is a gate failure that the user must see.
 
 **Reaching the cleared-but-empty state from classification, before any
 planner runs.** The mechanism above is triggered post-plan, by
-`detect_no_work` reading every planner's `status`/`subtasks`. But an
+`_detect_no_work` reading every planner's `status`/`subtasks`. But an
 already-satisfied task can make the classification gate itself unable to
 converge on a category set, before a planner is ever spawned: the
 classifier's `check_classifier_output` and the independent
@@ -4911,7 +4911,7 @@ classify at all, so this only structures a claim it could previously only
 make as prose the pipeline discarded. If the classification-gate retry
 loop exhausts without converging, and `st.data["likely_already_satisfied"]`
 is `True` with evidence, `phase_classification_gate` routes directly to
-`_finish_no_work_run` — the identical terminal state `detect_no_work`
+`_finish_no_work_run` — the identical terminal state `_detect_no_work`
 produces, reached one phase earlier for this specific case. This field is
 OR-accumulated across re-classify rounds within one gate call, not
 last-write-wins: each re-classify round is a fresh classifier invocation
@@ -4926,7 +4926,7 @@ exactly the un-accumulated version of this: one round found the
 deliverable already on HEAD, a later round's category-focused re-classify
 silently dropped the claim, and the gate died instead of routing to the
 no-work exit.) This is not a new trust boundary: it extends the same one
-`detect_no_work` already accepts (a worker's own investigation,
+`_detect_no_work` already accepts (a worker's own investigation,
 un-double-checked by a second judge) from "the planner found nothing to
 do" to "the classifier independently found the same thing, and
 classification could not otherwise converge anyway." A classifier that
@@ -5071,7 +5071,7 @@ probe is *not* satisfied (a genuine lazy/broken no-op, the case the backstop was
 built for), the existing retryable-failure path is unchanged. The same
 base-tree-only-vs-HEAD distinction is deliberate: the pre-schedule probe must
 not span history, but the post-execution probe measures against exactly the ref
-the commit-presence gate itself uses (`compute_run_branch`), so it cannot
+the commit-presence gate itself uses (`_compute_run_branch`), so it cannot
 "find" the deliverable on an unrelated branch.
 
 **Scope: sibling-committed *or* base-tree-already-satisfied.** The probe judges
@@ -5126,7 +5126,7 @@ leaves the mechanical no-commits failure intact. What the probe decides —
 "are these success criteria semantically met on this tree?" — is exactly the
 kind of judgment §12's *complementary half* assigns to a worker: it cannot be
 checked mechanically (it requires matching criteria prose against file content),
-which is precisely why the pre-schedule `filter_satisfied_subtasks` uses the same
+which is precisely why the pre-schedule `_filter_satisfied_subtasks` uses the same
 worker. This adds no new §12 carve-out; it is the outcome-checked-where-possible,
 judgment-left-to-the-worker split the principle already prescribes.
 
@@ -5193,7 +5193,7 @@ mis-wirings:
   is extended to adversarially attack the implementer's diff for the behavioral
   gaps the self-grade missed (the decoy click, the unhandled error path, the
   missing exit-guard, the sibling data-path site left unedited). This axis
-  **gates** in `settle_subtask`; the conformer's existing build/lint/test and
+  **gates** in `_settle_subtask`; the conformer's existing build/lint/test and
   drift/docs/rule work stays advisory (below).
 - **classifier** → an independent verifier of the category set against the
   task + codebase: does the chosen set cover the actual work, and does it
@@ -5413,7 +5413,7 @@ planning pass — and the run then died of budget exhaustion having written no
 code.
 
 leerie already holds the prescribed commands as structured classifier output,
-so `repair_prescribed_commands` synthesises a subtask that runs them, at zero
+so `_repair_prescribed_commands` synthesises a subtask that runs them, at zero
 worker cost, before the floor is evaluated. A repairable gap therefore never
 reaches the re-plan path. This is the wiring gate's *detect → repair what is
 unambiguous → re-drive only what is not* contract applied to the gate whose
@@ -5427,13 +5427,13 @@ attach arbitrarily. A dedicated subtask whose entire content is running the
 prescribed commands cannot be wrong about intent. It depends on the plan's
 current sinks, so it is acyclic by construction and schedules alone in the
 final wave. Validated across every corpus run carrying a prescribed procedure:
-5 of 5 repaired to a clean floor with `schedule()` and `validate_plan()`
+5 of 5 repaired to a clean floor with `_schedule()` and `_validate_plan()`
 passing, 3 already-clean runs correctly untouched.
 
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
-orchestrator mechanically resolves the paths (`glob_task_references`) and
+orchestrator mechanically resolves the paths (`_glob_task_references`) and
 names them for the planner, which reads them itself; whether the plan
 covers what they require is the `task_coverage_judge`'s call (§8). This
 is deliberately just a list of paths — an external reference the planner
@@ -5629,20 +5629,20 @@ Two further disciplines apply, and they sit at the §12 axis:
   final verification step (a `pnpm run build`, a heavy test suite) and then has
   that step OOM-killed gets its `claude -p` session reaped before it writes a
   checkpoint. The synthesized result is an `incomplete-handoff` whose
-  `checkpoint_path` does not exist — `validate_result` tags it `empty_handoff`.
-  Naively this is treated as a retryable no-op: `settle_subtask` calls `fail()`,
+  `checkpoint_path` does not exist — `_validate_result` tags it `empty_handoff`.
+  Naively this is treated as a retryable no-op: `_settle_subtask` calls `fail()`,
   which `_reset_subtask_worktree`s away the worktree (destroying any committed
   diff) and burns `failed_retries` until the whole run dies. But the worker may
   have *already committed a complete, green diff* and died only at a
   container-environmental verification step (the build OOMs the same way for
   sibling subtasks whose criteria don't gate on it — they return before dying
   and settle `complete`). So before failing an `empty_handoff`, the orchestrator
-  runs the positive-polarity `branch_has_commits_ahead` gate: **if the branch has
+  runs the positive-polarity `_branch_has_commits_ahead` gate: **if the branch has
   commits ahead of the run branch, the worker produced a real deliverable** and
   the result is settled as `complete` — routed through the advisory conformance
   phase, which records the unfinished verification as a warning — rather than
   discarded. Only a genuine no-op (no commits) stays retryable, and the
-  commit-presence test is a *positive* proof (`branch_has_commits_ahead`, as
+  commit-presence test is a *positive* proof (`_branch_has_commits_ahead`, as
   distinct from the `check_branch_has_commits` no-op gate on the `complete`
   path): a
   worktree that is gone or on which git fails counts as "no proven commits" and
@@ -6063,7 +6063,7 @@ the change the user had prohibited.
 The gap this exposed: §12's discipline is applied rigorously to *worker*
 behavior — schema validation, caps, the conformer gate — but nothing
 mechanically checks whether a plan's *shape* honors an instruction the user
-explicitly prescribed. The existing plan-time gates (`validate_plan`,
+explicitly prescribed. The existing plan-time gates (`_validate_plan`,
 `check_budget_feasibility`, `phase_overlap_judge`) are purely structural — id
 prefixes, cycles, budget, file overlap. None of them compares the plan
 against the literal thing the user asked for. A planner can reason its way
@@ -6307,7 +6307,7 @@ subtask 38, leaving the run branch with the first few waves' worth of
 integrated commits and the rest unrunnable.
 
 The corresponding *early* check belongs at the plan/execute boundary.
-By the time `schedule()` returns its `(subtasks, waves)` pair, every
+By the time `_schedule()` returns its `(subtasks, waves)` pair, every
 unknown that determines how much budget the rest of the run will
 consume is resolved: the final subtask count is fixed, the wave count
 is computed (deterministically, by Kahn's algorithm over the
@@ -6324,7 +6324,7 @@ with no free variables beyond the per-subtask call multiplier, which
 is well-bounded empirically.
 
 **A re-plan needs its own preflight.** The gate above runs *once*, after
-`schedule()`. But a gate that re-plans (`phase_adherence_gate`,
+`_schedule()`. But a gate that re-plans (`phase_adherence_gate`,
 `phase_planning_coverage_gate`) authorises the single largest budget event
 in a run, and did so with no budget check at all. A re-plan is also far more
 expensive than "re-running the planners": `phase_plan` re-runs the entire P1
@@ -6344,11 +6344,11 @@ the real cause; dying at worker 200 costs the whole run. It honours the same
 load-bearing backstop either way.
 
 **Why the gate cannot move earlier, even though the satisfied-probe
-spends first.** The probe runs before `schedule()`, so its per-subtask
+spends first.** The probe runs before `_schedule()`, so its per-subtask
 calls are billed before this gate can fire — which reads oddly against
 "cheapest moment". Moving the gate earlier, or adding a pre-probe
 guard, was measured and rejected: the probe *drops* subtasks, and
-`schedule()` merges the post-drop plans, so anything running before it
+`_schedule()` merges the post-drop plans, so anything running before it
 sees a **pre-drop** count. Measured across real runs, drops shrink a
 plan by a median ~32% (up to 50%), so a pre-probe guard systematically
 over-estimates and would abort runs the real gate passes — a sweep
@@ -6377,7 +6377,7 @@ warnings or otherwise come in under the estimate. The escape hatch
 matches the same precedence chain as `--skip-smoke` and
 `--skip-overlap-judge`: a deliberate opt-out, not a default.
 
-**This gate firing is not a dead end.** Because `schedule()`'s output is
+**This gate firing is not a dead end.** Because `_schedule()`'s output is
 one of the per-phase planning checkpoints (§6 *Resumable planning*), a
 run that stops here has its `subtasks`/`waves` already recoverable from
 `plan_snapshot` — `--resume` rehydrates them and re-runs only the budget
@@ -6973,7 +6973,7 @@ The group layer adds four thin capabilities on top:
    siblings seeded as read-only inspect-dirs (`--inspect-dir <sibling-repo>`).
    Workers may `Read`/`Grep`/`Glob` under `/inspect/<name>`; they may not
    write there. The enforcement mechanism is the existing
-   `filter_offtree_subtasks` guard (§12), unchanged.
+   `_filter_offtree_subtasks` guard (§12), unchanged.
 
 3. **Deploy-ordering notes.** When a member's planner declares a cross-repo
    prerequisite as `requires.extent: external` (§5) naming a sibling repo,
@@ -7028,7 +7028,7 @@ The `--inspect-dir` mechanism mounts a sibling repo read-only into the
 worker's filesystem (`/inspect/<name>`). Locally, this is a kernel-enforced
 `:ro` bind mount. On the Fly runtime, it is convention-enforced (the sibling
 is seeded without the leerie user's write credentials). In both cases,
-`filter_offtree_subtasks` (§12) soft-drops any subtask whose files fall
+`_filter_offtree_subtasks` (§12) soft-drops any subtask whose files fall
 outside the member's repository root. This is the same enforcement that
 prevents a single-run worker from writing outside its worktree; the group
 adds no new mechanism, it just applies the existing one to a new directory.

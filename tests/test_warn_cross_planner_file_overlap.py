@@ -1,4 +1,4 @@
-"""Tests for warn_cross_planner_file_overlap() — the plan-validation
+"""Tests for _warn_cross_planner_file_overlap() — the plan-validation
 warning that surfaces when multiple planners claim the same file in
 `files_likely_touched`.
 
@@ -32,7 +32,7 @@ def test_no_overlap_is_silent(leerie, monkeypatch):
             {"id": "refactor-001", "files_likely_touched": ["src/c.py"]},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     assert lines == []
 
 
@@ -47,7 +47,7 @@ def test_overlap_within_same_planner_does_not_warn(leerie, monkeypatch):
             {"id": "feat-002", "files_likely_touched": ["src/shared.py"]},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     assert lines == []
 
 
@@ -65,7 +65,7 @@ def test_cross_planner_overlap_warns(leerie, monkeypatch):
              "files_likely_touched": ["src/app/globals.css"]},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     assert any("cross-planner file overlap" in l for l in lines)
     assert any("globals.css" in l for l in lines)
     assert any("feat(feat-001)" in l for l in lines)
@@ -84,7 +84,7 @@ def test_warn_reports_count(leerie, monkeypatch):
              "files_likely_touched": ["a.css", "b.css", "c.css"]},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     # The leading log line should mention the count "3 file(s)".
     summary = [l for l in lines if "cross-planner file overlap" in l]
     assert summary, "expected a summary warning line"
@@ -105,7 +105,7 @@ def test_multiple_subtasks_per_planner_listed(leerie, monkeypatch):
             {"id": "refactor-001", "files_likely_touched": ["x.tsx"]},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     detail = [l for l in lines if "x.tsx" in l]
     assert detail, "expected a per-file detail line"
     assert "feat-001" in detail[0]
@@ -115,7 +115,7 @@ def test_multiple_subtasks_per_planner_listed(leerie, monkeypatch):
 
 def test_empty_plans_list(leerie, monkeypatch):
     lines = _capture_logs(leerie, monkeypatch)
-    leerie.warn_cross_planner_file_overlap([])
+    leerie._warn_cross_planner_file_overlap([])
     assert lines == []
 
 
@@ -129,7 +129,7 @@ def test_plan_with_no_subtasks(leerie, monkeypatch):
         ]},
         {"domain": "docs", "subtasks": []},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     assert lines == []
 
 
@@ -145,5 +145,5 @@ def test_missing_files_likely_touched_is_safe(leerie, monkeypatch):
             {"id": "refactor-001"},
         ]},
     ]
-    leerie.warn_cross_planner_file_overlap(plans)
+    leerie._warn_cross_planner_file_overlap(plans)
     assert lines == []

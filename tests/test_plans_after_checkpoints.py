@@ -112,14 +112,14 @@ class TestCheckpointsFollowTheirPhaseCall:
         assert call < key
 
     def test_reconcile_checkpoint_precedes_no_work_short_circuit(self, leerie):
-        """detect_no_work can `return` immediately after phase_reconcile —
+        """_detect_no_work can `return` immediately after phase_reconcile —
         the reconcile checkpoint must land before that short-circuit or a
         run that turns out to have work loses it."""
         src = _phases_src(leerie)
         key = src.find('st.data["plans_after_reconcile"]')
-        no_work = src.find("no_work_map = detect_no_work(plans)")
+        no_work = src.find("no_work_map = _detect_no_work(plans)")
         assert key != -1
-        assert no_work != -1, "_run_phases must call detect_no_work(plans)"
+        assert no_work != -1, "_run_phases must call _detect_no_work(plans)"
         assert key < no_work
 
     def test_overlap_judge_checkpoint_follows_overlap_judge_call(self, leerie):
@@ -148,14 +148,14 @@ class TestCheckpointsFollowTheirPhaseCall:
 
     def test_filters_checkpoint_follows_both_filters(self, leerie):
         src = _phases_src(leerie)
-        offtree = src.find("filter_offtree_subtasks(plans, Path(os.getcwd()),")
+        offtree = src.find("_filter_offtree_subtasks(plans, Path(os.getcwd()),")
         satisfied = src.find(
-            "satisfied_no_work = await filter_satisfied_subtasks("
+            "satisfied_no_work = await _filter_satisfied_subtasks("
         )
         key = src.find('st.data["plans_after_filters"]')
-        assert offtree != -1, "_run_phases must call filter_offtree_subtasks"
+        assert offtree != -1, "_run_phases must call _filter_offtree_subtasks"
         assert satisfied != -1, (
-            "_run_phases must call filter_satisfied_subtasks"
+            "_run_phases must call _filter_satisfied_subtasks"
         )
         assert key != -1
         assert offtree < satisfied < key
@@ -166,7 +166,7 @@ class TestCheckpointsFollowTheirPhaseCall:
         """The satisfied-probe sweep can itself return a no-work map that
         short-circuits via _finish_no_work_run — the filters checkpoint
         must land after that check resolves (plans_after_filters is written
-        only for a run that has real work to schedule)."""
+        only for a run that has real work to _schedule)."""
         src = _phases_src(leerie)
         key = src.find('st.data["plans_after_filters"]')
         no_work_check = src.find("if satisfied_no_work is not None:")
@@ -177,9 +177,9 @@ class TestCheckpointsFollowTheirPhaseCall:
     def test_filters_checkpoint_precedes_schedule(self, leerie):
         src = _phases_src(leerie)
         key = src.find('st.data["plans_after_filters"]')
-        sched = src.find("subtasks, waves = schedule(plans)")
+        sched = src.find("subtasks, waves = _schedule(plans)")
         assert key != -1
-        assert sched != -1, "_run_phases must call schedule(plans)"
+        assert sched != -1, "_run_phases must call _schedule(plans)"
         assert key < sched
 
 
@@ -201,9 +201,9 @@ class TestCheckpointsAppearInPipelineOrder:
 
 
 class TestPlanSnapshotStillAuthoritativeAfterSchedule:
-    """plan_snapshot (existing, DESIGN §6) remains the post-schedule
+    """plan_snapshot (existing, DESIGN §6) remains the post-_schedule
     checkpoint — this subtask must not disturb its established ordering
-    relative to schedule()/the die() gates, already pinned in
+    relative to _schedule()/the die() gates, already pinned in
     tests/test_plan_snapshot_wiring.py. Pinned again here, narrowly, as a
     regression guard against this subtask's edits landing in the wrong
     place relative to plan_snapshot."""

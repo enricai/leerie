@@ -27,7 +27,7 @@ import pytest
 
 
 def _mk_run(root, run_id, *, started=None, run_json=None, state=None):
-    """Create a run dir discover_runs() will find."""
+    """Create a run dir _discover_runs() will find."""
     d = root / "runs" / run_id
     d.mkdir(parents=True, exist_ok=True)
     st = {"task": "t", "worker_count": 0}
@@ -154,5 +154,5 @@ def test_fixtures_are_valid_run_json(leerie, tmp_path):
     _mk_run(tmp_path, "a" * 64, started="2026-01-01T00:00:00+00:00",
             run_json={"pushed_at": "2026-01-01T02:00:00+00:00",
                       "pr_url": "https://example.com/pr/1"})
-    rows = leerie.discover_runs(tmp_path)
+    rows = leerie._discover_runs(tmp_path)
     assert leerie._run_status_for(rows[0], tmp_path) == "done-pushed-pr"

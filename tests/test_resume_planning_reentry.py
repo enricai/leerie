@@ -117,13 +117,13 @@ def _stub_common(leerie, monkeypatch, calls: dict):
     caller after this stub is installed.
     """
     monkeypatch.setattr(
-        leerie, "enforce_and_record_cgroup_containment",
+        leerie, "_enforce_and_record_cgroup_containment",
         lambda st, allow_uncapped: calls.setdefault(
-            "enforce_and_record_cgroup_containment", 0))
+            "_enforce_and_record_cgroup_containment", 0))
     monkeypatch.setattr(
-        leerie, "absorb_supplied_answers",
+        leerie, "_absorb_supplied_answers",
         lambda args, st, leerie_dir: calls.__setitem__(
-            "absorb_supplied_answers", calls.get("absorb_supplied_answers", 0) + 1))
+            "_absorb_supplied_answers", calls.get("_absorb_supplied_answers", 0) + 1))
 
     async def _backstop(*a, **kw):
         calls["_backstop_capture_prior_runs"] = calls.get(
@@ -173,21 +173,21 @@ def _stub_common(leerie, monkeypatch, calls: dict):
         leerie, "phase_planning_coverage_gate", _coverage_gate)
 
     monkeypatch.setattr(
-        leerie, "warn_cross_planner_file_overlap", lambda plans: None)
-    monkeypatch.setattr(leerie, "warn_layer_gaps", lambda plans: None)
+        leerie, "_warn_cross_planner_file_overlap", lambda plans: None)
+    monkeypatch.setattr(leerie, "_warn_layer_gaps", lambda plans: None)
     monkeypatch.setattr(
-        leerie, "warn_provider_subset_subtasks", lambda plans: None)
+        leerie, "_warn_provider_subset_subtasks", lambda plans: None)
     monkeypatch.setattr(
-        leerie, "filter_offtree_subtasks",
+        leerie, "_filter_offtree_subtasks",
         lambda plans, repo_root, inspect_dirs, st: calls.__setitem__(
-            "filter_offtree_subtasks",
-            calls.get("filter_offtree_subtasks", 0) + 1))
+            "_filter_offtree_subtasks",
+            calls.get("_filter_offtree_subtasks", 0) + 1))
 
     async def _satisfied(plans, repo_root, st, caps, models, efforts):
-        calls["filter_satisfied_subtasks"] = calls.get(
-            "filter_satisfied_subtasks", 0) + 1
+        calls["_filter_satisfied_subtasks"] = calls.get(
+            "_filter_satisfied_subtasks", 0) + 1
         return None
-    monkeypatch.setattr(leerie, "filter_satisfied_subtasks", _satisfied)
+    monkeypatch.setattr(leerie, "_filter_satisfied_subtasks", _satisfied)
 
     monkeypatch.setattr(
         leerie, "check_budget_feasibility",
@@ -195,13 +195,13 @@ def _stub_common(leerie, monkeypatch, calls: dict):
             "check_budget_feasibility",
             calls.get("check_budget_feasibility", 0) + 1))
     monkeypatch.setattr(
-        leerie, "validate_plan",
+        leerie, "_validate_plan",
         lambda subtasks: calls.__setitem__(
-            "validate_plan", calls.get("validate_plan", 0) + 1))
+            "_validate_plan", calls.get("_validate_plan", 0) + 1))
     monkeypatch.setattr(
-        leerie, "write_plan",
+        leerie, "_write_plan",
         lambda leerie_dir, task, st, subtasks, waves: calls.__setitem__(
-            "write_plan", calls.get("write_plan", 0) + 1))
+            "_write_plan", calls.get("_write_plan", 0) + 1))
 
     async def _execute(*a, **kw):
         calls["phase_execute"] = calls.get("phase_execute", 0) + 1
@@ -259,10 +259,10 @@ class TestPerPhaseRoundTrip:
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
         assert calls.get("phase_planning_coverage_gate") == 1
-        assert calls.get("filter_satisfied_subtasks") == 1
+        assert calls.get("_filter_satisfied_subtasks") == 1
         assert calls.get("check_budget_feasibility") == 1
-        assert calls.get("write_plan") == 1
-        assert "waves" in st.data or True  # write_plan stubbed; see below
+        assert calls.get("_write_plan") == 1
+        assert "waves" in st.data or True  # _write_plan stubbed; see below
         assert st.data["plans_after_plan"] == [
             _plan("bug-fixing", _subtask("bugfix-001"))]
 
@@ -282,7 +282,7 @@ class TestPerPhaseRoundTrip:
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
         assert calls.get("phase_planning_coverage_gate") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_write_plan") == 1
 
     def test_resume_after_reconcile_skips_reconcile_reruns_overlap_onward(
         self, leerie, monkeypatch, run_dirs
@@ -301,7 +301,7 @@ class TestPerPhaseRoundTrip:
         assert calls.get("phase_overlap_judge") == 1
         assert calls.get("phase_adherence_gate") == 1
         assert calls.get("phase_planning_coverage_gate") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_write_plan") == 1
 
     def test_resume_after_overlap_judge_skips_it_reruns_adherence_onward(
         self, leerie, monkeypatch, run_dirs
@@ -319,7 +319,7 @@ class TestPerPhaseRoundTrip:
             "phase_overlap_judge already checkpointed — must not re-invoke it")
         assert calls.get("phase_adherence_gate") == 1
         assert calls.get("phase_planning_coverage_gate") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_write_plan") == 1
 
     def test_resume_after_adherence_gate_skips_it_reruns_coverage_gate_onward(
         self, leerie, monkeypatch, run_dirs
@@ -338,9 +338,9 @@ class TestPerPhaseRoundTrip:
             "phase_adherence_gate already checkpointed — must not "
             "re-invoke it")
         assert calls.get("phase_planning_coverage_gate") == 1
-        assert calls.get("filter_offtree_subtasks") == 1
-        assert calls.get("filter_satisfied_subtasks") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_filter_offtree_subtasks") == 1
+        assert calls.get("_filter_satisfied_subtasks") == 1
+        assert calls.get("_write_plan") == 1
 
     def test_resume_after_coverage_gate_skips_it_reruns_filters_onward(
         self, leerie, monkeypatch, run_dirs
@@ -359,9 +359,9 @@ class TestPerPhaseRoundTrip:
         assert "phase_planning_coverage_gate" not in calls, (
             "phase_planning_coverage_gate already checkpointed — must not "
             "re-invoke it")
-        assert calls.get("filter_offtree_subtasks") == 1
-        assert calls.get("filter_satisfied_subtasks") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_filter_offtree_subtasks") == 1
+        assert calls.get("_filter_satisfied_subtasks") == 1
+        assert calls.get("_write_plan") == 1
 
     def test_resume_after_filters_skips_all_planning_reaches_schedule(
         self, leerie, monkeypatch, run_dirs
@@ -381,14 +381,14 @@ class TestPerPhaseRoundTrip:
             "phase_classify", "phase_plan", "phase_reconcile",
             "phase_overlap_judge", "phase_adherence_gate",
             "phase_planning_coverage_gate",
-            "filter_offtree_subtasks", "filter_satisfied_subtasks",
+            "_filter_offtree_subtasks", "_filter_satisfied_subtasks",
         ):
             assert phase not in calls, (
                 f"{phase} already checkpointed — must not re-invoke it")
-        # schedule() itself is not stubbed — real deterministic function —
+        # _schedule() itself is not stubbed — real deterministic function —
         # so plan_snapshot/waves are the real output.
         assert calls.get("check_budget_feasibility") == 1
-        assert calls.get("write_plan") == 1
+        assert calls.get("_write_plan") == 1
         assert st.data["plan_snapshot"]["subtasks"] == {
             "bugfix-001": _subtask("bugfix-001")}
 
@@ -428,7 +428,7 @@ def test_resume_skips_provision_when_recipe_is_empty_list(
 def test_reported_failure_resumes_past_satisfied_probe_sweep(
     leerie, monkeypatch, run_dirs
 ):
-    """Mirrors the reported incident: paused mid `filter_satisfied_subtasks`
+    """Mirrors the reported incident: paused mid `_filter_satisfied_subtasks`
     sweep (current_phase stamped, no plans_after_filters/waves yet).
     Reverting the fix (restoring the old `die()`) must fail this test."""
     calls: dict = {}
@@ -454,8 +454,8 @@ def test_reported_failure_resumes_past_satisfied_probe_sweep(
     caps = _caps(leerie)
     args = _args()
     _drive(leerie, args, caps, run_dirs, st)
-    assert calls.get("filter_satisfied_subtasks") == 1
-    assert calls.get("write_plan") == 1
+    assert calls.get("_filter_satisfied_subtasks") == 1
+    assert calls.get("_write_plan") == 1
     assert "plans_after_filters" in st.data
 
 
@@ -492,8 +492,8 @@ def test_post_scheduling_resume_falls_through_to_execute_unchanged(
         "phase_classify", "phase_plan", "phase_reconcile",
         "phase_overlap_judge", "phase_adherence_gate",
         "phase_planning_coverage_gate",
-        "filter_offtree_subtasks", "filter_satisfied_subtasks",
-        "check_budget_feasibility", "write_plan",
+        "_filter_offtree_subtasks", "_filter_satisfied_subtasks",
+        "check_budget_feasibility", "_write_plan",
     ):
         assert phase not in calls, (
             f"{phase} must not run on a post-scheduling resume — "
@@ -535,18 +535,18 @@ def test_budget_check_resume_rehydrates_plan_snapshot(
         "phase_classify", "phase_plan", "phase_reconcile",
         "phase_overlap_judge", "phase_adherence_gate",
         "phase_planning_coverage_gate",
-        "filter_offtree_subtasks", "filter_satisfied_subtasks",
+        "_filter_offtree_subtasks", "_filter_satisfied_subtasks",
     ):
         assert phase not in calls, (
             f"{phase} must not re-run on a budget-check resume — plans "
             "are already fully checkpointed")
     assert calls.get("check_budget_feasibility") == 1
-    assert calls.get("write_plan") == 1
+    assert calls.get("_write_plan") == 1
 
 
 # ===========================================================================
 # Determinism: a fresh run and a checkpoint-then-resume of the same task
-# produce identical `waves` (schedule() is a pure function of the dep
+# produce identical `waves` (_schedule() is a pure function of the dep
 # graph + lexicographic ids — proven in tests/test_schedule_determinism.py;
 # this test pins that the resume path reuses that guarantee end-to-end).
 # ===========================================================================
@@ -562,13 +562,13 @@ def test_fresh_run_and_checkpointed_resume_produce_identical_waves(
         )
     ]
 
-    # Fresh: schedule() called directly (no orchestrator plumbing needed —
+    # Fresh: _schedule() called directly (no orchestrator plumbing needed —
     # it is a pure function of plans).
-    fresh_subtasks, fresh_waves = leerie.schedule(
+    fresh_subtasks, fresh_waves = leerie._schedule(
         json.loads(json.dumps(plans)))
 
     # Checkpoint-then-resume: drive _run_phases from a plans_after_filters
-    # checkpoint (the input to schedule()) and inspect the resulting
+    # checkpoint (the input to _schedule()) and inspect the resulting
     # plan_snapshot.
     calls: dict = {}
     _stub_common(leerie, monkeypatch, calls)
@@ -716,8 +716,8 @@ def test_worker_count_unchanged_across_satisfied_probe_cache_resume(
     args = _args()
     _drive(leerie, args, caps, run_dirs, st)
 
-    assert calls.get("filter_satisfied_subtasks") == 1
-    assert calls.get("write_plan") == 1
+    assert calls.get("_filter_satisfied_subtasks") == 1
+    assert calls.get("_write_plan") == 1
     assert "plans_after_filters" in st.data
     assert st.data["worker_count"] == seeded_worker_count, (
         "resume re-entered at the satisfied-probe-cache checkpoint but "

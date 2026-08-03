@@ -1,4 +1,4 @@
-"""Unit tests for rank_repo_map (DESIGN §5½ (P6)).
+"""Unit tests for _rank_repo_map (DESIGN §5½ (P6)).
 
 Pins the three load-bearing contracts of the personalized-PageRank ranking:
 
@@ -9,7 +9,7 @@ Pins the three load-bearing contracts of the personalized-PageRank ranking:
 3. Binary-search shrink: lowering the token budget yields a strictly shorter
    (fewer-file) output.
 
-Fixture is built directly without build_repo_map — this isolates ranking.
+Fixture is built directly without _build_repo_map — this isolates ranking.
 No LLM calls; everything is deterministic.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 def _khop_map() -> dict:
     """Synthetic 4-file repo_map with a clear k-hop structure.
 
-    Graph (callee→caller edges rank_repo_map builds):
+    Graph (callee→caller edges _rank_repo_map builds):
         seed.py → hop1.py → hop2.py → (dangling)
         unrelated.py          (dangling, no path to/from seed cluster)
 
@@ -46,7 +46,7 @@ def _khop_map() -> dict:
 
 
 def _ranked_files(result: str) -> list[str]:
-    """Extract file names from a rank_repo_map result string, in order."""
+    """Extract file names from a _rank_repo_map result string, in order."""
     files = []
     for line in result.strip().splitlines():
         line = line.strip()
@@ -65,7 +65,7 @@ class TestSeedNeighborhoodRanking:
 
     def test_seed_file_ranks_above_unrelated(self, leerie):
         """seed.py (directly seeded) appears before unrelated.py."""
-        result = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
+        result = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
         files = _ranked_files(result)
         assert "seed.py" in files
         assert "unrelated.py" in files
@@ -75,7 +75,7 @@ class TestSeedNeighborhoodRanking:
 
     def test_hop1_neighbor_ranks_above_unrelated(self, leerie):
         """hop1.py (1-hop from seed via callee→caller edge) appears before unrelated.py."""
-        result = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
+        result = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
         files = _ranked_files(result)
         assert "hop1.py" in files
         assert "unrelated.py" in files
@@ -85,7 +85,7 @@ class TestSeedNeighborhoodRanking:
 
     def test_seed_symbol_biases_definer_above_unrelated(self, leerie):
         """Seeding on seed_func (a symbol) biases seed.py (its definer) above unrelated.py."""
-        result = leerie.rank_repo_map(_khop_map(), [], ["seed_func"], 2000)
+        result = leerie._rank_repo_map(_khop_map(), [], ["seed_func"], 2000)
         files = _ranked_files(result)
         assert "seed.py" in files
         assert "unrelated.py" in files
@@ -95,7 +95,7 @@ class TestSeedNeighborhoodRanking:
 
     def test_all_connected_nodes_before_unrelated(self, leerie):
         """seed.py, hop1.py, and hop2.py all appear before unrelated.py."""
-        result = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
+        result = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], 2000)
         files = _ranked_files(result)
         assert "unrelated.py" in files
         unrelated_idx = files.index("unrelated.py")
@@ -119,7 +119,7 @@ class TestSeedNeighborhoodRanking:
             files[f"island_{i:02d}.py"] = [f"island_fn_{i}"]
         repo_map = {"files": files, "refs": refs}
 
-        result = leerie.rank_repo_map(repo_map, ["chain_00.py"], [], 5000)
+        result = leerie._rank_repo_map(repo_map, ["chain_00.py"], [], 5000)
         ranked = _ranked_files(result)
 
         # The first connected-chain file before the first island file
@@ -142,7 +142,7 @@ class TestTokenBudgetEnforcement:
 
     def test_explicit_budget_respected(self, leerie):
         """Output token count does not exceed an explicit budget."""
-        result = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], 10)
+        result = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], 10)
         assert self._approx_tokens(result) <= 10, (
             f"approx tokens {self._approx_tokens(result)} exceeded budget 10"
         )
@@ -155,7 +155,7 @@ class TestTokenBudgetEnforcement:
             for i in range(200)
         }
         repo_map = {"files": large_files, "refs": {}}
-        result = leerie.rank_repo_map(repo_map, [], [], None)
+        result = leerie._rank_repo_map(repo_map, [], [], None)
         cap = leerie.DEFAULT_CAPS["repo_map_tokens"]
         approx = self._approx_tokens(result)
         assert approx <= cap, (
@@ -165,18 +165,18 @@ class TestTokenBudgetEnforcement:
     def test_none_budget_equals_default_cap(self, leerie):
         """Passing token_budget=None gives the same result as passing the cap value."""
         cap = leerie.DEFAULT_CAPS["repo_map_tokens"]
-        result_none = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], None)
-        result_cap = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], cap)
+        result_none = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], None)
+        result_cap = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], cap)
         assert result_none == result_cap
 
     def test_token_count_is_nonnegative(self, leerie):
         """Rendered output is never a negative-token string (basic sanity)."""
-        result = leerie.rank_repo_map(_khop_map(), ["seed.py"], [], 50)
+        result = leerie._rank_repo_map(_khop_map(), ["seed.py"], [], 50)
         assert len(result.encode()) >= 0
 
     def test_empty_map_returns_empty_string(self, leerie):
         """Empty repo_map produces empty string regardless of budget."""
-        result = leerie.rank_repo_map({"files": {}, "refs": {}}, [], [], 1000)
+        result = leerie._rank_repo_map({"files": {}, "refs": {}}, [], [], 1000)
         assert result == ""
 
 
@@ -196,8 +196,8 @@ class TestBinarySearchShrink:
     def test_lower_budget_yields_shorter_output(self, leerie):
         """Halving the budget produces output that is <= the original length."""
         repo_map = self._build_shrinkable_map()
-        result_large = leerie.rank_repo_map(repo_map, [], [], 500)
-        result_small = leerie.rank_repo_map(repo_map, [], [], 50)
+        result_large = leerie._rank_repo_map(repo_map, [], [], 500)
+        result_small = leerie._rank_repo_map(repo_map, [], [], 50)
         assert len(result_small.encode()) <= len(result_large.encode()), (
             f"smaller budget produced longer output: {len(result_small)} vs {len(result_large)}"
         )
@@ -207,8 +207,8 @@ class TestBinarySearchShrink:
         repo_map = self._build_shrinkable_map()
         # 20 files × ~30 bytes each ≈ 150 approx tokens; budget 200 fits all,
         # budget 5 fits at most one line.
-        result_all = leerie.rank_repo_map(repo_map, [], [], 200)
-        result_few = leerie.rank_repo_map(repo_map, [], [], 5)
+        result_all = leerie._rank_repo_map(repo_map, [], [], 200)
+        result_few = leerie._rank_repo_map(repo_map, [], [], 5)
         files_all = _ranked_files(result_all)
         files_few = _ranked_files(result_few)
         assert len(files_few) < len(files_all), (
@@ -221,7 +221,7 @@ class TestBinarySearchShrink:
         budgets = [5, 15, 30, 100, 500]
         prev_len = -1
         for budget in budgets:
-            result = leerie.rank_repo_map(repo_map, [], [], budget)
+            result = leerie._rank_repo_map(repo_map, [], [], budget)
             cur_len = len(result.encode())
             assert cur_len >= prev_len, (
                 f"output shrank as budget grew from {budgets[budgets.index(budget) - 1]}"
@@ -232,7 +232,7 @@ class TestBinarySearchShrink:
     def test_tight_budget_respects_limit(self, leerie):
         """A 1-token budget yields empty or a single very-short entry."""
         repo_map = self._build_shrinkable_map()
-        result = leerie.rank_repo_map(repo_map, [], [], 1)
+        result = leerie._rank_repo_map(repo_map, [], [], 1)
         approx = max(1, len(result.encode()) // 4)
         assert approx <= 1, f"1-token budget exceeded: {approx} approx tokens"
 
@@ -240,7 +240,7 @@ class TestBinarySearchShrink:
         """A map with one file either fits the budget or returns empty string."""
         repo_map = {"files": {"solo.py": ["fn_a", "fn_b"]}, "refs": {}}
         for budget in (1, 2, 5, 10, 100):
-            result = leerie.rank_repo_map(repo_map, [], [], budget)
+            result = leerie._rank_repo_map(repo_map, [], [], budget)
             approx = max(1, len(result.encode()) // 4)
             assert approx <= budget or result == "", (
                 f"budget {budget} violated: approx_tokens={approx}, result={result!r}"

@@ -39,6 +39,20 @@ _PROTOCOL = {"__getattr__", "__del__", "__init__", "__enter__", "__exit__",
              "__aenter__", "__aexit__", "__repr__", "__str__", "__eq__",
              "__hash__", "__iter__", "__next__", "__len__", "__contains__"}
 
+# Deliberately uncalled from Python, with a documented reason. Keep this tiny
+# and make every entry justify itself — the whole point of the sweep is that
+# an unused helper reads as live control flow.
+_INTENTIONALLY_UNCALLED = {
+    # A parity anchor, not dead code: `scripts/new-worktree.sh` and
+    # `scripts/integrate.sh` build the same `leerie/subtasks/<run-id>/<sid>`
+    # string, and this helper exists so that shape is grep-able from Python
+    # and any future Python call site goes through one function. Its own
+    # docstring says so, and `tests/test_branch_namespaces_dont_collide.py`
+    # asserts the Python and bash forms agree. Deleting it would remove the
+    # anchor that test checks against.
+    "_compute_subtask_branch",
+}
+
 
 @pytest.fixture(scope="module")
 def tree() -> ast.Module:
@@ -66,13 +80,26 @@ def test_no_private_module_level_function_is_unreferenced(tree: ast.Module):
 
     A *public* name is API surface: `run_rebaser` is invoked from
     `scripts/host-finalize.sh`, `run_recapture_deps` from the launcher's
-    `config --recapture` arm, and `compose_pr_body` /
-    `compute_subtask_branch` / `resolve_token_probe_cache_sec` from bash or
-    the test suite. None is referenced inside `leerie.py` itself, so a
-    module-scoped scan calls all five dead — which is why this checks only
-    the underscore-prefixed helpers. All three functions the audit removed
-    were private, and privacy is exactly the claim "nothing outside this
-    file calls me"."""
+    `config --recapture` arm, and `compose_pr_body` from bash. None is
+    referenced inside `leerie.py` itself, so a module-scoped scan would call
+    them dead — which is why this checks only the underscore-prefixed
+    helpers. Privacy is exactly the claim "nothing outside this file calls
+    me".
+
+    This docstring previously also listed `compute_subtask_branch` and
+    `resolve_token_probe_cache_sec` as bash-called. That was wrong — neither
+    had any caller outside this repo's tests. Renaming both private brought
+    them under this sweep, which caught them immediately:
+
+    - `resolve_token_probe_cache_sec` was a genuine wiring bug — nothing
+      called it, so its documented `LEERIE_TOKEN_PROBE_CACHE_SEC` env var and
+      `leerie.toml` key silently did nothing. It is now wired, and back to
+      being **public**: it belongs to the `resolve_*` cap-resolver family
+      alongside 41 public siblings, so privatising it was itself an
+      over-application (see
+      `test_helper_naming_convention.py::test_caps_wiring_uses_public_resolvers`).
+    - `_compute_subtask_branch` is a deliberate parity anchor, now in
+      `_INTENTIONALLY_UNCALLED`."""
     defined = {
         n.name: n.lineno
         for n in tree.body                       # module level only
@@ -83,6 +110,7 @@ def test_no_private_module_level_function_is_unreferenced(tree: ast.Module):
     dead = sorted(
         (ln, nm) for nm, ln in defined.items()
         if nm not in used and nm not in _PROTOCOL
+        and nm not in _INTENTIONALLY_UNCALLED
     )
     assert not dead, (
         "these functions are defined but never referenced anywhere in "

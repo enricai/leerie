@@ -8,7 +8,7 @@ Covers:
   - `_build_size_retry_prompt` builder (names offenders, surfaces
     provides/requires/depends_on, includes the decomposition rule,
     re-appends the original user prompt).
-  - `validate_plan` error wording switches between "planner" and
+  - `_validate_plan` error wording switches between "planner" and
     "reconciler" based on the `_added_by_reconciler` flag.
 
 Integration testing of the async retry loop in `phase_reconcile` is
@@ -62,7 +62,7 @@ def test_find_oversized_empty_when_no_subtasks(leerie):
 def test_find_oversized_ignores_planner_authored_large(leerie):
     """A planner-authored `size: large` subtask is NOT caught by the
     size gate — the size gate only runs against reconciler-added
-    subtasks. The planner case is the responsibility of `validate_plan`
+    subtasks. The planner case is the responsibility of `_validate_plan`
     (the post-merge backstop). This boundary is load-bearing: the size
     gate's revert mechanism only knows how to revert the reconciler's
     mutations, not planner output."""
@@ -187,7 +187,7 @@ def test_size_retry_prompt_marks_no_provides_as_smell(leerie):
 
 
 # ---------------------------------------------------------------------------
-# validate_plan error-message wording (the "D" fix)
+# _validate_plan error-message wording (the "D" fix)
 # ---------------------------------------------------------------------------
 
 def _good_subtask(sid="feat-001", **overrides):
@@ -216,7 +216,7 @@ def test_validate_plan_large_planner_wording(leerie, capsys):
     behavior, regression guard)."""
     plan = {"feat-001": _good_subtask("feat-001", size="large")}
     with pytest.raises(SystemExit):
-        leerie.validate_plan(plan)
+        leerie._validate_plan(plan)
     err = capsys.readouterr().err
     assert "feat-001: size='large'" in err
     assert "planner must split it further" in err
@@ -232,7 +232,7 @@ def test_validate_plan_large_reconciler_wording(leerie, capsys):
     s["_added_by_reconciler"] = True
     plan = {"feat-011": s}
     with pytest.raises(SystemExit):
-        leerie.validate_plan(plan)
+        leerie._validate_plan(plan)
     err = capsys.readouterr().err
     assert "feat-011: size='large'" in err
     assert "reconciler must split it further" in err

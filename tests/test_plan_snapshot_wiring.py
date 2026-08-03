@@ -2,9 +2,9 @@
 
 `plan_snapshot` exists for exactly one reason: to persist the scheduled plan
 *before* the two gates that `die()` — `check_budget_feasibility` and
-`validate_plan`. A run that trips either gate loses the planner / fit_judge /
-splitter spend entirely otherwise, because `write_plan` never runs (observed:
-a real run died at `validate_plan` and its `state.json` had no plan key at all).
+`_validate_plan`. A run that trips either gate loses the planner / fit_judge /
+splitter spend entirely otherwise, because `_write_plan` never runs (observed:
+a real run died at `_validate_plan` and its `state.json` had no plan key at all).
 
 That guarantee is pure ordering, so a refactor moving the `st.save()` below
 either gate would void the feature with a green suite. Source-coupling is the
@@ -34,7 +34,7 @@ def _phases_src(leerie) -> str:
 
 
 class TestSnapshotPrecedesTheDieGates:
-    """The whole point of the field: written after schedule(), before the
+    """The whole point of the field: written after _schedule(), before the
     gates that can terminate the run."""
 
     def test_snapshot_is_written_in_run_phases(self, leerie):
@@ -42,8 +42,8 @@ class TestSnapshotPrecedesTheDieGates:
         assert 'st.data["plan_snapshot"]' in src, (
             "_run_phases must capture the scheduled plan into "
             'st.data["plan_snapshot"] — without it a die() at '
-            "check_budget_feasibility / validate_plan discards the entire "
-            "planning spend (write_plan never runs)."
+            "check_budget_feasibility / _validate_plan discards the entire "
+            "planning spend (_write_plan never runs)."
         )
 
     def test_snapshot_is_saved(self, leerie):
@@ -59,14 +59,14 @@ class TestSnapshotPrecedesTheDieGates:
         )
 
     def test_snapshot_follows_schedule(self, leerie):
-        """It captures schedule()'s output, so it cannot precede the call."""
+        """It captures _schedule()'s output, so it cannot precede the call."""
         src = _phases_src(leerie)
-        sched = src.find("subtasks, waves = schedule(plans)")
+        sched = src.find("subtasks, waves = _schedule(plans)")
         snap = src.find('st.data["plan_snapshot"]')
-        assert sched != -1, "_run_phases must call schedule(plans)"
+        assert sched != -1, "_run_phases must call _schedule(plans)"
         assert snap != -1
         assert sched < snap, (
-            "plan_snapshot must be captured AFTER schedule() returns — it "
+            "plan_snapshot must be captured AFTER _schedule() returns — it "
             "records that call's subtasks/waves."
         )
 
@@ -83,31 +83,31 @@ class TestSnapshotPrecedesTheDieGates:
         )
 
     def test_snapshot_precedes_validate_plan_gate(self, leerie):
-        """validate_plan die()s — the gate that killed the reported run."""
+        """_validate_plan die()s — the gate that killed the reported run."""
         src = _phases_src(leerie)
         snap = src.find('st.data["plan_snapshot"]')
-        gate = src.find("validate_plan(subtasks)")
-        assert gate != -1, "_run_phases must call validate_plan(subtasks)"
+        gate = src.find("_validate_plan(subtasks)")
+        assert gate != -1, "_run_phases must call _validate_plan(subtasks)"
         assert snap < gate, (
-            "plan_snapshot must be captured BEFORE validate_plan — that gate "
+            "plan_snapshot must be captured BEFORE _validate_plan — that gate "
             "die()s on a dangling depends_on, and without the snapshot the "
             "whole planning spend is unrecoverable (the reported failure)."
         )
 
     def test_snapshot_is_not_write_plan(self, leerie):
-        """Deliberately not write_plan(): that also emits per-subtask spec
+        """Deliberately not _write_plan(): that also emits per-subtask spec
         files and seeds the execution scaffolding, which would make a failed
         run look half-executable. The snapshot must land strictly earlier.
 
-        Matches the real call site, not the bare substring — `write_plan(`
+        Matches the real call site, not the bare substring — `_write_plan(`
         also appears in the surrounding comments that explain this ordering.
         """
         src = _phases_src(leerie)
         snap = src.find('st.data["plan_snapshot"]')
-        wp = src.find("write_plan(leerie_dir, task, st, subtasks, waves)")
-        assert wp != -1, "_run_phases must call write_plan with the real plan"
+        wp = src.find("_write_plan(leerie_dir, task, st, subtasks, waves)")
+        assert wp != -1, "_run_phases must call _write_plan with the real plan"
         assert snap < wp, (
-            "plan_snapshot must precede write_plan — it is the cheap "
+            "plan_snapshot must precede _write_plan — it is the cheap "
             "diagnostic capture, not a substitute for the real plan write."
         )
 

@@ -1,4 +1,4 @@
-"""Tests for filter_satisfied_subtasks() — the phase-3 per-subtask
+"""Tests for _filter_satisfied_subtasks() — the phase-3 per-subtask
 already-satisfied gate (DESIGN §8 *Already-satisfied subtask elimination*).
 
 Covers:
@@ -94,9 +94,9 @@ def test_satisfied_subtask_dropped_and_recorded(leerie, tmp_path, monkeypatch):
                      "checked": ["a.py"]},
         "feat-002": {"satisfied": False, "evidence": "missing"},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
-    # not all dropped → None (proceed to schedule)
+    # not all dropped → None (proceed to _schedule)
     assert res is None
     surviving = [s["id"] for s in plans[0]["subtasks"]]
     assert surviving == ["feat-002"]
@@ -115,7 +115,7 @@ def test_unsatisfied_all_survive_no_drop_key(leerie, tmp_path, monkeypatch):
         "feat-001": {"satisfied": False, "evidence": "x"},
         "feat-002": {"satisfied": False, "evidence": "y"},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     assert len(plans[0]["subtasks"]) == 2
@@ -137,7 +137,7 @@ def test_all_satisfied_returns_no_work_map(leerie, tmp_path, monkeypatch):
         "feat-001": {"satisfied": True, "evidence": "done"},
         "feat-002": {"satisfied": True, "evidence": "done"},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is not None
     assert "feature-implementation" in res
@@ -150,8 +150,8 @@ def test_all_satisfied_returns_no_work_map(leerie, tmp_path, monkeypatch):
 def test_blocked_empty_plan_does_not_route_no_work(leerie, tmp_path,
                                                    monkeypatch):
     # A ready plan fully dropped, but another plan is blocked with 0
-    # subtasks → must NOT route to no-work (blocked must reach schedule's
-    # all-blocked die). Mirrors detect_no_work's ready-only guard.
+    # subtasks → must NOT route to no-work (blocked must reach _schedule's
+    # all-blocked die). Mirrors _detect_no_work's ready-only guard.
     st = _make_state(leerie, tmp_path / "run")
     plans = [
         {"domain": "feature-implementation", "status": "ready",
@@ -160,7 +160,7 @@ def test_blocked_empty_plan_does_not_route_no_work(leerie, tmp_path,
     ]
     _patch_probe(leerie, monkeypatch,
                  {"feat-001": {"satisfied": True, "evidence": "done"}})
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None  # blocked plan present → no no-work route
 
@@ -179,7 +179,7 @@ def test_skip_flag_short_circuits(leerie, tmp_path, monkeypatch):
         raise AssertionError("probe must not be spawned when skip is set")
     monkeypatch.setattr(leerie, "claude_p", boom)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     assert len(plans[0]["subtasks"]) == 1
@@ -195,7 +195,7 @@ def test_no_criteria_subtask_never_probed(leerie, tmp_path, monkeypatch):
         raise AssertionError("subtask with blank criteria must not be probed")
     monkeypatch.setattr(leerie, "claude_p", boom)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     assert len(plans[0]["subtasks"]) == 1
@@ -209,7 +209,7 @@ def test_probe_crash_fails_safe_keeps_subtask(leerie, tmp_path, monkeypatch):
         "feat-001": "CRASH",
         "feat-002": {"satisfied": True, "evidence": "done"},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     surviving = [s["id"] for s in plans[0]["subtasks"]]
@@ -244,7 +244,7 @@ def test_probe_payload_carries_surviving_siblings_excluding_self(
         return {"satisfied": False, "evidence": "n/a"}
     monkeypatch.setattr(leerie, "claude_p", capturing_claude_p)
 
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
 
     # Each probe sees the OTHER subtask as a surviving sibling, never itself.
@@ -276,7 +276,7 @@ def test_sibling_invalidation_verdict_keeps_the_dropped_test(
                      "evidence": "feat-001 adds keys this parity test guards"},
         "feat-001": {"satisfied": False, "evidence": "keys missing"},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     surviving = [s["id"] for s in plans[0]["subtasks"]]
@@ -287,7 +287,7 @@ def test_sibling_invalidation_verdict_keeps_the_dropped_test(
 def test_budget_exhaustion_propagates_not_swallowed(leerie, tmp_path,
                                                     monkeypatch):
     """bump_workers' WorkerError (budget exhaustion) is the hard backstop —
-    it must propagate OUT of filter_satisfied_subtasks, NOT be swallowed by
+    it must propagate OUT of _filter_satisfied_subtasks, NOT be swallowed by
     the probe-crash fail-safe. Otherwise a run past its worker budget would
     silently continue. (Contrast: a claude_p crash IS caught → subtask
     survives.)"""
@@ -303,7 +303,7 @@ def test_budget_exhaustion_propagates_not_swallowed(leerie, tmp_path,
     monkeypatch.setattr(leerie, "claude_p", unreached)
 
     with pytest.raises(leerie.WorkerError):
-        _run(leerie.filter_satisfied_subtasks(
+        _run(leerie._filter_satisfied_subtasks(
             plans, tmp_path, st, caps, _MODELS, _EFFORTS))
     # No drops recorded — the run aborts rather than silently keeping/dropping.
     assert "dropped_subtasks" not in st.data
@@ -361,8 +361,8 @@ def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
     """A dropped id can no longer satisfy any dependent, so inbound
     `depends_on` references to it must be pruned.
 
-    Without the prune this is a live crash: schedule() drops the edge
-    silently and validate_plan then die()s the run — the reported failure,
+    Without the prune this is a live crash: _schedule() drops the edge
+    silently and _validate_plan then die()s the run — the reported failure,
     reachable via this filter independently of the recursion.
     """
     st = _make_state(leerie, tmp_path / "run")
@@ -376,7 +376,7 @@ def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
         "feat-001": {"satisfied": True, "evidence": "merged by sibling PR",
                      "checked": ["a.py"]},
     })
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
 
@@ -389,7 +389,7 @@ def test_dropped_subtask_dep_is_pruned(leerie, tmp_path, monkeypatch):
     # The non-dropped dep survives; only the dropped id is removed.
     assert by_id["feat-003"]["depends_on"] == ["feat-002"]
 
-    # No dangling edge survives to validate_plan.
+    # No dangling edge survives to _validate_plan.
     assert not [d for s in surv
                 for d in (s.get("depends_on") or []) if d not in ids]
 
@@ -408,11 +408,11 @@ def test_validate_plan_survives_a_satisfied_drop(leerie, tmp_path, monkeypatch):
     _patch_probe(leerie, monkeypatch, {
         "feat-001": {"satisfied": True, "evidence": "done", "checked": []},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
 
     surv = plans[0]["subtasks"]
-    leerie.validate_plan({s["id"]: s for s in surv})   # must not die()
+    leerie._validate_plan({s["id"]: s for s in surv})   # must not die()
 
 
 def _req(*tags):
@@ -424,7 +424,7 @@ def test_dropped_provider_orphans_requires_tag_is_pruned(
     """Regression: the sibling-service 2026-07-17 failure. A consolidation subtask
     `requires` a tag provided ONLY by a dropped subtask; the drop must prune
     that inbound `requires` (the tag channel), not just `depends_on` (the id
-    channel). Without the tag prune validate_plan die()s with
+    channel). Without the tag prune _validate_plan die()s with
     `requires 'X' but nothing provides it` — after the full planner spend.
     """
     st = _make_state(leerie, tmp_path / "run")
@@ -440,7 +440,7 @@ def test_dropped_provider_orphans_requires_tag_is_pruned(
         "docs-002": {"satisfied": True, "evidence": "section already on disk",
                      "checked": ["docs/audit-findings.md"]},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
 
     surv = plans[0]["subtasks"]
@@ -451,7 +451,7 @@ def test_dropped_provider_orphans_requires_tag_is_pruned(
     tags = [r["tag"] for r in by_id["docs-010"]["requires"]]
     assert tags == ["a1"], tags
     # end-to-end: the gate that killed the run must now pass
-    leerie.validate_plan({s["id"]: s for s in surv})
+    leerie._validate_plan({s["id"]: s for s in surv})
 
 
 def test_requires_tag_with_surviving_provider_is_kept(
@@ -468,17 +468,17 @@ def test_requires_tag_with_surviving_provider_is_kept(
     _patch_probe(leerie, monkeypatch, {
         "docs-002": {"satisfied": True, "evidence": "dup", "checked": []},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     by_id = {s["id"]: s for s in plans[0]["subtasks"]}
     assert [r["tag"] for r in by_id["docs-010"]["requires"]] == ["shared"]
-    leerie.validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
+    leerie._validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
 
 
 def test_never_provided_requires_tag_is_not_masked(
         leerie, tmp_path, monkeypatch):
     """A `requires` tag no subtask ever provided is a genuine planner error;
-    the drop's tag-prune must NOT swallow it — validate_plan must still die()
+    the drop's tag-prune must NOT swallow it — _validate_plan must still die()
     on it. Guards against a naive 'prune any requires-tag not in surviving
     provides' implementation."""
     st = _make_state(leerie, tmp_path / "run")
@@ -492,15 +492,15 @@ def test_never_provided_requires_tag_is_not_masked(
     _patch_probe(leerie, monkeypatch, {
         "docs-002": {"satisfied": True, "evidence": "x", "checked": []},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
     by_id = {s["id"]: s for s in plans[0]["subtasks"]}
     # the never-provided tag is preserved (a1 kept too — it has a surviving provider)
     tags = sorted(r["tag"] for r in by_id["docs-010"]["requires"])
     assert tags == ["a1", "never-provided-by-anyone"], tags
-    # and validate_plan STILL flags the genuine error
+    # and _validate_plan STILL flags the genuine error
     with pytest.raises(SystemExit):
-        leerie.validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
+        leerie._validate_plan({s["id"]: s for s in plans[0]["subtasks"]})
 
 
 def test_cross_plan_surviving_provider_keeps_requires_tag(
@@ -510,7 +510,7 @@ def test_cross_plan_surviving_provider_keeps_requires_tag(
     from another plan.
 
     Capability tags are cross-domain (DESIGN §5): `requires` in plan A can be
-    satisfied by `provides` in plan B, and validate_plan checks provider
+    satisfied by `provides` in plan B, and _validate_plan checks provider
     existence globally over the merged plan. A per-plan prune would wrongly drop
     the tag because it only sees plan A's provides. The prune must operate over
     all plans at once.
@@ -530,7 +530,7 @@ def test_cross_plan_surviving_provider_keeps_requires_tag(
     _patch_probe(leerie, monkeypatch, {
         "bugfix-001": {"satisfied": True, "evidence": "dup provider", "checked": []},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
 
     by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
@@ -538,7 +538,7 @@ def test_cross_plan_surviving_provider_keeps_requires_tag(
     assert [r["tag"] for r in by_id["bugfix-002"]["requires"]] == ["shared"]
     # end-to-end over the merged plan
     merged = {s["id"]: s for p in plans for s in p["subtasks"]}
-    leerie.validate_plan(merged)   # must not die()
+    leerie._validate_plan(merged)   # must not die()
 
 
 def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
@@ -548,7 +548,7 @@ def test_no_drop_leaves_deps_untouched(leerie, tmp_path, monkeypatch):
               "subtasks": [_sub("feat-001"),
                            _sub("feat-002", depends_on=["feat-001"])]}]
     _patch_probe(leerie, monkeypatch, {})     # all unsatisfied
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS))
 
     surv = plans[0]["subtasks"]
@@ -595,7 +595,7 @@ def test_cache_hit_skips_semaphore_and_claude_p(leerie, tmp_path, monkeypatch):
         raise AssertionError("claude_p must not be called on a cache hit")
     monkeypatch.setattr(leerie, "claude_p", unreached)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     surviving = [s["id"] for s in plans[0]["subtasks"]]
@@ -618,7 +618,7 @@ def test_verdicts_persisted_for_both_outcomes(leerie, tmp_path, monkeypatch):
                      "checked": ["a.py"]},
         "feat-002": {"satisfied": False, "evidence": "not yet"},
     })
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     cache = st.data["satisfied_probe_cache"]
@@ -642,7 +642,7 @@ def test_crash_path_writes_no_cache_entry(leerie, tmp_path, monkeypatch):
     plans = [{"domain": "d", "status": "ready",
               "subtasks": [_sub("feat-001")]}]
     _patch_probe(leerie, monkeypatch, {"feat-001": "CRASH"})
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
     assert "feat-001" not in st.data.get("satisfied_probe_cache", {})
 
@@ -669,7 +669,7 @@ def test_stale_sha_invalidates_cache_and_reprobes(leerie, tmp_path,
         return {"satisfied": False, "evidence": "fresh probe result"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     assert called["count"] == 1, "stale-sha cache entry must trigger a re-probe"
@@ -702,7 +702,7 @@ def test_resume_reprobes_only_uncached_subtasks(leerie, tmp_path,
         return {"satisfied": False, "evidence": "probed after resume"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
     assert res is None
     # Only the two uncached subtasks trigger a fresh claude_p call.

@@ -1,4 +1,4 @@
-"""Tests for `detect_recipe_from_lockfiles` — the deterministic table
+"""Tests for `_detect_recipe_from_lockfiles` — the deterministic table
 that maps lockfile presence in a repo root to install commands.
 
 Verified shape (DESIGN §6½, IMPLEMENTATION §6½):
@@ -42,7 +42,7 @@ def test_single_lockfile_matches(leerie, tmp_path, files, expected_argv0):
     """Each lockfile alone produces a one-entry recipe with the documented
     argv[0]."""
     _make_files(tmp_path, files)
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert len(recipe) == 1
     assert recipe[0]["command"][0] == expected_argv0[0]
     assert recipe[0]["working_dir"] == "."
@@ -54,7 +54,7 @@ def test_pnpm_wins_over_yarn(leerie, tmp_path):
     presence of both lockfiles usually means a left-behind yarn artifact
     from a prior tool, and the most-specific match wins."""
     _make_files(tmp_path, ["pnpm-lock.yaml", "yarn.lock"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert len(recipe) == 1
     assert recipe[0]["command"][0] == "pnpm"
 
@@ -62,7 +62,7 @@ def test_pnpm_wins_over_yarn(leerie, tmp_path):
 def test_pnpm_wins_over_npm(leerie, tmp_path):
     """Same precedence rule against package-lock.json."""
     _make_files(tmp_path, ["pnpm-lock.yaml", "package-lock.json"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert len(recipe) == 1
     assert recipe[0]["command"][0] == "pnpm"
 
@@ -70,7 +70,7 @@ def test_pnpm_wins_over_npm(leerie, tmp_path):
 def test_yarn_wins_over_npm(leerie, tmp_path):
     """Without pnpm-lock.yaml, yarn beats npm."""
     _make_files(tmp_path, ["yarn.lock", "package-lock.json"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert len(recipe) == 1
     assert recipe[0]["command"][0] == "yarn"
 
@@ -80,7 +80,7 @@ def test_polyglot_rails_with_frontend(leerie, tmp_path):
     BOTH Gemfile.lock and yarn.lock at root must emit BOTH installs,
     not just the first match."""
     _make_files(tmp_path, ["Gemfile.lock", "yarn.lock"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     argv0 = {entry["command"][0] for entry in recipe}
     assert argv0 == {"bundle", "yarn"}
 
@@ -88,7 +88,7 @@ def test_polyglot_rails_with_frontend(leerie, tmp_path):
 def test_polyglot_go_plus_node(leerie, tmp_path):
     """Another polyglot shape: Go backend + JS frontend."""
     _make_files(tmp_path, ["go.mod", "go.sum", "pnpm-lock.yaml"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     argv0 = {entry["command"][0] for entry in recipe}
     assert argv0 == {"go", "pnpm"}
 
@@ -107,7 +107,7 @@ def test_table_abstains(leerie, tmp_path, files):
     """The deterministic table returns an empty list (caller falls back
     to LLM) for ambiguous or unsupported shapes."""
     _make_files(tmp_path, files)
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert recipe == []
 
 
@@ -115,7 +115,7 @@ def test_uv_wins_over_poetry(leerie, tmp_path):
     """A repo with both uv.lock and poetry.lock picks uv (verified
     pattern from FastAPI-style projects in transition)."""
     _make_files(tmp_path, ["uv.lock", "poetry.lock"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     assert len(recipe) == 1
     assert recipe[0]["command"][0] == "uv"
 
@@ -124,7 +124,7 @@ def test_python_lockfile_does_not_trigger_node(leerie, tmp_path):
     """Sanity: a Python-only repo doesn't accidentally emit Node
     install commands."""
     _make_files(tmp_path, ["uv.lock", "pyproject.toml"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     argv0 = {entry["command"][0] for entry in recipe}
     assert argv0 == {"uv"}
 
@@ -133,7 +133,7 @@ def test_recipe_entries_have_required_fields(leerie, tmp_path):
     """Every entry must carry kind, command, working_dir, timeout_s —
     matching the schema in SCHEMAS["provision"]."""
     _make_files(tmp_path, ["pnpm-lock.yaml"])
-    recipe = leerie.detect_recipe_from_lockfiles(tmp_path)
+    recipe = leerie._detect_recipe_from_lockfiles(tmp_path)
     for entry in recipe:
         assert entry["kind"] in ("install", "build", "none")
         assert isinstance(entry["command"], list)

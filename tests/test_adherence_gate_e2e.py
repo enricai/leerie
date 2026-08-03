@@ -7,7 +7,7 @@ runs, see the plan writeup) turned on:
 
 1. Incident shape: a prescribed procedure whose commands no subtask runs
    ⇒ the gate fires and routes to a re-plan before the plan would ever
-   reach schedule()/phase_execute.
+   reach _schedule()/phase_execute.
 2. Ordinary shape: a goal-only task with no prescribed procedure ⇒ the
    gate short-circuits with zero extra judge/re-plan spend.
 
@@ -204,7 +204,7 @@ class TestAdherenceGateEndToEnd:
             bad_plans, _INCIDENT_TASK, st, _caps(leerie), _MODELS, _EFFORTS))
 
         # The gate must have actually re-planned — i.e. it did NOT let the
-        # incident-shaped plan fall through to schedule()/phase_execute
+        # incident-shaped plan fall through to _schedule()/phase_execute
         # unchanged.
         assert len(replan_calls) == 1, (
             "the gate must re-plan exactly once when the incident shape "
@@ -216,7 +216,7 @@ class TestAdherenceGateEndToEnd:
         )
         assert result == good_plans, (
             "the gate must return the re-planned (now-compliant) plan, "
-            "ready for schedule()"
+            "ready for _schedule()"
         )
         # The re-planned result is itself clean under the deterministic
         # floor — confirms the gate converged on a plan that actually

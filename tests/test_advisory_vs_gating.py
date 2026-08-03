@@ -17,18 +17,18 @@ class TestConformerConfidenceIsAdvisory:
     independent `solution_defects` axis does."""
 
     def test_conformance_axis_is_advisory_in_settle_subtask(self, leerie):
-        """settle_subtask gates on actionable_solution_defects, not on the
+        """_settle_subtask gates on _actionable_solution_defects, not on the
         conformer's confidence.conformance self-score."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         # The gating branch keys on solution_defects, not on a conformance
         # confidence number.
-        assert "actionable_solution_defects(conf_res)" in src
+        assert "_actionable_solution_defects(conf_res)" in src
         assert 'conf_res.get("confidence")' not in src
 
     def test_actionable_filter_requires_concrete_case(self, leerie):
         """The gate cannot fire on a self-assertable/vague signal — a defect
         must carry a concrete_case AND where, or it is dropped."""
-        src = inspect.getsource(leerie.actionable_solution_defects)
+        src = inspect.getsource(leerie._actionable_solution_defects)
         assert "concrete_case" in src
         assert "where" in src
 
@@ -139,11 +139,11 @@ class TestDemotedSelfScoresDoNotGate:
         assert not any("LOW_CONFIDENCE" in i for i in issues)
 
     def test_implementer_self_score_gate_is_gone(self, leerie):
-        """settle_subtask no longer runs the root_cause/solution self-score
+        """_settle_subtask no longer runs the root_cause/solution self-score
         gate — the conformer solution_defects axis is authoritative. The old
         '_confidence_axes_clear' call and 'confidence gate not cleared' log
-        must be absent from settle_subtask."""
-        src = inspect.getsource(leerie.settle_subtask)
+        must be absent from _settle_subtask."""
+        src = inspect.getsource(leerie._settle_subtask)
         assert "_confidence_axes_clear" not in src
         assert "confidence gate not cleared" not in src
 

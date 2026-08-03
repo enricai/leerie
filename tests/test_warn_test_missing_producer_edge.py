@@ -1,4 +1,4 @@
-"""Tests for `warn_test_subtask_missing_producer_edge` (DESIGN §5) — the
+"""Tests for `_warn_test_subtask_missing_producer_edge` (DESIGN §5) — the
 advisory that flags a `test-`-domain subtask declaring no cross-subtask edge
 while the plan has producing subtasks.
 
@@ -22,7 +22,7 @@ def _warn_out(leerie, capsys, plans) -> str:
     """Run the warn and return everything it printed. `log()` prints to stdout
     (not stdlib logging), so capsys — not caplog — is the capture channel."""
     capsys.readouterr()  # clear
-    leerie.warn_test_subtask_missing_producer_edge(plans)
+    leerie._warn_test_subtask_missing_producer_edge(plans)
     return capsys.readouterr().out
 
 

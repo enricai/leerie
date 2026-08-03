@@ -23,7 +23,7 @@ splits of a single file).
 
 The cycle trial is load-bearing rather than defensive. A well-formed but WRONG
 edge was measured closing a dependency cycle across an entire 13-subtask plan,
-which `schedule()` then die()s on — so an unguarded repair would convert a
+which `_schedule()` then die()s on — so an unguarded repair would convert a
 survivable planning defect into a dead run. `test_cycling_edge_is_skipped`
 is the pin for that.
 """
@@ -100,18 +100,18 @@ def test_repairs_the_incident_shape(leerie):
 def test_repaired_plan_schedules_producers_before_consumer(leerie):
     plans = _incident_plan()
     leerie._repair_missing_requires(plans, INCIDENT_DEFECTS)
-    subtasks, waves = leerie.schedule(plans)
+    subtasks, waves = leerie._schedule(plans)
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     assert pos["test-002"] < pos["refactor-005"]
     assert pos["test-003"] < pos["refactor-005"]
     assert not leerie.check_plan_wiring(subtasks)
-    leerie.validate_plan(subtasks)
+    leerie._validate_plan(subtasks)
 
 
 def test_unrepaired_plan_races_the_consumer(leerie):
     """Anti-vacuity control: without the repair the consumer shares a wave
     with the producers it is supposed to run after."""
-    subtasks, waves = leerie.schedule(_incident_plan())
+    subtasks, waves = leerie._schedule(_incident_plan())
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     assert pos["refactor-005"] <= pos["test-002"]
 
@@ -162,12 +162,12 @@ def test_id_channel_repairs_via_depends_on(leerie):
 
 
 def test_id_channel_orders_the_producer_first(leerie):
-    """The repair is worthless if the added edge does not actually schedule
+    """The repair is worthless if the added edge does not actually _schedule
     the consumer behind the subtask it names."""
     plans = _plans(("testing", [_sub("test-001"), _sub("feat-001")]))
     leerie._repair_missing_requires(
         plans, [_defect("test-001", "feat-001")])
-    _subtasks, waves = leerie.schedule(copy.deepcopy(plans))
+    _subtasks, waves = leerie._schedule(copy.deepcopy(plans))
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     assert pos["feat-001"] < pos["test-001"]
 
@@ -255,7 +255,7 @@ def test_single_cluster_fanout_orders_behind_every_member(leerie):
         ]),
     )
     leerie._repair_missing_requires(plans, [_defect("test-001", "baked")])
-    _subtasks, waves = leerie.schedule(copy.deepcopy(plans))
+    _subtasks, waves = leerie._schedule(copy.deepcopy(plans))
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     for member in ("feat-001-r1", "feat-001-r2", "feat-001-r3"):
         assert pos[member] < pos["test-001"]
@@ -384,15 +384,15 @@ def test_cycling_edge_is_skipped_not_applied(leerie):
 
 def test_plan_still_schedules_after_a_skipped_cycle(leerie):
     """The proof that skipping matters: applying the edge would make
-    schedule() die, so an unguarded repair kills an otherwise-live run."""
+    _schedule() die, so an unguarded repair kills an otherwise-live run."""
     plans = _cycle_plan()
     leerie._repair_missing_requires(plans, [_defect("a-001", "from-b")])
-    subtasks, waves = leerie.schedule(plans)
+    subtasks, waves = leerie._schedule(plans)
     assert len(subtasks) == 2
     forced = _cycle_plan()
     leerie._add_requires_edge(forced, "a-001", "from-b")
     with pytest.raises(SystemExit):
-        leerie.schedule(forced)
+        leerie._schedule(forced)
 
 
 def test_cycle_trials_are_cumulative(leerie):
@@ -405,7 +405,7 @@ def test_cycle_trials_are_cumulative(leerie):
     ]))
     repairs, _ = leerie._repair_missing_requires(
         plans, [_defect("a-001", "from-b"), _defect("b-001", "from-c")])
-    subtasks, _waves = leerie.schedule(plans)
+    subtasks, _waves = leerie._schedule(plans)
     assert len(subtasks) == 3, "the applied set must leave an acyclic graph"
     assert len(repairs) <= 2
 
@@ -457,7 +457,7 @@ def test_gate_repairs_then_passes_and_records(leerie, monkeypatch, tmp_path):
     assert out is plans
     assert [r["sid"] for r in st.data["wiring_gate"]["repairs"]] == \
         ["refactor-005", "refactor-005"]
-    subtasks, waves = leerie.schedule(plans)
+    subtasks, waves = leerie._schedule(plans)
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     assert pos["test-002"] < pos["refactor-005"]
 
@@ -483,15 +483,15 @@ def test_gate_still_dies_on_unrepairable(leerie, monkeypatch):
 def test_caller_reschedules_when_repairs_land(leerie):
     """Source-coupling pin: the added edges change the wave partition, so
     `_run_phases` must re-derive subtasks/waves and rewrite plan_snapshot —
-    otherwise the budget preflight, check_plan_wiring, validate_plan and
-    write_plan all operate on the pre-repair schedule."""
+    otherwise the budget preflight, check_plan_wiring, _validate_plan and
+    _write_plan all operate on the pre-repair _schedule."""
     import inspect
     src = inspect.getsource(leerie._run_phases)
     gate = src.index("await phase_wiring_gate(")
     tail = src[gate:gate + 1200]
     assert '"repairs"' in tail, (
         "_run_phases must branch on the gate's repairs list")
-    assert "schedule(plans)" in tail, "it must re-run schedule() after a repair"
+    assert "_schedule(plans)" in tail, "it must re-run _schedule() after a repair"
     assert 'st.data["plan_snapshot"]' in tail, (
         "and rewrite plan_snapshot so a later resume rehydrates the repaired "
         "wave partition")

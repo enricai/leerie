@@ -1,7 +1,7 @@
 """Tests for _format_owned_region_section() (DESIGN §5½ (P1) *Sub-file*).
 
 The sub-file splitter gives each region child an `owned_region` field on its
-on-disk spec; run_implementer surfaces it as an OWNED_REGION prompt section so
+on-disk spec; _run_implementer surfaces it as an OWNED_REGION prompt section so
 the implementer stays inside its line range. These tests cover the deterministic
 render: None when there is no region, the rendered section when there is, and
 graceful degrade on a missing/corrupt spec (mirrors test_artifact_passing.py's

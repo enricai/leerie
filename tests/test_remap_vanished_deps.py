@@ -1,7 +1,7 @@
 """Unit tests for `_remap_vanished_deps` (DESIGN §5 *Id-vanishing operations*).
 
 The helper is the single mechanism behind all four id-vanishing call sites:
-`recursive_decompose` (intra-generation), `phase_plan` (cross-subtask), and the
+`_recursive_decompose` (intra-generation), `phase_plan` (cross-subtask), and the
 two phase-3 soft-drop filters. Fan-out (a parent becomes N leaves) and prune (a
 drop maps to `[]`) are the same operation over the mapping.
 """
@@ -108,7 +108,7 @@ class TestSelfReference:
     """The `repl != sid` guard.
 
     Dead code on every reachable input — a leaf can only fan back to itself if
-    a subtask declares `depends_on` on its own parent, and `schedule()` already
+    a subtask declares `depends_on` on its own parent, and `_schedule()` already
     die()s on a self-edge before recursion runs. Retained to match
     `_apply_overlap_merge`'s discipline; pinned here so a future caller that
     *can* reach it keeps the guarantee.

@@ -1,14 +1,14 @@
 """Tests for the implementer completeness gate (DESIGN §9 *The one gating
 axis: solution completeness*): the conformer's gating `solution_defects` axis
-routed through settle_subtask (per-subtask retry/block) and
-run_final_conformance (whole-tree die), both INDEPENDENT of --strict-conformer.
+routed through _settle_subtask (per-subtask retry/block) and
+_run_final_conformance (whole-tree die), both INDEPENDENT of --strict-conformer.
 
-- Tier 1: source-coupling wiring pins for the settle_subtask seam (the retry
+- Tier 1: source-coupling wiring pins for the _settle_subtask seam (the retry
   branch is deep inside a large function driving real implementers, so its
   wiring is pinned by source inspection, per the discipline used in
   test_dep_capture_wiring.py). The decision predicate itself
-  (actionable_solution_defects) is unit-tested in test_solution_defects.py.
-- Tier 2: behavioral tests of run_final_conformance's independent-of-strict
+  (_actionable_solution_defects) is unit-tested in test_solution_defects.py.
+- Tier 2: behavioral tests of _run_final_conformance's independent-of-strict
   solution_defects die, using a real staging worktree.
 """
 from __future__ import annotations
@@ -22,64 +22,64 @@ from pathlib import Path
 import pytest
 
 
-# === Tier 1: settle_subtask source-coupling ================================
+# === Tier 1: _settle_subtask source-coupling ================================
 
 class TestSettleSubtaskWiring:
     def test_calls_actionable_solution_defects(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
-        assert "actionable_solution_defects(conf_res)" in src
+        src = inspect.getsource(leerie._settle_subtask)
+        assert "_actionable_solution_defects(conf_res)" in src
 
     def test_gates_on_completeness_retry_rounds_cap(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         assert 'completeness_retry_rounds' in src
 
     def test_retry_sets_continuation_and_note(self, leerie):
         """A found defect re-drives the implementer: continuation=True, a
         note carrying the defects, in_progress status, and continue."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         # locate the completeness block
-        block = src[src.index("actionable_solution_defects(conf_res)"):]
+        block = src[src.index("_actionable_solution_defects(conf_res)"):]
         assert "continuation = True" in block
         assert "_format_solution_defects(" in block
         assert '"in_progress"' in block
         assert "continue" in block
 
     def test_exhaustion_returns_blocked(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
-        block = src[src.index("actionable_solution_defects(conf_res)"):]
+        src = inspect.getsource(leerie._settle_subtask)
+        block = src[src.index("_actionable_solution_defects(conf_res)"):]
         assert '"status": "blocked"' in block
 
     def test_completeness_retries_counter_is_separate(self, leerie):
         """The counter must be distinct from confidence/failed/continuation
         budgets (a self-graded axis borrowing another budget is the bug this
         change removes)."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         assert "completeness_retries = 0" in src
 
     def test_gate_precedes_strict_blocked_reason(self, leerie):
         """The completeness gate (independent of strict) must run before the
         strict-conformer blocked_reason return, so it is not preempted."""
-        src = inspect.getsource(leerie.settle_subtask)
-        i_gate = src.index("actionable_solution_defects(conf_res)")
+        src = inspect.getsource(leerie._settle_subtask)
+        i_gate = src.index("_actionable_solution_defects(conf_res)")
         i_blocked = src.index("if blocked_reason:")
         assert i_gate < i_blocked
 
 
 class TestFinalConformanceWiring:
     def test_final_uses_actionable_solution_defects(self, leerie):
-        src = inspect.getsource(leerie.run_final_conformance)
-        assert "actionable_solution_defects(last_res)" in src
+        src = inspect.getsource(leerie._run_final_conformance)
+        assert "_actionable_solution_defects(last_res)" in src
 
     def test_final_dies_on_defects_independent_of_strict(self, leerie):
         """final_defects must die() outside the strict_conformer guard."""
-        src = inspect.getsource(leerie.run_final_conformance)
+        src = inspect.getsource(leerie._run_final_conformance)
         assert "final_defects" in src
         # The die on final_defects must not be gated on strict_conformer.
         block = src[src.index("final_defects ="):]
         assert "if final_defects:" in block
 
 
-# === Tier 2: run_final_conformance behavioral ==============================
+# === Tier 2: _run_final_conformance behavioral ==============================
 
 def _run(cmd, cwd, check=True):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -165,7 +165,7 @@ def test_final_defects_die_even_without_strict(env):
         "where": "src.py:10", "why_ships_a_defect": "crashes",
     }]))
     with pytest.raises(SystemExit):
-        asyncio.run(c.run_final_conformance(
+        asyncio.run(c._run_final_conformance(
             env["run_dir"], env["st"], env["caps"], env["models"],
             env["efforts"]))
 
@@ -173,7 +173,7 @@ def test_final_defects_die_even_without_strict(env):
 def test_final_clean_passes(env):
     c = env["leerie"]
     _stub_claude_p(c, _clean_final())
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"], env["efforts"]))
     final = (env["st"].data.get("conformance") or {}).get("_final")
     assert final is not None
@@ -187,7 +187,7 @@ def test_final_vague_defect_does_not_die(env):
         "kind": "unhandled_input", "concrete_case": "",
         "where": "src.py:10", "why_ships_a_defect": "vague",
     }]))
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"], env["efforts"]))
     final = (env["st"].data.get("conformance") or {}).get("_final")
     assert final["blocked"] is False
@@ -204,7 +204,7 @@ def test_skip_completeness_check_demotes_final_gate(env):
         "where": "src.py:10", "why_ships_a_defect": "crashes",
     }]))
     # No SystemExit despite an actionable defect.
-    asyncio.run(c.run_final_conformance(
+    asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"], env["efforts"]))
     final = (env["st"].data.get("conformance") or {}).get("_final")
     assert final["blocked"] is False
@@ -213,9 +213,9 @@ def test_skip_completeness_check_demotes_final_gate(env):
 
 class TestSkipWiring:
     def test_settle_subtask_honors_skip_flag(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         assert 'skip_completeness_check' in src
 
     def test_final_conformance_honors_skip_flag(self, leerie):
-        src = inspect.getsource(leerie.run_final_conformance)
+        src = inspect.getsource(leerie._run_final_conformance)
         assert 'skip_completeness_check' in src

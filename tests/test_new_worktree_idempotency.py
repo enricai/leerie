@@ -62,7 +62,7 @@ def test_orphaned_dir_without_registration_is_reclaimed(tmp_path: Path) -> None:
 
     The failure this pins: a partial cleanup deregisters the worktree but
     leaves the directory on disk. `git worktree add` then refuses with
-    "fatal: '<path>' already exists" and `run_implementer` raises, killing
+    "fatal: '<path>' already exists" and `_run_implementer` raises, killing
     the whole run. Neither `git worktree prune` (only drops entries whose
     dir is *gone*) nor `--force` (overrides branch-checked-out and
     path-*missing*, not path-present) recovers it — only removing the

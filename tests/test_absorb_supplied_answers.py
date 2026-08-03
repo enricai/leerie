@@ -1,8 +1,8 @@
-"""Tests for absorb_supplied_answers().
+"""Tests for _absorb_supplied_answers().
 
 This helper closes the load-bearing P5-1 bug: prior to its addition,
 `--resume --answers FILE` silently dropped the answers file because
-the resume branch of orchestrate() never read `args.answers`. The
+the resume branch of _orchestrate() never read `args.answers`. The
 documented user flow for a non-interactive deferred-question exit
 (Phase-1 classifier OR §11 mid-execution clarification) is:
 
@@ -73,14 +73,14 @@ def test_noop_when_no_answers_arg(leerie, state, leerie_dir):
     """The helper is safe to call on every run; with --answers unset
     it's a no-op."""
     before = dict(state.data["answers"])
-    leerie.absorb_supplied_answers(_args(None), state, leerie_dir)
+    leerie._absorb_supplied_answers(_args(None), state, leerie_dir)
     assert state.data["answers"] == before
 
 
 def test_merges_supplied_into_state(leerie, state, leerie_dir, tmp_path):
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"new-q2": "fresh value"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
     assert state.data["answers"]["new-q2"] == "fresh value"
     # Existing keys are preserved — this is a merge, not a replace.
@@ -93,7 +93,7 @@ def test_supplied_overrides_existing(leerie, state, leerie_dir, tmp_path):
     fresh answers on resume."""
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"existing-q1": "corrected"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
     assert state.data["answers"]["existing-q1"] == "corrected"
 
@@ -103,7 +103,7 @@ def test_state_is_persisted_to_disk(leerie, state, leerie_dir, tmp_path):
     re-spawned implementer reads from the persisted state.json."""
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"q": "value"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
     on_disk = json.loads((leerie_dir / "state.json").read_text())
     assert on_disk["answers"]["q"] == "value"
@@ -127,7 +127,7 @@ def test_existing_subtask_specs_get_updated(leerie, state, leerie_dir,
 
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"new-q2": "fresh"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
 
     updated = json.loads(spec_path.read_text())
@@ -148,7 +148,7 @@ def test_spec_propagation_iterates_all_specs(leerie, state, leerie_dir,
 
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"q": "v"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
 
     for sid in ("a-1", "b-2", "c-3"):
@@ -167,7 +167,7 @@ def test_corrupted_spec_does_not_abort(leerie, state, leerie_dir,
 
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"q": "v"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
 
     good = json.loads((sub_dir / "good.json").read_text())
@@ -191,7 +191,7 @@ def test_handles_missing_subtasks_directory(leerie, tmp_path):
     st.save()
     answers_file = tmp_path / "answers.json"
     answers_file.write_text(json.dumps({"q": "v"}))
-    leerie.absorb_supplied_answers(_args(str(answers_file)), st, st.run_dir)
+    leerie._absorb_supplied_answers(_args(str(answers_file)), st, st.run_dir)
     assert st.data["answers"]["q"] == "v"
 
 
@@ -199,7 +199,7 @@ def test_handles_missing_subtasks_directory(leerie, tmp_path):
 
 def test_missing_file_dies(leerie, state, leerie_dir, capsys):
     with pytest.raises(SystemExit) as exc:
-        leerie.absorb_supplied_answers(
+        leerie._absorb_supplied_answers(
             _args("/nonexistent/path.json"), state, leerie_dir)
     assert exc.value.code != 0
     err = capsys.readouterr().err
@@ -210,7 +210,7 @@ def test_invalid_json_dies(leerie, state, leerie_dir, tmp_path, capsys):
     answers_file = tmp_path / "bad.json"
     answers_file.write_text("not valid {{{")
     with pytest.raises(SystemExit) as exc:
-        leerie.absorb_supplied_answers(
+        leerie._absorb_supplied_answers(
             _args(str(answers_file)), state, leerie_dir)
     assert exc.value.code != 0
     err = capsys.readouterr().err
@@ -224,7 +224,7 @@ def test_non_object_json_dies(leerie, state, leerie_dir, tmp_path, capsys):
     answers_file = tmp_path / "array.json"
     answers_file.write_text(json.dumps(["a", "b"]))
     with pytest.raises(SystemExit) as exc:
-        leerie.absorb_supplied_answers(
+        leerie._absorb_supplied_answers(
             _args(str(answers_file)), state, leerie_dir)
     assert exc.value.code != 0
     err = capsys.readouterr().err
@@ -239,7 +239,7 @@ def test_bad_source_of_truth_value_dies(leerie, state, leerie_dir,
     answers_file = tmp_path / "bad-sot.json"
     answers_file.write_text(json.dumps({"source_of_truth": "neither"}))
     with pytest.raises(SystemExit) as exc:
-        leerie.absorb_supplied_answers(
+        leerie._absorb_supplied_answers(
             _args(str(answers_file)), state, leerie_dir)
     assert exc.value.code != 0
     err = capsys.readouterr().err
@@ -251,7 +251,7 @@ def test_valid_source_of_truth_accepted(leerie, state, leerie_dir,
     answers_file = tmp_path / "sot.json"
     answers_file.write_text(json.dumps({"source_of_truth": "research",
                                          "q1": "a"}))
-    leerie.absorb_supplied_answers(
+    leerie._absorb_supplied_answers(
         _args(str(answers_file)), state, leerie_dir)
     assert state.data["answers"]["source_of_truth"] == "research"
     assert state.data["answers"]["q1"] == "a"

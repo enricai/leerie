@@ -1,10 +1,10 @@
 """A worktree-creation failure must fail ONE subtask, not the whole run.
 
-`run_implementer` raises `WorkerError` when `new-worktree.sh` returns
+`_run_implementer` raises `WorkerError` when `new-worktree.sh` returns
 nonzero (e.g. an orphaned worktree dir makes `git worktree add` refuse).
-Its own `except WorkerError` guard wraps only `claude_p`, so a `run_script`
-failure escapes it. Left uncaught in `settle_subtask` it reaches
-`gather_or_cancel`, which cancels the wave and takes down the entire run —
+Its own `except WorkerError` guard wraps only `claude_p`, so a `_run_script`
+failure escapes it. Left uncaught in `_settle_subtask` it reaches
+`_gather_or_cancel`, which cancels the wave and takes down the entire run —
 discarding every sibling's committed work and skipping finalize.
 
 That contradicts DESIGN §3 *Partial-wave integration*, where a wave collects
@@ -17,7 +17,7 @@ continuation path, hit `fatal: '<path>' already exists`, and killed a run
 that had two subtasks' worth of correct committed work.
 
 The `env` fixture is reused from test_oom_naming — it builds a real git repo
-plus a `.leerie` run dir and State, which is exactly the ground settle_subtask
+plus a `.leerie` run dir and State, which is exactly the ground _settle_subtask
 needs.
 """
 from __future__ import annotations
@@ -28,25 +28,25 @@ from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
 
 def _stub_raising_run_implementer(leerie_mod, monkeypatch, calls):
-    """Patch run_implementer to raise the exact WorkerError that
-    `run_script("new-worktree.sh", ...)` produces on a nonzero rc."""
+    """Patch _run_implementer to raise the exact WorkerError that
+    `_run_script("new-worktree.sh", ...)` produces on a nonzero rc."""
     async def _stub(sid_, leerie_dir, caps, st, models, efforts,
                     continuation=False, note=""):
         calls.append(sid_)
         raise leerie_mod.WorkerError(
             f"worktree creation failed for {sid_}: "
             f"fatal: '/leerie-state/runs/r/worktrees/{sid_}' already exists")
-    monkeypatch.setattr(leerie_mod, "run_implementer", _stub)
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)
 
 
 def _settle(leerie_mod, env):
-    return asyncio.run(leerie_mod.settle_subtask(
+    return asyncio.run(leerie_mod._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
         env["models"], env["efforts"]))
 
 
 def test_worktree_failure_returns_failed_instead_of_raising(env, monkeypatch):  # noqa: F811
-    """settle_subtask returns a `failed` result; the WorkerError must not
+    """_settle_subtask returns a `failed` result; the WorkerError must not
     escape to the wave runner (which would kill the run)."""
     leerie_mod = env["leerie"]
     calls: list[str] = []
@@ -54,7 +54,7 @@ def test_worktree_failure_returns_failed_instead_of_raising(env, monkeypatch):  
 
     res = _settle(leerie_mod, env)
 
-    assert res is not None, "settle_subtask must return a result, not raise"
+    assert res is not None, "_settle_subtask must return a result, not raise"
     assert res["status"] == "failed", f"expected a failed result, got {res!r}"
     assert "worktree creation failed" in res["summary"], (
         "the diagnosis must survive into the result so the operator can see "

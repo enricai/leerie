@@ -1,4 +1,4 @@
-"""Pin Fix-B's diagnostics payoff end-to-end through `settle_subtask`.
+"""Pin Fix-B's diagnostics payoff end-to-end through `_settle_subtask`.
 
 Background (bugfix-003 handoff doc, DESIGN §6 *Detecting memory OOM*): a
 worker running a build/test command that overshoots its cgroup's
@@ -6,14 +6,14 @@ worker running a build/test command that overshoots its cgroup's
 result event, no checkpoint. `_invoke`'s no-envelope path already names
 this (`tests/test_invoke_streaming.py`) by probing the cgroup's
 `oom_kill` counter and raising a `WorkerError` that carries the offending
-command and the memory cap. `run_implementer` catches that `WorkerError`
+command and the memory cap. `_run_implementer` catches that `WorkerError`
 and folds its message into `res["summary"]` on a synthesized
 `status="incomplete-handoff"` envelope with a checkpoint_path that was
 never written.
 
 This file pins the NEXT seam: once that envelope reaches
-`settle_subtask`, `validate_result` tags it `empty_handoff` (generic
-"checkpoint ... does not exist" text) — but `settle_subtask` must prefer
+`_settle_subtask`, `_validate_result` tags it `empty_handoff` (generic
+"checkpoint ... does not exist" text) — but `_settle_subtask` must prefer
 the worker's named OOM summary over that generic message, on both of its
 empty_handoff branches (the has-commits rescue and the no-commits fail
 path), so the operator sees the named cause instead of a cryptic
@@ -44,7 +44,7 @@ def _run(cmd, cwd, check=True):
 
 # The named-OOM message _invoke would have produced (see
 # test_invoke_streaming.py::test_invoke_names_memory_oom_on_no_envelope) —
-# threaded through run_implementer's `except WorkerError` catch into
+# threaded through _run_implementer's `except WorkerError` catch into
 # `res["summary"]` on the synthesized incomplete-handoff envelope.
 _OOM_SUMMARY = (
     "worker produced no schema-valid result: worker cfg-002 was "
@@ -109,10 +109,10 @@ def env(leerie, tmp_path):
 
 def _stub_named_oom_handoff(leerie_mod, sid, run_dir, monkeypatch,
                              summary=_OOM_SUMMARY):
-    """Patch run_implementer to return the exact shape `run_implementer`'s
+    """Patch _run_implementer to return the exact shape `_run_implementer`'s
     `except WorkerError` arm synthesizes: status='incomplete-handoff'
     with a checkpoint_path that was never written (empty_handoff once
-    validate_result sees it) and the named-OOM text as `summary`."""
+    _validate_result sees it) and the named-OOM text as `summary`."""
     async def _stub(sid_, leerie_dir, caps, st, models, efforts,
                     continuation=False, note=""):
         return {
@@ -121,14 +121,14 @@ def _stub_named_oom_handoff(leerie_mod, sid, run_dir, monkeypatch,
             "checkpoint_path": str(run_dir / "checkpoints" / f"{sid_}.md"),
             "summary": summary,
         }
-    monkeypatch.setattr(leerie_mod, "run_implementer", _stub)
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)
 
 
 def _stub_healthy_no_op_handoff(leerie_mod, monkeypatch):
     """A session-limit no-op empty_handoff with NO named cause — mirrors
-    the ordinary WorkerError message run_implementer synthesizes when
+    the ordinary WorkerError message _run_implementer synthesizes when
     _cgroup_stat's oom_kill was 0 (or containment was off), i.e. the
-    pre-existing generic path validate_result's `message` covers."""
+    pre-existing generic path _validate_result's `message` covers."""
     async def _stub(sid_, leerie_dir, caps, st, models, efforts,
                     continuation=False, note=""):
         return {
@@ -138,7 +138,7 @@ def _stub_healthy_no_op_handoff(leerie_mod, monkeypatch):
             "summary": "worker produced no schema-valid result: "
                        "claude -p produced no result event (stderr: (empty))",
         }
-    monkeypatch.setattr(leerie_mod, "run_implementer", _stub)
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)
 
 
 # --- oom_kill > 0: the operator sees the named cause, not the cryptic ------
@@ -146,15 +146,15 @@ def _stub_healthy_no_op_handoff(leerie_mod, monkeypatch):
 # and has-commits rescue path).
 
 def test_no_commits_empty_handoff_surfaces_named_oom(env, monkeypatch):
-    """No committed work on the subtask branch -> settle_subtask's
+    """No committed work on the subtask branch -> _settle_subtask's
     empty_handoff `fail()` path. The terminal `failed` result's summary
     must be the worker's named-OOM diagnostic (command + memory cap),
-    not validate_result's generic 'checkpoint_path ... does not exist'
+    not _validate_result's generic 'checkpoint_path ... does not exist'
     text, and must point the operator at the remediation flags."""
     c = env["leerie"]
     _stub_named_oom_handoff(c, env["sid"], env["run_dir"], monkeypatch)
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
         env["models"], env["efforts"]))
 
@@ -171,7 +171,7 @@ def test_no_commits_empty_handoff_surfaces_named_oom(env, monkeypatch):
 
 
 def test_has_commits_empty_handoff_rescue_logs_named_oom(env, monkeypatch, capsys):
-    """Committed work IS present -> settle_subtask's rescue branch (keeps
+    """Committed work IS present -> _settle_subtask's rescue branch (keeps
     the diff, settles as `complete`). The rescue log line must still
     prefer the named-OOM summary over the generic checkpoint message —
     same operator-facing naming guarantee applies on this branch too."""
@@ -179,14 +179,14 @@ def test_has_commits_empty_handoff_rescue_logs_named_oom(env, monkeypatch, capsy
     _stub_named_oom_handoff(c, env["sid"], env["run_dir"], monkeypatch)
 
     # Give the subtask branch a commit ahead of the run branch, so
-    # branch_has_commits_ahead is True and the rescue branch fires
+    # _branch_has_commits_ahead is True and the rescue branch fires
     # instead of fail().
     (env["worktree"] / "src.py").write_text("def f():\n    pass\n")
     _run(["git", "add", "-A"], cwd=env["worktree"])
     _run(["git", "commit", "-q", "-m", "implementer: add f()"],
          cwd=env["worktree"])
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
         env["models"], env["efforts"]))
 
@@ -205,12 +205,12 @@ def test_has_commits_empty_handoff_rescue_logs_named_oom(env, monkeypatch, capsy
 def test_no_oom_empty_handoff_does_not_emit_oom_message(env, monkeypatch):
     """A session-limit no-op empty_handoff (no named cause from _invoke —
     the oom_kill==0 / containment-off case) must NOT be misreported as an
-    OOM. settle_subtask falls back to the ordinary message; no
+    OOM. _settle_subtask falls back to the ordinary message; no
     'OOM-killed' text is fabricated."""
     c = env["leerie"]
     _stub_healthy_no_op_handoff(c, monkeypatch)
 
-    res = asyncio.run(c.settle_subtask(
+    res = asyncio.run(c._settle_subtask(
         env["sid"], env["run_dir"], env["caps"], env["st"],
         env["models"], env["efforts"]))
 

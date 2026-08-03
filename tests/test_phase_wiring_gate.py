@@ -78,15 +78,15 @@ class TestWiring:
         src = inspect.getsource(leerie._run_phases)
         assert "await phase_wiring_gate(" in src
         assert "check_plan_wiring(" in src
-        # The deterministic check runs before validate_plan.
+        # The deterministic check runs before _validate_plan.
         i_check = src.index("check_plan_wiring(")
-        i_validate = src.index("validate_plan(subtasks)")
+        i_validate = src.index("_validate_plan(subtasks)")
         assert i_check < i_validate
 
     def test_wiring_gate_runs_after_the_drop_filters(self, leerie):
         """Regression pin (post-merge Finding C): the LLM wiring_judge must run
-        on the POST-DROP plan — after both soft-drop filters and schedule(),
-        and before validate_plan. It reads `dropped_subtasks` (populated by the
+        on the POST-DROP plan — after both soft-drop filters and _schedule(),
+        and before _validate_plan. It reads `dropped_subtasks` (populated by the
         filters) for its broken_by_drop / broken_by_merge reasoning and is told
         the plan is 'post-drop', so a pre-filter placement feeds it a plan that
         still contains to-be-dropped subtasks + an incomplete drop audit (the
@@ -94,13 +94,13 @@ class TestWiring:
         guarded the placement).
         """
         src = inspect.getsource(leerie._run_phases)
-        i_offtree = src.index("filter_offtree_subtasks(")
-        i_satisfied = src.index("await filter_satisfied_subtasks(")
-        i_schedule = src.index("schedule(plans)")
+        i_offtree = src.index("_filter_offtree_subtasks(")
+        i_satisfied = src.index("await _filter_satisfied_subtasks(")
+        i_schedule = src.index("_schedule(plans)")
         i_gate = src.index("await phase_wiring_gate(")
-        i_validate = src.index("validate_plan(subtasks)")
-        # Both drop filters + schedule() precede the gate; the gate precedes
-        # validate_plan (IMPLEMENTATION.md "3 Schedule" sequence + the
+        i_validate = src.index("_validate_plan(subtasks)")
+        # Both drop filters + _schedule() precede the gate; the gate precedes
+        # _validate_plan (IMPLEMENTATION.md "3 Schedule" sequence + the
         # phase_wiring_gate docstring + DESIGN §5).
         assert i_offtree < i_gate
         assert i_satisfied < i_gate

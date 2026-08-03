@@ -3,7 +3,7 @@
 Two layers:
 1. _check_migration_surface (intra-domain, CRITIC-enforced via
    check_planner_output) — greps for old-pattern call sites.
-2. warn_layer_gaps (cross-domain, advisory) — schema-without-seed
+2. _warn_layer_gaps (cross-domain, advisory) — schema-without-seed
    and env-provider-without-template heuristics.
 """
 from __future__ import annotations
@@ -313,7 +313,7 @@ class TestProseSignalAbsent:
             "issues on run 19a70d96")
 
 
-# --- warn_layer_gaps ------------------------------------------------------ #
+# --- _warn_layer_gaps ------------------------------------------------------ #
 
 class TestWarnLayerGaps:
     def _make_plan(self, subtasks: list[dict]) -> dict:
@@ -326,7 +326,7 @@ class TestWarnLayerGaps:
             "files_likely_touched": ["prisma/schema.prisma"],
             "provides": [],
         }])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" in captured.err or "LAYER_GAP" in captured.out
 
@@ -339,7 +339,7 @@ class TestWarnLayerGaps:
              "files_likely_touched": ["prisma/seed.ts"],
              "provides": []},
         ])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" not in captured.err
         assert "LAYER_GAP" not in captured.out
@@ -354,7 +354,7 @@ class TestWarnLayerGaps:
                  "prisma/migrations/001_add_model/migration.sql"],
              "provides": []},
         ])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" not in captured.err
         assert "LAYER_GAP" not in captured.out
@@ -365,7 +365,7 @@ class TestWarnLayerGaps:
             "files_likely_touched": ["src/lib/platform/bootstrap.ts"],
             "provides": ["superadmin-bootstrap-env-contract"],
         }])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" in captured.err or "LAYER_GAP" in captured.out
 
@@ -378,7 +378,7 @@ class TestWarnLayerGaps:
              "files_likely_touched": [".env.example"],
              "provides": []},
         ])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" not in captured.err
         assert "LAYER_GAP" not in captured.out
@@ -389,7 +389,7 @@ class TestWarnLayerGaps:
             "files_likely_touched": ["src/api/users.ts"],
             "provides": ["user-crud-api"],
         }])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" not in captured.err
         assert "LAYER_GAP" not in captured.out
@@ -400,13 +400,13 @@ class TestWarnLayerGaps:
             "files_likely_touched": ["infra/lib/app-stack.ts"],
             "provides": ["platform-secret-bundle-provisioned"],
         }])]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" in captured.err or "LAYER_GAP" in captured.out
 
     def test_no_subtasks_no_crash(self, leerie, capsys):
         plans = [{"domain": "testing", "subtasks": []}]
-        leerie.warn_layer_gaps(plans)
+        leerie._warn_layer_gaps(plans)
         captured = capsys.readouterr()
         assert "LAYER_GAP" not in captured.err
         assert "LAYER_GAP" not in captured.out

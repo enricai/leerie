@@ -357,7 +357,7 @@ local setup) because nerdctl can't reach Keychain. See
   one worker's cgroup, so high wave-level parallelism is safe. Users
   on smaller VMs can opt down.
 - `--skip-repo-map` — skip the P6 codebase structural map (DESIGN §5½ (P6)).
-  Suppresses `build_repo_map()` and the ranked subgraph injected into
+  Suppresses `_build_repo_map()` and the ranked subgraph injected into
   planner and splitter context; the planner degrades gracefully to the
   prior grep/glob-only path with no other change in behavior. Use on
   repos where tree-sitter cannot parse the primary language, or to opt
@@ -365,7 +365,7 @@ local setup) because nerdctl can't reach Keychain. See
   `skip_repo_map = true` in `leerie.toml`. Precedence: `--skip-repo-map`
   → `LEERIE_SKIP_REPO_MAP` → `leerie.toml` → default `False`. See the
   full surface (resolver function, state field) in
-  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map--build_repo_map--rank_repo_map).
+  [`IMPLEMENTATION.md`](IMPLEMENTATION.md#p6-repo-map--_build_repo_map--_rank_repo_map).
 - **P1 recursive decompose caps** — four internal defaults that bound the
   fit-judge recursion (DESIGN §5½ (P1) *Recursive judge + splitter*). These are
   not user-tunable via CLI / env / `leerie.toml`; they are listed here so

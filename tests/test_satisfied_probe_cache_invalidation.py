@@ -109,7 +109,7 @@ def test_cache_honored_while_head_unchanged(leerie, tmp_path, monkeypatch):
         raise AssertionError("claude_p must not be called on a live-sha hit")
     monkeypatch.setattr(leerie, "claude_p", unreached)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     # HEAD never moved (still sha_a) — the cached verdict is honored: the
@@ -154,7 +154,7 @@ def test_stale_satisfied_entry_reprobed_after_head_moves(
         return {"satisfied": False, "evidence": "not satisfied on new tree"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert res is None
@@ -198,7 +198,7 @@ def test_stale_unsatisfied_entry_reprobed_after_head_moves(
                 "checked": ["b.py"]}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert calls == ["satisfied_probe-feat-001"], (
@@ -236,7 +236,7 @@ def test_missing_base_sha_treated_as_miss_and_reprobed(
         return {"satisfied": False, "evidence": "freshly probed"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert calls == ["satisfied_probe-feat-001"], (
@@ -265,7 +265,7 @@ def test_malformed_base_sha_treated_as_miss_and_reprobed(
         return {"satisfied": False, "evidence": "freshly probed"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert sorted(calls) == ["satisfied_probe-feat-001",

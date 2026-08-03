@@ -1,23 +1,23 @@
-"""Pin schedule()'s determinism under a plans checkpoint round-trip.
+"""Pin _schedule()'s determinism under a plans checkpoint round-trip.
 
 The planning-resume design (see the resumable-planning-checkpoints task)
-rests on a safety-by-construction property: `schedule()` re-sorts every
+rests on a safety-by-construction property: `_schedule()` re-sorts every
 wave by subtask id (`orchestrator/leerie.py:17374`,
 `wave = sorted(sid for sid in remaining if preds[sid] <= done)`), so the
 wave partition is a pure function of the dependency graph plus
 lexicographic ids — independent of dict/set iteration order and of the
 input plan/subtask order. That means a `plans` list persisted to
 state.json and reloaded on `--resume` (a JSON round-trip) rehydrates to
-a byte-identical schedule as the original in-memory run.
+a byte-identical _schedule as the original in-memory run.
 
-This test proves the property directly against schedule() rather than
+This test proves the property directly against _schedule() rather than
 assuming it: a fresh call, a JSON-round-tripped call, and calls with
 plan order and per-plan subtask order reversed must all agree on
 `waves` and on the merged subtask id set. Removing the `sorted(...)` at
 the wave-construction line must fail this file.
 
 Pure-function property test: no state, no stubs, no async — the only
-subtask whose failure would indict schedule() itself rather than the
+subtask whose failure would indict _schedule() itself rather than the
 resume machinery built on top of it.
 """
 from __future__ import annotations
@@ -59,7 +59,7 @@ def _multi_domain_plans() -> list[dict]:
     `depends_on` would not exercise the tag-channel ordering where
     iteration-order sensitivity would most plausibly creep in.
 
-    Shape (acyclic, ≥1 subtask — schedule() die()s on cycles/empty):
+    Shape (acyclic, ≥1 subtask — _schedule() die()s on cycles/empty):
       feat-001                              (no deps)          -> wave 0
       feat-002 depends_on feat-001          (intra-domain)      -> wave 1
       bug-001  requires "feat-ready"        (cross-domain tag,  -> wave 1
@@ -103,36 +103,36 @@ def _reverse_subtask_order(plans: list[dict]) -> list[dict]:
 def test_schedule_deterministic_across_json_roundtrip_and_reordering(leerie):
     plans = _multi_domain_plans()
 
-    subtasks_fresh, waves_fresh = leerie.schedule(copy.deepcopy(plans))
+    subtasks_fresh, waves_fresh = leerie._schedule(copy.deepcopy(plans))
 
     # A JSON round-trip (exactly what a state.json checkpoint reload
-    # does) must reproduce the identical schedule.
+    # does) must reproduce the identical _schedule.
     roundtripped = json.loads(json.dumps(plans))
-    subtasks_rt, waves_rt = leerie.schedule(roundtripped)
+    subtasks_rt, waves_rt = leerie._schedule(roundtripped)
 
     # Reversing the order of the plans list itself.
     reversed_plans = list(reversed(copy.deepcopy(plans)))
-    subtasks_rev, waves_rev = leerie.schedule(reversed_plans)
+    subtasks_rev, waves_rev = leerie._schedule(reversed_plans)
 
     # Reversing each plan's subtasks list.
     reversed_subtasks = _reverse_subtask_order(plans)
-    subtasks_rev_st, waves_rev_st = leerie.schedule(reversed_subtasks)
+    subtasks_rev_st, waves_rev_st = leerie._schedule(reversed_subtasks)
 
     # Reversing both plan order AND each plan's subtask order.
     reversed_both = _reverse_subtask_order(list(reversed(
         copy.deepcopy(plans))))
-    subtasks_rev_both, waves_rev_both = leerie.schedule(reversed_both)
+    subtasks_rev_both, waves_rev_both = leerie._schedule(reversed_both)
 
     assert waves_fresh == waves_rt, (
-        "schedule() output changed across a JSON round-trip — a "
+        "_schedule() output changed across a JSON round-trip — a "
         "checkpointed-then-reloaded plans list would NOT rehydrate to "
         "the same wave partition as the fresh run")
     assert waves_fresh == waves_rev, (
-        "schedule() output is sensitive to plan input order")
+        "_schedule() output is sensitive to plan input order")
     assert waves_fresh == waves_rev_st, (
-        "schedule() output is sensitive to a plan's subtasks list order")
+        "_schedule() output is sensitive to a plan's subtasks list order")
     assert waves_fresh == waves_rev_both, (
-        "schedule() output is sensitive to combined plan/subtask reordering")
+        "_schedule() output is sensitive to combined plan/subtask reordering")
 
     # Same merged subtask id set across every variant.
     ids_fresh = set(subtasks_fresh)
@@ -151,7 +151,7 @@ def test_schedule_deterministic_across_json_roundtrip_and_reordering(leerie):
         "feat-001", "feat-002", "bug-001", "bug-002",
         "test-001", "test-002", "refactor-001",
     }
-    # Cross-domain requires edges actually constrained the schedule:
+    # Cross-domain requires edges actually constrained the _schedule:
     # bug-001 (requires feat-ready) must not precede feat-001's wave.
     wave_of = {sid: i for i, wave in enumerate(waves_fresh) for sid in wave}
     assert wave_of["bug-001"] > wave_of["feat-001"]
@@ -169,9 +169,9 @@ def test_each_wave_is_sorted(leerie):
     correct), so this must be checked directly rather than inferred
     from the round-trip test alone."""
     plans = _multi_domain_plans()
-    _subtasks, waves = leerie.schedule(plans)
+    _subtasks, waves = leerie._schedule(plans)
     for wave in waves:
         assert wave == sorted(wave), (
             f"wave {wave!r} is not lexicographically sorted — "
-            "schedule() must sort each wave by subtask id for the "
+            "_schedule() must sort each wave by subtask id for the "
             "output to be independent of dict/set iteration order")
