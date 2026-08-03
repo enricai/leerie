@@ -112,7 +112,7 @@ another project's domain model is the canonical example, on a repo where that
 symbol does not exist.
 
 Examples in a prompt must use **this repository's own symbols**
-(`gather_provision_fixtures`, `_run_checked_loop`) or an **obviously synthetic
+(`_gather_provision_fixtures`, `_run_checked_loop`) or an **obviously synthetic
 placeholder**. Never a name taken from another project — including one you
 found in a task file, a run log, or an existing test fixture. A fixture is
 contained; a prompt ships.
@@ -463,7 +463,7 @@ export LEERIE_WORKER_PIDS_MAX=4096
 ./leerie "task" --skip-budget-check
 
 # Skip the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase
-# structural map*): suppresses build_repo_map() and the ranked
+# structural map*): suppresses _build_repo_map() and the ranked
 # subgraph injection into planner/splitter context. The planner
 # degrades gracefully to the prior grep/glob-only path. Use on repos
 # where tree-sitter cannot parse the primary language, or to opt out
@@ -663,7 +663,7 @@ totals exactly; what breaks is *two suites at once*, not parallelism itself.
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,
 `gather_answers` validation gate, `_retryable_failure`,
-`check_merge_committed`, `validate_result`, `validate_plan`,
+`check_merge_committed`, `_validate_result`, `_validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
 `resolve_blt`)
 including a coupling test that the
@@ -721,17 +721,17 @@ present) — is tested via bash-harness subprocess tests with stubbed `git` and
 tested in two files: `tests/test_cgroup_helpers.py` covers the
 orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 `_cgroup_enroll`/`_cgroup_destroy` via a stubbed socket round-trip) and
-the fail-closed `enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
+the fail-closed `_enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
 sid validation, and v1/v2 path selection — against
 a fake cgroupfs. Memory-OOM naming (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending
-command + `memory.max`) over `validate_result`'s generic "checkpoint ...
-does not exist" text — is pinned end-to-end through `settle_subtask` in
+command + `memory.max`) over `_validate_result`'s generic "checkpoint ...
+does not exist" text — is pinned end-to-end through `_settle_subtask` in
 `tests/test_oom_naming.py`: both empty_handoff branches (the no-commits
 `fail()` path and the has-commits rescue path that keeps the diff and
 logs instead of discarding it) surface the named cause when
-`run_implementer`'s synthesized `incomplete-handoff` envelope carries one,
+`_run_implementer`'s synthesized `incomplete-handoff` envelope carries one,
 including the `--worker-memory-max` / `--max-parallel` remediation
 pointer; a healthy no-op empty_handoff (no named cause) does not
 fabricate an "OOM-killed" message. Mid-run PID reaping (DESIGN §6 *Mid-run PID reaping*) is
@@ -788,7 +788,7 @@ reaper's source contains no `/proc`/`listdir`/`_orphan_zombie_children`
 without the wiring), and `_mark_reapable` never admits an
 `_ASYNCIO_MANAGED_PIDS` member; plus a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
-that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
+that `main()` calls `_become_subreaper()` and `_orchestrate()` spawns+cancels
 `_zombie_reaper`. The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
@@ -911,7 +911,7 @@ definer, all connected before unrelated, large-graph unrelated cluster at tail);
 empty map returns `""`); `TestBinarySearchShrink` (lowering the budget yields
 shorter output and fewer files; increasing budgets yield non-decreasing lengths;
 1-token budget yields empty or a single very-short entry). Fixture is built
-directly (no `build_repo_map`) — isolates ranking. No LLM calls; deterministic.
+directly (no `_build_repo_map`) — isolates ranking. No LLM calls; deterministic.
 The P1 recursive decomposition surface (DESIGN §5½ (P1)) is tested across four
 files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
 required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
@@ -930,31 +930,31 @@ resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absen
 from `MODEL_DEFAULT_PER_WORKER` (sonnet via global `MODEL_DEFAULT` fallback); both
 in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override
 chains; isolation (override doesn't bleed to other workers); structural wiring
-guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
+guards. `tests/test_partition_files.py` is the dedicated test for `_partition_files()`:
 44 tests across parametrized invariant sweeps (input sizes 0, 1, 8, 29, 64;
 chunk-size 1, equals-n, larger-than-n, partial-last-chunk) plus named
 telemetry cases — the 29-file migration sweep and 64-file date-fns sweep that
 drove the design (LLM silently dropped 14/29; code-partition is complete by
 construction). Asserts: 100% coverage (sum of chunk lengths == len(input)),
 zero overlap (no file in two chunks), chunks bounded by chunk_size, and order
-preserved. `tests/test_recursive_decompose.py` covers `recursive_decompose()`
+preserved. `tests/test_recursive_decompose.py` covers `_recursive_decompose()`
 (well-fit subtask is a leaf at score ≥ 0.70, oversized subtask recurses then
 children are judged, depth cap terminates at `decompose_max_depth`, no-progress
 guard terminates after `decompose_noprogress_rounds`, migration path uses
-`partition_files` for the file→chunk partition and invokes the splitter only in
+`_partition_files` for the file→chunk partition and invokes the splitter only in
 label-only mode to title each chunk (distinct titles; deterministic fallback on
 splitter failure), `st.bump_workers` called before every `claude_p`, both
 `claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps`
 — the C0 regression guard), and a passed `repo_map` is re-ranked per node and
 injected into fit_judge/splitter prompts); it also carries a parallel set of
-structural `partition_files` tests for regression coverage within that file.
+structural `_partition_files` tests for regression coverage within that file.
 `tests/test_recursive_decompose_schedule.py` is the integration test for the
 seam between Layer B and the existing scheduler (DESIGN §5½ (P1) end-of-pipeline
-claim): leaf ids from `recursive_decompose` carry a valid domain prefix so
-`schedule()` cross-domain wiring and `validate_plan`'s id-prefix check both
-pass; a ready plan built from stubbed leaves feeds `schedule()` and produces
+claim): leaf ids from `_recursive_decompose` carry a valid domain prefix so
+`_schedule()` cross-domain wiring and `_validate_plan`'s id-prefix check both
+pass; a ready plan built from stubbed leaves feeds `_schedule()` and produces
 the correct topo-sorted wave partition (independent leaves in wave 0, a
-dependent leaf in wave 1); and `validate_plan` accepts the full leaf set
+dependent leaf in wave 1); and `_validate_plan` accepts the full leaf set
 without errors.
 The post-ship gap fixes are pinned in `tests/test_recursive_decompose.py`
 (C0: `test_recursive_decompose_calls_claude_p_with_full_signature` binds each
@@ -967,7 +967,7 @@ in `tests/test_check_functions.py` (G3:
 `test_low_decomposition_quality_does_not_gate`,
 `test_low_task_understanding_still_gates` — the axis is advisory, only
 `task_understanding` gates), and in `tests/test_repo_map_degrade_warning.py`
-(G6: `build_repo_map` warns exactly once per process when source files exist
+(G6: `_build_repo_map` warns exactly once per process when source files exist
 but the graph is empty, stays quiet for a non-code repo). `tests/test_repo_map.py`
 now carries a `HAS_TREESITTER` module skip gate (G4) mirroring
 `test_build_repo_map.py`.
@@ -1056,11 +1056,11 @@ citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
 well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
 `test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
 The P6 repo-map builder is pinned in two files.
-`tests/test_repo_map.py` covers `build_repo_map` (symbol/def extraction, class
+`tests/test_repo_map.py` covers `_build_repo_map` (symbol/def extraction, class
 methods, ref edges, relative-path keys, empty-repo, skip-.git/node_modules),
 the mtime cache (dir created on first use, unchanged file served from cache
 sentinel, changed file re-parsed, only-changed file re-parsed),
-`rank_repo_map` (string result, token-budget fits, seed-file/seed-symbol bias,
+`_rank_repo_map` (string result, token-budget fits, seed-file/seed-symbol bias,
 empty map, determinism, very-tight budget), `_parse_repo_file` (unsupported
 extension, markdown, python defs + refs), `_walk_calls` (bare call extracted,
 attribute call not extracted), and `_pagerank` (dangling node, personalization,
@@ -1075,17 +1075,17 @@ The P6 Layer A wiring — `phase_plan` ctx injection — is tested in
 `tests/test_phase_plan_repo_map_ctx.py`: repo-map enabled path (ctx contains
 `repo_map` string, non-empty, JSON-serializable, contains known symbol names,
 seed_files from `task_file_items` respected); skip path (ctx omits `repo_map`,
-baseline keys present, values match inputs); empty-repo degrade (`rank_repo_map`
-returns `""` → key omitted); exception-swallow degrade (`build_repo_map`
+baseline keys present, values match inputs); empty-repo degrade (`_rank_repo_map`
+returns `""` → key omitted); exception-swallow degrade (`_build_repo_map`
 raises → exception caught, ctx emitted without `repo_map`).
 The P1 Layer C wiring — `phase_plan` recursion expansion — is tested in
 `tests/test_phase_plan_recursion_wiring.py`: source-coupling guard (`phase_plan`
-source contains `recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`,
+source contains `_recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`,
 expansion loop precedes final logging); integration — one oversized subtask (stubbed
-`recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two
-first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
+`_recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two
+first-pass subtasks → `_recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
-empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
+empty-subtasks plan not touched (`_recursive_decompose` never called, subtasks stays `[]`).
 The plan-instruction-adherence gate's worker registration (schema, prompt,
 model/effort defaults) is tested in two files mirroring the
 `fit_judge`/`splitter` pair above. `tests/test_adherence_judge_schema.py` covers
@@ -1172,13 +1172,13 @@ self-report; it closes the "forgot to fill the field" case, not the
 "consistently wrong on both fields" case.
 
 The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
-gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
+gate run after `phase_overlap_judge` and before `_schedule()`/`_validate_plan`,
 composing the deterministic floor and the `adherence_judge` behind
 `_run_checked_loop` — is tested in `tests/test_phase_adherence_gate.py` (22
 tests), split into source-coupling wiring pins (floor+judge both run; a low
 result routes through the retry path via a re-invoked `phase_plan`; a
 `WorkerError` never discards the plan; the call site precedes
-`schedule()`/`validate_plan`, ordered after `phase_overlap_judge`) and
+`_schedule()`/`_validate_plan`, ordered after `phase_overlap_judge`) and
 behavioral integration tests against a stubbed `claude_p` and a stubbed
 `phase_plan` (skip-flag and not-prescribed short-circuits returning `plans`
 unchanged; a clean plan passing without a re-plan; a low-adherence round
@@ -1229,7 +1229,7 @@ channel's list-of-providers), prune (`id → []`, the drop case), empty-mapping 
 dep-absent-from-mapping pass-through (guards over-eager rewriting), dedup-after-rewrite
 and two-vanished-ids-sharing-a-successor (mirrors `_apply_overlap_merge`), and the
 `repl != sid` self-reference guard — pinned but documented as **currently dead code**:
-it is unreachable because `schedule()` already die()s on a planner self-edge
+it is unreachable because `_schedule()` already die()s on a planner self-edge
 (`feat-a → feat-a`) before recursion runs, and it is retained only to match
 `_apply_overlap_merge`'s discipline for future callers.
 `tests/test_recursive_decompose.py` covers the intra-generation remap — the seam
@@ -1240,22 +1240,22 @@ the survivor fans out to the terminal ids and the intermediate appears in no
 worker injecting sibling deps and proves `_migration_child` discards them (children keep
 the parent's `depends_on`/`provides` verbatim, so the map stays empty on the ~84% path).
 `tests/test_phase_plan_recursion_wiring.py` covers the cross-subtask remap: the reported
-regression (a sibling of an expanded parent fans out to all leaves and `validate_plan`
+regression (a sibling of an expanded parent fans out to all leaves and `_validate_plan`
 no longer die()s — the exact gate that killed a real run after full planner spend),
 a dep on an unexpanded subtask left untouched, and dedup when a sibling already names a
 leaf. `tests/test_filter_satisfied_subtasks.py` and
 `tests/test_filter_offtree_subtasks.py` cover the two phase-3 soft-drop filters, which
 vanish ids the same way: a dropped id's inbound refs pruned (non-dropped deps survive),
-`validate_plan` survives the drop end-to-end, and a no-drop run leaves `depends_on`
+`_validate_plan` survives the drop end-to-end, and a no-drop run leaves `depends_on`
 byte-identical. `tests/test_plan_snapshot_wiring.py` pins the `plan_snapshot` capture by
 source inspection (mirroring `test_dep_capture_wiring.py`): the assignment is followed
-by `st.save()`, follows `schedule()`, and precedes **both** `check_budget_feasibility`
-and `validate_plan` — the ordering *is* the feature, since a die() at either gate
-otherwise discards the whole planning spend (`write_plan` never runs); plus that it is
-deliberately not `write_plan` (which would seed execution scaffolding for a run that
+by `st.save()`, follows `_schedule()`, and precedes **both** `check_budget_feasibility`
+and `_validate_plan` — the ordering *is* the feature, since a die() at either gate
+otherwise discards the whole planning spend (`_write_plan` never runs); plus that it is
+deliberately not `_write_plan` (which would seed execution scaffolding for a run that
 cannot start) and that the payload round-trips through a real `State.save()`.
 `tests/test_decompose_snapshot.py` is `plan_snapshot`'s sibling for the D3 crash
-barrier: a `WorkerError` from `recursive_decompose`'s `fit_judge` call degrades the
+barrier: a `WorkerError` from `_recursive_decompose`'s `fit_judge` call degrades the
 node to a leaf (`[subtask]` unchanged, not dropped, not propagated) rather than
 discarding sibling subtasks' already-completed fit/split decisions. A `WorkerError`
 from the coupled-minority `splitter` call (the non-migration split path, ~70 lines
@@ -1271,10 +1271,10 @@ leaf count matches `plan["subtasks"]` (nothing silently dropped); and, mirroring
 `test_plan_snapshot_wiring.py`'s `TestSnapshotPrecedesTheDieGates`,
 `test_decompose_snapshot_precedes_the_die_gates` pins that `_run_phases` calls
 `phase_plan` (which writes the snapshot) strictly before `check_budget_feasibility`
-and `validate_plan` — the two gates that die() and would otherwise make a discarded
+and `_validate_plan` — the two gates that die() and would otherwise make a discarded
 decomposition unrecoverable.
 The safety-by-construction property the planning-resume checkpoint design rests
-on — that `schedule()` (`:17334`) re-sorts every wave by subtask id
+on — that `_schedule()` (`:17334`) re-sorts every wave by subtask id
 (`wave = sorted(...)`, `:17374`), making the wave partition a pure function of the
 dependency graph plus lexicographic ids, independent of dict/set iteration order
 and of input plan/subtask order — is pinned directly, with no state/stubs/async,
@@ -1345,8 +1345,8 @@ in-memory-only write is lost on pause/crash); each key's assignment sits
 strictly *after* its phase's call in source order — never at entry, which
 is the same "`current_phase` is stamped at entry, not completion" trap
 `plan_snapshot`'s own wiring test guards against; `plans_after_reconcile`
-precedes the `detect_no_work` short-circuit and `plans_after_filters`
-precedes both the `satisfied_no_work` short-circuit and `schedule()`, so a
+precedes the `_detect_no_work` short-circuit and `plans_after_filters`
+precedes both the `satisfied_no_work` short-circuit and `_schedule()`, so a
 run that turns out to have work is never left without its checkpoint; the
 six keys' first-occurrence source order matches pipeline order (guards
 against a correctly-individually-ordered but scrambled insertion producing
@@ -1391,11 +1391,11 @@ key-presence-not-truthiness resume-skip (an empty `recipe: []` is a valid
 completed state, not "resume must redo it"); the reported incident
 directly (`current_phase` naming the satisfied-probe sweep with a partial
 `satisfied_probe_cache` and no `plans_after_filters` resumes through to
-`write_plan` instead of dying "did not reach the scheduling phase");
+`_write_plan` instead of dying "did not reach the scheduling phase");
 post-scheduling resume falling straight through to `phase_execute`
 unchanged when `waves` is already present; budget-check resume rehydrating
 `plan_snapshot` instead of the old "Plans are not persisted" die; the
-`schedule()`-determinism guarantee end-to-end (a fresh `schedule()` call
+`_schedule()`-determinism guarantee end-to-end (a fresh `_schedule()` call
 and a checkpoint-then-resume of the same `plans` produce byte-identical
 `waves`/`subtasks`); an allowlist guard that every checkpoint key this
 consumer reads is present in `STATE_FIELDS`; that the old
@@ -1408,9 +1408,9 @@ is nothing to resume from.
 end-to-end regression lock on top of `test_resume_planning_reentry.py`'s
 per-phase stub sweep: rather than stubbing every phase to assert call
 counts, it drives `_run_phases` with only the phases upstream of
-`filter_satisfied_subtasks`/`schedule` stubbed, leaving
-`filter_satisfied_subtasks`, `schedule`, `check_budget_feasibility`, and
-`write_plan` REAL (against a real temp git repo, for the `base_sha`
+`_filter_satisfied_subtasks`/`_schedule` stubbed, leaving
+`_filter_satisfied_subtasks`, `_schedule`, `check_budget_feasibility`, and
+`_write_plan` REAL (against a real temp git repo, for the `base_sha`
 scoping `satisfied_probe_cache` needs) — so its four scenarios prove the
 fix composes end-to-end, not merely that each phase's skip-flag is
 individually wired. (a) reproduces the reported incident shape verbatim:
@@ -1424,10 +1424,10 @@ than passing vacuously. (b) reruns a real `check_budget_feasibility` twice
 against the same seeded `plan_snapshot` — once under a low
 `max_total_workers` (dies, as expected) and once under a raised cap on a
 fresh `State` reload (mirroring a real second `--resume` invocation) —
-and asserts `write_plan` runs exactly once and no upstream planning phase
+and asserts `_write_plan` runs exactly once and no upstream planning phase
 re-runs. (c) asserts a `waves`-present resume reaches `phase_execute` with
-zero calls to every planning phase, `filter_satisfied_subtasks`,
-`check_budget_feasibility`, `validate_plan`, and `write_plan`. (d) covers
+zero calls to every planning phase, `_filter_satisfied_subtasks`,
+`check_budget_feasibility`, `_validate_plan`, and `_write_plan`. (d) covers
 both early-return guards, including the case where planning checkpoints
 ARE present but `no_work_required` still wins ahead of any rehydration.
 A final grep guard (prior art `tests/test_ec2_launcher_dispatch_e2e.py`)
@@ -1484,14 +1484,14 @@ judges a sibling's still-pending work would break it). The guidance lives in
 `prompts/satisfied_probe.md`'s "A sibling's pending work can invalidate an
 already-met criterion" section, scoped explicitly to the pre-schedule call
 site (`surviving_siblings` is absent from the post-execution
-`probe_criteria_satisfied_on_head` payload, since HEAD there already reflects
+`_probe_criteria_satisfied_on_head` payload, since HEAD there already reflects
 whatever siblings committed — there is no future left to anticipate).
 The dominant real cause behind that same incident batch — a `test-`-domain
 subtask declaring no `requires`/`depends_on` edge to the feature subtask whose
 not-yet-created output it targets — is pinned in
 `tests/test_warn_test_missing_producer_edge.py`: the new
-`warn_test_subtask_missing_producer_edge` advisory (mirrors
-`warn_provider_subset_subtasks`) fires when a `test-` subtask has empty
+`_warn_test_subtask_missing_producer_edge` advisory (mirrors
+`_warn_provider_subset_subtasks`) fires when a `test-` subtask has empty
 `requires`+`depends_on` while another subtask in the plan is a producer
 (`provides` or `files_likely_touched` non-empty), and stays silent when the
 subtask declares either edge, when no other subtask is a producer, on a
@@ -1558,16 +1558,16 @@ base_sha` comparison in `probe_one` (`orchestrator/leerie.py:7402`) fails
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
-`clobbered_owned_files` against real temp git repos (legit conformer edit not
+`_clobbered_owned_files` against real temp git repos (legit conformer edit not
 flagged; revert-to-base flagged; deletion flagged; a file outside the
 implementer's owned set never flagged; a new file added not flagged; the
 load-bearing round-0 snapshot test — a per-round HEAD misses a round-0 clobber
 while the pre-loop `impl_head_sha` catches it; empty-ref no-op), `_blob_sha`'s
 present/absent contract (the missing-path returns None, guarding the bare
-`git rev-parse <ref>:<path>` footgun), `rollback_conformer_commits` actually
+`git rev-parse <ref>:<path>` footgun), `_rollback_conformer_commits` actually
 restoring clobbered implementer content and dropping the conformer commit
 (`TestRollbackRestoresClobber`), and source-coupling wiring guards that both
-`_run_conformance_phase` and `run_final_conformance` snapshot before the round
+`_run_conformance_phase` and `_run_final_conformance` snapshot before the round
 loop and call the guard under `strict_conformer`.
 `tests/test_normalize_pip_installs.py` covers `_is_pip_install` /
 `_normalize_pip_installs` (adds `--break-system-packages` to
@@ -1938,7 +1938,7 @@ callers' `is None` escalation is unchanged, the retry is bounded at exactly
 never returned as the crashed round's output.
 The integrator-crash salvage path (DESIGN §12 *salvage if there is something
 to salvage*) is tested in `tests/test_rescue_integrator_work.py` against real
-temp git repos left mid-merge. `rescue_integrator_work` captures a crashed
+temp git repos left mid-merge. `_rescue_integrator_work` captures a crashed
 integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>`
 before `git merge --abort` destroys it (verified: abort reverts a resolved
 file to its pre-merge content, leaving no stash and no reachable object). The
@@ -2260,7 +2260,7 @@ three-tier cycle ladder (`multi_drop_fanout` →
 `multi_drop_degraded_single` → `skipped_would_cycle`), since the fan-out
 *adds* graph edges and can close a cycle no individual pair would;
 sorted-survivor determinism at both the cluster-collection and
-`_apply_multidrop` layers (`schedule()` is documented deterministic, so
+`_apply_multidrop` layers (`_schedule()` is documented deterministic, so
 the plan must not depend on judge emission order); that a *legitimate*
 transitive chain still applies both drops (the guard must not
 over-suppress); and — previously **entirely unpinned**, the
@@ -2393,15 +2393,15 @@ guard has its own group because it is load-bearing rather than defensive — a
 well-formed but WRONG edge was measured closing a cycle across an entire plan,
 so `test_plan_still_schedules_after_a_skipped_cycle` asserts both that the
 skipped edge leaves a schedulable plan AND that force-applying it makes
-`schedule()` die; `test_cycle_trials_are_cumulative` pins that trials run
+`_schedule()` die; `test_cycle_trials_are_cumulative` pins that trials run
 against the plan as already mutated, so individually-safe edges cannot combine
 into a cycle. Two source-coupling guards close the loop: `_run_phases` must
-re-run `schedule()` and rewrite `plan_snapshot` when repairs land (otherwise
-the budget preflight, `check_plan_wiring`, `validate_plan` and `write_plan` all
+re-run `_schedule()` and rewrite `plan_snapshot` when repairs land (otherwise
+the budget preflight, `check_plan_wiring`, `_validate_plan` and `_write_plan` all
 see the pre-repair wave partition), and the `die()` must precede the
 `st.data["wiring_gate"]` write so a failing gate leaves no key for `--resume`
 to skip on. **Note:** widening
-`warn_test_subtask_missing_producer_edge` past its `test-` prefix was tried in
+`_warn_test_subtask_missing_producer_edge` past its `test-` prefix was tried in
 the same change and reverted — it does not catch this class. Run 6146bd2f's
 under-wired subtask declared 3 `requires` and 3 `depends_on`; it was missing
 four *specific* edges, not all of them, so the advisory's both-empty condition
@@ -2493,8 +2493,8 @@ specific ones catches a regression on exactly those and nothing else. It
 scopes to underscore-prefixed helpers because public names are API surface
 invoked from outside the module — `run_rebaser` from
 `scripts/host-finalize.sh`, `run_recapture_deps` from the launcher's
-`config --recapture` arm, `compose_pr_body` / `compute_subtask_branch` /
-`resolve_token_probe_cache_sec` from bash or tests — none of which appear
+`config --recapture` arm, `compose_pr_body` / `_compute_subtask_branch` /
+`_resolve_token_probe_cache_sec` from bash or tests — none of which appear
 as references inside `leerie.py` itself, so a module-scoped scan calls all
 five dead. It found three real ones (2026-08-01 audit), all pre-existing:
 `_confidence_issues` (IMPLEMENTATION.md had already recorded it as having
@@ -2550,7 +2550,7 @@ start-session` handler that decodes `ec2_remote_exec`'s base64-wrapped
 command and executes it with the invoking process's stdin drained
 through — the same mechanism the launcher's EC2 branch relies on to
 pipe the multi-line state-mutation Python program to the remote
-`python3 -`. `_collect_run_rows`/`list_runs` in `orchestrator/leerie.py`
+`python3 -`. `_collect_run_rows`/`_list_runs` in `orchestrator/leerie.py`
 now track an `is_ec2` axis (`ec2_instance_id` in `run.json` or
 `ec2-instance.json` present) alongside the existing `is_fly`, so
 `--list --runtime ec2` filters correctly, `--list --runtime local`
@@ -2558,7 +2558,7 @@ excludes both Fly and EC2 runs, a plain `--list` renders an EC2 run's
 status column without requiring `LEERIE_FLY_APP`, and an EC2 run is
 still detected via the `ec2-instance.json` sidecar alone when
 `run.json` doesn't exist yet. These `--list` tests exercise
-`list_runs()` directly (no launcher subprocess, no AWS stub), mirroring
+`_list_runs()` directly (no launcher subprocess, no AWS stub), mirroring
 `tests/test_list_runs.py`'s pattern.
 
 `--resume` routing a paused EC2 run through `resume_instance()` — the

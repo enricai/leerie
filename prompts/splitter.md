@@ -18,7 +18,7 @@ the orchestrator provides:
 ## Mode A — Migration sweep (pre-partitioned chunks)
 
 When `files_likely_touched` has already been partitioned into per-chunk
-lists by the orchestrator's `partition_files()` function, your job is to:
+lists by the orchestrator's `_partition_files()` function, your job is to:
 
 1. **Label each chunk** with a precise `title` and `success_criteria_seed`
    that accurately describes what implementing that file chunk entails.
