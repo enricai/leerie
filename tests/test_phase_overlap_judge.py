@@ -2330,13 +2330,23 @@ def test_multi_drop_survivor_order_is_sorted(leerie):
 
 def test_phase_overlap_judge_dies_on_unresolvable(leerie, monkeypatch,
                                                   capsys):
-    """The highest-severity silent-disable in this phase, and previously
-    unpinned: `unresolvable` is the judge's escalation for two subtasks
-    whose APIs genuinely contradict. If the die() is ever disabled, both
-    implementers ship incompatible APIs against one artifact and it
-    surfaces at integration with no trace back to phase 2¾ — the exact
-    failure this phase exists to prevent. The plan must also be left
-    unmutated: the abort has to precede any apply step."""
+    """The highest-severity silent-disable in this phase: `unresolvable` is
+    the judge's escalation for two subtasks whose APIs genuinely contradict.
+    If it is ever ignored, both implementers ship incompatible APIs against
+    one artifact and it surfaces at integration with no trace back to phase
+    2¾ — the exact failure this phase exists to prevent. The plan must also
+    be left unmutated: the abort has to precede any apply step.
+
+    **Updated for the scoped-re-plan recovery (DESIGN §5).** The FIRST
+    unresolvable verdict now re-plans the implicated domains instead of
+    dying — 5 of 43 corpus runs that reached this judge died here (12%),
+    burning 404 workers with no resume path, while the judge resolved 95.5%
+    of collisions fine. What must never be silently disabled is the
+    escalation itself, so this test now pins the **bounded** contract: with
+    `overlap_replan_done` already set — i.e. the re-plan was tried and the
+    contradiction survived it — the phase still dies, still names both
+    subtasks, and still leaves the plan unmutated.
+    `tests/test_scoped_replan.py` pins the first-verdict re-plan path."""
     # Two contributing planners: a single-planner run cheap-skips the
     # judge entirely before any collision is considered.
     plans = [
@@ -2353,7 +2363,9 @@ def test_phase_overlap_judge_dies_on_unresolvable(leerie, monkeypatch,
 
     class _St:
         def __init__(self):
-            self.data = {}
+            # Pre-set: the scoped re-plan has already been attempted, so this
+            # is the second verdict — the one that must still be terminal.
+            self.data = {"overlap_replan_done": True}
 
         def save(self):
             pass

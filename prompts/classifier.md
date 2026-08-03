@@ -194,3 +194,5 @@ object (required by schema):
 
 The orchestrator runs mechanical checks on your output and may re-invoke
 you with structured feedback if issues are found.
+
+{{include: _confidence.md}}

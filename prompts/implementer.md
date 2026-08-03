@@ -439,3 +439,5 @@ Return **only** this JSON object as your final message — no prose, no fences:
   when your subtask produces structured deliverables for downstream
   subtasks — see the "Producing artifacts for downstream subtasks"
   section above for when this applies.
+
+{{include: _confidence.md}}

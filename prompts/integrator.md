@@ -96,3 +96,5 @@ object (required by schema):
 
 The orchestrator runs mechanical checks (conflict markers, merge committed)
 and may re-invoke you with structured feedback.
+
+{{include: _confidence.md}}

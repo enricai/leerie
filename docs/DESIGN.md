@@ -553,6 +553,32 @@ intent is strictly superseded), or `unresolvable` (the intents are
 structurally contradictory and the run should die at plan time rather
 than crash at integration).
 
+**An `unresolvable` verdict re-plans before it dies.** The judge refusing to
+merge two contradictory designs is the phase working correctly — but the
+response to it was a terminal `die()` whose own message said *"this run cannot
+be resumed"*, after the entire planning spend. Measured across the corpus: 43
+runs reached this judge and **5 (12%) died here, burning 404 workers, none
+recoverable**, while the judge resolved the other 95.5% of collisions (232 of
+243) without incident. `eb1aa53e` is the shape — one collision, where one
+planner added an `ApiKey.allowedDomains` column and another explicitly refused
+to, citing a directive in a task-referenced file that the first had not
+honoured.
+
+An unresolvable collision is a verdict about the **plan**, not about the
+judge's output quality, so it should re-drive the plan — which is what every
+other gate already does on far weaker findings. It now re-plans the implicated
+domains once, with the contradiction as feedback, and dies only if the second
+verdict is still unresolvable (bounded by `overlap_replan_done`).
+
+The re-plan is **scoped**, and this gate is the only one where that is
+currently possible: a collision names `a_sid`/`b_sid`, so the implicated
+domains are mechanically derivable, whereas `coverage_gaps` and the adherence
+judge's `violations` carry no subtask reference at all. Scope is the implicated
+domains plus `replan_domain_closure` — the transitive set of domains depending
+on them across both the id and tag channels — so no surviving edge can dangle.
+Measured over 85 (domain, plan) re-plan simulations on real corpus plans:
+closure-scoped schedules and validates 85/85, naive single-domain 79/85.
+
 The artifact a collision names is very often one that does **not yet
 exist**: the canonical case is two planners that each propose to
 *create* the same component or test file. A mechanical check that
@@ -5325,6 +5351,85 @@ The conformer loop (`_run_conformance_phase`) is the original instance
 of this pattern — it loops on observable build/lint/test signals. The
 generic `_run_checked_loop` extends it to all workers.
 
+#### Findings carry a severity; only gating findings re-invoke
+
+A check function's findings are not all the same kind of thing. Some name a
+defect that makes the output **unusable** — a dependency on a subtask that
+does not exist, a cycle, a subtask with no success criteria. Others are
+**advice** about a judgement call that is frequently correct as it stands: two
+subtasks touching one file is often legitimate, and a path with no existing
+ancestor directory is exactly what a subtask that *creates* a new module looks
+like.
+
+Treating both as retry triggers is a mistake with two distinct costs, both
+measured on the 2026-08-03 runs:
+
+- **Advice cannot converge, so it burns the whole retry budget.**
+  `INTRA_DOMAIN_OVERLAP`'s own text is *"consider merging or splitting"*. It
+  went 43 → 12 → 6 across every planner in both runs and never reached zero,
+  exhausting the round cap every time — because there was frequently nothing
+  wrong to fix.
+- **Per-subtask advice turns the retry count into a proxy for plan size.**
+  Findings like `PHANTOM_PATH` fire once per offending subtask, so issue count
+  scales ~1:1 with subtask count. Since multi-sample selection ranks on fewest
+  issues, a large plan must be flawless to beat a small plan with one flaw —
+  and an *empty* plan, having nothing to inspect, scores a perfect zero. That
+  is the same defect the sample validity gate addresses at its extreme; the
+  severity split addresses the general case.
+
+So each finding declares a severity. `_run_checked_loop` re-invokes only on
+**gating** findings; **advisory** findings are surfaced once, in the returned
+warnings, without costing a round. Multi-sample selection likewise ranks on
+gating findings only, so plan size stops being a scoring penalty.
+
+**The default is gating.** A finding whose severity nobody declared keeps
+today's behaviour, so the classification can be incomplete without silently
+weakening a real gate — an advisory misfiling is a deliberate act, not an
+omission. The advisory set is an explicit allowlist for exactly this reason.
+
+This does not weaken enforcement, because advisory findings were never
+enforcing anything: a check that cannot be satisfied is not a gate, it is a
+tax on every run that trips it. Where a genuine guarantee is wanted, §12
+applies unchanged — write a real check with a satisfiable condition.
+
+**A mechanical floor is not thereby an independent one.** The same
+investigation found `check_prescribed_command_coverage` gating on
+`runs_commands`, a planner self-report field populated on **4.9%** of subtasks
+(24 of 486 across 38 plans; 74% of plans have none at all). Being pure Python
+made it deterministic, not independent — it reads a field the planner can
+simply omit, so it fires on nearly every task that prescribes a command. This
+repeats the trap already documented for `migration_targets` in §8 (*"both
+signals come from the same non-adversarial planner self-report"*). Generalised:
+a floor must either read something the planner cannot omit — the repository,
+the diff, the dependency graph — or repair the omission itself rather than
+re-driving the worker that made it.
+
+**Repairing an omitted self-report beats re-driving for it.** The floor above
+*is* satisfiable: told explicitly, planners do fill the field — run
+`d8a764f3…` went from 0 of 35 subtasks carrying `runs_commands` (8 floor
+issues) to 14 of 36 (0 issues) after its re-plan. What is wrong is the price.
+That re-plan cost ~125 of the run's 201 spawns — twice the entire first
+planning pass — and the run then died of budget exhaustion having written no
+code.
+
+leerie already holds the prescribed commands as structured classifier output,
+so `repair_prescribed_commands` synthesises a subtask that runs them, at zero
+worker cost, before the floor is evaluated. A repairable gap therefore never
+reaches the re-plan path. This is the wiring gate's *detect → repair what is
+unambiguous → re-drive only what is not* contract applied to the gate whose
+remedy was the most expensive in the system.
+
+The repair **synthesises rather than picking an owner**. Attaching the
+commands to "the subtask that owns verification" was prototyped and rejected:
+against `d8a764f3`'s real plan a verification-shaped matcher hits 32 of 36
+subtasks, so an exactly-one-owner rule would never fire and a looser one would
+attach arbitrarily. A dedicated subtask whose entire content is running the
+prescribed commands cannot be wrong about intent. It depends on the plan's
+current sinks, so it is acyclic by construction and schedules alone in the
+final wave. Validated across every corpus run carrying a prescribed procedure:
+5 of 5 repaired to a clean floor with `schedule()` and `validate_plan()`
+passing, 3 already-clean runs correctly untouched.
+
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
@@ -6217,6 +6322,26 @@ feasibility check at this point can estimate the remaining cost
 (implementer + conformer per subtask, integrator per wave, finalize)
 with no free variables beyond the per-subtask call multiplier, which
 is well-bounded empirically.
+
+**A re-plan needs its own preflight.** The gate above runs *once*, after
+`schedule()`. But a gate that re-plans (`phase_adherence_gate`,
+`phase_planning_coverage_gate`) authorises the single largest budget event
+in a run, and did so with no budget check at all. A re-plan is also far more
+expensive than "re-running the planners": `phase_plan` re-runs the entire P1
+decomposition behind them, and that decomposition is the larger half.
+Measured on run `d8a764f3…`, `fit_judge` was 118 of 201 spawns (59%) against
+the planners' 62 (31%), and the adherence-gate re-plan cost ~125 of 201 —
+almost twice the entire first planning pass, against a subtask set the
+re-plan itself had inflated 35 → 65. The run then died of budget exhaustion
+mid-decomposition, having written no code and produced nothing recoverable.
+
+So `check_replan_affordable` runs before each re-plan, projecting the
+re-plan's cost from the domain count and the *already-known* subtask count
+(the decomposition term dominates, so subtask count is what it scales on) and
+`die()`ing early when it cannot fit. Dying at the gate costs nothing and names
+the real cause; dying at worker 200 costs the whole run. It honours the same
+`skip_budget_check` opt-out, and `State.bump_workers()` remains the
+load-bearing backstop either way.
 
 **Why the gate cannot move earlier, even though the satisfied-probe
 spends first.** The probe runs before `schedule()`, so its per-subtask

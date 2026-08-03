@@ -2275,6 +2275,32 @@ complete — two workers logging at the same wall-clock instant agree on
 the count instead of carrying frozen snapshots from their respective
 spawn moments.
 
+#### Rejected-payload diagnostic
+
+`_read_stream` latches the input of every `StructuredOutput` tool_use into
+`last_structured_payload` (rendered by `_format_payload_for_log`, capped at
+`_REJECTED_PAYLOAD_LOG_MAX = 4000` chars, degrading to `repr` if
+`json.dumps` raises — a diagnostic must never kill the run it is explaining).
+When a subsequent tool_result is an errored **schema** rejection —
+`_is_schema_rejection`, matching `does not match required schema` or
+`inputvalidationerror` case-insensitively — the latched payload is logged
+beside the rejection, then cleared so a later unrelated failure cannot
+re-print a stale payload.
+
+Emitted at every verbosity (it is a failure diagnostic, not per-event
+activity). The gate is deliberately narrow: an ordinary tool failure (a
+failing test, a missing file) must never drag an unrelated structured payload
+into the log beside it.
+
+Why this exists: the rejection text names the offending fields but never
+echoes what was submitted, and the payload lives in a preceding event the
+error text cannot reach — so the commonest worker failure signature was
+undiagnosable from a log. The `InputValidationError` (unparseable JSON) path
+already logged its payload; this closes the gap for the parseable-but-invalid
+case. Recovering these by hand under `--output-format stream-json` is what
+disproved the 2026-08-03 investigation's leading hypothesis about their cause.
+Pinned by `tests/test_rejected_payload_logging.py`.
+
 Resolution order (highest priority first):
 
 1. **`--verbosity LEVEL`** CLI flag, values `quiet` / `normal` /
@@ -4544,14 +4570,55 @@ regardless of `make_feedback_prompt`.
 
 | Function | Purpose |
 |----------|---------|
-| `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. Oscillation guard aborts a round only when its issue-signature set is EXACTLY EQUAL to an earlier round's — a proper subset (fewer, still-open issues) is genuine partial progress and is allowed to keep retrying (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). |
+| `replan_domain_closure(plans, targets)` | Domains that must be re-planned together with `targets` — the transitive closure of domains depending on them across BOTH the id (`depends_on`) and tag (`requires`→`provides`) channels. A re-plan vanishes every id the domain used, so any other domain holding an edge into it would dangle; re-planning the whole closure makes that vacuous rather than merely checked. Domains are subtask-id prefixes. Measured over 85 (domain, plan) simulations on real corpus plans: closure-scoped schedules and validates 85/85, naive single-domain 79/85. Consumed by `phase_overlap_judge`'s unresolvable recovery; `phase_plan(..., domains=…)` takes the result. Pinned by `tests/test_scoped_replan.py`. |
+| `repair_prescribed_commands(plans, prescribed)` | Mechanical plan repair for the adherence floor (DESIGN §CRITIC *Repairing an omitted self-report beats re-driving for it*). Synthesises one subtask carrying every prescribed command, `depends_on` = the plan's current sinks (acyclic by construction, schedules alone in the final wave), and returns its id — or `None` when the floor is already clean, there are no commands, or no plan can supply a valid id prefix (a `_reconciler` pseudo-plan's `domain` is not a real category). Mutates `plans` in place; never raises; declines rather than guessing, mirroring `_repair_missing_requires`. Called from `_check_adherence` **before** `check_prescribed_command_coverage`, so a repairable gap never reaches the ~125-spawn re-plan path. Deliberately does not attach to an existing subtask: a verification-shaped matcher hits 32 of 36 subtasks on the real incident plan. Pinned by `tests/test_prescribed_command_repair.py`. |
+| `check_replan_affordable(st, caps, gate, plans)` | Budget preflight before a re-plan (DESIGN §13). `check_budget_feasibility` runs once after `schedule()`, but a re-plan is the largest budget event in a run and was authorised unchecked — and it re-runs the whole P1 decomposition, not just the planners (`fit_judge` was 118 of 201 spawns in run `d8a764f3…` against the planners' 62). Estimates `n_domains × planner_samples + n_subtasks × replan_decompose_estimate` from the **plans the caller passes in** — NOT from `plan_snapshot`, which `_run_phases` writes only after `schedule()` while both gates run before it (sizing from state made the check inert at both call sites: `d8a764f3`'s real state produced no die at all). The recommended `--max-workers` is `int()`-cast, since the estimate is fractional and the flag is `type=_positive_int`. `die()`s with `EXIT_BUDGET_INFEASIBLE` when it exceeds what is left. Called at the top of both re-planning `_on_feedback` callbacks (`phase_adherence_gate`, `phase_planning_coverage_gate`) BEFORE `phase_plan`. Honours `skip_budget_check`. Pinned by `tests/test_replan_budget_preflight.py`. |
+| `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. Re-invokes on **gating** findings only — see *Finding severity* below. Oscillation guard aborts a round only when its issue-signature set is EXACTLY EQUAL to an earlier round's — a proper subset (fewer, still-open issues) is genuine partial progress and is allowed to keep retrying (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). |
+| `_partition_issues_by_severity(issues)` | Splits findings into `(gating, advisory)`, order preserved. Used by `_run_checked_loop` and `_select_best_planner_sample`. |
+| `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). Its free-text fields carry length caps: `basis` is capped at `_CONFIDENCE_BASIS_MAX_LENGTH` (2000 chars) and each `falsifiers_tested`/`contradictions_reconciled` array item at `_CONFIDENCE_LIST_ITEM_MAX_LENGTH` (500 chars) — a mitigation for `anthropics/claude-code#49747` (open, unfixed): the `claude` CLI intermittently corrupts a `StructuredOutput` tool call (valid JSON switching mid-payload into legacy XML `<parameter name="...">` tags) correlated with the length of a single tool-call string argument. Observed directly in run `d8302c0d46d8...` (barnacle, 2026-07-31): the raw `__unparsedToolInput` capture showed the corruption starting exactly where the (then-uncapped) `confidence.basis` field's ~16KB of prose began. The cap reduces trigger frequency; it does not fix the upstream CLI bug — revisit once #49747 closes. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). Its free-text fields carry length caps: `basis` is capped at `_CONFIDENCE_BASIS_MAX_LENGTH` (8000 chars) and each `falsifiers_tested`/`contradictions_reconciled` array item at `_CONFIDENCE_LIST_ITEM_MAX_LENGTH` (2000 chars) — a mitigation for `anthropics/claude-code#49747` (open, unfixed): the `claude` CLI intermittently corrupts a `StructuredOutput` tool call (valid JSON switching mid-payload into legacy XML `<parameter name="...">` tags) correlated with the length of a single tool-call string argument. Observed directly in run `d8302c0d46d8...` (barnacle, 2026-07-31): the raw `__unparsedToolInput` capture showed the corruption starting exactly where the (then-uncapped) `confidence.basis` field's ~16KB of prose began. The cap reduces trigger frequency; it does not fix the upstream CLI bug — revisit once #49747 closes. The caps were RESIZED (from 2000/500) on 2026-08-03 after measuring the actual output distribution: `basis` runs 463–1321 chars and list items 130–502, so the old values sat directly on that distribution's shoulder and overflow was routine rather than exceptional — 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8 `contradictions_reconciled`), including a live reproduction that missed by TWO characters (502 against the 500 cap). A cap at the top of the natural distribution does not shorten output, it converts the tail into rejected work. The new values sit ~4x above the measured maximum while staying an order of magnitude below the ~16KB at which corruption was actually observed, so the mitigation is intact. They are now also stated to the workers via `prompts/_confidence.md` (included by all 10 confidence-emitting prompts) — previously they appeared in no prompt, so a worker had no way to comply with a bound it was never told about while being asked for detailed evidence. Pinned by `tests/test_confidence_length_caps.py`, which also guards `confidence` staying top-level REQUIRED: making it optional was considered and rejected, since that is a DESIGN §8/§12 structural self-gating contract and accounted for only 4 of the 65 measured failures. |
+
+### Finding severity — gating vs advisory
+
+`_run_checked_loop` partitions each round's findings with
+`_partition_issues_by_severity(issues) -> (gating, advisory)` and re-invokes
+**only on gating findings**. Advisory findings are appended to `warnings` (so
+nothing is hidden) and logged once, but never consume a round, never enter
+`_format_check_feedback`, and never enter the oscillation guard's signature
+set. `_select_best_planner_sample` likewise ranks on the gating subset only.
+
+`_issue_is_advisory(issue)` keys on the mechanical `LABEL` prefix — the same
+prefix `_issue_signature` parses, generated by leerie's own check functions,
+not LLM prose, so this is not the natural-language parsing CLAUDE.md forbids.
+A `LABEL (subtype):` parenthetical is stripped before lookup.
+
+`_ADVISORY_ISSUE_LABELS` is a **frozenset allowlist**, and the default is
+therefore **gating**: a finding nobody classified keeps today's behaviour, so
+an incomplete classification cannot silently disarm a real gate.
+
+| Advisory label | Why it is advice, not a defect |
+|---|---|
+| `INTRA_DOMAIN_OVERLAP` | Its own text is "consider merging or splitting". Two subtasks touching one file is frequently legitimate — measured 43 → 12 → 6 across every planner in both 2026-08-03 runs, never reaching zero. |
+| `PHANTOM_PATH` | Fires when no ancestor dir exists for a planned path — exactly what a subtask that *creates* a new module looks like. Also the dominant driver of the issue-count/plan-size coupling. |
+| `OVERSIZED` | "size='large' — split it" grades a planner self-report, but the independent `fit_judge` in `recursive_decompose` is the authoritative decomposition gate (DESIGN §5½, §8). |
+| `MANY_CATEGORIES` | "typical tasks span 1–3" is a heuristic, not a correctness property. |
+| `SAME_WORK_RISK`, `TEST_OWNERSHIP_RISK` | Both end by telling the classifier to apply a judgement test and keep both categories if the deliverables genuinely differ. A finding whose own remedy may be "change nothing" cannot gate. |
+
+Everything else — `DANGLING_DEP`, `INTRA_DOMAIN_CYCLE`, `EMPTY_CRITERIA`,
+`PROTECTED_PATH`, `MIGRATION_TARGETS_MISSING`, `UNCOVERED_MIGRATION_SURFACE`,
+`PRESCRIBED_CMD_UNRUN`, `REQUIRED_ITEM_UNCOVERED`, and every other worker's
+codes — remains gating.
+
+Pinned by `tests/test_issue_severity.py`, whose most important test is
+`test_unknown_labels_default_to_gating`: if that default ever inverts, every
+future check silently stops gating until someone remembers to classify it.
 
 ### Per-worker mechanical checks
 
-Each returns `list[str]` — empty when clean. Pure Python, no LLM.
+Each returns `list[str]` — empty when clean. Pure Python, no LLM. Severity is
+resolved from the issue code per the table above, not from the check function.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
@@ -4855,6 +4922,36 @@ subtask count (more = better coverage), tiebreak on first sample
 (worker returned `None`) is dropped from the candidate set before
 selection. If all samples for a domain crash, the run aborts.
 
+**Validity gate (runs before scoring).**
+`_planner_sample_is_empty_ready(sample)` returns True for a `status ==
+"ready"` plan with no subtasks. `_select_best_planner_sample` drops those
+samples **before** ranking — but only while at least one non-empty sibling
+survives; if every sample is empty the full set is ranked unchanged, so
+`detect_no_work`'s terminal route still fires.
+
+The gate must precede the scoring rather than join it as another sort key:
+`check_planner_output` inspects subtasks, so a plan with none to inspect
+returns `[]` and scores a perfect zero on the **primary** criterion. An empty
+plan is therefore unfalsifiable and beats every sibling with real content to
+critique — no tiebreak is ever consulted. Measured across two 2026-08-03 runs:
+2 of 21 selections (9.5%) chose a 0-subtask sample, discarding the whole
+domain, with every winner logging "0 issues". Scoped to `ready` only: an empty
+`blocked` plan is a planner verdict `schedule()` must still act on.
+
+Pinned by `tests/test_planner_sample_validity_gate.py`, which includes an
+anti-vacuity control (`test_falsifier_empty_sample_would_win_without_the_gate`)
+asserting the incident still reproduces without the gate, and
+`test_selection_is_biased_toward_smaller_plans_when_issues_scale`, which
+records the residual bias the gate does **not** fix: per-subtask findings make
+issue count grow with plan size, so a larger plan can still lose to a smaller
+one. Correcting that needs the severity channel, not this gate.
+
+The selection log line lists **every ranked sample**, not just the winner
+(`… — ranked: #0(2i/2s), #2(3i/3s)`), using each sample's index in the
+ORIGINAL `samples` list so the number cross-references the
+`planner-{category}-s{idx}` worker sid. A winner line alone cannot show why it
+won.
+
 ### Cap resolvers
 
 Same resolution pattern as existing resolvers (CLI → env → TOML →
@@ -4882,6 +4979,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | implementer completeness re-drives per subtask (`completeness_retry_rounds`) | 1 | the conformer's gating `solution_defects` axis found concrete behavioral gaps in the implementer's diff (DESIGN §9 *The one gating axis: solution completeness*). Each round folds the found defects into the implementer's next attempt as mandatory criteria and re-drives it (a **separate** counter from `implementer_confidence_retries` / `failed_retries` / `subtask_continuations` so the completeness loop cannot silently consume another budget). On exhaustion the subtask returns `blocked` with the residual defects named (fix + `--resume`) — never silently advisory. Independent of `--strict-conformer`, which governs only the advisory build/lint/test/residual axes. |
 | total worker invocations per run | 200 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `--resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `schedule()`, before `write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns, so a run that is mathematically unwinnable fails at the cheapest moment rather than mid-wave. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment* and §"Budget feasibility preflight" above. |
 | per-subtask call-estimate (for the feasibility preflight) | 3.0 (`subtask_call_estimate`) | not a runtime gate; consumed by `check_budget_feasibility()` as the per-subtask multiplier in its remaining-call estimate. Default calibrated from successful runs at 2.0–2.31; raised from 2.5 to absorb the per-subtask conformer completeness gate (DESIGN §9), whose `solution_defects` finding re-drives the implementer up to `completeness_retry_rounds` times — an N-subtask run can add up to N extra implementer invocations. The safety margin (next row) still absorbs the lint-fighting inflator on environments-heavy repos. |
+| per-subtask re-plan estimate | 1.5 (`replan_decompose_estimate`) | not a runtime gate; consumed by `check_replan_affordable()` as the per-subtask multiplier when projecting a re-plan's cost. A re-plan re-runs the whole P1 decomposition, not just the planners, and that is the larger half: run `d8a764f3…` issued 80 `fit_judge` + 5 `splitter` calls against a subtask set that grew 35 → 65 (~1.3/subtask). Rounded up to 1.5 so the preflight errs toward refusing a marginal re-plan — dying mid-decomposition at the worker cap having written no code costs far more than an early die() the operator answers with `--max-workers`. |
 | budget-preflight safety margin | 1.15 (`budget_safety_margin`) | not a runtime gate; consumed by `check_budget_feasibility()` as the multiplier on `total_estimate` before comparison to `max_total_workers`. With the default `subtask_call_estimate=3.0`, the guaranteed cap headroom is ~1.20×. |
 | concurrent workers within a wave | 5 (`--max-parallel`, also `LEERIE_MAX_PARALLEL` env or `max_parallel` in `leerie.toml`) | throughput throttle. Per-worker cgroup memory containment (see row below) keeps an OOM inside one worker's cgroup, so the wave-level parallelism can be high without risking cascade to sshd / lima-guestagent. Users on smaller VMs can opt down via `--max-parallel`. |
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
@@ -7454,6 +7552,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. Two producers, distinguished by shape: `filter_offtree_subtasks()` drops subtasks whose `files_likely_touched` resolved outside the run's repo root (value `{reasons: [str], files: [str]}`); `filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) drops subtasks the `satisfied_probe` judged already met on the base tree (value `{reason: "already_satisfied", evidence: str, checked: [str]}`); and the post-execution no-commits re-probe in `settle_subtask` records a subtask whose criteria are already met on the run-branch HEAD (value `{reason: "already_satisfied_mid_run", evidence: str, checked: [str]}` — same shape, judged against the run-branch HEAD instead of the base tree; DESIGN §8 *The mid-run sibling case*). The `mid_run` label names the moment the rescue fires (post-execution, this run), not the provenance: it covers both a sibling committing the deliverable this run and a subtask already satisfied on the base tree (DESIGN §8 *Scope*). Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
 | `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. Each value is `{reason: str, from_unresolved_tag: str}` where `reason` quotes the consumer's conditional intent + names why the precondition is false (the reconciler emits this) and `from_unresolved_tag` records which unresolved tag's resolution motivated the drop (looked up from the unresolved set at apply time). Absent when no conditional_drop fired. Distinct audit field from `dropped_subtasks` (off-tree soft drops, phase 3) so the two causes stay separately auditable. |
 | `speculative_collapse_drops` | list[str] | subtask sids mechanically pruned by dead-subtask elimination (DESIGN §5) — fully-speculative subtasks whose every `in_plan` requires was unresolvable because the provider domain returned 0 subtasks. Recorded before `_check_unresolvable` runs so the audit trail survives even when `die()` fires for remaining unresolvable entries. Absent when no dead-subtask elimination fired. Distinct from `conditional_drops` (LLM-judged, based on conditional prose in intent) and `dropped_subtasks` (off-tree soft drops, phase 3). |
+| `overlap_replan_done` | bool | set once when `phase_overlap_judge` answers an `unresolvable` collision with a **scoped re-plan** instead of `die()`ing (DESIGN §5). Bounds that recovery to a single attempt: a second unresolvable verdict after re-planning dies, since the contradiction is then not something re-planning resolves. Absent on runs that never hit an unresolvable collision — which is 88% of runs reaching the judge (5 of 43 hit one). |
 | `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. Persisted before the apply step (so if a `die()` fires on `unresolvable` or the merge-feasibility backstop the audit record survives). Absent when `phase_overlap_judge` cheap-skipped (single-planner / <2-subtask runs / `--skip-overlap-judge`) or when the judge returned `{collisions: []}`. |
 | `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
 | `adherence_gate` | dict | audit record from the phase 2⅞ instruction-adherence gate (`phase_adherence_gate` — see "Instruction-adherence gate" above) — `{judge: <adherence_judge output>, floor_issues: list[str]}`. Written once the gate clears (either immediately, or after re-planning). Absent when the gate cheap-skipped (`skip_adherence_check` / no prescribed procedure) or when the judge crashed every round (the degrade path returns without persisting this key). |

@@ -421,3 +421,5 @@ orchestrator's validation backstop these:
    orchestrator distinguishes your work from the implementer's in
    `git log`. A missing prefix produces a warning but no rollback —
    this is observability, not enforcement.
+
+{{include: _confidence.md}}

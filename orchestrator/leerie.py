@@ -240,6 +240,18 @@ DEFAULT_CAPS = {
     # case plus one completeness re-drive per subtask while still flagging
     # the truly-unwinnable large runs that motivated the preflight.
     "budget_safety_margin": 1.15,
+    # `claude -p` calls a RE-PLAN spends per already-known subtask, on top of
+    # the planners themselves — consumed by `check_replan_affordable()` only,
+    # never by `bump_workers()`. A re-plan re-runs the whole P1 decomposition,
+    # not just the planners, which is the larger half: measured on run
+    # `d8a764f3…` the re-plan issued 80 `fit_judge` + 5 `splitter` calls
+    # against a subtask set that grew 35 → 65, i.e. ~1.3 decomposition calls
+    # per subtask. Rounded up to 1.5 so the preflight errs toward declaring a
+    # marginal re-plan unaffordable — the failure it exists to prevent (dying
+    # mid-decomposition at the worker cap, having written no code) costs far
+    # more than an early, actionable die() the operator answers with
+    # `--max-workers`.
+    "replan_decompose_estimate": 1.5,
     # Repo-map token budget for the personalized-PageRank-ranked subgraph
     # injected into the planner and splitter (DESIGN §5½ (P6) *Codebase structural
     # map*). The subgraph is binary-searched to fit within this many tokens;
@@ -320,6 +332,12 @@ STATE_FIELDS = (
     "strict_conformer",
     "skip_base_baseline",
     "skip_repo_map",
+    # overlap_replan_done: set once when phase_overlap_judge responds to an
+    # `unresolvable` collision with a scoped re-plan instead of dying
+    # (DESIGN §5). Bounds that recovery to a single attempt — a second
+    # unresolvable verdict after re-planning dies, since the contradiction
+    # is then not something re-planning can resolve.
+    "overlap_replan_done",
     # cgroup_containment: recorded by the fail-closed gate
     # (enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
@@ -1112,8 +1130,25 @@ _REQUIRES_ITEM = {
 # decoder-level bug leerie cannot fix; the cap only reduces how often a
 # worker's own output is long enough to trigger it. Revisit once #49747
 # closes upstream.
-_CONFIDENCE_BASIS_MAX_LENGTH = 2000
-_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 500
+# Sized against the MEASURED output distribution, not guessed. Captured across
+# real planner submissions (2026-08-03): `basis` ran 463–1321 chars and list
+# items 130–502. The previous values (2000 / 500) sat directly on that
+# distribution's shoulder, so overflow was routine rather than exceptional —
+# 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8
+# `contradictions_reconciled`), including one live reproduction that missed by
+# TWO characters (502 against the 500 cap) and resubmitted at 260.
+#
+# A cap set at the top of the natural distribution does not shorten output; it
+# converts the tail into rejected work. These values sit ~4x above the measured
+# maximum — clear of normal output — while remaining an order of magnitude
+# below the ~16KB single-argument length at which the #49747 corruption was
+# actually observed, so the mitigation above is intact.
+#
+# The limits are also stated to the workers (`prompts/_confidence.md`). They
+# were previously in no prompt at all, so a worker had no way to comply with a
+# bound it was never told about while being asked for detailed evidence.
+_CONFIDENCE_BASIS_MAX_LENGTH = 8000
+_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 2000
 
 
 def _confidence_schema(axes: list[str]) -> dict:
@@ -10824,6 +10859,70 @@ def _tool_result_outcome(event: dict) -> bool | None:
     return None
 
 
+# Cap on the rejected-payload diagnostic (`_format_payload_for_log`). Large
+# enough that a truncated planner submission — the shape this exists to
+# diagnose — is shown whole, since the useful signal is precisely WHICH fields
+# are absent, and a mid-cut payload cannot answer that. Small enough that a
+# complete 100-subtask plan does not flood the inline log; the per-worker .log
+# file carries the raw stream regardless.
+_REJECTED_PAYLOAD_LOG_MAX = 4000
+
+
+def _format_payload_for_log(payload: object) -> str | None:
+    """Render a `StructuredOutput` submission for the rejection diagnostic.
+
+    Returns None for an absent payload so the caller's `and` guard skips the
+    log line entirely rather than printing "None". Serialisation is
+    best-effort: `json.dumps` on an arbitrary worker payload can raise, and a
+    diagnostic that crashes the stream reader would convert a recoverable
+    schema failure into a dead run — so any failure degrades to `repr`."""
+    if payload is None:
+        return None
+    try:
+        text = json.dumps(payload, sort_keys=True)
+    except Exception:
+        text = repr(payload)
+    if len(text) > _REJECTED_PAYLOAD_LOG_MAX:
+        text = (text[:_REJECTED_PAYLOAD_LOG_MAX]
+                + f"… [truncated at {_REJECTED_PAYLOAD_LOG_MAX} chars]")
+    return text
+
+
+# Substrings that identify a *schema* rejection of a structured submission, as
+# opposed to any other errored tool result. Measured against real worker
+# streams: the CLI emits "Output does not match required schema: …" for a
+# parseable-but-invalid payload, and "InputValidationError" when the payload
+# could not be parsed as JSON at all.
+_SCHEMA_REJECTION_MARKERS = (
+    "does not match required schema",
+    "inputvalidationerror",
+)
+
+
+def _is_schema_rejection(event: dict) -> bool:
+    """True when this stream event is a tool_result rejecting a structured
+    submission on schema grounds.
+
+    Deliberately narrow. `_read_stream` uses this to decide whether to print
+    the latched payload, and an ordinary tool failure (a failing test, a
+    missing file) must never drag an unrelated structured payload into the log
+    beside it."""
+    if not isinstance(event, dict) or event.get("type") != "user":
+        return False
+    for b in (event.get("message") or {}).get("content") or []:
+        # `isinstance` rather than a bare `.get`: this runs on every event of
+        # a live stream, and a single malformed block would otherwise raise
+        # AttributeError out of _read_stream and kill the run.
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") != "tool_result" or not b.get("is_error"):
+            continue
+        text = _extract_tool_result_text(b).lower()
+        if any(m in text for m in _SCHEMA_REJECTION_MARKERS):
+            return True
+    return False
+
+
 def _tag_each_line(prefix: str, content: str) -> str:
     """Prefix the first non-empty line of `content` with `prefix`;
     subsequent lines get a width-matched continuation prefix that
@@ -11958,10 +12057,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # this is the only way to tell the operator *what* was running when the
     # kernel OOM-killed the cgroup (DESIGN §6 *Detecting memory OOM*).
     last_bash_cmd: str | None = None
+    # Last payload the worker submitted to `StructuredOutput`. Latched for the
+    # same reason as `last_bash_cmd`: when the submission is REJECTED, the
+    # error names the offending fields but never echoes what was actually
+    # sent, and the payload lives in a preceding event the error text cannot
+    # reach. Without this, the commonest worker failure signature (a schema
+    # mismatch) is undiagnosable from a log — the 2026-08-03 investigation had
+    # to re-run workers under `--output-format stream-json` by hand to recover
+    # these, which is also what disproved the leading hypothesis about their
+    # cause. `InputValidationError` (unparseable JSON) already logs its
+    # payload; this closes the gap for the parseable-but-invalid case.
+    last_structured_payload: str | None = None
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
         nonlocal pids_events_baseline, last_bash_cmd
+        nonlocal last_structured_payload
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -12000,13 +12111,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     if t == "assistant":
                         for b in (event.get("message", {})
                                   .get("content", []) or []):
-                            if (b.get("type") == "tool_use"
-                                    and b.get("name") == "Bash"):
+                            if b.get("type") != "tool_use":
+                                continue
+                            if b.get("name") == "Bash":
                                 cmd_lines = (
                                     (b.get("input", {}) or {})
                                     .get("command") or "").splitlines()
                                 if cmd_lines:
                                     last_bash_cmd = cmd_lines[0]
+                            elif b.get("name") == "StructuredOutput":
+                                last_structured_payload = _format_payload_for_log(
+                                    b.get("input"))
                     # Latch credit-exhaustion state (see `overage_blocked`
                     # declaration above for why this keys on
                     # `overageDisabledReason`, NOT `overageStatus`).
@@ -12038,6 +12153,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # window still leaves an ordinary failing test (≤1 error)
                     # below the threshold — and the cgroup read is the final
                     # authority regardless.
+                    # Surface the rejected payload alongside the rejection.
+                    # Gated on the schema-mismatch signature specifically so
+                    # ordinary tool errors (a failing test, a missing file)
+                    # never drag an unrelated structured payload into the log.
+                    if _is_schema_rejection(event) and last_structured_payload:
+                        log(f"  [{sid} tool-fail] rejected payload was: "
+                            f"{last_structured_payload}")
+                        # Cleared so a later, unrelated error cannot re-print a
+                        # stale payload from an earlier submission.
+                        last_structured_payload = None
                     _outcome = _tool_result_outcome(event)
                     if _outcome is not None:
                         tool_result_window.append(_outcome)
@@ -15423,28 +15548,86 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     log("phase 1½: provision recipe gate clean")
 
 
+def _planner_sample_is_empty_ready(sample: dict) -> bool:
+    """True for a `ready` plan carrying no subtasks.
+
+    Deliberately NOT called "invalid" on its own: this exact shape is the
+    planner's legitimate way to say *this domain has no work*, and
+    `detect_no_work` routes a run on it. It is only a defect **relative to a
+    sibling sample that found work** — see `_select_best_planner_sample`."""
+    return (sample.get("status") == "ready"
+            and not sample.get("subtasks"))
+
+
 def _select_best_planner_sample(
     samples: list[dict], repo_root: Path, domain: str,
 ) -> dict:
     """Mechanically select the best planner sample for a domain.
 
+    Validity gate (DESIGN §5 *Selection separates validity from quality*),
+    applied BEFORE scoring:
+      0. Drop empty-`ready` samples — but only while a non-empty sibling
+         survives.
+
     Selection criteria (no LLM — avoids self-bias per ACL 2024):
       1. Fewest mechanical-check issues
       2. Tiebreak: most subtasks (more investigation = better coverage)
       3. Tiebreak: first sample (determinism device)
-    """
+
+    Why the gate has to precede the scoring rather than join it as another
+    sort key: the criteria above rank samples by *what is wrong with them*,
+    and an empty plan is *unfalsifiable* — `check_planner_output` inspects
+    subtasks, so with none to inspect it returns `[]` and the sample scores a
+    perfect zero. It therefore beat every sibling that had real content to
+    critique. Measured across the two 2026-08-03 runs: **2 of 21 selections
+    (9.5%) chose a 0-subtask sample**, silently discarding the whole domain,
+    and every winner logged "0 issues". Demoting the empty sample by tiebreak
+    could not fix this — it loses on the PRIMARY key, so no tiebreak is ever
+    consulted.
+
+    The gate is relative, never absolute. If every sample is empty-`ready`
+    the domain genuinely has no work, so the full set is ranked unchanged and
+    `detect_no_work`'s terminal route still fires."""
+    ranked = [s for s in samples if not _planner_sample_is_empty_ready(s)]
+    if ranked and len(ranked) < len(samples):
+        log(f"  {domain}: dropped {len(samples) - len(ranked)} empty sample(s) "
+            f"before ranking — {len(ranked)} sibling(s) found work, so an "
+            f"empty plan is not a usable answer for this domain")
+    elif not ranked:
+        # Every sample is empty: a real no-work verdict, not a degenerate one.
+        ranked = samples
+
     scored: list[tuple[int, int, int, dict]] = []
-    for i, sample in enumerate(samples):
-        issues = check_planner_output(sample, repo_root, domain)
+    for sample in ranked:
+        # Rank on GATING findings only. Advisory findings fire once per
+        # offending subtask, so counting them makes issue count scale ~1:1
+        # with plan size and turns the primary key into a plan-size penalty:
+        # a large plan would have to be flawless to beat a small plan with one
+        # flaw (DESIGN §"Findings carry a severity").
+        issues, _advisory = _partition_issues_by_severity(
+            check_planner_output(sample, repo_root, domain))
         n_subtasks = len(sample.get("subtasks", []))
+        # Index into the ORIGINAL `samples`, not into `ranked` — the gate above
+        # can drop entries, and renumbering would make the logged sample id
+        # disagree with the per-sample worker sids (`planner-<domain>-s<N>`)
+        # this line exists to be cross-referenced against.
+        idx = next(i for i, s in enumerate(samples) if s is sample)
         # Lower issue count is better; higher subtask count is better.
-        scored.append((len(issues), -n_subtasks, i, sample))
+        scored.append((len(issues), -n_subtasks, idx, sample))
     scored.sort()
     winner = scored[0]
     if len(samples) > 1:
+        # Log EVERY ranked sample's score, not just the winner's. The winner
+        # line alone cannot show why it won — a run that selected
+        # "(0 issues, 0 subtasks)" looks like a domain with no work, when in
+        # fact the alternatives held 16 and 13 subtasks and lost only because
+        # having content to critique earned them issues. That distinction is
+        # the whole diagnostic, and it was invisible.
+        roster = ", ".join(
+            f"#{i}({n_iss}i/{-neg_n}s)" for n_iss, neg_n, i, _ in scored)
         log(f"  {domain}: multi-sample selected sample {winner[2]} "
             f"({winner[0]} issues, {-winner[1]} subtasks) from "
-            f"{len(samples)} samples")
+            f"{len(samples)} samples — ranked: {roster}")
     return winner[3]
 
 
@@ -15533,10 +15716,63 @@ async def phase_artifact_registry(
     return artifacts
 
 
+def replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
+    """Domains that must be re-planned together with `targets`.
+
+    A re-plan replaces a domain's subtasks with fresh ones, so every id it
+    used vanishes. Any *other* domain holding an edge into it would dangle —
+    `validate_plan` catches that, but as a `die()`, which is the outcome
+    scoping exists to avoid. So the scope is `targets` **plus the transitive
+    closure of domains depending on them**, over both channels: `depends_on`
+    (id) and `requires`→`provides` (tag). Everything that could dangle is
+    re-planned, which makes the coherence question vacuous rather than
+    merely checked.
+
+    Domains are subtask-id prefixes, which `_ID_PREFIXES` guarantees are
+    per-category and globally unique.
+
+    Measured across every multi-domain plan in the corpus — 85 (domain, plan)
+    re-plan simulations: scoping to this closure yields a plan that schedules
+    and validates **85 / 85 (100%)**, while scoping to the named domain alone
+    manages 79 / 85 (93%). The 6 failures are exactly the dangling-edge
+    hazard, so the closure is necessary rather than defensive. The closure is
+    also small: a single domain in 85% of cases, the whole plan in 6%, mean
+    47% of the plan."""
+    subs = [s for p in plans for s in (p.get("subtasks") or [])]
+
+    def _dom(sid: str) -> str:
+        return sid.split("-", 1)[0] if "-" in sid else sid
+
+    provider: dict[str, str] = {}
+    for s in subs:
+        for tag in (s.get("provides") or []):
+            provider[tag] = _dom(s["id"])
+    # consumer_domain -> producer_domain
+    edges: set[tuple[str, str]] = set()
+    for s in subs:
+        d = _dom(s["id"])
+        for dep in (s.get("depends_on") or []):
+            if _dom(dep) != d:
+                edges.add((d, _dom(dep)))
+        for req in (s.get("requires") or []):
+            tag = req.get("tag") if isinstance(req, dict) else req
+            pd = provider.get(tag)
+            if pd and pd != d:
+                edges.add((d, pd))
+    clo = set(targets)
+    while True:
+        new = {c for c, p in edges if p in clo} - clo
+        if not new:
+            break
+        clo |= new
+    return clo
+
+
 async def phase_plan(task: str, st: State, caps: dict,
                      models: dict[str, str],
                      efforts: dict[str, str | None],
-                     replan_round: int = 0) -> list[dict]:
+                     replan_round: int = 0,
+                     domains: set[str] | None = None) -> list[dict]:
     """Phase 2: one planner per category, run in parallel (bounded by
     max_parallel). Each returns a JSON plan of granular subtasks.
 
@@ -15560,6 +15796,24 @@ async def phase_plan(task: str, st: State, caps: dict,
     st.data["current_phase"] = "phase 2: planning"
     st.save()
     cats = st.data["categories"]
+    if domains is not None:
+        # Scoped re-plan (DESIGN §5): plan only the requested categories. The
+        # caller is responsible for merging the result with the plans it
+        # retained — `phase_plan` returns only what it planned, so a caller
+        # that forgets to merge loses subtasks loudly (schedule()/
+        # validate_plan die) rather than silently.
+        #
+        # Matched on the id PREFIX, not the category name, because that is
+        # what `replan_domain_closure` returns and what subtask ids carry.
+        cats = [c for c in cats if CATEGORY_ABBREV.get(c, c) in domains]
+        if not cats:
+            die("scoped re-plan selected no categories — the requested "
+                f"domain(s) {sorted(domains)} match none of "
+                f"{st.data['categories']}. This is a leerie bug: the closure "
+                "is computed from subtask id prefixes, which are derived "
+                "from these same categories.")
+        log(f"  scoped re-plan: {len(cats)} of "
+            f"{len(st.data['categories'])} domain(s) — {', '.join(cats)}")
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
     sys_prompt = load_prompt("planner")
@@ -19420,6 +19674,18 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
 
     def _check_adherence(judge_result: dict) -> list[str]:
         last_judge_result[0] = judge_result
+        # Repair BEFORE evaluating the floor (DESIGN §5 *detect → repair what
+        # is unambiguous → re-drive only what is not*). The floor reads
+        # `runs_commands`, a planner self-report filled on 4.9% of subtasks,
+        # so it fires on nearly every prescribed-procedure task and its only
+        # remedy was a ~125-spawn re-plan. Attaching the commands leerie
+        # already holds costs zero workers, so a repairable gap never reaches
+        # the re-plan path at all.
+        repaired = repair_prescribed_commands(
+            cur_plans[0], prescribed_procedure)
+        if repaired:
+            log(f"  adherence-gate: synthesised {repaired} to run the task's "
+                f"prescribed commands (mechanical repair — no re-plan)")
         floor_issues = check_prescribed_command_coverage(
             prescribed_procedure,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
@@ -19449,6 +19715,9 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # `_run_checked_loop`'s existing retry semantics exactly like the
         # reconciler and overlap-judge do.
         replan_round[0] += 1
+        # A re-plan is the largest budget event in a run and was previously
+        # authorised with no budget check at all (DESIGN §13).
+        check_replan_affordable(st, caps, "adherence gate", cur_plans[0])
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — your previous plan did not honor the prescribed "
@@ -19670,6 +19939,9 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         # this reuses `_run_checked_loop`'s existing retry semantics exactly
         # like the reconciler/adherence/overlap-judge gates do.
         replan_round[0] += 1
+        # A re-plan is the largest budget event in a run and was previously
+        # authorised with no budget check at all (DESIGN §13).
+        check_replan_affordable(st, caps, "coverage gate", cur_plans[0])
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — an independent review of your previous plan found "
@@ -20109,22 +20381,76 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             f"{c.get('reason', '<no reason>')}"
             for c in unresolvable
         )
-        die(
-            f"plan-overlap judge found {len(unresolvable)} unresolvable "
-            "surface collision(s) in the reconciled plan:\n"
-            f"{bullets}\n"
-            "Each collision is two planners producing the same exported "
-            "artifact with structurally incompatible APIs (DESIGN §5 "
-            "*Cross-domain surface overlap*). Auto-merging would produce "
-            "a frankenstein implementer spec the judge correctly "
-            "refused. To unblock, refine the task description and re-run "
-            "(this run cannot be resumed — see below):\n"
-            "  • Disambiguate the disputed surface: name which API "
-            "survives, or split it into two distinct artifacts.\n"
-            "  • Or narrow the task so a single planner owns the "
-            "surface. Each category the classifier selects spawns its "
-            "own planner, and only multi-planner runs can collide here."
+        # An unresolvable collision is a verdict about the PLAN, not about the
+        # judge's output quality — yet until now it re-drove nothing and
+        # `die()`d terminally ("this run cannot be resumed") after the entire
+        # planning spend. Measured across the corpus: 43 runs reached this
+        # judge and 5 (12%) died here, burning 404 workers, none recoverable —
+        # while the judge resolved the other 95.5% of collisions (232 of 243)
+        # without incident. Every other gate re-drives `phase_plan` on far
+        # weaker findings.
+        #
+        # So re-plan the implicated domains once, with the contradiction as
+        # feedback. Unlike the coverage and adherence judges — whose findings
+        # carry no subtask reference — a collision names `a_sid`/`b_sid`, so
+        # the implicated domains are mechanically derivable and the re-plan
+        # can be scoped instead of rebuilding the whole plan (DESIGN §5).
+        if st.data.get("overlap_replan_done"):
+            die(
+                f"plan-overlap judge still reports {len(unresolvable)} "
+                "unresolvable surface collision(s) after a scoped re-plan:\n"
+                f"{bullets}\n"
+                "Each collision is two planners producing the same exported "
+                "artifact with structurally incompatible APIs (DESIGN §5 "
+                "*Cross-domain surface overlap*). Auto-merging would produce "
+                "a frankenstein implementer spec the judge correctly "
+                "refused, and re-planning the implicated domains did not "
+                "resolve it. To unblock, refine the task description and "
+                "re-run:\n"
+                "  • Disambiguate the disputed surface: name which API "
+                "survives, or split it into two distinct artifacts.\n"
+                "  • Or narrow the task so a single planner owns the "
+                "surface. Each category the classifier selects spawns its "
+                "own planner, and only multi-planner runs can collide here."
+            )
+        implicated = {
+            sid.split("-", 1)[0]
+            for c in unresolvable
+            for sid in (c.get("a_sid", ""), c.get("b_sid", ""))
+            if isinstance(sid, str) and "-" in sid
+        }
+        scope = replan_domain_closure(plans, implicated)
+        log(f"phase 2¾: {len(unresolvable)} unresolvable collision(s) — "
+            f"re-planning {len(scope)} domain(s) ({', '.join(sorted(scope))}) "
+            "with the contradiction as feedback, instead of dying")
+        st.data["overlap_replan_done"] = True
+        st.save()
+        check_replan_affordable(st, caps, "overlap judge", plans)
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — two planners produced structurally incompatible "
+            "designs for the same artifact, and an independent judge refused "
+            f"to merge them:\n{bullets}\n"
+            "Re-plan so exactly one design survives for each disputed "
+            "artifact. Where the task (or a file it references) already "
+            "states which approach to take, follow it — do not re-litigate a "
+            "decision the task has already made."
         )
+        retained = [
+            p for p in plans
+            if not any(
+                (s.get("id", "").split("-", 1)[0] if "-" in s.get("id", "")
+                 else s.get("id", "")) in scope
+                for s in (p.get("subtasks") or []))
+        ]
+        fresh = await phase_plan(replan_task, st, caps, models, efforts,
+                                 replan_round=1, domains=scope)
+        plans = retained + fresh
+        # A re-plan invalidates every phase upstream of this one (DESIGN §5).
+        # `phase_reconcile` short-circuits when nothing new is unresolved.
+        plans = await phase_reconcile(plans, task, st, caps, models, efforts)
+        return await phase_overlap_judge(plans, task, st, caps, models,
+                                         efforts)
 
     # Apply merges and drops in input order via the pure helper.
     applied = _apply_overlap_collisions(plans, collisions)
@@ -20465,6 +20791,162 @@ def check_budget_feasibility(st: State, caps: dict,
             f"still fire if the estimate was correct).",
             code=EXIT_BUDGET_INFEASIBLE,
         )
+
+
+def repair_prescribed_commands(plans: list[dict],
+                               prescribed: dict) -> str | None:
+    """Attach the task's prescribed commands to the plan mechanically.
+
+    Returns the synthesised subtask's id, or None when nothing was repaired
+    (the floor is already clean, or the plan is too degenerate to host a
+    subtask). Mutates `plans` in place, mirroring `_repair_missing_requires`'
+    contract: never raises, and declines rather than guessing.
+
+    **Why repair rather than re-drive.** `check_prescribed_command_coverage`
+    reads `runs_commands`, a planner self-report field populated on **4.9% of
+    subtasks** (24 of 486 across 38 real plans; 74% of plans have none at all).
+    So on any task that prescribes a command the floor fires almost
+    everywhere, and its only remedy was a full re-plan. Measured on run
+    `d8a764f3…`: the first plan had 0 of 35 subtasks carrying `runs_commands`
+    and 8 floor issues; the re-plan fixed it (14 of 36, 0 issues) but cost
+    ~125 of the run's 201 spawns — twice the entire first planning pass — and
+    the run then died of budget exhaustion having written no code.
+
+    The re-plan works. It is the *price* that is wrong: leerie already holds
+    the prescribed commands as structured classifier output, so attaching them
+    is a mechanical plan repair costing zero workers. This is the same
+    detect-repair-then-die contract the wiring gate already established
+    (DESIGN §5), applied to the gate whose remedy was most expensive.
+
+    **Synthesise, don't guess an owner.** Picking "the subtask that owns
+    verification" was tried and rejected: against `d8a764f3`'s real plan a
+    verification-shaped matcher hits 32 of 36 subtasks, so an
+    "exactly-one-owner" rule would essentially never fire and a looser one
+    would attach the commands somewhere arbitrary. A dedicated subtask whose
+    entire content is running the prescribed commands cannot be wrong about
+    intent.
+
+    The synthesised subtask depends on the plan's current sinks, so it is
+    acyclic by construction (nothing depends on it) and schedules alone in the
+    final wave. Validated against every corpus run carrying a prescribed
+    procedure: 5 of 5 repaired to a clean floor with `schedule()` and
+    `validate_plan()` passing, and 3 already-clean runs correctly untouched."""
+    subs = [s for p in plans for s in (p.get("subtasks") or [])]
+    if not check_prescribed_command_coverage(prescribed, subs):
+        return None
+    cmds = [c for c in (prescribed.get("commands") or [])
+            if isinstance(c, str) and c.strip()]
+    if not cmds:
+        return None
+    host = next((p for p in plans if p.get("subtasks")), None)
+    if host is None:
+        # No subtask anywhere to hang a dependency on, and no domain to derive
+        # an id prefix from. Decline; the floor still gates.
+        return None
+    prefix = CATEGORY_ABBREV.get(host.get("domain"), "")
+    if not prefix:
+        # A synthetic plan (e.g. the reconciler's) whose `domain` is not a real
+        # category cannot supply a valid id prefix, and `validate_plan` rejects
+        # ids without one. Decline rather than emit an invalid subtask.
+        return None
+    prefix += "-"
+    ids = {s["id"] for s in subs if isinstance(s.get("id"), str)}
+    # Sinks: nothing depends on them, so depending on all of them puts the
+    # verifier strictly last without inventing an ordering opinion.
+    depended = {d for s in subs for d in (s.get("depends_on") or [])}
+    sinks = sorted(i for i in ids if i not in depended)
+    n = 1
+    while f"{prefix}{900 + n:03d}" in ids:
+        n += 1
+    sid = f"{prefix}{900 + n:03d}"
+    host["subtasks"].append({
+        "id": sid,
+        "title": "Run the task's prescribed verification commands",
+        "intent": (
+            "Run every command the task prescribes, in the order given, and "
+            "fix whatever they surface. This subtask exists because the task "
+            "explicitly prescribed these commands as its verification "
+            "procedure."),
+        "scope_note": "Verification only — no feature work.",
+        "files_likely_touched": [],
+        "depends_on": sinks,
+        "requires": [],
+        "provides": [],
+        "success_criteria_seed": (
+            "every prescribed command has been run and passes: "
+            + "; ".join(cmds)),
+        "size": "small",
+        "investigation_notes": "",
+        "runs_commands": list(cmds),
+    })
+    return sid
+
+
+def check_replan_affordable(st: State, caps: dict, gate: str,
+                            plans: list[dict]) -> None:
+    """Pre-flight a re-plan against the remaining worker budget.
+
+    `check_budget_feasibility` runs once, after `schedule()`. But a re-plan is
+    the single largest budget event in a run and was authorised with no budget
+    check at all — and it is far more expensive than "re-running the
+    planners", because `phase_plan` also re-runs the entire P1 decomposition
+    behind it (`recursive_decompose`'s per-subtask `fit_judge`, which measured
+    59% of one run's spend against the planners' 31%).
+
+    Run `d8a764f3…` is the shape this prevents: an adherence-gate re-plan cost
+    ~125 of 201 spawns — almost twice the entire first planning pass — and the
+    run then died of budget exhaustion mid-decomposition, having written no
+    code. Dying here instead costs nothing and names the real cause.
+
+    **`plans` is a parameter, not read from state, and that is load-bearing.**
+    The first version of this function sized the re-plan from
+    `st.data["plan_snapshot"]` — which `_run_phases` does not write until
+    *after* `schedule()`, while both re-planning gates run *before* it. On a
+    fresh run the snapshot was therefore absent, `n_subtasks` was 0, the
+    estimate collapsed to the planner count alone, and the check never fired:
+    replaying `d8a764f3`'s real call-site state (160 of 200 spent, 3 domains,
+    no snapshot) produced no die at all. Its unit tests passed only because
+    they seeded a `plan_snapshot` that cannot exist at that call site. The
+    caller already holds the live plans, so they are passed in.
+
+    `die()`s with EXIT_BUDGET_INFEASIBLE when the projected re-plan cannot fit
+    in what is left. Honours the same `skip_budget_check` opt-out, and the
+    runtime backstop in `State.bump_workers()` remains the load-bearing
+    enforcement either way."""
+    if st.data.get("skip_budget_check"):
+        return
+    cap = caps["max_total_workers"]
+    spent = st.data.get("worker_count", 0)
+    remaining = cap - spent
+    # A re-plan's cost is dominated by per-subtask decomposition, so scale on
+    # the live subtask count rather than a constant.
+    n_subtasks = sum(len(p.get("subtasks") or []) for p in (plans or []))
+    n_domains = max(1, len(st.data.get("categories") or []))
+    estimate = (
+        n_domains * caps["planner_samples"]
+        + n_subtasks * caps["replan_decompose_estimate"]
+    )
+    if estimate <= remaining:
+        return
+    # int() so the recommendation is a value `--max-workers` actually accepts:
+    # the estimate is fractional by construction (n_subtasks × 1.5), and the
+    # flag is `type=_positive_int`, so a bare f-string emitted e.g.
+    # "--max-workers 241.5" — advice the CLI rejects. Mirrors
+    # `check_budget_feasibility`'s own `int(...) + 5`.
+    recommended = int(spent + estimate) + 20
+    die(
+        f"re-plan from the {gate} is not affordable: {spent} of {cap} "
+        f"`claude -p` call(s) already spent, leaving {remaining}. Re-planning "
+        f"{n_domains} domain(s) at {caps['planner_samples']} sample(s) each, "
+        f"plus re-decomposing {n_subtasks} subtask(s), is an estimated "
+        f"{estimate:g} more calls — a re-plan re-runs the whole P1 "
+        f"decomposition (per-subtask fit_judge), not just the planners, which "
+        f"is typically the larger half of planning spend. Re-run with "
+        f"--max-workers {recommended}, narrow the task, or use "
+        f"--skip-budget-check to push through (the runtime backstop in "
+        f"State.bump_workers() will still fire).",
+        code=EXIT_BUDGET_INFEASIBLE,
+    )
 
 
 def _write_subtask_artifacts(leerie_dir: Path, sid: str,
@@ -21506,6 +21988,67 @@ def _format_check_feedback(
     return header + body + footer
 
 
+# Findings that are ADVICE about a judgement call, not defects that make the
+# output unusable (DESIGN §"Findings carry a severity; only gating findings
+# re-invoke"). Surfaced once as warnings; they never cost a retry round and
+# never count toward multi-sample selection.
+#
+# An explicit allowlist keyed on the mechanical `LABEL` prefix every issue
+# string in this codebase already carries — the same prefix `_issue_signature`
+# parses for oscillation detection. Deliberately an allowlist rather than a
+# denylist: a finding nobody classified stays GATING, so an incomplete
+# classification preserves today's behaviour instead of silently disarming a
+# real gate. Demoting a finding is then a deliberate act with a reason, which
+# is what each entry below records.
+_ADVISORY_ISSUE_LABELS = frozenset({
+    # "consider merging or splitting" — its own text is advice. Two subtasks
+    # touching one file is frequently legitimate, which is why it measured
+    # 43 → 12 → 6 across every planner in both 2026-08-03 runs and never
+    # reached zero, exhausting the round cap every time.
+    "INTRA_DOMAIN_OVERLAP",
+    # Fires when no ancestor directory exists for a planned path — which is
+    # exactly what a subtask that CREATES a new module looks like. Also the
+    # dominant driver of the issue-count/plan-size coupling, since it fires
+    # once per offending subtask.
+    "PHANTOM_PATH",
+    # "size='large' — split it". The planner self-reports `size`, and the
+    # independent `fit_judge` in `recursive_decompose` is the authoritative
+    # decomposition gate (DESIGN §5½, §8) — this is a second, self-graded
+    # opinion on a decision that already has an independent owner.
+    "OVERSIZED",
+    # "typical tasks span 1–3" — a heuristic about category count, not a
+    # correctness property.
+    "MANY_CATEGORIES",
+    # Both end by telling the classifier to apply a judgement test and keep
+    # both categories if they produce genuinely different deliverables. A
+    # finding whose own remedy may be "change nothing" cannot gate.
+    "SAME_WORK_RISK",
+    "TEST_OWNERSHIP_RISK",
+})
+
+
+def _issue_is_advisory(issue: str) -> bool:
+    """True when `issue` is advice rather than a gating defect.
+
+    Keys on the `LABEL` prefix (before the first `:`), which is mechanically
+    generated by leerie's own check functions — not LLM prose, so this is not
+    the natural-language parsing CLAUDE.md forbids. Anything unrecognised is
+    gating, per the default above."""
+    if not isinstance(issue, str):
+        return False
+    return issue.split(":", 1)[0].split(" (", 1)[0].strip() \
+        in _ADVISORY_ISSUE_LABELS
+
+
+def _partition_issues_by_severity(
+        issues: list[str]) -> tuple[list[str], list[str]]:
+    """Split check findings into `(gating, advisory)`, order preserved."""
+    gating, advisory = [], []
+    for issue in issues:
+        (advisory if _issue_is_advisory(issue) else gating).append(issue)
+    return gating, advisory
+
+
 def _issue_signature(issue: str) -> str:
     """Extract a stable identity from a `_run_checked_loop` issue string,
     for oscillation detection across rounds.
@@ -21637,12 +22180,23 @@ async def _run_checked_loop(
             warnings.append(f"{name} round {rnd}: worker returned None")
             break
 
-        issues = check(last_res)
+        all_issues = check(last_res)
+        # Advisory findings are surfaced but never re-invoke (DESIGN
+        # §"Findings carry a severity; only gating findings re-invoke").
+        # Everything below this line reasons about `issues` — the gating
+        # subset — so an unsatisfiable piece of advice cannot consume a round,
+        # trip the oscillation guard, or become feedback the worker is asked
+        # to act on. `warnings` still carries both, so nothing is hidden.
+        issues, advisory = _partition_issues_by_severity(all_issues)
+
+        for issue in all_issues:
+            warnings.append(f"{name} round {rnd}: {issue}")
+        if advisory and not issues:
+            log(f"  {name}: {len(advisory)} advisory finding(s), no gating "
+                f"issues — accepting (advice does not re-invoke)")
+
         if not issues:
             break
-
-        for issue in issues:
-            warnings.append(f"{name} round {rnd}: {issue}")
 
         if make_feedback_prompt is None:
             # Detect-and-die, single pass: nothing re-drives the input

@@ -160,3 +160,5 @@ object (required by schema):
 
 The orchestrator runs mechanical checks (lockfile consistency, working_dir
 existence) and may re-invoke you with structured feedback.
+
+{{include: _confidence.md}}
