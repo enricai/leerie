@@ -15,9 +15,16 @@ that is public *but has no external caller* therefore sits outside that guard
 for no reason — it is neither API nor covered by the dead-code check.
 
 The rule: a module-level `def` in `orchestrator/leerie.py` that nothing outside
-that file references must start with `_`. Anything genuinely reached from bash,
+that file **calls** must start with `_`. Anything genuinely reached from bash,
 another module, or the plugin surface stays public and is listed in
 `_EXTERNAL_API` below with the caller that justifies it.
+
+"Calls" is literal: only `.py`, `.sh` and extensionless files (the `leerie`
+launcher) are scanned. Markdown was scanned in the first version of this
+guard, which exempted 26 helpers on the strength of a documentation mention
+alone — and since CLAUDE.md documents nearly every symbol in this repo, that
+hole would have swallowed most future offenders too. A doc mention is not a
+caller.
 """
 from __future__ import annotations
 
@@ -35,37 +42,52 @@ _EXTERNAL_API = {
     "run_rebaser": "scripts/host-finalize.sh",
     "run_recapture_deps": "launcher `config --recapture` arm",
     "compose_pr_body": "finalize bash",
-    "compute_subtask_branch": "worktree scripts",
-    "resolve_token_probe_cache_sec": "launcher",
     # process entry points
     "main": "console entry point",
 }
 
 # Pre-existing public-but-internal helpers, captured when this guard was
 # introduced (2026-08-03). This is a RATCHET, not an approval: the set may
-# shrink, never grow. Renaming 39 established functions in one change would be
+# shrink, never grow. Renaming 67 established functions in one change would be
 # a large, risky refactor with no behavioural benefit, and demanding it would
 # have made this guard un-mergeable — so the guard's job is to stop the NEXT
 # one, which is the actual observed problem (three introduced in a single PR).
+#
+# It grew 39 -> 67 when the scan stopped treating a markdown mention as a
+# caller: those 28 were never exempt on merit, only by documentation.
 #
 # `test_grandfathered_set_only_shrinks` enforces the ratchet; if you rename one
 # of these, delete it from here in the same change.
 _GRANDFATHERED = frozenset({
     "absorb_supplied_answers", "actionable_solution_defects",
-    "branch_has_commits_ahead", "capture_conformance_baseline",
-    "compute_run_branch", "detect_recipe_from_lockfiles",
-    "detect_session_limit", "discover_rules_files", "discover_runs",
-    "extract_readme_sections", "filter_offtree_subtasks", "find_pr_template",
-    "gather_or_cancel", "glob_task_references", "heal_apply_patch",
-    "heal_baseline", "heal_replay_patched", "is_protected_path",
-    "judge_capture", "partition_lines", "partition_symbols_by_line",
-    "replay_capture", "report_run", "run_conformer", "run_mise_install",
-    "run_script", "run_setup_hook", "run_streaming", "scan_conflict_markers",
-    "select_active_oauth_token", "surface_clarification",
-    "synth_mise_go_override", "validate_checkpoint",
-    "validate_conformance_result", "validate_provision_recipe",
-    "verbosity_from_shortcuts", "warn_cross_planner_file_overlap",
-    "warn_layer_gaps", "write_heal_report",
+    "branch_has_commits_ahead", "build_repo_map",
+    "capture_conformance_baseline", "clobbered_owned_files",
+    "compute_run_branch", "compute_subtask_branch", "detect_no_work",
+    "detect_recipe_from_lockfiles", "detect_session_limit",
+    "discover_rules_files", "discover_runs",
+    "enforce_and_record_cgroup_containment", "extract_readme_sections",
+    "filter_offtree_subtasks", "filter_satisfied_subtasks",
+    "find_pr_template", "gather_or_cancel",
+    "gather_provision_fixtures", "glob_task_references",
+    "heal_apply_patch", "heal_baseline", "heal_replay_patched",
+    "is_protected_path", "judge_capture", "list_runs", "load_prompt",
+    "orchestrate", "partition_files", "partition_lines",
+    "partition_symbols_by_line", "probe_criteria_satisfied_on_head",
+    "rank_repo_map", "recursive_decompose", "replay_capture",
+    "report_run", "request_patch", "rescue_integrator_work",
+    "resolve_token_probe_cache_sec", "rollback_conformer_commits",
+    "run_conformer", "run_final_conformance", "run_implementer",
+    "run_mise_install", "run_script", "run_setup_hook",
+    "run_streaming", "scan_conflict_markers", "schedule",
+    "select_active_oauth_token", "settle_subtask",
+    "surface_clarification", "synth_mise_go_override",
+    "validate_checkpoint", "validate_conformance_result",
+    "validate_plan", "validate_provision_recipe", "validate_result",
+    "validate_resume_state", "verbosity_from_shortcuts",
+    "warn_cross_planner_file_overlap", "warn_layer_gaps",
+    "warn_provider_subset_subtasks",
+    "warn_test_subtask_missing_producer_edge", "write_heal_report",
+    "write_plan",
 })
 
 # Whole families that are public by documented convention, not by accident.
@@ -95,7 +117,11 @@ def _referenced_outside_orchestrator(name: str) -> bool:
     for path in REPO.rglob("*"):
         if not path.is_file():
             continue
-        if path.suffix not in (".py", ".sh", ".md", ".json", ""):
+        # Only things that can actually CALL a Python function. Markdown was
+        # scanned originally, which exempted 26 helpers on the strength of a
+        # doc mention alone — and since CLAUDE.md documents nearly every
+        # symbol here, that hole would swallow most future offenders too.
+        if path.suffix not in (".py", ".sh", ""):
             continue
         rel = path.relative_to(REPO).as_posix()
         if rel.startswith(("tests/", ".git/", "docs/")):
@@ -152,6 +178,28 @@ def test_allowlisted_names_actually_exist():
     defined = set(_module_level_defs())
     stale = [n for n in _EXTERNAL_API if n not in defined]
     assert not stale, f"_EXTERNAL_API names no longer defined: {stale}"
+
+
+def test_allowlisted_names_have_a_real_code_caller():
+    """The justification must be TRUE, not just present.
+
+    `_EXTERNAL_API` originally carried two entries — `compute_subtask_branch`
+    ("worktree scripts") and `resolve_token_probe_cache_sec` ("launcher") —
+    whose stated callers did not exist. Both names were lifted from CLAUDE.md
+    prose listing public API and given justifications nobody verified; they
+    are referenced only in markdown. `test_allowlisted_names_actually_exist`
+    could not catch that, because the names *are* defined.
+
+    An exemption whose reason is false is worse than no exemption: it silently
+    removes a name from the guard forever."""
+    liars = [n for n in _EXTERNAL_API
+             if not _referenced_outside_orchestrator(n)]
+    assert not liars, (
+        f"_EXTERNAL_API entries with no actual code caller: {sorted(liars)}. "
+        "Either the justification is wrong (move the name to _GRANDFATHERED "
+        "or make it private), or the caller lives in a file type this scan "
+        "does not read — in which case widen the scan deliberately."
+    )
 
 
 def test_grandfathered_set_only_shrinks():

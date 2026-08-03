@@ -20420,9 +20420,6 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             if isinstance(sid, str) and "-" in sid
         }
         scope = _replan_domain_closure(plans, implicated)
-        log(f"phase 2¾: {len(unresolvable)} unresolvable collision(s) — "
-            f"re-planning {len(scope)} domain(s) ({', '.join(sorted(scope))}) "
-            "with the contradiction as feedback, instead of dying")
         # Preflight BEFORE recording the attempt. The flag means "a re-plan
         # was actually attempted", not "we reached the point of considering
         # one" — and `check_replan_affordable` can `die()`. Setting the flag
@@ -20434,6 +20431,14 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
         # failed to resolve the contradiction when no re-plan had run.
         # Reproduced by execution before this fix.
         check_replan_affordable(st, caps, "overlap judge", plans)
+        # Logged only once the re-plan is actually going to happen. Announcing
+        # it above the preflight produced a log that read "…instead of dying"
+        # immediately followed by the preflight's die — a line contradicting
+        # what happened next, which is exactly the kind of thing that makes a
+        # failed run slow to diagnose.
+        log(f"phase 2¾: {len(unresolvable)} unresolvable collision(s) — "
+            f"re-planning {len(scope)} domain(s) ({', '.join(sorted(scope))}) "
+            "with the contradiction as feedback, instead of dying")
         st.data["overlap_replan_done"] = True
         st.save()
         replan_task = (
