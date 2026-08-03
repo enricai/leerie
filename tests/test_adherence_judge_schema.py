@@ -218,7 +218,7 @@ def test_adherence_judge_schema_round_trips(leerie):
 # --- wiring checks ----------------------------------------------------------
 
 def test_adherence_judge_in_worker_types(leerie):
-    """adherence_judge must be in WORKER_TYPES so load_prompt / claude_p
+    """adherence_judge must be in WORKER_TYPES so _load_prompt / claude_p
     accept it and per-worker CLI/env/TOML resolution registers it."""
     assert "adherence_judge" in leerie.WORKER_TYPES
 
@@ -241,7 +241,7 @@ def test_adherence_judge_effort_default_is_medium(leerie):
 
 
 def test_adherence_judge_prompt_file_exists(leerie):
-    """prompts/adherence_judge.md must exist — load_prompt() reads it at
+    """prompts/adherence_judge.md must exist — _load_prompt() reads it at
     call time."""
     from pathlib import Path
     leerie_path = Path(leerie.__file__)

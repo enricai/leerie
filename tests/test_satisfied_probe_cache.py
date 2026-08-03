@@ -1,5 +1,5 @@
 """Dedicated pin for `satisfied_probe_cache` read/write seams inside
-`filter_satisfied_subtasks`'s `probe_one` (DESIGN §6 "The satisfied-probe
+`_filter_satisfied_subtasks`'s `probe_one` (DESIGN §6 "The satisfied-probe
 sweep needs finer-than-phase granularity" / bugfix-005).
 
 Scope is deliberately narrow — a single checkable condition: does
@@ -61,7 +61,7 @@ def _sub(sid, **kw):
 
 def _init_git_repo(path: Path) -> str:
     """Create a minimal real git repo at `path` and return HEAD's sha —
-    `filter_satisfied_subtasks` scopes the cache to `_branch_head_sha`."""
+    `_filter_satisfied_subtasks` scopes the cache to `_branch_head_sha`."""
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", "t@example.com"],
@@ -106,7 +106,7 @@ def test_cached_satisfied_drops_with_zero_claude_p_calls(
         return {"satisfied": False, "evidence": "still needed"}
     monkeypatch.setattr(leerie, "claude_p", counting_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     # claude_p was invoked only for the UNCACHED sid — never for feat-001.
@@ -136,7 +136,7 @@ def test_cached_not_satisfied_keeps_with_zero_claude_p_calls(
         raise AssertionError("claude_p must not be called on a cache hit")
     monkeypatch.setattr(leerie, "claude_p", counting_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert calls == []
@@ -174,7 +174,7 @@ def test_uncached_sid_probed_once_and_verdict_persisted_both_outcomes(
         return {"satisfied": False, "evidence": "not yet"}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert calls == {"feat-sat": 1, "feat-unsat": 1}
@@ -211,7 +211,7 @@ def test_crash_keeps_subtask_and_writes_no_cache_entry(
         raise leerie.WorkerError("probe boom")
     monkeypatch.setattr(leerie, "claude_p", crashing_claude_p)
 
-    res = _run(leerie.filter_satisfied_subtasks(
+    res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert calls == {"feat-crash": 1}
@@ -232,7 +232,7 @@ def test_crash_keeps_subtask_and_writes_no_cache_entry(
 #
 # The falsifier: removing the `st.save()` after the `cache[sid]={...}` write
 # in probe_one makes this test fail — with the save gone, the on-disk
-# state.json carries no verdict until gather_or_cancel completes, so the
+# state.json carries no verdict until _gather_or_cancel completes, so the
 # in-flight read below sees an empty cache.
 # ---------------------------------------------------------------------------
 
@@ -246,7 +246,7 @@ def test_verdict_reaches_disk_before_the_sweep_completes(
 
     # feat-slow blocks until feat-fast's verdict has been SAVED to disk, then
     # inspects the on-disk state.json. Because feat-slow's coroutine has not
-    # returned at that point, the sweep-final flush (after gather_or_cancel)
+    # returned at that point, the sweep-final flush (after _gather_or_cancel)
     # cannot have run yet — so any verdict seen on disk got there via the
     # per-verdict save inside probe_one.
     #
@@ -278,7 +278,7 @@ def test_verdict_reaches_disk_before_the_sweep_completes(
         return {"satisfied": False, "evidence": "slow", "checked": []}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    _run(leerie.filter_satisfied_subtasks(
+    _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     assert inspected.is_set()

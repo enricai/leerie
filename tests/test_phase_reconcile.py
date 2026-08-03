@@ -78,7 +78,7 @@ def test_phase_reconcile_dies_on_planner_vs_planner_id_collision(leerie, tmp_pat
     """Two planners (different domains) both emit a subtask with id
     `feat-001`. Each planner's prompt tells it to prefix its ids with
     its domain, but the prompt is advisory per CLAUDE.md; if a planner
-    ignores the rule and the orchestrator doesn't catch it, schedule()'s
+    ignores the rule and the orchestrator doesn't catch it, _schedule()'s
     dict-flatten would silently overwrite — the same silent-data-loss
     failure class as the reconciler-output collisions caught
     downstream.
@@ -220,7 +220,7 @@ def test_phase_reconcile_uses_reconciler_model(leerie):
 def test_phase_reconcile_uses_reconciler_prompt(leerie):
     """The system prompt comes from prompts/reconciler.md."""
     src = inspect.getsource(leerie.phase_reconcile)
-    assert 'load_prompt("reconciler")' in src
+    assert '_load_prompt("reconciler")' in src
 
 
 def test_phase_reconcile_dies_on_unresolvable(leerie):
@@ -351,7 +351,7 @@ def test_phase_reconcile_external_only_short_circuits(leerie, tmp_path):
     assert result is plans
     # No worker spawned.
     assert st.data.get("worker_count", 0) == 0
-    # External preconditions persisted for write_plan to pick up.
+    # External preconditions persisted for _write_plan to pick up.
     pre = st.data.get("external_preconditions", [])
     assert len(pre) == 1
     assert pre[0]["tag"] == "dynamo-table"
@@ -387,7 +387,7 @@ def test_phase_reconcile_promotes_collision_before_unresolved_check(leerie, tmp_
 
 def test_phase_reconcile_persists_empty_preconditions_when_none(leerie, tmp_path):
     """`external_preconditions` is always persisted (even as []) so
-    write_plan() has a consistent key to read from. Catches a regression
+    _write_plan() has a consistent key to read from. Catches a regression
     where st.save() is skipped on the empty path."""
     plans = [
         _plan("feature-implementation",

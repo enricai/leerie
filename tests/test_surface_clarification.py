@@ -1,10 +1,10 @@
-"""Direct unit tests for surface_clarification().
+"""Direct unit tests for _surface_clarification().
 
 The helper carries a mid-execution clarification question across a
 worker boundary: TTY path captures the answer with input() and
 returns True; non-TTY path writes .leerie/pending-clarifications.json
 and exits with EXIT_NEEDS_ANSWERS. The Pass-7 coupling test verifies
-the *call site* in settle_subtask invokes this helper; these tests
+the *call site* in _settle_subtask invokes this helper; these tests
 verify the helper's own behavior so a refactor that breaks the JSON
 shape, the answer-key naming, or the exit code is caught.
 
@@ -33,7 +33,7 @@ def _question(qid: str = "feat-001-q1") -> dict:
 
 @pytest.fixture
 def state(leerie, tmp_path):
-    """A State pointed at a tmp per-run directory. surface_clarification
+    """A State pointed at a tmp per-run directory. _surface_clarification
     derives the per-run dir from st.path.parent, so we need a real
     on-disk State."""
     leerie_root = tmp_path / ".leerie"
@@ -51,26 +51,26 @@ def test_tty_path_stores_answer_under_question_id(leerie, state, monkeypatch):
     """The TTY branch captures the user's input via input() and stores
     it in st.data['answers'][question['id']]. This key choice is
     load-bearing: the re-spawned implementer reads its
-    _clarification_answers by the same id (see settle_subtask which
+    _clarification_answers by the same id (see _settle_subtask which
     rewrites the spec from st.data['answers'])."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: "preserve compat")
     q = _question("auth-001-q1")
-    result = leerie.surface_clarification(
+    result = leerie._surface_clarification(
         "auth-001", q, "/tmp/checkpoint.md", state)
     assert result is True
     assert state.data["answers"]["auth-001-q1"] == "preserve compat"
 
 
 def test_tty_path_strips_whitespace(leerie, state, monkeypatch):
-    """The .strip() in surface_clarification is the existing
+    """The .strip() in _surface_clarification is the existing
     gather_answers convention. Trailing newlines from input() shouldn't
     pollute the answer downstream — pin the strip so a future
     refactor that removes it is caught."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: "  break compat  \n")
     q = _question()
-    leerie.surface_clarification("feat-001", q, "/tmp/cp.md", state)
+    leerie._surface_clarification("feat-001", q, "/tmp/cp.md", state)
     assert state.data["answers"][q["id"]] == "break compat"
 
 
@@ -84,18 +84,18 @@ def test_tty_path_empty_input_stores_empty_string(leerie, state, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: "")
     q = _question()
-    leerie.surface_clarification("feat-001", q, "/tmp/cp.md", state)
+    leerie._surface_clarification("feat-001", q, "/tmp/cp.md", state)
     assert state.data["answers"][q["id"]] == ""
 
 
 def test_tty_path_persists_state_to_disk(leerie, state, monkeypatch):
     """Same persistence-survives-process property as
-    absorb_supplied_answers: the answer must reach state.json on disk
+    _absorb_supplied_answers: the answer must reach state.json on disk
     so the re-spawned worker (in a fresh process) can read it."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt: "answer text")
     q = _question("test-q1")
-    leerie.surface_clarification("test-sid", q, "/tmp/cp.md", state)
+    leerie._surface_clarification("test-sid", q, "/tmp/cp.md", state)
     on_disk = json.loads(state.path.read_text())
     assert on_disk["answers"]["test-q1"] == "answer text"
 
@@ -112,7 +112,7 @@ def test_non_tty_writes_pending_clarifications_json(leerie, state,
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     q = _question("feat-001-q1")
     with pytest.raises(SystemExit) as exc:
-        leerie.surface_clarification(
+        leerie._surface_clarification(
             "feat-001", q, "/path/to/checkpoint.md", state)
     assert exc.value.code == leerie.EXIT_NEEDS_ANSWERS
 
@@ -133,7 +133,7 @@ def test_non_tty_saves_state_before_exiting(leerie, state, monkeypatch):
     state.data["answers"]["earlier-answer"] = "from before"
     q = _question()
     with pytest.raises(SystemExit):
-        leerie.surface_clarification("sid", q, "/cp.md", state)
+        leerie._surface_clarification("sid", q, "/cp.md", state)
     # state.json on disk reflects the in-memory state at exit time.
     on_disk = json.loads(state.path.read_text())
     assert on_disk["answers"]["earlier-answer"] == "from before"
@@ -147,7 +147,7 @@ def test_non_tty_exit_code_is_exit_needs_answers(leerie, state, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     q = _question()
     with pytest.raises(SystemExit) as exc:
-        leerie.surface_clarification("sid", q, "/cp.md", state)
+        leerie._surface_clarification("sid", q, "/cp.md", state)
     assert exc.value.code == 10
     # Constant matches the literal — guard against the constant being
     # changed without the wrapper-facing contract being reviewed.
@@ -157,14 +157,14 @@ def test_non_tty_exit_code_is_exit_needs_answers(leerie, state, monkeypatch):
 def test_non_tty_does_not_modify_answers(leerie, state, monkeypatch):
     """The non-TTY path defers the answer — it shouldn't pre-populate
     anything in st.data['answers']. (The answer arrives later via
-    --resume --answers FILE, handled by absorb_supplied_answers.)
+    --resume --answers FILE, handled by _absorb_supplied_answers.)
     Pin this so a future change that, say, writes a stub answer to
     avoid the re-ask doesn't accidentally land."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     before = dict(state.data["answers"])
     q = _question("never-asked-q1")
     with pytest.raises(SystemExit):
-        leerie.surface_clarification("sid", q, "/cp.md", state)
+        leerie._surface_clarification("sid", q, "/cp.md", state)
     # answers dict on disk is the SAME as before (modulo state.save
     # rewriting the file, but with the same content)
     on_disk = json.loads(state.path.read_text())

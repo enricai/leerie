@@ -5,7 +5,7 @@ Covers:
   - the cap rename: `handoff_continuations` → `subtask_continuations`
   - the schema additions (new status enum value, new
     `clarification_question` field)
-  - the cross-field invariant in `validate_result`: the new status
+  - the cross-field invariant in `_validate_result`: the new status
     requires both `clarification_question` (with three non-empty
     sub-fields) AND `checkpoint_path` (existing and on disk)
 """
@@ -57,7 +57,7 @@ def test_clarification_question_field_shape(leerie):
         assert cq["properties"][f]["type"] == "string"
 
 
-# ----- cross-field invariant in validate_result ------------------------------
+# ----- cross-field invariant in _validate_result ------------------------------
 
 def _good_clarification_result(checkpoint_path: str) -> dict:
     return {
@@ -100,14 +100,14 @@ def _write_valid_checkpoint(tmp_path: Path) -> Path:
 def test_validate_result_passes_well_formed_clarification(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
-    assert leerie.validate_result(res) is None
+    assert leerie._validate_result(res) is None
 
 
 def test_validate_result_rejects_missing_clarification_question(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"] = None
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "clarification_question" in err[1]
@@ -118,7 +118,7 @@ def test_validate_result_rejects_empty_question_field(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["question"] = ""
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "question" in err[1]
@@ -131,7 +131,7 @@ def test_validate_result_rejects_empty_why_underivable(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["why_underivable"] = "   "
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "why_underivable" in err[1]
@@ -141,7 +141,7 @@ def test_validate_result_rejects_missing_checkpoint_path(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["checkpoint_path"] = None
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "checkpoint_path" in err[1]
@@ -156,7 +156,7 @@ def test_validate_result_rejects_nonexistent_checkpoint_file(leerie, tmp_path):
     (see test_incomplete_handoff_with_nonexistent_checkpoint_returns_error
     in test_validate_result.py)."""
     res = _good_clarification_result(str(tmp_path / "ghost.md"))
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "does not exist" in err[1]
@@ -168,7 +168,7 @@ def test_validate_result_rejects_empty_question_id(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["id"] = ""
-    err = leerie.validate_result(res)
+    err = leerie._validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "id" in err[1]
@@ -178,7 +178,7 @@ def test_validate_result_rejects_empty_question_id(leerie, tmp_path):
 
 def test_incomplete_handoff_still_requires_checkpoint(leerie):
     """The cap rename did not affect this invariant; pin it."""
-    err = leerie.validate_result({
+    err = leerie._validate_result({
         "subtask_id": "x", "status": "incomplete-handoff",
         "checkpoint_path": None,
     })
@@ -188,7 +188,7 @@ def test_incomplete_handoff_still_requires_checkpoint(leerie):
 
 
 def test_blocked_still_requires_blocker(leerie):
-    err = leerie.validate_result({
+    err = leerie._validate_result({
         "subtask_id": "x", "status": "blocked", "blocker": "",
     })
     assert err is not None

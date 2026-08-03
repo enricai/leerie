@@ -61,9 +61,9 @@ def test_retryable_kinds_constant_matches_documented_set(leerie):
 _PRODUCER_RETRYABLE_KINDS = {
     # check_branch_has_commits → "no_commits"
     "no_commits",
-    # the inline dirty-worktree check in settle_subtask → "dirty_worktree"
+    # the inline dirty-worktree check in _settle_subtask → "dirty_worktree"
     "dirty_worktree",
-    # validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
+    # _validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
     "empty_handoff",
 }
 
@@ -93,12 +93,12 @@ def test_check_branch_has_commits_tags_no_commits(leerie):
 
 
 def test_validate_result_tags_empty_handoff_for_missing_checkpoint(leerie):
-    """`validate_result`'s incomplete-handoff + missing-checkpoint arm
+    """`_validate_result`'s incomplete-handoff + missing-checkpoint arm
     must tag `("empty_handoff", ...)` — this is the Claude Code
     session-limit / rate-limit safety net path."""
-    src = inspect.getsource(leerie.validate_result)
+    src = inspect.getsource(leerie._validate_result)
     assert '"empty_handoff"' in src, (
-        "validate_result no longer tags `empty_handoff` for the "
+        "_validate_result no longer tags `empty_handoff` for the "
         "incomplete-handoff missing-checkpoint case — the session-"
         "limit no-op recovery path would be silently downgraded "
         "to terminal."
@@ -106,25 +106,25 @@ def test_validate_result_tags_empty_handoff_for_missing_checkpoint(leerie):
 
 
 def test_settle_subtask_tags_dirty_worktree(leerie):
-    """The inline dirty-worktree check in `settle_subtask` is the only
+    """The inline dirty-worktree check in `_settle_subtask` is the only
     producer of the `dirty_worktree` kind. Find it in the leerie.py
     source text and confirm the literal appears."""
     source = LEERIE_PY.read_text()
     settle_match = re.search(
-        r"^(?:async )?def settle_subtask\b.*?"
+        r"^(?:async )?def _settle_subtask\b.*?"
         r"(?=^(?:async )?(?:def |class ))",
         source, re.DOTALL | re.MULTILINE,
     )
-    assert settle_match, "could not locate settle_subtask in source"
+    assert settle_match, "could not locate _settle_subtask in source"
     assert '"dirty_worktree"' in settle_match.group(0), (
-        "settle_subtask's dirty-worktree check no longer tags "
+        "_settle_subtask's dirty-worktree check no longer tags "
         "`dirty_worktree` — that retryable case would be silently "
         "downgraded to terminal."
     )
 
 
 def test_settle_subtask_fail_calls_use_two_arg_signature():
-    """Every `await fail(...)` invocation inside `settle_subtask` must
+    """Every `await fail(...)` invocation inside `_settle_subtask` must
     pass exactly two positional args: (kind, reason). The legacy
     single-arg shape `fail(reason)` would raise `TypeError` at runtime
     because `fail` was changed to take a structured `failure_kind`
@@ -132,24 +132,24 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
     worker-self-reported-failed arm because no test exercised that
     branch (the path is rare in production — see the "Per-subtask
     checks" table in IMPLEMENTATION.md §5 "Deterministic enforcement
-    points"). This test parses settle_subtask's AST and asserts the
+    points"). This test parses _settle_subtask's AST and asserts the
     signature is consistent across ALL call sites.
 
     Concretely guards: the worker-self-reported `status: "failed"`
-    arm in settle_subtask must pass a structured kind alongside the
+    arm in _settle_subtask must pass a structured kind alongside the
     worker's freeform summary."""
     source = LEERIE_PY.read_text()
     tree = ast.parse(source)
 
-    # Locate settle_subtask in the module's top-level functions.
+    # Locate _settle_subtask in the module's top-level functions.
     settle = None
     for node in tree.body:
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "settle_subtask":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_settle_subtask":
             settle = node
             break
-    assert settle is not None, "could not locate settle_subtask in leerie.py AST"
+    assert settle is not None, "could not locate _settle_subtask in leerie.py AST"
 
-    # Find every Call node inside settle_subtask whose callee is the
+    # Find every Call node inside _settle_subtask whose callee is the
     # bare name `fail` — the local closure. Exclude the def itself.
     fail_calls = []
     for node in ast.walk(settle):
@@ -158,7 +158,7 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
             fail_calls.append(node)
 
     assert fail_calls, (
-        "no `fail(...)` calls found inside settle_subtask — the test's "
+        "no `fail(...)` calls found inside _settle_subtask — the test's "
         "AST walk is broken or the function was renamed."
     )
 
@@ -168,7 +168,7 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
         if len(call.args) != 2
     ]
     assert not bad, (
-        f"fail() calls inside settle_subtask must pass exactly 2 "
+        f"fail() calls inside _settle_subtask must pass exactly 2 "
         f"positional args (kind, reason); found wrong arity at: {bad!r}. "
         f"Every fail() invocation must pair a structured "
         f"`failure_kind` with a human-readable `reason`."

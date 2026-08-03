@@ -92,10 +92,10 @@ def _run_phase_plan(leerie, task: str, replan_round: int = 0,
         return [subtask]  # already a leaf
 
     with (
-        patch.object(leerie, "load_prompt", return_value="system-prompt"),
+        patch.object(leerie, "_load_prompt", return_value="system-prompt"),
         patch.object(leerie, "claude_p", new=AsyncMock(side_effect=fake_claude_p)),
         patch.object(leerie, "check_planner_output", return_value=[]),
-        patch.object(leerie, "recursive_decompose",
+        patch.object(leerie, "_recursive_decompose",
                      new=AsyncMock(side_effect=fake_recursive_decompose)),
     ):
         plans = _run(leerie.phase_plan(
@@ -179,7 +179,7 @@ class TestReplanCallSitesIncrementRound:
         with (
             patch.object(leerie, "claude_p", new=AsyncMock(side_effect=fake_claude_p)),
             patch.object(leerie, "phase_plan", new=AsyncMock(side_effect=fake_phase_plan)),
-            patch.object(leerie, "load_prompt", return_value="sys"),
+            patch.object(leerie, "_load_prompt", return_value="sys"),
         ):
             try:
                 _run(leerie.phase_adherence_gate(

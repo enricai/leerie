@@ -1,28 +1,28 @@
-"""Tests for the empty-handoff-keeps-committed-work fix (settle_subtask).
+"""Tests for the empty-handoff-keeps-committed-work fix (_settle_subtask).
 
 The defect: when a worker is reaped mid-turn (e.g. it backgrounded an
 expensive final step like a build that OOM-died) it writes no checkpoint,
-`validate_result` tags the synthesized result `empty_handoff`, and the settle
+`_validate_result` tags the synthesized result `empty_handoff`, and the settle
 loop `fail()`s it — which `_reset_subtask_worktree`s away a green, committed
 diff and burns the retry cap until the whole run dies.
 
-The fix (in `settle_subtask`): before failing an `empty_handoff`, if the
+The fix (in `_settle_subtask`): before failing an `empty_handoff`, if the
 worktree has commits ahead of the run branch, the worker DID produce a
 deliverable — settle it as `complete` and let the advisory conformance phase
 record whatever verification step didn't finish, instead of discarding it.
 
-The load-bearing predicate is `branch_has_commits_ahead` — a POSITIVE-polarity
+The load-bearing predicate is `_branch_has_commits_ahead` — a POSITIVE-polarity
 bool (True only when the worktree exists, git succeeds, AND there are commits).
 This matters: the earlier `check_branch_has_commits(...) is None` gate was buggy
 because that function returns None for THREE cases (worktree gone, git failed,
 has-commits), so it would have rescued an `empty_handoff` as a fake `complete`
-when the worktree was gone. `branch_has_commits_ahead` collapses the
+when the worktree was gone. `_branch_has_commits_ahead` collapses the
 indeterminate cases to False (not rescued) so only a proven commit triggers the
 rescue.
 
 These tests pin that predicate's contract against real temp git repos
 (mirroring test_clobbered_owned_files.py) and source-couple the rescue wiring in
-`settle_subtask` so the fix can't be silently reverted.
+`_settle_subtask` so the fix can't be silently reverted.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _repo_with_run_branch(tmp_path):
 
 
 class TestBranchHasCommitsAhead:
-    """`branch_has_commits_ahead(...) is True` is exactly the rescue gate the
+    """`_branch_has_commits_ahead(...) is True` is exactly the rescue gate the
     settle loop uses to decide whether an `empty_handoff` holds real work.
     True ONLY on a proven commit; every indeterminate case is False."""
 
@@ -62,14 +62,14 @@ class TestBranchHasCommitsAhead:
         (d / "feature.py").write_text("the implemented feature\n")
         _git(d, "add", "-A")
         _git(d, "commit", "-qm", "feat: implement the thing")
-        r = asyncio.run(leerie.branch_has_commits_ahead(str(d), "run"))
+        r = asyncio.run(leerie._branch_has_commits_ahead(str(d), "run"))
         assert r is True
 
     def test_no_commits_is_false(self, leerie, tmp_path):
         # Worker was reaped having committed nothing — a genuine no-op. Not
         # rescuable.
         d = _repo_with_run_branch(tmp_path)
-        r = asyncio.run(leerie.branch_has_commits_ahead(str(d), "run"))
+        r = asyncio.run(leerie._branch_has_commits_ahead(str(d), "run"))
         assert r is False
 
     def test_uncommitted_only_is_false(self, leerie, tmp_path):
@@ -77,7 +77,7 @@ class TestBranchHasCommitsAhead:
         # No commit ahead of `run` → not rescuable.
         d = _repo_with_run_branch(tmp_path)
         (d / "half-done.py").write_text("work in progress, never committed\n")
-        r = asyncio.run(leerie.branch_has_commits_ahead(str(d), "run"))
+        r = asyncio.run(leerie._branch_has_commits_ahead(str(d), "run"))
         assert r is False
 
     def test_missing_worktree_is_false(self, leerie, tmp_path):
@@ -86,7 +86,7 @@ class TestBranchHasCommitsAhead:
         # a gone worktree returned None and would have been rescued as a fake
         # complete). This is the load-bearing regression pin for DEFECT 1.
         missing = tmp_path / "gone"
-        r = asyncio.run(leerie.branch_has_commits_ahead(str(missing), "run"))
+        r = asyncio.run(leerie._branch_has_commits_ahead(str(missing), "run"))
         assert r is False
 
     def test_git_failure_is_false(self, leerie, tmp_path):
@@ -95,7 +95,7 @@ class TestBranchHasCommitsAhead:
         # the missing-worktree case, for the returncode!=0 branch.
         notarepo = tmp_path / "plain"
         notarepo.mkdir()
-        r = asyncio.run(leerie.branch_has_commits_ahead(str(notarepo), "run"))
+        r = asyncio.run(leerie._branch_has_commits_ahead(str(notarepo), "run"))
         assert r is False
 
 
@@ -126,18 +126,18 @@ class TestCheckBranchHasCommitsUnchanged:
 
 
 class TestSettleWiring:
-    """Source-coupling guards: the rescue logic is wired into settle_subtask.
+    """Source-coupling guards: the rescue logic is wired into _settle_subtask.
     The fix is inert without this wiring, and a plain re-read of the function
     body catches a silent revert (mirrors test_dep_capture_wiring.py's approach).
     """
 
     def test_settle_subtask_rescues_empty_handoff_with_commits(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         # The rescue branch keys on the empty_handoff kind...
         assert 'kind == "empty_handoff"' in src
         # ...and gates on PROVEN committed work via the positive-polarity
         # predicate (NOT the buggy `check_branch_has_commits(...) is None`).
-        assert "branch_has_commits_ahead(" in src
+        assert "_branch_has_commits_ahead(" in src
         # A rescued result is settled as complete, not failed/reset.
         assert "rescued_from_empty_handoff" in src
 
@@ -145,18 +145,18 @@ class TestSettleWiring:
         """DEFECT 1 regression pin: the rescue must NOT re-introduce the
         `check_branch_has_commits(...) is None` gate, which over-fires on a
         gone worktree / git failure."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         # The empty_handoff rescue region must not gate on `... is None`.
         rescue_start = src.find('kind == "empty_handoff"')
         rescue_region = src[rescue_start:rescue_start + 400]
         assert "check_branch_has_commits" not in rescue_region
-        assert "branch_has_commits_ahead" in rescue_region
+        assert "_branch_has_commits_ahead" in rescue_region
 
     def test_rescue_precedes_the_fail_call(self, leerie):
         """The commit-check must be evaluated BEFORE fail() on the
         empty_handoff path — fail() calls _reset_subtask_worktree, which would
         destroy the very commits the rescue keeps."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         rescue_idx = src.find('kind == "empty_handoff"')
         fail_idx = src.find("done = await fail(kind, reason)")
         assert rescue_idx != -1 and fail_idx != -1
@@ -166,13 +166,13 @@ class TestSettleWiring:
         """A rescued result has no confidence envelope (the worker was reaped
         mid-turn), so the confidence gate must be skipped — otherwise it loops
         re-spawning the doomed worker."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         assert "not rescued_from_empty_handoff" in src
 
     def test_dirty_check_discards_debris_for_rescued(self, leerie):
         """A reaped worker may leave uncommitted debris; a dirty_worktree fail
         would _reset_subtask_worktree and destroy the kept commits. The dirty
         check must discard the debris for rescued results instead of failing."""
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         assert 'git", "checkout", "--", "."' in src
         assert "rescued_from_empty_handoff" in src

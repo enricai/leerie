@@ -180,7 +180,7 @@ class TestStaysSilent:
 
     def test_same_files_but_different_tags(self, leerie):
         """Two subtasks editing one file for different reasons is the
-        deliberately-permissive case `warn_cross_planner_file_overlap`
+        deliberately-permissive case `_warn_cross_planner_file_overlap`
         already covers advisorily."""
         plans = _plans(("feature-implementation", [
             _sub("feat-001", provides=["header"], files=["page.tsx"]),
@@ -278,7 +278,7 @@ class TestInputHandling:
             _plans(("feature-implementation", [a, b]))) == []
 
     def test_output_is_deterministic(self, leerie):
-        """`schedule()` is documented deterministic; a floor whose message
+        """`_schedule()` is documented deterministic; a floor whose message
         order depended on dict iteration would make run logs non-reproducible."""
         plans = _plans(("feature-implementation", [
             _sub("feat-003", provides=["b", "a"], files=["x.ts"]),

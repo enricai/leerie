@@ -1,4 +1,4 @@
-"""Tests for `discover_runs()` — enumerates `.leerie/runs/*/state.json`
+"""Tests for `_discover_runs()` — enumerates `.leerie/runs/*/state.json`
 for `--list` and `--resume` discovery.
 
 Covers: empty repo, single run, multiple runs (sorted), bootstrap dir
@@ -24,19 +24,19 @@ def _make_run(leerie_root: Path, run_id: str, state: dict) -> Path:
 
 def test_discover_runs_empty_dir(leerie, tmp_path):
     """No `.leerie/runs/` directory → empty list, no error."""
-    assert leerie.discover_runs(tmp_path) == []
+    assert leerie._discover_runs(tmp_path) == []
 
 
 def test_discover_runs_empty_runs_dir(leerie, tmp_path):
     """`.leerie/runs/` exists but has no children → empty list."""
     (tmp_path / "runs").mkdir()
-    assert leerie.discover_runs(tmp_path) == []
+    assert leerie._discover_runs(tmp_path) == []
 
 
 def test_discover_runs_single_run(leerie, tmp_path):
     _make_run(tmp_path, "feat-foo-abc123",
               {"task": "do thing", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 1
     assert runs[0]["run_id"] == "feat-foo-abc123"
     assert runs[0]["task"] == "do thing"
@@ -51,7 +51,7 @@ def test_discover_runs_multiple_runs_sorted_newest_first(leerie, tmp_path):
               {"task": "b", "started_at": "2026-05-26T12:00:00+00:00"})
     _make_run(tmp_path, "feat-c-cccccc",
               {"task": "c", "started_at": "2026-05-26T11:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert [r["run_id"] for r in runs] == [
         "feat-b-bbbbbb", "feat-c-cccccc", "feat-a-aaaaaa"
     ]
@@ -63,7 +63,7 @@ def test_discover_runs_skips_non_dirs(leerie, tmp_path):
     (tmp_path / "runs" / "stray-file").write_text("garbage")
     _make_run(tmp_path, "feat-foo-abc123",
               {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 1
 
 
@@ -76,7 +76,7 @@ def test_discover_runs_skips_empty_dirs(leerie, tmp_path):
     (tmp_path / "runs" / "feat-broken-xyz789").mkdir(parents=True)
     _make_run(tmp_path, "feat-foo-abc123",
               {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 1
     assert runs[0]["run_id"] == "feat-foo-abc123"
 
@@ -94,7 +94,7 @@ def _make_orphan(leerie_root: Path, run_id: str, fly: dict) -> Path:
 def test_discover_runs_surfaces_orphan_with_fly_machine_json(leerie, tmp_path):
     """A run dir with fly-machine.json but no state.json is the
     pre-classify failure case (seed_auth aborted before the orchestrator
-    wrote state.json). discover_runs must surface it so --list and
+    wrote state.json). _discover_runs must surface it so --list and
     --resume can reach it. Marked `_orphan=True` with started_at copied
     from the fly sidecar."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {
@@ -103,7 +103,7 @@ def test_discover_runs_surfaces_orphan_with_fly_machine_json(leerie, tmp_path):
         "started_at": "2026-06-04T19:20:58+00:00",
         "run_id": "feat-seed-died-abc123",
     })
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 1
     assert runs[0]["run_id"] == "feat-seed-died-abc123"
     assert runs[0]["_orphan"] is True
@@ -121,7 +121,7 @@ def test_discover_runs_skips_malformed_fly_machine_json(leerie, tmp_path, capsys
     (run_dir / "fly-machine.json").write_text("{not valid json")
     _make_run(tmp_path, "feat-foo-abc123",
               {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     # The malformed orphan does NOT appear; the healthy run does.
     assert [r["run_id"] for r in runs] == ["feat-foo-abc123"]
 
@@ -141,7 +141,7 @@ def test_discover_runs_mixed_orphan_and_healthy(leerie, tmp_path):
         "task": "z",
         "started_at": "2026-06-04T15:00:00+00:00",
     })
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert [r["run_id"] for r in runs] == [
         "feat-died-aaa111",  # newest
         "feat-mid-ccc333",
@@ -161,7 +161,7 @@ def test_discover_runs_skips_malformed_json(leerie, tmp_path, capsys):
     (run_dir / "state.json").write_text("{not valid json")
     _make_run(tmp_path, "feat-foo-abc123",
               {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 1
     assert runs[0]["run_id"] == "feat-foo-abc123"
 
@@ -172,7 +172,7 @@ def test_discover_runs_skips_non_object_state(leerie, tmp_path):
     run_dir = tmp_path / "runs" / "feat-array-xyz000"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text('["this is", "an array"]')
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert runs == []
 
 
@@ -183,7 +183,7 @@ def test_discover_runs_handles_missing_started_at(leerie, tmp_path):
               {"task": "a", "started_at": "2026-05-26T10:00:00+00:00"})
     _make_run(tmp_path, "feat-undated-bbb222",
               {"task": "b"})  # no started_at
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert len(runs) == 2
     # The one with started_at sorts first; undated sorts last.
     assert runs[0]["run_id"] == "feat-newer-aaa111"
@@ -201,7 +201,7 @@ def test_discover_runs_preserves_state_fields(leerie, tmp_path):
         "categories": ["feature-implementation"],
         "worker_count": 17,
     })
-    runs = leerie.discover_runs(tmp_path)
+    runs = leerie._discover_runs(tmp_path)
     assert runs[0]["finished_at"] == "2026-05-26T11:00:00+00:00"
     assert runs[0]["categories"] == ["feature-implementation"]
     assert runs[0]["worker_count"] == 17

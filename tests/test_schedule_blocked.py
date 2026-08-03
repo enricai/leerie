@@ -1,7 +1,7 @@
-"""Tests for schedule()'s handling of blocked planner outputs.
+"""Tests for _schedule()'s handling of blocked planner outputs.
 
 DESIGN §8 planner gate: a planner can exit `status: "blocked"` with an
-empty subtasks list. schedule() must:
+empty subtasks list. _schedule() must:
   - die with an informative message when ALL planners block (and thus
     no subtasks exist)
   - emit a WARNING and proceed when SOME planners block but at least
@@ -77,7 +77,7 @@ def _blocked_plan(domain: str, gap: dict | None = None) -> dict:
 
 
 def test_all_blocked_dies_with_informative_message(leerie, capsys):
-    """When every planner blocked, schedule() dies citing each blocked
+    """When every planner blocked, _schedule() dies citing each blocked
     domain and pointing the user at the configurable knob and the gap
     field — not the generic 'no subtasks' message."""
     plans = [
@@ -85,7 +85,7 @@ def test_all_blocked_dies_with_informative_message(leerie, capsys):
         _blocked_plan("bug-fixing"),
     ]
     with pytest.raises(SystemExit) as exc:
-        leerie.schedule(plans)
+        leerie._schedule(plans)
     assert exc.value.code != 0
     err = capsys.readouterr().err
     # Specific blocked domains are named so the user knows which planners
@@ -99,18 +99,18 @@ def test_all_blocked_dies_with_informative_message(leerie, capsys):
 
 def test_partial_block_emits_warning_and_proceeds(leerie, capsys):
     """When some planners block but at least one produced subtasks,
-    schedule() must succeed AND log a WARNING naming the blocked
+    _schedule() must succeed AND log a WARNING naming the blocked
     domain(s). Silent loss of a domain is the footgun this test guards
     against."""
     plans = [
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _blocked_plan("bug-fixing"),
     ]
-    subtasks, waves = leerie.schedule(plans)
+    subtasks, waves = leerie._schedule(plans)
     # Scheduling proceeded with the ready domain's subtasks.
     assert "feat-001" in subtasks
     assert any("feat-001" in wave for wave in waves)
-    # The blocked domain is named in a WARNING that schedule() emits
+    # The blocked domain is named in a WARNING that _schedule() emits
     # to stdout via log() (capsys captures both streams).
     out = capsys.readouterr().out
     assert "WARNING" in out
@@ -124,7 +124,7 @@ def test_all_ready_no_warning(leerie, capsys):
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _ready_plan("testing", _good_subtask("test-001")),
     ]
-    subtasks, _waves = leerie.schedule(plans)
+    subtasks, _waves = leerie._schedule(plans)
     assert set(subtasks.keys()) == {"feat-001", "test-001"}
     out = capsys.readouterr().out
     assert "WARNING" not in out
@@ -133,22 +133,22 @@ def test_all_ready_no_warning(leerie, capsys):
 def test_blocked_domain_without_subtasks_does_not_contribute_provides(leerie):
     """Sanity: a blocked planner has subtasks=[], so it provides nothing.
     A ready sibling that requires a capability the blocked planner would
-    have provided will fail validate_plan (tested separately); schedule()
+    have provided will fail _validate_plan (tested separately); _schedule()
     itself just won't see that capability in the providers map.
 
-    This test pins the upstream fact: schedule() merges only the
+    This test pins the upstream fact: _schedule() merges only the
     subtasks of ready (or empty-but-ready) plans, never fabricates
     'provides' on behalf of a blocked planner."""
     plans = [
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _blocked_plan("refactoring"),
     ]
-    subtasks, _waves = leerie.schedule(plans)
+    subtasks, _waves = leerie._schedule(plans)
     # Only the ready domain's subtask is in the merged map.
     assert list(subtasks.keys()) == ["feat-001"]
 
 
-# ----- detect_no_work (DESIGN §8 cleared-but-empty terminal state) ---------
+# ----- _detect_no_work (DESIGN §8 cleared-but-empty terminal state) ---------
 
 def test_detect_no_work_all_ready_empty(leerie):
     """All planners returned status=ready with no subtasks → returns
@@ -156,12 +156,12 @@ def test_detect_no_work_all_ready_empty(leerie):
 
     This is the cleared-but-empty terminal state: each planner cleared
     its gate and confirmed the task is already satisfied on HEAD.
-    `orchestrate` short-circuits on this and exits 0."""
+    `_orchestrate` short-circuits on this and exits 0."""
     plans = [
         _ready_plan("bug-fixing", basis="HEAD already ships the fix"),
         _ready_plan("testing", basis="regression test already exists"),
     ]
-    out = leerie.detect_no_work(plans)
+    out = leerie._detect_no_work(plans)
     assert out == {
         "bug-fixing": "HEAD already ships the fix",
         "testing": "regression test already exists",
@@ -170,32 +170,32 @@ def test_detect_no_work_all_ready_empty(leerie):
 
 def test_detect_no_work_returns_none_when_any_subtasks(leerie):
     """If any planner produced subtasks, that's a normal run — return
-    None so schedule() proceeds. An empty-but-ready sibling simply
+    None so _schedule() proceeds. An empty-but-ready sibling simply
     contributes zero subtasks to the merged plan, which is fine."""
     plans = [
         _ready_plan("bug-fixing", basis="nothing to fix"),
         _ready_plan("feature-implementation",
                     _good_subtask("feat-001"), basis="one subtask"),
     ]
-    assert leerie.detect_no_work(plans) is None
+    assert leerie._detect_no_work(plans) is None
 
 
 def test_detect_no_work_returns_none_when_any_blocked(leerie):
     """An empty-ready + blocked mix is NOT a no-work outcome — a
     blocker is a gate failure the user must see. Return None so
-    schedule()'s existing all-blocked die() path can fire."""
+    _schedule()'s existing all-blocked die() path can fire."""
     plans = [
         _ready_plan("bug-fixing", basis="nothing to fix"),
         _blocked_plan("testing"),
     ]
-    assert leerie.detect_no_work(plans) is None
+    assert leerie._detect_no_work(plans) is None
     # And the existing all-blocked die() still fires for the
-    # blocked-only case (regression guard that detect_no_work didn't
+    # blocked-only case (regression guard that _detect_no_work didn't
     # accidentally swallow the blocked path).
     blocked_only = [_blocked_plan("bug-fixing"), _blocked_plan("testing")]
-    assert leerie.detect_no_work(blocked_only) is None
+    assert leerie._detect_no_work(blocked_only) is None
     with pytest.raises(SystemExit):
-        leerie.schedule(blocked_only)
+        leerie._schedule(blocked_only)
 
 
 def test_detect_no_work_basis_missing_falls_back(leerie):
@@ -206,7 +206,7 @@ def test_detect_no_work_basis_missing_falls_back(leerie):
     job is to surface reasoning, not re-validate the schema."""
     # Missing confidence entirely.
     plans_a = [{"domain": "bug-fixing", "status": "ready", "subtasks": []}]
-    out_a = leerie.detect_no_work(plans_a)
+    out_a = leerie._detect_no_work(plans_a)
     assert out_a is not None
     assert "bug-fixing" in out_a
     assert out_a["bug-fixing"]  # non-empty placeholder
@@ -217,7 +217,7 @@ def test_detect_no_work_basis_missing_falls_back(leerie):
         "subtasks": [],
         "confidence": {"basis": "   "},  # whitespace only
     }]
-    out_b = leerie.detect_no_work(plans_b)
+    out_b = leerie._detect_no_work(plans_b)
     assert out_b is not None
     assert out_b["testing"]  # non-empty placeholder
     plans_c = [{
@@ -226,7 +226,7 @@ def test_detect_no_work_basis_missing_falls_back(leerie):
         "subtasks": [],
         "confidence": None,  # malformed
     }]
-    out_c = leerie.detect_no_work(plans_c)
+    out_c = leerie._detect_no_work(plans_c)
     assert out_c is not None
     assert out_c["configuration-build"]
 
@@ -235,7 +235,7 @@ def test_detect_no_work_empty_plans_returns_none(leerie):
     """No plans at all → return None. (Defensive; the orchestrator
     won't reach phase 3 with an empty plans list, but the helper
     shouldn't crash if it ever does.)"""
-    assert leerie.detect_no_work([]) is None
+    assert leerie._detect_no_work([]) is None
 
 
 # ----- source-text coupling: pin the call site -----------------------------
@@ -243,7 +243,7 @@ def test_detect_no_work_empty_plans_returns_none(leerie):
 def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
     """The cleared-but-empty short-circuit (DESIGN §8) must run after
     phase_reconcile (so the reconciler has had its chance to add
-    subtasks via `added_subtasks`) and before schedule (which would
+    subtasks via `added_subtasks`) and before _schedule (which would
     otherwise hit the all-blocked die() path or proceed with an empty
     plan). Pin the order so a refactor that moves the check elsewhere
     fails this test instead of silently breaking the no-work flow.
@@ -264,23 +264,23 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
         end = rest.find("\ndef ", 1)
     fn = rest[:end if end > 0 else len(rest)]
     reconcile_idx = fn.find("await phase_reconcile(")
-    detect_idx = fn.find("detect_no_work(")
-    schedule_idx = fn.find("schedule(plans)")
+    detect_idx = fn.find("_detect_no_work(")
+    schedule_idx = fn.find("_schedule(plans)")
     assert reconcile_idx >= 0
     assert detect_idx >= 0, (
-        "_run_phases must call detect_no_work() — without it, a run "
+        "_run_phases must call _detect_no_work() — without it, a run "
         "where every planner returns status=ready with empty subtasks "
         "dies on 'planners produced no subtasks' instead of exiting "
         "cleanly. See DESIGN §8 *The cleared-but-empty terminal "
         "state*.")
     assert schedule_idx >= 0
     assert reconcile_idx < detect_idx < schedule_idx, (
-        "ordering must be: phase_reconcile → detect_no_work → "
-        "schedule. detect_no_work must come after the reconciler "
+        "ordering must be: phase_reconcile → _detect_no_work → "
+        "_schedule. _detect_no_work must come after the reconciler "
         "(so any added_subtasks land in the plan first) and before "
-        "schedule (which would otherwise die on empty subtasks).")
+        "_schedule (which would otherwise die on empty subtasks).")
     # And the branch must call _finish_no_work_run + return on the
-    # no-work path. A `detect_no_work` call whose result is ignored
+    # no-work path. A `_detect_no_work` call whose result is ignored
     # would not short-circuit phase_execute.
     finish_idx = fn.find("_finish_no_work_run(")
     return_idx = fn.find("return", detect_idx)
@@ -329,8 +329,8 @@ def test_orchestrate_resume_guard_for_no_work_required():
     assert resume_idx < guard_idx < else_idx, (
         "the no_work_required guard must live inside the "
         "`if args.resume:` block — the initial-run path handles the "
-        "no-work case via detect_no_work() between phase_reconcile "
-        "and schedule.")
+        "no-work case via _detect_no_work() between phase_reconcile "
+        "and _schedule.")
     # And the guard must return.
     return_after_guard = fn.find("return", guard_idx)
     next_section = fn.find("\n        if ", guard_idx + 1)

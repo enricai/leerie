@@ -1,15 +1,15 @@
-"""Tests for check_convergence(), write_heal_report(), phase_heal(),
+"""Tests for check_convergence(), _write_heal_report(), phase_heal(),
 HEAL_* constants, and importability.
 
 Coverage:
   - check_convergence returns SUCCESS / PLATEAUED / TIMEOUT / BUDGET_EXHAUSTED /
     REGRESSED / CONTINUE under the correct conditions
-  - write_heal_report creates the expected file with best patch text and
+  - _write_heal_report creates the expected file with best patch text and
     iteration count
-  - phase_heal with a stubbed no-op request_patch terminates with PLATEAUED
+  - phase_heal with a stubbed no-op _request_patch terminates with PLATEAUED
     after plateau_window iterations and writes the heal report
   - HEAL_* module constants have the documented default values
-  - check_convergence, write_heal_report, phase_heal are importable and callable
+  - check_convergence, _write_heal_report, phase_heal are importable and callable
 """
 from __future__ import annotations
 
@@ -59,13 +59,13 @@ def _base_config(leerie, **overrides) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_convergence_symbols_importable(leerie):
-    """check_convergence, write_heal_report, phase_heal must be importable."""
+    """check_convergence, _write_heal_report, phase_heal must be importable."""
     assert hasattr(leerie, "check_convergence"), \
         "check_convergence not in leerie"
     assert callable(leerie.check_convergence)
-    assert hasattr(leerie, "write_heal_report"), \
-        "write_heal_report not in leerie"
-    assert callable(leerie.write_heal_report)
+    assert hasattr(leerie, "_write_heal_report"), \
+        "_write_heal_report not in leerie"
+    assert callable(leerie._write_heal_report)
     assert hasattr(leerie, "phase_heal"), \
         "phase_heal not in leerie"
     assert callable(leerie.phase_heal)
@@ -305,11 +305,11 @@ def test_check_convergence_continue_with_no_history(leerie, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Criterion 7: write_heal_report creates file
+# Criterion 7: _write_heal_report creates file
 # ---------------------------------------------------------------------------
 
 def test_write_heal_report_creates_file(leerie, tmp_path):
-    """write_heal_report creates healing-<call_type>.md in state_dir."""
+    """_write_heal_report creates healing-<call_type>.md in state_dir."""
     hs = _make_heal_state(
         leerie, tmp_path,
         call_type="classifier",
@@ -320,7 +320,7 @@ def test_write_heal_report_creates_file(leerie, tmp_path):
             {"iter_n": 2, "pass_rate": 0.80},
         ],
     )
-    path = leerie.write_heal_report("classifier", hs, "patch content here")
+    path = leerie._write_heal_report("classifier", hs, "patch content here")
     assert path.exists(), f"Report not created at {path}"
     assert path.name == "healing-classifier.md"
 
@@ -335,7 +335,7 @@ def test_write_heal_report_contains_best_patch(leerie, tmp_path):
         history=[{"iter_n": 1, "pass_rate": 0.75}],
     )
     patch = "THIS IS THE BEST PATCH CONTENT"
-    path = leerie.write_heal_report("planner", hs, patch)
+    path = leerie._write_heal_report("planner", hs, patch)
     content = path.read_text()
     assert patch in content, f"Best patch text not found in report:\n{content}"
 
@@ -351,7 +351,7 @@ def test_write_heal_report_contains_iteration_count(leerie, tmp_path):
         baseline={"z": {"pass_rate": 0.40}},
         history=history,
     )
-    path = leerie.write_heal_report("implementer", hs, "patch")
+    path = leerie._write_heal_report("implementer", hs, "patch")
     content = path.read_text()
     assert str(n_iters) in content, (
         f"Iteration count {n_iters} not found in report:\n{content}")
@@ -366,7 +366,7 @@ def test_write_heal_report_no_patch_placeholder(leerie, tmp_path):
         baseline={},
         history=[],
     )
-    path = leerie.write_heal_report("classifier", hs)
+    path = leerie._write_heal_report("classifier", hs)
     content = path.read_text()
     assert "no patch" in content.lower() or "baseline" in content.lower(), (
         f"Expected placeholder in empty-patch report:\n{content}")
@@ -457,7 +457,7 @@ def _patch_network(leerie, monkeypatch):
     async def fake_replay(record, *, override_system_prompt=None, cwd=None):
         return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
@@ -467,7 +467,7 @@ def _patch_network(leerie, monkeypatch):
 
 
 def _no_op_request_patch(hs, iter_n: int):
-    """Stub request_patch that always returns a fixed no-op patch."""
+    """Stub _request_patch that always returns a fixed no-op patch."""
     return ("ANCHOR_HERE", f"FIXED_PATCH_iter{iter_n}")
 
 

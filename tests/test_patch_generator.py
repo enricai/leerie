@@ -2,11 +2,11 @@
 
 Covers:
   (1) SCHEMAS["patch_generator"] validates the expected envelope shapes
-  (2) request_patch builds a user_prompt containing the capture response
+  (2) _request_patch builds a user_prompt containing the capture response
       and the resolved prompt body
-  (3) request_patch raises ValueError (or returns sentinel) when anchor is
+  (3) _request_patch raises ValueError (or returns sentinel) when anchor is
       not a substring of the resolved prompt body
-  (4) phase_heal with the real request_patch (stubbed claude_p) runs a
+  (4) phase_heal with the real _request_patch (stubbed claude_p) runs a
       full baseline → request → apply → replay → converge cycle
   (5) prompts/patch_generator.md exists and contains expected sections
 """
@@ -111,11 +111,11 @@ def _make_state(leerie, run_dir: Path):
 
 
 def _patch_network(leerie, monkeypatch):
-    """Patch both replay_capture and _invoke so no real network calls occur."""
+    """Patch both _replay_capture and _invoke so no real network calls occur."""
     async def fake_replay(record, *, override_system_prompt=None, cwd=None):
         return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-    monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+    monkeypatch.setattr(leerie, "_replay_capture", fake_replay)
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
@@ -228,12 +228,12 @@ def test_patch_generator_schema_allows_null_pivot_reason(leerie):
 
 
 # ---------------------------------------------------------------------------
-# Criterion 2: request_patch user_prompt contains capture and prompt body
+# Criterion 2: _request_patch user_prompt contains capture and prompt body
 # ---------------------------------------------------------------------------
 
 def test_request_patch_user_prompt_contains_capture_and_prompt(
         leerie, tmp_path, monkeypatch):
-    """request_patch must pass a user_prompt that contains:
+    """_request_patch must pass a user_prompt that contains:
     - The failing capture's response_content
     - The resolved prompt body for the call_type
     """
@@ -268,7 +268,7 @@ def test_request_patch_user_prompt_contains_capture_and_prompt(
     }]
     hs.history = []
 
-    asyncio.run(leerie.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
+    asyncio.run(leerie._request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
 
     assert len(captured_user_prompt) == 1, "claude_p was not called exactly once"
     up = captured_user_prompt[0]
@@ -289,7 +289,7 @@ def test_request_patch_user_prompt_contains_capture_and_prompt(
 def test_request_patch_anchor_not_in_prompt_sentinel(
         leerie, tmp_path, monkeypatch):
     """When the worker returns an anchor that is NOT in the resolved prompt
-    body, request_patch must raise ValueError (or return a sentinel), not
+    body, _request_patch must raise ValueError (or return a sentinel), not
     silently apply garbage.
     """
     _, real_prompt_body, _ = leerie.resolve_prompt("classifier")
@@ -326,7 +326,7 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
     raised_value_error = False
 
     try:
-        result = asyncio.run(leerie.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
+        result = asyncio.run(leerie._request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
         # If no exception, the function must have returned a sentinel.
         # A sentinel is indicated by the anchor being empty/None or by
         # the caller receiving something that cannot be applied.
@@ -338,7 +338,7 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
         raised_value_error = True
 
     assert raised_value_error or sentinel_returned, (
-        "request_patch must raise ValueError or return a sentinel when anchor "
+        "_request_patch must raise ValueError or return a sentinel when anchor "
         "is not found in the resolved prompt body"
     )
 
@@ -347,18 +347,18 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
     if raised_value_error:
         # Re-run to capture the exception type.
         with pytest.raises(ValueError):
-            asyncio.run(leerie.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
+            asyncio.run(leerie._request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
 
 
 # ---------------------------------------------------------------------------
-# Criterion 4: phase_heal with real request_patch runs a full cycle
+# Criterion 4: phase_heal with real _request_patch runs a full cycle
 # ---------------------------------------------------------------------------
 
 def test_phase_heal_with_real_request_patch_runs_cycle(
         leerie, tmp_path, monkeypatch):
-    """phase_heal called with the real request_patch (no request_patch_fn
+    """phase_heal called with the real _request_patch (no request_patch_fn
     override) must complete at least one baseline → request → apply → replay
-    → converge cycle without raising, given stubbed claude_p/replay_capture.
+    → converge cycle without raising, given stubbed claude_p/_replay_capture.
     """
     run_dir = tmp_path / "run"
     heal_dir = tmp_path / "heal"
@@ -406,7 +406,7 @@ def test_phase_heal_with_real_request_patch_runs_cycle(
     verdict = asyncio.run(
         leerie.phase_heal(
             "classifier", records, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
-            # No request_patch_fn → uses real request_patch
+            # No request_patch_fn → uses real _request_patch
             n=1, config=config,
         )
     )
@@ -483,8 +483,8 @@ def test_patch_generator_prompt_has_minimise_change(leerie):
 # ---------------------------------------------------------------------------
 
 def test_request_patch_importable(leerie):
-    """request_patch must be importable from leerie and be callable."""
-    assert hasattr(leerie, "request_patch"), (
-        "request_patch not found in leerie module"
+    """_request_patch must be importable from leerie and be callable."""
+    assert hasattr(leerie, "_request_patch"), (
+        "_request_patch not found in leerie module"
     )
-    assert callable(leerie.request_patch), "request_patch must be callable"
+    assert callable(leerie._request_patch), "_request_patch must be callable"

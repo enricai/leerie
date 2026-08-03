@@ -120,7 +120,7 @@ def test_baseline_section_measured_is_mandatory_no_legacy_default(leerie):
     """`measured` is a mandatory field (no legacy support): an axis dict
     without it is NOT treated as a measured pass/fail. A `passed: False`
     axis missing `measured` is therefore not surfaced as RED — every real
-    axis dict from capture_conformance_baseline always carries the field."""
+    axis dict from _capture_conformance_baseline always carries the field."""
     baseline = {"axes": {
         "tests": {"ran": True, "passed": False,
                   "summary": "2 failed, 100 passed"},
@@ -162,7 +162,7 @@ def test_base_health_payload_red(leerie, tmp_path):
 def test_base_health_payload_unmeasurable_axis_not_red(leerie, tmp_path):
     """Regression: an unmeasurable axis (runner missing) must NOT colour
     base_status red — it carries no verdict. Mirrors the same measured-aware
-    rule in capture_conformance_baseline.red_axes and
+    rule in _capture_conformance_baseline.red_axes and
     _format_baseline_section, so the PR body doesn't show a false-RED base."""
     st = _st(tmp_path, conformance={"_baseline": {"axes": {
         "build": {"ran": False, "measured": False, "passed": None},
@@ -221,28 +221,28 @@ def test_record_run_health_no_logs_dir_is_noop(leerie, tmp_path):
 # --- wiring seams (source-coupling; the fix is inert without them) -------
 
 def test_phase_execute_calls_baseline_gated_on_skip(leerie):
-    """phase_execute must call capture_conformance_baseline, gated on
+    """phase_execute must call _capture_conformance_baseline, gated on
     skip_base_baseline. Silent removal disables F2 entirely."""
     src = inspect.getsource(leerie.phase_execute)
-    assert "capture_conformance_baseline(" in src, (
-        "phase_execute must invoke capture_conformance_baseline() — the "
+    assert "_capture_conformance_baseline(" in src, (
+        "phase_execute must invoke _capture_conformance_baseline() — the "
         "base-tree health baseline (DESIGN §9) stops firing without it.")
     assert 'skip_base_baseline' in src, (
         "the baseline call must be gated on st.data['skip_base_baseline'] "
         "so --skip-base-baseline actually skips it.")
     # The call must be inside a non-fatal guard (advisory phase).
-    call_pos = src.index("capture_conformance_baseline(")
+    call_pos = src.index("_capture_conformance_baseline(")
     try_pos = src.rindex("try:", 0, call_pos)
     except_pos = src.index("except Exception", call_pos)
     assert try_pos < call_pos < except_pos, (
-        "capture_conformance_baseline() must sit inside a try/except "
+        "_capture_conformance_baseline() must sit inside a try/except "
         "Exception guard — a baseline glue error must never block the run.")
 
 
 def test_both_conformers_inject_baseline_section(leerie):
-    """run_conformer and run_final_conformance must both append the
+    """_run_conformer and _run_final_conformance must both append the
     BASELINE: section so the conformer scopes residuals to the delta."""
-    for fn in (leerie.run_conformer, leerie.run_final_conformance):
+    for fn in (leerie._run_conformer, leerie._run_final_conformance):
         src = inspect.getsource(fn)
         assert "_format_baseline_section(" in src, (
             f"{fn.__name__} must inject _format_baseline_section() into the "
@@ -262,16 +262,16 @@ def test_phase_finalize_records_run_health(leerie):
 def test_baseline_maps_tests_axis_to_resolve_blt_test_key(leerie):
     """Regression: resolve_blt keys the test command "test" (singular),
     but the baseline stores/reports the axis as "tests" (plural, matching
-    the conformer result shape). capture_conformance_baseline must map
+    the conformer result shape). _capture_conformance_baseline must map
     "tests" -> blt["test"], else the tests axis silently never runs.
 
     Pins the mapping in source so a future refactor can't reintroduce the
     `blt.get("tests")` (always-None) bug."""
-    src = inspect.getsource(leerie.capture_conformance_baseline)
+    src = inspect.getsource(leerie._capture_conformance_baseline)
     # The command lookup must go through the axis->cmd-key map, not a bare
     # blt.get(axis) which would return None for the "tests" axis.
     assert "_AXIS_CMD_KEY" in src, (
-        "capture_conformance_baseline must map the 'tests' axis to "
+        "_capture_conformance_baseline must map the 'tests' axis to "
         "resolve_blt's 'test' key — a bare blt.get('tests') is always None "
         "and silently skips the test suite.")
     assert '"tests": "test"' in src, (

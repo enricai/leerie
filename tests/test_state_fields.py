@@ -6,7 +6,7 @@ Two parities are enforced:
 1. spec ↔ code: the field table in IMPLEMENTATION.md §8 lists exactly
    the names in `STATE_FIELDS`.
 2. code ↔ runtime: every `st.data["x"] = ...`, `st.data.setdefault("x", ...)`,
-   and key in the run-init dict literal in `orchestrate()` uses a name
+   and key in the run-init dict literal in `_orchestrate()` uses a name
    that appears in `STATE_FIELDS`.
 
 If a future change adds a new state field, both this test and the spec
@@ -47,13 +47,13 @@ def _spec_fields() -> set[str]:
 def _runtime_field_writes() -> set[str]:
     """Every name used as a key on `st.data` in leerie.py — whether via
     `st.data["x"] = ...`, `st.data.setdefault("x", ...)`, or as a key in
-    the run-init dict literal in `orchestrate()`."""
+    the run-init dict literal in `_orchestrate()`."""
     source = LEERIE_PY.read_text()
 
     direct = set(re.findall(r'st\.data\["([a-z_]+)"\]\s*=', source))
     setdefault = set(re.findall(r'st\.data\.setdefault\("([a-z_]+)"', source))
 
-    # The init in `orchestrate()` writes several keys in one dict literal:
+    # The init in `_orchestrate()` writes several keys in one dict literal:
     #   st.data = {"task": task, "started_at": now(), ...}
     init_match = re.search(
         r"st\.data\s*=\s*\{(.*?)\}", source, re.DOTALL,

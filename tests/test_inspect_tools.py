@@ -188,7 +188,7 @@ def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
     checks the CONSTANT's content but not that the call site uses it.
 
     Boundary note: unlike the sibling call-site tests above (which slice to
-    the next `async def`), filter_satisfied_subtasks is followed by a large
+    the next `async def`), _filter_satisfied_subtasks is followed by a large
     NON-async block (the provisioning helpers), so the next-`async def`
     bound would span ~40KB of unrelated code and make the negative asserts
     scoped far too broadly. Slice to the next top-level `def `/`async def`
@@ -196,7 +196,7 @@ def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
     """
     import re
     src = LEERIE_PY.read_text()
-    start = src.index("async def filter_satisfied_subtasks(")
+    start = src.index("async def _filter_satisfied_subtasks(")
     m = re.search(r"\n(?:async def |def )", src[start + 10:])
     end = start + 10 + m.start() if m else len(src)
     body = src[start:end]
@@ -204,11 +204,11 @@ def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
     # future refactor that moves the claude_p call out of this function
     # can't make the tool-scope asserts vacuously pass.
     assert "claude_p(" in body, (
-        "filter_satisfied_subtasks body no longer contains the claude_p "
+        "_filter_satisfied_subtasks body no longer contains the claude_p "
         "call — this test's boundary or the worker wiring changed"
     )
     assert "allowed_tools=SATISFIED_PROBE_TOOLS" in body, (
-        "filter_satisfied_subtasks must pass "
+        "_filter_satisfied_subtasks must pass "
         "allowed_tools=SATISFIED_PROBE_TOOLS to claude_p"
     )
     assert "allowed_tools=INSPECT_TOOLS" not in body

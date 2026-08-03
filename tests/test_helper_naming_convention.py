@@ -46,49 +46,12 @@ _EXTERNAL_API = {
     "main": "console entry point",
 }
 
-# Pre-existing public-but-internal helpers, captured when this guard was
-# introduced (2026-08-03). This is a RATCHET, not an approval: the set may
-# shrink, never grow. Renaming 67 established functions in one change would be
-# a large, risky refactor with no behavioural benefit, and demanding it would
-# have made this guard un-mergeable — so the guard's job is to stop the NEXT
-# one, which is the actual observed problem (three introduced in a single PR).
-#
-# It grew 39 -> 67 when the scan stopped treating a markdown mention as a
-# caller: those 28 were never exempt on merit, only by documentation.
-#
-# `test_grandfathered_set_only_shrinks` enforces the ratchet; if you rename one
-# of these, delete it from here in the same change.
-_GRANDFATHERED = frozenset({
-    "absorb_supplied_answers", "actionable_solution_defects",
-    "branch_has_commits_ahead", "build_repo_map",
-    "capture_conformance_baseline", "clobbered_owned_files",
-    "compute_run_branch", "compute_subtask_branch", "detect_no_work",
-    "detect_recipe_from_lockfiles", "detect_session_limit",
-    "discover_rules_files", "discover_runs",
-    "enforce_and_record_cgroup_containment", "extract_readme_sections",
-    "filter_offtree_subtasks", "filter_satisfied_subtasks",
-    "find_pr_template", "gather_or_cancel",
-    "gather_provision_fixtures", "glob_task_references",
-    "heal_apply_patch", "heal_baseline", "heal_replay_patched",
-    "is_protected_path", "judge_capture", "list_runs", "load_prompt",
-    "orchestrate", "partition_files", "partition_lines",
-    "partition_symbols_by_line", "probe_criteria_satisfied_on_head",
-    "rank_repo_map", "recursive_decompose", "replay_capture",
-    "report_run", "request_patch", "rescue_integrator_work",
-    "resolve_token_probe_cache_sec", "rollback_conformer_commits",
-    "run_conformer", "run_final_conformance", "run_implementer",
-    "run_mise_install", "run_script", "run_setup_hook",
-    "run_streaming", "scan_conflict_markers", "schedule",
-    "select_active_oauth_token", "settle_subtask",
-    "surface_clarification", "synth_mise_go_override",
-    "validate_checkpoint", "validate_conformance_result",
-    "validate_plan", "validate_provision_recipe", "validate_result",
-    "validate_resume_state", "verbosity_from_shortcuts",
-    "warn_cross_planner_file_overlap", "warn_layer_gaps",
-    "warn_provider_subset_subtasks",
-    "warn_test_subtask_missing_producer_edge", "write_heal_report",
-    "write_plan",
-})
+# EMPTY, and it must stay that way. This started as a 67-name ratchet of
+# pre-existing public-but-internal helpers; all 67 were renamed, so there is
+# nothing left to grandfather. Anything added here is a new exemption — prefer
+# renaming the helper, or `_EXTERNAL_API` if it genuinely has an outside
+# caller (which `test_allowlisted_names_have_a_real_code_caller` verifies).
+_GRANDFATHERED = frozenset()
 
 # Whole families that are public by documented convention, not by accident.
 _PUBLIC_FAMILIES = (
@@ -183,8 +146,8 @@ def test_allowlisted_names_actually_exist():
 def test_allowlisted_names_have_a_real_code_caller():
     """The justification must be TRUE, not just present.
 
-    `_EXTERNAL_API` originally carried two entries — `compute_subtask_branch`
-    ("worktree scripts") and `resolve_token_probe_cache_sec` ("launcher") —
+    `_EXTERNAL_API` originally carried two entries — `_compute_subtask_branch`
+    ("worktree scripts") and `_resolve_token_probe_cache_sec` ("launcher") —
     whose stated callers did not exist. Both names were lifted from CLAUDE.md
     prose listing public API and given justifications nobody verified; they
     are referenced only in markdown. `test_allowlisted_names_actually_exist`

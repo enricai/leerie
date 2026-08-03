@@ -283,11 +283,11 @@ class TestBothRootCausesComposeOnOnePayload:
         # incident's own CLAUDE.md text reaches no gate at all — leerie
         # names the file for the planner and `task_coverage_judge` reads
         # it, but nothing harvests headings out of it into a ratio.
-        assert leerie.glob_task_references(task, tmp_path), (
+        assert leerie._glob_task_references(task, tmp_path), (
             "the incident task should still resolve CLAUDE.md — otherwise "
             "this composition tests nothing about root cause A")
         section = leerie._format_task_file_references(
-            leerie.glob_task_references(task, tmp_path), tmp_path)
+            leerie._glob_task_references(task, tmp_path), tmp_path)
         assert "CLAUDE.md" in section
         for heading in shape["coverage_gate"][
                 "uncoverable_backtick_must_headings"]:

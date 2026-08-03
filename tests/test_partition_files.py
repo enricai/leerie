@@ -1,4 +1,4 @@
-"""Unit tests for partition_files() — the deterministic chunker (DESIGN §5½ (P1)).
+"""Unit tests for _partition_files() — the deterministic chunker (DESIGN §5½ (P1)).
 
 Verifies the 'complete by construction' invariant: union of chunks == input
 set, no file in two chunks, chunk sizes bounded by the target. Named
@@ -36,7 +36,7 @@ CASES = [
 @pytest.mark.parametrize("label,files,chunk_size", CASES, ids=[c[0] for c in CASES])
 def test_coverage_100_percent(leerie, label, files, chunk_size):
     """Every input file appears in the output exactly once."""
-    chunks = leerie.partition_files(files, chunk_size)
+    chunks = leerie._partition_files(files, chunk_size)
     flat = [f for chunk in chunks for f in chunk]
     assert len(flat) == len(files)
     assert sorted(flat) == sorted(files)
@@ -45,7 +45,7 @@ def test_coverage_100_percent(leerie, label, files, chunk_size):
 @pytest.mark.parametrize("label,files,chunk_size", CASES, ids=[c[0] for c in CASES])
 def test_zero_overlap(leerie, label, files, chunk_size):
     """No file appears in more than one chunk."""
-    chunks = leerie.partition_files(files, chunk_size)
+    chunks = leerie._partition_files(files, chunk_size)
     seen: set[str] = set()
     for chunk in chunks:
         for f in chunk:
@@ -56,7 +56,7 @@ def test_zero_overlap(leerie, label, files, chunk_size):
 @pytest.mark.parametrize("label,files,chunk_size", CASES, ids=[c[0] for c in CASES])
 def test_chunk_size_bounded(leerie, label, files, chunk_size):
     """Every chunk is at most chunk_size (last chunk may be smaller)."""
-    chunks = leerie.partition_files(files, chunk_size)
+    chunks = leerie._partition_files(files, chunk_size)
     for chunk in chunks:
         assert len(chunk) <= max(chunk_size, 1)
 
@@ -64,7 +64,7 @@ def test_chunk_size_bounded(leerie, label, files, chunk_size):
 @pytest.mark.parametrize("label,files,chunk_size", CASES, ids=[c[0] for c in CASES])
 def test_order_preserved(leerie, label, files, chunk_size):
     """Files appear in the same order across all chunks as in the input."""
-    chunks = leerie.partition_files(files, chunk_size)
+    chunks = leerie._partition_files(files, chunk_size)
     flat = [f for chunk in chunks for f in chunk]
     assert flat == files
 
@@ -74,16 +74,16 @@ def test_order_preserved(leerie, label, files, chunk_size):
 # ---------------------------------------------------------------------------
 
 def test_empty_input_returns_empty_list(leerie):
-    assert leerie.partition_files([], 8) == []
+    assert leerie._partition_files([], 8) == []
 
 
 def test_single_file_one_chunk(leerie):
-    assert leerie.partition_files(["a.py"], 8) == [["a.py"]]
+    assert leerie._partition_files(["a.py"], 8) == [["a.py"]]
 
 
 def test_exact_multiple_chunk_count(leerie):
     files = _make_files(16)
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     assert len(chunks) == 2
     assert chunks[0] == files[:8]
     assert chunks[1] == files[8:]
@@ -91,7 +91,7 @@ def test_exact_multiple_chunk_count(leerie):
 
 def test_partial_last_chunk_sizes(leerie):
     files = _make_files(10)
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     assert len(chunks) == 2
     assert len(chunks[0]) == 8
     assert len(chunks[1]) == 2
@@ -100,13 +100,13 @@ def test_partial_last_chunk_sizes(leerie):
 def test_chunk_size_degenerate_zero_returns_single_chunk(leerie):
     """chunk_size < 1 returns all files in a single chunk (degenerate guard)."""
     files = ["a.py", "b.py"]
-    chunks = leerie.partition_files(files, 0)
+    chunks = leerie._partition_files(files, 0)
     assert chunks == [["a.py", "b.py"]]
 
 
 def test_chunk_size_1_one_file_per_chunk(leerie):
     files = ["a.py", "b.py", "c.py"]
-    chunks = leerie.partition_files(files, 1)
+    chunks = leerie._partition_files(files, 1)
     assert chunks == [["a.py"], ["b.py"], ["c.py"]]
 
 
@@ -122,7 +122,7 @@ def test_29_file_migration_sweep_complete(leerie):
     code-partition is complete by construction.
     """
     files = [f"src/module{i:03d}.ts" for i in range(29)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
 
     flat = [f for chunk in chunks for f in chunk]
     assert sorted(flat) == sorted(files), "coverage: all 29 files must appear"
@@ -143,10 +143,10 @@ def test_64_file_date_fns_sweep_complete(leerie):
 
     This is the dominant telemetry case (84% of affected runs) where leerie
     jammed all 64 files into one subtask, exhausting the worker's budget
-    mid-execution. partition_files covers all 64 by construction.
+    mid-execution. _partition_files covers all 64 by construction.
     """
     files = [f"src/date-fns/migrate_{i:03d}.ts" for i in range(64)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
 
     flat = [f for chunk in chunks for f in chunk]
     assert sorted(flat) == sorted(files), "coverage: all 64 files must appear"

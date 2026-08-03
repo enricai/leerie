@@ -195,7 +195,7 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -276,7 +276,7 @@ def test_concrete_defect_dies(leerie, tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -352,7 +352,7 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -434,7 +434,7 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
     monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)

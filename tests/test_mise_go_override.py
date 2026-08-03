@@ -1,4 +1,4 @@
-"""Tests for `synth_mise_go_override` — leerie's bridge between Go's
+"""Tests for `_synth_mise_go_override` — leerie's bridge between Go's
 `go.mod` and mise's go plugin.
 
 Mise does NOT parse `go.mod`'s `go 1.X` line (the mise maintainer
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 def test_no_gomod_returns_none(leerie, tmp_path):
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -31,7 +31,7 @@ def test_synthesizes_from_simple_gomod(leerie, tmp_path):
     (tmp_path / "go.mod").write_text(
         "module example.com/foo\n\ngo 1.22\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is not None
     body = out.read_text()
     assert '[tools]' in body
@@ -44,7 +44,7 @@ def test_synthesizes_with_patch_version(leerie, tmp_path):
     (tmp_path / "go.mod").write_text(
         "module example.com/foo\n\ngo 1.22.3\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'go = "1.22.3"' in body
 
@@ -54,7 +54,7 @@ def test_existing_go_version_file_blocks_synth(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".go-version").write_text("1.21.5\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -63,7 +63,7 @@ def test_existing_tool_versions_with_go_blocks_synth(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".tool-versions").write_text("go 1.21.5\nnode 20.11.0\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -74,7 +74,7 @@ def test_existing_tool_versions_without_go_does_not_block(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".tool-versions").write_text("node 20.11.0\npython 3.11.7\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is not None
 
 
@@ -83,7 +83,7 @@ def test_existing_mise_toml_with_go_blocks_synth(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / "mise.toml").write_text('[tools]\ngo = "1.21"\nnode = "20.11.0"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -102,7 +102,7 @@ def test_existing_mise_toml_without_go_is_concatenated(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / "mise.toml").write_text('[tools]\nnode = "20.11.0"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body
     assert 'go = "1.22"' in body
@@ -122,7 +122,7 @@ def test_existing_mise_toml_without_tools_section_gets_one_appended(
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / "mise.toml").write_text('[env]\nFOO = "bar"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'FOO = "bar"' in body
     assert 'go = "1.22"' in body
@@ -142,7 +142,7 @@ def test_polyglot_go_plus_nvmrc_injects_node_pin(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".nvmrc").write_text("20.11.0\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'go = "1.22"' in body
     assert 'node = "20.11.0"' in body
@@ -157,7 +157,7 @@ def test_dotted_mise_toml_with_go_blocks_synth(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".mise.toml").write_text('[tools]\ngo = "1.20"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -169,7 +169,7 @@ def test_dotted_mise_toml_node_pin_survives_synth(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".mise.toml").write_text('[tools]\nnode = "20.11.0"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'go = "1.22"' in body
     assert 'node = "20.11.0"' in body, \
@@ -185,7 +185,7 @@ def test_capital_v_prefix_is_stripped(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".nvmrc").write_text("V20.11.0\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body
     assert 'node = "V20.11.0"' not in body
@@ -205,7 +205,7 @@ def test_asdf_nodejs_alias_normalized_to_node(leerie, tmp_path):
     (tmp_path / ".tool-versions").write_text(
         "nodejs 18.17.0\npython 3.11.7\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body, ".nvmrc must win the precedence"
     assert 'node = "18.17.0"' not in body, "nodejs alias must not clobber"
@@ -220,7 +220,7 @@ def test_tool_versions_nodejs_alone_normalized_to_node(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".tool-versions").write_text("nodejs 20.11.0\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body
     assert 'nodejs' not in body
@@ -232,7 +232,7 @@ def test_nvmrc_v_prefix_is_stripped(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".nvmrc").write_text("v20.11.0\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body
     assert 'node = "v20.11.0"' not in body
@@ -244,7 +244,7 @@ def test_polyglot_go_plus_python_version(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     (tmp_path / ".python-version").write_text("3.11.7\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'go = "1.22"' in body
     assert 'python = "3.11.7"' in body
@@ -263,7 +263,7 @@ def test_existing_mise_toml_pin_wins_over_idiomatic_file(leerie, tmp_path):
     (tmp_path / ".nvmrc").write_text("20.11.0\n")
     (tmp_path / "mise.toml").write_text('[tools]\nnode = "18.17.0"\n')
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "18.17.0"' in body
     assert 'node = "20.11.0"' not in body
@@ -284,7 +284,7 @@ def test_tool_versions_multiple_entries_injected(leerie, tmp_path):
         "ruby 3.3.0\n"
     )
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     body = out.read_text()
     assert 'node = "20.11.0"' in body
     assert 'python = "3.11.7"' in body
@@ -298,7 +298,7 @@ def test_malformed_gomod_returns_none(leerie, tmp_path):
     guessing."""
     (tmp_path / "go.mod").write_text("module example.com/foo\n")
     run_dir = tmp_path / ".leerie" / "runs" / "x"
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is None
 
 
@@ -308,7 +308,7 @@ def test_run_dir_is_created_if_missing(leerie, tmp_path):
     (tmp_path / "go.mod").write_text("go 1.22\n")
     run_dir = tmp_path / ".leerie" / "runs" / "fresh" / "nested"
     assert not run_dir.exists()
-    out = leerie.synth_mise_go_override(tmp_path, run_dir)
+    out = leerie._synth_mise_go_override(tmp_path, run_dir)
     assert out is not None
     assert out.parent == run_dir
     assert run_dir.is_dir()

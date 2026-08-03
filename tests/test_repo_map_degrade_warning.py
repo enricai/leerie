@@ -1,10 +1,10 @@
 """G6 — make silent P6 degradation visible (DESIGN §12 "no silent
 under-coverage").
 
-When build_repo_map() finds source files but produces an EMPTY symbol graph
+When _build_repo_map() finds source files but produces an EMPTY symbol graph
 (tree-sitter unavailable or its API incompatible — e.g. a language-pack
 version without process()), the whole P6 layer silently becomes a no-op the
-planner cannot detect. build_repo_map() must emit exactly ONE warning per
+planner cannot detect. _build_repo_map() must emit exactly ONE warning per
 process in that case, and stay quiet for a genuinely empty/non-code repo.
 
 These tests force the empty-graph condition by stubbing _parse_repo_file, so
@@ -49,7 +49,7 @@ def test_warns_when_source_files_but_empty_graph(leerie, tmp_path, capsys):
     (tmp_path / "b.ts").write_text("function y(){}\n")
     lr = tmp_path / "leerie-root"
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
-        rm = leerie.build_repo_map(tmp_path, lr)
+        rm = leerie._build_repo_map(tmp_path, lr)
     assert rm["files"] == {}
     out = capsys.readouterr().out
     assert "repo-map is empty" in out
@@ -62,7 +62,7 @@ def test_no_warning_for_non_code_repo(leerie, tmp_path, capsys):
     (tmp_path / "data.json").write_text("{}\n")
     lr = tmp_path / "leerie-root"
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
-        rm = leerie.build_repo_map(tmp_path, lr)
+        rm = leerie._build_repo_map(tmp_path, lr)
     assert rm["files"] == {}
     assert "repo-map is empty" not in capsys.readouterr().out
 
@@ -71,9 +71,9 @@ def test_warns_only_once_per_process(leerie, tmp_path, capsys):
     (tmp_path / "app.py").write_text("def x():\n    pass\n")
     lr = tmp_path / "leerie-root"
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
-        leerie.build_repo_map(tmp_path, lr)
+        leerie._build_repo_map(tmp_path, lr)
         first = capsys.readouterr().out
-        leerie.build_repo_map(tmp_path, lr)
+        leerie._build_repo_map(tmp_path, lr)
         second = capsys.readouterr().out
     assert "repo-map is empty" in first
     assert "repo-map is empty" not in second
@@ -94,7 +94,7 @@ def test_warning_includes_probe_exception_detail(leerie, tmp_path, capsys):
         return [], []
 
     with patch.object(leerie, "_parse_repo_file", new=_parse):
-        rm = leerie.build_repo_map(tmp_path, lr)
+        rm = leerie._build_repo_map(tmp_path, lr)
     assert rm["files"] == {}
     out = capsys.readouterr().out
     assert "repo-map is empty" in out
@@ -111,7 +111,7 @@ def test_no_probe_detail_when_empty_result_is_not_an_exception(
     (tmp_path / "app.py").write_text("def x():\n    pass\n")
     lr = tmp_path / "leerie-root"
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
-        rm = leerie.build_repo_map(tmp_path, lr)
+        rm = leerie._build_repo_map(tmp_path, lr)
     assert rm["files"] == {}
     out = capsys.readouterr().out
     assert "repo-map is empty" in out
@@ -136,6 +136,6 @@ def test_no_false_warning_when_parser_works_but_repo_symbolless(
         return [], []
 
     with patch.object(leerie, "_parse_repo_file", new=_parse):
-        rm = leerie.build_repo_map(tmp_path, lr)
+        rm = leerie._build_repo_map(tmp_path, lr)
     assert rm["files"] == {}
     assert "repo-map is empty" not in capsys.readouterr().out

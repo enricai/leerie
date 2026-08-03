@@ -12,7 +12,7 @@ test_dep_capture_wiring.py's inspect.getsource approach):
   2. A violation (floor issue or low adherence score) routes through the
      EXISTING _run_checked_loop planner-retry path — re-invoking phase_plan
      — not a new pause/resume mechanism. Negatively: the gate's source must
-     NOT introduce EXIT_NEEDS_ANSWERS / surface_clarification machinery.
+     NOT introduce EXIT_NEEDS_ANSWERS / _surface_clarification machinery.
   3. adherence_judge's WorkerError degrades (keeps the floor-only verdict,
      never discards the assembled plan) rather than propagating and
      abandoning the plan — mirroring fit_judge's WorkerError->degrade shape
@@ -157,7 +157,7 @@ class TestViolationRoutesThroughExistingRetryLoop:
         """NEGATIVE pin (per investigation_notes): the design explicitly
         reuses _run_checked_loop and does NOT add a new pause/resume path.
         The gate's source must not reference EXIT_NEEDS_ANSWERS or
-        surface_clarification — introducing either would mean a second,
+        _surface_clarification — introducing either would mean a second,
         undocumented pause mechanism competing with the classifier's
         existing clarification-question flow."""
         src = inspect.getsource(leerie.phase_adherence_gate)
@@ -166,8 +166,8 @@ class TestViolationRoutesThroughExistingRetryLoop:
             "violations are handled via the existing _run_checked_loop "
             "re-plan path, not a new pause/resume exit code"
         )
-        assert "surface_clarification" not in src, (
-            "phase_adherence_gate must NOT call surface_clarification — "
+        assert "_surface_clarification" not in src, (
+            "phase_adherence_gate must NOT call _surface_clarification — "
             "that is the classifier/implementer clarification-question "
             "seam, not the plan-check retry seam this gate reuses"
         )
@@ -299,8 +299,8 @@ class TestPlannerSchemaCarriesRunsCommands:
 
 
 # ---------------------------------------------------------------------------
-# Sanity: the phase itself is wired into the orchestrate pipeline, after
-# phase_overlap_judge and before schedule() — corroborates the _task
+# Sanity: the phase itself is wired into the _orchestrate pipeline, after
+# phase_overlap_judge and before _schedule() — corroborates the _task
 # insertion-point claim without duplicating test_phase_adherence_gate.py's
 # fuller wiring-order coverage.
 # ---------------------------------------------------------------------------
@@ -310,9 +310,9 @@ class TestPhaseInsertionPoint:
         src = inspect.getsource(leerie)
         overlap_idx = src.find("phase_overlap_judge(")
         gate_idx = src.find("phase_adherence_gate(", overlap_idx)
-        schedule_idx = src.find("schedule(", gate_idx) if gate_idx != -1 else -1
+        schedule_idx = src.find("_schedule(", gate_idx) if gate_idx != -1 else -1
         assert overlap_idx != -1 and gate_idx != -1 and schedule_idx != -1, (
             "expected phase_overlap_judge(...) then phase_adherence_gate(...) "
-            "then schedule(...) to appear in that order in the orchestrator "
+            "then _schedule(...) to appear in that order in the orchestrator "
             "source"
         )

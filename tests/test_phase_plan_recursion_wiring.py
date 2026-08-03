@@ -1,21 +1,21 @@
-"""Tests for P1 Layer C: recursive_decompose wired into phase_plan (DESIGN §5½).
+"""Tests for P1 Layer C: _recursive_decompose wired into phase_plan (DESIGN §5½).
 
 Verifies:
 
-1. Source-coupling guard: phase_plan calls recursive_decompose with the right
+1. Source-coupling guard: phase_plan calls _recursive_decompose with the right
    arguments (inspect.getsource) — any refactor that breaks the wiring fails
    loudly here.
 
 2. Integration: a plan_one result containing one oversized subtask is expanded
-   via a stubbed recursive_decompose into multiple leaves, and that leaf set
+   via a stubbed _recursive_decompose into multiple leaves, and that leaf set
    replaces the original subtasks in the plan before phase_plan returns.
 
-3. Skip / well-fit path: when the stubbed recursive_decompose returns the
+3. Skip / well-fit path: when the stubbed _recursive_decompose returns the
    original subtask as-is (well-fit leaf; score ≥ threshold on the first
    judge call), phase_plan's plan["subtasks"] is the same single-element
    list — no mutation, no extra subtasks.
 
-These tests stub claude_p and recursive_decompose directly, so no live worker
+These tests stub claude_p and _recursive_decompose directly, so no live worker
 is spawned. Phase-plan is exercised end-to-end except for the network/subprocess
 boundary.
 """
@@ -35,23 +35,23 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class TestSourceCouplingGuard:
-    """phase_plan must call recursive_decompose after plan_one collects results."""
+    """phase_plan must call _recursive_decompose after plan_one collects results."""
 
     def test_phase_plan_calls_recursive_decompose(self, leerie):
         src = inspect.getsource(leerie.phase_plan)
-        assert "recursive_decompose(" in src, (
-            "phase_plan must call recursive_decompose() for P1 Layer C. "
+        assert "_recursive_decompose(" in src, (
+            "phase_plan must call _recursive_decompose() for P1 Layer C. "
             "The call was removed or renamed — first-pass subtasks will no "
             "longer be expanded to leaves before reaching phase_reconcile."
         )
 
     def test_phase_plan_passes_depth_zero(self, leerie):
-        """recursive_decompose must be called at depth 0 (top-level entry)."""
+        """_recursive_decompose must be called at depth 0 (top-level entry)."""
         src = inspect.getsource(leerie.phase_plan)
-        assert "recursive_decompose(" in src
+        assert "_recursive_decompose(" in src
         # The depth-0 call is the entry point for each first-pass subtask.
         assert ", 0," in src, (
-            "recursive_decompose must be called with depth=0 in phase_plan "
+            "_recursive_decompose must be called with depth=0 in phase_plan "
             "so the recursion depth cap counts from the planner's level."
         )
 
@@ -60,28 +60,28 @@ class TestSourceCouplingGuard:
         src = inspect.getsource(leerie.phase_plan)
         assert 'plan["subtasks"] = leaves' in src or "plan['subtasks'] = leaves" in src, (
             "phase_plan must assign the leaf union back to plan['subtasks'] "
-            "so that downstream (reconcile→schedule) sees the expanded set."
+            "so that downstream (reconcile→_schedule) sees the expanded set."
         )
 
     def test_phase_plan_passes_repo_map_to_recursive_decompose(self, leerie):
         """G2 caller-side seam: phase_plan must pass the built repo_map into
-        recursive_decompose, else the per-node P6 grounding is dead code
+        _recursive_decompose, else the per-node P6 grounding is dead code
         (the callee has the injection logic but never receives a map)."""
         src = inspect.getsource(leerie.phase_plan)
         assert "repo_map=repo_map" in src, (
-            "phase_plan must call recursive_decompose(..., repo_map=repo_map) "
+            "phase_plan must call _recursive_decompose(..., repo_map=repo_map) "
             "so the once-built symbol graph reaches fit_judge/splitter for "
             "per-node re-ranking (DESIGN §5½ P6)."
         )
 
     def test_phase_plan_expands_before_logging(self, leerie):
-        """The recursive_decompose loop must precede the final logging loop."""
+        """The _recursive_decompose loop must precede the final logging loop."""
         src = inspect.getsource(leerie.phase_plan)
-        decompose_pos = src.index("recursive_decompose(")
+        decompose_pos = src.index("_recursive_decompose(")
         # The final logging line uses the category+plan zip
         logging_pos = src.index('log(f"  {category}:')
         assert decompose_pos < logging_pos, (
-            "recursive_decompose must run before the final per-category "
+            "_recursive_decompose must run before the final per-category "
             "logging so the logged subtask count reflects the expanded set."
         )
 
@@ -158,7 +158,7 @@ class TestRecursionExpansion:
     """phase_plan replaces an oversized subtask with its recursive leaves."""
 
     def test_oversized_subtask_expanded_to_leaves(self, leerie, tmp_path):
-        """Stubbed recursive_decompose returning two leaves → plan has 2 subtasks."""
+        """Stubbed _recursive_decompose returning two leaves → plan has 2 subtasks."""
         st = _make_state(leerie)
         caps = _make_caps(leerie)
         models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
@@ -173,13 +173,13 @@ class TestRecursionExpansion:
         fake_planner_result = json.loads(json.dumps(_PLANNER_RESPONSE))
 
         with (
-            patch.object(leerie, "load_prompt", return_value="system-prompt"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="system-prompt"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=fake_planner_result)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan(
@@ -196,7 +196,7 @@ class TestRecursionExpansion:
         assert ids == {"feat-001-1", "feat-001-2"}
 
     def test_multiple_first_pass_subtasks_all_expanded(self, leerie, tmp_path):
-        """Two first-pass subtasks → recursive_decompose called for each."""
+        """Two first-pass subtasks → _recursive_decompose called for each."""
         st = _make_state(leerie)
         caps = _make_caps(leerie)
         models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
@@ -216,22 +216,22 @@ class TestRecursionExpansion:
             return [subtask]
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan(
                 "Migrate files", st, caps, models, efforts))
 
-        # recursive_decompose was called once per first-pass subtask.
+        # _recursive_decompose was called once per first-pass subtask.
         assert sorted(call_log) == ["feat-001", "feat-002"], (
-            f"Expected recursive_decompose called for each first-pass subtask; "
+            f"Expected _recursive_decompose called for each first-pass subtask; "
             f"call_log={call_log}"
         )
         plan = plans[0]
@@ -243,11 +243,11 @@ class TestRecursionExpansion:
 # ---------------------------------------------------------------------------
 
 class TestWellFitPassThrough:
-    """When recursive_decompose returns the original subtask (well-fit leaf),
+    """When _recursive_decompose returns the original subtask (well-fit leaf),
     plan['subtasks'] is the same single-element list — no mutation."""
 
     def test_well_fit_subtask_passed_through_unchanged(self, leerie, tmp_path):
-        """Stubbed recursive_decompose returning the input subtask as-is."""
+        """Stubbed _recursive_decompose returning the input subtask as-is."""
         well_fit = {**_OVERSIZED_SUBTASK, "id": "feat-001",
                     "files_likely_touched": ["src/one_file.ts"]}
         planner_resp = {**_PLANNER_RESPONSE, "subtasks": [well_fit]}
@@ -263,14 +263,14 @@ class TestWellFitPassThrough:
             return [subtask]
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan(
@@ -282,7 +282,7 @@ class TestWellFitPassThrough:
         assert subtasks[0]["id"] == "feat-001"
 
     def test_empty_subtasks_plan_passes_through(self, leerie, tmp_path):
-        """A plan with no subtasks is left untouched (no recursive_decompose call)."""
+        """A plan with no subtasks is left untouched (no _recursive_decompose call)."""
         planner_resp = {**_PLANNER_RESPONSE, "subtasks": []}
         call_count = [0]
 
@@ -296,21 +296,21 @@ class TestWellFitPassThrough:
             return []
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=json.loads(
                              json.dumps(planner_resp)))),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan(
                 "Nothing to do", st, caps, models, efforts))
 
         assert call_count[0] == 0, (
-            "recursive_decompose should not be called for a plan with no subtasks"
+            "_recursive_decompose should not be called for a plan with no subtasks"
         )
         assert plans[0].get("subtasks", []) == []
 
@@ -323,7 +323,7 @@ class TestWellFitPassThrough:
 class TestExpansionRemapsDependsOn:
     """Expansion vanishes the parent's id; a sibling that named it must be
     rewritten to name every leaf the parent became. Without this the edge
-    dangles and validate_plan die()s the run after the full planner spend.
+    dangles and _validate_plan die()s the run after the full planner spend.
     """
 
     def _drive(self, leerie, planner_resp, fake_decompose):
@@ -332,13 +332,13 @@ class TestExpansionRemapsDependsOn:
         models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
         efforts = {k: None for k in leerie.WORKER_TYPES}
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_decompose)),
         ):
             return _run(leerie.phase_plan("task", st, caps, models, efforts))
@@ -363,7 +363,7 @@ class TestExpansionRemapsDependsOn:
 
         sib = next(s for s in subtasks if s["id"] == "feat-002")
         assert sib["depends_on"] == ["feat-001-1", "feat-001-2"]
-        # No dangling edge — the exact validate_plan gate that killed the run.
+        # No dangling edge — the exact _validate_plan gate that killed the run.
         assert not [d for s in subtasks
                     for d in (s.get("depends_on") or []) if d not in ids]
 

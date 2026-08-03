@@ -201,7 +201,7 @@ def test_fit_judge_schema_round_trips(leerie):
 # --- wiring checks ----------------------------------------------------------
 
 def test_fit_judge_in_worker_types(leerie):
-    """fit_judge must be in WORKER_TYPES so load_prompt / claude_p accept it."""
+    """fit_judge must be in WORKER_TYPES so _load_prompt / claude_p accept it."""
     assert "fit_judge" in leerie.WORKER_TYPES
 
 
@@ -219,7 +219,7 @@ def test_fit_judge_effort_default_is_medium(leerie):
 
 
 def test_fit_judge_prompt_file_exists(leerie):
-    """prompts/fit_judge.md must exist — load_prompt() reads it at call time."""
+    """prompts/fit_judge.md must exist — _load_prompt() reads it at call time."""
     import importlib.util
     from pathlib import Path
     leerie_path = Path(leerie.__file__)

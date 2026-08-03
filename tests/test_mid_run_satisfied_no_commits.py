@@ -5,14 +5,14 @@ The defect: a test-only subtask whose entire deliverable a *sibling subtask*
 already committed to the run branch (in an earlier wave, same run) reaches its
 implementer, correctly reports `complete` with nothing to commit, and the
 mechanical `check_branch_has_commits` no-op gate fails it as `no_commits`. The
-plan-time `filter_satisfied_subtasks` probe judged the BASE tree and could not
+plan-time `_filter_satisfied_subtasks` probe judged the BASE tree and could not
 see the sibling's mid-run commit. A retry reproduces the identical no-op (the
 work exists on the branch the subtask is measured against), the retry cap is
 exhausted, and the wave dies — a deterministic loop that repeats on `--resume`.
 
-The fix (`settle_subtask`): before failing a no-commits `complete`, re-run the
+The fix (`_settle_subtask`): before failing a no-commits `complete`, re-run the
 `satisfied_probe` against the subtask's `success_criteria_seed` on the
-run-branch HEAD via `probe_criteria_satisfied_on_head`. If satisfied, settle
+run-branch HEAD via `_probe_criteria_satisfied_on_head`. If satisfied, settle
 `complete` (recorded in `dropped_subtasks` with reason
 `already_satisfied_mid_run`); if not, the existing `no_commits` retry path is
 unchanged.
@@ -77,9 +77,9 @@ def _patch_probe(leerie, monkeypatch, verdict):
         return verdict
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    # load_prompt reads prompts/satisfied_probe.md off disk; keep it cheap and
+    # _load_prompt reads prompts/satisfied_probe.md off disk; keep it cheap and
     # decoupled from the real prompt text.
-    monkeypatch.setattr(leerie, "load_prompt", lambda *_a, **_k: "SYS")
+    monkeypatch.setattr(leerie, "_load_prompt", lambda *_a, **_k: "SYS")
     return seen
 
 
@@ -88,7 +88,7 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
-# probe_criteria_satisfied_on_head — the helper contract
+# _probe_criteria_satisfied_on_head — the helper contract
 # ---------------------------------------------------------------------------
 
 def test_satisfied_on_head_returns_drop_record(leerie, tmp_path, monkeypatch):
@@ -96,7 +96,7 @@ def test_satisfied_on_head_returns_drop_record(leerie, tmp_path, monkeypatch):
     seen = _patch_probe(leerie, monkeypatch, {
         "satisfied": True, "evidence": "sibling committed the test file",
         "checked": ["tests/test_x.py"]})
-    drop = _run(leerie.probe_criteria_satisfied_on_head(
+    drop = _run(leerie._probe_criteria_satisfied_on_head(
         _sub("test-003"), str(tmp_path / "wt"), st, _CAPS, _MODELS, _EFFORTS))
     assert drop is not None
     assert drop["reason"] == "already_satisfied_mid_run"
@@ -112,7 +112,7 @@ def test_not_satisfied_returns_none(leerie, tmp_path, monkeypatch):
     # subtask must fall through to the existing retry path.
     st = _make_state(leerie, tmp_path / "run")
     _patch_probe(leerie, monkeypatch, {"satisfied": False, "evidence": "gap"})
-    drop = _run(leerie.probe_criteria_satisfied_on_head(
+    drop = _run(leerie._probe_criteria_satisfied_on_head(
         _sub("test-003"), str(tmp_path / "wt"), st, _CAPS, _MODELS, _EFFORTS))
     assert drop is None
 
@@ -125,11 +125,11 @@ def test_no_criterion_never_probes(leerie, tmp_path, monkeypatch):
     async def boom(**_kw):
         raise AssertionError("claude_p must not be called with no criterion")
     monkeypatch.setattr(leerie, "claude_p", boom)
-    monkeypatch.setattr(leerie, "load_prompt", lambda *_a, **_k: "SYS")
+    monkeypatch.setattr(leerie, "_load_prompt", lambda *_a, **_k: "SYS")
 
     sub = _sub("test-003")
     sub["success_criteria_seed"] = "   "  # blank/whitespace → no criterion
-    drop = _run(leerie.probe_criteria_satisfied_on_head(
+    drop = _run(leerie._probe_criteria_satisfied_on_head(
         sub, str(tmp_path / "wt"), st, _CAPS, _MODELS, _EFFORTS))
     assert drop is None
 
@@ -139,7 +139,7 @@ def test_probe_crash_fails_safe_to_none(leerie, tmp_path, monkeypatch):
     # no-op path (a probe crash must never mask a real lazy no-op).
     st = _make_state(leerie, tmp_path / "run")
     _patch_probe(leerie, monkeypatch, "CRASH")
-    drop = _run(leerie.probe_criteria_satisfied_on_head(
+    drop = _run(leerie._probe_criteria_satisfied_on_head(
         _sub("test-003"), str(tmp_path / "wt"), st, _CAPS, _MODELS, _EFFORTS))
     assert drop is None
 
@@ -154,10 +154,10 @@ def test_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
     async def unreached(**_kw):
         raise AssertionError("claude_p must not run once budget is exhausted")
     monkeypatch.setattr(leerie, "claude_p", unreached)
-    monkeypatch.setattr(leerie, "load_prompt", lambda *_a, **_k: "SYS")
+    monkeypatch.setattr(leerie, "_load_prompt", lambda *_a, **_k: "SYS")
 
     try:
-        _run(leerie.probe_criteria_satisfied_on_head(
+        _run(leerie._probe_criteria_satisfied_on_head(
             _sub("test-003"), str(tmp_path / "wt"), st, caps, _MODELS, _EFFORTS))
         raised = False
     except leerie.WorkerError:
@@ -166,14 +166,14 @@ def test_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# settle_subtask wiring — source-coupling guards (mirror
+# _settle_subtask wiring — source-coupling guards (mirror
 # test_empty_handoff_keeps_committed_work.py::TestSettleWiring)
 # ---------------------------------------------------------------------------
 
 class TestSettleWiring:
     def test_settle_calls_head_reprobe_on_no_commits(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
-        assert "probe_criteria_satisfied_on_head(" in src
+        src = inspect.getsource(leerie._settle_subtask)
+        assert "_probe_criteria_satisfied_on_head(" in src
 
     def test_reprobe_precedes_the_fail_call(self, leerie):
         """The HEAD re-probe must run BEFORE the no-commits fail() — fail()
@@ -181,8 +181,8 @@ class TestSettleWiring:
         the rescue prevents. Guard against the FIRST fail() at or after the
         probe (the commit-path fail), since an earlier empty_handoff fail()
         also exists above the probe."""
-        src = inspect.getsource(leerie.settle_subtask)
-        probe_idx = src.find("probe_criteria_satisfied_on_head(")
+        src = inspect.getsource(leerie._settle_subtask)
+        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
         assert probe_idx != -1
         fail_after = src.find("done = await fail(kind, message)", probe_idx)
         assert fail_after != -1, "the commit-path fail() must follow the probe"
@@ -191,8 +191,8 @@ class TestSettleWiring:
     def test_reprobe_gated_on_no_commits_not_empty_handoff(self, leerie):
         """The re-probe lives on the check_branch_has_commits (`commit_err`)
         branch, distinct from the empty_handoff rescue above it."""
-        src = inspect.getsource(leerie.settle_subtask)
-        probe_idx = src.find("probe_criteria_satisfied_on_head(")
+        src = inspect.getsource(leerie._settle_subtask)
+        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
         # the nearest guard above the probe is the `if commit_err ...` branch
         region = src[:probe_idx]
         last_if = region.rfind("if commit_err")
@@ -203,9 +203,9 @@ class TestSettleWiring:
         """The source between the HEAD-probe call and its rescued `complete`
         return — the exact rescue block, sliced by structure (not a fixed
         char window) so adding comments can't silently break these guards."""
-        src = inspect.getsource(leerie.settle_subtask)
-        probe_idx = src.find("probe_criteria_satisfied_on_head(")
-        assert probe_idx != -1, "probe call missing from settle_subtask"
+        src = inspect.getsource(leerie._settle_subtask)
+        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
+        assert probe_idx != -1, "probe call missing from _settle_subtask"
         ret_idx = src.find(
             'return {"subtask_id": sid, "status": "complete"', probe_idx)
         assert ret_idx != -1, "rescued complete-return missing after the probe"
@@ -213,7 +213,7 @@ class TestSettleWiring:
         return src[probe_idx:src.find("\n", ret_idx)]
 
     def test_rescued_result_is_complete_with_drop_record(self, leerie):
-        src = inspect.getsource(leerie.settle_subtask)
+        src = inspect.getsource(leerie._settle_subtask)
         # settle records the helper's drop and marks the subtask complete
         assert "dropped_subtasks" in src
         region = self._rescue_region(leerie)
@@ -240,7 +240,7 @@ class TestRescueScopeProvenanceAgnostic:
     """DESIGN §8 *Scope*: the rescue judges WHETHER the criteria are met on
     HEAD, not WHO met them — so it fires identically whether a sibling
     committed the deliverable this run or it was already on the base tree.
-    `probe_criteria_satisfied_on_head` therefore returns a drop record on any
+    `_probe_criteria_satisfied_on_head` therefore returns a drop record on any
     `satisfied: True`, with no provenance check."""
 
     def test_helper_rescues_regardless_of_provenance(self, leerie, tmp_path,
@@ -252,7 +252,7 @@ class TestRescueScopeProvenanceAgnostic:
             "satisfied": True,
             "evidence": "criteria already met on base tree (no sibling)",
             "checked": ["src/x.py"]})
-        drop = _run(leerie.probe_criteria_satisfied_on_head(
+        drop = _run(leerie._probe_criteria_satisfied_on_head(
             _sub("feat-009"), str(tmp_path / "wt"), st, _CAPS, _MODELS,
             _EFFORTS))
         assert drop is not None

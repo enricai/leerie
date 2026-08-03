@@ -2,7 +2,7 @@
 gating fix).
 
 This functional probe is the single predicate the whole gating fix rests
-on: build_repo_map's degrade-warning check (G6) and every HAS_TREESITTER
+on: _build_repo_map's degrade-warning check (G6) and every HAS_TREESITTER
 skip gate (tests/conftest.py) call it to distinguish a broken/incompatible
 parser from a legitimately symbol-less repo. A regression that breaks the
 probe would either silently un-skip the 19 host-sensitive tree-sitter tests

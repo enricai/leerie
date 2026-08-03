@@ -48,7 +48,7 @@ def _capture_guard_handlers(fn) -> list[ast.ExceptHandler]:
     this fix hardens.
 
     "Directly" is load-bearing: `main()`'s top-level `try` wraps
-    `asyncio.run(orchestrate(...))`, and its handler *bodies* (`except
+    `asyncio.run(_orchestrate(...))`, and its handler *bodies* (`except
     WorkerError`, `except TerminalAuthFailure`, ...) contain the nested capture
     try-blocks. Walking the outer try would wrongly collect `except WorkerError`
     as a "capture guard". So we match only a `Try` whose own `body` (not its

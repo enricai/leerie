@@ -6,7 +6,7 @@
     "—" for runs with no telemetry (orphans), right-aligned.
   - `compose_pr_body` cost line (Part 2): present when telemetry exists,
     omitted otherwise.
-  - `report_run` (Part 5): per-call_type aggregation + memory peak,
+  - `_report_run` (Part 5): per-call_type aggregation + memory peak,
     reconciling against state.json.telemetry; run-selection reuse.
 
 Mirrors the module-load-via-conftest `leerie` fixture pattern.
@@ -185,7 +185,7 @@ def test_list_runs_cost_column_header(leerie, tmp_path, capsys):
         "started_at": "2026-05-26T10:00:00+00:00", "task": "x",
         "telemetry": {"calls": 3, "cost_usd": 12.5,
                       "input_tokens": 10, "output_tokens": 20}})
-    leerie.list_runs(tmp_path)
+    leerie._list_runs(tmp_path)
     out = capsys.readouterr().out
     for col in ("run_id", "started_at", "status", "cost", "branch"):
         assert col in out
@@ -196,7 +196,7 @@ def test_list_runs_cost_value_rendered(leerie, tmp_path, capsys):
         "started_at": "2026-05-26T10:00:00+00:00", "task": "x",
         "telemetry": {"calls": 3, "cost_usd": 107.25,
                       "input_tokens": 10, "output_tokens": 20}})
-    leerie.list_runs(tmp_path)
+    leerie._list_runs(tmp_path)
     out = capsys.readouterr().out
     assert "$107.25" in out
 
@@ -205,7 +205,7 @@ def test_list_runs_no_telemetry_renders_dash(leerie, tmp_path, capsys):
     # A run with no telemetry block (e.g. pre-classify) shows "—", not $0.00.
     _make_run(tmp_path, "feat-c-cccccc", {
         "started_at": "2026-05-26T10:00:00+00:00", "task": "x"})
-    leerie.list_runs(tmp_path)
+    leerie._list_runs(tmp_path)
     out = capsys.readouterr().out
     assert "—" in out
     assert "$" not in out
@@ -235,7 +235,7 @@ def test_pr_body_cost_line_absent_without_telemetry(leerie):
 
 
 # ---------------------------------------------------------------------------
-# Part 5 — report_run
+# Part 5 — _report_run
 # ---------------------------------------------------------------------------
 
 _CALLS = [
@@ -261,7 +261,7 @@ _STATE = {
 
 def test_report_run_header_and_weight(leerie, tmp_path, capsys):
     _make_run(tmp_path, "rrr111", _STATE, calls=_CALLS, memory=_MEMORY)
-    leerie.report_run(tmp_path, "rrr111")
+    leerie._report_run(tmp_path, "rrr111")
     out = capsys.readouterr().out
     assert "rrr111" in out
     assert "$42.00" in out
@@ -271,7 +271,7 @@ def test_report_run_header_and_weight(leerie, tmp_path, capsys):
 
 def test_report_run_per_call_type_breakdown(leerie, tmp_path, capsys):
     _make_run(tmp_path, "rrr222", _STATE, calls=_CALLS, memory=_MEMORY)
-    leerie.report_run(tmp_path, "rrr222")
+    leerie._report_run(tmp_path, "rrr222")
     out = capsys.readouterr().out
     # implementer: 2 calls, 150 in, 280 out, 1 failure; planner: 1 call.
     assert "implementer" in out and "planner" in out
@@ -284,7 +284,7 @@ def test_report_run_per_call_type_breakdown(leerie, tmp_path, capsys):
 
 def test_report_run_memory_peak(leerie, tmp_path, capsys):
     _make_run(tmp_path, "rrr333", _STATE, calls=_CALLS, memory=_MEMORY)
-    leerie.report_run(tmp_path, "rrr333")
+    leerie._report_run(tmp_path, "rrr333")
     out = capsys.readouterr().out
     assert "46,000 KiB" in out
     assert "33 fds" in out
@@ -292,7 +292,7 @@ def test_report_run_memory_peak(leerie, tmp_path, capsys):
 
 def test_report_run_missing_calls_is_graceful(leerie, tmp_path, capsys):
     _make_run(tmp_path, "rrr444", _STATE)  # no calls.ndjson / memory.ndjson
-    leerie.report_run(tmp_path, "rrr444")
+    leerie._report_run(tmp_path, "rrr444")
     out = capsys.readouterr().out
     assert "no calls.ndjson found" in out
 

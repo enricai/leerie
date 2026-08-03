@@ -1,4 +1,4 @@
-"""Tests for validate_checkpoint() — the structural and freshness checks
+"""Tests for _validate_checkpoint() — the structural and freshness checks
 on an `incomplete-handoff` checkpoint file.
 
 Cover three classes of failure:
@@ -45,7 +45,7 @@ def _full_good_checkpoint() -> str:
 def test_well_formed_checkpoint_passes(leerie, tmp_path):
     p = tmp_path / "feat-001.md"
     p.write_text(_full_good_checkpoint())
-    assert leerie.validate_checkpoint(str(p)) is None
+    assert leerie._validate_checkpoint(str(p)) is None
 
 
 def test_missing_section_fails(leerie, tmp_path):
@@ -54,13 +54,13 @@ def test_missing_section_fails(leerie, tmp_path):
                                           "")
     p = tmp_path / "bad.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None
     assert "## Next action" in err
 
 
 def test_file_missing_returns_error(leerie, tmp_path):
-    err = leerie.validate_checkpoint(str(tmp_path / "nope.md"))
+    err = leerie._validate_checkpoint(str(tmp_path / "nope.md"))
     assert err is not None
     assert "does not exist" in err
 
@@ -75,7 +75,7 @@ def test_empty_required_section_fails(leerie, tmp_path):
         "## Current status\n\n")
     p = tmp_path / "empty-status.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None
     assert "## Current status" in err
     assert "no content" in err
@@ -89,7 +89,7 @@ def test_whitespace_only_required_section_fails(leerie, tmp_path):
         "## Files touched\n   \n\t\n")
     p = tmp_path / "ws-touched.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None
     assert "## Files touched" in err
 
@@ -105,7 +105,7 @@ def test_noise_token_in_required_section_fails(leerie, tmp_path):
         "## Current status\nnone\n")
     p = tmp_path / "none-status.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None
     assert "placeholder" in err
 
@@ -119,7 +119,7 @@ def test_bullet_noise_token_in_required_section_fails(leerie, tmp_path):
         "## Next action\n- tbd\n")
     p = tmp_path / "tbd-next.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None
     assert "placeholder" in err
 
@@ -133,7 +133,7 @@ def test_noise_token_in_open_unknowns_passes(leerie, tmp_path):
         "## Open unknowns\nnone\n")
     p = tmp_path / "open-none.md"
     p.write_text(ok)
-    assert leerie.validate_checkpoint(str(p)) is None
+    assert leerie._validate_checkpoint(str(p)) is None
 
 
 def test_noise_token_in_decisions_made_passes(leerie, tmp_path):
@@ -145,7 +145,7 @@ def test_noise_token_in_decisions_made_passes(leerie, tmp_path):
         "## Decisions made\nn/a\n")
     p = tmp_path / "dec-na.md"
     p.write_text(ok)
-    assert leerie.validate_checkpoint(str(p)) is None
+    assert leerie._validate_checkpoint(str(p)) is None
 
 
 # Widened token set + trailing-punctuation normalization. Each value is
@@ -176,7 +176,7 @@ def test_widened_noise_tokens_rejected(leerie, tmp_path, body):
         f"## Current status\n{body}\n")
     p = tmp_path / "bad.md"
     p.write_text(bad)
-    err = leerie.validate_checkpoint(str(p))
+    err = leerie._validate_checkpoint(str(p))
     assert err is not None, f"expected rejection for body={body!r}"
     assert "placeholder" in err
 
@@ -196,7 +196,7 @@ def test_real_content_not_falsely_rejected(leerie, tmp_path, body):
         f"## Current status\n{body}\n")
     p = tmp_path / "ok.md"
     p.write_text(ok)
-    assert leerie.validate_checkpoint(str(p)) is None, (
+    assert leerie._validate_checkpoint(str(p)) is None, (
         f"unexpected rejection for body={body!r}")
 
 
@@ -213,7 +213,7 @@ def test_freshness_check_path_exists(leerie, tmp_path):
         "- src/handler.py — added new route\n")
     p = tmp_path / "ok.md"
     p.write_text(content)
-    assert leerie.validate_checkpoint(str(p), worktree_root=worktree) is None
+    assert leerie._validate_checkpoint(str(p), worktree_root=worktree) is None
 
 
 def test_freshness_check_path_missing_fails(leerie, tmp_path):
@@ -226,7 +226,7 @@ def test_freshness_check_path_missing_fails(leerie, tmp_path):
         "- src/handler.py — added new route\n")
     p = tmp_path / "stale.md"
     p.write_text(content)
-    err = leerie.validate_checkpoint(str(p), worktree_root=worktree)
+    err = leerie._validate_checkpoint(str(p), worktree_root=worktree)
     assert err is not None
     assert "src/handler.py" in err
     assert "stale" in err or "deleted" in err
@@ -242,7 +242,7 @@ def test_freshness_check_deleted_annotation_passes(leerie, tmp_path):
         "- src/old_handler.py [deleted] — replaced by new module\n")
     p = tmp_path / "deleted.md"
     p.write_text(content)
-    assert leerie.validate_checkpoint(str(p), worktree_root=worktree) is None
+    assert leerie._validate_checkpoint(str(p), worktree_root=worktree) is None
 
 
 def test_freshness_check_skipped_when_worktree_gone(leerie, tmp_path):
@@ -254,7 +254,7 @@ def test_freshness_check_skipped_when_worktree_gone(leerie, tmp_path):
     p = tmp_path / "no-wt.md"
     p.write_text(content)
     nonexistent = tmp_path / "ghost"
-    assert leerie.validate_checkpoint(str(p), worktree_root=nonexistent) is None
+    assert leerie._validate_checkpoint(str(p), worktree_root=nonexistent) is None
 
 
 def test_freshness_check_narration_lines_ignored(leerie, tmp_path):
@@ -268,15 +268,15 @@ def test_freshness_check_narration_lines_ignored(leerie, tmp_path):
         "- see commit log for the full list\n")
     p = tmp_path / "narration.md"
     p.write_text(content)
-    assert leerie.validate_checkpoint(str(p), worktree_root=worktree) is None
+    assert leerie._validate_checkpoint(str(p), worktree_root=worktree) is None
 
 
 # ----- backward compatibility ------------------------------------------------
 
 def test_validate_checkpoint_works_without_worktree_root(leerie, tmp_path):
-    # The original signature was validate_checkpoint(path) — keep that path
+    # The original signature was _validate_checkpoint(path) — keep that path
     # working so callers that don't have a worktree handy still get the
     # structural + content checks.
     p = tmp_path / "old-style.md"
     p.write_text(_full_good_checkpoint())
-    assert leerie.validate_checkpoint(str(p)) is None
+    assert leerie._validate_checkpoint(str(p)) is None

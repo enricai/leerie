@@ -1,6 +1,6 @@
 """Tests for the pure-Python helpers behind `phase_reconcile`:
 
-- `_compute_unresolved_requires` — set lookup mirroring `validate_plan`'s
+- `_compute_unresolved_requires` — set lookup mirroring `_validate_plan`'s
   cross-domain check, but emitting data instead of raising.
 - `_apply_reconciler_output` — mechanical mutation of the merged plan
   according to the reconciler worker's output.
@@ -304,7 +304,7 @@ def test_apply_dies_names_colliding_ids_in_error(leerie, capsys):
 def test_apply_dies_on_duplicate_added_subtask_self_collision(leerie):
     """The reconciler emitted two added_subtasks with the same id —
     neither colliding with an existing subtask, but colliding with each
-    other. schedule()'s dict-flatten would silently drop one; this
+    other. _schedule()'s dict-flatten would silently drop one; this
     must die() with the same fail-loud guarantee as the
     existing-vs-added case. Pin the behavior so a future refactor of
     the collision check (e.g., to a single-pass form) can't accidentally
@@ -477,7 +477,7 @@ def test_promote_external_counts_each_promotion_separately(leerie):
 def test_promote_external_ignores_in_plan_entries(leerie):
     """`_promote_external_collisions` only touches external entries;
     in_plan entries that look "wrong" are someone else's problem
-    (validate_plan or the reconciler)."""
+    (_validate_plan or the reconciler)."""
     plans = [
         _plan("feature-implementation",
               {"id": "feat-001", "title": "x", "provides": ["cap-a"]}),

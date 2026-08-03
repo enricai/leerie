@@ -32,7 +32,7 @@ def test_resume_reexports_override_env_when_set(leerie, tmp_path, monkeypatch):
     override_path = str(tmp_path / "mise-overrides.toml")
 
     # Simulate what the resume path actually does (we only test the
-    # narrow env-export contract, not the whole orchestrate() entrypoint).
+    # narrow env-export contract, not the whole _orchestrate() entrypoint).
     state_data = {"provision": {"override_file": override_path}}
     persisted_override = (state_data.get("provision") or {}).get("override_file")
     if persisted_override:

@@ -141,7 +141,7 @@ def test_format_upstream_artifacts_section_empty_returns_none(leerie):
 
 
 def _write_plan(leerie_dir: Path, subtasks: dict) -> None:
-    """Persist a minimal plan.json matching what `write_plan` produces.
+    """Persist a minimal plan.json matching what `_write_plan` produces.
     Only the keys read by `_format_upstream_artifacts_for_sid` need to
     be present."""
     leerie_dir.mkdir(parents=True, exist_ok=True)
@@ -226,7 +226,7 @@ def test_format_for_sid_isolates_non_predecessors(leerie, tmp_path):
 
 
 def test_format_for_sid_no_plan_returns_none(leerie, tmp_path):
-    """Missing plan.json (e.g. the bootstrap phase before write_plan)
+    """Missing plan.json (e.g. the bootstrap phase before _write_plan)
     is silently treated as 'no upstream artifacts'."""
     rendered = leerie._format_upstream_artifacts_for_sid(tmp_path, "feat-001")
     assert rendered is None

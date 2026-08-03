@@ -12,8 +12,8 @@ Two tiers:
    by source inspection: the gate calls claude_p with
    schema_key='task_coverage_judge' inside a _run_checked_loop, a
    non-empty coverage_gaps result re-invokes phase_plan, a WorkerError
-   never discards the plan, and the call site precedes schedule()/
-   validate_plan in _run_phases.
+   never discards the plan, and the call site precedes _schedule()/
+   _validate_plan in _run_phases.
 2. Behavioral integration tests with a stubbed `claude_p` and a stubbed
    `phase_plan`.
 
@@ -167,20 +167,20 @@ class TestWiringPrecedesScheduleAndValidatePlan:
         src = inspect.getsource(leerie._run_phases)
         gate_idx = src.find("phase_planning_coverage_gate(")
         assert gate_idx != -1
-        schedule_idx = src.find("schedule(plans)", gate_idx)
+        schedule_idx = src.find("_schedule(plans)", gate_idx)
         assert schedule_idx != -1, (
             "phase_planning_coverage_gate must be called BEFORE "
-            "schedule(plans) in _run_phases's source order"
+            "_schedule(plans) in _run_phases's source order"
         )
 
     def test_coverage_gate_precedes_validate_plan(self, leerie):
         src = inspect.getsource(leerie._run_phases)
         gate_idx = src.find("phase_planning_coverage_gate(")
         assert gate_idx != -1
-        validate_idx = src.find("validate_plan(subtasks)", gate_idx)
+        validate_idx = src.find("_validate_plan(subtasks)", gate_idx)
         assert validate_idx != -1, (
             "phase_planning_coverage_gate must be called BEFORE "
-            "validate_plan in _run_phases's source order"
+            "_validate_plan in _run_phases's source order"
         )
 
     def test_plans_reassigned_from_coverage_gate_call(self, leerie):
@@ -287,7 +287,7 @@ def test_replan_with_cross_category_tag_drift_gets_reconciled(
     capability — `bugfix-006` provides `events-create-contract-fixed`,
     `test-004` requires `events-payload-casing-fixed`. Without the
     post-replan phase_reconcile call, this mismatch would reach
-    schedule()/phase_wiring_gate unresolved (the exact failure that
+    _schedule()/phase_wiring_gate unresolved (the exact failure that
     motivated this fix — DESIGN §5 *Bridge cross-domain capability-tag
     mismatches*). Falsify by commenting out the `phase_reconcile` call in
     phase_planning_coverage_gate's `_on_feedback` and re-running: the

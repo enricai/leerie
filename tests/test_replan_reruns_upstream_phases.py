@@ -14,7 +14,7 @@ Run 19a70d96 (2026-08-01) is the incident: the judge merged 8 subtasks down to 4
 with every duplicate restored (`plans_after_coverage_gate` == 8), nothing
 re-detected them, and all 8 executed until the integration gate refused the
 merge — 4.7 hours and 164 workers spent on a plan the overlap judge had already
-rejected. Two subtasks had performed the same `gather_provision_fixtures`
+rejected. Two subtasks had performed the same `_gather_provision_fixtures`
 migration; one's `files_likely_touched` was a strict subset of the other's.
 
 The repair is asymmetric because the gates sit at different pipeline positions,
@@ -49,7 +49,7 @@ def test_adherence_gate_reruns_reconcile_and_overlap_judge(leerie):
     assert "phase_overlap_judge" in calls, (
         "a re-plan reintroduces the cross-planner surface collisions the "
         "overlap judge already merged; not re-running it hands duplicates "
-        "straight to schedule()")
+        "straight to _schedule()")
 
 
 def test_adherence_gate_does_not_rerun_the_downstream_coverage_gate(leerie):
@@ -192,7 +192,7 @@ def test_coverage_gate_replan_feeds_the_overlap_judge(leerie, monkeypatch):
     surviving = [s["id"] for p in out for s in p.get("subtasks", [])]
     assert surviving == ["feat-003"], (
         "the judge's merge must survive to the gate's return value; before "
-        "the fix the duplicate reached schedule() and executed")
+        "the fix the duplicate reached _schedule() and executed")
 
 
 def test_no_replan_means_no_extra_phase_calls(leerie, monkeypatch):

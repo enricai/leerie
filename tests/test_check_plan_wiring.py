@@ -1,10 +1,10 @@
 """Unit tests for `check_plan_wiring` (DESIGN §5 *A wiring re-check on the
 fully-merged plan*, §8).
 
-Pure-function structural dangle detector that replays validate_plan's two
+Pure-function structural dangle detector that replays _validate_plan's two
 id/tag-channel checks on the merged post-drop plan (sid->subtask dict) and
 returns a list of wiring-specific messages ([] when clean). It front-runs
-validate_plan's generic die with an actionable one; validate_plan stays the
+_validate_plan's generic die with an actionable one; _validate_plan stays the
 backstop.
 
 Mirrors test_remap_vanished_deps.py's pure-function style.
@@ -93,7 +93,7 @@ class TestRequiresDangle:
         assert leerie.check_plan_wiring(plan) == []
 
     def test_malformed_requires_entry_is_ignored(self, leerie):
-        """Shape errors are validate_plan's job, not wiring's — a bare-string
+        """Shape errors are _validate_plan's job, not wiring's — a bare-string
         or tagless entry must not crash the wiring scan."""
         plan = _plan(_sub("feat-001", requires=["not-an-object",
                                                 {"extent": "in_plan"}]))

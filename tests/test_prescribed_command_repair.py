@@ -109,7 +109,7 @@ def test_empty_plan_declines_rather_than_raising(leerie):
 
 def test_unknown_domain_declines(leerie):
     """A synthetic plan (e.g. the reconciler's `_reconciler`) has no real
-    category, so it cannot supply an id prefix `validate_plan` accepts.
+    category, so it cannot supply an id prefix `_validate_plan` accepts.
     Declining beats emitting an invalid subtask."""
     plans = [{"domain": "_reconciler", "status": "ready",
               "subtasks": [_sub("docs-006")]}]
@@ -161,8 +161,8 @@ def test_depends_on_the_sinks_only(leerie):
 def test_schedules_alone_in_the_final_wave(leerie):
     plans = _plans(4)
     sid = leerie._repair_prescribed_commands(plans, _INCIDENT)
-    subtasks, waves = leerie.schedule(plans)
-    leerie.validate_plan(subtasks)
+    subtasks, waves = leerie._schedule(plans)
+    leerie._validate_plan(subtasks)
     assert waves[-1] == [sid]
 
 
@@ -171,8 +171,8 @@ def test_multi_domain_plan_still_validates(leerie):
     plans = _plans(2) + [{"domain": "testing", "status": "ready",
                           "subtasks": [_sub("test-001"), _sub("test-002")]}]
     sid = leerie._repair_prescribed_commands(plans, _INCIDENT)
-    subtasks, waves = leerie.schedule(plans)
-    leerie.validate_plan(subtasks)
+    subtasks, waves = leerie._schedule(plans)
+    leerie._validate_plan(subtasks)
     assert waves[-1] == [sid]
     new = subtasks[sid]
     assert set(new["depends_on"]) == {"bugfix-002", "test-001", "test-002"}

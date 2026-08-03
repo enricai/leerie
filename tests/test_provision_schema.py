@@ -68,7 +68,7 @@ def test_provision_command_is_argv_list(leerie):
 
 
 def test_provision_argv0_allowlist_intersects_documented_managers(leerie):
-    """The argv[0] allowlist enforced by validate_provision_recipe is
+    """The argv[0] allowlist enforced by _validate_provision_recipe is
     the §12 carve-out's mechanical containment. Pin it against the
     documented set from IMPLEMENTATION §6½ — any drift here must be a
     deliberate update to both the validator and the docs."""

@@ -148,7 +148,7 @@ def test_resolve_message_includes_available_runs(leerie, tmp_path, capsys):
 # wrote .leerie/runs/<run-id>/fly-machine.json but the orchestrator
 # never wrote state.json. Pre-Change-4, resolve_run_id rejected
 # --run-id <orphan> with "does not match any known run" because
-# discover_runs filtered the dir out, leaving users with no way to
+# _discover_runs filtered the dir out, leaving users with no way to
 # recover three of the four hung runs from the 2026-06-04 incident
 # (the fourth had progressed far enough to write state.json).
 

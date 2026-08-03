@@ -1,5 +1,5 @@
 """Tests for the Fix C helpers in `_run_conformance_phase` /
-`run_final_conformance` — `_count_bash_axis_invocations` and
+`_run_final_conformance` — `_count_bash_axis_invocations` and
 `_count_orphaned_bg_axis`.
 
 These helpers parse the per-worker JSONL log (the same one the

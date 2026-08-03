@@ -4,12 +4,12 @@
 Three behaviors, tested as one unit per the subtask scope note — a crash
 barrier without the snapshot cannot show what survived:
 
-1. `recursive_decompose`: a `WorkerError` from the `fit_judge` call degrades
+1. `_recursive_decompose`: a `WorkerError` from the `fit_judge` call degrades
    the node to a **leaf** (`[subtask]` unchanged), matching the existing
    depth-cap and no-progress-guard precedents — it does not propagate and
    discard sibling subtasks' already-completed fit/split decisions.
 
-2. `recursive_decompose`: a `WorkerError` from the coupled-minority
+2. `_recursive_decompose`: a `WorkerError` from the coupled-minority
    `splitter` call (the non-migration split path) degrades the node to a
    **leaf** the same way — this is the surviving half of D3: the fit_judge
    guard alone left the splitter call ~70 lines below unguarded, so a crash
@@ -121,7 +121,7 @@ _PLANNER_RESPONSE = {
 
 
 # ---------------------------------------------------------------------------
-# 1. recursive_decompose: fit_judge WorkerError degrades node to leaf
+# 1. _recursive_decompose: fit_judge WorkerError degrades node to leaf
 # ---------------------------------------------------------------------------
 
 class TestFitJudgeCrashBarrier:
@@ -142,13 +142,13 @@ class TestFitJudgeCrashBarrier:
             raise leerie.WorkerError("Failed to authenticate: OAuth session expired")
 
         with patch.object(leerie, "claude_p", new=crashing_claude_p):
-            leaves = _run(leerie.recursive_decompose(
+            leaves = _run(leerie._recursive_decompose(
                 subtask, 0, st, caps, models, efforts, Path("/tmp")))
 
         assert leaves == [subtask]
 
     def test_fit_judge_crash_does_not_raise(self, leerie):
-        """The WorkerError must be caught inside recursive_decompose, not
+        """The WorkerError must be caught inside _recursive_decompose, not
         left to propagate to the caller."""
         subtask = {"id": "t-002", "title": "Another task",
                    "success_criteria_seed": "crit",
@@ -163,13 +163,13 @@ class TestFitJudgeCrashBarrier:
 
         with patch.object(leerie, "claude_p", new=crashing_claude_p):
             # Must not raise.
-            leaves = _run(leerie.recursive_decompose(
+            leaves = _run(leerie._recursive_decompose(
                 subtask, 0, st, caps, models, efforts, Path("/tmp")))
         assert leaves == [subtask]
 
 
 # ---------------------------------------------------------------------------
-# 2. recursive_decompose: coupled-minority splitter WorkerError degrades to
+# 2. _recursive_decompose: coupled-minority splitter WorkerError degrades to
 #    leaf (the surviving half of D3 — the fit_judge guard alone left this
 #    call unguarded)
 # ---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ class TestFitJudgeCrashBarrier:
 class TestSplitterCrashBarrier:
     def test_splitter_crash_degrades_to_leaf(self, leerie):
         """fit_judge scores below threshold (forcing the split path); the
-        subsequent splitter call raises WorkerError. recursive_decompose
+        subsequent splitter call raises WorkerError. _recursive_decompose
         must return [subtask] unchanged, not propagate the crash."""
         subtask = {"id": "t-003", "title": "Coupled task",
                    "success_criteria_seed": "crit",
@@ -199,14 +199,14 @@ class TestSplitterCrashBarrier:
                 "Failed to authenticate: OAuth session expired")
 
         with patch.object(leerie, "claude_p", new=fake_claude_p):
-            leaves = _run(leerie.recursive_decompose(
+            leaves = _run(leerie._recursive_decompose(
                 subtask, 0, st, caps, models, efforts, Path("/tmp")))
 
         assert leaves == [subtask]
 
     def test_splitter_crash_does_not_raise(self, leerie):
         """The WorkerError from the splitter call must be caught inside
-        recursive_decompose, not left to propagate to the caller."""
+        _recursive_decompose, not left to propagate to the caller."""
         subtask = {"id": "t-004", "title": "Another coupled task",
                    "success_criteria_seed": "crit",
                    "files_likely_touched": ["c.py"]}
@@ -226,13 +226,13 @@ class TestSplitterCrashBarrier:
 
         with patch.object(leerie, "claude_p", new=fake_claude_p):
             # Must not raise.
-            leaves = _run(leerie.recursive_decompose(
+            leaves = _run(leerie._recursive_decompose(
                 subtask, 0, st, caps, models, efforts, Path("/tmp")))
         assert leaves == [subtask]
 
     def test_splitter_crash_preserves_sibling_snapshot(self, leerie):
         """End-to-end through phase_plan: feat-001 finishes expanding (its
-        leaves land in decompose_snapshot); feat-002's recursive_decompose
+        leaves land in decompose_snapshot); feat-002's _recursive_decompose
         forces the split path and then crashes on the splitter call. The
         snapshot must still contain feat-001's already-completed leaves —
         this is precisely the loss D3 set out to prevent, and the surviving
@@ -242,14 +242,14 @@ class TestSplitterCrashBarrier:
         models = {k: leerie.MODEL_DEFAULT for k in leerie.WORKER_TYPES}
         efforts = {k: None for k in leerie.WORKER_TYPES}
         planner_resp = json.loads(json.dumps(_PLANNER_RESPONSE))
-        real_recursive_decompose = leerie.recursive_decompose
+        real_recursive_decompose = leerie._recursive_decompose
 
         async def fake_recursive_decompose(subtask, depth, st_, caps_,
                                            models_, efforts_, repo_root_,
                                            **kwargs):
             if subtask["id"] == "feat-001":
                 return [subtask]
-            # feat-002: real recursive_decompose, forced through the split
+            # feat-002: real _recursive_decompose, forced through the split
             # path and crashed on the splitter call itself.
             async def fake_claude_p(*args, schema_key, **kw):
                 if schema_key == "fit_judge":
@@ -269,13 +269,13 @@ class TestSplitterCrashBarrier:
                     repo_root_, **kwargs)
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan("task", st, caps, models, efforts))
@@ -299,7 +299,7 @@ class TestSplitterCrashBarrier:
 class TestDecomposeSnapshotPersistence:
     def test_snapshot_populated_with_completed_subtasks_before_crash(self, leerie):
         """feat-001 finishes expanding (snapshot records it); feat-002's
-        recursive_decompose then raises WorkerError. The snapshot must still
+        _recursive_decompose then raises WorkerError. The snapshot must still
         contain feat-001's already-completed leaves — that work is not
         discarded even though the run as a whole cannot proceed past the
         crash."""
@@ -317,13 +317,13 @@ class TestDecomposeSnapshotPersistence:
                 "Failed to authenticate: OAuth session expired")
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             with pytest.raises(leerie.WorkerError):
@@ -355,13 +355,13 @@ class TestDecomposeSnapshotPersistence:
             return [subtask]
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             plans = _run(leerie.phase_plan("task", st, caps, models, efforts))
@@ -385,13 +385,13 @@ class TestDecomposeSnapshotPersistence:
             return [subtask]
 
         with (
-            patch.object(leerie, "load_prompt", return_value="sys"),
-            patch.object(leerie, "build_repo_map",
+            patch.object(leerie, "_load_prompt", return_value="sys"),
+            patch.object(leerie, "_build_repo_map",
                          side_effect=RuntimeError("no tree-sitter")),
             patch.object(leerie, "claude_p",
                          new=AsyncMock(return_value=planner_resp)),
             patch.object(leerie, "check_planner_output", return_value=[]),
-            patch.object(leerie, "recursive_decompose",
+            patch.object(leerie, "_recursive_decompose",
                          new=AsyncMock(side_effect=fake_recursive_decompose)),
         ):
             _run(leerie.phase_plan("task", st, caps, models, efforts))
@@ -441,8 +441,8 @@ class TestSnapshotSourceCoupling:
 
     def test_fit_judge_call_is_wrapped_in_try_except_workererror(self, leerie):
         """Source-coupling for the barrier itself: the fit_judge claude_p
-        call inside recursive_decompose must be guarded."""
-        src = inspect.getsource(leerie.recursive_decompose)
+        call inside _recursive_decompose must be guarded."""
+        src = inspect.getsource(leerie._recursive_decompose)
         judge_idx = src.find('schema_key="fit_judge"')
         assert judge_idx != -1
         try_idx = src.rfind("try:", 0, judge_idx)
@@ -457,9 +457,9 @@ class TestSnapshotSourceCoupling:
 
     def test_splitter_call_is_wrapped_in_try_except_workererror(self, leerie):
         """Source-coupling for the surviving half of D3: the coupled-minority
-        splitter claude_p call inside recursive_decompose (the non-migration
+        splitter claude_p call inside _recursive_decompose (the non-migration
         path, ~70 lines after the fit_judge guard) must also be guarded."""
-        src = inspect.getsource(leerie.recursive_decompose)
+        src = inspect.getsource(leerie._recursive_decompose)
         split_idx = src.find('schema_key="splitter"')
         assert split_idx != -1
         try_idx = src.rfind("try:", 0, split_idx)
@@ -477,7 +477,7 @@ class TestSnapshotSourceCoupling:
         """Cross-function ordering, mirroring
         tests/test_plan_snapshot_wiring.py: decompose_snapshot is written
         inside phase_plan's expansion loop, and _run_phases calls phase_plan
-        strictly before it calls check_budget_feasibility / validate_plan —
+        strictly before it calls check_budget_feasibility / _validate_plan —
         the two gates that die() and would otherwise make a discarded
         decomposition unrecoverable. This is what actually matters for the
         subtask's intent: the snapshot must exist on disk before either gate
@@ -486,10 +486,10 @@ class TestSnapshotSourceCoupling:
         run_phases_src = inspect.getsource(leerie._run_phases)
         plan_call = run_phases_src.find("phase_plan(task, st, caps, models, efforts)")
         budget_gate = run_phases_src.find("check_budget_feasibility(")
-        validate_gate = run_phases_src.find("validate_plan(subtasks)")
+        validate_gate = run_phases_src.find("_validate_plan(subtasks)")
         assert plan_call != -1, "_run_phases must call phase_plan(...)"
         assert budget_gate != -1, "_run_phases must call check_budget_feasibility"
-        assert validate_gate != -1, "_run_phases must call validate_plan(subtasks)"
+        assert validate_gate != -1, "_run_phases must call _validate_plan(subtasks)"
         assert plan_call < budget_gate, (
             "phase_plan (which writes decompose_snapshot) must be called "
             "before check_budget_feasibility — that gate die()s, and the "
@@ -498,7 +498,7 @@ class TestSnapshotSourceCoupling:
         )
         assert plan_call < validate_gate, (
             "phase_plan (which writes decompose_snapshot) must be called "
-            "before validate_plan — that gate die()s, and the snapshot must "
+            "before _validate_plan — that gate die()s, and the snapshot must "
             "already be on disk for the decomposition spend to be "
             "recoverable."
         )

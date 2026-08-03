@@ -94,7 +94,7 @@ class TestMigrationTargetsPropagation:
     """`migration_targets`/`performs_replacement` must survive expansion.
 
     `check_planner_output`'s migration-surface checks run on the planner's
-    raw sample before `recursive_decompose` expands it, so these fields are
+    raw sample before `_recursive_decompose` expands it, so these fields are
     inert for that gate's own purposes here — but a leaf child still
     replaces the same pattern its parent did, and dropping the fields would
     make that fact unrecoverable for anything that reads a leaf later."""

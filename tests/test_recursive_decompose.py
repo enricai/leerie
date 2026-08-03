@@ -1,9 +1,9 @@
-"""Tests for partition_files() and recursive_decompose() (DESIGN §5½ (P1)).
+"""Tests for _partition_files() and _recursive_decompose() (DESIGN §5½ (P1)).
 
-partition_files: deterministic chunker — 100% coverage + 0 overlap guaranteed
+_partition_files: deterministic chunker — 100% coverage + 0 overlap guaranteed
 by construction. Tests verify this on small and large inputs.
 
-recursive_decompose: stubbed via monkeypatching claude_p to return fake
+_recursive_decompose: stubbed via monkeypatching claude_p to return fake
 fit_judge / splitter responses. Verifies:
   - A well-fit subtask (score >= 0.70) is returned unsplit as a leaf.
   - An oversized subtask recurses until children pass the threshold.
@@ -37,22 +37,22 @@ def leerie():
 
 
 # ---------------------------------------------------------------------------
-# partition_files
+# _partition_files
 # ---------------------------------------------------------------------------
 
 def test_partition_files_empty(leerie):
-    assert leerie.partition_files([], 8) == []
+    assert leerie._partition_files([], 8) == []
 
 
 def test_partition_files_single_chunk(leerie):
     files = ["a.py", "b.py", "c.py"]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     assert chunks == [["a.py", "b.py", "c.py"]]
 
 
 def test_partition_files_exact_multiple(leerie):
     files = [f"f{i}.py" for i in range(16)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     assert len(chunks) == 2
     assert chunks[0] == files[:8]
     assert chunks[1] == files[8:]
@@ -60,7 +60,7 @@ def test_partition_files_exact_multiple(leerie):
 
 def test_partition_files_partial_last_chunk(leerie):
     files = [f"f{i}.py" for i in range(10)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     assert len(chunks) == 2
     assert len(chunks[0]) == 8
     assert len(chunks[1]) == 2
@@ -69,7 +69,7 @@ def test_partition_files_partial_last_chunk(leerie):
 def test_partition_files_coverage_100_percent(leerie):
     """Every file appears in exactly one chunk."""
     files = [f"src/module{i}.ts" for i in range(29)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     flat = [f for chunk in chunks for f in chunk]
     assert sorted(flat) == sorted(files)
 
@@ -77,7 +77,7 @@ def test_partition_files_coverage_100_percent(leerie):
 def test_partition_files_zero_overlap(leerie):
     """No file appears in more than one chunk."""
     files = [f"src/f{i}.py" for i in range(25)]
-    chunks = leerie.partition_files(files, 8)
+    chunks = leerie._partition_files(files, 8)
     seen: set[str] = set()
     for chunk in chunks:
         for f in chunk:
@@ -88,13 +88,13 @@ def test_partition_files_zero_overlap(leerie):
 def test_partition_files_chunk_size_1(leerie):
     """chunk_size=1 produces one file per chunk."""
     files = ["a.py", "b.py", "c.py"]
-    chunks = leerie.partition_files(files, 1)
+    chunks = leerie._partition_files(files, 1)
     assert chunks == [["a.py"], ["b.py"], ["c.py"]]
 
 
 def test_partition_files_preserves_order(leerie):
     files = [f"file_{i:03d}.py" for i in range(20)]
-    chunks = leerie.partition_files(files, 7)
+    chunks = leerie._partition_files(files, 7)
     flat = [f for chunk in chunks for f in chunk]
     assert flat == files
 
@@ -102,12 +102,12 @@ def test_partition_files_preserves_order(leerie):
 def test_partition_files_chunk_size_zero_treated_as_one_chunk(leerie):
     """chunk_size < 1 returns all files in a single chunk (degenerate guard)."""
     files = ["a.py", "b.py"]
-    chunks = leerie.partition_files(files, 0)
+    chunks = leerie._partition_files(files, 0)
     assert chunks == [["a.py", "b.py"]]
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose helpers
+# _recursive_decompose helpers
 # ---------------------------------------------------------------------------
 
 def _make_state(leerie, caps):
@@ -169,7 +169,7 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — well-fit subtask is a leaf
+# _recursive_decompose — well-fit subtask is a leaf
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_well_fit_is_leaf(leerie):
@@ -191,7 +191,7 @@ def test_recursive_decompose_well_fit_is_leaf(leerie):
         pytest.fail("splitter should not be called for a well-fit subtask")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             subtask, 0, st, caps, models, efforts, Path("/tmp")))
 
     assert leaves == [subtask]
@@ -200,7 +200,7 @@ def test_recursive_decompose_well_fit_is_leaf(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — oversized subtask recurses
+# _recursive_decompose — oversized subtask recurses
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_oversized_recurses(leerie):
@@ -233,7 +233,7 @@ def test_recursive_decompose_oversized_recurses(leerie):
         pytest.fail(f"unexpected schema_key {schema_key!r}")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     # One parent judge + 3 child judges = 4 judge calls.
@@ -247,7 +247,7 @@ def test_recursive_decompose_oversized_recurses(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — depth cap terminates recursion
+# _recursive_decompose — depth cap terminates recursion
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_depth_cap(leerie):
@@ -270,7 +270,7 @@ def test_recursive_decompose_depth_cap(leerie):
         pytest.fail("splitter called at depth cap")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             subtask, 5, st, caps, models, efforts, Path("/tmp")))
 
     assert leaves == [subtask]
@@ -278,7 +278,7 @@ def test_recursive_decompose_depth_cap(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — no-progress guard
+# _recursive_decompose — no-progress guard
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_noprogress_guard(leerie, capsys):
@@ -309,7 +309,7 @@ def test_recursive_decompose_noprogress_guard(leerie, capsys):
         pytest.fail(f"unexpected schema_key {schema_key!r}")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     # Must return exactly one leaf (the stuck subtask or one of its descendants).
@@ -324,11 +324,11 @@ def test_recursive_decompose_noprogress_guard(leerie, capsys):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — migration: partition_files owns files, splitter labels
+# _recursive_decompose — migration: _partition_files owns files, splitter labels
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_migration_partition_owns_files_splitter_only_labels(leerie):
-    """When files_likely_touched > 8, partition_files() owns the file→chunk
+    """When files_likely_touched > 8, _partition_files() owns the file→chunk
     assignment (100% coverage), and the splitter is invoked ONLY in label-only
     mode to title each chunk (DESIGN §5½ "the LLM only labels"). The splitter
     never decides which files go where."""
@@ -362,7 +362,7 @@ def test_recursive_decompose_migration_partition_owns_files_splitter_only_labels
         pytest.fail(f"unexpected schema_key {schema_key!r}")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     # Splitter IS called (label-only), exactly once for the migration parent.
@@ -370,7 +370,7 @@ def test_recursive_decompose_migration_partition_owns_files_splitter_only_labels
     assert splitter_calls[0].startswith("splitter-label-")
     # 24 files / 8 per chunk = 3 children.
     assert len(leaves) == 3
-    # partition_files owns coverage: every original file in exactly one leaf.
+    # _partition_files owns coverage: every original file in exactly one leaf.
     leaf_files = [f for leaf in leaves for f in leaf.get("files_likely_touched", [])]
     assert sorted(leaf_files) == sorted(big_files)
 
@@ -399,7 +399,7 @@ def test_recursive_decompose_migration_children_have_distinct_labels(leerie):
              "success_criteria_seed": f"c {i}"} for i in ids]}
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     titles = [leaf["title"] for leaf in leaves]
@@ -428,7 +428,7 @@ def test_recursive_decompose_migration_label_fallback_on_splitter_failure(leerie
         raise leerie.WorkerError("simulated splitter crash")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     titles = [leaf["title"] for leaf in leaves]
@@ -437,11 +437,11 @@ def test_recursive_decompose_migration_label_fallback_on_splitter_failure(leerie
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — C0 regression: claude_p called with the REAL signature
+# _recursive_decompose — C0 regression: claude_p called with the REAL signature
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_calls_claude_p_with_full_signature(leerie):
-    """C0 regression. The two claude_p call sites in recursive_decompose must
+    """C0 regression. The two claude_p call sites in _recursive_decompose must
     pass every REQUIRED keyword-only arg of the real claude_p (cwd, autonomous,
     caps, ...). A permissive ``**kwargs`` stub hid a missing-arg bug that
     crashed every live run with TypeError. This stub binds each call against
@@ -468,7 +468,7 @@ def test_recursive_decompose_calls_claude_p_with_full_signature(leerie):
         return _split_response("sig", 1)
 
     with patch.object(leerie, "claude_p", new=faithful_claude_p):
-        _run(leerie.recursive_decompose(
+        _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     # Both a fit_judge and a splitter call bound successfully.
@@ -477,7 +477,7 @@ def test_recursive_decompose_calls_claude_p_with_full_signature(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — bump_workers called for every judge/split
+# _recursive_decompose — bump_workers called for every judge/split
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_bump_workers_every_call(leerie):
@@ -505,18 +505,18 @@ def test_recursive_decompose_bump_workers_every_call(leerie):
         return _split_response("bw", 1)
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        _run(leerie.recursive_decompose(
+        _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — G2: repo-map reaches fit_judge / splitter
+# _recursive_decompose — G2: repo-map reaches fit_judge / splitter
 # ---------------------------------------------------------------------------
 
 def test_recursive_decompose_injects_repo_map_into_worker_prompts(leerie):
     """G2: when a repo_map is passed, each fit_judge/splitter prompt is grounded
-    with a per-node ranked subgraph (rank_repo_map re-ranked to the node's
-    files). Uses a stubbed rank_repo_map so the test is parser-independent."""
+    with a per-node ranked subgraph (_rank_repo_map re-ranked to the node's
+    files). Uses a stubbed _rank_repo_map so the test is parser-independent."""
     parent = {"id": "g2", "title": "t", "success_criteria_seed": "c",
               "files_likely_touched": ["a.py"]}  # coupled path → splitter too
     caps = _make_caps(leerie, decompose_max_depth=1)
@@ -534,8 +534,8 @@ def test_recursive_decompose_injects_repo_map_into_worker_prompts(leerie):
         return _split_response("g2", 1)
 
     with patch.object(leerie, "claude_p", new=fake_claude_p), \
-         patch.object(leerie, "rank_repo_map", return_value=SENTINEL):
-        _run(leerie.recursive_decompose(
+         patch.object(leerie, "_rank_repo_map", return_value=SENTINEL):
+        _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp"),
             repo_map={"files": {"a.py": ["f"]}, "refs": {}}))
 
@@ -545,7 +545,7 @@ def test_recursive_decompose_injects_repo_map_into_worker_prompts(leerie):
 
 def test_recursive_decompose_no_repo_map_when_none(leerie):
     """G2: with repo_map=None (skip_repo_map / build failure), no ranked
-    subgraph is injected and rank_repo_map is never called."""
+    subgraph is injected and _rank_repo_map is never called."""
     parent = {"id": "g2b", "title": "t", "success_criteria_seed": "c",
               "files_likely_touched": ["a.py"]}
     caps = _make_caps(leerie, decompose_max_depth=1)
@@ -562,9 +562,9 @@ def test_recursive_decompose_no_repo_map_when_none(leerie):
         return _split_response("g2b", 1)
 
     with patch.object(leerie, "claude_p", new=fake_claude_p), \
-         patch.object(leerie, "rank_repo_map",
+         patch.object(leerie, "_rank_repo_map",
                       side_effect=AssertionError("must not be called")):
-        _run(leerie.recursive_decompose(
+        _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp"),
             repo_map=None))
 
@@ -573,7 +573,7 @@ def test_recursive_decompose_no_repo_map_when_none(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — intra-generation depends_on remap
+# _recursive_decompose — intra-generation depends_on remap
 # (DESIGN §5 *Id-vanishing operations*)
 # ---------------------------------------------------------------------------
 
@@ -584,7 +584,7 @@ def test_recursive_decompose_remaps_sibling_dep_on_split_sibling(leerie):
     surviving sibling must be rewritten to depend on the terminal ids.
 
     Without the intra-generation remap this is the reported crash class:
-    validate_plan die()s on the dangling edge after the full planner spend.
+    _validate_plan die()s on the dangling edge after the full planner spend.
     """
     parent = {"id": "config-003", "title": "parent",
               "success_criteria_seed": "crit",
@@ -618,7 +618,7 @@ def test_recursive_decompose_remaps_sibling_dep_on_split_sibling(leerie):
         ]}
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     ids = {leaf["id"] for leaf in leaves}
@@ -668,7 +668,7 @@ def test_recursive_decompose_migration_remap_is_a_noop(leerie):
         ]}
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, Path("/tmp")))
 
     assert len(leaves) == 3
@@ -682,7 +682,7 @@ def test_recursive_decompose_migration_remap_is_a_noop(leerie):
 
 
 # ---------------------------------------------------------------------------
-# recursive_decompose — sub-file split (DESIGN §5½ (P1) *Sub-file*)
+# _recursive_decompose — sub-file split (DESIGN §5½ (P1) *Sub-file*)
 # ---------------------------------------------------------------------------
 
 def _write_lines(path: Path, n: int) -> None:
@@ -719,7 +719,7 @@ def test_subfile_oversized_single_file_region_splits(leerie, tmp_path):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     # Every leaf owns the same single file with an owned_region + cluster marker.
@@ -773,7 +773,7 @@ def test_subfile_region_children_have_distinct_intents(leerie, tmp_path):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     assert len(leaves) >= 2
@@ -796,8 +796,8 @@ def test_subfile_region_children_have_distinct_intents(leerie, tmp_path):
 
 
 def test_subfile_ids_carry_domain_prefix(leerie, tmp_path):
-    """Region-child ids keep the parent's domain prefix so validate_plan's
-    id-prefix check and schedule() cross-domain wiring still pass."""
+    """Region-child ids keep the parent's domain prefix so _validate_plan's
+    id-prefix check and _schedule() cross-domain wiring still pass."""
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
     parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
@@ -813,7 +813,7 @@ def test_subfile_ids_carry_domain_prefix(leerie, tmp_path):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     for leaf in leaves:
@@ -837,7 +837,7 @@ def test_subfile_no_ranges_uses_line_window_fallback(leerie, tmp_path):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     assert len(leaves) >= 3  # 2000 / 700 → 3 windows
@@ -866,7 +866,7 @@ def test_subfile_small_file_not_split(leerie, tmp_path):
         pytest.fail("no split expected for a small single file")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     assert leaves == [parent]
@@ -895,7 +895,7 @@ def test_subfile_unreadable_file_degrades_to_normal_path(leerie, tmp_path):
         pytest.fail(f"unexpected {schema_key!r}")
 
     with patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     # Degraded cleanly to a leaf via the coupled path, no crash.
@@ -920,7 +920,7 @@ def test_subfile_bump_workers_not_called_for_region_children(leerie, tmp_path):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=ranges), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        _run(leerie.recursive_decompose(
+        _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     # Exactly one worker call: the parent fit_judge. Region children add none.
@@ -986,7 +986,7 @@ def test_peel_unit_single_file_declines(leerie, tmp_path):
 
 
 def test_peel_end_to_end_dense_file_tiles(leerie, tmp_path):
-    """Full recursive_decompose on the impl+test shape: the dense file peels
+    """Full _recursive_decompose on the impl+test shape: the dense file peels
     then tiles into region leaves; the test file survives as its own leaf.
     Uses the tier-2 line-window fallback (no tree-sitter ranges needed)."""
     _write_lines(tmp_path / "flow-runner.ts", 2000)
@@ -1016,7 +1016,7 @@ def test_peel_end_to_end_dense_file_tiles(leerie, tmp_path):
     # No tree-sitter ranges → tier-2 line-window fallback tiles the dense file.
     with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        leaves = _run(leerie.recursive_decompose(
+        leaves = _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
     # The dense file produced >=2 region leaves (each owning only flow-runner.ts
@@ -1064,13 +1064,13 @@ def _peel_leaves(leerie, tmp_path, *, downstream=None):
 
     with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
          patch.object(leerie, "claude_p", new=fake_claude_p):
-        return _run(leerie.recursive_decompose(
+        return _run(leerie._recursive_decompose(
             parent, 0, st, caps, models, efforts, tmp_path))
 
 
 def test_peel_ids_carry_domain_prefix(leerie, tmp_path):
     """Peel leaf ids (`feat-005-f1-rN`, `feat-005-f2`) inherit the parent's
-    domain prefix so `validate_plan`'s `_ID_PREFIXES` check and `schedule()`'s
+    domain prefix so `_validate_plan`'s `_ID_PREFIXES` check and `_schedule()`'s
     cross-domain wiring both accept them — mirrors
     `test_subfile_ids_carry_domain_prefix` for the peel path."""
     leaves = _peel_leaves(leerie, tmp_path)
@@ -1078,13 +1078,13 @@ def test_peel_ids_carry_domain_prefix(leerie, tmp_path):
     for leaf in leaves:
         assert leaf["id"].startswith("feat-"), (
             f"peel leaf id {leaf['id']!r} must start with 'feat-' so "
-            "validate_plan's id-prefix check passes")
+            "_validate_plan's id-prefix check passes")
         assert any(leaf["id"].startswith(p) for p in leerie._ID_PREFIXES)
 
 
 def test_peel_leaves_survive_schedule_and_validate_plan(leerie, tmp_path):
-    """The load-bearing gap: peel leaves must feed `schedule()` and
-    `validate_plan()` end-to-end without a die/dangling-id — the exact
+    """The load-bearing gap: peel leaves must feed `_schedule()` and
+    `_validate_plan()` end-to-end without a die/dangling-id — the exact
     invariant class that killed a real run after full planner spend. The
     split/migration path has `test_recursive_decompose_schedule.py`; this is
     its peel equivalent."""
@@ -1094,13 +1094,13 @@ def test_peel_leaves_survive_schedule_and_validate_plan(leerie, tmp_path):
     all_deps = [d for l in leaves for d in (l.get("depends_on") or [])]
     assert not [d for d in all_deps if d not in subtasks], (
         f"dangling depends_on after peel: {all_deps}")
-    # validate_plan die()s on any error; reaching the end means it passed.
-    leerie.validate_plan(subtasks)
-    # schedule() accepts the leaves and partitions them into waves (all
+    # _validate_plan die()s on any error; reaching the end means it passed.
+    leerie._validate_plan(subtasks)
+    # _schedule() accepts the leaves and partitions them into waves (all
     # independent here → a single wave).
     plan = {"domain": "feature-implementation", "status": "ready",
             "subtasks": list(leaves)}
-    sched_subtasks, waves = leerie.schedule([plan])
+    sched_subtasks, waves = leerie._schedule([plan])
     assert set(sched_subtasks.keys()) == set(subtasks.keys())
     assert sum(len(w) for w in waves) == len(leaves)  # every leaf scheduled
 
@@ -1112,7 +1112,7 @@ def test_peel_grandchild_expansion_remaps_downstream_dep(leerie, tmp_path):
     `test_recursive_decompose_remaps_sibling_dep_on_split_sibling`, but for a
     dep that vanishes via the peel→tile path rather than a splitter sibling.
 
-    The downstream subtask is decomposed in its OWN `recursive_decompose` call
+    The downstream subtask is decomposed in its OWN `_recursive_decompose` call
     (as phase_plan does per top-level subtask), so the intra-frame remap does
     not see it. Instead we assert the invariant at the plan level: after both
     subtasks decompose, the downstream dep on the vanished `feat-005-f1` must
@@ -1143,4 +1143,4 @@ def test_peel_grandchild_expansion_remaps_downstream_dep(leerie, tmp_path):
     # And the combined plan (peel leaves + remapped downstream) validates.
     combined = {l["id"]: l for l in leaves}
     combined["feat-006"] = downstream
-    leerie.validate_plan(combined)
+    leerie._validate_plan(combined)

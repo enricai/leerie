@@ -1,6 +1,6 @@
 """Tests for Fix 2: clear stale blocked[sid] when a subtask completes.
 
-The `settle_subtask` function must pop the sid from `st.data["blocked"]`
+The `_settle_subtask` function must pop the sid from `st.data["blocked"]`
 when the final written status is "complete", so a resume-that-completes
 doesn't leave a contradictory blocked record in state.json.
 """
@@ -25,12 +25,12 @@ def _make_fake_state(blocked: dict) -> types.SimpleNamespace:
 
 
 def test_blocked_entry_cleared_on_complete(leerie):
-    """When settle_subtask writes status == 'complete', any pre-existing
+    """When _settle_subtask writes status == 'complete', any pre-existing
     blocked[sid] entry must be removed before st.save() is called."""
     sid = "test-sid-001"
     st = _make_fake_state({"test-sid-001": "PID namespace exhausted"})
 
-    # Simulate the exact code path from settle_subtask:
+    # Simulate the exact code path from _settle_subtask:
     #   st.data.setdefault("subtask_status", {})[sid] = status
     #   if status == "complete":
     #       st.data.get("blocked", {}).pop(sid, None)
@@ -49,7 +49,7 @@ def test_blocked_entry_cleared_on_complete(leerie):
 
 
 def test_blocked_entry_untouched_on_failed(leerie):
-    """When settle_subtask writes status == 'failed', the blocked[sid]
+    """When _settle_subtask writes status == 'failed', the blocked[sid]
     entry must remain — Fix 2 only clears on 'complete'."""
     sid = "test-sid-002"
     st = _make_fake_state({"test-sid-002": "some prior error"})
@@ -67,7 +67,7 @@ def test_blocked_entry_untouched_on_failed(leerie):
 
 
 def test_blocked_entry_untouched_on_blocked(leerie):
-    """When settle_subtask writes status == 'blocked', the blocked[sid]
+    """When _settle_subtask writes status == 'blocked', the blocked[sid]
     entry must remain — Fix 2 only clears on 'complete'."""
     sid = "test-sid-003"
     st = _make_fake_state({"test-sid-003": "missing env var"})
@@ -121,13 +121,13 @@ def test_blocked_clear_only_removes_completing_sid(leerie):
 
 
 def test_settle_subtask_source_text_contains_blocked_pop(leerie):
-    """Coupling test: the source of settle_subtask must contain the exact
+    """Coupling test: the source of _settle_subtask must contain the exact
     blocked-pop expression so this fix can't be silently reverted by a
     future refactor that changes the code but not the tests."""
     import inspect
-    src = inspect.getsource(leerie.settle_subtask)
+    src = inspect.getsource(leerie._settle_subtask)
     assert 'st.data.get("blocked", {}).pop(sid, None)' in src, (
-        "settle_subtask must contain "
+        "_settle_subtask must contain "
         '`st.data.get("blocked", {}).pop(sid, None)` — '
         "the Fix 2 blocked-clear expression is missing"
     )

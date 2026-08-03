@@ -127,14 +127,14 @@ def test_fully_repaired_runs_schedule_with_producers_first(leerie, run):
     repairs, unrepaired = leerie._repair_missing_requires(plans, live)
     assert not unrepaired, f"{run} is expected to repair fully"
 
-    subtasks, waves = leerie.schedule(copy.deepcopy(plans))
+    subtasks, waves = leerie._schedule(copy.deepcopy(plans))
     pos = {sid: i for i, w in enumerate(waves) for sid in w}
     for r in repairs:
         assert pos[r["provider"]] < pos[r["sid"]], (
             f"{run}: {r['sid']} must be scheduled after {r['provider']}, "
             f"the sole provider of {r['tag']!r}")
     assert not leerie.check_plan_wiring(subtasks)
-    leerie.validate_plan(subtasks)
+    leerie._validate_plan(subtasks)
 
 
 def test_the_one_unrepairable_run_is_refused_for_a_principled_reason(leerie):

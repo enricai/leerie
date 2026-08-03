@@ -333,7 +333,7 @@ def test_apply_drop_unions_provides_to_survivor(leerie):
     """The dropped subtask's `provides` tags must be unioned into the
     survivor — otherwise downstream `requires` entries that matched
     the dropped subtask's tags become orphans that surface as a
-    confusing `validate_plan` error instead of a clean plan-time
+    confusing `_validate_plan` error instead of a clean plan-time
     resolution. This is the load-bearing fix from the self-review."""
     plans = _two_plans_basic()
     leerie._apply_overlap_drop(plans, dropped_sid="feat-008",
@@ -352,7 +352,7 @@ def test_apply_drop_resolves_orphan_downstream_requires(leerie):
     subtask requires a tag that only the dropped subtask provides;
     after the drop, that requirement must resolve against the
     surviving subtask's now-unioned provides — not orphan into a
-    `validate_plan` error."""
+    `_validate_plan` error."""
     plans = [
         {"domain": "feature-implementation", "subtasks": [
             {"id": "feat-008", "title": "x", "intent": "x",
@@ -374,7 +374,7 @@ def test_apply_drop_resolves_orphan_downstream_requires(leerie):
     ]
     leerie._apply_overlap_drop(plans, dropped_sid="feat-008",
                                surviving_sid="refactor-001")
-    # Build the merged subtasks dict the way schedule()/validate_plan do.
+    # Build the merged subtasks dict the way _schedule()/_validate_plan do.
     merged = {s["id"]: s for plan in plans for s in plan["subtasks"]}
     all_provides = {tag for s in merged.values()
                     for tag in s.get("provides", [])}
@@ -1510,7 +1510,7 @@ def test_backstop_die_on_logic_bug(leerie, monkeypatch, capsys):
 # `prompts/plan_overlap_judge.md` explicitly sanctions. The pre-fix
 # validator counted bare appearances, called such a sid an "anchor",
 # and die()d, killing a run whose judge output was correct after the
-# full planning spend (unrecoverably — phase 2¾ precedes write_plan()).
+# full planning spend (unrecoverably — phase 2¾ precedes _write_plan()).
 #
 # The apply side matters just as much: replaying the pairs through the
 # transitive `survivor_of` rewrite drops a *live* subtask the judge
@@ -1629,7 +1629,7 @@ def test_apply_multi_drop_three_way(leerie):
 
 
 def test_apply_multi_drop_is_order_independent(leerie):
-    """`schedule()` is documented deterministic, so the applied plan
+    """`_schedule()` is documented deterministic, so the applied plan
     must not depend on the order the judge emitted its pairs in. The
     naive first-survivor-wins variant fails this."""
     def _snapshot(plans):
@@ -1662,7 +1662,7 @@ def test_apply_multi_drop_degrades_when_fanout_would_cycle(leerie):
     assert "bugfix-003" not in live
     assert live["test-004"]["depends_on"] == ["test-001"]
     # The whole point of degrading: the plan still schedules.
-    leerie.schedule([{"domain": "test", "status": "ready",
+    leerie._schedule([{"domain": "test", "status": "ready",
                       "subtasks": [s for p in plans for s in p["subtasks"]]}])
 
 
@@ -1710,13 +1710,13 @@ def test_apply_multi_drop_alongside_merge(leerie):
 
 def test_multi_drop_plan_validates_and_schedules(leerie):
     """End-to-end: the applied plan passes both downstream gates. Note
-    validate_plan alone is not a safety net here — cycle detection
-    lives only in schedule()."""
+    _validate_plan alone is not a safety net here — cycle detection
+    lives only in _schedule()."""
     plans = _multidrop_plans()
     leerie._apply_overlap_collisions(plans, _double_drop_collisions())
     subtasks = {s["id"]: s for p in plans for s in p["subtasks"]}
-    leerie.validate_plan(subtasks)
-    _merged, waves = leerie.schedule(plans)
+    leerie._validate_plan(subtasks)
+    _merged, waves = leerie._schedule(plans)
     assert waves == [["test-001", "test-002"], ["test-004"]]
 
 
@@ -2306,7 +2306,7 @@ def test_apply_multidrop_sorts_its_own_survivors(leerie):
 def test_multi_drop_survivor_order_is_sorted(leerie):
     """N1/N3: survivors are sorted at both the cluster-collection and
     apply layers, so the emitted plan never depends on the order the
-    judge happened to list its pairs in (`schedule()` is documented
+    judge happened to list its pairs in (`_schedule()` is documented
     deterministic). Asserts the sorted order directly rather than only
     comparing two runs — a sort removed from *both* layers would keep
     the two runs equal to each other while both being emission-ordered."""

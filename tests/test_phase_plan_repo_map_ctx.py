@@ -1,18 +1,18 @@
 """Tests for P6 repo-map injection into phase_plan context (DESIGN §5½ (P6)).
 
 Verifies:
-- With skip_repo_map=False, build_repo_map + rank_repo_map are called and the
+- With skip_repo_map=False, _build_repo_map + _rank_repo_map are called and the
   resulting ranked subgraph is injected as "repo_map" into the ctx JSON blob.
 - With skip_repo_map=True, the ctx JSON omits "repo_map" and no exception is
   raised (graceful degrade to grep/glob-only planner path).
 - Baseline ctx keys (task, source_of_truth, clarification_answers,
   confidence_rounds) are present in both branches.
-- When rank_repo_map returns an empty string (empty map), "repo_map" is omitted
+- When _rank_repo_map returns an empty string (empty map), "repo_map" is omitted
   from ctx (no blank entries).
-- When build_repo_map raises, the exception is swallowed and ctx is emitted
+- When _build_repo_map raises, the exception is swallowed and ctx is emitted
   without "repo_map".
 
-These tests call the sub-functions directly (build_repo_map, rank_repo_map)
+These tests call the sub-functions directly (_build_repo_map, _rank_repo_map)
 rather than phase_plan end-to-end, since phase_plan requires a live claude
 subprocess. The logic under test is the ctx-building block introduced in feat-004.
 """
@@ -56,12 +56,12 @@ def _build_ctx(
     }
     if not skip_repo_map:
         try:
-            repo_map = leerie.build_repo_map(repo_root, leerie_root)
+            repo_map = leerie._build_repo_map(repo_root, leerie_root)
             seed_files = (
                 [str(Path(item.split(": ", 1)[0])) for item in task_file_items]
                 if task_file_items else []
             )
-            ranked = leerie.rank_repo_map(repo_map, seed_files, [])
+            ranked = leerie._rank_repo_map(repo_map, seed_files, [])
             if ranked:
                 ctx_dict["repo_map"] = ranked
         except Exception:
@@ -164,7 +164,7 @@ class TestRepoMapEnabled:
         )
 
     def test_seed_files_from_task_file_items(self, leerie, tmp_path):
-        """task_file_items → seed_files for rank_repo_map; seeded file appears."""
+        """task_file_items → seed_files for _rank_repo_map; seeded file appears."""
         repo = tmp_path / "repo"
         _write_fixture_repo(repo)
         # Provide task_file_items seeding utils.py
@@ -266,7 +266,7 @@ class TestRepoMapSkipped:
 # ---------------------------------------------------------------------------
 
 class TestRepoMapEmptyDegrade:
-    """Empty repo → rank_repo_map returns '' → 'repo_map' omitted from ctx."""
+    """Empty repo → _rank_repo_map returns '' → 'repo_map' omitted from ctx."""
 
     def test_empty_repo_omits_repo_map(self, leerie, tmp_path):
         repo = tmp_path / "empty-repo"
@@ -281,22 +281,22 @@ class TestRepoMapEmptyDegrade:
             leerie_root=tmp_path / "leerie-root",
             skip_repo_map=False,
         )
-        # Empty repo → build_repo_map returns {"files":{}, "refs":{}}
-        # → rank_repo_map returns "" → omitted
+        # Empty repo → _build_repo_map returns {"files":{}, "refs":{}}
+        # → _rank_repo_map returns "" → omitted
         assert "repo_map" not in ctx
 
 
 # ---------------------------------------------------------------------------
-# Branch 4: build_repo_map raises → exception swallowed, ctx sans repo_map
+# Branch 4: _build_repo_map raises → exception swallowed, ctx sans repo_map
 # ---------------------------------------------------------------------------
 
 class TestRepoMapExceptionDegrade:
-    """If build_repo_map raises, the exception is caught and ctx omits repo_map."""
+    """If _build_repo_map raises, the exception is caught and ctx omits repo_map."""
 
     def test_exception_swallowed_degrade(self, leerie, tmp_path):
         repo = tmp_path / "repo"
         _write_fixture_repo(repo)
-        with patch.object(leerie, "build_repo_map",
+        with patch.object(leerie, "_build_repo_map",
                           side_effect=RuntimeError("tree-sitter unavailable")):
             ctx = _build_ctx(
                 leerie,

@@ -1,6 +1,6 @@
 """Tests for task-referenced file resolution.
 
-Covers ``_expand_braces``, ``glob_task_references``, ``_repo_rel`` and
+Covers ``_expand_braces``, ``_glob_task_references``, ``_repo_rel`` and
 ``_format_task_file_references`` — all pure path arithmetic. leerie names
 the files a task points at; the planner and ``task_coverage_judge`` read
 them. Nothing here parses their contents, and ``TestProseHarvestAbsent``
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 
-# --- glob_task_references ------------------------------------------------ #
+# --- _glob_task_references ------------------------------------------------ #
 
 class TestExpandBraces:
     def test_no_braces(self, leerie):
@@ -34,12 +34,12 @@ class TestExpandBraces:
 
 class TestGlobTaskReferences:
     def test_no_file_refs(self, leerie, tmp_path):
-        assert leerie.glob_task_references(
+        assert leerie._glob_task_references(
             "fix the login bug", tmp_path) == []
 
     def test_explicit_md_file(self, leerie, tmp_path):
         (tmp_path / "spec.md").write_text("# Spec\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "implement everything in spec.md", tmp_path)
         assert len(result) == 1
         assert result[0].name == "spec.md"
@@ -48,18 +48,18 @@ class TestGlobTaskReferences:
         (tmp_path / "plan-a.md").write_text("# A\n")
         (tmp_path / "plan-b.md").write_text("# B\n")
         (tmp_path / "plan-c.txt").write_text("C\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "check plan-*.md files", tmp_path)
         assert len(result) == 2
 
     def test_yaml_file(self, leerie, tmp_path):
         (tmp_path / "tasks.yaml").write_text("- id: t1\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "complete tasks.yaml", tmp_path)
         assert len(result) == 1
 
     def test_nonexistent_file(self, leerie, tmp_path):
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "fix missing.py", tmp_path)
         assert result == []
 
@@ -67,7 +67,7 @@ class TestGlobTaskReferences:
         (tmp_path / "plan.md").write_text("# Plan\n")
         (tmp_path / "plan.yaml").write_text("- id: t1\n")
         (tmp_path / "plan.txt").write_text("ignored\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "check plan.{md,yaml}", tmp_path)
         assert len(result) == 2
         names = {p.name for p in result}
@@ -76,13 +76,13 @@ class TestGlobTaskReferences:
     def test_brace_expansion_with_glob(self, leerie, tmp_path):
         (tmp_path / "spec-a.md").write_text("# A\n")
         (tmp_path / "spec-b.yaml").write_text("- id: b\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "check spec-*.{md,yaml}", tmp_path)
         assert len(result) == 2
 
     def test_deduplication(self, leerie, tmp_path):
         (tmp_path / "spec.md").write_text("# Spec\n")
-        result = leerie.glob_task_references(
+        result = leerie._glob_task_references(
             "check spec.md and also spec.md again", tmp_path)
         assert len(result) == 1
 
@@ -106,14 +106,14 @@ class TestFormatTaskFileReferences:
     def test_lists_referenced_files(self, leerie, tmp_path):
         (tmp_path / "SPEC.md").write_text("# Spec\n\n### Do the thing\n")
         (tmp_path / "conf.yaml").write_text("key: value\n")
-        files = leerie.glob_task_references(
+        files = leerie._glob_task_references(
             "implement SPEC.md per conf.yaml", tmp_path)
         out = leerie._format_task_file_references(files, tmp_path)
         assert "SPEC.md" in out and "conf.yaml" in out
         assert "Read each one" in out
 
     def test_none_when_no_files_referenced(self, leerie, tmp_path):
-        files = leerie.glob_task_references("just do the thing", tmp_path)
+        files = leerie._glob_task_references("just do the thing", tmp_path)
         assert leerie._format_task_file_references(files, tmp_path) is None
 
     def test_lists_paths_only_never_file_contents(self, leerie, tmp_path):
@@ -121,7 +121,7 @@ class TestFormatTaskFileReferences:
         them. A heading inside the file must not appear in the section."""
         (tmp_path / "SPEC.md").write_text(
             "# Spec\n\n### Run `pnpm lint` - MUST pass\n\n1. First item\n")
-        files = leerie.glob_task_references("implement SPEC.md", tmp_path)
+        files = leerie._glob_task_references("implement SPEC.md", tmp_path)
         out = leerie._format_task_file_references(files, tmp_path)
         assert "pnpm lint" not in out
         assert "First item" not in out
@@ -131,7 +131,7 @@ class TestFormatTaskFileReferences:
         sub = tmp_path / "docs"
         sub.mkdir()
         (sub / "DESIGN.md").write_text("# D\n")
-        files = leerie.glob_task_references("see docs/DESIGN.md", tmp_path)
+        files = leerie._glob_task_references("see docs/DESIGN.md", tmp_path)
         out = leerie._format_task_file_references(files, tmp_path)
         assert "docs/DESIGN.md" in out
         assert str(tmp_path) not in out, "absolute paths leak the sandbox"

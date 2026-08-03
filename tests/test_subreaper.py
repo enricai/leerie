@@ -111,18 +111,18 @@ def test_zombie_reaper_reaps_an_orphaned_child(leerie):
 
 
 def test_reaper_is_wired_into_orchestrate(leerie):
-    """The reaper only helps if `orchestrate()` actually spawns AND cancels it
+    """The reaper only helps if `_orchestrate()` actually spawns AND cancels it
     (mirroring `_memory_sampler`'s lifecycle). Source-pin the wiring so a
     refactor can't silently drop it — the fix is inert without this."""
     import inspect
 
-    src = inspect.getsource(leerie.orchestrate)
+    src = inspect.getsource(leerie._orchestrate)
     assert "_zombie_reaper()" in src, (
-        "orchestrate() must spawn _zombie_reaper() as a background task")
+        "_orchestrate() must spawn _zombie_reaper() as a background task")
     assert "reaper_task = asyncio.create_task" in src, (
         "reaper task must be created like sampler_task")
     assert "reaper_task.cancel()" in src, (
-        "reaper task must be cancelled in orchestrate()'s finally")
+        "reaper task must be cancelled in _orchestrate()'s finally")
 
 
 def test_main_installs_subreaper(leerie):
@@ -132,7 +132,7 @@ def test_main_installs_subreaper(leerie):
 
     src = inspect.getsource(leerie.main)
     assert "_become_subreaper()" in src, (
-        "main() must call _become_subreaper() early, before orchestrate()")
+        "main() must call _become_subreaper() early, before _orchestrate()")
 
 
 @linux_only

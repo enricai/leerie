@@ -10,7 +10,7 @@ Two tiers, mirroring the discipline used elsewhere in this suite
 1. Source-coupling wiring pins (`TestWiring*`) — the seams that are only
    verifiable by source inspection: the phase runs floor+judge, a low
    result routes through the retry path, a WorkerError never discards the
-   plan, and the call site precedes schedule()/validate_plan.
+   plan, and the call site precedes _schedule()/_validate_plan.
 2. Behavioral integration tests with a stubbed `claude_p` and a stubbed
    `phase_plan` (the re-plan action itself is a full planning phase —
    too heavy to run for real in a unit test, so it is monkeypatched to a
@@ -198,8 +198,8 @@ class TestWiringWorkerErrorDegrades:
 
 
 class TestWiringPrecedesScheduleAndValidatePlan:
-    """The phase must run between phase_overlap_judge and schedule()/
-    validate_plan in _run_phases — re-planning after scheduling or
+    """The phase must run between phase_overlap_judge and _schedule()/
+    _validate_plan in _run_phases — re-planning after scheduling or
     validation would rebuild an already-scheduled DAG."""
 
     def test_orchestrate_calls_phase_adherence_gate(self, leerie):
@@ -211,7 +211,7 @@ class TestWiringPrecedesScheduleAndValidatePlan:
     def test_adherence_gate_follows_overlap_judge(self, leerie):
         src = inspect.getsource(leerie._run_phases)
         overlap_idx = src.find("phase_overlap_judge(")
-        assert overlap_idx != -1, "orchestrate must call phase_overlap_judge"
+        assert overlap_idx != -1, "_orchestrate must call phase_overlap_judge"
         gate_idx = src.find("phase_adherence_gate(", overlap_idx)
         assert gate_idx != -1, (
             "phase_adherence_gate must be called AFTER phase_overlap_judge "
@@ -222,9 +222,9 @@ class TestWiringPrecedesScheduleAndValidatePlan:
         src = inspect.getsource(leerie._run_phases)
         gate_idx = src.find("phase_adherence_gate(")
         assert gate_idx != -1
-        schedule_idx = src.find("schedule(plans)", gate_idx)
+        schedule_idx = src.find("_schedule(plans)", gate_idx)
         assert schedule_idx != -1, (
-            "phase_adherence_gate must be called BEFORE schedule(plans) "
+            "phase_adherence_gate must be called BEFORE _schedule(plans) "
             "in _run_phases's source order — a re-plan must never rebuild "
             "an already-scheduled DAG"
         )
@@ -233,9 +233,9 @@ class TestWiringPrecedesScheduleAndValidatePlan:
         src = inspect.getsource(leerie._run_phases)
         gate_idx = src.find("phase_adherence_gate(")
         assert gate_idx != -1
-        validate_idx = src.find("validate_plan(subtasks)", gate_idx)
+        validate_idx = src.find("_validate_plan(subtasks)", gate_idx)
         assert validate_idx != -1, (
-            "phase_adherence_gate must be called BEFORE validate_plan "
+            "phase_adherence_gate must be called BEFORE _validate_plan "
             "in _run_phases's source order"
         )
 

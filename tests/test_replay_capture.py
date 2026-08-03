@@ -1,11 +1,11 @@
-"""Tests for replay_capture() — the primitive for judge and heal-loop replays.
+"""Tests for _replay_capture() — the primitive for judge and heal-loop replays.
 
 Covers:
   - Arguments passed to claude_p match the captured record's fields.
   - override_system_prompt replaces system_prompt end-to-end.
   - A replay call does not write to any calls.ndjson (no capture pollution).
   - Return value is (envelope, structured_output) 2-tuple.
-  - replay_capture is importable from the leerie module.
+  - _replay_capture is importable from the leerie module.
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def _stub_invoke(leerie, monkeypatch, envelope=_GOOD_ENVELOPE):
 # ---------------------------------------------------------------------------
 
 def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
-    """replay_capture passes system_prompt, user_content, call_type→schema_key,
+    """_replay_capture passes system_prompt, user_content, call_type→schema_key,
     and model from the capture record through to claude_p / _invoke.
 
     The appended-system-prompt flag (--append-system-prompt vs. the
@@ -90,7 +90,7 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    asyncio.run(leerie.replay_capture(_CAPTURE_RECORD))
+    asyncio.run(leerie._replay_capture(_CAPTURE_RECORD))
 
     assert collected_cmd, "fake_invoke was never called"
     cmd = collected_cmd[0]
@@ -148,7 +148,7 @@ def test_override_system_prompt(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
     override = "PATCHED: use a different classifier strategy."
-    asyncio.run(leerie.replay_capture(
+    asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
         override_system_prompt=override,
     ))
@@ -170,7 +170,7 @@ def test_override_system_prompt(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_replay_does_not_pollute_captures(leerie, tmp_path, monkeypatch):
-    """replay_capture must not write to any calls.ndjson file — replays must
+    """_replay_capture must not write to any calls.ndjson file — replays must
     not pollute the captures stream."""
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
@@ -181,7 +181,7 @@ def test_replay_does_not_pollute_captures(leerie, tmp_path, monkeypatch):
 
     # Run replay with cwd set to tmp_path so if any files are written they
     # land there where we can detect them.
-    asyncio.run(leerie.replay_capture(
+    asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
         cwd=str(tmp_path),
     ))
@@ -206,13 +206,13 @@ def test_replay_does_not_modify_existing_capture_file(leerie, tmp_path,
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    asyncio.run(leerie.replay_capture(
+    asyncio.run(leerie._replay_capture(
         _CAPTURE_RECORD,
         cwd=str(tmp_path),
     ))
 
     assert existing.read_text() == original_content, (
-        "replay_capture modified an existing calls.ndjson")
+        "_replay_capture modified an existing calls.ndjson")
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ def test_replay_does_not_modify_existing_capture_file(leerie, tmp_path,
 # ---------------------------------------------------------------------------
 
 def test_return_value_shape(leerie, tmp_path, monkeypatch):
-    """replay_capture returns a 2-tuple (envelope, structured_output)."""
+    """_replay_capture returns a 2-tuple (envelope, structured_output)."""
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
@@ -228,7 +228,7 @@ def test_return_value_shape(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    result = asyncio.run(leerie.replay_capture(_CAPTURE_RECORD))
+    result = asyncio.run(leerie._replay_capture(_CAPTURE_RECORD))
 
     assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
     assert len(result) == 2, f"Expected 2-tuple, got {len(result)}-tuple"
@@ -251,8 +251,8 @@ def test_return_value_shape(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_replay_capture_importable(leerie):
-    """replay_capture must be a top-level name in the leerie module."""
-    assert hasattr(leerie, "replay_capture"), (
-        "replay_capture is not defined in orchestrator/leerie.py")
-    assert callable(leerie.replay_capture), (
-        "replay_capture is not callable")
+    """_replay_capture must be a top-level name in the leerie module."""
+    assert hasattr(leerie, "_replay_capture"), (
+        "_replay_capture is not defined in orchestrator/leerie.py")
+    assert callable(leerie._replay_capture), (
+        "_replay_capture is not callable")

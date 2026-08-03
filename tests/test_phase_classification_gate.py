@@ -241,7 +241,7 @@ def test_judge_crash_degrades_without_dying(leerie, tmp_path, monkeypatch):
 # already on HEAD can make classification unable to converge on a category
 # set — the classifier's own investigation already explains why (the diff
 # doesn't exist), so exhaustion should route to the SAME terminal state
-# detect_no_work produces post-plan, not die().
+# _detect_no_work produces post-plan, not die().
 
 def test_exhaustion_routes_to_no_work_when_likely_already_satisfied(
         leerie, tmp_path, monkeypatch):

@@ -73,14 +73,14 @@ def _read_version() -> str:
         (ROOT / ".claude-plugin" / "plugin.json").read_text()
     )["version"]
 
-# `{{include: _foo.md}}` placeholder pattern used by load_prompt() to embed
+# `{{include: _foo.md}}` placeholder pattern used by _load_prompt() to embed
 # a shared prompt fragment into a worker prompt. Only files prefixed with
 # `_` are eligible — that prefix marks an internal include, never a
 # standalone worker prompt. One level deep; no recursion needed today.
 _PROMPT_INCLUDE_RE = re.compile(r"\{\{\s*include:\s*(_[a-z0-9_]+\.md)\s*\}\}")
 
 
-def load_prompt(name: str) -> str:
+def _load_prompt(name: str) -> str:
     """Read prompts/<name>.md and expand any {{include: _foo.md}}
     placeholders by inlining the named fragment. Replaces the prior
     `(PROMPTS / f"{name}.md").read_text()` pattern so the
@@ -115,14 +115,14 @@ DEFAULT_CAPS = {
     "subtask_continuations": 3,
     "failed_retries": 1,            # re-spawns of a failed implementer
     # Orchestrator-level conformer re-runs per subtask (DESIGN §9 *Post-
-    # work conformance*). Bounds the loop in `settle_subtask` that re-spawns
+    # work conformance*). Bounds the loop in `_settle_subtask` that re-spawns
     # the conformer when its output is malformed or residuals remain.
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
     "conformance_rounds": 3,
     # Implementer completeness re-drives per subtask (DESIGN §9 *The one
     # gating axis: solution completeness*). Bounds the loop in
-    # `settle_subtask` that re-drives the implementer when the conformer's
+    # `_settle_subtask` that re-drives the implementer when the conformer's
     # gating `solution_defects` axis found concrete behavioral gaps in the
     # implementer's diff. A SEPARATE counter from conformance_rounds,
     # implementer_confidence_retries, failed_retries, and
@@ -258,13 +258,13 @@ DEFAULT_CAPS = {
     # ranked so the most task-relevant symbols appear at the prompt extremes.
     # ~1000 tokens keeps the injection below 5% of typical planner context.
     "repo_map_tokens": 1000,
-    # Maximum recursion depth for recursive_decompose() (DESIGN §5½ (P1) *P1
+    # Maximum recursion depth for _recursive_decompose() (DESIGN §5½ (P1) *P1
     # recursive judge + splitter*). A depth-5 tree can represent up to 2^5=32
     # leaves from a single subtask, more than enough for the observed 64-file
     # migration sweeps (target ~8 leaves). Terminates recursion at depth ≥ 5
     # even if fit_judge still scores below decompose_fit_threshold.
     "decompose_max_depth": 5,
-    # P1 fit-judge pass threshold for recursive_decompose() (DESIGN §5½ (P1)).
+    # P1 fit-judge pass threshold for _recursive_decompose() (DESIGN §5½ (P1)).
     # A subtask scoring ≥ this value is accepted as a leaf (well-fit).
     # MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs
     # well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. The
@@ -272,13 +272,13 @@ DEFAULT_CAPS = {
     # (their scores cluster at 0.82–0.93); 0.70 is the empirically-derived
     # optimum (see F1-build-measure.md).
     "decompose_fit_threshold": 0.70,
-    # No-progress guard for recursive_decompose(). If this many consecutive
+    # No-progress guard for _recursive_decompose(). If this many consecutive
     # recursion rounds produce no child whose fit score exceeds the parent's,
     # the subtask is accepted as a leaf with a warning rather than recursing
     # indefinitely. Prevents a degenerate splitter output from looping to
     # decompose_max_depth.
     "decompose_noprogress_rounds": 2,
-    # Sub-file split span for recursive_decompose() (DESIGN §5½ (P1) *Sub-file*).
+    # Sub-file split span for _recursive_decompose() (DESIGN §5½ (P1) *Sub-file*).
     # A single-file subtask (or a single intra-file region) whose line span
     # exceeds this is split *within* the file — tier 1 on tree-sitter
     # function-boundary spans, tier 2 on contiguous line-windows for a function
@@ -339,7 +339,7 @@ STATE_FIELDS = (
     # is then not something re-planning can resolve.
     "overlap_replan_done",
     # cgroup_containment: recorded by the fail-closed gate
-    # (enforce_and_record_cgroup_containment, in _run_phases just before the
+    # (_enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
     # "v2"|"v1"|null}. `enforced=false` means workers ran without memory/PID
     # limits (only reachable via --dangerously-allow-uncapped). Persisted
@@ -352,7 +352,7 @@ STATE_FIELDS = (
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
     # entries collected during phase_reconcile (DESIGN §5
-    # `requires.extent`). Persisted so write_plan() can surface them in
+    # `requires.extent`). Persisted so _write_plan() can surface them in
     # plan.json's `preconditions` section. Empty list when no planner
     # declared any external requirement — the common case.
     "external_preconditions",
@@ -361,7 +361,7 @@ STATE_FIELDS = (
     # RSS growth with the code path that produced it. Updated at each
     # phase_* entry. Empty string before phase 1.
     "current_phase",
-    # dropped_subtasks: subtasks soft-dropped by filter_offtree_subtasks
+    # dropped_subtasks: subtasks soft-dropped by _filter_offtree_subtasks
     # because their files_likely_touched resolved off-tree (most commonly
     # into an inspect-dir mount). Map of sid → {reasons: [str], files:
     # [str]}. Empty/absent when no drop fired. Audit trail only — the
@@ -427,7 +427,7 @@ STATE_FIELDS = (
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
     # the on-disk copy later). Persisted into st.data so downstream
-    # readers (pr_writer payload, run_final_conformance's DIFF_BASE)
+    # readers (pr_writer payload, _run_final_conformance's DIFF_BASE)
     # do not have to re-query git or re-read run.json.
     "working_branch",
     # pr_base_branch: the final branch this run's PR merges into. Defaults
@@ -456,7 +456,7 @@ STATE_FIELDS = (
     # phase whose output key is absent, reusing the persisted `plans` as
     # that phase's input instead of re-deriving it. Absent for a phase
     # that has not yet completed (or on a run that has already reached
-    # `waves`, since plan_snapshot/write_plan supersede these by then).
+    # `waves`, since plan_snapshot/_write_plan supersede these by then).
     "plans_after_classify",
     "plans_after_plan",
     "plans_after_reconcile",
@@ -527,7 +527,7 @@ _CLAUDE_DELIVERABLE_PREFIXES = (
 )
 
 
-def is_protected_path(path: str) -> bool:
+def _is_protected_path(path: str) -> bool:
     """Return True if `path` is a meta-directory the implementer must not
     write to. See `_PROTECTED_PREFIXES` and `_CLAUDE_DELIVERABLE_PREFIXES`
     for the rule."""
@@ -633,7 +633,7 @@ EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # `die()` exit code 1 so the Fly runtime's decide_teardown trap and
 # automation around it can route this case specifically. The error message
 # names a recommended `--max-workers` value. Not resumable: `--resume`
-# re-enters past schedule(), so the preflight has nothing to gate; a run
+# re-enters past _schedule(), so the preflight has nothing to gate; a run
 # that died here re-runs from scratch with the recommended cap or a split
 # task.
 EXIT_BUDGET_INFEASIBLE = 11
@@ -788,7 +788,7 @@ SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-budget-check bypass (DESIGN §13 *Budget feasibility — fail
 # fast at the cheapest moment*). Suppresses `check_budget_feasibility()`
-# in `_run_phases()` after `schedule()` returns. The runtime backstop in
+# in `_run_phases()` after `_schedule()` returns. The runtime backstop in
 # `State.bump_workers()` still fires if the run actually exceeds
 # `max_total_workers` during execution; this flag only suppresses the
 # *early* die() that catches mathematically-unwinnable runs at the
@@ -803,7 +803,7 @@ STRICT_CONFORMER_ENV = "LEERIE_STRICT_CONFORMER"
 STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-base-baseline bypass (DESIGN §9 *Base-tree health baseline*).
-# Suppresses `capture_conformance_baseline()` at the start of
+# Suppresses `_capture_conformance_baseline()` at the start of
 # `phase_execute` — the once-per-run install-into-staging + BLT pass that
 # records whether the base tree was green before any subtask mutated it.
 # The pass runs the full test suite once (tens of seconds to a few
@@ -817,7 +817,7 @@ SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-repo-map bypass (DESIGN §5½ (P6) *Codebase structural map*). Suppresses
-# `build_repo_map()` and the ranked-subgraph injection into the planner
+# `_build_repo_map()` and the ranked-subgraph injection into the planner
 # context. Use on repos where tree-sitter cannot parse the primary language,
 # or where the user wants the prior grep/glob-only planning path. When
 # skipped, the planner receives no repo-map context and degrades gracefully
@@ -841,7 +841,7 @@ SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # --skip-completeness-check bypass (the conformer's gating solution_defects
 # axis — DESIGN §9 *The one gating axis: solution completeness*). Unlike the
 # per-subtask completeness retry (bounded by completeness_retry_rounds, blocks
-# one subtask), the FINAL-tree completeness gate in run_final_conformance is
+# one subtask), the FINAL-tree completeness gate in _run_final_conformance is
 # always-on and die()s the whole run — a single hallucinated defect on the
 # integrated tree would otherwise block finalize with no escape, and each
 # --resume re-attacks. This flag makes both the per-subtask and final-tree
@@ -854,9 +854,9 @@ SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
 SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
-# the mtime-keyed per-file parse results produced by build_repo_map() so
+# the mtime-keyed per-file parse results produced by _build_repo_map() so
 # only changed files are re-parsed on subsequent runs (Aider diskcache
-# pattern). Created on first use by build_repo_map().
+# pattern). Created on first use by _build_repo_map().
 REPO_MAP_CACHE_DIR = "repo-map-cache"
 
 # capture_deps preference (DESIGN §6½). Controls whether phase_finalize
@@ -867,13 +867,13 @@ CAPTURE_DEPS_ENV = "LEERIE_CAPTURE_DEPS"
 CAPTURE_DEPS_CONFIG = ".leerie/config.toml"
 
 # --skip-satisfied-check bypass (DESIGN §8 *Already-satisfied subtask
-# elimination*). Suppresses the phase-3 `filter_satisfied_subtasks()`
+# elimination*). Suppresses the phase-3 `_filter_satisfied_subtasks()`
 # gate that spawns a per-subtask `satisfied_probe` worker to drop
 # subtasks already met on the base tree. When set, every subtask
-# proceeds to schedule(); the mechanical `check_branch_has_commits`
+# proceeds to _schedule(); the mechanical `check_branch_has_commits`
 # backstop still catches an already-satisfied subtask post-execution
-# (settle_subtask re-probes the criteria against HEAD and settles complete
-# if met — see `probe_criteria_satisfied_on_head`). Resolution order: --skip-satisfied-check CLI
+# (_settle_subtask re-probes the criteria against HEAD and settles complete
+# if met — see `_probe_criteria_satisfied_on_head`). Resolution order: --skip-satisfied-check CLI
 # flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check in
 # leerie.toml → False.
 SKIP_SATISFIED_CHECK_ENV = "LEERIE_SKIP_SATISFIED_CHECK"
@@ -1016,7 +1016,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "rebaser")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
-# the main orchestrate loop, but they do get dedicated model resolution via
+# the main _orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
 MODEL_JUDGE_ENV = "LEERIE_MODEL_JUDGE"
 MODEL_HEAL_ENV = "LEERIE_MODEL_HEAL"
@@ -1105,7 +1105,7 @@ _CONFORMER_BLT_PROP = {
 # must be present and `extent` is restricted to two values. The
 # *conditional* invariant ("`reason` is required and non-empty when
 # `extent == 'external'`") is not expressible in vanilla JSON Schema
-# without `if/then`, so it is enforced in `validate_plan` instead, per
+# without `if/then`, so it is enforced in `_validate_plan` instead, per
 # CLAUDE.md "prompts are advisory, code enforces." See DESIGN §5
 # `requires.extent` for the architectural contract.
 _REQUIRES_ITEM = {
@@ -1459,7 +1459,7 @@ SCHEMAS: dict[str, dict] = {
                 # depends_on references; the drop is recorded in
                 # state.data["conditional_drops"] for audit (distinct from
                 # state.data["dropped_subtasks"] which records off-tree
-                # soft-drops from filter_offtree_subtasks). Restricted to
+                # soft-drops from _filter_offtree_subtasks). Restricted to
                 # planner-authored consumers — the apply step die()s if
                 # the target sid carries _added_by_reconciler: true
                 # (reconciler-added subtasks have no planner prose to
@@ -1712,7 +1712,7 @@ SCHEMAS: dict[str, dict] = {
         # discipline fails its own JSON gate before the orchestrator reads
         # it; cross-field invariants (residuals require non-empty
         # rules_files_read, fixed-violations cite a rule, updates cite a
-        # path) are enforced by validate_conformance_result().
+        # path) are enforced by _validate_conformance_result().
         "type": "object",
         "required": [
             "subtask_id", "rules_files_read",
@@ -1783,7 +1783,7 @@ SCHEMAS: dict[str, dict] = {
             # unedited. This is the ONE gating axis (build/lint/test and the
             # confidence self-score below stay advisory). A non-empty set of
             # ACTIONABLE defects (each carrying a concrete_case + where —
-            # validate_conformance_result drops the rest as non-actionable, so
+            # _validate_conformance_result drops the rest as non-actionable, so
             # the gate cannot fire on vague "looks incomplete" prose) re-drives
             # the implementer with the defects folded in as mandatory criteria
             # (bounded by completeness_retry_rounds), or blocks on exhaustion.
@@ -1833,7 +1833,7 @@ SCHEMAS: dict[str, dict] = {
         # fields; the heal loop validates that `anchor` is a literal
         # substring of the current prompt body before applying the patch
         # (per the prompts-are-advisory-code-enforces principle — the
-        # check is in request_patch, not in the prompt).
+        # check is in _request_patch, not in the prompt).
         "type": "object",
         "required": ["anchor", "replacement"],
         "properties": {
@@ -1901,10 +1901,10 @@ SCHEMAS: dict[str, dict] = {
     },
     "provision": {
         # LLM fallback for per-repo dependency provisioning (DESIGN §6½).
-        # Fires only when detect_recipe_from_lockfiles() returns an empty
+        # Fires only when _detect_recipe_from_lockfiles() returns an empty
         # list — Java/Gradle, bare pyproject.toml, polyglot Makefile setups.
         # The recipe is structurally bounded here, then mechanically
-        # validated by validate_provision_recipe() (§12 carve-out).
+        # validated by _validate_provision_recipe() (§12 carve-out).
         "type": "object",
         "required": ["recipe", "confidence"],
         "properties": {
@@ -1925,7 +1925,7 @@ SCHEMAS: dict[str, dict] = {
                         "kind": {"enum": ["install", "build", "none"]},
                         # argv list (NOT a shell string). argv[0] must be
                         # in the allowlist enforced by
-                        # validate_provision_recipe; no shell metacharacters
+                        # _validate_provision_recipe; no shell metacharacters
                         # anywhere in the argv.
                         "command": {
                             "type": "array",
@@ -1934,7 +1934,7 @@ SCHEMAS: dict[str, dict] = {
                         },
                         # `.` or a relative path inside the repo. No
                         # absolute paths, no `..` segments — enforced by
-                        # validate_provision_recipe.
+                        # _validate_provision_recipe.
                         "working_dir": {"type": "string"},
                         "timeout_s": {"type": "integer", "minimum": 1},
                     },
@@ -2019,9 +2019,9 @@ SCHEMAS: dict[str, dict] = {
         # Output of the per-subtask satisfied-probe worker (DESIGN §8
         # *Already-satisfied subtask elimination*). Spawned from two sites,
         # both HEAD/working-tree-only (never other refs): (1) per surviving
-        # subtask by `filter_satisfied_subtasks` in phase 3 against the
+        # subtask by `_filter_satisfied_subtasks` in phase 3 against the
         # *base tree* at plan time; (2) per no-commits `complete` by
-        # `probe_criteria_satisfied_on_head` in `settle_subtask` against the
+        # `_probe_criteria_satisfied_on_head` in `_settle_subtask` against the
         # *run-branch HEAD* post-execution (DESIGN §8 *The mid-run sibling
         # case*). Both decide whether the subtask's success criteria are
         # already fully met, such that an implementer would have nothing to
@@ -2080,7 +2080,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "fit_judge": {
         # Output of the P1 fit-judge worker (DESIGN §5½ (P1) *P1 recursive
-        # judge + splitter*). Spawned by recursive_decompose() for each
+        # judge + splitter*). Spawned by _recursive_decompose() for each
         # subtask candidate. The worker scores P1 Task-Context Fit as a
         # 0–1 confidence value: a subtask scores high when its scope and
         # context are co-minimized (minimum necessary complexity, maximum
@@ -2110,15 +2110,15 @@ SCHEMAS: dict[str, dict] = {
     },
     "splitter": {
         # Output of the P1 splitter worker (DESIGN §5½ (P1) *P1 recursive
-        # judge + splitter*). Spawned by recursive_decompose() when
+        # judge + splitter*). Spawned by _recursive_decompose() when
         # fit_judge scores below decompose_fit_threshold. The worker
-        # receives a pre-computed file partition (from partition_files()
+        # receives a pre-computed file partition (from _partition_files()
         # for migration sweeps) or the P6 repo-map subgraph for coupled
         # cases, and emits child subtasks with titles + success_criteria_seed.
         #
         # The worker only LABELS pre-partitioned chunks (it never decides
         # which files go where for the migration case — that is guaranteed
-        # 100%-coverage by partition_files() by construction). For the
+        # 100%-coverage by _partition_files() by construction). For the
         # coupled-minority case it emits structural seams backed by the
         # repo-map, backstopped by _check_migration_surface.
         "type": "object",
@@ -2303,7 +2303,7 @@ SCHEMAS: dict[str, dict] = {
     "provision_judge": {
         # Attacks the detected install recipe against the actual image /
         # runtime, catching the SEMANTIC gaps the deterministic
-        # _normalize_pip_installs / validate_provision_recipe miss. Proven
+        # _normalize_pip_installs / _validate_provision_recipe miss. Proven
         # harm: a recipe self-graded 9.3 that omitted --break-system-packages
         # caused 12 real install failures on the externally-managed Debian
         # image (28 runs got the broken recipe, 20 got the correct one for the
@@ -2506,7 +2506,7 @@ def _install_run_log_tee(run_dir: Path) -> None:
 class InterruptedBySignal(BaseException):
     """Raised by signal handlers (SIGTERM, SIGHUP) installed in main().
     Inherits BaseException (not Exception) so the broad `except Exception`
-    handlers inside orchestrate() don't swallow it. Caught only at
+    handlers inside _orchestrate() don't swallow it. Caught only at
     main()'s top-level try/except, where it triggers worktree-only
     cleanup with state and branches preserved (DESIGN §6).
 
@@ -2607,7 +2607,7 @@ _SESSION_LIMIT_RESET = re.compile(
 _RATE_LIMIT_ALLOWED_STATUSES = ("allowed", "allowed_warning")
 
 
-def detect_session_limit(text: str) -> RateLimitedExit | None:
+def _detect_session_limit(text: str) -> RateLimitedExit | None:
     """Return a RateLimitedExit if `text` matches the Claude Code
     session-limit message format, else None. Parse failures of the
     reset clause produce an exit with reset_at=None — the run still
@@ -3124,7 +3124,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         return
     # Full purge: delete branches and the run dir. The run branch lives
     # at leerie/runs/<run-id> and subtask branches under
-    # leerie/subtasks/<run-id>/<sid> — see compute_run_branch for the
+    # leerie/subtasks/<run-id>/<sid> — see _compute_run_branch for the
     # namespace-disjointness rationale.
     branch_globs = [
         f"refs/heads/leerie/runs/{st.run_id}",
@@ -3156,7 +3156,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     re-runs the script against a still-registered worktree and an existing
     branch — the second `git worktree add -b` fails with
     `fatal: a branch ... already exists`, the WorkerError escapes
-    settle_subtask, and gather_or_cancel takes down the whole wave.
+    _settle_subtask, and _gather_or_cancel takes down the whole wave.
 
     Tolerates either being absent: both `git worktree remove --force`
     and `git branch -D` return nonzero when their target is missing,
@@ -3301,12 +3301,12 @@ def _check_claude_cli_version() -> None:
 # and PR body.
 
 
-def compute_run_branch(run_id: str) -> str:
+def _compute_run_branch(run_id: str) -> str:
     """The git branch name carrying a run's integrated work.
 
     The `leerie/runs/` prefix is **mandatory**, not cosmetic. Subtask
     branches live under the sibling prefix `leerie/subtasks/<run-id>/<sid>`
-    (see `compute_subtask_branch`). Git's loose ref store represents each
+    (see `_compute_subtask_branch`). Git's loose ref store represents each
     ref as a file inside `refs/heads/…/`, so a ref AT a path and a ref
     UNDER that same path cannot coexist. If both lived under
     `leerie/<run-id>` the first `git worktree add` for a subtask would
@@ -3315,10 +3315,10 @@ def compute_run_branch(run_id: str) -> str:
     return f"leerie/runs/{run_id}"
 
 
-def compute_subtask_branch(run_id: str, sid: str) -> str:
+def _compute_subtask_branch(run_id: str, sid: str) -> str:
     """The git branch name for one subtask's worktree.
 
-    Paired with `compute_run_branch` — see that function for the
+    Paired with `_compute_run_branch` — see that function for the
     namespace-disjointness rationale. The bash side
     (`scripts/new-worktree.sh`, `scripts/integrate.sh`) constructs the
     same string; this helper exists so the shape is grep-able from
@@ -3569,7 +3569,7 @@ def _write_run_json(run_dir: Path, **fields) -> None:
 
 # --- run discovery and resolution (DESIGN §6 multi-run resume) ----------
 
-def discover_runs(leerie_root: Path) -> list[dict]:
+def _discover_runs(leerie_root: Path) -> list[dict]:
     """Enumerate `<state-root>/runs/*/state.json`, returning one summary
     dict per discovered run. Malformed state.json files are skipped with
     a logged warning, never raising.
@@ -3669,7 +3669,7 @@ _AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
 
 
 def _run_status_for(run: dict, leerie_root: Path) -> str:
-    """Derived status for a `discover_runs` row.
+    """Derived status for a `_discover_runs` row.
 
     Reads the run.json sidecar (same source `leerie --list` consults) and
     hands it to `_derive_run_status` alongside the state.json dict the
@@ -3728,7 +3728,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
     Auto-picking a live run is safe for `--resume`: the run dir's flock
     rejects a second orchestrator (DESIGN §6 *Single owner per run dir*),
     surfacing as "already running" rather than a double-drive."""
-    runs = discover_runs(leerie_root)
+    runs = _discover_runs(leerie_root)
     if cli_run_id is not None:
         for r in runs:
             if r["run_id"] == cli_run_id:
@@ -3794,7 +3794,7 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
                                         - mtime)
         except (OSError, ValueError, OverflowError):
             # OSError: the sidecar (state.json or fly-machine.json) was
-            # deleted between discover_runs and now.
+            # deleted between _discover_runs and now.
             # ValueError/OverflowError: pathological mtime (NaN, inf) that
             # _format_age's int() would reject. Both are extremely unlikely
             # in practice; this is defense-in-depth so a one-in-a-million
@@ -3833,7 +3833,7 @@ def _format_age(seconds: float) -> str:
 # `seed-failed` is special: it covers run dirs that have a
 # fly-machine.json (machine was provisioned) but no state.json (the
 # orchestrator never wrote one — typically seed_auth aborted before
-# phase_classify). Surfaced by `discover_runs` as `_orphan=True`,
+# phase_classify). Surfaced by `_discover_runs` as `_orphan=True`,
 # matched by the earliest check in `_derive_run_status`. See plan file
 # for the 2026-06-04 incident where this status would have rescued
 # three runs that hid behind the prior "no state.json → skip" rule.
@@ -3862,7 +3862,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
 
     Order of checks matters — earlier checks fire first:
       0. state_json["_orphan"] set → `seed-failed` (synthesized by
-                                     `discover_runs` for run dirs that
+                                     `_discover_runs` for run dirs that
                                      have fly-machine.json but no
                                      state.json; seed_auth aborted
                                      before phase_classify).
@@ -3899,7 +3899,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     misclassify them.
 
     state_json is consulted for the `_orphan` marker (synthesized by
-    `discover_runs`); other state.json fields remain reserved for
+    `_discover_runs`); other state.json fields remain reserved for
     forward-compat (future statuses like 'blocked' may consult
     state.json["blocked"])."""
     if (state_json or {}).get("_orphan"):
@@ -3956,9 +3956,9 @@ def _collect_run_rows(
     `cost` is the run's aggregate `$X.XX` from `state.json`'s telemetry
     block, or `—` when telemetry is absent (e.g. pre-classify orphans).
     `is_fly` stays at r[4] as a filter-only field so the existing `r[2]`
-    status filter in `list_runs` is unaffected; `is_ec2` is appended at
+    status filter in `_list_runs` is unaffected; `is_ec2` is appended at
     r[6] (after `cost`) for the same reason."""
-    runs = discover_runs(leerie_root)
+    runs = _discover_runs(leerie_root)
     rows: list[tuple[str, str, str, str, bool, str, bool]] = []
     for state in runs:
         run_id = state["run_id"]
@@ -3974,12 +3974,12 @@ def _collect_run_rows(
                 run_json = None
         status = _derive_run_status(run_json, state)
         started_at = state.get("started_at") or "—"
-        branch = (run_json or {}).get("branch") or compute_run_branch(run_id)
+        branch = (run_json or {}).get("branch") or _compute_run_branch(run_id)
         is_fly = bool((run_json or {}).get("fly_machine_id")
                       or (run_dir / "fly-machine.json").is_file())
         is_ec2 = bool((run_json or {}).get("ec2_instance_id")
                       or (run_dir / "ec2-instance.json").is_file())
-        # Telemetry rides along in the state summary (discover_runs passes the
+        # Telemetry rides along in the state summary (_discover_runs passes the
         # whole state.json through), so no extra disk read. Orphans have no
         # state.json and thus no telemetry → render "—".
         tel = state.get("telemetry") or {}
@@ -4010,7 +4010,7 @@ def _render_run_table(
         print(fmt.format(r[0], r[1], r[2], r[5], r[3]))
 
 
-def list_runs(
+def _list_runs(
     leerie_root: Path,
     status_filter: str | None = None,
     runtime_filter: str | None = None,
@@ -4112,7 +4112,7 @@ def _memory_peak(mem_path: Path) -> dict | None:
             "max_open_fds": max_fds, "max_thread_count": max_threads}
 
 
-def report_run(leerie_root: Path, cli_run_id: str | None) -> None:
+def _report_run(leerie_root: Path, cli_run_id: str | None) -> None:
     """Print a telemetry report for one run: header (status, duration,
     aggregate calls/$/tokens from state.json), a per-call_type breakdown
     (count, in/out tokens, avg latency, failures) from calls.ndjson, and a
@@ -4452,7 +4452,7 @@ def resolve_confidence_rounds(repo_root: Path,
         default=DEFAULT_CAPS["confidence_rounds"])
 
 
-def resolve_token_probe_cache_sec(repo_root: Path,
+def _resolve_token_probe_cache_sec(repo_root: Path,
                                   cli_value: int | None = None) -> int:
     """Resolve the multi-token probe-cache floor (DESIGN §6 *Multi-token
     rotation*). Order: CLI flag (if the caller wires one) →
@@ -4872,13 +4872,13 @@ def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
     LEERIE_SKIP_SATISFIED_CHECK env var →
     skip_satisfied_check in leerie.toml → False.
 
-    When True, `filter_satisfied_subtasks()` (DESIGN §8 *Already-
+    When True, `_filter_satisfied_subtasks()` (DESIGN §8 *Already-
     satisfied subtask elimination*) is suppressed: no `satisfied_probe`
-    worker spawns and every subtask proceeds to `schedule()`. The
+    worker spawns and every subtask proceeds to `_schedule()`. The
     mechanical `check_branch_has_commits` backstop still catches an
     already-satisfied subtask post-execution: on a no-commits `complete`,
-    `settle_subtask` re-probes the criteria against the run-branch HEAD
-    (`probe_criteria_satisfied_on_head`) and settles it `complete` if met
+    `_settle_subtask` re-probes the criteria against the run-branch HEAD
+    (`_probe_criteria_satisfied_on_head`) and settles it `complete` if met
     (a base-tree-satisfied subtask still has no commits, so the same rescue
     fires), rather than burning the retry cap. This flag trades the cheap
     plan-time skip for that more expensive post-execution one. Off by
@@ -4914,7 +4914,7 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
     LEERIE_SKIP_BASE_BASELINE env var →
     skip_base_baseline in leerie.toml → False.
 
-    When True, `capture_conformance_baseline` is not run — the once-per-run
+    When True, `_capture_conformance_baseline` is not run — the once-per-run
     install-into-staging + build/lint/test pass that records base-tree
     health (DESIGN §9 *Base-tree health baseline*) is skipped, and the
     conformer gets no BASELINE context. Use on repos whose base is known
@@ -4932,7 +4932,7 @@ def resolve_skip_repo_map(repo_root: Path, cli_value: bool) -> bool:
     LEERIE_SKIP_REPO_MAP env var →
     skip_repo_map in leerie.toml → False.
 
-    When True, `build_repo_map()` is not called — the ranked P6 subgraph
+    When True, `_build_repo_map()` is not called — the ranked P6 subgraph
     injection into the planner/splitter context is skipped and the planner
     degrades gracefully to the prior grep/glob-only path. Use on repos where
     tree-sitter cannot parse the primary language, or where the user wants to
@@ -5017,7 +5017,7 @@ def resolve_verbosity(repo_root: Path,
         allowed=VERBOSITY_VALUES, default=VERBOSITY_DEFAULT)
 
 
-def verbosity_from_shortcuts(verbose: int, quiet: int) -> str | None:
+def _verbosity_from_shortcuts(verbose: int, quiet: int) -> str | None:
     """Map argparse -v/-vv/-q/-qq counts to a verbosity level.
 
     Anchors to `normal` (NOT to VERBOSITY_DEFAULT), so -v always means
@@ -5270,7 +5270,7 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     `env` defaults to None, which inherits the orchestrator's environment
     (asyncio's own default) — so every existing call site is unchanged.
     Callers pass it to scope a variable to one command, e.g.
-    `rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
+    `_rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -5307,7 +5307,7 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     )
 
 
-async def run_streaming(
+async def _run_streaming(
     cmd: list[str],
     *,
     cwd: str | None = None,
@@ -5348,7 +5348,7 @@ async def run_streaming(
     process-group/exception-safety story, different I/O shape. Pick
     `run_proc` for short captures (git plumbing, smoke tests) where
     the synchronous-collect shape is what the caller wants; pick
-    `run_streaming` for anything that might run long enough that a
+    `_run_streaming` for anything that might run long enough that a
     silent terminal would mislead the user.
     """
     proc = await asyncio.create_subprocess_exec(
@@ -5433,7 +5433,7 @@ async def run_streaming(
     return rc, "\n".join(tail)
 
 
-async def gather_or_cancel(*aws):
+async def _gather_or_cancel(*aws):
     """Like asyncio.gather, but on the first exception cancel every other
     in-flight task and await its finalization before re-raising. Paired with
     run_proc's child-killing exception handler, this terminates in-flight
@@ -5457,7 +5457,7 @@ async def gather_or_cancel(*aws):
         raise
 
 
-async def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
+async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
     """Run one of the bundled git worktree scripts in the target repo."""
     return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd())
 
@@ -5815,14 +5815,14 @@ def _check_migration_targets_declared(subtasks: list[dict]) -> list[str]:
 # P1 recursive decomposition (DESIGN §5½ (P1))
 # ---------------------------------------------------------------------------
 
-def partition_files(files: list[str], chunk_size: int) -> list[list[str]]:
+def _partition_files(files: list[str], chunk_size: int) -> list[list[str]]:
     """Partition *files* into non-overlapping chunks of at most *chunk_size*.
 
     100% coverage + 0 overlap guaranteed by construction: every element of
     *files* appears in exactly one chunk, and no element appears in more than
     one chunk. The last chunk may be smaller than *chunk_size*.
 
-    Used by recursive_decompose() for migration sweeps — the exhaustive file
+    Used by _recursive_decompose() for migration sweeps — the exhaustive file
     list comes from P6 / _grep_old_pattern; the splitter LLM only labels the
     pre-computed chunks rather than deciding which files go where (the
     measured LLM-drops-14/29 correction from F1-build-measure.md)."""
@@ -5834,16 +5834,16 @@ def partition_files(files: list[str], chunk_size: int) -> list[list[str]]:
     return chunks
 
 
-def partition_lines(lo: int, hi: int, max_span: int) -> list[tuple[int, int]]:
+def _partition_lines(lo: int, hi: int, max_span: int) -> list[tuple[int, int]]:
     """Tile the inclusive line range ``[lo, hi]`` into contiguous windows of at
     most *max_span* lines each (DESIGN §5½ (P1) *Sub-file* — tier 2).
 
-    100% coverage + 0 overlap by construction (the ``partition_files`` guarantee
+    100% coverage + 0 overlap by construction (the ``_partition_files`` guarantee
     on line numbers instead of files): every line in ``[lo, hi]`` falls in exactly
     one window, the last window may be shorter. Used to sub-split a single
     function whose span alone exceeds the cap (function boundaries can't break it)
     and as the whole-file fallback when tree-sitter yields no symbol ranges.
-    Degenerate guards mirror ``partition_files``: an empty range (``hi < lo``)
+    Degenerate guards mirror ``_partition_files``: an empty range (``hi < lo``)
     returns ``[]``; ``max_span < 1`` returns the whole range as one window."""
     if hi < lo:
         return []
@@ -5857,7 +5857,7 @@ def partition_lines(lo: int, hi: int, max_span: int) -> list[tuple[int, int]]:
     return windows
 
 
-def partition_symbols_by_line(
+def _partition_symbols_by_line(
     ranges: list[tuple[str, int, int]], total_lines: int, max_span: int,
 ) -> list[tuple[int, int]]:
     """Tile ``[1, total_lines]`` into contiguous regions on function boundaries
@@ -5869,13 +5869,13 @@ def partition_symbols_by_line(
     - the union is exactly ``[1, total_lines]`` with no gaps or overlap — an
       inter-symbol gap (blank lines, imports, a comment block) attaches to the
       *preceding* region, and the final region extends to ``total_lines``, so the
-      tiling stays exhaustive by construction (the ``partition_files`` guarantee);
+      tiling stays exhaustive by construction (the ``_partition_files`` guarantee);
     - a region grows by absorbing whole adjacent symbols until adding the next
       would push it past *max_span*, then a new region starts;
     - a **single symbol whose own span exceeds *max_span*** still becomes its own
       region rather than being force-merged — function boundaries cannot break it,
-      so it is handed back oversized on purpose. ``recursive_decompose`` re-enters
-      that region and tier 2 (``partition_lines``) sub-splits it. This is the
+      so it is handed back oversized on purpose. ``_recursive_decompose`` re-enters
+      that region and tier 2 (``_partition_lines``) sub-splits it. This is the
       1,733-line-function case (run 5d488583).
 
     Returns ``[(1, total_lines)]`` when there are no usable ranges — the caller
@@ -6016,7 +6016,7 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
     aliased lists leak dependencies via `_apply_overlap_drop`). Differences:
 
     - ``files_likely_touched`` is the *single* parent file — every region child
-      co-owns it, which is legitimate downstream (schedule ignores files;
+      co-owns it, which is legitimate downstream (_schedule ignores files;
       `git merge` reconciles; the overlap judge is told to exclude same-file/
       different-region collisions via the region-scoped ``intent`` below plus
       the ``_cofile_cluster`` marker it's shown — DESIGN §5 *Cross-domain
@@ -6080,7 +6080,7 @@ async def _label_migration_chunks(
     wrap_repo_map: Callable[[str], str],
 ) -> list[dict]:
     """LABEL-ONLY splitter pass for migration chunks (DESIGN §5½ — "the LLM
-    only labels"). The file→chunk partition is fixed by partition_files();
+    only labels"). The file→chunk partition is fixed by _partition_files();
     this asks the splitter to write a distinct title + success_criteria_seed
     per chunk (keyed by its pre-assigned id) so children are not identical
     parent-copies. §12 code-enforces coverage: if the worker returns a
@@ -6097,7 +6097,7 @@ async def _label_migration_chunks(
     chunk_spec = [{"id": cid, "files_likely_touched": chunk}
                   for cid, chunk in zip(ids, chunks)]
     st.bump_workers(caps)
-    sys_prompt = load_prompt("splitter")
+    sys_prompt = _load_prompt("splitter")
     user_prompt = wrap_repo_map(
         "LABEL PRE-PARTITIONED MIGRATION CHUNKS (label-only mode).\n"
         "The file partition below is FIXED — do NOT move, add, or drop files. "
@@ -6133,7 +6133,7 @@ async def _label_migration_chunks(
     except WorkerError:
         # Worker crashed — keep the distinct deterministic labels (§12: a
         # split must never silently produce identical children).
-        log(f"recursive_decompose: label-only splitter failed for "
+        log(f"_recursive_decompose: label-only splitter failed for "
             f"{base_id}; using deterministic chunk labels")
 
     return [
@@ -6149,16 +6149,16 @@ def _subfile_split(subtask: dict, repo_root: Path,
     membership. Returns ``[]`` when the subtask is not a sub-file split candidate
     or cannot be split further (the caller then treats the node as a leaf).
 
-    Two entry shapes, both routed here from ``recursive_decompose``:
+    Two entry shapes, both routed here from ``_recursive_decompose``:
 
     - **First entry** — a whole single-file subtask with no ``owned_region``. Tier
-      1: tile the file on function-boundary spans (`partition_symbols_by_line`).
+      1: tile the file on function-boundary spans (`_partition_symbols_by_line`).
       A region that is itself over the cap comes back oversized and re-enters
       recursion, hitting the second shape below.
     - **Re-entry** — a child carrying ``owned_region`` whose span still exceeds the
       cap (a single function larger than the cap, e.g. the 1,733-line
       `executeStepWithHealing`). Tier 2: contiguous line-windows over that region
-      (`partition_lines`), which needs no symbol ranges.
+      (`_partition_lines`), which needs no symbol ranges.
 
     Coverage/overlap is guaranteed by construction and re-asserted by
     `_check_intra_file_surface`; a backstop failure logs and returns ``[]`` (fall
@@ -6176,7 +6176,7 @@ def _subfile_split(subtask: dict, repo_root: Path,
         lo, hi = owned.get("start", 1), owned.get("end", 1)
         if (hi - lo + 1) <= max_span:
             return []  # small enough — leaf
-        windows = partition_lines(lo, hi, max_span)
+        windows = _partition_lines(lo, hi, max_span)
         surface_total = hi - lo + 1
         # shift windows into a 1-based frame only for the backstop check
         shifted = [(w0 - lo + 1, w1 - lo + 1) for w0, w1 in windows]
@@ -6193,11 +6193,11 @@ def _subfile_split(subtask: dict, repo_root: Path,
         if total_lines <= max_span:
             return []  # whole file already within the cap — leaf
         ranges = _extract_symbol_ranges(abs_path)
-        regions = partition_symbols_by_line(ranges, total_lines, max_span)
+        regions = _partition_symbols_by_line(ranges, total_lines, max_span)
         if len(regions) <= 1:
             # No usable boundaries (or one span covers the file): tier-2 fallback
             # over the whole file so a range-less large file still gets split.
-            regions = partition_lines(1, total_lines, max_span)
+            regions = _partition_lines(1, total_lines, max_span)
         issues = _check_intra_file_surface(regions, total_lines)
         # Attach the symbols that fall inside each region for the child's prompt.
         symbols_per = []
@@ -6206,7 +6206,7 @@ def _subfile_split(subtask: dict, repo_root: Path,
                 [n for (n, s, e) in ranges if lo <= s and e <= hi])
 
     if issues:
-        log(f"recursive_decompose: intra-file partition of {file!r} failed its "
+        log(f"_recursive_decompose: intra-file partition of {file!r} failed its "
             f"coverage backstop ({issues}); accepting as leaf")
         return []
     if len(regions) <= 1:
@@ -6276,7 +6276,7 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
     return [dense_child, rest_child]
 
 
-async def recursive_decompose(
+async def _recursive_decompose(
     subtask: dict,
     depth: int,
     st: "State",
@@ -6295,7 +6295,7 @@ async def recursive_decompose(
       1. Judge the subtask's Task-Context Fit via the fit_judge worker.
       2. If score >= decompose_fit_threshold or depth >= decompose_max_depth:
          return [subtask] (leaf).
-      3. Split using partition_files (migration) or the splitter worker
+      3. Split using _partition_files (migration) or the splitter worker
          (coupled minority). Every judge/split call goes through st.bump_workers.
       4. No-progress guard: if decompose_noprogress_rounds consecutive rounds
          produce no child whose score exceeds the parent's, accept as leaf with
@@ -6309,7 +6309,7 @@ async def recursive_decompose(
     ``None`` when skip_repo_map is set or the map could not be built — the
     workers then run on the raw subtask spec (graceful degrade).
 
-    Returns a flat list of leaf subtasks ready for schedule()."""
+    Returns a flat list of leaf subtasks ready for _schedule()."""
     max_depth = caps.get("decompose_max_depth",
                          DEFAULT_CAPS["decompose_max_depth"])
     threshold = caps.get("decompose_fit_threshold",
@@ -6332,7 +6332,7 @@ async def recursive_decompose(
         if region_children:
             leaves: list[dict] = []
             for child in region_children:
-                leaves.extend(await recursive_decompose(
+                leaves.extend(await _recursive_decompose(
                     child, depth + 1, st, caps, models, efforts, repo_root,
                     repo_map=repo_map))
             return leaves
@@ -6341,13 +6341,13 @@ async def recursive_decompose(
     # Per-node P6 grounding: re-rank the global repo-map to this subtask's
     # files so the fit_judge/splitter see the local structural neighborhood
     # (DESIGN §5½). Empty seed_symbols — subtasks carry files, not symbols;
-    # mirrors phase_plan's planner-ctx rank_repo_map(rm, seeds, []) call.
+    # mirrors phase_plan's planner-ctx _rank_repo_map(rm, seeds, []) call.
     node_map_text = ""
     if repo_map is not None:
         try:
             node_files = [str(Path(f)) for f in
                           (subtask.get("files_likely_touched") or [])]
-            node_map_text = rank_repo_map(repo_map, node_files, [])
+            node_map_text = _rank_repo_map(repo_map, node_files, [])
         except Exception:
             node_map_text = ""  # degrade silently; worker runs without it
 
@@ -6361,7 +6361,7 @@ async def recursive_decompose(
 
     # --- judge step ----------------------------------------------------------
     st.bump_workers(caps)
-    sys_prompt = load_prompt("fit_judge")
+    sys_prompt = _load_prompt("fit_judge")
     user_prompt = _with_repo_map(
         "SUBTASK TO JUDGE:\n"
         f"{json.dumps(subtask, indent=2)}\n\n"
@@ -6389,7 +6389,7 @@ async def recursive_decompose(
         # establish a confident split. Without this, one WorkerError here
         # would propagate and discard every fit/split decision already paid
         # for elsewhere in the tree (DESIGN §6 *Credential strategy*).
-        log(f"recursive_decompose: fit_judge crashed for "
+        log(f"_recursive_decompose: fit_judge crashed for "
             f"{subtask.get('id', '?')}; accepting as leaf")
         return [subtask]
     score: float = judge_result.get("score", 0.0)
@@ -6398,7 +6398,7 @@ async def recursive_decompose(
     if score >= threshold or depth >= max_depth:
         if depth >= max_depth and score < threshold:
             log(
-                f"recursive_decompose: depth cap ({max_depth}) reached for "
+                f"_recursive_decompose: depth cap ({max_depth}) reached for "
                 f"{subtask.get('id', '?')} (score={score:.2f}); accepting as leaf"
             )
         return [subtask]
@@ -6411,7 +6411,7 @@ async def recursive_decompose(
 
     if new_noprogress >= noprogress_max:
         log(
-            f"recursive_decompose: no-progress guard triggered for "
+            f"_recursive_decompose: no-progress guard triggered for "
             f"{subtask.get('id', '?')} after {noprogress_max} rounds "
             f"(score={score:.2f}); accepting as leaf with warning"
         )
@@ -6449,13 +6449,13 @@ async def recursive_decompose(
     # Migration path (dominant case, ~84%): code-partitions, LLM only labels.
     # Coupled-minority path: LLM-splitter decides the partition.
     elif len(files) > chunk_size:
-        # Migration sweep: partition_files guarantees 100% coverage + 0 overlap
+        # Migration sweep: _partition_files guarantees 100% coverage + 0 overlap
         # BY CONSTRUCTION (the code owns the partition — DESIGN §5½). The
         # splitter worker is then invoked in LABEL-ONLY mode: it titles and
         # writes success criteria per pre-computed chunk; it must NOT move
         # files. This is the plan's "LLM only labels" rule — a bare parent-copy
         # gives every chunk an identical, useless title.
-        chunks = partition_files(files, chunk_size)
+        chunks = _partition_files(files, chunk_size)
         base_id = subtask.get("id", "split")
         children = await _label_migration_chunks(
             subtask, chunks, base_id, depth, st, caps, models, efforts,
@@ -6465,7 +6465,7 @@ async def recursive_decompose(
         # structural seams from the repo-map; backstopped by
         # _check_migration_surface at the plan level.
         st.bump_workers(caps)
-        sys_prompt_s = load_prompt("splitter")
+        sys_prompt_s = _load_prompt("splitter")
         user_prompt_s = _with_repo_map(
             "SUBTASK TO SPLIT:\n"
             f"{json.dumps(subtask, indent=2)}\n\n"
@@ -6493,14 +6493,14 @@ async def recursive_decompose(
             # establish a confident split. Without this, one WorkerError here
             # would propagate and discard every fit/split decision already
             # paid for elsewhere in the tree (DESIGN §6 *Credential strategy*).
-            log(f"recursive_decompose: splitter crashed for "
+            log(f"_recursive_decompose: splitter crashed for "
                 f"{subtask.get('id', '?')}; accepting as leaf")
             return [subtask]
         children = split_result.get("children") or []
         if not children:
             # Splitter produced no children; accept the subtask as a leaf.
             log(
-                f"recursive_decompose: splitter returned no children for "
+                f"_recursive_decompose: splitter returned no children for "
                 f"{subtask.get('id', '?')}; accepting as leaf"
             )
             return [subtask]
@@ -6515,7 +6515,7 @@ async def recursive_decompose(
     # sibling), so the remap below is a no-op there.
     expansion: dict[str, list[str]] = {}
     for child in children:
-        child_leaves = await recursive_decompose(
+        child_leaves = await _recursive_decompose(
             child, depth + 1, st, caps, models, efforts, repo_root,
             repo_map=repo_map,
             _parent_score=score,
@@ -6554,7 +6554,7 @@ def _remap_vanished_deps(subtasks: list[dict],
     Single pass, which requires `mapping` to be *flat*: no successor may itself
     be a vanished key, or the substitution would leave a dangling id behind
     (`{A: [B], B: [C]}` rewrites `A` to `B` and stops). Both callers satisfy
-    this by construction — `recursive_decompose` returns fully-flattened leaves,
+    this by construction — `_recursive_decompose` returns fully-flattened leaves,
     so a generation's map only ever names terminal ids, and `phase_plan`'s map
     is keyed by first-pass parent ids whose successors are suffixed leaf ids
     that no other plan can name as a parent. A future caller that can build a
@@ -6584,20 +6584,20 @@ def _prune_orphaned_requires(plans: list[dict],
     the vanishing subtask's `provides`, so a tag edge self-heals; a drop has no
     successor, so its `provides` are gone and any survivor whose `requires` names
     a tag only the dropped subtask provided is now orphaned — which dies at
-    `validate_plan` (`requires 'X' but nothing provides it`) after the full
+    `_validate_plan` (`requires 'X' but nothing provides it`) after the full
     planner spend.
 
     Operates over **all plans at once**, not per-plan, because capability tags
     are cross-domain: `requires` in one domain's plan is resolved by a `provides`
     that may live in another domain's plan (DESIGN §5 *Cross-domain capability
-    tags*), and `validate_plan` computes provider-existence globally over the
+    tags*), and `_validate_plan` computes provider-existence globally over the
     merged plan. A per-plan prune would wrongly drop a tag a surviving subtask in
     a *different* plan still provides.
 
     The prune set is gated on `dropped_provides` (the union of the dropped
     subtasks' `provides`, captured *before* the survivor-filter removed them): a
     tag still provided by a surviving subtask (in any plan) is kept, and a tag no
-    subtask ever provided is left intact so `validate_plan` still surfaces it as a
+    subtask ever provided is left intact so `_validate_plan` still surfaces it as a
     genuine planner error rather than silently masking it. Pruning "any
     requires-tag not in surviving provides" would swallow that never-provided
     case — hence the `dropped_provides` gate.
@@ -6826,7 +6826,7 @@ def check_planner_output(
 
     for s in subtasks:
         bad = [f for f in (s.get("files_likely_touched") or [])
-               if isinstance(f, str) and is_protected_path(f)]
+               if isinstance(f, str) and _is_protected_path(f)]
         if bad:
             issues.append(
                 f"PROTECTED_PATH: {s.get('id', '?')} lists "
@@ -6870,7 +6870,7 @@ def check_planner_output(
     # `decomposition_quality` and `task_understanding` are retained in the
     # planner schema as advisory self-reports, but neither is a gating axis
     # here anymore (DESIGN §5½, §8): the independent `fit_judge` in
-    # recursive_decompose is the authoritative decomposition gate, and the
+    # _recursive_decompose is the authoritative decomposition gate, and the
     # independent `task_coverage_judge` (phase_planning_coverage_gate) is the
     # authoritative coverage gate — both remove the self-grading bias of
     # letting the planner grade its own decomposition/coverage.
@@ -7241,7 +7241,7 @@ def _format_task_file_references(
     )
 
 
-def glob_task_references(task: str, repo_root: Path) -> list[Path]:
+def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
     """Find file references in the task string via glob expansion.
 
     Scans for tokens that look like file paths or glob patterns (contain
@@ -7355,7 +7355,7 @@ def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
     sorted by ``start_line`` — the ordered, exhaustive span sequence the sub-file
     splitter tiles into regions (DESIGN §5½ (P1) *Sub-file*).
 
-    Deliberately separate from ``_parse_repo_file`` / ``build_repo_map``: the
+    Deliberately separate from ``_parse_repo_file`` / ``_build_repo_map``: the
     repo-map graph stores bare symbol *names* (no positions) and is pinned by
     ~10 tests plus an mtime cache whose shape those tests fix. Reading ranges
     through a dedicated function keeps that contract — and its cache — untouched,
@@ -7368,7 +7368,7 @@ def _extract_symbol_ranges(path: Path) -> list[tuple[str, int, int]]:
     the 1-based, inclusive line numbers the partitioner, prompts, and editors use.
     Returns ``[]`` when the language is unsupported or extraction fails — the
     caller falls back to tier-2 line-windows over the whole file
-    (``partition_lines``)."""
+    (``_partition_lines``)."""
     try:
         import tree_sitter_language_pack as tslp  # noqa: PLC0415
     except ImportError:
@@ -7411,7 +7411,7 @@ _repo_map_empty_warned = False
 # last call succeeded or hit a plain unsupported-extension miss). Read by
 # _warn_repo_map_empty_once() right after the probe call below, so it always
 # reflects that call — never a stale error from an earlier real-file parse
-# during build_repo_map's walk (see the reset at the top of
+# during _build_repo_map's walk (see the reset at the top of
 # _tree_sitter_extraction_works()).
 _last_parse_error: str | None = None
 
@@ -7421,7 +7421,7 @@ def _tree_sitter_extraction_works() -> bool:
     Parses a trivial snippet through _parse_repo_file so an installed-but-
     incompatible parser (imports fine, extracts nothing) is caught. Used to
     distinguish a broken parser (warn) from a legitimately symbol-less repo
-    (stay quiet) in build_repo_map's empty-graph check. Resets
+    (stay quiet) in _build_repo_map's empty-graph check. Resets
     _last_parse_error before probing so the result reflects only this call."""
     global _last_parse_error
     import tempfile  # noqa: PLC0415
@@ -7439,7 +7439,7 @@ def _tree_sitter_extraction_works() -> bool:
 
 
 def _warn_repo_map_empty_once(source_candidates: int) -> None:
-    """Emit at most one warning per process when build_repo_map produces an
+    """Emit at most one warning per process when _build_repo_map produces an
     empty graph despite the repo containing source files AND a functional
     probe confirms tree-sitter cannot extract symbols — the signal that
     tree-sitter is unavailable or its API is incompatible and P6 has silently
@@ -7465,7 +7465,7 @@ def _warn_repo_map_empty_once(source_candidates: int) -> None:
     )
 
 
-def build_repo_map(
+def _build_repo_map(
     repo_root: Path,
     leerie_root: Path,
 ) -> dict:
@@ -7657,7 +7657,7 @@ def _count_tokens_approx(text: str) -> int:
     return max(1, len(text.encode()) // 4)
 
 
-def rank_repo_map(
+def _rank_repo_map(
     repo_map: dict,
     seed_files: list[str],
     seed_symbols: list[str],
@@ -7755,26 +7755,26 @@ def check_plan_wiring(subtasks: dict) -> list[str]:
     (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Pure Python,
     no LLM — returns a list of dangle messages ([] when clean).
 
-    Replays exactly `validate_plan`'s two id/tag-channel dangle checks:
+    Replays exactly `_validate_plan`'s two id/tag-channel dangle checks:
       - every `depends_on` id resolves to a surviving subtask, and
       - every `requires` tag with `extent: in_plan` has some subtask's
         `provides` matching it.
 
-    The point is not to duplicate `validate_plan` for its own sake — it is to
+    The point is not to duplicate `_validate_plan` for its own sake — it is to
     run these checks *and give a wiring-specific, actionable message* on the
     merged plan produced AFTER every id/tag-vanishing operation (reconciler
     merge/rename/drop, both phase-3 soft-drop filters, P1 expansion). Each of
     those ops owes the plan a rewrite of inbound references; each is an
     independent opportunity to leave a dangle that only surfaces at
-    `validate_plan` — after the full planner/reconciler spend, whose generic
+    `_validate_plan` — after the full planner/reconciler spend, whose generic
     `die()` throws that spend away. Running this first `die()`s earlier with a
     message that names the wiring failure (and, when derivable, whether the
-    provider vanished via a drop/merge). `validate_plan` stays the backstop:
+    provider vanished via a drop/merge). `_validate_plan` stays the backstop:
     it re-checks the same invariants and catches anything this misses.
 
-    `subtasks` is the sid→subtask dict `schedule()` returns (same shape
-    `validate_plan` consumes). `extent: external` requires are deliberately
-    NOT checked (declared out-of-graph, per `validate_plan`)."""
+    `subtasks` is the sid→subtask dict `_schedule()` returns (same shape
+    `_validate_plan` consumes). `extent: external` requires are deliberately
+    NOT checked (declared out-of-graph, per `_validate_plan`)."""
     issues: list[str] = []
     all_ids = set(subtasks.keys())
     all_provides: set[str] = set()
@@ -7791,7 +7791,7 @@ def check_plan_wiring(subtasks: dict) -> list[str]:
                     "(DESIGN §5 *Id-vanishing operations*)")
         for entry in s.get("requires", []) or []:
             if not isinstance(entry, dict):
-                continue  # shape errors are validate_plan's job, not wiring's
+                continue  # shape errors are _validate_plan's job, not wiring's
             tag = entry.get("tag", "")
             extent = entry.get("extent", "")
             if not tag or not isinstance(tag, str):
@@ -7805,7 +7805,7 @@ def check_plan_wiring(subtasks: dict) -> list[str]:
     return issues
 
 
-def validate_plan(subtasks: dict) -> None:
+def _validate_plan(subtasks: dict) -> None:
     """Structural validation of the merged plan — pure Python set operations.
 
     `requires` entries are objects `{tag, extent, reason?}` per DESIGN §5
@@ -7855,7 +7855,7 @@ def validate_plan(subtasks: dict) -> None:
                     f"{sid}: depends_on '{dep}' which does not exist — an "
                     "id vanished from the plan without its inbound "
                     "references being rewritten (DESIGN §5 *Id-vanishing "
-                    "operations*); schedule() already dropped this edge")
+                    "operations*); _schedule() already dropped this edge")
         for entry in s.get("requires", []):
             # Defensive: the JSON schema rejects bare strings before this
             # function runs, but the planner output gets mutated downstream
@@ -7898,7 +7898,7 @@ def validate_plan(subtasks: dict) -> None:
         # `artifacts` result field routed via provides/depends_on.
         bad_paths = [
             f for f in (s.get("files_likely_touched") or [])
-            if isinstance(f, str) and is_protected_path(f)
+            if isinstance(f, str) and _is_protected_path(f)
         ]
         if bad_paths:
             errors.append(
@@ -7917,7 +7917,7 @@ def validate_plan(subtasks: dict) -> None:
     log(f"plan validation: {len(subtasks)} subtasks ok")
 
 
-def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
+def _warn_cross_planner_file_overlap(plans: list[dict]) -> None:
     """Log a warning when subtasks from different planner outputs both list
     the same path in `files_likely_touched`. Two planners decomposing the
     same surface produces contradictory criteria the integrator can't
@@ -7951,7 +7951,7 @@ def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
-def warn_provider_subset_subtasks(plans: list[dict]) -> None:
+def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
     """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
     `files_likely_touched` surface is owned by an ordered predecessor it
     depends on (via `depends_on` or a `requires`→`provides` tag match).
@@ -7968,9 +7968,9 @@ def warn_provider_subset_subtasks(plans: list[dict]) -> None:
 
     Warning only, never a drop — a subtask may make a genuinely distinct edit
     to a shared file, and dropping it would silently delete real work (the
-    same safe-direction reasoning as `filter_satisfied_subtasks`'s
+    same safe-direction reasoning as `_filter_satisfied_subtasks`'s
     conservative default). Pure function; mirrors
-    `warn_cross_planner_file_overlap`. Reuses `_build_predecessor_graph` so
+    `_warn_cross_planner_file_overlap`. Reuses `_build_predecessor_graph` so
     the notion of "predecessor" cannot drift from the scheduler's.
 
     Scope note: uses **direct** predecessors only (`preds[sid]` from
@@ -8018,7 +8018,7 @@ def warn_provider_subset_subtasks(plans: list[dict]) -> None:
             f"[{preds_str}]")
 
 
-def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
+def _warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     """Advisory plan-time warning (DESIGN §5): flag a `test-`-domain subtask
     that declares NO cross-subtask edge at all (`requires` and `depends_on`
     both empty) while the plan contains code subtasks that produce artifacts.
@@ -8045,7 +8045,7 @@ def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     the code site lives inside a large shared module), so no `files_likely_
     touched`-overlap predicate can recover the edge — and raw file overlap is
     explicitly an unreliable dependency signal (see
-    `warn_provider_subset_subtasks`). §12 assigns such prose-only facts to a
+    `_warn_provider_subset_subtasks`). §12 assigns such prose-only facts to a
     worker: the `wiring_judge` remains the enforcer. This warning only surfaces
     the high-risk shape one phase earlier, and the `planner.md` rule reduces how
     often planners emit it.
@@ -8057,7 +8057,7 @@ def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     we are explicitly deferring); we flag the missing declaration. Silent when
     the test declares any edge, when there are no other producing subtasks, or
     on a single-subtask plan. Pure function; mirrors
-    `warn_provider_subset_subtasks`."""
+    `_warn_provider_subset_subtasks`."""
     all_subtasks: list[dict] = [
         s for plan in plans for s in (plan.get("subtasks", []) or [])
     ]
@@ -8188,7 +8188,7 @@ _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
 
-def warn_layer_gaps(plans: list[dict]) -> None:
+def _warn_layer_gaps(plans: list[dict]) -> None:
     """Advisory cross-domain layer-gap warnings (DESIGN §5).
 
     Runs on the reconciled plan before scheduling. Two heuristics:
@@ -8244,12 +8244,12 @@ def _resolves_under(path_str: str, root: Path) -> bool:
         return False
 
 
-def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
+def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
                             inspect_dirs: list[str], st: "State") -> None:
     """Mutate `plans` in place: drop any subtask whose `files_likely_touched`
     contains a path that does not resolve under `repo_root`. Record drops
     in `st.data["dropped_subtasks"]` and log a per-subtask warning. Soft
-    drop — the run continues with the surviving subtasks, `schedule()`
+    drop — the run continues with the surviving subtasks, `_schedule()`
     runs after this and sees a clean plan.
 
     Motivation: cross-repo `--inspect-dir` runs let the planner read
@@ -8263,9 +8263,9 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     Why a soft drop and not `die()`: a hard fail here is unrecoverable
     via `--resume`. The resume branch in `_run_phases` does not re-run
     `phase_plan` or this filter, and `state.json["waves"]` is only
-    written by `write_plan` which runs after `schedule()`. Soft drop
-    matches the existing `warn_cross_planner_file_overlap` pattern at
-    the same pre-schedule layer."""
+    written by `_write_plan` which runs after `_schedule()`. Soft drop
+    matches the existing `_warn_cross_planner_file_overlap` pattern at
+    the same pre-_schedule layer."""
     inspect_roots = [Path(d).resolve() for d in (inspect_dirs or [])]
     dropped: dict[str, dict] = {}
     for plan in plans:
@@ -8300,8 +8300,8 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
         return
     # A dropped id can no longer satisfy any dependent, so prune every inbound
     # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
-    # Without this the edge dangles: schedule() drops it silently and
-    # validate_plan then die()s the run.
+    # Without this the edge dangles: _schedule() drops it silently and
+    # _validate_plan then die()s the run.
     pruned = {sid: [] for sid in dropped}
     dropped_provides = {t for info in dropped.values()
                         for t in info.get("provides", [])}
@@ -8313,7 +8313,7 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
     # by a surviving subtask in another plan must not be pruned.
     _prune_orphaned_requires(plans, dropped_provides)
-    log(f"⚠  filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
+    log(f"⚠  _filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
         "with off-tree files_likely_touched:")
     for sid, info in sorted(dropped.items()):
         for r in info["reasons"]:
@@ -8322,7 +8322,7 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     st.save()
 
 
-async def filter_satisfied_subtasks(
+async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
 ) -> dict[str, str] | None:
@@ -8334,21 +8334,21 @@ async def filter_satisfied_subtasks(
     soft-drops the ones the probe marks `satisfied`. Recorded in
     `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
     the probe's evidence — the same audit shape as
-    `filter_offtree_subtasks`.
+    `_filter_offtree_subtasks`.
 
     Returns a `no_work_map` (`domain → basis`) IFF the drop empties every
     `status == "ready"` plan (so the caller routes to
     `_finish_no_work_run`, the same terminal state as the native
     cleared-but-empty case, DESIGN §8). Returns None otherwise — the run
-    proceeds to `schedule()` with the surviving subtasks. A `status ==
+    proceeds to `_schedule()` with the surviving subtasks. A `status ==
     "blocked"` plan with zero subtasks does NOT trigger the no-work route
-    (it must still fall to `schedule()`'s all-blocked `die`), mirroring
-    `detect_no_work`'s ready-only guard.
+    (it must still fall to `_schedule()`'s all-blocked `die`), mirroring
+    `_detect_no_work`'s ready-only guard.
 
     Soft drop, not `die()`: same resume-safety reasoning as
-    `filter_offtree_subtasks` — the drop happens on the plan→schedule
+    `_filter_offtree_subtasks` — the drop happens on the plan→_schedule
     path that `--resume` does not re-run, and `state.json["waves"]` is
-    only written by `write_plan` after `schedule()`, so a surviving-only
+    only written by `_write_plan` after `_schedule()`, so a surviving-only
     plan is what gets persisted. The gate is advisory and subordinate to
     the mechanical `check_branch_has_commits` backstop (§12): a
     false-negative (probe says "still needed" when it was done) costs one
@@ -8390,7 +8390,7 @@ async def filter_satisfied_subtasks(
     base_sha = await _branch_head_sha(str(repo_root))
     cache: dict[str, dict] = st.data.setdefault("satisfied_probe_cache", {})
 
-    sys_prompt = load_prompt("satisfied_probe")
+    sys_prompt = _load_prompt("satisfied_probe")
     sem = asyncio.Semaphore(caps["max_parallel"])
     # sid → drop record; only satisfied subtasks land here.
     dropped: dict[str, dict] = {}
@@ -8472,7 +8472,7 @@ async def filter_satisfied_subtasks(
         async with sem:
             # bump_workers is OUTSIDE the try: its WorkerError signals
             # budget exhaustion (worker_count > max_total_workers), which
-            # is the hard backstop — it must propagate so gather_or_cancel
+            # is the hard backstop — it must propagate so _gather_or_cancel
             # aborts the run, not be swallowed into a silent subtask-keep.
             # Only a claude_p failure is caught below as the fail-safe.
             st.bump_workers(caps)
@@ -8502,7 +8502,7 @@ async def filter_satisfied_subtasks(
         # in-memory write alone is not enough — st.data only reaches disk
         # via st.save(), so without the save below a pause between this
         # probe and the sweep-final flush (~7 lines down, after
-        # gather_or_cancel) discards every since-flush verdict and resume
+        # _gather_or_cancel) discards every since-flush verdict and resume
         # re-probes them. The single-event-loop invariant (CLAUDE.md) means
         # this data-write / save pair never interleaves with another
         # coroutine, so the per-verdict save is safe here.
@@ -8523,7 +8523,7 @@ async def filter_satisfied_subtasks(
                 "provides": list(s.get("provides") or []),
             }
 
-    await gather_or_cancel(*(probe_one(s) for s in probeable))
+    await _gather_or_cancel(*(probe_one(s) for s in probeable))
     st.save()
 
     if not dropped:
@@ -8538,8 +8538,8 @@ async def filter_satisfied_subtasks(
 
     # A dropped id can no longer satisfy any dependent, so prune every inbound
     # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
-    # Without this the edge dangles: schedule() drops it silently and
-    # validate_plan then die()s the run — after the full planner spend.
+    # Without this the edge dangles: _schedule() drops it silently and
+    # _validate_plan then die()s the run — after the full planner spend.
     pruned = {sid: [] for sid in dropped}
     dropped_provides = {t for info in dropped.values()
                         for t in info.get("provides", [])}
@@ -8564,8 +8564,8 @@ async def filter_satisfied_subtasks(
     # the drop evidence (NOT from plan confidence.basis, which is the
     # planner's original "I found work" rationale — misleading here) and
     # signal the caller to route to _finish_no_work_run. A blocked plan
-    # with 0 subtasks must still fall through to schedule()'s all-blocked
-    # die, so guard on ready-only exactly like detect_no_work.
+    # with 0 subtasks must still fall through to _schedule()'s all-blocked
+    # die, so guard on ready-only exactly like _detect_no_work.
     for plan in plans:
         if plan.get("status") != "ready":
             return None
@@ -8580,11 +8580,11 @@ async def filter_satisfied_subtasks(
     return no_work_map
 
 
-async def probe_criteria_satisfied_on_head(
+async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
 ) -> dict | None:
-    """Post-execution analogue of `filter_satisfied_subtasks`'s per-subtask
+    """Post-execution analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe (DESIGN §8 *The mid-run sibling case*). Runs one read-only
     `satisfied_probe` against the subtask's `success_criteria_seed` on the
     *current worktree HEAD* — the run branch's integration state, which may
@@ -8603,7 +8603,7 @@ async def probe_criteria_satisfied_on_head(
     only rescues, and "are the criteria semantically met on this tree?" is the
     judgment §12's complementary half assigns to a worker.
 
-    Unlike the pre-schedule probe (base tree at plan time), this probes HEAD —
+    Unlike the pre-_schedule probe (base tree at plan time), this probes HEAD —
     but still HEAD-only, never history-spanning git, via the same
     `SATISFIED_PROBE_TOOLS` scope. HEAD here is the same ref the mechanical
     commit-presence gate measures against, so the probe cannot false-positive
@@ -8627,14 +8627,14 @@ async def probe_criteria_satisfied_on_head(
         "CURRENT working tree / HEAD only — never other branches or "
         "history. Default satisfied=false on any uncertainty."
     )
-    # bump_workers OUTSIDE the try, same as filter_satisfied_subtasks: a
+    # bump_workers OUTSIDE the try, same as _filter_satisfied_subtasks: a
     # budget-exhaustion WorkerError must propagate to abort the run, not be
     # swallowed into a silent no-rescue.
     st.bump_workers(caps)
     try:
         out = await claude_p(
             user_prompt=user_prompt,
-            system_prompt=load_prompt("satisfied_probe"),
+            system_prompt=_load_prompt("satisfied_probe"),
             schema_key="satisfied_probe", cwd=worktree,
             allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
             autonomous=False, caps=caps, st=st,
@@ -8663,7 +8663,7 @@ async def probe_criteria_satisfied_on_head(
 # fallback → worktree replay).
 
 # argv[0] allowlist for any provision command — both table-emitted commands
-# and the LLM-fallback recipe. Validated by validate_provision_recipe().
+# and the LLM-fallback recipe. Validated by _validate_provision_recipe().
 # Anything outside this set is rejected; the §12 carve-out (the LLM
 # fallback worker) is mechanically contained by this list.
 _PROVISION_ARGV0_ALLOW = frozenset({
@@ -8796,7 +8796,7 @@ def _lockfile_table_entries(repo_root: Path) -> list[dict]:
     return entries
 
 
-def detect_recipe_from_lockfiles(repo_root: Path) -> list[dict]:
+def _detect_recipe_from_lockfiles(repo_root: Path) -> list[dict]:
     """Public entry point for the deterministic detection layer. Returns
     a list of recipe entries (possibly empty). An empty list means the
     table abstained and the caller should fall back to the LLM worker.
@@ -8816,7 +8816,7 @@ def _normalize_pip_installs(recipe: list[dict]) -> list[dict]:
     --break-system-packages`). The LLM provision worker generates recipes
     by mirroring the repo's CI, which runs in a venv/runner and needs no
     such flag, so it never emits one. That gap silently breaks every
-    recipe consumer — most visibly `capture_conformance_baseline`, whose
+    recipe consumer — most visibly `_capture_conformance_baseline`, whose
     `pip install` then fails and leaves the base-tree test axis recording
     `command not found` instead of a real pass/fail. Normalizing here, at
     the single point every consumer reads the recipe as data, fixes all
@@ -8860,7 +8860,7 @@ def _is_pip_install(cmd: list[str]) -> bool:
     return False
 
 
-def validate_provision_recipe(recipe: list[dict]) -> None:
+def _validate_provision_recipe(recipe: list[dict]) -> None:
     """Mechanically bound the provision recipe. Raises ValueError on any
     violation. Called for BOTH the table-emitted recipe and the LLM-
     fallback recipe — the §12 carve-out for the LLM worker is contained
@@ -8936,7 +8936,7 @@ def validate_provision_recipe(recipe: list[dict]) -> None:
 # ceiling; any truncation is noted in the worker prompt. Sized to admit
 # the full command set for essentially every run (~50–80k tokens undeduped,
 # ~66k worst-case) while bounding the LLM input. Mirrors the
-# _FIXTURE_TOTAL_BUDGET idiom in gather_provision_fixtures.
+# _FIXTURE_TOTAL_BUDGET idiom in _gather_provision_fixtures.
 #
 # This is an LLM-context token budget, not an argv-size constraint: the
 # dep_capture worker's user_prompt (this text plus _gather_dep_manifests'
@@ -9316,7 +9316,7 @@ async def capture_repo_deps(
         log(f"capture: skipped dep_capture worker (worker budget exhausted at "
             f"{wc}/{caps['max_total_workers']})")
         return
-    sys_prompt = load_prompt("dep_capture")
+    sys_prompt = _load_prompt("dep_capture")
     model = models.get("dep_capture", MODEL_DEFAULT)
     effort = efforts.get("dep_capture")
     truncation_note = (
@@ -9639,7 +9639,7 @@ def run_rebaser(
 
     # Worker-budget pre-check (mirrors capture_repo_deps's identical guard
     # above): the run has already spent its budget across the whole
-    # orchestrate loop by the time finalize runs, so a rebaser call must
+    # _orchestrate loop by the time finalize runs, so a rebaser call must
     # respect the same max_total_workers ceiling — CLAUDE.md "Caps are real
     # Python counters," not a worker that bounds itself.
     wc = st.data.get("worker_count", 0)
@@ -9667,7 +9667,7 @@ def run_rebaser(
         }
     pre_rebase_sha = pre_rebase_sha_r.stdout.strip()
 
-    sys_prompt = load_prompt("rebaser")
+    sys_prompt = _load_prompt("rebaser")
     user_prompt = (
         f"Current branch (this worktree's checkout): {run_branch}\n"
         f"Base branch to rebase onto: {pr_base_branch}\n"
@@ -9793,7 +9793,7 @@ _README_EXTRACT_BUDGET = 12288  # per-README slice handed to the worker
 _FIXTURE_TOTAL_BUDGET = 24576   # 24KB hard ceiling per repo
 
 
-def extract_readme_sections(text: str) -> str:
+def _extract_readme_sections(text: str) -> str:
     """Return the leading slice of a README, cut at a section boundary.
 
     Size-bounding only. WHICH parts of a README describe installation is a
@@ -9811,7 +9811,7 @@ def extract_readme_sections(text: str) -> str:
     its body sheared off mid-sentence, but that is presentation, not
     selection: nothing here reads what a header *means*. A README longer
     than the budget is truncated from the bottom, and
-    `gather_provision_fixtures` flags that through `hit_ceiling`; the
+    `_gather_provision_fixtures` flags that through `hit_ceiling`; the
     worker also sees manifests, workflows and CONTRIBUTING, which is
     where install facts usually live when a README is that long.
     """
@@ -9835,7 +9835,7 @@ def extract_readme_sections(text: str) -> str:
 
 def _read_file_safely(path: Path, budget: int) -> str:
     """Read a file with a byte ceiling, swallowing missing-file and
-    decode errors. Used by gather_provision_fixtures to assemble the
+    decode errors. Used by _gather_provision_fixtures to assemble the
     fixture dict from optional repo files."""
     try:
         return path.read_text(errors="replace")[:budget]
@@ -9893,7 +9893,7 @@ def _sample_workspace_manifests(repo_root: Path, pkg_json_text: str,
     return sampled
 
 
-def gather_provision_fixtures(repo_root: Path) -> dict:
+def _gather_provision_fixtures(repo_root: Path) -> dict:
     """Assemble the LLM-fallback worker's input set. Returns a dict with
     keys:
       - readme: leading slice of the README (≤_README_EXTRACT_BUDGET);
@@ -9946,7 +9946,7 @@ def gather_provision_fixtures(repo_root: Path) -> dict:
     for rp in readme_paths:
         if rp.is_file():
             raw = _read_file_safely(rp, _README_EXTRACT_BUDGET * 4)
-            extract = extract_readme_sections(raw)
+            extract = _extract_readme_sections(raw)
             if add_bytes(len(extract)):
                 out["readme"] = extract
                 # How much of the README the worker is NOT seeing. The
@@ -10086,7 +10086,7 @@ def _split_checkpoint_sections(content: str) -> dict[str, list[str]]:
     return sections
 
 
-def validate_checkpoint(path: str,
+def _validate_checkpoint(path: str,
                         worktree_root: Path | None = None) -> str | None:
     """Return an error description if the checkpoint is structurally incomplete,
     None if it looks good. A missing section produces a confused successor;
@@ -10195,7 +10195,7 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
 
 # --- result cross-field validation -------------------------------------------
 
-def validate_result(result: dict) -> tuple[str, str] | None:
+def _validate_result(result: dict) -> tuple[str, str] | None:
     """Cross-field invariant checks that JSON Schema cannot express.
     Returns `(failure_kind, message)` if the result is self-contradictory,
     None if ok. `failure_kind` is the structured discriminator
@@ -10278,7 +10278,7 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     — the base every subtask branched off of. Hardcoding `leerie/staging`
     here used to silently disable the check after the per-run refactor
     (the branch doesn't exist), so the protected-path enforcement was off."""
-    run_branch = compute_run_branch(st.run_id)
+    run_branch = _compute_run_branch(st.run_id)
     r = await run_proc(
         ["git", "diff", "--name-only", f"{run_branch}..HEAD"],
         cwd=worktree,
@@ -10293,8 +10293,8 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     # `.claude/{agents,commands,skills}/` are exempt (documented Claude
     # Code user-deliverable locations); top-level `.claude/` files
     # (settings.json, settings.local.json) stay protected. See
-    # is_protected_path() for the rule.
-    protected = [f for f in touched if is_protected_path(f)]
+    # _is_protected_path() for the rule.
+    protected = [f for f in touched if _is_protected_path(f)]
     if protected:
         return (f"{sid}: diff touches protected path(s): {protected} — "
                 "implementers must not modify meta-directories")
@@ -10412,7 +10412,7 @@ async def check_rebaser_worktree_state(
 
 # --- branch-has-commits verification -----------------------------------------
 
-async def branch_has_commits_ahead(worktree: str,
+async def _branch_has_commits_ahead(worktree: str,
                                    parent_branch: str) -> bool:
     """True iff the subtask branch has ≥1 commit ahead of `parent_branch`.
 
@@ -10421,7 +10421,7 @@ async def branch_has_commits_ahead(worktree: str,
     A missing worktree or a failed git command returns False — "can't
     prove commits exist" is treated as "no commits," so no caller mistakes
     an indeterminate state for real committed work. `check_branch_has_commits`
-    (the no-op gate) and the `empty_handoff` rescue in `settle_subtask` both
+    (the no-op gate) and the `empty_handoff` rescue in `_settle_subtask` both
     key on this: the rescue keeps committed work only when it can *prove* the
     commit exists, never on a bare `None`/indeterminate result."""
     if not Path(worktree).exists():
@@ -10448,11 +10448,11 @@ async def check_branch_has_commits(sid: str, worktree: str,
     nothing — a silent no-op that wastes an integration attempt. The
     `"no_commits"` kind is retryable per `_RETRYABLE_FAILURE_KINDS`.
 
-    Note the deliberate asymmetry with `branch_has_commits_ahead`: an
+    Note the deliberate asymmetry with `_branch_has_commits_ahead`: an
     indeterminate state (worktree gone / git failed) returns None here —
     "don't block" — because this is a *gate* on a `complete` claim, where
     the safe default is to let it through rather than fail a subtask on an
-    unverifiable git error. The rescue path uses `branch_has_commits_ahead`
+    unverifiable git error. The rescue path uses `_branch_has_commits_ahead`
     instead, whose safe default is the opposite (don't rescue unless proven)."""
     if not Path(worktree).exists():
         return None  # worktree gone — can't determine, don't block
@@ -10475,7 +10475,7 @@ async def check_branch_has_commits(sid: str, worktree: str,
 
 # --- conflict marker scan post-integration -----------------------------------
 
-async def scan_conflict_markers(staging: Path) -> str | None:
+async def _scan_conflict_markers(staging: Path) -> str | None:
     """Return error if unresolved conflict markers remain in the staging tree.
     git grep exit 0 = matches found (bad); exit 1 = clean (good)."""
     if not staging.exists():
@@ -10498,7 +10498,7 @@ async def scan_conflict_markers(staging: Path) -> str | None:
 
 # --- resume state integrity check --------------------------------------------
 
-def validate_resume_state(data: dict) -> None:
+def _validate_resume_state(data: dict) -> None:
     """Assert the structure of a loaded state.json before resuming. A corrupt
     or hand-edited file produces wrong behavior; fail fast rather than run
     silently. Only `task` is strictly required here — a run interrupted before
@@ -11048,14 +11048,14 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
                 # the text path of the limit: when the subscription limit
                 # is hit, claude -p returns the session-limit string as
                 # assistant text and then closes the session with
-                # subtype="success" — without this check, validate_result
+                # subtype="success" — without this check, _validate_result
                 # would see a synthesized incomplete-handoff and the
                 # `_retryable_failure` safety net would be the only
                 # remaining defense. (The protocol-level path is handled
                 # below in the rate_limit_event branch.) See DESIGN §6
                 # *Cleanup on abnormal exit* for the auto-resume contract.
                 text = b.get("text") or ""
-                if (exc := detect_session_limit(text)):
+                if (exc := _detect_session_limit(text)):
                     raise exc
                 # Emit every non-empty line of the assistant's text as
                 # its own [<sid> text] entry, full-width (no
@@ -11211,7 +11211,7 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
     A subtask is:
       - running:      `subtask_status[sid]` absent or not in _TERMINAL_STATUSES
       - in_conformer: status == "complete" but `conformance[sid]` absent
-                      (settle_subtask writes that key exactly when the
+                      (_settle_subtask writes that key exactly when the
                       advisory conformer phase finishes, so absence is a
                       precise live signal — DESIGN §9)
       - done:         status in _TERMINAL_STATUSES, and (if status ==
@@ -11449,7 +11449,7 @@ def _cgroup_stat(sid: str | None) -> tuple[int, int, int, int] | None:
     return None
 
 
-def enforce_and_record_cgroup_containment(st: "State",
+def _enforce_and_record_cgroup_containment(st: "State",
                                           allow_uncapped: bool) -> None:
     """Fail-closed containment gate + state recording, run once per run
     just before the first worker spawns (DESIGN §6 *Memory containment*).
@@ -11836,7 +11836,7 @@ async def _rotate_oauth_token_or_raise(
     raise RateLimitedExit(reset_at=soonest_reset, raw_message=raw_message)
 
 
-async def select_active_oauth_token(st: "State", caps: dict) -> None:
+async def _select_active_oauth_token(st: "State", caps: dict) -> None:
     """Start-of-run smart token selection (DESIGN §6 *Multi-token
     rotation*). Only runs when CLAUDE_CODE_OAUTH_TOKENS is present in the
     environment — the singular-var-only path is entirely unaffected (no
@@ -11985,7 +11985,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # `_cgroup_request`'s 5 s timeout, so the stall is negligible and no
     # deadlock is possible (the broker never calls back into leerie).
     # Containment enforcement itself was already gated at run start
-    # (enforce_and_record_cgroup_containment); here a per-worker failure
+    # (_enforce_and_record_cgroup_containment); here a per-worker failure
     # returns None / False and the worker runs without its own sub-cgroup
     # — the cgroup path NEVER aborts the worker (telemetry that crashes its
     # host is worse than no telemetry, same principle as _memory_sampler).
@@ -12391,7 +12391,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # worker's whole subtree (claude -p + its tool-call
             # grandchildren via PPID walk) and reap any backgrounded
             # subprocesses the tracker observed during the run. Then
-            # re-raise. Leerie's gather_or_cancel relies on this for clean
+            # re-raise. Leerie's _gather_or_cancel relies on this for clean
             # aborts.
             watchdog_task.cancel()
             await _terminate_proc_tree(proc)
@@ -12464,7 +12464,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # is killed by the kernel mid-turn — bare `Killed`, no error text,
         # no result event. That symptom is otherwise indistinguishable from
         # a session-limit no-op or a --max-turns exhaustion, and lands
-        # downstream in settle_subtask as a cryptic "checkpoint does not
+        # downstream in _settle_subtask as a cryptic "checkpoint does not
         # exist" once the retry cap is hit. `final_stat` (read from the
         # worker's cgroup just before destroy, above) is the authoritative
         # signal — mirrors the PID-exhaustion probe's use of the same
@@ -12743,7 +12743,7 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
     `WNOHANG` keeps this non-blocking: a recorded PID that is still alive is
     skipped now and retried next tick. A PID that is gone (already reaped, or
     never ours) raises and is dropped. Spawned as a background task by
-    `orchestrate()` and cancelled in its `finally`, mirroring `_memory_sampler`."""
+    `_orchestrate()` and cancelled in its `finally`, mirroring `_memory_sampler`."""
     while True:
         try:
             for pid in list(_REAPABLE_PIDS):
@@ -12771,7 +12771,7 @@ async def _memory_sampler(st: "State",
     FDs, and thread count — enough to correlate growth with the phase and
     the worker concurrency in flight at that moment.
 
-    Lifecycle: spawned as a fire-and-forget task by `orchestrate()`, cancelled
+    Lifecycle: spawned as a fire-and-forget task by `_orchestrate()`, cancelled
     in the `finally` block. On cancellation, one final sample is written
     before re-raising so the on-disk trail captures the orchestrator's
     end-of-run state.
@@ -13280,7 +13280,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 os.unlink(system_prompt_file)
 
 
-async def replay_capture(record: dict, *,
+async def _replay_capture(record: dict, *,
                          override_system_prompt: str | None = None,
                          cwd: str | None = None) -> tuple[dict, dict]:
     """Replay one captured call from a calls.ndjson record.
@@ -13361,12 +13361,12 @@ def _accumulate_telemetry(data: dict, envelope: dict) -> None:
 
 
 class _ReplayState:
-    """Minimal State-alike for replay_capture: no persistent writes.
+    """Minimal State-alike for _replay_capture: no persistent writes.
 
     Satisfies the interface claude_p() calls on the state object (bump_workers,
     add_telemetry, .data, .run_id, .run_dir, .path) without touching the
     state root on disk. All save() calls are no-ops. last_envelope captures the envelope returned
-    by _invoke so replay_capture can return (envelope, structured_output).
+    by _invoke so _replay_capture can return (envelope, structured_output).
     """
 
     def __init__(self, run_dir: Path, state_path: Path) -> None:
@@ -13545,7 +13545,7 @@ class State:
 # judge phase — LLM-scored review of captured call records
 # =========================================================================
 
-async def judge_capture(record: dict, models: dict[str, str],
+async def _judge_capture(record: dict, models: dict[str, str],
                         efforts: dict[str, str | None],
                         caps: dict, st: "State") -> dict:
     """Run a judge worker against one captured call record.
@@ -13560,7 +13560,7 @@ async def judge_capture(record: dict, models: dict[str, str],
     """
     call_type = record.get("call_type", "unknown")
     call_id = record.get("call_id", "unknown")
-    sys_prompt = load_prompt("judge")
+    sys_prompt = _load_prompt("judge")
     user_prompt = (
         "CALL RECORD TO JUDGE:\n"
         f"call_type: {call_type}\n"
@@ -13604,7 +13604,7 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
     """Judge all captured call records in run_dir/calls.ndjson.
 
     Reads each line of calls.ndjson, optionally filters by call_type when
-    `judge_call_types` is provided, then runs judge_capture() in parallel
+    `judge_call_types` is provided, then runs _judge_capture() in parallel
     under the existing asyncio.Semaphore(max_parallel) bound.
 
     Each verdict is written to judge_out_dir/<call_id>.json. After all
@@ -13647,7 +13647,7 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
         async with sem:
             call_id = rec.get("call_id", "unknown")
             call_type = rec.get("call_type", "unknown")
-            verdict = await judge_capture(rec, models, efforts, caps, st)
+            verdict = await _judge_capture(rec, models, efforts, caps, st)
             verdict_path = judge_out_dir / f"{call_id}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))
             index.append({
@@ -13658,7 +13658,7 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
             status = "pass" if verdict.get("passed") else "FAIL"
             log(f"  judge-{call_type}-{call_id[:8]}: {status}")
 
-    await gather_or_cancel(*(judge_one(r) for r in records))
+    await _gather_or_cancel(*(judge_one(r) for r in records))
 
     # Sort index by call_id for stable output across parallel orderings.
     index.sort(key=lambda e: e["call_id"])
@@ -13679,8 +13679,8 @@ class HealState:
     Fields written to state.json:
       failing_samples  — list of capture records the heal loop is working on
       baseline         — {call_id: {"pass_rate": float, "verdicts": list}}
-                         noise-floor measured by heal_baseline
-      history          — list of iteration records appended by heal_replay_patched
+                         noise-floor measured by _heal_baseline
+      history          — list of iteration records appended by _heal_replay_patched
       best_so_far      — {pass_rate: float, iter_n: int} tracking the best arm
     """
 
@@ -13719,14 +13719,14 @@ class HealState:
         return True
 
 
-async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
+async def _heal_baseline(call_type: str, failing_records: list[dict], n: int,
                         heal_dir: Path, caps: dict, st: "State",
                         models: dict[str, str],
                         efforts: dict[str, str | None]) -> HealState:
     """Run n unpatched replays per failing capture to establish a noise-floor.
 
-    For each record in failing_records, runs n replay_capture() calls with the
-    original system prompt (no override), judges each replay via judge_capture(),
+    For each record in failing_records, runs n _replay_capture() calls with the
+    original system prompt (no override), judges each replay via _judge_capture(),
     and persists the per-sample pass rates + verdict list to
     <heal_dir>/<call_type>/baseline/verdicts/.
 
@@ -13748,7 +13748,7 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
             call_id = record["call_id"]
             # Replay with original system prompt (no patch).
             try:
-                envelope, _ = await replay_capture(record)
+                envelope, _ = await _replay_capture(record)
             except Exception:
                 envelope = {}
             # Build a synthetic record for the judge using the replayed output.
@@ -13758,7 +13758,7 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
             )
             judge_record["parsed_ok"] = not envelope.get("is_error", True)
             judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, efforts, caps, st)
+            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
             # Write verdict file.
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
@@ -13773,7 +13773,7 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
 
     results: list[tuple[dict, dict]] = []
     coros = [_run_one(rec, idx) for rec, idx in tasks]
-    verdicts_flat = await gather_or_cancel(*coros)
+    verdicts_flat = await _gather_or_cancel(*coros)
 
     # Aggregate per-sample pass rates.
     task_idx = 0
@@ -13796,12 +13796,12 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
     )
     hs.best_so_far = {"pass_rate": overall_pass_rate, "iter_n": 0}
     hs.save()
-    log(f"heal_baseline: {call_type}: {len(failing_records)} sample(s), "
+    log(f"_heal_baseline: {call_type}: {len(failing_records)} sample(s), "
         f"n={n}, baseline pass_rate={overall_pass_rate:.2%}")
     return hs
 
 
-def heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
+def _heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
                      anchor_match: str, heal_dir: Path,
                      failing_records: list[dict]) -> list[Path]:
     """Materialise per-sample patched prompts under iter-<N>/patched-prompts/.
@@ -13822,12 +13822,12 @@ def heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
         dest = out_dir / f"{call_id}.txt"
         dest.write_text(patched)
         written.append(dest)
-    log(f"heal_apply_patch: {call_type} iter-{iter_n}: "
+    log(f"_heal_apply_patch: {call_type} iter-{iter_n}: "
         f"wrote {len(written)} patched prompt(s)")
     return written
 
 
-async def heal_replay_patched(call_type: str, iter_n: int, n: int,
+async def _heal_replay_patched(call_type: str, iter_n: int, n: int,
                               heal_dir: Path, caps: dict, st: "State",
                               models: dict[str, str],
                               efforts: dict[str, str | None]) -> HealState:
@@ -13835,8 +13835,8 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
 
     Reads HealState from disk. For each failing sample, loads the patched
     prompt from iter-<iter_n>/patched-prompts/<call_id>.txt, runs n
-    replay_capture() calls with that prompt override, judges each via
-    judge_capture(), computes the pass rate, and appends an iteration record
+    _replay_capture() calls with that prompt override, judges each via
+    _judge_capture(), computes the pass rate, and appends an iteration record
     to hs.history. Updates hs.best_so_far if the pass rate improved.
 
     Replays run in parallel under asyncio.Semaphore(max_parallel).
@@ -13845,7 +13845,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
     hs = HealState(heal_dir, call_type)
     if not hs.load():
         raise FileNotFoundError(
-            f"HealState not found at {hs.path} — run heal_baseline first"
+            f"HealState not found at {hs.path} — run _heal_baseline first"
         )
 
     patched_dir = heal_dir / call_type / f"iter-{iter_n}" / "patched-prompts"
@@ -13858,7 +13858,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
                        patched_prompt: str) -> dict:
         async with sem:
             try:
-                envelope, _ = await replay_capture(
+                envelope, _ = await _replay_capture(
                     record, override_system_prompt=patched_prompt
                 )
             except Exception:
@@ -13869,7 +13869,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
             )
             judge_record["parsed_ok"] = not envelope.get("is_error", True)
             judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, efforts, caps, st)
+            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))
@@ -13881,7 +13881,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
         call_id = record["call_id"]
         prompt_path = patched_dir / f"{call_id}.txt"
         if not prompt_path.exists():
-            log(f"  heal_replay_patched: missing patched prompt for {call_id}, "
+            log(f"  _heal_replay_patched: missing patched prompt for {call_id}, "
                 f"skipping")
             continue
         patched_prompt = prompt_path.read_text()
@@ -13889,7 +13889,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
             tasks.append((record, patched_prompt, idx))
 
     coros = [_run_one(rec, idx, prompt) for rec, prompt, idx in tasks]
-    verdicts_flat: list[dict] = await gather_or_cancel(*coros)
+    verdicts_flat: list[dict] = await _gather_or_cancel(*coros)
 
     # Aggregate per-sample pass rates for this iteration.
     iter_scores: dict = {}
@@ -13924,7 +13924,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
         hs.best_so_far = {"pass_rate": overall_pass_rate, "iter_n": iter_n}
 
     hs.save()
-    log(f"heal_replay_patched: {call_type} iter-{iter_n}: "
+    log(f"_heal_replay_patched: {call_type} iter-{iter_n}: "
         f"pass_rate={overall_pass_rate:.2%}")
     return hs
 
@@ -13992,7 +13992,7 @@ def check_convergence(state: HealState, config: dict) -> str:
     return "CONTINUE"
 
 
-def write_heal_report(call_type: str, state: HealState,
+def _write_heal_report(call_type: str, state: HealState,
                       best_patch_text: str = "") -> Path:
     """Render a markdown heal report to <heal_dir>/<call_type>/healing-<call_type>.md.
 
@@ -14043,11 +14043,11 @@ def write_heal_report(call_type: str, state: HealState,
 
     lines.append("")
     report_path.write_text("\n".join(lines))
-    log(f"write_heal_report: {call_type}: wrote {report_path}")
+    log(f"_write_heal_report: {call_type}: wrote {report_path}")
     return report_path
 
 
-async def request_patch(state: HealState, iter_n: int,
+async def _request_patch(state: HealState, iter_n: int,
                         st: "State", caps: dict,
                         models: dict[str, str],
                         efforts: dict[str, str | None]) -> tuple[str, str]:
@@ -14071,7 +14071,7 @@ async def request_patch(state: HealState, iter_n: int,
     """
     call_type = state.call_type
     _, prompt_body, _ = resolve_prompt(call_type)
-    sys_prompt = load_prompt("patch_generator")
+    sys_prompt = _load_prompt("patch_generator")
 
     # Build the failing samples section: only response_content is needed
     # for the patch-generator to understand what went wrong.
@@ -14130,7 +14130,7 @@ async def request_patch(state: HealState, iter_n: int,
     # the prompt is advisory but this application check is mechanical.
     if anchor not in prompt_body:
         raise ValueError(
-            f"request_patch: anchor {anchor!r} not found in resolved prompt "
+            f"_request_patch: anchor {anchor!r} not found in resolved prompt "
             f"for call_type={call_type!r} — cannot apply patch safely"
         )
 
@@ -14150,20 +14150,20 @@ async def phase_heal(call_type: str, failing_records: list[dict],
       1. Baseline (once): run n unpatched replays per record to measure noise-floor.
       2. Loop:
          a. request_patch_fn(state, iter_n) → (anchor_match, patch_text)
-         b. heal_apply_patch — materialise patched prompts
-         c. heal_replay_patched — run n replays with the patched prompt + judge
+         b. _heal_apply_patch — materialise patched prompts
+         c. _heal_replay_patched — run n replays with the patched prompt + judge
          d. check_convergence — returns SUCCESS/PLATEAUED/TIMEOUT/BUDGET_EXHAUSTED/
             REGRESSED/CONTINUE
-      3. write_heal_report — always written, even if the loop terminates early.
+      3. _write_heal_report — always written, even if the loop terminates early.
 
     `request_patch_fn` is a callable taking (state: HealState, iter_n: int) and
     returning (anchor_match: str, patch_text: str). When None (the default), the
-    real `request_patch` worker is used. Injecting a stub keeps this function
+    real `_request_patch` worker is used. Injecting a stub keeps this function
     independently testable.
 
     Note: the injected callable may be sync (for tests) or async. If it is a
     sync stub with 2 arguments (state, iter_n), it is called directly. If it is
-    None, the real async `request_patch(state, iter_n, st, caps, models)` is
+    None, the real async `_request_patch(state, iter_n, st, caps, models)` is
     awaited — this is the production path.
 
     Returns the terminal verdict string.
@@ -14186,7 +14186,7 @@ async def phase_heal(call_type: str, failing_records: list[dict],
         f"threshold={converge_config['success_threshold']:.0%}, "
         f"n={n})")
 
-    hs = await heal_baseline(call_type, failing_records, n, heal_dir, caps, st,
+    hs = await _heal_baseline(call_type, failing_records, n, heal_dir, caps, st,
                              models, efforts)
 
     best_patch_text: str = ""
@@ -14200,16 +14200,16 @@ async def phase_heal(call_type: str, failing_records: list[dict],
 
         # Invoke the patch generator: real worker (default) or injected stub.
         if request_patch_fn is None:
-            anchor_match, patch_text = await request_patch(
+            anchor_match, patch_text = await _request_patch(
                 hs, iter_n, st, caps, models, efforts)
         elif asyncio.iscoroutinefunction(request_patch_fn):
             anchor_match, patch_text = await request_patch_fn(hs, iter_n)
         else:
             anchor_match, patch_text = request_patch_fn(hs, iter_n)
 
-        heal_apply_patch(call_type, iter_n, patch_text, anchor_match,
+        _heal_apply_patch(call_type, iter_n, patch_text, anchor_match,
                          heal_dir, hs.failing_samples)
-        hs = await heal_replay_patched(call_type, iter_n, n, heal_dir,
+        hs = await _heal_replay_patched(call_type, iter_n, n, heal_dir,
                                        caps, st, models, efforts)
         converge_config["worker_count"] = st.data.get("worker_count", 0)
         verdict = check_convergence(hs, converge_config)
@@ -14220,7 +14220,7 @@ async def phase_heal(call_type: str, failing_records: list[dict],
 
         log(f"phase_heal: {call_type} iter-{iter_n}: verdict={verdict}")
 
-    write_heal_report(call_type, hs, best_patch_text)
+    _write_heal_report(call_type, hs, best_patch_text)
     log(f"phase_heal: {call_type}: terminated with {verdict}")
     return verdict
 
@@ -14238,7 +14238,7 @@ async def phase_heal(call_type: str, failing_records: list[dict],
 _DOCS_ONLY_CATEGORIES = frozenset({"documentation"})
 
 
-async def run_setup_hook(repo_root: Path, log_dir: Path,
+async def _run_setup_hook(repo_root: Path, log_dir: Path,
                           st: "State") -> None:
     """Execute `<repo>/.leerie-setup.sh` if present. Idempotent via
     `st.data["provision"]["sh_hook_ran"]` — re-entering this function
@@ -14293,7 +14293,7 @@ async def run_setup_hook(repo_root: Path, log_dir: Path,
     log_path = log_dir / "setup-hook.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     try:
-        rc, tail = await run_streaming(
+        rc, tail = await _run_streaming(
             ["bash", str(hook)],
             cwd=str(repo_root),
             timeout=600,  # 10 minutes
@@ -14401,7 +14401,7 @@ _ASDF_TOOL_ALIASES = {
 
 def _existing_mise_toml_tool_keys(text: str | None) -> set[str]:
     """Return the set of tool keys pinned by a `[tools]` section in the
-    given mise.toml text. Used by `synth_mise_go_override` to avoid
+    given mise.toml text. Used by `_synth_mise_go_override` to avoid
     re-pinning a tool the repo already wired up explicitly. Heuristic
     line-level scan — full TOML parsing would pull in tomllib and the
     set of forms we care about (top-level `[tools]` table, simple
@@ -14487,7 +14487,7 @@ def _read_idiomatic_pins(repo_root: Path,
     return pins
 
 
-def synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
+def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     """If `go.mod` exists and no other Go pin is in place, write a mise
     override file that pins the Go version mise should install. Returns
     the absolute path to the override file (so the caller can export
@@ -14645,7 +14645,7 @@ def _repo_has_version_signal(repo_root: Path,
     return False
 
 
-async def run_mise_install(repo_root: Path, log_dir: Path,
+async def _run_mise_install(repo_root: Path, log_dir: Path,
                             st: "State",
                             override_file: Path | None = None) -> None:
     """Invoke `mise install` at the repo root. If `override_file` is
@@ -14686,7 +14686,7 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     # installs every declared tool. We let the resolver figure out the
     # set from the repo's .tool-versions / .nvmrc / .python-version /
     # rust-toolchain.toml / .go-version (the last either committed or
-    # synthesized by synth_mise_go_override).
+    # synthesized by _synth_mise_go_override).
     #
     # Stream output: a first-run install of Python 3.12 / Ruby 3.2 /
     # Rust can take minutes; without streaming the user sees a silent
@@ -14694,7 +14694,7 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     # whatever container-level wall-clock the user gives up at).
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     try:
-        rc, tail = await run_streaming(
+        rc, tail = await _run_streaming(
             ["mise", "install"],
             cwd=str(repo_root),
             env=env,
@@ -14753,7 +14753,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     log("phase 1: classifying task")
     st.data["current_phase"] = "phase 1: classify"
     st.save()
-    sys_prompt = load_prompt("classifier")
+    sys_prompt = _load_prompt("classifier")
     repo_root = Path(os.getcwd())
     user_prompt_parts: list[str] = [
         f"TASK:\n{task}\n\nClassify it and apply the clarification filter."]
@@ -14867,7 +14867,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     exhaustion, `die()`s exactly like the adherence/reconciler gates —
     UNLESS `st.data["likely_already_satisfied"]` carries `True` with
     evidence, in which case that is treated as the same "cleared-but-empty
-    terminal state" `detect_no_work` already produces post-plan (DESIGN
+    terminal state" `_detect_no_work` already produces post-plan (DESIGN
     §8): the run cannot converge on a category set because some round's
     classifier investigation found the task's deliverable already on HEAD,
     so classification precision no longer matters. This field is
@@ -14879,7 +14879,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     round is not guaranteed — only a genuinely fresh contradicting claim
     with its own evidence would ever override an earlier True. Routes
     to `_finish_no_work_run` and returns True in that case; the caller must
-    then stop the pipeline (mirroring the existing `detect_no_work` call
+    then stop the pipeline (mirroring the existing `_detect_no_work` call
     site's `_finish_no_work_run(...); return` pattern). A
     `classification_judge` `WorkerError` (infrastructure crash) degrades: the
     classifier's own output is preserved (never discarded), consistent with
@@ -14890,7 +14890,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     stop); False otherwise (the categories live on state, like
     `phase_classify`'s own writes, and the caller proceeds normally)."""
     repo_root = Path(os.getcwd())
-    sys_prompt = load_prompt("classification_judge")
+    sys_prompt = _load_prompt("classification_judge")
 
     # Accumulated across every round of this gate call: every category the
     # independent judge has vetted as belonging in the set, so a re-classify
@@ -15102,7 +15102,7 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     return answers
 
 
-def absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
+def _absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
     """Merge --answers FILE into st.data['answers'] and propagate the
     update to existing subtask spec files. Safe to call on both initial
     runs and on --resume; a no-op when --answers is not set.
@@ -15114,12 +15114,12 @@ def absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
     resume we just want the merge half — the user has already produced
     an answers file in response to a prior EXIT_NEEDS_ANSWERS exit
     (either pending-questions.json from gather_answers, or
-    pending-clarifications.json from surface_clarification), and the
+    pending-clarifications.json from _surface_clarification), and the
     job here is to get those answers into state and onto disk so the
     next worker invocation sees them.
 
     The subtask-spec rewrite mirrors leerie.py around the
-    needs-clarification branch of settle_subtask: every existing spec
+    needs-clarification branch of _settle_subtask: every existing spec
     file gets its `_clarification_answers` field overwritten with the
     current st.data['answers']. This is intentionally aggressive — a
     subtask that doesn't read the new keys ignores them; a subtask
@@ -15167,7 +15167,7 @@ def absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
             spec_path.write_text(json.dumps(spec, indent=2))
 
 
-def surface_clarification(sid: str, question: dict, checkpoint_path: str,
+def _surface_clarification(sid: str, question: dict, checkpoint_path: str,
                           st: State) -> bool:
     """Surface a mid-execution clarification question to the user
     (DESIGN §11). Mirrors `gather_answers`'s TTY-vs-non-TTY split:
@@ -15311,15 +15311,15 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         return
 
     # 2. Setup hook.
-    await run_setup_hook(repo_root, log_dir, st)
+    await _run_setup_hook(repo_root, log_dir, st)
 
     # 3. Synthesize a mise go override if go.mod lacks a sibling pin.
-    override = synth_mise_go_override(repo_root, st.run_dir)
+    override = _synth_mise_go_override(repo_root, st.run_dir)
     if override is not None:
         log(f"  synthesized mise override at {override.name} "
             f"(go.mod → .go-version equivalent)")
     # Persist so a `--resume` after this point can re-export the env
-    # var (orchestrate() re-reads provision state on resume).
+    # var (_orchestrate() re-reads provision state on resume).
     prov["override_file"] = str(override) if override is not None else None
     st.save()
     # Export MISE_OVERRIDE_CONFIG_FILENAMES into the orchestrator's
@@ -15335,7 +15335,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
 
     # 4. mise install + version capture.
-    await run_mise_install(repo_root, log_dir, st, override_file=override)
+    await _run_mise_install(repo_root, log_dir, st, override_file=override)
     versions = prov.get("mise_versions") or {}
     if versions:
         version_summary = ", ".join(
@@ -15347,15 +15347,15 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
             log(f"  resolved versions: {version_summary}")
 
     # 5a. Detect install commands — table first.
-    recipe = detect_recipe_from_lockfiles(repo_root)
+    recipe = _detect_recipe_from_lockfiles(repo_root)
     if recipe:
         prov["source"] = "table"
         log(f"  table emitted {len(recipe)} install command(s)")
     else:
         # 5b. LLM fallback with CRITIC-pattern mechanical feedback loop.
         log("  table abstained — invoking provision worker")
-        fixtures = gather_provision_fixtures(repo_root)
-        sys_prompt = load_prompt("provision")
+        fixtures = _gather_provision_fixtures(repo_root)
+        sys_prompt = _load_prompt("provision")
         prov_up_parts: list[str] = [
             _format_provision_user_prompt(fixtures, st.data["task"])]
 
@@ -15405,7 +15405,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # see it via prompt injection and we don't want to ship them
     # malformed entries.
     try:
-        validate_provision_recipe(recipe)
+        _validate_provision_recipe(recipe)
     except ValueError as e:
         die(f"provision recipe failed validation: {e}")
 
@@ -15438,7 +15438,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     independent `provision_judge` attacks the recipe against the actual
     image/runtime and gates on a NON-EMPTY `recipe_failures` array — catching
     the SEMANTIC gaps the deterministic `_normalize_pip_installs` /
-    `validate_provision_recipe` (which already ran inside phase_provision)
+    `_validate_provision_recipe` (which already ran inside phase_provision)
     miss.
 
     A recipe that would fail is fatal (matching phase_provision's own
@@ -15455,7 +15455,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
         log("phase 1½: provision gate skipped (no install recipe)")
         return
 
-    sys_prompt = load_prompt("provision_judge")
+    sys_prompt = _load_prompt("provision_judge")
 
     def _image_runtime_context() -> str:
         versions = prov.get("mise_versions") or {}
@@ -15553,7 +15553,7 @@ def _planner_sample_is_empty_ready(sample: dict) -> bool:
 
     Deliberately NOT called "invalid" on its own: this exact shape is the
     planner's legitimate way to say *this domain has no work*, and
-    `detect_no_work` routes a run on it. It is only a defect **relative to a
+    `_detect_no_work` routes a run on it. It is only a defect **relative to a
     sibling sample that found work** — see `_select_best_planner_sample`."""
     return (sample.get("status") == "ready"
             and not sample.get("subtasks"))
@@ -15587,7 +15587,7 @@ def _select_best_planner_sample(
 
     The gate is relative, never absolute. If every sample is empty-`ready`
     the domain genuinely has no work, so the full set is ranked unchanged and
-    `detect_no_work`'s terminal route still fires."""
+    `_detect_no_work`'s terminal route still fires."""
     ranked = [s for s in samples if not _planner_sample_is_empty_ready(s)]
     if ranked and len(ranked) < len(samples):
         log(f"  {domain}: dropped {len(samples) - len(ranked)} empty sample(s) "
@@ -15661,7 +15661,7 @@ async def phase_artifact_registry(
     st.data["current_phase"] = "phase 2: artifact registry"
     st.save()
     repo_root = Path(os.getcwd())
-    sys_prompt = load_prompt("artifact_registry")
+    sys_prompt = _load_prompt("artifact_registry")
 
     # Reuse the P6 repo-map for grounding, ranked to fit the token budget only —
     # no task-file seeds (unlike phase_plan's own repo-map injection), since the
@@ -15670,8 +15670,8 @@ async def phase_artifact_registry(
     ctx_dict: dict = {"task": task}
     if not st.data.get("skip_repo_map"):
         try:
-            repo_map = build_repo_map(repo_root, st.leerie_root)
-            ranked = rank_repo_map(repo_map, [], [])
+            repo_map = _build_repo_map(repo_root, st.leerie_root)
+            ranked = _rank_repo_map(repo_map, [], [])
             if ranked:
                 ctx_dict["repo_map"] = ranked
         except Exception:
@@ -15721,7 +15721,7 @@ def _replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
 
     A re-plan replaces a domain's subtasks with fresh ones, so every id it
     used vanishes. Any *other* domain holding an edge into it would dangle —
-    `validate_plan` catches that, but as a `die()`, which is the outcome
+    `_validate_plan` catches that, but as a `die()`, which is the outcome
     scoping exists to avoid. So the scope is `targets` **plus the transitive
     closure of domains depending on them**, over both channels: `depends_on`
     (id) and `requires`→`provides` (tag). Everything that could dangle is
@@ -15800,8 +15800,8 @@ async def phase_plan(task: str, st: State, caps: dict,
         # Scoped re-plan (DESIGN §5): plan only the requested categories. The
         # caller is responsible for merging the result with the plans it
         # retained — `phase_plan` returns only what it planned, so a caller
-        # that forgets to merge loses subtasks loudly (schedule()/
-        # validate_plan die) rather than silently.
+        # that forgets to merge loses subtasks loudly (_schedule()/
+        # _validate_plan die) rather than silently.
         #
         # Matched on the id PREFIX, not the category name, because that is
         # what `_replan_domain_closure` returns and what subtask ids carry.
@@ -15816,7 +15816,7 @@ async def phase_plan(task: str, st: State, caps: dict,
             f"{len(st.data['categories'])} domain(s) — {', '.join(cats)}")
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
-    sys_prompt = load_prompt("planner")
+    sys_prompt = _load_prompt("planner")
 
     sem = asyncio.Semaphore(caps["max_parallel"])
 
@@ -15834,7 +15834,7 @@ async def phase_plan(task: str, st: State, caps: dict,
     # feedback rounds on a ratio no planner could move. Coverage of the
     # task's actual requirements is `task_coverage_judge`'s job (phase
     # 2⅞½), which reads these files itself.
-    task_files = glob_task_references(task, repo_root)
+    task_files = _glob_task_references(task, repo_root)
     task_file_section = _format_task_file_references(task_files, repo_root)
     if task_files:
         log(f"  task references {len(task_files)} file(s); "
@@ -15891,9 +15891,9 @@ async def phase_plan(task: str, st: State, caps: dict,
     repo_map: dict | None = None
     if not st.data.get("skip_repo_map"):
         try:
-            repo_map = build_repo_map(repo_root, st.leerie_root)
+            repo_map = _build_repo_map(repo_root, st.leerie_root)
             seed_files = [_repo_rel(f, repo_root) for f in task_files]
-            ranked = rank_repo_map(repo_map, seed_files, [])
+            ranked = _rank_repo_map(repo_map, seed_files, [])
             if ranked:
                 ctx_dict["repo_map"] = ranked
                 log(f"  injected ranked repo-map subgraph "
@@ -15971,7 +15971,7 @@ async def phase_plan(task: str, st: State, caps: dict,
 
     if n_samples <= 1:
         # Fast path: identical to single-sample behavior.
-        plans = await gather_or_cancel(*(plan_one(c) for c in cats))
+        plans = await _gather_or_cancel(*(plan_one(c) for c in cats))
     else:
         # Multi-sample: run N independent invocations per category,
         # then mechanically select the cleanest sample per category.
@@ -15982,7 +15982,7 @@ async def phase_plan(task: str, st: State, caps: dict,
             for s_idx in range(n_samples):
                 all_coros.append(plan_one(c, s_idx))
                 coro_keys.append((c, s_idx))
-        all_results = await gather_or_cancel(*all_coros)
+        all_results = await _gather_or_cancel(*all_coros)
 
         by_category: dict[str, list[dict]] = {}
         for (c, _s_idx), result in zip(coro_keys, all_results):
@@ -16000,8 +16000,8 @@ async def phase_plan(task: str, st: State, caps: dict,
             plans.append(best)
 
     # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
-    # counts from the planner level, not from inside recursive_decompose itself.
-    log("  expanding subtasks via recursive_decompose (P1 Layer C)")
+    # counts from the planner level, not from inside _recursive_decompose itself.
+    log("  expanding subtasks via _recursive_decompose (P1 Layer C)")
     # Expansion vanishes each split parent's id, so a first-pass sibling that
     # declared `depends_on: [parent]` must be rewritten to depend on every leaf
     # the parent became (DESIGN §5 *Id-vanishing operations*). Accumulated
@@ -16014,7 +16014,7 @@ async def phase_plan(task: str, st: State, caps: dict,
             continue
         leaves: list[dict] = []
         for subtask in first_pass:
-            expanded = await recursive_decompose(
+            expanded = await _recursive_decompose(
                 subtask, 0, st, caps, models, efforts, repo_root,
                 repo_map=repo_map)
             pid = subtask.get("id")
@@ -16108,7 +16108,7 @@ def _collect_external_preconditions(plans: list[dict]) -> list[dict]:
 def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     """Pure-Python lookup: every (sid, tag, domain) where a subtask
     `requires` a capability tag that no subtask in the merged plan
-    `provides`. Mirrors the set logic in validate_plan() but emits the
+    `provides`. Mirrors the set logic in _validate_plan() but emits the
     data rather than raising. Used by phase_reconcile to assemble the
     reconciler worker's input and (after the worker applies its
     resolutions) to verify the output actually closed every gap.
@@ -16210,7 +16210,7 @@ def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
     `_added_by_reconciler: true`, stamped by `_apply_reconciler_output`)
     whose `size` is `"large"`. Mirrors the planner-side prohibition the
     planner prompt already states ("Never emit `size: large`") and the
-    final `validate_plan` backstop — but fires earlier so the size
+    final `_validate_plan` backstop — but fires earlier so the size
     gate in `phase_reconcile` can respawn the reconciler with structured
     feedback before the post-merge validator gets a chance to die().
 
@@ -16259,10 +16259,10 @@ def _apply_reconciler_output(
     1. `renames` rewrite a single `requires` entry on the named subtask.
     2. `added_provides` append a tag to the named subtask's `provides`.
     3. `added_subtasks` become a new domain="_reconciler" plan appended
-       to the list — schedule() flattens by id, so domain only affects
+       to the list — _schedule() flattens by id, so domain only affects
        the per-domain log line. Each added subtask is stamped with
        `_added_by_reconciler: true` for downstream traceability
-       (size gate + validate_plan error wording + conditional_drops'
+       (size gate + _validate_plan error wording + conditional_drops'
        planner-only guard rely on it).
     4. `conditional_drops` remove a planner-emitted consumer subtask
        whose own `intent` declared it conditional on an unresolvable
@@ -16341,8 +16341,8 @@ def _apply_reconciler_output(
 
     added = output.get("added_subtasks", [])
     if added:
-        # Fail loud on id collisions. schedule() merges all subtasks
-        # into a single dict keyed by id (leerie.py: see `schedule`),
+        # Fail loud on id collisions. _schedule() merges all subtasks
+        # into a single dict keyed by id (leerie.py: see `_schedule`),
         # so a duplicate id would silently overwrite a real subtask and
         # vanish its requires/provides/depends_on from the DAG. The
         # reconciler's prompt warns against this, but prompts are
@@ -16352,7 +16352,7 @@ def _apply_reconciler_output(
         #      subtask the planners already produced.
         #   2. added-vs-added: the reconciler emitted the same id twice
         #      within added_subtasks itself. Both halves get silently
-        #      collapsed by schedule()'s dict-flatten if not caught here.
+        #      collapsed by _schedule()'s dict-flatten if not caught here.
         existing_ids = {s["id"] for s in by_id.values()}
         ext_collisions = sorted({s["id"] for s in added if s["id"] in existing_ids})
         seen: set[str] = set()
@@ -16378,7 +16378,7 @@ def _apply_reconciler_output(
                 "Refine the task or re-run."
             )
         # Stamp `_added_by_reconciler: true` on every added subtask.
-        # The size gate + validate_plan's "planner vs reconciler" error
+        # The size gate + _validate_plan's "planner vs reconciler" error
         # wording rely on this flag; stamping it here (rather than
         # trusting the model to set it in its response) makes the
         # provenance signal a mechanical guarantee that a defective
@@ -16631,13 +16631,13 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     agreed; otherwise runs one reconciler worker whose output is applied
     mechanically. Genuinely unresolvable gaps die.
 
-    Returns the (possibly mutated) `plans` list, ready for `schedule()`."""
+    Returns the (possibly mutated) `plans` list, ready for `_schedule()`."""
     # Pre-condition: subtask ids are globally unique across plans. The
     # planner prompt tells each domain to scope ids to itself with a
     # domain-prefix, and the 8 CATEGORIES map to distinct prefixes
     # (leerie.py: CATEGORIES / _ID_PREFIXES), so in practice this
     # invariant holds. But prompts are advisory per CLAUDE.md; if a
-    # planner ignores the rule, schedule()'s dict-flatten (line ~2997:
+    # planner ignores the rule, _schedule()'s dict-flatten (line ~2997:
     # `subtasks[s["id"]] = s`) would silently overwrite, vanishing the
     # loser's requires/provides/depends_on from the DAG — the same
     # silent-data-loss failure class as the reconciler-output collisions
@@ -16661,7 +16661,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             f"{bullets}\n"
             "Planners must emit globally unique subtask ids — by "
             "convention, each domain prefixes its ids with the domain "
-            "(feat-, test-, bugfix-, …). schedule()'s by-id merge "
+            "(feat-, test-, bugfix-, …). _schedule()'s by-id merge "
             "would otherwise silently drop one of the subtasks from "
             "the DAG. Refine the task or re-run."
         )
@@ -16671,7 +16671,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     #   1. Promote `external` entries whose tag is in some plan's
     #      `provides` to `in_plan` — the real producer wins.
     #   2. Collect remaining `external` entries into the preconditions
-    #      list, persisted via st so write_plan can surface it in
+    #      list, persisted via st so _write_plan can surface it in
     #      plan.json. Externals never enter the reconciler's queue.
     promoted = _promote_external_collisions(plans)
     if promoted:
@@ -16743,7 +16743,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         "unresolved_requires": unresolved,
     }
 
-    sys_prompt = load_prompt("reconciler")
+    sys_prompt = _load_prompt("reconciler")
     user_prompt = (
         "RECONCILER INPUT:\n" + json.dumps(payload, indent=2) +
         "\n\nResolve every unresolved_requires entry per your "
@@ -16812,7 +16812,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         whose resolution motivated the drop). Called after each
         successful _apply_reconciler_output. Distinct from
         st.data["dropped_subtasks"] which records off-tree soft-drops
-        from filter_offtree_subtasks (phase 3) — same audit shape,
+        from _filter_offtree_subtasks (phase 3) — same audit shape,
         different cause, separately auditable.
 
         The from_unresolved_tag lookup uses the closure-scoped
@@ -18363,7 +18363,7 @@ def _validate_unresolved_must_include(
 # worker budget already spent across earlier waves.
 #
 # `phase_overlap_judge` runs one `plan_overlap_judge` worker between
-# reconcile and schedule to detect these collisions at plan time. The
+# reconcile and _schedule to detect these collisions at plan time. The
 # judge emits zero or more `collisions`, each with one of four
 # resolutions: `merge` (one component satisfies both intents),
 # `drop_a` / `drop_b` (one intent supersedes), or `unresolvable`
@@ -18478,7 +18478,7 @@ def _contradictory_drop_sids(collisions: list[dict]) -> set[str]:
     output that `prompts/plan_overlap_judge.md` explicitly sanctions
     and `_apply_multidrop` applies as a cluster. Gating on appearance
     count instead die()s that correct emission after the full planning
-    spend, unrecoverably, since this phase precedes `write_plan()`."""
+    spend, unrecoverably, since this phase precedes `_write_plan()`."""
     survives: set[str] = set()
     dropped: set[str] = set()
     for c in collisions:
@@ -18559,7 +18559,7 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
     # explicitly instructs. It is applied as a cluster by
     # `_apply_multidrop`. Gating on bare appearance count (the pre-fix
     # behavior) die()d that correct output after the full planning
-    # spend, unrecoverably, since this phase precedes `write_plan()`.
+    # spend, unrecoverably, since this phase precedes `_write_plan()`.
     #
     # (Earlier iterations of this audit also gated `merge`-between-
     # two-anchors, but the apply loop's natural semantics — fall
@@ -18667,7 +18667,7 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
     union, dropping `feat-008` (provides `widget-frame-adopted`) in
     favor of `refactor-001` (provides `widget-frame-component`) would
     orphan every `feat-011 requires widget-frame-adopted` edge into a
-    `validate_plan` error that doesn't trace back to the judge's drop.
+    `_validate_plan` error that doesn't trace back to the judge's drop.
     `phase_overlap_judge` runs after the reconciler's unresolved-retry
     loop, so leaving orphans for "the next pass" is not an option.
 
@@ -18794,7 +18794,7 @@ def _apply_multidrop(plans: list[dict], dropped_sid: str,
 
     dropped = by_id.get(dropped_sid)
     # Sorted so the result never depends on the order the judge
-    # happened to emit its pairs in (`schedule()` is documented
+    # happened to emit its pairs in (`_schedule()` is documented
     # deterministic). Self-references are impossible here — a
     # `drop_*(X, X)` cannot name X as both sides — but filtered
     # defensively, mirroring `_apply_overlap_drop`'s self-loop guard.
@@ -19568,7 +19568,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     """Instruction-adherence gate: enforce that the assembled plan honors
     a procedure the user explicitly prescribed (DESIGN: instruction-
     adherence is code-enforced, sibling to §12 "prompts advisory, code
-    enforces"). Runs after `phase_overlap_judge` and before `schedule()`.
+    enforces"). Runs after `phase_overlap_judge` and before `_schedule()`.
 
     Two-stage composition — the corpus-validated (0/21 false positives)
     design; do NOT gate on the judge's score alone, which alone
@@ -19608,7 +19608,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     `skip_adherence_check` in leerie.toml).
 
     Returns the (possibly re-planned) `plans` list, ready for
-    `schedule()` (this phase runs after `phase_overlap_judge`)."""
+    `_schedule()` (this phase runs after `phase_overlap_judge`)."""
     if st.data.get("skip_adherence_check"):
         log("phase 2⅞: adherence-gate skipped (--skip-adherence-check / "
             "LEERIE_SKIP_ADHERENCE_CHECK / skip_adherence_check=true)")
@@ -19625,7 +19625,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     st.save()
 
     repo_root = Path(os.getcwd())
-    sys_prompt = load_prompt("adherence_judge")
+    sys_prompt = _load_prompt("adherence_judge")
 
     def _build_payload(cur_plans: list[dict]) -> dict:
         subtasks = [s for plan in cur_plans for s in plan.get("subtasks", []) or []]
@@ -19733,7 +19733,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # cross-category tag visibility (DESIGN §5), so a re-plan can
         # reintroduce the exact cross-domain provides/requires drift
         # phase_reconcile already resolved on the first pass. Re-run it
-        # here so the re-planned output isn't handed to schedule()/
+        # here so the re-planned output isn't handed to _schedule()/
         # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
         # when the re-plan didn't introduce any new unresolved requires.
         cur_plans[0] = await phase_reconcile(
@@ -19817,7 +19817,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
                                         efforts: dict[str, str | None]) -> list[dict]:
     """Independent adversarial verification of the merged plan's coverage of
     the task (DESIGN §8 *Independent adversarial verification*). Runs after
-    `phase_adherence_gate` and before the soft-drop filters / `schedule()` —
+    `phase_adherence_gate` and before the soft-drop filters / `_schedule()` —
     task coverage is a whole-task property of the MERGED plan set, not a
     per-domain one, so this attacks `plans` after every planner domain has
     been reconciled and overlap-judged, exactly like `phase_wiring_gate`
@@ -19860,13 +19860,13 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     handling.
 
     Returns the (possibly re-planned) `plans` list, ready for the soft-drop
-    filters and `schedule()`."""
+    filters and `_schedule()`."""
     log("phase 2⅞½: task-coverage gate")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
     st.save()
 
     repo_root = Path(os.getcwd())
-    sys_prompt = load_prompt("task_coverage_judge")
+    sys_prompt = _load_prompt("task_coverage_judge")
     required_items = st.data.get("required_items") or []
 
     def _build_payload(cur_plans: list[dict]) -> dict:
@@ -19957,7 +19957,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         # cross-category tag visibility (DESIGN §5), so a re-plan can
         # reintroduce the exact cross-domain provides/requires drift
         # phase_reconcile already resolved on the first pass. Re-run it
-        # here so the re-planned output isn't handed to schedule()/
+        # here so the re-planned output isn't handed to _schedule()/
         # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
         # when the re-plan didn't introduce any new unresolved requires.
         cur_plans[0] = await phase_reconcile(
@@ -20047,7 +20047,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     """Independent SEMANTIC verification of the fully-merged plan's wiring
     (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Runs after
     every id/tag-vanishing operation (reconcile, both soft-drop filters,
-    expansion) and after `schedule()`, so it attacks the truly-merged
+    expansion) and after `_schedule()`, so it attacks the truly-merged
     POST-DROP plan. Its structural counterpart, the deterministic
     `check_plan_wiring` — which owns the structural dangle (does every declared
     `requires`/`depends_on` resolve) — is an independent backstop that runs on
@@ -20077,7 +20077,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     Returns `plans` unchanged (the gate does not mutate the plan; it either
     passes it through or `die()`s)."""
     repo_root = Path(os.getcwd())
-    sys_prompt = load_prompt("wiring_judge")
+    sys_prompt = _load_prompt("wiring_judge")
 
     payload = {
         "subtasks": [
@@ -20153,7 +20153,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
         return plans
 
     # Repair the unambiguous defects before deciding to die (DESIGN §5).
-    # `plans` is mutated in place; `_run_phases` re-runs schedule() and
+    # `plans` is mutated in place; `_run_phases` re-runs _schedule() and
     # rewrites plan_snapshot when anything landed, so the wave partition
     # downstream reflects the repaired graph.
     repairs, unrepaired = _repair_missing_requires(
@@ -20232,7 +20232,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     output to `st.data["plan_overlap_judge"]` and the mutation summary
     to `st.data["plan_overlap_applied"]` for audit.
 
-    Returns the (possibly mutated) `plans` list, ready for `schedule()`.
+    Returns the (possibly mutated) `plans` list, ready for `_schedule()`.
     """
     # DETERMINISTIC FLOOR — deliberately ABOVE every skip below, so it is
     # evaluated on the paths where the judge never runs at all: a
@@ -20302,7 +20302,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             })
     payload = {"task": task, "subtasks": subtask_views}
 
-    sys_prompt = load_prompt("plan_overlap_judge")
+    sys_prompt = _load_prompt("plan_overlap_judge")
     user_prompt = (
         "JUDGE INPUT:\n" + json.dumps(payload, indent=2) +
         "\n\nReturn only the JSON object per your schema. If no surface "
@@ -20557,8 +20557,8 @@ def _build_predecessor_graph(
     Shared by every consumer of the subtask DAG so none can drift in what
     counts as an edge: the phase 2½ acyclicity gate (`phase_reconcile`), the
     phase 2¾ per-resolution cycle trials (`_would_cycle_after`) and post-merge
-    backstop, the phase 3 scheduler (`schedule`),
-    `warn_provider_subset_subtasks`, and the implementer's upstream-artifact
+    backstop, the phase 3 scheduler (`_schedule`),
+    `_warn_provider_subset_subtasks`, and the implementer's upstream-artifact
     lookup. Callers handle empties and cycles themselves — no side effects, no
     `die()`.
 
@@ -20591,12 +20591,12 @@ def _build_predecessor_graph(
             else:
                 # Unreachable once every id-vanishing op rewrites its
                 # inbound refs (DESIGN §5). Log rather than drop in
-                # silence: this runs before validate_plan, so it is the
+                # silence: this runs before _validate_plan, so it is the
                 # earliest observation point for an edge going missing,
                 # and the canary if a new id-vanishing op forgets the
-                # rewrite. validate_plan stays the single enforcement
+                # rewrite. _validate_plan stays the single enforcement
                 # point — never die() here.
-                log(f"schedule: {sid} depends_on unknown id {dep!r} "
+                log(f"_schedule: {sid} depends_on unknown id {dep!r} "
                     "— edge dropped")
         for entry in s.get("requires", []):
             if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
@@ -20611,7 +20611,7 @@ def _build_predecessor_graph(
     return preds, providers, edge_sources
 
 
-def detect_no_work(plans: list[dict]) -> dict[str, str] | None:
+def _detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     """Return a `{domain: basis}` map iff *every* plan satisfies
     `status == "ready"` and `subtasks == []` — the cleared-but-empty
     terminal state (DESIGN §8): the planner gate cleared and confirmed
@@ -20624,7 +20624,7 @@ def detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     planner's reasoning, not to re-validate the schema.
 
     Returns None on the mixed and all-blocked cases so the normal
-    `schedule()` path (and its all-blocked die) still fires."""
+    `_schedule()` path (and its all-blocked die) still fires."""
     if not plans:
         return None
     out: dict[str, str] = {}
@@ -20657,7 +20657,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
     fail its non-empty-branch check and `cleanup.sh` has no subtask
     branches to drop."""
-    log("phase 3: nothing to schedule — every planner returned "
+    log("phase 3: nothing to _schedule — every planner returned "
         "status=ready with zero subtasks")
     for domain, basis in no_work_map.items():
         log(f"  {domain}: no work (basis: {basis!r})")
@@ -20688,7 +20688,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
             f"(see {st.path})")
 
 
-def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
+def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
     dependencies, topologically sort into waves. Deterministic."""
     log("phase 3: scheduling")
@@ -20745,7 +20745,7 @@ def check_budget_feasibility(st: State, caps: dict,
                              waves: list[list[str]]) -> None:
     """Phase 3 pure-Python gate (DESIGN §13 *Budget feasibility — fail
     fast at the cheapest moment*). Called once in `_run_phases()`
-    immediately after `schedule()` returns and before `write_plan()`
+    immediately after `_schedule()` returns and before `_write_plan()`
     persists anything. Estimates the `claude -p` calls the run will
     consume from here to finalize and `die()`s with
     EXIT_BUDGET_INFEASIBLE when the estimate exceeds
@@ -20844,8 +20844,8 @@ def _repair_prescribed_commands(plans: list[dict],
     The synthesised subtask depends on the plan's current sinks, so it is
     acyclic by construction (nothing depends on it) and schedules alone in the
     final wave. Validated against every corpus run carrying a prescribed
-    procedure: 5 of 5 repaired to a clean floor with `schedule()` and
-    `validate_plan()` passing, and 3 already-clean runs correctly untouched."""
+    procedure: 5 of 5 repaired to a clean floor with `_schedule()` and
+    `_validate_plan()` passing, and 3 already-clean runs correctly untouched."""
     subs = [s for p in plans for s in (p.get("subtasks") or [])]
     if not check_prescribed_command_coverage(prescribed, subs):
         return None
@@ -20861,7 +20861,7 @@ def _repair_prescribed_commands(plans: list[dict],
     prefix = CATEGORY_ABBREV.get(host.get("domain"), "")
     if not prefix:
         # A synthetic plan (e.g. the reconciler's) whose `domain` is not a real
-        # category cannot supply a valid id prefix, and `validate_plan` rejects
+        # category cannot supply a valid id prefix, and `_validate_plan` rejects
         # ids without one. Decline rather than emit an invalid subtask.
         return None
     prefix += "-"
@@ -20901,11 +20901,11 @@ def check_replan_affordable(st: State, caps: dict, gate: str,
                             plans: list[dict]) -> None:
     """Pre-flight a re-plan against the remaining worker budget.
 
-    `check_budget_feasibility` runs once, after `schedule()`. But a re-plan is
+    `check_budget_feasibility` runs once, after `_schedule()`. But a re-plan is
     the single largest budget event in a run and was authorised with no budget
     check at all — and it is far more expensive than "re-running the
     planners", because `phase_plan` also re-runs the entire P1 decomposition
-    behind it (`recursive_decompose`'s per-subtask `fit_judge`, which measured
+    behind it (`_recursive_decompose`'s per-subtask `fit_judge`, which measured
     59% of one run's spend against the planners' 31%).
 
     Run `d8a764f3…` is the shape this prevents: an adherence-gate re-plan cost
@@ -20916,7 +20916,7 @@ def check_replan_affordable(st: State, caps: dict, gate: str,
     **`plans` is a parameter, not read from state, and that is load-bearing.**
     The first version of this function sized the re-plan from
     `st.data["plan_snapshot"]` — which `_run_phases` does not write until
-    *after* `schedule()`, while both re-planning gates run *before* it. On a
+    *after* `_schedule()`, while both re-planning gates run *before* it. On a
     fresh run the snapshot was therefore absent, `n_subtasks` was 0, the
     estimate collapsed to the planner count alone, and the check never fired:
     replaying `d8a764f3`'s real call-site state (160 of 200 spent, 3 domains,
@@ -21107,7 +21107,7 @@ def _format_upstream_artifacts_section(payloads: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
-def write_plan(leerie_dir: Path, task: str, st: State,
+def _write_plan(leerie_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
     answers = st.data.get("answers", {})
@@ -21253,7 +21253,7 @@ def _format_provision_recipe_section(recipe: list[dict],
     return "\n".join(lines)
 
 
-async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
+async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
                           models: dict[str, str],
                           efforts: dict[str, str | None],
                           continuation: bool = False, note: str = "") -> dict:
@@ -21261,8 +21261,8 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     both kinds of continuation up to the shared `subtask_continuations`
     cap: context-exhaustion handoffs and DESIGN §11 mid-execution
     clarifications."""
-    sys_prompt = load_prompt("implementer")
-    proc = await run_script("new-worktree.sh", sid, st.run_id)
+    sys_prompt = _load_prompt("implementer")
+    proc = await _run_script("new-worktree.sh", sid, st.run_id)
     if proc.returncode != 0:
         raise WorkerError(f"worktree creation failed for {sid}: {proc.stderr.strip()}")
     worktree = proc.stdout.strip().splitlines()[-1]
@@ -21345,7 +21345,7 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # worker could not return schema-valid output even after a retry
         # (e.g. it hit --max-turns mid-task) -> treat as a handoff so a fresh
         # implementer can continue from whatever checkpoint exists. If no
-        # checkpoint was written, validate_result tags it
+        # checkpoint was written, _validate_result tags it
         # `failure_kind="empty_handoff"` (retryable); see the TimeoutExpired
         # arm below for the full retry-classification rationale.
         return {"subtask_id": sid, "status": "incomplete-handoff",
@@ -21355,12 +21355,12 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # worker hit the per-process wall-clock cap (`worker_timeout_sec`,
         # default 5400s / 90 min). _invoke killed the claude -p child
         # and re-raised TimeoutExpired. Without this catch the
-        # exception would escape settle_subtask → gather_or_cancel →
-        # phase_execute → orchestrate → main()'s catch-all and dump a
+        # exception would escape _settle_subtask → _gather_or_cancel →
+        # phase_execute → _orchestrate → main()'s catch-all and dump a
         # 50KB traceback (with the entire claude -p command line) to
         # the user's terminal. Same treatment as the WorkerError
         # arm — a fresh implementer can continue from any partial
-        # checkpoint. If no checkpoint was written, validate_result
+        # checkpoint. If no checkpoint was written, _validate_result
         # tags the missing-checkpoint case as `failure_kind="empty_handoff"`
         # which `_retryable_failure` accepts as retryable; the
         # failed_retries cap then bounds the chain.
@@ -21391,17 +21391,17 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
 _RETRYABLE_FAILURE_KINDS = frozenset({
     "no_commits",      # check_branch_has_commits — implementer claimed
                        # complete with nothing committed
-    "dirty_worktree",  # inline status-porcelain check in settle_subtask —
+    "dirty_worktree",  # inline status-porcelain check in _settle_subtask —
                        # uncommitted changes would be lost on integration
-    "empty_handoff",   # validate_result — `incomplete-handoff` envelope
+    "empty_handoff",   # _validate_result — `incomplete-handoff` envelope
                        # with a checkpoint_path that does not exist on
                        # disk. Two known triggers: (a) the Claude Code
                        # session-limit / rate-limit no-op case (primarily
-                       # caught by detect_session_limit() upstream; this
+                       # caught by _detect_session_limit() upstream; this
                        # is the safety net for a message-format change),
                        # and (b) a worker that hit --max-turns with no
                        # checkpoint written, synthesized into the same
-                       # envelope by run_implementer's WorkerError /
+                       # envelope by _run_implementer's WorkerError /
                        # TimeoutExpired catches. Both are corrective-note
                        # cases — a fresh worker can plausibly do better.
 })
@@ -21416,8 +21416,8 @@ def _retryable_failure(kind: str) -> bool:
 
     Everything else is terminal: the worker is broken or dishonest, and
     re-running it burns a worker invocation against the budget for no
-    expected gain. The canonical terminal kind emitted by `validate_result`
-    and `settle_subtask` is `"broken"` (cross-field invariant violation,
+    expected gain. The canonical terminal kind emitted by `_validate_result`
+    and `_settle_subtask` is `"broken"` (cross-field invariant violation,
     diff touched a protected path, worker-level error). Any unknown kind
     is also terminal — adding a new retryable mode requires extending
     `_RETRYABLE_FAILURE_KINDS`."""
@@ -21426,7 +21426,7 @@ def _retryable_failure(kind: str) -> bool:
 
 # --- post-work conformance phase (DESIGN §9 *Post-work conformance*) -------
 # Runs after the implementer's success-path settlement checks pass, before
-# `settle_subtask` returns. The phase is advisory: nothing it does or fails
+# `_settle_subtask` returns. The phase is advisory: nothing it does or fails
 # to do can produce a `failed` / `blocked` subtask status. The code-enforced
 # guarantees are narrow — rule-file discovery is deterministic, the worker's
 # output is schema-validated, and the same diff-scope check that gates the
@@ -21454,7 +21454,7 @@ _RULES_FILE_CANDIDATES = (
 )
 
 
-def discover_rules_files(repo_root: Path) -> list[Path]:
+def _discover_rules_files(repo_root: Path) -> list[Path]:
     """Return existing rule-file paths from `_RULES_FILE_CANDIDATES`, in
     declaration order, capped at the candidate-list length. Never raises;
     never recurses; returns [] cleanly when nothing matches."""
@@ -21487,7 +21487,7 @@ def _format_convention_docs_section(repo_root: Path) -> str | None:
     no discoverable convention docs, so no empty block is injected. Paths
     only — the implementer opens the ones its subtask needs from its own
     worktree checkout, avoiding inlining a large design-system doc."""
-    rules_files = discover_rules_files(repo_root)
+    rules_files = _discover_rules_files(repo_root)
     if not rules_files:
         return None
     return ("CONVENTION_DOCS (authoritative repo conventions — read the ones "
@@ -21517,7 +21517,7 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
         out["build"] = "make"
     if (repo_root / "package.json").is_file():
         # Lockfile-aware PM detection — precedence mirrors
-        # detect_recipe_from_lockfiles (pnpm > yarn > bun > npm).
+        # _detect_recipe_from_lockfiles (pnpm > yarn > bun > npm).
         # `<pm> run build` / `<pm> run test` uniformly: bun's bare
         # `bun test` / `bun build` invoke built-in tools, not
         # package.json scripts.
@@ -21639,7 +21639,7 @@ def resolve_blt(repo_root: Path) -> dict[str, str]:
     return out
 
 
-def validate_conformance_result(result: dict, worktree: str) -> str | None:
+def _validate_conformance_result(result: dict, worktree: str) -> str | None:
     """Cross-field invariants for the conformer's structured output.
     Returns None when valid, else a one-line error string.
 
@@ -21710,7 +21710,7 @@ def validate_conformance_result(result: dict, worktree: str) -> str | None:
     return None
 
 
-def actionable_solution_defects(conf_res: dict | None) -> list[dict]:
+def _actionable_solution_defects(conf_res: dict | None) -> list[dict]:
     """The conformer's gating solution-completeness findings (DESIGN §9 *The
     one gating axis: solution completeness*): solution_defects that carry a
     concrete_case AND a where. A defect missing either is dropped as
@@ -21779,7 +21779,7 @@ async def _protected_paths_since(worktree: str,
     if r.returncode != 0:
         return []
     touched = [f for f in r.stdout.strip().splitlines() if f]
-    return [f for f in touched if is_protected_path(f)]
+    return [f for f in touched if _is_protected_path(f)]
 
 
 async def _blob_sha(worktree: str, ref: str, path: str) -> str | None:
@@ -21799,7 +21799,7 @@ async def _blob_sha(worktree: str, ref: str, path: str) -> str | None:
     return out if (r.returncode == 0 and out) else None
 
 
-async def clobbered_owned_files(worktree: str, base_ref: str,
+async def _clobbered_owned_files(worktree: str, base_ref: str,
                                 impl_head: str) -> list[str]:
     """Return implementer-owned files the conformer reverted-to-base or
     deleted, i.e. the data-loss signature (DESIGN §9 *No clobbering the
@@ -21839,7 +21839,7 @@ async def clobbered_owned_files(worktree: str, base_ref: str,
     return clobbered
 
 
-async def rollback_conformer_commits(worktree: str, before_sha: str) -> None:
+async def _rollback_conformer_commits(worktree: str, before_sha: str) -> None:
     """Hard-reset the subtask branch back to `before_sha`. Used when the
     conformer wrote to a protected path — the implementer's commits
     are preserved, the conformer's are dropped. Safe to call when no
@@ -21895,7 +21895,7 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
             if line and not line.startswith(prefix)]
 
 
-async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
+async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
                         efforts: dict[str, str | None],
                         rules_files: list[Path],
@@ -21906,7 +21906,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
     Returns the worker's structured output, or None on WorkerError (which
     is recorded as a warning by the caller — DESIGN §9: the phase is
     advisory)."""
-    sys_prompt = load_prompt("conformer")
+    sys_prompt = _load_prompt("conformer")
     repo_root = st.repo_root
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
     up = [f"Run the post-work conformance phase for subtask `{sid}`.",
@@ -21938,7 +21938,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
     # WorkerError when max_total_workers is exhausted, and the conformance
     # phase must NEVER escalate that into a failed/blocked subtask
     # (DESIGN §9 Post-work conformance — the phase is advisory only). The
-    # implementer at run_implementer() places bump_workers outside its try
+    # implementer at _run_implementer() places bump_workers outside its try
     # because for the implementer the budget-exhausted error IS meant to
     # abort the run.
     try:
@@ -21955,7 +21955,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
         log(f"  {sid}: conformer crashed: {e}")
         return None
     except subprocess.TimeoutExpired:
-        # Same rationale as run_implementer's TimeoutExpired catch —
+        # Same rationale as _run_implementer's TimeoutExpired catch —
         # don't let the worker-timeout traceback escape. The conformer
         # phase is advisory; a timed-out conformer becomes one more
         # warning, not a run-killer.
@@ -22027,7 +22027,7 @@ _ADVISORY_ISSUE_LABELS = frozenset({
     # once per offending subtask.
     "PHANTOM_PATH",
     # "size='large' — split it". The planner self-reports `size`, and the
-    # independent `fit_judge` in `recursive_decompose` is the authoritative
+    # independent `fit_judge` in `_recursive_decompose` is the authoritative
     # decomposition gate (DESIGN §5½, §8) — this is a second, self-graded
     # opinion on a decision that already has an independent owner.
     "OVERSIZED",
@@ -22465,9 +22465,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     warnings."""
     warnings: list[str] = []
     repo_root = st.repo_root
-    rules_files = discover_rules_files(repo_root)
+    rules_files = _discover_rules_files(repo_root)
     blt = resolve_blt(repo_root)
-    run_branch = compute_run_branch(st.run_id)
+    run_branch = _compute_run_branch(st.run_id)
     last_res: dict | None = None
     blt_feedback: str | None = None
     # Snapshot the implementer's committed HEAD ONCE, before any conformer
@@ -22485,7 +22485,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
-        last_res = await run_conformer(
+        last_res = await _run_conformer(
             sid, leerie_dir, worktree, caps, st, models, efforts,
             rules_files=rules_files, blt_commands=blt,
             diff_base=run_branch, extra_feedback=blt_feedback)
@@ -22495,7 +22495,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             "phase surfaced as advisory")
             break
 
-        err = validate_conformance_result(last_res, worktree)
+        err = _validate_conformance_result(last_res, worktree)
         if err:
             warnings.append(f"conformer round {c_round}: malformed result: {err}")
             break
@@ -22506,7 +22506,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # check_diff_scope returns a string ONLY for a protected-path
         # violation — .leerie/, .git/, or top-level .claude/ files;
         # .claude/{agents,commands,skills}/ are exempt per
-        # is_protected_path(). The scope-volume warning is logged
+        # _is_protected_path(). The scope-volume warning is logged
         # side-channel and does not surface here.
         scope_err = await check_diff_scope(sid, worktree, subtask, st)
         if scope_err:
@@ -22516,7 +22516,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                     f"conformer round {c_round}: discarding "
                     f"{len(discarded)} uncommitted file(s) during rollback: "
                     f"{[line[3:] for line in discarded]}")
-            await rollback_conformer_commits(worktree, before_sha)
+            await _rollback_conformer_commits(worktree, before_sha)
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
             break
@@ -22535,7 +22535,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # roll the conformer's commits back to the implementer HEAD. Not
         # auto-rolled-back in advisory mode — a legitimate revert-to-base
         # is git-indistinguishable from a clobber and the phase is advisory.
-        clobbered = await clobbered_owned_files(
+        clobbered = await _clobbered_owned_files(
             worktree, run_branch, impl_head_sha)
         if clobbered:
             clobbered_files = clobbered
@@ -22549,7 +22549,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                         f"conformer round {c_round}: discarding "
                         f"{len(discarded)} uncommitted file(s) during "
                         f"clobber rollback: {[line[3:] for line in discarded]}")
-                await rollback_conformer_commits(worktree, impl_head_sha)
+                await _rollback_conformer_commits(worktree, impl_head_sha)
                 warnings.append(
                     f"conformer round {c_round}: strict mode — rolled "
                     "conformer commits back to implementer HEAD to restore "
@@ -22569,7 +22569,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         # worker invoked an axis more than once in one round, or fired a
         # fresh BLT command in response to an auto-backgrounded prior
         # one. The conformer's sid is f"{sid}-conformer" — see
-        # `run_conformer` where claude_p is called.
+        # `_run_conformer` where claude_p is called.
         _emit_bash_axis_warnings(
             leerie_dir / "logs" / f"{sid}-conformer.log",
             f"conformer round {c_round}", warnings)
@@ -22635,7 +22635,7 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     measure," NOT folded into GREEN or RED: a false GREEN would tell the
     conformer to treat every failure as new; a false RED gives it a
     delta it can't use. Every axis dict carries `measured` (set by
-    `capture_conformance_baseline`), so a missing/false value means the
+    `_capture_conformance_baseline`), so a missing/false value means the
     axis is not a measured pass."""
     if not baseline:
         return None
@@ -22693,7 +22693,7 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     return "\n".join(lines)
 
 
-async def capture_conformance_baseline(
+async def _capture_conformance_baseline(
         leerie_dir: Path, st: State, caps: dict) -> None:
     """Record base-tree build/lint/test health once per run (DESIGN §9
     *Base-tree health baseline*).
@@ -22703,7 +22703,7 @@ async def capture_conformance_baseline(
     so the tree is an unmodified snapshot of the base. Installs the
     provision recipe into staging (deps live only in worktrees — §6½ — so
     the suite cannot run without this), then runs each resolved
-    build/lint/test command directly via `run_streaming` and records the
+    build/lint/test command directly via `_run_streaming` and records the
     **exit code** per axis (non-zero ⇒ RED). Exit-code-based on purpose:
     100% reliable, no per-framework output parsing.
 
@@ -22754,7 +22754,7 @@ async def capture_conformance_baseline(
             continue
         wd = staging / (e.get("working_dir") or ".")
         try:
-            await run_streaming(
+            await _run_streaming(
                 e["command"], cwd=str(wd),
                 timeout=float(e.get("timeout_s") or 1800),
                 log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
@@ -22776,7 +22776,7 @@ async def capture_conformance_baseline(
                           "summary": "", "command": ""}
             continue
         try:
-            rc, tail = await run_streaming(
+            rc, tail = await _run_streaming(
                 ["bash", "-lc", cmd], cwd=str(staging), timeout=timeout,
                 log_path=log_path, label=f"baseline-{axis}: {cmd}",
                 verbosity=verbosity)
@@ -22836,7 +22836,7 @@ async def capture_conformance_baseline(
                                                "red_axes": []}})
 
 
-async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
     """Whole-tree conformance pass on the integrated staging worktree
@@ -22874,14 +22874,14 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     st.save()
 
     repo_root = st.repo_root
-    rules_files = discover_rules_files(repo_root)
+    rules_files = _discover_rules_files(repo_root)
     blt = resolve_blt(repo_root)
 
     warnings: list[str] = []
     last_res: dict | None = None
     blt_feedback: str | None = None
 
-    sys_prompt = load_prompt("conformer")
+    sys_prompt = _load_prompt("conformer")
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
 
     # Base ref and pre-pass snapshot for the clobber-survival check
@@ -22889,14 +22889,14 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # from the run branch (setup-run.sh), so `run_branch..staging_before`
     # is the union of all integrated implementer work; the run branch is
     # the base version to compare against.
-    run_branch = compute_run_branch(st.run_id)
+    run_branch = _compute_run_branch(st.run_id)
     staging_before_sha = await _branch_head_sha(str(staging))
     clobbered_files: list[str] = []
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
 
-        # Build the per-round user prompt. Mirrors run_conformer's shape
+        # Build the per-round user prompt. Mirrors _run_conformer's shape
         # but the spec / criteria lines are replaced with one sentence
         # framing this as the post-integration whole-tree pass — there
         # is no per-subtask spec file to point at.
@@ -22952,13 +22952,13 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             break
 
         last_res = res
-        # validate_conformance_result enforces shape rules
+        # _validate_conformance_result enforces shape rules
         # (residuals-imply-rules-files-read, every fixed violation
         # cites a rule) and path-traversal safety for docs/tests
         # update entries. The worktree it resolves paths against is
         # the staging worktree here, mirroring how the per-subtask
         # call passes the subtask worktree.
-        err = validate_conformance_result(res, str(staging))
+        err = _validate_conformance_result(res, str(staging))
         if err:
             warnings.append(f"final conformer round {c_round}: "
                             f"malformed result: {err}")
@@ -22982,7 +22982,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                     f"final conformer round {c_round}: discarding "
                     f"{len(discarded)} uncommitted file(s) during "
                     f"rollback: {[line[3:] for line in discarded]}")
-            await rollback_conformer_commits(str(staging), before_sha)
+            await _rollback_conformer_commits(str(staging), before_sha)
             warnings.append(f"final conformer round {c_round}: "
                             f"protected-path violation reverted "
                             f"(touched {protected})")
@@ -22998,7 +22998,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # implementer's work*): same guard as the per-subtask phase,
         # scoped to the integrated staging tree. base=run_branch,
         # impl_head=staging HEAD captured before this pass.
-        clobbered = await clobbered_owned_files(
+        clobbered = await _clobbered_owned_files(
             str(staging), run_branch, staging_before_sha)
         if clobbered:
             clobbered_files = clobbered
@@ -23012,7 +23012,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                         f"final conformer round {c_round}: discarding "
                         f"{len(discarded)} uncommitted file(s) during "
                         f"clobber rollback: {[line[3:] for line in discarded]}")
-                await rollback_conformer_commits(
+                await _rollback_conformer_commits(
                     str(staging), staging_before_sha)
                 warnings.append(
                     f"final conformer round {c_round}: strict mode — "
@@ -23057,7 +23057,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # matching the strict final_blocked die. --skip-completeness-check demotes
     # this to advisory (a hallucinated defect on the integrated tree would
     # otherwise block finalize with no escape, re-attacking on every --resume).
-    final_defects = actionable_solution_defects(last_res)
+    final_defects = _actionable_solution_defects(last_res)
     if final_defects and st.data.get("skip_completeness_check"):
         warnings.append(
             f"completeness gate found {len(final_defects)} unhandled case(s) "
@@ -23093,7 +23093,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             "run blocked. Fix and --resume.")
 
 
-async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
+async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict:
     """Drive one subtask to a terminal state.
@@ -23134,7 +23134,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         clears the leftover worktree + branch so `new-worktree.sh`
         reaches its "fresh subtask" path on the next iteration. Without
         this reset, the retry hits `fatal: a branch ... already exists`
-        and the WorkerError escapes to `gather_or_cancel`, killing the
+        and the WorkerError escapes to `_gather_or_cancel`, killing the
         whole wave."""
         nonlocal retries, continuation, note
         res = {"subtask_id": sid, "status": "failed", "summary": reason}
@@ -23154,15 +23154,15 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
 
     while True:
         try:
-            res = await run_implementer(sid, leerie_dir, caps, st, models,
+            res = await _run_implementer(sid, leerie_dir, caps, st, models,
                                         efforts, continuation=continuation,
                                         note=note)
         except WorkerError as e:
             # Per-subtask infrastructure failure (e.g. `new-worktree.sh`
-            # could not create the worktree). `run_implementer`'s own
+            # could not create the worktree). `_run_implementer`'s own
             # `except WorkerError` guard wraps only `claude_p`, so a
-            # `run_script` failure escapes it. Left uncaught here it reaches
-            # `gather_or_cancel`, which cancels the wave and kills the whole
+            # `_run_script` failure escapes it. Left uncaught here it reaches
+            # `_gather_or_cancel`, which cancels the wave and kills the whole
             # run — discarding every sibling's committed work and skipping
             # finalize. That contradicts DESIGN §3 *Partial-wave
             # integration*, where the wave collects `failed`/`blocked` and
@@ -23176,10 +23176,10 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # cross-field invariant check — catches a worker that lied about
         # status. A self-contradictory result means the worker is malfunctioning
         # or dishonest: non-retryable by `_retryable_failure` (kind="broken"),
-        # except for the empty-handoff case which validate_result tags
+        # except for the empty-handoff case which _validate_result tags
         # "empty_handoff" — retryable because a fresh worker can plausibly
         # do better.
-        problem = validate_result(res)
+        problem = _validate_result(res)
         rescued_from_empty_handoff = False
         if problem:
             kind, message = problem
@@ -23195,8 +23195,8 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # the build got by luck (they returned before dying); made
             # deterministic here. See DESIGN §9.
             if kind == "empty_handoff" and \
-                    await branch_has_commits_ahead(
-                        worktree, compute_run_branch(st.run_id)):
+                    await _branch_has_commits_ahead(
+                        worktree, _compute_run_branch(st.run_id)):
                 # Prefer the named cause (e.g. a memory-OOM diagnostic from
                 # _invoke's no-envelope path, DESIGN §6 *Detecting memory
                 # OOM*) over the generic checkpoint message, same as the
@@ -23219,7 +23219,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # named cause when one is available: `_invoke`'s no-envelope
                 # path (DESIGN §6 *Detecting memory OOM*) names a cgroup
                 # memory-OOM in `res["summary"]` when it detects one, but
-                # `validate_result`'s `message` is the generic "checkpoint
+                # `_validate_result`'s `message` is the generic "checkpoint
                 # ... does not exist" text. Prefer the named cause so the
                 # operator sees "worker OOM-killed on <cmd> ..." instead of
                 # the cryptic checkpoint error once the retry cap is hit.
@@ -23248,7 +23248,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
             # Mechanical checks on the implementer's output.
-            run_branch = compute_run_branch(st.run_id)
+            run_branch = _compute_run_branch(st.run_id)
             diff_proc = await run_proc(
                 ["git", "diff", "--name-only", run_branch],
                 cwd=worktree)
@@ -23296,7 +23296,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # a 'complete' claim with no commits is a retryable mistake —
             # the worker may genuinely have work to commit and just forgot
             commit_err = await check_branch_has_commits(
-                sid, worktree, compute_run_branch(st.run_id))
+                sid, worktree, _compute_run_branch(st.run_id))
             if commit_err and not has_artifacts:
                 kind, message = commit_err
                 # A no-commits `complete` is normally a retryable mistake, but
@@ -23310,7 +23310,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # against), exhaust the cap, and kill the wave — a deterministic
                 # loop across --resume. The probe fails safe to None, so a
                 # genuine lazy no-op still falls through to the retry path.
-                drop = await probe_criteria_satisfied_on_head(
+                drop = await _probe_criteria_satisfied_on_head(
                     subtask, worktree, st, caps, models, efforts)
                 if drop is not None:
                     log(f"  {sid}: no commits, but success criteria are "
@@ -23436,10 +23436,10 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # --strict-conformer (which governs only the advisory
             # build/lint/test/residual axes handled by blocked_reason below).
             # A conformer crash/malformed result leaves conf_res None →
-            # actionable_solution_defects returns [] → fail-open (advisory).
+            # _actionable_solution_defects returns [] → fail-open (advisory).
             # --skip-completeness-check demotes the whole axis to advisory:
             # found defects surface as warnings but never re-drive or block.
-            solution_defects = actionable_solution_defects(conf_res)
+            solution_defects = _actionable_solution_defects(conf_res)
             if solution_defects and st.data.get("skip_completeness_check"):
                 msg = (f"completeness gate found {len(solution_defects)} "
                        "unhandled case(s) but --skip-completeness-check is set "
@@ -23500,7 +23500,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # if it no longer exists (e.g. cleanup ran early), the check
             # is skipped gracefully.
             wt_root = leerie_dir / "worktrees" / sid
-            cp_err = validate_checkpoint(res.get("checkpoint_path") or "",
+            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
                                          worktree_root=wt_root)
             if cp_err:
                 log(f"  bad checkpoint for {sid}: {cp_err}")
@@ -23521,12 +23521,12 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # DESIGN §11 mid-execution clarification: same continuation
             # mechanism as `incomplete-handoff` (worker wrote a
             # checkpoint, orchestrator re-spawns with CONTINUATION),
-            # plus a side trip through surface_clarification to capture
+            # plus a side trip through _surface_clarification to capture
             # the user's answer. Consumes from the same
             # subtask_continuations budget — there is no extra "ask the
             # user" allowance.
             wt_root = leerie_dir / "worktrees" / sid
-            cp_err = validate_checkpoint(res.get("checkpoint_path") or "",
+            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
                                          worktree_root=wt_root)
             if cp_err:
                 log(f"  bad checkpoint for {sid}: {cp_err}")
@@ -23544,7 +23544,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # exit with EXIT_NEEDS_ANSWERS. On interactive return, the
             # answer is already in st.data['answers'] so the re-spawned
             # worker reads it via _clarification_answers in its spec.
-            surface_clarification(sid, res["clarification_question"],
+            _surface_clarification(sid, res["clarification_question"],
                                   res.get("checkpoint_path") or "", st)
             # Rewrite this subtask's spec so the new answer is visible
             # to the next implementer — the spec was written once at
@@ -23577,7 +23577,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         return res
 
 
-async def rescue_integrator_work(staging: Path, sid: str,
+async def _rescue_integrator_work(staging: Path, sid: str,
                                  run_id: str) -> str | None:
     """Capture a crashed integrator's in-progress resolution before the merge
     is aborted. Returns the rescue ref name, or None if there was nothing to
@@ -23669,7 +23669,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       worktree clean, and the run terminates with its diagnosis. Its partial
       work is deliberately discarded — it said so itself.
     - **Crash** (every round raised, so there is no status and no diagnosis):
-      infrastructure, not judgment. `rescue_integrator_work` captures the
+      infrastructure, not judgment. `_rescue_integrator_work` captures the
       in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` *before*
       the abort — `git merge --abort` destroys it otherwise, and it is the
       most expensive artifact in the run to recreate. `blocked[sid]` is
@@ -23680,7 +23680,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
             continue
-        proc = await run_script("integrate.sh", sid, st.run_id)
+        proc = await _run_script("integrate.sh", sid, st.run_id)
         if proc.returncode == 0:
             integrated.append(sid)
             integrated_so_far.append(sid)
@@ -23700,7 +23700,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 f"{proc.stderr.strip() or proc.stdout.strip() or 'no message'}")
         # exit 1 (conflict): staging worktree is mid-merge — hand to an integrator
         log(f"  conflict integrating {sid}; spawning integrator")
-        sys_prompt = load_prompt("integrator")
+        sys_prompt = _load_prompt("integrator")
         up_parts: list[str] = [
             f"Resolve the in-progress merge conflict in this worktree.\n"
             f"LEERIE_DIR is {leerie_dir}.\n"
@@ -23747,7 +23747,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # committed nothing, which is exactly the case worth rescuing.
             for w in int_warnings:
                 log(f"  integrator-{sid}: {w}")
-            rescue_ref = await rescue_integrator_work(staging, sid, st.run_id)
+            rescue_ref = await _rescue_integrator_work(staging, sid, st.run_id)
             await run_proc(["git", "merge", "--abort"], cwd=str(staging))
             # Record the block before dying (local convention — see the
             # neighboring die() site above, which this path used to skip).
@@ -23777,7 +23777,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             if merge_err:
                 await run_proc(["git", "merge", "--abort"], cwd=str(staging))
                 die(f"integrator for {sid} returned 'resolved' but {merge_err}. "
-                    f"The merge was aborted; {compute_run_branch(st.run_id)} "
+                    f"The merge was aborted; {_compute_run_branch(st.run_id)} "
                     "is clean. Resolve and re-run with --resume.")
             commit_err = await check_integrator_commit(staging)
             if commit_err:
@@ -23795,7 +23795,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # mechanically fix a semantic finding from an independent judge
             # without a fresh conflict-resolution attempt, so re-driving would
             # reproduce the same merge.
-            sys_prompt_judge = load_prompt("integration_judge")
+            sys_prompt_judge = _load_prompt("integration_judge")
             repo_root = Path(os.getcwd())
 
             # Build context: the merged diff, both parent subtask intents, and
@@ -23913,7 +23913,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             die(f"integrator could not integrate {sid} "
                 f"({ires.get('status')}): {diagnosis}\n"
                 f"The in-progress merge was aborted; "
-                f"{compute_run_branch(st.run_id)} is intact at the last "
+                f"{_compute_run_branch(st.run_id)} is intact at the last "
                 f"good wave. Resolve the conflict between {sid} and "
                 f"the already-integrated subtasks manually, then re-run with "
                 f"--resume.")
@@ -23928,7 +23928,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     log("phase 4: creating run-branch worktree")
     st.data["current_phase"] = "phase 4-5: implementing"
     st.save()
-    proc = await run_script("setup-run.sh", st.run_id)
+    proc = await _run_script("setup-run.sh", st.run_id)
     if proc.returncode != 0:
         die(f"run setup failed: {proc.stderr.strip()}")
 
@@ -23947,9 +23947,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # skip_base_baseline (the full-suite-run cost).
     if not st.data.get("skip_base_baseline"):
         try:
-            await capture_conformance_baseline(leerie_dir, st, caps)
+            await _capture_conformance_baseline(leerie_dir, st, caps)
         except Exception as e:
-            # Defense-in-depth: capture_conformance_baseline is documented
+            # Defense-in-depth: _capture_conformance_baseline is documented
             # to never raise, but a bug in its glue must not block the run.
             log(f"phase 4: base-health baseline errored "
                 f"({type(e).__name__}: {e}); proceeding with no baseline")
@@ -23958,7 +23958,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
 
     async def settle_one(sid: str) -> tuple[str, dict]:
         async with sem:
-            r = await settle_subtask(sid, leerie_dir, caps, st, models, efforts)
+            r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
             log(f"  {sid}: {r.get('status')}")
             return sid, r
 
@@ -23993,7 +23993,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         if cleared:
             st.save()
 
-        pairs = await gather_or_cancel(*(settle_one(sid) for sid in remaining))
+        pairs = await _gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = dict(pairs)
 
         blocked = [s for s, r in results.items()
@@ -24026,7 +24026,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # quality is the implementer's §8 confidence gate — there is no
         # LLM wave-level re-validation (see DESIGN §8, §9).
         staging_path = leerie_dir / "worktrees" / "staging"
-        marker_err = await scan_conflict_markers(staging_path)
+        marker_err = await _scan_conflict_markers(staging_path)
         if marker_err:
             die(f"wave {wi + 1}: {marker_err}\n"
                 f"Resolve manually in {staging_path}, commit, "
@@ -24109,7 +24109,7 @@ _PR_TEMPLATE_MULTI_DIRS = (
 )
 
 
-def find_pr_template(repo_root: Path,
+def _find_pr_template(repo_root: Path,
                      override: str | None = None) -> tuple[Path, str] | None:
     """Locate the PR template the worker should fill out, or None when
     the repo has no template.
@@ -24251,7 +24251,7 @@ def _base_health_payload(st: "State") -> dict | None:
     axes = baseline.get("axes") or {}
     ran = {a: (axes.get(a) or {}) for a in ("build", "lint", "tests")}
     # An axis is RED only if it ran, was measurable, and failed — same
-    # rule as capture_conformance_baseline's red_axes and
+    # rule as _capture_conformance_baseline's red_axes and
     # _format_baseline_section. An unmeasurable axis (runner missing)
     # carries no verdict and must not colour base_status red.
     red = [a for a in ("build", "lint", "tests")
@@ -24417,7 +24417,7 @@ async def _compose_pr_via_llm(st: "State",
     """
     try:
         # 1. Locate the template (may be None).
-        tpl = find_pr_template(repo_root, pr_template_override)
+        tpl = _find_pr_template(repo_root, pr_template_override)
         tpl_content = ""
         tpl_rel: str | None = None
         tpl_truncated = False
@@ -24438,7 +24438,7 @@ async def _compose_pr_via_llm(st: "State",
 
         # 2. Collect git context. Commits are the spine; diff is sampled.
         working_branch = st.data.get("working_branch") or "HEAD"
-        run_branch = compute_run_branch(st.run_id)
+        run_branch = _compute_run_branch(st.run_id)
         rev_range = f"{working_branch}..{run_branch}"
 
         async def _git(args: list[str]) -> str:
@@ -24472,7 +24472,7 @@ async def _compose_pr_via_llm(st: "State",
             full_diff, PR_WRITER_DIFF_SAMPLE_MAX_LINES)
 
         # 3. Pull planner-written subtask titles from plan.json. The
-        # planner writes its full plan there (write_plan above), and the
+        # planner writes its full plan there (_write_plan above), and the
         # titles are the cleanest human-readable summary of each subtask's
         # intent. Empty list if plan.json is missing or malformed.
         subtask_titles: list[str] = []
@@ -24525,7 +24525,7 @@ async def _compose_pr_via_llm(st: "State",
         if preconditions:
             payload["external_preconditions"] = preconditions
 
-        sys_prompt = load_prompt("pr_writer")
+        sys_prompt = _load_prompt("pr_writer")
         model = models.get("pr_writer", MODEL_DEFAULT_PER_WORKER.get(
             "pr_writer", MODEL_DEFAULT))
         effort = efforts.get("pr_writer")
@@ -24634,7 +24634,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if isinstance(waves, list) and completed < len(waves):
         die(f"refusing to finalize: only {completed} of {len(waves)} waves "
             f"complete. Resume to finish: leerie --resume {st.run_id}")
-    proc = await run_script("finalize.sh", st.run_id)
+    proc = await _run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
     # Stamp the finalize phase ONLY after finalize.sh confirms the run
@@ -24651,7 +24651,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # `--resume` re-enters finalize to re-run finalize.sh's non-empty check.
     st.data["current_phase"] = "phase 6: finalize"
     st.save()
-    await run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
+    await _run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
     # Post-cleanup verification: the run branch must survive cleanup.
     # finalize.sh verified it existed moments ago; if it's gone after
     # cleanup.sh, something deleted it (a concurrent process, a git
@@ -24721,17 +24721,17 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
 
     if not will_push:
         log(f"skipped push and PR (--no-push); the run branch "
-            f"{compute_run_branch(st.run_id)} is local-only; "
+            f"{_compute_run_branch(st.run_id)} is local-only; "
             "your working branch is unchanged")
     else:
-        log(f"work is on {compute_run_branch(st.run_id)}; the host "
+        log(f"work is on {_compute_run_branch(st.run_id)}; the host "
             "launcher will push and open the PR after this container exits")
 
     pr_url = None  # the launcher writes pr_url to run.json after gh pr create
     pr_suffix = ""
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations.{pr_suffix} Work is on "
-        f"{compute_run_branch(st.run_id)}; working branch unchanged.")
+        f"{_compute_run_branch(st.run_id)}; working branch unchanged.")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
             f"${tel.get('cost_usd', 0.0):,.2f}, "
@@ -24743,7 +24743,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
 # =========================================================================
 # entry point
 # =========================================================================
-async def orchestrate(args, caps: dict, leerie_dir: Path, st: State,
+async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
                       models: dict[str, str],
                       efforts: dict[str, str | None]) -> None:
@@ -24777,15 +24777,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
                       models: dict[str, str],
                       efforts: dict[str, str | None]) -> None:
-    """The phase sequence of one run. Split out from `orchestrate()`
+    """The phase sequence of one run. Split out from `_orchestrate()`
     so the latter can wrap it with the memory-sampler try/finally
     without burying the phase calls behind extra indentation. Source-
-    text coupling tests for the orchestrate call-sites parse this
+    text coupling tests for the _orchestrate call-sites parse this
     function's body — keep all phase calls here."""
     if args.resume:
         if not st.load():
             die(f"nothing to resume — no state.json at {st.path}")
-        validate_resume_state(st.data)
+        _validate_resume_state(st.data)
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
         log(f"per-worker logs: {st.run_dir / 'logs'}/")
@@ -24821,7 +24821,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # no longer means "cannot resume" — the shared pipeline below
         # (used by both a fresh run and a resumed one) re-enters at the
         # first phase whose `plans_after_*` checkpoint (or `plan_snapshot`
-        # for the post-schedule/pre-write_plan gap) is absent, reusing the
+        # for the post-_schedule/pre-_write_plan gap) is absent, reusing the
         # last-persisted `plans` as that phase's input. A state.json with
         # NONE of those keys and no `categories` either (i.e. the run
         # never got past its very first st.save(), before phase_classify
@@ -24860,7 +24860,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # loaded and this resume is past the completed/no-work short-
         # circuits (i.e. it WILL spawn workers). Merges into the resumed
         # state rather than clobbering it.
-        enforce_and_record_cgroup_containment(
+        _enforce_and_record_cgroup_containment(
             st, args.dangerously_allow_uncapped)
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
@@ -24868,7 +24868,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # file, re-run with --resume --answers <file>. Without this
         # call the answers file was silently dropped — the re-spawned
         # worker would re-ask the same question forever. See P5-1.
-        absorb_supplied_answers(args, st, leerie_dir)
+        _absorb_supplied_answers(args, st, leerie_dir)
         # Re-export the mise override env var if the original run
         # synthesized one. phase_provision (below) is skipped when
         # provision.recipe is already persisted, but downstream
@@ -24907,7 +24907,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # worker (phase_classify below). Must come after the
         # `st.data = {...}` seed above, which would otherwise discard the
         # recorded key.
-        enforce_and_record_cgroup_containment(
+        _enforce_and_record_cgroup_containment(
             st, args.dangerously_allow_uncapped)
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
@@ -24916,7 +24916,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # rotation*) — a no-op when CLAUDE_CODE_OAUTH_TOKENS is unset.
         # Fresh-run only: on --resume, active_oauth_token (if any) is
         # already persisted in st.data from the original run.
-        await select_active_oauth_token(st, caps)
+        await _select_active_oauth_token(st, caps)
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
 
@@ -24966,7 +24966,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 _write_run_json(
                     st.run_dir,
                     run_id=st.run_id,
-                    branch=compute_run_branch(st.run_id),
+                    branch=_compute_run_branch(st.run_id),
                     working_branch=working_branch,
                     pr_base_branch=pr_base_branch,
                     started_at=st.data["started_at"],
@@ -25059,7 +25059,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.save()
             # Cleared-but-empty terminal state (DESIGN §8): every planner
             # cleared its gate and confirmed the task is already satisfied
-            # on HEAD. Nothing to schedule, nothing to execute, no run
+            # on HEAD. Nothing to _schedule, nothing to execute, no run
             # branch to push. _finish_no_work_run records the outcome and
             # we return — skipping phase_execute (which would call
             # setup-run.sh) and phase_finalize (which would try to push a
@@ -25071,7 +25071,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # already passed (or would have short-circuited via
             # no_work_required/finished_at above) this check the first
             # time it ran.
-            no_work_map = detect_no_work(plans)
+            no_work_map = _detect_no_work(plans)
             if no_work_map is not None:
                 _finish_no_work_run(st, no_work_map)
                 return
@@ -25111,7 +25111,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # existing checked-loop feedback path, die()ing on
             # exhaustion. Runs after the overlap-judge (so re-planning
             # doesn't waste that judge's spend if it doesn't need to
-            # fire) and before schedule() (so a re-plan never rebuilds an
+            # fire) and before _schedule() (so a re-plan never rebuilds an
             # already-scheduled DAG).
             plans = await phase_adherence_gate(
                 plans, task, st, caps, models, efforts)
@@ -25128,7 +25128,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # verification of the MERGED plan's coverage of the task
             # (DESIGN §8). Runs after the adherence gate (so re-planning
             # doesn't waste that gate's spend if it doesn't need to fire)
-            # and before the soft-drop filters/schedule() (so a re-plan
+            # and before the soft-drop filters/_schedule() (so a re-plan
             # never rebuilds an already-scheduled DAG). Replaces the
             # planner's self-graded `task_understanding` confidence axis.
             plans = await phase_planning_coverage_gate(
@@ -25146,48 +25146,48 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # the reconciler handles capability-tag drift but not
             # file-claim conflicts (yet); empirically these correlate
             # strongly with integrator design-conflict crashes downstream.
-            warn_cross_planner_file_overlap(plans)
-            warn_layer_gaps(plans)
+            _warn_cross_planner_file_overlap(plans)
+            _warn_layer_gaps(plans)
             # Flag a subtask whose entire file surface is owned by an
             # ordered predecessor — at high risk of being a mid-run no-op
             # if the predecessor commits the shared deliverable (DESIGN
             # §5, §8 *The mid-run sibling case*). Warning only; the
-            # mid-run satisfied rescue in settle_subtask is the actual
+            # mid-run satisfied rescue in _settle_subtask is the actual
             # safety net.
-            warn_provider_subset_subtasks(plans)
+            _warn_provider_subset_subtasks(plans)
             # Flag a test subtask that declares NO cross-subtask edge at all
             # while the plan has producing subtasks. Advisory, and narrow: the
             # commoner wiring-gate death is a subtask that declares several
             # edges and is missing a specific few, which this both-channels-
             # empty condition cannot see. The wiring gate's constrained repair
             # is what closes that class (DESIGN §5).
-            warn_test_subtask_missing_producer_edge(plans)
+            _warn_test_subtask_missing_producer_edge(plans)
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
             # drop so the surviving subtasks proceed; the drop is
             # recorded in state.data["dropped_subtasks"] for audit. Must
-            # run BEFORE schedule() so the resulting waves do not
+            # run BEFORE _schedule() so the resulting waves do not
             # reference dropped sids.
-            filter_offtree_subtasks(plans, Path(os.getcwd()),
+            _filter_offtree_subtasks(plans, Path(os.getcwd()),
                                     st.data.get("inspect_dirs") or [], st)
             # Already-satisfied subtask elimination (DESIGN §8).
             # Per-subtask probe of the base tree; drops subtasks already
             # met (e.g. a sibling run merged the deliverable to the
             # base). Soft drop, recorded in state.data["dropped_subtasks"].
             # If it empties every ready plan, route to the same
-            # cleared-but-empty terminal state as detect_no_work — using
+            # cleared-but-empty terminal state as _detect_no_work — using
             # the drop-derived no_work_map, not the planner's original
-            # confidence.basis. Must run BEFORE schedule(). The
+            # confidence.basis. Must run BEFORE _schedule(). The
             # per-subtask satisfied_probe_cache (DESIGN §6, keyed by base
             # commit sha) already makes a resumed sweep skip every
             # subtask decided before the pause.
-            satisfied_no_work = await filter_satisfied_subtasks(
+            satisfied_no_work = await _filter_satisfied_subtasks(
                 plans, Path(os.getcwd()), st, caps, models, efforts)
             if satisfied_no_work is not None:
                 _finish_no_work_run(st, satisfied_no_work)
                 return
             # Resumable-planning checkpoint: the filtered `plans`
-            # immediately before schedule() — the last plans_after_*
+            # immediately before _schedule() — the last plans_after_*
             # checkpoint before plan_snapshot/waves take over as the
             # resume cursor (DESIGN §6).
             st.data["plans_after_filters"] = copy.deepcopy(plans)
@@ -25198,27 +25198,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if "plan_snapshot" not in st.data:
             st.data["current_phase"] = "phase 3: scheduling"
             st.save()
-            subtasks, waves = schedule(plans)
+            subtasks, waves = _schedule(plans)
             # Diagnostic snapshot BEFORE the two gates that can die()
             # below. Both are terminal, and the planner/fit_judge/splitter
             # spend that produced this plan is the most expensive thing in
             # the run — without this, a die() here leaves state.json with
             # no plan at all and the whole spend is unrecoverable.
-            # Deliberately not write_plan(): that also emits per-subtask
+            # Deliberately not _write_plan(): that also emits per-subtask
             # spec files and seeds the execution scaffolding, which would
             # make a failed run look half-executable (and the budget
             # preflight below exists precisely to avoid writing those for
             # a run that cannot win). `--resume` reads this back (DESIGN
             # §6 "Budget-check resume") when the run stopped between here
-            # and write_plan().
+            # and _write_plan().
             st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
             st.save()
         else:
             # Budget-check resume (DESIGN §6 "Budget-check resume"): a
-            # prior attempt reached schedule() and persisted plan_snapshot,
+            # prior attempt reached _schedule() and persisted plan_snapshot,
             # then died at check_budget_feasibility (or was interrupted
-            # before write_plan ran). Rehydrate subtasks/waves rather than
-            # re-deriving them from plans — schedule() is a pure function
+            # before _write_plan ran). Rehydrate subtasks/waves rather than
+            # re-deriving them from plans — _schedule() is a pure function
             # of the dep graph plus lexicographic ids (proven
             # deterministic, tests/test_schedule_determinism.py), so
             # re-running it here would be redundant, not incorrect, but
@@ -25235,7 +25235,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # never encoded) and die()s on a concrete defect (detect-and-die,
         # returns `plans` unchanged; audit persisted to
         # st.data["wiring_gate"]). Runs HERE — after both soft-drop filters
-        # (earlier plans_after_filters block) and schedule() — so it attacks
+        # (earlier plans_after_filters block) and _schedule() — so it attacks
         # the truly-merged POST-DROP plan with a fully-populated
         # `dropped_subtasks` audit (its broken_by_drop / broken_by_merge
         # reasoning depends on that), matching its docstring + DESIGN §5.
@@ -25257,19 +25257,19 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 plans, task, st, caps, models, efforts)
             # A repair adds `requires` edges, which changes the wave
             # partition — re-derive so the budget preflight,
-            # check_plan_wiring, validate_plan and write_plan below all see
+            # check_plan_wiring, _validate_plan and _write_plan below all see
             # the repaired graph rather than the one the judge rejected,
             # and rewrite plan_snapshot so a later resume rehydrates the
-            # repaired schedule (DESIGN §5).
+            # repaired _schedule (DESIGN §5).
             if (st.data.get("wiring_gate") or {}).get("repairs"):
-                subtasks, waves = schedule(plans)
+                subtasks, waves = _schedule(plans)
                 st.data["plan_snapshot"] = {
                     "subtasks": subtasks, "waves": waves}
                 st.save()
 
         # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
-        # fail fast at the cheapest moment*). Runs after schedule() so we
-        # have the real wave count, before validate_plan / write_plan so
+        # fail fast at the cheapest moment*). Runs after _schedule() so we
+        # have the real wave count, before _validate_plan / _write_plan so
         # no plan.json or subtask spec files get written for a run that
         # is mathematically unwinnable. die()s with EXIT_BUDGET_INFEASIBLE
         # and a recommended --max-workers; opt-out via
@@ -25281,11 +25281,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         check_budget_feasibility(st, caps, subtasks, waves)
         # Deterministic wiring re-check on the fully-merged POST-DROP plan
         # (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8). Runs
-        # after both soft-drop filters and schedule() so ids/tags are final,
-        # and BEFORE validate_plan so a dangle left by a merge/rename/drop
+        # after both soft-drop filters and _schedule() so ids/tags are final,
+        # and BEFORE _validate_plan so a dangle left by a merge/rename/drop
         # rewrite dies here with a wiring-specific, actionable message rather
-        # than at validate_plan's generic die — both throw the plan spend
-        # away, but this one names the failure. validate_plan stays the
+        # than at _validate_plan's generic die — both throw the plan spend
+        # away, but this one names the failure. _validate_plan stays the
         # backstop (it re-checks the same invariants below).
         wiring_issues = check_plan_wiring(subtasks)
         if wiring_issues:
@@ -25298,8 +25298,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "(DESIGN §5 *Id-vanishing operations*):\n" +
                 "\n".join(f"  • {i}" for i in wiring_issues)
             )
-        validate_plan(subtasks)
-        write_plan(leerie_dir, task, st, subtasks, waves)
+        _validate_plan(subtasks)
+        _write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
     # Final-tree conformance pass on the integrated staging worktree
@@ -25307,9 +25307,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # Advisory — never raises; failure modes surface in
     # st.data["conformance"]["_final"].
     try:
-        await run_final_conformance(leerie_dir, st, caps, models, efforts)
+        await _run_final_conformance(leerie_dir, st, caps, models, efforts)
     except Exception as e:
-        # Defense-in-depth: run_final_conformance is documented to
+        # Defense-in-depth: _run_final_conformance is documented to
         # never raise, but a bug in its glue (e.g. a future state
         # mutation that throws) must not block phase_finalize. Record
         # and move on.
@@ -25383,7 +25383,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--list", action="store_true", dest="list_runs",
                     help="enumerate in-flight and completed runs in this "
                          "repository (run id, started, status, branch). "
-                         "Exits without running orchestrate. Default: off")
+                         "Exits without running _orchestrate. Default: off")
     ap.add_argument("--status", metavar="STATE", dest="status_filter",
                     choices=RUN_STATUSES,
                     help=f"with --list, restrict the table to runs whose "
@@ -25395,7 +25395,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "token/cost/latency/failure breakdown plus memory "
                          "peak. Pass a run id, or omit it to auto-pick when "
                          "exactly one run exists. Exits without running "
-                         "orchestrate. See `--list` to enumerate.")
+                         "_orchestrate. See `--list` to enumerate.")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--clarify", action="store_true",
@@ -25550,12 +25550,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "§8 Already-satisfied subtask elimination). When set, "
                          "every subtask proceeds to scheduling; the mechanical "
                          "no-commits backstop still catches already-satisfied "
-                         "work post-execution (settle_subtask re-probes the "
+                         "work post-execution (_settle_subtask re-probes the "
                          "criteria against HEAD and settles complete if met). "
                          f"Also {SKIP_SATISFIED_CHECK_ENV} env or "
                          "skip_satisfied_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-budget-check", action="store_true",
-                    help="skip the post-schedule budget-feasibility preflight "
+                    help="skip the post-_schedule budget-feasibility preflight "
                          "(DESIGN §13 Budget feasibility — fail fast at the "
                          "cheapest moment). The runtime backstop in "
                          "State.bump_workers() still fires if the run exceeds "
@@ -25584,7 +25584,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "skip_base_baseline in leerie.toml. Default: off.")
     ap.add_argument("--skip-repo-map", action="store_true",
                     help="skip the P6 repo-map structural context (DESIGN §5½ (P6)): "
-                         "suppresses build_repo_map() and the ranked subgraph "
+                         "suppresses _build_repo_map() and the ranked subgraph "
                          "injection into planner/splitter context. The planner "
                          "degrades gracefully to the prior grep/glob-only path. "
                          "Use on repos where tree-sitter cannot parse the "
@@ -25733,7 +25733,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # from outside a git repo.
     if args.list_runs:
         leerie_root = resolve_leerie_root(Path(os.getcwd()))
-        list_runs(
+        _list_runs(
             leerie_root,
             status_filter=args.status_filter,
             runtime_filter=args.runtime,
@@ -25741,11 +25741,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         return
 
     # --report is a read-only telemetry verb; like --list it exits without
-    # running orchestrate. `const=""` (nargs="?") means the flag was passed
+    # running _orchestrate. `const=""` (nargs="?") means the flag was passed
     # with no inline id → resolve_run_id auto-picks the sole run.
     if getattr(args, "report", None) is not None:
         leerie_root = resolve_leerie_root(Path(os.getcwd()))
-        report_run(leerie_root, args.report or args.run_id)
+        _report_run(leerie_root, args.report or args.run_id)
         return
 
     if not shutil.which("claude"):
@@ -25778,6 +25778,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             cwd, getattr(args, "implementer_confidence_retries", None))
     caps["planner_samples"] = resolve_planner_samples(
         cwd, getattr(args, "planner_samples", None))
+    # This line was missing. `_resolve_token_probe_cache_sec` existed and was
+    # tested, but nothing ever called it, so `caps["token_probe_cache_sec"]`
+    # only ever held `DEFAULT_CAPS`' 180 — meaning the documented
+    # `LEERIE_TOKEN_PROBE_CACHE_SEC` env var and the `token_probe_cache_sec`
+    # leerie.toml key silently did nothing (IMPLEMENTATION.md §6 describes
+    # both as working). Surfaced by `test_no_dead_functions.py` once the
+    # helper was renamed private and thus came under that guard's scope.
+    caps["token_probe_cache_sec"] = _resolve_token_probe_cache_sec(
+        cwd, getattr(args, "token_probe_cache_sec", None))
     # Resolve per-worker cgroup memory cap. Auto-derives from
     # /proc/meminfo when unset; resolver die()s on a bad size string.
     # Reads `caps["max_parallel"]` already resolved above so the auto-
@@ -25797,9 +25806,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q
     # shortcuts (anchored to `normal`); else env / TOML / default.
-    # See verbosity_from_shortcuts() for the shortcut-mapping rationale.
+    # See _verbosity_from_shortcuts() for the shortcut-mapping rationale.
     verbosity = (args.verbosity
-                 or verbosity_from_shortcuts(args.verbose, args.quiet)
+                 or _verbosity_from_shortcuts(args.verbose, args.quiet)
                  or resolve_verbosity(Path(os.getcwd()), None))
 
     # The on-disk layout is per-run: every run gets its own subdirectory
@@ -25865,7 +25874,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         log("efforts: " + ", ".join(_e_pairs))
 
     # Resolve --no-push: CLI flag → LEERIE_NO_PUSH env → no_push in
-    # leerie.toml → False. Re-attach to args so orchestrate() /
+    # leerie.toml → False. Re-attach to args so _orchestrate() /
     # preflight() / phase_finalize() see the resolved value uniformly via
     # `args.no_push` regardless of where the choice came from.
     args.no_push = resolve_no_push(repo_root, args.no_push)
@@ -25881,13 +25890,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     )
 
     # Resolve --clarify with the same shape as --no-push (DESIGN §11).
-    # Re-attach to args so orchestrate() folds it into state.json under
+    # Re-attach to args so _orchestrate() folds it into state.json under
     # the canonical "clarify" key.
     args.clarify = resolve_clarify(repo_root, args.clarify)
 
     # Resolve --dangerously-skip-permissions (DESIGN §12 escape hatch).
     # Same precedence shape as --no-push / --clarify. Re-attach to args
-    # so orchestrate() folds it into state.json under the canonical
+    # so _orchestrate() folds it into state.json under the canonical
     # "dangerously_skip_permissions" key; claude_p reads it from there
     # on every invocation instead of threading another parameter.
     args.dangerously_skip_permissions = resolve_dangerously_skip_permissions(
@@ -25899,7 +25908,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     # Resolve --skip-overlap-judge (DESIGN §5 *Cross-domain surface
     # overlap*). Same precedence shape as --clarify /
-    # --dangerously-skip-permissions. Re-attach to args so orchestrate()
+    # --dangerously-skip-permissions. Re-attach to args so _orchestrate()
     # folds it into state.json under the canonical "skip_overlap_judge"
     # key; phase_overlap_judge reads it from there on entry.
     args.skip_overlap_judge = resolve_skip_overlap_judge(
@@ -25907,29 +25916,29 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     # Resolve --skip-adherence-check (instruction-adherence gate). Same
     # precedence shape as the other skip flags. Re-attach to args so
-    # orchestrate() folds it into state.json under the canonical
+    # _orchestrate() folds it into state.json under the canonical
     # "skip_adherence_check" key; the planner check loop reads it from
     # there on entry.
     args.skip_adherence_check = resolve_skip_adherence_check(
         repo_root, args.skip_adherence_check)
 
     # Resolve --skip-completeness-check (the conformer's gating
-    # solution_defects axis, DESIGN §9). Same precedence shape; orchestrate()
-    # folds it into state.json under "skip_completeness_check"; settle_subtask
-    # and run_final_conformance read it from there.
+    # solution_defects axis, DESIGN §9). Same precedence shape; _orchestrate()
+    # folds it into state.json under "skip_completeness_check"; _settle_subtask
+    # and _run_final_conformance read it from there.
     args.skip_completeness_check = resolve_skip_completeness_check(
         repo_root, getattr(args, "skip_completeness_check", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.
-    # orchestrate() folds it into state.json under "skip_satisfied_check";
-    # filter_satisfied_subtasks reads it from there on entry.
+    # _orchestrate() folds it into state.json under "skip_satisfied_check";
+    # _filter_satisfied_subtasks reads it from there on entry.
     args.skip_satisfied_check = resolve_skip_satisfied_check(
         repo_root, args.skip_satisfied_check)
 
     # Resolve --skip-budget-check (DESIGN §13 *Budget feasibility — fail
     # fast at the cheapest moment*). Same precedence shape as the other
-    # skip flags. Re-attach to args so orchestrate() folds it into
+    # skip flags. Re-attach to args so _orchestrate() folds it into
     # state.json under the canonical "skip_budget_check" key;
     # check_budget_feasibility() reads it from there.
     args.skip_budget_check = resolve_skip_budget_check(
@@ -25963,7 +25972,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
     # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
-    # → []. Re-attached to args so orchestrate() can fold it into state.
+    # → []. Re-attached to args so _orchestrate() can fold it into state.
     args.inspect_dirs = resolve_inspect_dirs(
         repo_root, getattr(args, "inspect_dir", None))
 
@@ -25975,7 +25984,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         repo_root, getattr(args, "heal_success_threshold", None))
 
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
-    # orchestrate() flow — just pick an existing run and run the skill.
+    # _orchestrate() flow — just pick an existing run and run the skill.
     if args.phase:
         # `--phase judge|heal` spawns claude -p workers (judge /
         # patch_generator) but is deliberately NOT gated by the cgroup
@@ -26073,7 +26082,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # containment*) runs inside `_run_phases`, at the two points that are
     # guaranteed to spawn workers (after the resume short-circuits for
     # already-completed / no-work runs, which spawn none). Gating here in
-    # `main()` — before `orchestrate()` — would die() spuriously on those
+    # `main()` — before `_orchestrate()` — would die() spuriously on those
     # zero-worker resume paths on a containment-incapable host.
 
     # Signal handlers (DESIGN §6 / DESIGN §14): SIGTERM and SIGHUP raise
@@ -26088,7 +26097,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     exit_code = 0
     exit_message: str | None = None
     try:
-        asyncio.run(orchestrate(args, caps, st.run_dir, st,
+        asyncio.run(_orchestrate(args, caps, st.run_dir, st,
                                 sot_pref, verbosity, models, efforts))
     except WorkerError as e:
         abnormal = True
@@ -26297,7 +26306,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 pass
         raise
     except BaseException as e:
-        # Anything else (genuinely unhandled exception in orchestrate,
+        # Anything else (genuinely unhandled exception in _orchestrate,
         # asyncio cancellation chain, etc.). Save state, mark abnormal
         # so the finally block runs cleanup, then re-raise so the user
         # sees the traceback.

@@ -116,13 +116,13 @@ class TestCheckpointFollowsItsPhaseCall:
 
     def test_filters_checkpoint_follows_both_filter_calls(self, leerie):
         src = _phases_src(leerie)
-        offtree = src.find("filter_offtree_subtasks(plans, Path(os.getcwd()),")
+        offtree = src.find("_filter_offtree_subtasks(plans, Path(os.getcwd()),")
         satisfied = src.find(
-            "satisfied_no_work = await filter_satisfied_subtasks(")
+            "satisfied_no_work = await _filter_satisfied_subtasks(")
         key = src.find('st.data["plans_after_filters"]')
-        assert offtree != -1, "_run_phases must call filter_offtree_subtasks"
+        assert offtree != -1, "_run_phases must call _filter_offtree_subtasks"
         assert satisfied != -1, (
-            "_run_phases must call filter_satisfied_subtasks")
+            "_run_phases must call _filter_satisfied_subtasks")
         assert key != -1, 'missing st.data["plans_after_filters"] assignment'
         assert offtree < key
         assert satisfied < key

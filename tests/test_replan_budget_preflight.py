@@ -1,6 +1,6 @@
 """`check_replan_affordable` — budget preflight before a re-plan (DESIGN §13).
 
-`check_budget_feasibility` runs once, after `schedule()`. But a re-plan is the
+`check_budget_feasibility` runs once, after `_schedule()`. But a re-plan is the
 single largest budget event in a run and was authorised with no budget check
 at all — and it is far more expensive than "re-running the planners", because
 `phase_plan` also re-runs the entire P1 decomposition behind it. Measured on
@@ -10,7 +10,7 @@ of budget exhaustion mid-decomposition, having written no code.
 
 **Why these tests pass the plans in explicitly.** The first version of this
 function sized the re-plan from `st.data["plan_snapshot"]`, which `_run_phases`
-does not write until *after* `schedule()` — while both re-planning gates run
+does not write until *after* `_schedule()` — while both re-planning gates run
 *before* it. The check was therefore inert at both call sites: replaying
 `d8a764f3`'s real state (160 of 200 spent, 3 domains, no snapshot) produced no
 die at all. Its original tests passed only because they seeded a

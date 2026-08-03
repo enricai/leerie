@@ -69,7 +69,7 @@ def test_cleanup_branch_delete_scopes_to_run_id():
     """When --branches is passed, only leerie/runs/<run-id> and
     leerie/subtasks/<run-id>/* get deleted — NOT every leerie/* branch.
     The two prefixes are disjoint so neither is an ancestor ref of the
-    other (see compute_run_branch docstring)."""
+    other (see _compute_run_branch docstring)."""
     src = _src()
     # The for-each-ref patterns restrict to the run_id's namespace.
     assert 'refs/heads/leerie/runs/${run_id}' in src

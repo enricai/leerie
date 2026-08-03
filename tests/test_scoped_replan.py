@@ -4,7 +4,7 @@ Two changes tested together because the second depends on the first.
 
 **`_replan_domain_closure`.** A re-plan replaces a domain's subtasks with fresh
 ones, so every id it used vanishes and any other domain holding an edge into it
-dangles. `validate_plan` catches that — as a `die()`, which is the outcome
+dangles. `_validate_plan` catches that — as a `die()`, which is the outcome
 scoping exists to avoid. So the scope is the targets plus the transitive
 closure of domains depending on them, over both the id (`depends_on`) and tag
 (`requires`/`provides`) channels.
