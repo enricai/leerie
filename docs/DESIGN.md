@@ -574,7 +574,7 @@ The re-plan is **scoped**, and this gate is the only one where that is
 currently possible: a collision names `a_sid`/`b_sid`, so the implicated
 domains are mechanically derivable, whereas `coverage_gaps` and the adherence
 judge's `violations` carry no subtask reference at all. Scope is the implicated
-domains plus `replan_domain_closure` — the transitive set of domains depending
+domains plus `_replan_domain_closure` — the transitive set of domains depending
 on them across both the id and tag channels — so no surviving edge can dangle.
 Measured over 85 (domain, plan) re-plan simulations on real corpus plans:
 closure-scoped schedules and validates 85/85, naive single-domain 79/85.
@@ -5413,7 +5413,7 @@ planning pass — and the run then died of budget exhaustion having written no
 code.
 
 leerie already holds the prescribed commands as structured classifier output,
-so `repair_prescribed_commands` synthesises a subtask that runs them, at zero
+so `_repair_prescribed_commands` synthesises a subtask that runs them, at zero
 worker cost, before the floor is evaluated. A repairable gap therefore never
 reaches the re-plan path. This is the wiring gate's *detect → repair what is
 unambiguous → re-drive only what is not* contract applied to the gate whose

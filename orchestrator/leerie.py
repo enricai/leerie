@@ -15716,7 +15716,7 @@ async def phase_artifact_registry(
     return artifacts
 
 
-def replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
+def _replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
     """Domains that must be re-planned together with `targets`.
 
     A re-plan replaces a domain's subtasks with fresh ones, so every id it
@@ -15804,7 +15804,7 @@ async def phase_plan(task: str, st: State, caps: dict,
         # validate_plan die) rather than silently.
         #
         # Matched on the id PREFIX, not the category name, because that is
-        # what `replan_domain_closure` returns and what subtask ids carry.
+        # what `_replan_domain_closure` returns and what subtask ids carry.
         cats = [c for c in cats if CATEGORY_ABBREV.get(c, c) in domains]
         if not cats:
             die("scoped re-plan selected no categories — the requested "
@@ -19681,7 +19681,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # remedy was a ~125-spawn re-plan. Attaching the commands leerie
         # already holds costs zero workers, so a repairable gap never reaches
         # the re-plan path at all.
-        repaired = repair_prescribed_commands(
+        repaired = _repair_prescribed_commands(
             cur_plans[0], prescribed_procedure)
         if repaired:
             log(f"  adherence-gate: synthesised {repaired} to run the task's "
@@ -20419,13 +20419,23 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             for sid in (c.get("a_sid", ""), c.get("b_sid", ""))
             if isinstance(sid, str) and "-" in sid
         }
-        scope = replan_domain_closure(plans, implicated)
+        scope = _replan_domain_closure(plans, implicated)
         log(f"phase 2¾: {len(unresolvable)} unresolvable collision(s) — "
             f"re-planning {len(scope)} domain(s) ({', '.join(sorted(scope))}) "
             "with the contradiction as feedback, instead of dying")
+        # Preflight BEFORE recording the attempt. The flag means "a re-plan
+        # was actually attempted", not "we reached the point of considering
+        # one" — and `check_replan_affordable` can `die()`. Setting the flag
+        # first persisted it to disk while the `plans_after_overlap_judge`
+        # checkpoint was never written, so `./leerie resume --max-workers N`
+        # (the remedy this very die() recommends) re-entered the gate, saw the
+        # flag, and died immediately without ever attempting the re-plan the
+        # raised budget now afforded — with a message claiming re-planning had
+        # failed to resolve the contradiction when no re-plan had run.
+        # Reproduced by execution before this fix.
+        check_replan_affordable(st, caps, "overlap judge", plans)
         st.data["overlap_replan_done"] = True
         st.save()
-        check_replan_affordable(st, caps, "overlap judge", plans)
         replan_task = (
             f"{task}\n\n"
             "IMPORTANT — two planners produced structurally incompatible "
@@ -20793,7 +20803,7 @@ def check_budget_feasibility(st: State, caps: dict,
         )
 
 
-def repair_prescribed_commands(plans: list[dict],
+def _repair_prescribed_commands(plans: list[dict],
                                prescribed: dict) -> str | None:
     """Attach the task's prescribed commands to the plan mechanically.
 
