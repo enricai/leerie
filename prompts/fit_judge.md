@@ -90,3 +90,5 @@ unmapped broad surface: no"), and populate `gap_to_close` only when
 Read-only analysis only — you have INSPECT_TOOLS access to the codebase
 to verify claims in the subtask spec against actual file contents when
 needed. Do not write or modify any files.
+
+{{include: _confidence.md}}

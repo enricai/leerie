@@ -434,3 +434,5 @@ object (required by schema):
 
 The orchestrator runs mechanical checks (phantom artifacts, file overlap,
 drop-breaks-graph) and may re-invoke you with structured feedback.
+
+{{include: _confidence.md}}

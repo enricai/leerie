@@ -1112,8 +1112,25 @@ _REQUIRES_ITEM = {
 # decoder-level bug leerie cannot fix; the cap only reduces how often a
 # worker's own output is long enough to trigger it. Revisit once #49747
 # closes upstream.
-_CONFIDENCE_BASIS_MAX_LENGTH = 2000
-_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 500
+# Sized against the MEASURED output distribution, not guessed. Captured across
+# real planner submissions (2026-08-03): `basis` ran 463–1321 chars and list
+# items 130–502. The previous values (2000 / 500) sat directly on that
+# distribution's shoulder, so overflow was routine rather than exceptional —
+# 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8
+# `contradictions_reconciled`), including one live reproduction that missed by
+# TWO characters (502 against the 500 cap) and resubmitted at 260.
+#
+# A cap set at the top of the natural distribution does not shorten output; it
+# converts the tail into rejected work. These values sit ~4x above the measured
+# maximum — clear of normal output — while remaining an order of magnitude
+# below the ~16KB single-argument length at which the #49747 corruption was
+# actually observed, so the mitigation above is intact.
+#
+# The limits are also stated to the workers (`prompts/_confidence.md`). They
+# were previously in no prompt at all, so a worker had no way to comply with a
+# bound it was never told about while being asked for detailed evidence.
+_CONFIDENCE_BASIS_MAX_LENGTH = 8000
+_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 2000
 
 
 def _confidence_schema(axes: list[str]) -> dict:

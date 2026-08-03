@@ -476,3 +476,5 @@ Rules:
   have an empty `files_likely_touched` — the implementer's `artifacts`
   result substitutes for a code commit (DESIGN §5 *Artifact passing
   between subtasks*).
+
+{{include: _confidence.md}}

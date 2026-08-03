@@ -106,3 +106,5 @@ object (required by schema):
 
 The orchestrator does not trust this self-report: it mechanically re-checks
 the worktree state you claim before deciding what to push.
+
+{{include: _confidence.md}}
