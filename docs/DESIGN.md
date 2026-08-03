@@ -594,6 +594,37 @@ place but stays advisory — the judge handles the load-bearing case;
 the warning surfaces the deliberately-permissive same-file-different-
 surface cases.
 
+**A deterministic floor underneath the judge.** Recall being 100% *when
+the judge runs* is not the same as the collision class being guarded: the
+judge is skipped outright on single-planner runs, skippable by flag, and —
+before the re-plan repair above — could be bypassed entirely by a
+downstream gate re-planning after it had already passed. In each of those
+cases nothing checked the class at all. So the §12 split applies here as
+it does at every other gate: the judgment layer keeps the semantic call,
+and a mechanical floor beneath it catches the shape that needs no
+judgment.
+
+The floor is pure set logic over already-structured planner output — no
+prose is read (*Language-to-JSON*). Two subtasks that declare the **same
+`provides` tag** and whose **`files_likely_touched` intersect** are doing
+the same work to the same file. The one exclusion is load-bearing: two
+subtasks sharing a `_cofile_cluster` are the deliberate sub-file region
+splits of one file and must never be flagged. Without that exclusion the
+rule matches 3571 pairs across the corpus; with it, 9 — in exactly two
+runs, both of which were destroyed by duplicate work (one died at this
+very gate's downstream wiring check, the other executed both duplicates
+and was refused at the integration gate after 4.7 hours). The other 50
+runs in the corpus produce no flags at all.
+
+An "already ordered by `depends_on`" exemption looks obviously necessary
+and is not: measured across the same corpus, **zero** flagged pairs were
+ordered. It is deliberately not implemented, so the rule stays the
+smallest thing that separates the two populations.
+
+Like every floor in this system, it is evaluated even when the judgment
+layer crashes — a worker-infrastructure failure must never become a way
+to waive a mechanical check.
+
 A single subtask can legitimately overlap with several siblings on
 different artifacts — e.g. one subtask creates a new config file
 *and* wires an existing config to it, each half colliding with a
@@ -845,16 +876,42 @@ judge's finding the first and only point at which the plan can be corrected.
 Measured across the run corpus, two thirds of the runs that reached this gate died
 at it, and half of those deaths were this exact shape.
 
-The repair is deliberately narrow. An edge is added only when the defect is a
-missing `requires`, the named tag resolves to **exactly one** in-plan provider that
-is not the subtask itself, and the resulting graph is still acyclic — trialled
-against a copy before it is applied, using the same cycle definition as every other
-site. Anything else is refused and the gate dies as before: a tag with *no*
-provider means the plan genuinely lacks the capability rather than the edge, and a
-tag with several providers is an ambiguity only a human can resolve. The cycle
-trial is load-bearing rather than defensive — a well-formed but wrong edge can
-close a cycle spanning the entire plan, so a repair that skipped the trial would
-convert a survivable planning defect into a dead run.
+The repair is deliberately narrow, but it must read the defect on **both** of the
+plan's dependency channels, because the judge names either one. The schema field
+is `tag_or_dep`, and the judge fills it with a capability tag *or* a subtask id
+depending on which the defect is about. Three shapes are therefore repairable:
+
+- **Tag channel.** The named tag resolves to exactly one in-plan provider that is
+  not the subtask itself → append an in-plan `requires`.
+- **Id channel.** The named value is a surviving subtask id (and not the subtask
+  itself) → append a `depends_on`. Unambiguous by construction: an id names
+  exactly one subtask, so the several-providers ambiguity below cannot arise.
+- **Single-cluster fan-out.** The named tag has several providers, but every one
+  of them shares a single `_cofile_cluster` → append an in-plan `requires`. Those
+  providers are the sub-file region splits of one file (§5½ (P1) *Sub-file*), so
+  requiring the tag orders the subtask behind the whole cluster, which is exactly
+  the intent. The ambiguity is an artifact of counting split siblings as rival
+  providers.
+
+In every case the resulting graph must still be acyclic — trialled against a copy
+before it is applied, using the same cycle definition as every other site.
+
+Anything else is refused and the gate dies as before: a value that is neither a
+subtask id nor a provided tag means the plan genuinely lacks the capability rather
+than the edge, and a tag with several providers spanning *different* clusters is
+an ambiguity only a human can resolve. The cycle trial is load-bearing rather than
+defensive — a well-formed but wrong edge can close a cycle spanning the entire
+plan, so a repair that skipped the trial would convert a survivable planning
+defect into a dead run.
+
+Reading only the tag channel was the original shape of this repair, and it was the
+dominant reason a repairable run still died: measured across the corpus, **23 of
+the 24 defects refused as "no in-plan provider" named a surviving subtask id**, and
+one run died with 22 defects of which every single one was that shape. Counting
+split siblings as rival providers accounted for the rest of the refusals in a
+second run (one tag, eleven providers, all one cluster). Closing both channels
+takes the corpus from 19/27 runs clearing the gate to 21/27, and the residual
+defects are then all genuine missing work.
 
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget

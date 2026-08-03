@@ -1272,6 +1272,7 @@
     "status": "ready",
     "subtasks": [
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1293,6 +1294,7 @@
       "title": "feat-001-r1"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1314,6 +1316,7 @@
       "title": "feat-001-r2"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1335,6 +1338,7 @@
       "title": "feat-001-r3"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1356,6 +1360,7 @@
       "title": "feat-001-r4"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1377,6 +1382,7 @@
       "title": "feat-001-r5"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1398,6 +1404,7 @@
       "title": "feat-001-r6"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1419,6 +1426,7 @@
       "title": "feat-001-r7"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1440,6 +1448,7 @@
       "title": "feat-001-r9"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1461,6 +1470,7 @@
       "title": "feat-001-r10"
      },
      {
+      "_cofile_cluster": "feat-001",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -1482,6 +1492,7 @@
       "title": "feat-001-r11"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1515,6 +1526,7 @@
       "title": "feat-002-r1"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1548,6 +1560,7 @@
       "title": "feat-002-r2"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1581,6 +1594,7 @@
       "title": "feat-002-r3-r1"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1614,6 +1628,7 @@
       "title": "feat-002-r3-r2"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1647,6 +1662,7 @@
       "title": "feat-002-r4"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1680,6 +1696,7 @@
       "title": "feat-002-r5"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1713,6 +1730,7 @@
       "title": "feat-002-r6"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1746,6 +1764,7 @@
       "title": "feat-002-r7"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1779,6 +1798,7 @@
       "title": "feat-002-r8"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1812,6 +1832,7 @@
       "title": "feat-002-r9"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1845,6 +1866,7 @@
       "title": "feat-002-r10"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1878,6 +1900,7 @@
       "title": "feat-002-r11"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1911,6 +1934,7 @@
       "title": "feat-002-r12"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1944,6 +1968,7 @@
       "title": "feat-002-r13"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -1977,6 +2002,7 @@
       "title": "feat-002-r14"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2010,6 +2036,7 @@
       "title": "feat-002-r16"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2043,6 +2070,7 @@
       "title": "feat-002-r17"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2076,6 +2104,7 @@
       "title": "feat-002-r18"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2109,6 +2138,7 @@
       "title": "feat-002-r19"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2142,6 +2172,7 @@
       "title": "feat-002-r20"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2175,6 +2206,7 @@
       "title": "feat-002-r21"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2208,6 +2240,7 @@
       "title": "feat-002-r22"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2241,6 +2274,7 @@
       "title": "feat-002-r23"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2274,6 +2308,7 @@
       "title": "feat-002-r24"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2307,6 +2342,7 @@
       "title": "feat-002-r25"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2340,6 +2376,7 @@
       "title": "feat-002-r26"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2373,6 +2410,7 @@
       "title": "feat-002-r27"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2406,6 +2444,7 @@
       "title": "feat-002-r28"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2439,6 +2478,7 @@
       "title": "feat-002-r29"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2472,6 +2512,7 @@
       "title": "feat-002-r30"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2505,6 +2546,7 @@
       "title": "feat-002-r31"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2538,6 +2580,7 @@
       "title": "feat-002-r32"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2571,6 +2614,7 @@
       "title": "feat-002-r33"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2604,6 +2648,7 @@
       "title": "feat-002-r34"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2637,6 +2682,7 @@
       "title": "feat-002-r35"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2670,6 +2716,7 @@
       "title": "feat-002-r36"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2703,6 +2750,7 @@
       "title": "feat-002-r37"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -2736,6 +2784,7 @@
       "title": "feat-002-r38-r1"
      },
      {
+      "_cofile_cluster": "feat-002",
       "depends_on": [
        "feat-001-r1",
        "feat-001-r2",
@@ -3100,6 +3149,7 @@
       "title": "feat-004"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3118,6 +3168,7 @@
       "title": "feat-005-r1"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3136,6 +3187,7 @@
       "title": "feat-005-r2"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3154,6 +3206,7 @@
       "title": "feat-005-r3"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3172,6 +3225,7 @@
       "title": "feat-005-r4"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3190,6 +3244,7 @@
       "title": "feat-005-r5"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3208,6 +3263,7 @@
       "title": "feat-005-r6"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3226,6 +3282,7 @@
       "title": "feat-005-r7"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3244,6 +3301,7 @@
       "title": "feat-005-r8"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3262,6 +3320,7 @@
       "title": "feat-005-r9"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"
@@ -3280,6 +3339,7 @@
       "title": "feat-005-r10"
      },
      {
+      "_cofile_cluster": "feat-005",
       "depends_on": [],
       "files_likely_touched": [
        "leerie"

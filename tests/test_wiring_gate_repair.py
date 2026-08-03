@@ -9,10 +9,17 @@ its `unresolved_requires` input at all. The gate is the first point in the
 pipeline at which the edge can be created.
 
 Measured motivation (2026-08-01): 6 of the 9 runs that ever reached this gate
-died at it, and the constrained repair resolves 3 of those 6 outright. The
-three it refuses are refused for principled reasons this file pins: a tag with
-no provider means the plan lacks the *work*, not the edge; a tag with several
-providers is an ambiguity only a human can settle.
+died at it, and the constrained repair resolves 5 of those 6 outright (it was
+3 of 6 when the repair read only the tag channel — PR #145).
+
+`tag_or_dep` is resolved against BOTH dependency channels, because the judge
+fills that field with either a capability tag or a subtask id. This file pins
+all three accepted shapes — tag / id / single-`_cofile_cluster` fan-out — and,
+just as importantly, what each still refuses: a value that is neither a
+provided tag nor a surviving subtask id means the plan lacks the *work*, not
+the edge; providers spanning *different* clusters remain an ambiguity only a
+human can settle (one shared cluster is not — those are the sub-file region
+splits of a single file).
 
 The cycle trial is load-bearing rather than defensive. A well-formed but WRONG
 edge was measured closing a dependency cycle across an entire 13-subtask plan,
@@ -22,6 +29,8 @@ is the pin for that.
 """
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 
@@ -29,14 +38,18 @@ import pytest
 # Fixtures
 # --------------------------------------------------------------------- #
 
-def _sub(sid, *, provides=(), requires=(), depends_on=(), files=("f.py",)):
-    return {
+def _sub(sid, *, provides=(), requires=(), depends_on=(), files=("f.py",),
+         cluster=None):
+    s = {
         "id": sid, "title": sid, "intent": f"intent {sid}",
         "success_criteria_seed": "c", "runs_commands": [],
         "files_likely_touched": list(files), "provides": list(provides),
         "requires": [{"tag": t, "extent": "in_plan"} for t in requires],
         "depends_on": list(depends_on), "size": "small",
     }
+    if cluster is not None:
+        s["_cofile_cluster"] = cluster
+    return s
 
 
 def _plans(*subs_by_domain):
@@ -108,16 +121,18 @@ def test_unrepaired_plan_races_the_consumer(leerie):
 # --------------------------------------------------------------------- #
 
 def test_zero_providers_declines(leerie):
-    """A tag nothing provides means the plan is missing the WORK, not the
-    edge. Inventing a dependency on nothing would be worse than dying."""
+    """A value that is neither a provided tag NOR a surviving subtask id
+    means the plan is missing the WORK, not the edge. Inventing a dependency
+    on nothing would be worse than dying."""
     plans = _incident_plan()
     repairs, unrepaired = leerie._repair_missing_requires(
         plans, [_defect("refactor-005", "nobody-provides-this")])
     assert not repairs and len(unrepaired) == 1
 
 
-def test_multiple_providers_declines(leerie):
-    """Ambiguous — only a human can say which provider was meant."""
+def test_multiple_providers_in_different_clusters_declines(leerie):
+    """Ambiguous — only a human can say which provider was meant. Providers
+    in one `_cofile_cluster` are the deliberate exception (below)."""
     plans = _plans(
         ("refactoring", [_sub("refactor-001")]),
         ("testing", [_sub("test-001", provides=["shared"]),
@@ -126,6 +141,188 @@ def test_multiple_providers_declines(leerie):
     repairs, unrepaired = leerie._repair_missing_requires(
         plans, [_defect("refactor-001", "shared")])
     assert not repairs and len(unrepaired) == 1
+
+
+# --------------------------------------------------------------------- #
+# Channel (b): the id channel. `tag_or_dep` names a subtask, not a tag.
+# 23 of the 24 corpus defects refused as "no in-plan provider" were this.
+# --------------------------------------------------------------------- #
+
+def test_id_channel_repairs_via_depends_on(leerie):
+    plans = _plans(("testing", [_sub("test-001"), _sub("feat-001")]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "feat-001")])
+    assert not unrepaired
+    assert repairs == [{"sid": "test-001", "tag": "feat-001",
+                        "provider": "feat-001", "channel": "id"}]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["depends_on"] == ["feat-001"]
+    # the tag channel must not have been used — no phantom `requires`
+    assert by_id["test-001"]["requires"] == []
+
+
+def test_id_channel_orders_the_producer_first(leerie):
+    """The repair is worthless if the added edge does not actually schedule
+    the consumer behind the subtask it names."""
+    plans = _plans(("testing", [_sub("test-001"), _sub("feat-001")]))
+    leerie._repair_missing_requires(
+        plans, [_defect("test-001", "feat-001")])
+    _subtasks, waves = leerie.schedule(copy.deepcopy(plans))
+    pos = {sid: i for i, w in enumerate(waves) for sid in w}
+    assert pos["feat-001"] < pos["test-001"]
+
+
+def test_id_channel_self_reference_declines(leerie):
+    plans = _plans(("testing", [_sub("test-001")]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "test-001")])
+    assert not repairs and len(unrepaired) == 1
+
+
+def test_id_channel_already_declared_is_neither_repaired_nor_gating(leerie):
+    plans = _plans(("testing", [_sub("test-001", depends_on=["feat-001"]),
+                                _sub("feat-001")]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "feat-001")])
+    assert not repairs and not unrepaired
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["depends_on"] == ["feat-001"], "no duplicate edge"
+
+
+def test_id_channel_respects_the_cycle_guard(leerie):
+    """feat-001 already depends on test-001, so test-001 -> feat-001 closes
+    a cycle and must be refused exactly like the tag channel's."""
+    plans = _plans(("testing", [_sub("test-001"),
+                                _sub("feat-001", depends_on=["test-001"])]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "feat-001")])
+    assert not repairs and len(unrepaired) == 1
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["depends_on"] == [], "edge must not be applied"
+
+
+def test_tag_channel_wins_when_the_value_is_both_a_tag_and_an_id(leerie):
+    """Ordering is deliberate: the tag channel is tried first so pre-existing
+    behavior is bit-for-bit unchanged."""
+    plans = _plans(("testing", [
+        _sub("test-001"),
+        _sub("feat-001"),                      # id collides with the tag name
+        _sub("feat-002", provides=["feat-001"]),
+    ]))
+    repairs, _unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "feat-001")])
+    assert [r["channel"] for r in repairs] == ["tag"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["depends_on"] == []
+    assert by_id["test-001"]["requires"] == [
+        {"tag": "feat-001", "extent": "in_plan"}]
+
+
+# --------------------------------------------------------------------- #
+# Channel (c): single-cluster fan-out. Several providers that are all
+# sub-file region splits of ONE file are not a real ambiguity.
+# --------------------------------------------------------------------- #
+
+def test_single_cluster_fanout_repairs(leerie):
+    plans = _plans(
+        ("testing", [_sub("test-001")]),
+        ("feature-implementation", [
+            _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
+            _sub("feat-001-r2", provides=["baked"], cluster="feat-001"),
+            _sub("feat-001-r3", provides=["baked"], cluster="feat-001"),
+        ]),
+    )
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "baked")])
+    assert not unrepaired
+    assert repairs == [{"sid": "test-001", "tag": "baked",
+                        "provider": "feat-001-r1",
+                        "channel": "cofile_cluster"}]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["requires"] == [
+        {"tag": "baked", "extent": "in_plan"}]
+
+
+def test_single_cluster_fanout_orders_behind_every_member(leerie):
+    """`provider` records only the lex-smallest member, but the tag edge must
+    order the consumer behind ALL of them — that is the whole point."""
+    plans = _plans(
+        ("testing", [_sub("test-001")]),
+        ("feature-implementation", [
+            _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
+            _sub("feat-001-r2", provides=["baked"], cluster="feat-001"),
+            _sub("feat-001-r3", provides=["baked"], cluster="feat-001"),
+        ]),
+    )
+    leerie._repair_missing_requires(plans, [_defect("test-001", "baked")])
+    _subtasks, waves = leerie.schedule(copy.deepcopy(plans))
+    pos = {sid: i for i, w in enumerate(waves) for sid in w}
+    for member in ("feat-001-r1", "feat-001-r2", "feat-001-r3"):
+        assert pos[member] < pos["test-001"]
+
+
+def test_providers_spanning_two_clusters_still_decline(leerie):
+    """The exclusion is 'all one cluster', not 'any cluster' — two genuinely
+    different split files are still an ambiguity only a human can resolve."""
+    plans = _plans(
+        ("testing", [_sub("test-001")]),
+        ("feature-implementation", [
+            _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
+            _sub("feat-002-r1", provides=["baked"], cluster="feat-002"),
+        ]),
+    )
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "baked")])
+    assert not repairs and len(unrepaired) == 1
+
+
+def test_providers_with_no_cluster_marker_still_decline(leerie):
+    """A `None` cluster is the absence of the marker, never a cluster that
+    several unrelated subtasks share."""
+    plans = _plans(
+        ("testing", [_sub("test-001")]),
+        ("feature-implementation", [_sub("feat-001", provides=["baked"]),
+                                    _sub("feat-002", provides=["baked"])]),
+    )
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("test-001", "baked")])
+    assert not repairs and len(unrepaired) == 1
+
+
+def test_cluster_channel_declines_when_sid_is_itself_a_member(leerie):
+    """A split sibling requiring its own cluster's tag is a self-loop."""
+    plans = _plans(("feature-implementation", [
+        _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
+        _sub("feat-001-r2", provides=["baked"], cluster="feat-001"),
+    ]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("feat-001-r1", "baked")])
+    assert not repairs and len(unrepaired) == 1
+
+
+def test_empty_tag_or_dep_declines(leerie):
+    """`SCHEMAS["wiring_judge"]` puts no `minLength` on `tag_or_dep`, so `""`
+    is schema-valid and reaches this function."""
+    plans = _incident_plan()
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("refactor-005", "")])
+    assert not repairs and len(unrepaired) == 1
+
+
+def test_empty_tag_never_matches_an_empty_provides_entry(leerie):
+    """The shape that makes the above reachable rather than academic: a
+    subtask declaring `provides: [""]` is a sole "provider" of the empty tag,
+    so without the guard the tag channel matches and the gate synthesizes a
+    `{"tag": ""}` edge — a meaningless dependency inside a correctness gate."""
+    plans = _plans(("refactoring", [
+        _sub("refactor-001"),
+        _sub("refactor-002", provides=[""]),
+    ]))
+    repairs, unrepaired = leerie._repair_missing_requires(
+        plans, [_defect("refactor-001", "")])
+    assert not repairs and len(unrepaired) == 1
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["refactor-001"]["requires"] == [], "no empty-tag edge"
 
 
 def test_non_missing_requires_kind_declines(leerie):
