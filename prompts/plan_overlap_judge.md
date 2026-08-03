@@ -266,7 +266,7 @@ self-contradictory. Pick one outcome for the pair, or `unresolvable`.
 surface most clearly (`WidgetFrame component`, `docs/USAGE.md bare-verb
 rewrite`). Nothing parses it.
 
-`artifact_paths` is the **structured** companion and is required on every
+`artifact_paths` is the **structured** companion — fill it in on every
 collision. List the repo-relative path(s) the artifact actually lives in —
 `["docs/USAGE.md"]`, or `["commands/leerie.md", "commands/chain.md"]` when
 the pair overlaps on several files. Each path must be real: present in the
@@ -429,7 +429,7 @@ object (required by schema):
   blocks of text.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
-- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+- **Gap surfacing:** if the score is below 9.0, name the
   artifact that would close the gap.
 
 The orchestrator runs mechanical checks (phantom artifacts, file overlap,

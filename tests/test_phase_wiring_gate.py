@@ -269,3 +269,86 @@ def test_judge_crash_degrades(leerie, tmp_path, monkeypatch):
     out = asyncio.run(leerie.phase_wiring_gate(
         _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
     assert out == _PLANS
+
+
+# ----- `severity` is asked for, not required (2026-08-03) --------------------
+#
+# Requiring it defeated its own purpose. A judge that omitted the field
+# produced no schema-valid payload at all, so this gate never ran and caught
+# NOTHING. Measured across the run corpus, every `wiring_judge` invocation that
+# never produced valid output (9 of 66) failed on this single field — all 18 of
+# its failing submissions. See DESIGN §5 and §8 *Findings carry a severity*.
+
+
+def test_severity_is_not_a_required_schema_field(leerie):
+    item = (leerie.SCHEMAS["wiring_judge"]["properties"]
+            ["wiring_defects"]["items"])
+    assert "severity" not in item["required"]
+    # Asked for, not deleted: the property and its enum must survive, or the
+    # judge loses the structured channel the field exists to provide.
+    assert set(item["properties"]["severity"]["enum"]) == {
+        "live_defect", "latent_risk"}
+
+
+def test_a_defect_without_severity_validates(leerie):
+    """The exact corpus shape that produced 9 dead invocations."""
+    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema.validate({
+        "plan_reviewed": True,
+        "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-002",
+            "tag_or_dep": "nothing-provides-this",
+            "concrete_reason": "reads the schema but declares no requires",
+        }],
+        "rationale": "missing edge",
+    }, leerie.SCHEMAS["wiring_judge"])
+
+
+def test_unlabelled_defect_still_gates(leerie, tmp_path, monkeypatch):
+    """The default is gating (DESIGN §8). An entry whose severity nobody
+    declared must keep the conservative behaviour — relaxing the schema must
+    not turn an omitted field into a silent bypass."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-002",
+            "tag_or_dep": "nothing-provides-this",
+            "concrete_reason": "reads the schema but declares no requires",
+        }], "rationale": "missing edge"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_wiring_gate(
+            _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+
+def test_severity_channel_still_works_after_the_relaxation(leerie, tmp_path,
+                                                           monkeypatch):
+    """Anti-vacuity: making the field optional must not disable the channel
+    itself. A declared `latent_risk` must still be excluded from gating —
+    otherwise this change would have re-broken run d8302c0d46d8..."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-003-1",
+            "tag_or_dep": "some-transitively-inherited-tag",
+            "concrete_reason": "resolves correctly today; fragile to a future "
+                               "merge of the intermediate subtask",
+            "severity": "latent_risk",
+        }], "rationale": "a latent fragility rather than a live defect"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == _PLANS
+
+
+def test_prompt_still_asks_for_severity(leerie):
+    """Optional in the schema, still requested in the prompt — that is the
+    whole point of the change (CLAUDE.md §12: prompts advisory, code
+    enforces). If the prompt stopped asking, the channel would go dark."""
+    text = leerie._load_prompt("wiring_judge")
+    assert "severity" in text
+    assert "latent_risk" in text and "live_defect" in text

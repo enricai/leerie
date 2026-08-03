@@ -4578,7 +4578,7 @@ regardless of `make_feedback_prompt`.
 | `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `_settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). Its free-text fields carry length caps: `basis` is capped at `_CONFIDENCE_BASIS_MAX_LENGTH` (8000 chars) and each `falsifiers_tested`/`contradictions_reconciled` array item at `_CONFIDENCE_LIST_ITEM_MAX_LENGTH` (2000 chars) — a mitigation for `anthropics/claude-code#49747` (open, unfixed): the `claude` CLI intermittently corrupts a `StructuredOutput` tool call (valid JSON switching mid-payload into legacy XML `<parameter name="...">` tags) correlated with the length of a single tool-call string argument. Observed directly in run `d8302c0d46d8...` (barnacle, 2026-07-31): the raw `__unparsedToolInput` capture showed the corruption starting exactly where the (then-uncapped) `confidence.basis` field's ~16KB of prose began. The cap reduces trigger frequency; it does not fix the upstream CLI bug — revisit once #49747 closes. The caps were RESIZED (from 2000/500) on 2026-08-03 after measuring the actual output distribution: `basis` runs 463–1321 chars and list items 130–502, so the old values sat directly on that distribution's shoulder and overflow was routine rather than exceptional — 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8 `contradictions_reconciled`), including a live reproduction that missed by TWO characters (502 against the 500 cap). A cap at the top of the natural distribution does not shorten output, it converts the tail into rejected work. The new values sit ~4x above the measured maximum while staying an order of magnitude below the ~16KB at which corruption was actually observed, so the mitigation is intact. They are now also stated to the workers via `prompts/_confidence.md` (included by all 10 confidence-emitting prompts) — previously they appeared in no prompt, so a worker had no way to comply with a bound it was never told about while being asked for detailed evidence. Pinned by `tests/test_confidence_length_caps.py`, which also guards `confidence` staying top-level REQUIRED: making it optional was considered and rejected, since that is a DESIGN §8/§12 structural self-gating contract and accounted for only 4 of the 65 measured failures. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. `confidence` remains top-level REQUIRED (the DESIGN §8/§12 structural self-gating contract is preserved — every gate still reads a real number). Pinned by `tests/test_confidence_length_caps.py`. |
 
 ### Finding severity — gating vs advisory
 
@@ -4646,13 +4646,26 @@ for its `files_likely_touched` set intersection.
 `artifact` is a **logical** label and Python never parses it.
 `prompts/plan_overlap_judge.md` asks for "the colliding exported artifact,
 e.g. `WidgetFrame component`", so it is prose; the judge names the files
-separately in the required `artifact_paths` array, and `PHANTOM_ARTIFACT`
+separately in the `artifact_paths` array, and `PHANTOM_ARTIFACT`
 does plain set membership on that — CLAUDE.md *Language-to-JSON*: Python
 operates only on already-structured data, never on an LLM's response. An
 empty `artifact_paths` means the artifact has no file (a cross-cutting
 convention, say) and there is nothing to verify, so nothing is flagged;
 `minLength: 1` on the items makes a blank entry a schema-gate retry rather
 than something the check filters out at read time.
+
+`artifact_paths` is **asked for but NOT in `collisions[].required`** (changed
+2026-08-03). Requiring it was measured to be far more destructive than the
+false positives it was introduced to prevent: across the run corpus
+`plan_overlap_judge` produced valid output on only **40.9% of its invocations
+(27/66)** while every other worker sat at 99.6–100%, and **84 of its 85
+validation failures were the single error `'artifact_paths' is a required
+property`** — a whole-payload rejection of otherwise-sound collision analysis,
+in the phase runs most often die in. Absence was already the designed-for case
+(the check does `paths = c.get("artifact_paths") or []` then `if not paths:
+continue`), so requiring the field bought no extra verification — it converted
+a graceful "cannot path-check this collision" skip into a discarded plan. See
+DESIGN §5 *Cross-domain surface overlap*.
 
 Both earlier shapes of this check were defects. Path-checking the whole
 `artifact` string false-positived every descriptive name — run `e2882da6…`
@@ -5136,10 +5149,22 @@ Every `fit_judge` and `splitter` invocation calls `st.bump_workers(caps)` before
 (string), `diffuse` (string, narrates the diffuse coupling when score < 0.70),
 `confidence` (sub-schema via `_confidence_schema(["fit"])`).
 
-`SCHEMAS["splitter"]` — required field: `children` (array, `minItems: 1`). Each
+`SCHEMAS["splitter"]` — required field: `children` (array; **no `minItems`** as
+of 2026-08-03 — an empty array is a valid "this does not split" answer). Each
 child mirrors the planner subtask shape: required `id`, `title`,
 `success_criteria_seed`; optional `intent`, `scope_note`, `files_likely_touched`,
 `depends_on`, `requires`, `provides`, `size`, `investigation_notes`.
+
+`minItems: 1` was removed because it made the honest answer unrepresentable:
+across the corpus the splitter returned `[]` 43 times and exactly *one* child 43
+more times (a single-child "split" being a no-op), and every empty return was
+rejected and retried — even though `_recursive_decompose` already accepts "no
+children" as a leaf, deliberately and with its own log line
+(`children = split_result.get("children") or []` → `if not children: return
+[subtask]`). The consumer was already correct; the schema rejected the payload
+before the consumer could see it. **No code change accompanied this** — the
+handling predates it. See DESIGN §5½ (P1) *"This does not split" is a valid
+answer*.
 
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
 (both default to `"medium"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
@@ -5220,9 +5245,11 @@ contract). Persists to `state.data["classification_coverage_gate"]`.
 `SCHEMAS["wiring_judge"]` — required fields: `plan_reviewed` (boolean),
 `wiring_defects` (array of `{kind: enum[missing_requires, missing_provides,
 broken_by_merge, broken_by_drop, orphaned_dependent], sid (string), tag_or_dep
-(string), concrete_reason (string), severity: enum[live_defect,
-latent_risk]}` — a `live_defect` entry ⇒ gate; a `latent_risk` entry is
-logged as a warning and never gates), `rationale` (string). The *semantic*
+(string), concrete_reason (string)}`, each entry also carrying an **optional**
+`severity: enum[live_defect, latent_risk]` — a `live_defect` entry ⇒ gate; a
+`latent_risk` entry is logged as a warning and never gates; an entry with no
+`severity` gates, per DESIGN §8 *Findings carry a severity* ("the default is
+gating")), `rationale` (string). The *semantic*
 half of the plan-wiring check (the *structural* half is the deterministic
 `check_plan_wiring`, below); wired as `phase_wiring_gate` before
 `_validate_plan` — **detect-and-die, single pass**: a `live_defect` entry
@@ -5247,6 +5274,18 @@ written will actually misbehave; `latent_risk` = correct today, fragile to
 a plausible future edit. Only `live_defect` gates; a mixed list still
 gates on its `live_defect` entries (severity narrows what counts as a
 defect, it is not a per-entry bypass).
+
+**Asked for, not `required` (changed 2026-08-03).** Requiring the field
+defeated its own purpose. A judge that omitted it produced no schema-valid
+payload at all, so `phase_wiring_gate` never ran and caught **nothing** —
+measured across the run corpus, **every** `wiring_judge` invocation that never
+produced valid output (9 of 66) failed on this single field, accounting for all
+18 of its failing submissions. Both consumers already tolerate absence
+(`d.get("severity") == "latent_risk"` at `:19098`, `!=` at `:20140`), so an
+unlabelled entry gates — the conservative direction, matching *Findings carry a
+severity*'s "default is gating" rule. One conservatively-gated defect is a
+recoverable false positive; a gate that never runs is not. The prompt still
+asks for it. Pinned by `tests/test_phase_wiring_gate.py`.
 
 `SCHEMAS["provision_judge"]` — required fields: `recipe_reviewed` (boolean),
 `recipe_failures` (array of `{kind: enum[missing_break_system_packages,
@@ -7660,7 +7699,7 @@ type. Required fields, current shape:
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,
   it emits `blocked` with an empty subtasks list and the gap analysis in
-  `confidence.gap_to_close`. A `ready` plan may also legitimately carry
+  `confidence.basis`. A `ready` plan may also legitimately carry
   an empty `subtasks` list (the cleared-but-empty terminal state — "I
   understand the task, I investigated this domain, the work is already
   satisfied on HEAD"); see DESIGN §8 and the phase 3 `_detect_no_work`
@@ -7670,9 +7709,10 @@ type. Required fields, current shape:
   (array of strings — what would-disprove probes were run and what they
   showed), `contradictions_reconciled` (array of strings — any contradictions
   with the worker's own prior statements, named with the kept version's
-  evidence), `gap_to_close` (object with optional `task_understanding` and
-  `decomposition_quality` strings — populated when either score is below
-  9.0). Each subtask is `{id, title,
+  evidence). `basis` and the two score axes are the only REQUIRED keys; the
+  two arrays are asked for by the prompt but optional, and there is no
+  `gap_to_close` (removed 2026-08-03 — see `_confidence_schema`). When a score
+  is below 9.0 the gap is stated in `basis`. Each subtask is `{id, title,
   success_criteria_seed (all required), intent, scope_note,
   files_likely_touched, depends_on, requires, provides, size,
   investigation_notes, runs_commands}`. **`requires` is an array of objects, not bare
@@ -7723,10 +7763,10 @@ type. Required fields, current shape:
   `_confidence_schema(["root_cause", "solution"])`, not consumed by the
   orchestrator: required keys are
   `root_cause` and `solution` (numbers 1–10), `basis` (string),
-  `falsifiers_tested` (array of strings), `contradictions_reconciled`
-  (array of strings), and `gap_to_close` (object with optional
-  `root_cause` and `solution` strings — populated when either score is
-  below 9.0); see DESIGN §8 for the disciplines these fields make
+  `falsifiers_tested` (array of strings, optional), `contradictions_reconciled`
+  (array of strings, optional). Only the two axes and `basis` are required;
+  when either score is below 9.0 the gap is stated in `basis` (there is no
+  `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
   mechanically required — the schema requires the object itself, so a
   worker that skipped self-gating fails validation before the
   orchestrator reads the payload).
@@ -7783,9 +7823,10 @@ type. Required fields, current shape:
   `summary` (string — one-line description of what the conformance pass
   did), `confidence` (worker-internal self-gate, not consumed by the
   orchestrator: required keys `conformance` (number 1–10), `basis`
-  (string), `falsifiers_tested` (array of strings), `contradictions_reconciled`
-  (array of strings), `gap_to_close` (object — populated when conformance
-  is below 9.0); see DESIGN §8 for the disciplines these fields make
+  (string), `falsifiers_tested` (array of strings, optional),
+  `contradictions_reconciled` (array of strings, optional). Only `conformance`
+  and `basis` are required; when conformance is below 9.0 the gap is stated in
+  `basis` (there is no `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
   mechanically required), and `solution_defects` (array of `{kind:
   enum[unhandled_input, unhandled_path, missing_guard, sibling_site_unedited,
   wrong_selector, decoy_or_shortcut], concrete_case (string, minLength 1),

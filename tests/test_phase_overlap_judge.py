@@ -2138,11 +2138,30 @@ class TestProsePathParsingAbsent:
         assert 'artifact_paths' in inspect.getsource(
             leerie.check_overlap_judge_output)
 
-    def test_schema_requires_artifact_paths(self, leerie):
+    def test_schema_offers_artifact_paths_without_requiring_it(self, leerie):
+        """The field must exist (PHANTOM_ARTIFACT reads it) but must NOT be
+        required.
+
+        Requiring it was measured far more destructive than the false
+        positives it was added to prevent: `plan_overlap_judge` produced valid
+        output on only 40.9% of its corpus invocations (27/66) while every
+        other worker sat at 99.6-100%, and 84 of its 85 validation failures
+        were the single error "'artifact_paths' is a required property" — a
+        whole-payload rejection of sound collision analysis, in the phase runs
+        most often die in. Absence was already the designed-for case, so
+        requiring it bought no verification at all."""
         item = (leerie.SCHEMAS["plan_overlap_judge"]["properties"]
                 ["collisions"]["items"])
-        assert "artifact_paths" in item["required"]
         assert item["properties"]["artifact_paths"]["type"] == "array"
+        assert "artifact_paths" not in item["required"]
+
+    def test_phantom_artifact_skips_a_collision_with_no_paths(self, leerie):
+        """Guard-the-guard: dropping the requirement is only safe because the
+        check already treats absence as "nothing to verify"."""
+        import inspect
+        src = inspect.getsource(leerie.check_overlap_judge_output)
+        assert 'c.get("artifact_paths") or []' in src
+        assert "if not paths:" in src
 
     def test_schema_rejects_a_blank_path_entry(self, leerie):
         """`minLength: 1` on the items — a blank entry is a malformed

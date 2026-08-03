@@ -94,7 +94,11 @@ def test_all_blocked_dies_with_informative_message(leerie, capsys):
     assert "bug-fixing" in err
     # The hint points at the knob and the gap field, not just "failed."
     assert "confidence_rounds" in err.lower() or "confidence-rounds" in err
-    assert "gap_to_close" in err
+    # The gap moved from `confidence.gap_to_close` to `confidence.basis` when
+    # the confidence block was flattened (DESIGN §8) — the message must name
+    # a field that still exists, or it sends the operator looking for nothing.
+    assert "confidence.basis" in err
+    assert "gap_to_close" not in err
 
 
 def test_partial_block_emits_warning_and_proceeds(leerie, capsys):
