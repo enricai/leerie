@@ -4303,6 +4303,82 @@ case "$OS" in
 esac
 fi  # end RUNTIME=local preflight
 
+# --- stale-install warning ----------------------------------------------
+# Running `leerie` never updates $LEERIE_REPO; only re-running install.sh
+# (or a manual pull) does. Nothing surfaced that, so an install could sit
+# arbitrarily far behind origin while the operator believed they were on
+# current code. Measured cost: two multi-hour funeralworks runs on
+# 2026-08-02 died at the phase-3 wiring gate on a v0.9.100 install,
+# reproducing the exact failure the v0.9.101 auto-repair fixes — state.json
+# recorded leerie_version 0.9.100 while the dev checkout was already 0.9.102.
+#
+# Warns, never blocks: an offline host, a missing remote, or a detached HEAD
+# must not fail a run. Every git call is guarded individually.
+#
+# The `|| true` on the call below is REQUIRED, not cosmetic — do not "tidy"
+# it away because the function appears to return 0 on every guarded path.
+# This script runs under `set -euo pipefail` (see the top of the file), and
+# the `_up_v=` assignment interpolates a PIPELINE: if `git show` cannot find
+# `.claude-plugin/plugin.json` on the upstream tree, pipefail makes the
+# pipeline non-zero, so the assignment is non-zero, and `set -e` would kill
+# the launcher outright. Invoking the function as part of an `||` list is
+# what suspends `set -e` for its whole body. Verified empirically, since
+# bash's rules here are subtle: with `|| true` the failing assignment is
+# survived and execution continues (leaving `_up_v` empty, which the
+# `${_up_v:-unknown}` fallback below already handles); without it, bash
+# exits 1 at that line.
+_warn_if_leerie_stale() {
+  command -v git >/dev/null 2>&1 || return 0
+  git -C "$LEERIE_REPO" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  # Detached HEAD and no-upstream both make @{upstream} meaningless.
+  git -C "$LEERIE_REPO" symbolic-ref -q HEAD >/dev/null 2>&1 || return 0
+  git -C "$LEERIE_REPO" rev-parse --abbrev-ref '@{upstream}' \
+    >/dev/null 2>&1 || return 0
+
+  # A fetch is MANDATORY, not an optimization: `HEAD..@{upstream}` reads the
+  # CACHED remote-tracking ref, which on a never-fetched install is exactly
+  # as stale as the checkout. Verified on the incident machine — `git status
+  # -sb` reported a bare `## main...origin/main` with no `[behind]` until a
+  # manual fetch. A fetch-free guard would stay silent through precisely the
+  # failure it exists to catch. Throttled to once per 24h via an mtime stamp
+  # (`find -mtime` rather than `stat`/`date -r`, which differ on BSD/GNU).
+  local _stamp="$LEERIE_STATE_HOST_DIR/.fetch-stamp"
+  if [ -z "$(find "$_stamp" -mtime -1 2>/dev/null)" ]; then
+    mkdir -p "$LEERIE_STATE_HOST_DIR" 2>/dev/null || true
+    # Bounded so a slow/unreachable remote never adds latency to a run.
+    # `timeout` is absent on a stock BSD/macOS host — fall back unbounded
+    # rather than skip the fetch, mirroring `_seed_timeout_prefix`. That
+    # helper is not reused here: scripts/remote/lib.sh is sourced only
+    # inside specific verb branches, never on this path.
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 5 git -C "$LEERIE_REPO" fetch --quiet >/dev/null 2>&1 || true
+    else
+      git -C "$LEERIE_REPO" fetch --quiet >/dev/null 2>&1 || true
+    fi
+    touch "$_stamp" 2>/dev/null || true
+  fi
+
+  local _behind
+  _behind="$(git -C "$LEERIE_REPO" rev-list --count 'HEAD..@{upstream}' \
+             2>/dev/null || echo 0)"
+  case "$_behind" in
+    ''|0|*[!0-9]*) return 0 ;;
+  esac
+
+  # Version strings are a far more actionable message than a commit count.
+  local _up_v
+  _up_v="$(git -C "$LEERIE_REPO" show \
+             '@{upstream}:.claude-plugin/plugin.json' 2>/dev/null \
+           | awk -F'"' '/"version"/ {print $4; exit}')"
+  remote_log "warning: the installed leerie is $_behind commit(s) behind" \
+             "origin (v$LEERIE_VERSION -> v${_up_v:-unknown})."
+  echo "  Runs use the INSTALLED copy at $LEERIE_REPO, not any other" >&2
+  echo "  checkout you may be developing in." >&2
+  echo "  Update with: git -C \"$LEERIE_REPO\" pull --ff-only" >&2
+  echo "  (or re-run scripts/install.sh)." >&2
+}
+_warn_if_leerie_stale || true
+
 # --- host preflight: git repo + gh + jq ---------------------------------
 # These checks moved out of the orchestrator (DESIGN §6 *Finalization*).
 # The launcher does the host-side push + PR after the container exits,

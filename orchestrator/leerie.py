@@ -8061,6 +8061,94 @@ def warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
         log(f"     {sid}: requires=[] depends_on=[]")
 
 
+def check_duplicate_providers(plans: list[dict]) -> list[str]:
+    """Deterministic duplicate-work floor beneath `phase_overlap_judge`
+    (DESIGN §5 *A deterministic floor underneath the judge*). Returns a list
+    of `DUPLICATE_PROVIDER` messages ([] when clean). Pure function, no
+    state, no LLM.
+
+    Two subtasks that declare the SAME `provides` tag and whose
+    `files_likely_touched` intersect are doing the same work to the same
+    file. That is a collision decidable by set logic over already-structured
+    planner fields — no prose is read (CLAUDE.md *Language-to-JSON*), which is
+    what makes it a floor rather than a second opinion.
+
+    Why a floor at all, when the `plan_overlap_judge` above it has 100% recall
+    on the corpus: recall *when the judge runs* is not coverage of the class.
+    The judge is cheap-skipped on single-planner runs, skippable via
+    `--skip-overlap-judge`, and — before the re-plan repair in DESIGN §5 — was
+    bypassable entirely by a downstream gate re-planning after it had passed.
+    In each of those cases nothing checked this class at all. So the §12 split
+    applies as it does at every other gate: judgment keeps the semantic call,
+    a mechanical check catches the shape that needs no judgment.
+
+    THE `_cofile_cluster` EXCLUSION IS LOAD-BEARING, NOT AN OPTIMIZATION. Two
+    subtasks sharing that marker are the deliberate sub-file region splits of
+    one file (DESIGN §5½ (P1) *Sub-file*) — same tag and same path by
+    construction. Without the exclusion this rule matches 3571 pairs across
+    the run corpus; with it, 9 — falling in exactly two runs, both of which
+    were destroyed by duplicate work (`392b5e7f` died at the phase-3 wiring
+    gate; `19a70d96` executed both duplicates and was refused at the
+    integration gate after 4.7 hours and 164 workers). The other 50 corpus
+    runs produce no flags.
+
+    An "already ordered by `depends_on`" exemption looks obviously necessary
+    and is deliberately absent: measured across the same corpus, ZERO flagged
+    pairs were ordered. Adding it would be untested speculation widening the
+    rule's escape hatches. `_build_predecessor_graph` is the function to reach
+    for if that ever changes.
+
+    Advisory as shipped — the caller logs these rather than gating on them,
+    pending confirmation across live runs (DESIGN §5)."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+
+    providers: dict[str, list[str]] = {}
+    for sid, s in subtasks.items():
+        for tag in s.get("provides", []) or []:
+            if isinstance(tag, str) and tag.strip():
+                providers.setdefault(tag, []).append(sid)
+
+    def _files(s: dict) -> set[str]:
+        # `_normalize_artifact_path`, not `os.path.normpath`: both sides are
+        # planner-authored repo-relative strings, which is exactly what that
+        # helper is for, and it is what the sibling NO_FILE_OVERLAP check in
+        # `check_overlap_judge_output` already uses. It additionally strips a
+        # leading `/`, which normpath keeps — so `/src/x.ts` and `src/x.ts`
+        # read as the same file instead of as a missed duplicate.
+        return {
+            _normalize_artifact_path(f)
+            for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and f.strip()
+        }
+
+    issues: list[str] = []
+    for tag in sorted(providers):
+        sids = sorted(providers[tag])
+        for i in range(len(sids)):
+            for j in range(i + 1, len(sids)):
+                a, b = subtasks[sids[i]], subtasks[sids[j]]
+                cluster = a.get("_cofile_cluster")
+                if cluster and cluster == b.get("_cofile_cluster"):
+                    continue  # deliberate sub-file split of one file
+                shared = _files(a) & _files(b)
+                if not shared:
+                    continue
+                issues.append(
+                    f"DUPLICATE_PROVIDER: {sids[i]} and {sids[j]} both "
+                    f"provide {tag!r} and both touch "
+                    f"{', '.join(sorted(shared))} — two subtasks doing the "
+                    "same work to the same file. One should be dropped or "
+                    "merged into the other, or they should be sequenced with "
+                    "an explicit depends_on and given distinct surfaces "
+                    "(DESIGN §5 *Cross-domain surface overlap*)")
+    return issues
+
+
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
@@ -18769,6 +18857,19 @@ def _add_requires_edge(tree: list[dict], sid: str, tag: str) -> None:
                 return
 
 
+def _add_depends_on_edge(tree: list[dict], sid: str, dep: str) -> None:
+    """Append an id-channel `depends_on` entry to `sid` inside `tree`.
+
+    The `_add_requires_edge` sibling for the other dependency channel. Takes
+    the whole plan list for the same reason: `_would_cycle_after` runs its
+    callable against a deep copy."""
+    for plan in tree:
+        for s in plan.get("subtasks", []) or []:
+            if s.get("id") == sid:
+                s.setdefault("depends_on", []).append(dep)
+                return
+
+
 def _repair_missing_requires(
     plans: list[dict], defects: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -18785,18 +18886,47 @@ def _repair_missing_requires(
     can be created, which is why the repair lives here rather than
     upstream.
 
-    Deliberately narrow. A defect is repaired only when every one of:
+    Deliberately narrow. A defect is only ever considered when
+    `kind == "missing_requires"` (the only shape with a mechanical fix),
+    the sid exists in the plan, the edge is not already declared
+    (idempotence), and the edge leaves the graph acyclic.
 
-    - `kind == "missing_requires"` (the only shape with a mechanical fix);
-    - the sid exists in the plan;
-    - the named tag has EXACTLY ONE in-plan provider, and it is not the
-      sid itself. Zero providers means the plan lacks the capability, not
-      the edge — a repair would be inventing a dependency on nothing. Two
-      or more is an ambiguity only a human can resolve;
-    - the sid does not already declare that tag (idempotence);
-    - the edge leaves the graph acyclic.
+    Given that, `tag_or_dep` is resolved against BOTH of the plan's
+    dependency channels, first match winning — the tag channel is tried
+    first so pre-existing behavior is bit-for-bit unchanged:
 
-    Everything else is returned unrepaired for the caller to die() on.
+    (a) TAG — the value has EXACTLY ONE in-plan provider that is not the
+        sid itself. Appends an in-plan `requires`.
+    (b) ID — the value is a surviving subtask id that is not the sid
+        itself. Appends a `depends_on`. Unambiguous by construction: an
+        id names exactly one subtask, so (a)'s several-providers
+        ambiguity cannot arise here.
+    (c) SINGLE-CLUSTER FAN-OUT — several providers, but all of them share
+        one non-None `_cofile_cluster` and the sid is not among them.
+        Appends an in-plan `requires`: those providers are the sub-file
+        region splits of ONE file (DESIGN §5½ (P1) *Sub-file*), so
+        requiring the tag orders the subtask behind the whole cluster,
+        which is exactly the intent. The ambiguity is an artifact of
+        counting split siblings as rival providers.
+
+    Everything else is returned unrepaired for the caller to die() on: a
+    value that is neither a surviving id nor a provided tag means the plan
+    genuinely lacks the capability rather than the edge, and providers
+    spanning DIFFERENT clusters is an ambiguity only a human can resolve.
+
+    Reading only channel (a) was this function's original shape, and it
+    was the dominant reason a repairable run still died. Measured across
+    the run corpus: 23 of the 24 defects refused as "no in-plan provider"
+    named a surviving subtask id, and run 62a19deb died with 22 defects of
+    which every one was that shape. Channel (c) accounted for the refusals
+    in a second run (one tag, eleven providers, all one cluster). See
+    `tests/test_wiring_repair_corpus.py` for the measured ratios.
+
+    Each repair records a `channel` of "tag" / "id" / "cofile_cluster".
+    `provider` is the sole provider for (a), the named id for (b), and the
+    lexicographically smallest cluster member for (c) — a determinism
+    device, since on (c) the added tag edge orders the sid behind ALL of
+    them, not just the recorded one.
 
     The cycle trial is load-bearing rather than defensive: a well-formed
     but WRONG edge was measured closing a cycle across an entire plan, so
@@ -18818,34 +18948,58 @@ def _repair_missing_requires(
     for d in defects:
         sid = d.get("sid")
         tag = (d.get("tag_or_dep") or "").strip()
-        if d.get("kind") != "missing_requires" or sid not in by_id:
+        # `tag_or_dep` carries no `minLength` in SCHEMAS["wiring_judge"], so
+        # an empty string is schema-valid. Without this guard a subtask
+        # declaring `provides: [""]` makes the tag channel match it and the
+        # gate synthesizes a meaningless `{"tag": ""}` edge — inside a
+        # correctness gate. `check_duplicate_providers` filters empty tags
+        # for the same reason.
+        if (d.get("kind") != "missing_requires" or sid not in by_id
+                or not tag):
             unrepaired.append(d)
             continue
         candidates = providers.get(tag, [])
-        if len(candidates) != 1 or candidates[0] == sid:
-            unrepaired.append(d)
-            continue
+        # `already` exists because a silently-discarded disagreement with the
+        # judge inside a correctness gate is exactly the kind of signal that
+        # should not vanish. Dropping the defect is still right — a duplicate
+        # edge is worse, and dying over an edge that already exists is absurd.
         declared = {
             e.get("tag") for e in (by_id[sid].get("requires") or [])
             if isinstance(e, dict)
         }
-        if tag in declared:
-            # Already wired — the judge misread the plan. Dropping it is
-            # right (a duplicate edge is worse, and dying over an edge that
-            # already exists is absurd), but log it: every other decision
-            # this function makes is either logged as a repair or surfaced
-            # as a residual, and a silently-discarded disagreement with the
-            # judge inside a correctness gate is exactly the kind of signal
-            # that should not vanish.
-            already.append(f"{sid} / {tag}")
-            continue
-        if _would_cycle_after(
-            plans, lambda tr, _s=sid, _t=tag: _add_requires_edge(tr, _s, _t)
-        ):
+        cluster: set = set()
+        if len(candidates) > 1 and sid not in candidates:
+            cluster = {by_id[c].get("_cofile_cluster") for c in candidates}
+
+        if len(candidates) == 1 and candidates[0] != sid:
+            channel, provider = "tag", candidates[0]
+        elif tag in by_id and tag != sid:
+            channel, provider = "id", tag
+        elif len(cluster) == 1 and None not in cluster:
+            channel, provider = "cofile_cluster", sorted(candidates)[0]
+        else:
             unrepaired.append(d)
             continue
-        _add_requires_edge(plans, sid, tag)
-        repairs.append({"sid": sid, "tag": tag, "provider": candidates[0]})
+
+        if channel == "id":
+            if tag in (by_id[sid].get("depends_on") or []):
+                already.append(f"{sid} / {tag}")
+                continue
+            apply_fn = (
+                lambda tr, _s=sid, _t=tag: _add_depends_on_edge(tr, _s, _t))
+        else:
+            if tag in declared:
+                already.append(f"{sid} / {tag}")
+                continue
+            apply_fn = (
+                lambda tr, _s=sid, _t=tag: _add_requires_edge(tr, _s, _t))
+
+        if _would_cycle_after(plans, apply_fn):
+            unrepaired.append(d)
+            continue
+        apply_fn(plans)
+        repairs.append({"sid": sid, "tag": tag, "provider": provider,
+                        "channel": channel})
     if already:
         log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
             f"subtask already declares — ignored ({', '.join(already)})")
@@ -19733,8 +19887,15 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     repairs, unrepaired = _repair_missing_requires(
         plans, _live_wiring_defects(judge_result))
     for r in repairs:
-        log(f"  wiring-gate: repaired {r['sid']} -> requires "
-            f"{r['tag']!r} (sole in-plan provider: {r['provider']})")
+        if r.get("channel") == "id":
+            log(f"  wiring-gate: repaired {r['sid']} -> depends_on "
+                f"{r['tag']!r} (named subtask id)")
+        elif r.get("channel") == "cofile_cluster":
+            log(f"  wiring-gate: repaired {r['sid']} -> requires "
+                f"{r['tag']!r} (sub-file cluster of {r['provider']})")
+        else:
+            log(f"  wiring-gate: repaired {r['sid']} -> requires "
+                f"{r['tag']!r} (sole in-plan provider: {r['provider']})")
     if repairs:
         log(f"phase 3: plan-wiring gate added {len(repairs)} missing "
             f"edge(s); {len(unrepaired)} defect(s) not auto-repairable")
@@ -19749,10 +19910,13 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "edges do not match the work the subtasks actually need (a subtask "
             "that should require a capability it never declares, or a merge/"
             "drop that severed a real dependency). The gate already added "
-            "every edge it could resolve unambiguously; what remains names a "
-            "tag with NO in-plan provider (the plan is missing the work, not "
-            "just the edge), or with SEVERAL providers (ambiguous — only you "
-            "can say which), or would close a dependency cycle. This is a "
+            "every edge it could resolve unambiguously — on the tag channel, "
+            "the subtask-id channel, and single-sub-file-cluster fan-outs. "
+            "What remains names a value that is NEITHER a surviving subtask "
+            "id NOR a tag any subtask provides (the plan is missing the work, "
+            "not just the edge), or a tag whose SEVERAL providers span "
+            "different sub-file clusters (ambiguous — only you can say "
+            "which), or would close a dependency cycle. This is a "
             "correctness gate "
             "with no bypass flag: add the missing requires/provides/depends_on "
             "to the plan, or refine the task so the cross-subtask dependencies "
@@ -19798,6 +19962,16 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
 
     Returns the (possibly mutated) `plans` list, ready for `schedule()`.
     """
+    # DETERMINISTIC FLOOR — deliberately ABOVE every skip below, so it is
+    # evaluated on the paths where the judge never runs at all: a
+    # single-planner plan, a `--skip-overlap-judge` opt-out, and (until the
+    # re-plan repair in DESIGN §5) a downstream gate re-planning after this
+    # phase had already passed. A mechanical check that a skip flag can
+    # switch off is not a floor (DESIGN §5 *A deterministic floor underneath
+    # the judge*). Advisory as shipped — logged, never gating.
+    for issue in check_duplicate_providers(plans):
+        log(f"⚠  {issue}")
+
     # Cheap-skip conditions, in order of cost.
     if st.data.get("skip_overlap_judge"):
         log("phase 2¾: overlap-judge skipped (--skip-overlap-judge / "

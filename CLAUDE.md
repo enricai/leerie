@@ -2351,15 +2351,44 @@ avoided: planners run blind, so a subtask in domain X cannot declare a
 `phase_reconcile`'s charter is *declared-but-unmatched* tags — a subtask that
 declared nothing never enters its `unresolved_requires` input. Measured across
 the corpus (2026-08-01), **6 of the 9 runs that ever reached this gate died at
-it**, and the repair resolves 3 of those 6 outright. `_repair_missing_requires`
-adds an edge only when the defect is `missing_requires`, the tag has EXACTLY
-ONE in-plan provider that is not the subtask itself, the subtask does not
-already declare it, and the edge leaves the graph acyclic. Pinned: the incident
-shape repairs and reschedules producers strictly before the consumer (with an
-anti-vacuity control that the *un*repaired plan races them); zero providers
-declines (the plan lacks the work, not the edge); several providers declines
-(ambiguous); a non-`missing_requires` kind, an unknown sid, and a self-provider
-all decline; an already-declared tag is neither repaired nor gating. The cycle
+it**. `_repair_missing_requires` adds an edge only when the defect is
+`missing_requires`, the sid is in the plan, `tag_or_dep` is non-empty (the
+schema carries no `minLength`, and a subtask declaring `provides: [""]` would
+otherwise make the tag channel synthesize a meaningless empty-tag edge), the
+edge is not already declared, and it leaves the graph acyclic.
+
+Given that, **`tag_or_dep` is resolved against BOTH dependency channels** —
+the field name is literal, and the judge fills it with either. First match
+wins, tag first, so pre-existing behavior is unchanged: **(a) tag** — exactly
+one in-plan provider that is not the sid → append an in-plan `requires`;
+**(b) id** — a surviving subtask id that is not the sid → append a
+`depends_on`, unambiguous by construction since an id names exactly one
+subtask; **(c) single-cluster fan-out** — several providers that all share one
+`_cofile_cluster` → append the `requires` tag, because those providers are the
+sub-file region splits of ONE file (§5½ (P1)) and requiring the tag orders the
+subtask behind the whole cluster. Each repair records a `channel`.
+
+Reading only the tag channel was the original shape (PR #145) and was the
+dominant refusal cause: **23 of the 24 defects refused as "no in-plan
+provider" named a surviving subtask id**, and run `62a19deb` died with 22
+defects of which every one was that shape; a second run's refusals were one
+tag with eleven providers that were all one cluster. Closing both channels
+took the corpus from 19/27 to 21/27 runs clearing the gate and from 35/63 to
+9/63 unrepaired defects — and the repair now resolves **5 of those 6** historic
+deaths rather than 3. The residual refusals are genuine: a `tag_or_dep` that
+is neither a surviving id nor a provided tag means the plan lacks the *work*,
+not the edge.
+
+Pinned: the incident shape repairs and reschedules producers strictly before
+the consumer (with an anti-vacuity control that the *un*repaired plan races
+them); a value that is neither a provided tag nor a subtask id declines;
+providers spanning *different* clusters decline
+(`test_multiple_providers_in_different_clusters_declines`), while one shared
+cluster repairs; the id channel declines a self-reference and respects the
+same cycle guard; the tag channel wins when a value is both a tag and an id; a
+non-`missing_requires` kind, an unknown sid, an empty `tag_or_dep`, and a
+self-provider all decline; an already-declared edge is neither repaired nor
+gating (on both channels). The cycle
 guard has its own group because it is load-bearing rather than defensive — a
 well-formed but WRONG edge was measured closing a cycle across an entire plan,
 so `test_plan_still_schedules_after_a_skipped_cycle` asserts both that the
@@ -2378,6 +2407,61 @@ under-wired subtask declared 3 `requires` and 3 `depends_on`; it was missing
 four *specific* edges, not all of them, so the advisory's both-empty condition
 never held regardless of prefix. Widening only added noise by flagging
 legitimate root producers.
+
+The repair's *measured effect* — as opposed to its per-rule behavior — is
+locked separately in `tests/test_wiring_repair_corpus.py` against
+`tests/fixtures/wiring_repair_corpus/corpus.json`, the real recorded
+`wiring_judge` output plus real post-filter plans from the six runs that ever
+died at this gate (prose redacted; only the fields the repair reads are kept,
+plus `_cofile_cluster`, which the single-cluster channel needs). It pins the
+per-run repaired/unrepaired counts, the **channel** each run's repairs flow
+through (a defect repairing for the *wrong* reason is a regression the counts
+alone cannot see), and the headline 5-of-6 ratio. Change the acceptance rules
+and this file fails with a message telling you the documented trade-off moved
+— which is the point.
+
+The **deterministic duplicate-provider floor** beneath `phase_overlap_judge`
+(DESIGN §5 *A deterministic floor underneath the judge*) is
+`check_duplicate_providers(plans) -> list[str]`, pinned in
+`tests/test_duplicate_providers.py`. It flags two subtasks that declare the
+same `provides` tag AND whose `files_likely_touched` intersect — pure set
+logic over structured planner fields, no prose read. It exists because the
+judge's 100% corpus recall is recall *when it runs*: it cheap-skips
+single-planner plans, is skippable by flag, and was bypassable by a downstream
+gate re-planning after it passed. The call therefore sits **above every skip**
+in `phase_overlap_judge`, and a source-coupling test enforces that ordering —
+a mechanical check a flag can switch off is not a floor.
+**The `_cofile_cluster` exclusion is load-bearing, not a refinement**: without
+it the rule matches 3571 pairs across the corpus, with it 9 — in exactly two
+runs, both destroyed by duplicate work (`392b5e7f` died at the wiring gate;
+`19a70d96` executed both duplicates and was refused at the integration gate
+after 4.7h/164 workers, having been scored CLEAN by the `wiring_judge`). The
+committed fixture makes that reproducible: stripping the marker floods
+`62a19deb` with 1752 false positives and `ad69057f` with 165. An
+"already ordered by `depends_on`" exemption is deliberately absent — measured
+zero such pairs. Paths are canonicalized with `_normalize_artifact_path` (not
+`os.path.normpath`, which keeps a leading `/` and would miss `/src/x.ts` vs
+`src/x.ts`), matching the sibling `NO_FILE_OVERLAP` check. Shipped
+**advisory** — logged, never gating — pending confirmation across live runs.
+
+The launcher's **stale-install warning** (`_warn_if_leerie_stale`,
+IMPLEMENTATION.md §0) is pinned in `tests/test_stale_install_warning.py`,
+which extracts the function verbatim from `leerie` and drives it against real
+local git fixtures (an "origin" plus a clone rewound behind it; no network).
+Running `leerie` never advances `$LEERIE_REPO` — only re-running `install.sh`
+does — so an install can sit arbitrarily far behind while the operator
+believes otherwise. Measured cost: two multi-hour funeralworks runs on
+2026-08-02 died at the wiring gate on a v0.9.100 install, reproducing the exact
+failure v0.9.101 fixes, with `state.json` recording `leerie_version: 0.9.100`
+while the dev checkout was already 0.9.102. **The throttled fetch is mandatory,
+not an optimization**: `HEAD..@{upstream}` reads the *cached* remote-tracking
+ref, which on a never-fetched install is exactly as stale as the checkout — so
+a fetch-free guard stays silent through precisely the failure it exists to
+catch (`test_warns_when_the_cached_ref_is_stale`, falsified live: removing the
+fetch fails 4 tests). Bounded at `timeout 5`, throttled to once per 24h via an
+mtime stamp in the state dir (same convention as `.dockerfile-hash`), and
+warn-only — a detached HEAD, no upstream, a non-git prefix, or an unreachable
+remote must all stay silent and never fail a run.
 
 `plans_after_*` checkpoints must be snapshots, not live references
 (`tests/test_checkpoint_aliasing.py`). `_run_phases` assigned
