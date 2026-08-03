@@ -2299,6 +2299,29 @@ undiagnosable from a log. The `InputValidationError` (unparseable JSON) path
 already logged its payload; this closes the gap for the parseable-but-invalid
 case. Recovering these by hand under `--output-format stream-json` is what
 disproved the 2026-08-03 investigation's leading hypothesis about their cause.
+
+#### Blocked-planner gap diagnostic
+
+`_format_blocked_gap(confidence) -> str` renders a blocked planner's stated
+gap for `phase_plan`'s per-category summary line, capped at
+`_BLOCKED_GAP_LOG_MAX = 400` chars with a visible `… [truncated; see log]`
+marker — never a silent cut, matching `_format_payload_for_log` above.
+
+Two transforms, both because the value is free prose. Whitespace is collapsed
+so an embedded newline cannot split a one-line summary across several rows,
+and the result is truncated: the gap moved from `confidence.gap_to_close` (a
+compact dict, frequently `{}`) to `confidence.basis` when the confidence block
+was flattened (DESIGN §8), and `basis` runs a **median of ~1.1k characters and
+up to 4.3k** across real planner submissions — so an untruncated line would put
+multiple KB on one row of the operator's terminal. The full text stays in the
+per-worker log, which the scheduling gate's own blocked-domain message already
+points at.
+
+Returns `""` rather than `None` for absent, empty or malformed input, so the
+caller interpolates an empty gap instead of the string `"None"`. The cap is
+much smaller than `_REJECTED_PAYLOAD_LOG_MAX` because this is one line inside a
+routine summary rather than a standalone failure dump. Pinned by
+`tests/test_schedule_blocked.py`.
 Pinned by `tests/test_rejected_payload_logging.py`.
 
 Resolution order (highest priority first):
