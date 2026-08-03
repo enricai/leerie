@@ -88,11 +88,18 @@ def test_no_private_module_level_function_is_unreferenced(tree: ast.Module):
 
     This docstring previously also listed `compute_subtask_branch` and
     `resolve_token_probe_cache_sec` as bash-called. That was wrong — neither
-    has any caller outside this repo's tests. When both were renamed private
-    and came under this sweep, it caught them: one was a genuine wiring bug
-    (`_resolve_token_probe_cache_sec` was never called, so its documented env
-    var and TOML key did nothing) and the other is a deliberate parity anchor,
-    now in `_INTENTIONALLY_UNCALLED`."""
+    had any caller outside this repo's tests. Renaming both private brought
+    them under this sweep, which caught them immediately:
+
+    - `resolve_token_probe_cache_sec` was a genuine wiring bug — nothing
+      called it, so its documented `LEERIE_TOKEN_PROBE_CACHE_SEC` env var and
+      `leerie.toml` key silently did nothing. It is now wired, and back to
+      being **public**: it belongs to the `resolve_*` cap-resolver family
+      alongside 41 public siblings, so privatising it was itself an
+      over-application (see
+      `test_helper_naming_convention.py::test_caps_wiring_uses_public_resolvers`).
+    - `_compute_subtask_branch` is a deliberate parity anchor, now in
+      `_INTENTIONALLY_UNCALLED`."""
     defined = {
         n.name: n.lineno
         for n in tree.body                       # module level only

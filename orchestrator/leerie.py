@@ -4452,7 +4452,7 @@ def resolve_confidence_rounds(repo_root: Path,
         default=DEFAULT_CAPS["confidence_rounds"])
 
 
-def _resolve_token_probe_cache_sec(repo_root: Path,
+def resolve_token_probe_cache_sec(repo_root: Path,
                                   cli_value: int | None = None) -> int:
     """Resolve the multi-token probe-cache floor (DESIGN §6 *Multi-token
     rotation*). Order: CLI flag (if the caller wires one) →
@@ -25778,14 +25778,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             cwd, getattr(args, "implementer_confidence_retries", None))
     caps["planner_samples"] = resolve_planner_samples(
         cwd, getattr(args, "planner_samples", None))
-    # This line was missing. `_resolve_token_probe_cache_sec` existed and was
+    # This line was missing. `resolve_token_probe_cache_sec` existed and was
     # tested, but nothing ever called it, so `caps["token_probe_cache_sec"]`
     # only ever held `DEFAULT_CAPS`' 180 — meaning the documented
     # `LEERIE_TOKEN_PROBE_CACHE_SEC` env var and the `token_probe_cache_sec`
     # leerie.toml key silently did nothing (IMPLEMENTATION.md §6 describes
     # both as working). Surfaced by `test_no_dead_functions.py` once the
     # helper was renamed private and thus came under that guard's scope.
-    caps["token_probe_cache_sec"] = _resolve_token_probe_cache_sec(
+    caps["token_probe_cache_sec"] = resolve_token_probe_cache_sec(
         cwd, getattr(args, "token_probe_cache_sec", None))
     # Resolve per-worker cgroup memory cap. Auto-derives from
     # /proc/meminfo when unset; resolver die()s on a bad size string.

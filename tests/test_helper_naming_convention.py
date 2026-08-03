@@ -147,7 +147,7 @@ def test_allowlisted_names_have_a_real_code_caller():
     """The justification must be TRUE, not just present.
 
     `_EXTERNAL_API` originally carried two entries — `_compute_subtask_branch`
-    ("worktree scripts") and `_resolve_token_probe_cache_sec` ("launcher") —
+    ("worktree scripts") and `resolve_token_probe_cache_sec` ("launcher") —
     whose stated callers did not exist. Both names were lifted from CLAUDE.md
     prose listing public API and given justifications nobody verified; they
     are referenced only in markdown. `test_allowlisted_names_actually_exist`
@@ -187,3 +187,48 @@ def test_guard_would_catch_a_public_internal_helper():
     assert not _referenced_outside_orchestrator(name), (
         "the synthetic name must be unreferenced for this control to mean "
         "anything")
+
+
+# ----- the converse direction ------------------------------------------------
+
+def test_caps_wiring_uses_public_resolvers():
+    """Every cap resolver wired into `caps[...]` must be PUBLIC.
+
+    The guard above is one-directional: it asks "is this public name missing
+    an external caller?" and never the converse, "is this private name in a
+    family declared public?". So a rename crossing that boundary passes
+    silently — which is exactly what happened. The 67-name rename privatised
+    `resolve_token_probe_cache_sec` even though it matches
+    `_PUBLIC_FAMILIES`' `^resolve_[a-z_]+$` and has 41 public siblings,
+    leaving one odd-one-out in the wiring block. Every guard stayed green.
+
+    A blanket converse rule would be wrong: the `_resolve_*_pref` primitives
+    (`_resolve_bool_pref`, `_resolve_positive_int_pref`, …) are legitimately
+    private and would match the same pattern once the leading underscore is
+    stripped. So this states the actual convention precisely instead — the
+    caps-wiring block is the cap-resolver family, and none of the generic
+    primitives appear in it.
+    """
+    src = ORCH.read_text()
+    # `caps["x"] = resolve_y(` / `caps["x"] = \\\n    resolve_y(`
+    calls = re.findall(r'caps\[\s*["\'][a-z_]+["\']\s*\]\s*=\s*\\?\s*'
+                       r'([A-Za-z_][A-Za-z_0-9]*)\s*\(', src)
+    assert calls, "found no caps-wiring assignments — has the block moved?"
+    private = sorted({c for c in calls if c.startswith("_")})
+    assert not private, (
+        f"cap resolver(s) wired into caps[...] are private: {private}. "
+        "They belong to the public `resolve_*` family — privatising one "
+        "leaves it inconsistent with its siblings and name-grouped with the "
+        "generic `_resolve_*_pref` primitives it calls."
+    )
+
+
+def test_caps_wiring_guard_sees_the_real_block():
+    """Anti-vacuity: the regex must actually match the real wiring, not pass
+    because it found nothing."""
+    src = ORCH.read_text()
+    calls = re.findall(r'caps\[\s*["\'][a-z_]+["\']\s*\]\s*=\s*\\?\s*'
+                       r'([A-Za-z_][A-Za-z_0-9]*)\s*\(', src)
+    assert len(calls) >= 6, f"only matched {len(calls)} cap resolvers: {calls}"
+    assert "resolve_token_probe_cache_sec" in calls, (
+        "the resolver this guard was written for is not being seen")

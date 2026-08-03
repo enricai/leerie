@@ -2494,7 +2494,7 @@ scopes to underscore-prefixed helpers because public names are API surface
 invoked from outside the module — `run_rebaser` from
 `scripts/host-finalize.sh`, `run_recapture_deps` from the launcher's
 `config --recapture` arm, `compose_pr_body` / `_compute_subtask_branch` /
-`_resolve_token_probe_cache_sec` from bash or tests — none of which appear
+`resolve_token_probe_cache_sec` from bash or tests — none of which appear
 as references inside `leerie.py` itself, so a module-scoped scan calls all
 five dead. It found three real ones (2026-08-01 audit), all pre-existing:
 `_confidence_issues` (IMPLEMENTATION.md had already recorded it as having
