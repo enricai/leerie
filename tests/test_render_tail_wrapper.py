@@ -199,3 +199,57 @@ def test_watcher_keeps_watching_when_proc_scan_finds_live(tmp_path):
             except subprocess.TimeoutExpired:
                 sleeper.kill()
                 sleeper.wait()
+
+
+# ----- liveness-scan cost (regression) --------------------------------------
+
+def test_liveness_scan_does_not_fork_per_process(tmp_path):
+    """`_orch_is_alive` must prefilter with ONE grep, not fork `tr` per
+    /proc entry.
+
+    The per-process form cost 11.8s at 789 processes (measured: sys 9.0s,
+    almost entirely fork overhead) and the watcher re-runs it every 2 seconds
+    — so the "orchestrator exited" banner the host greps for was delayed by a
+    full scan, and the four functional tests above timed out on any host with
+    a few hundred processes. They passed on an idle machine, which is why this
+    was mistaken for a flaky-environment problem across several review passes.
+
+    Source-coupled deliberately: the functional tests only expose the
+    regression under real load, so on an idle CI box they would pass against
+    the slow form. This assertion holds regardless of load.
+    """
+    script = _render(tmp_path)
+    assert 'grep -la "orchestrator/leerie.py" /proc/[0-9]*/cmdline' in script, (
+        "the /proc scan must prefilter with a single grep")
+    assert "for _cmd in /proc/[0-9]*/cmdline" not in script, (
+        "iterating the raw glob reintroduces one fork per process")
+
+
+def test_liveness_scan_completes_promptly(tmp_path):
+    """Functional companion: one scan against the real /proc must be fast.
+
+    Bound is generous (3s) so it cannot flake on a slow-but-correct host,
+    while the fork-per-entry form exceeds it on any machine with more than a
+    couple hundred processes — the condition under which the regression
+    actually bites.
+    """
+    import time
+
+    script = _render(tmp_path)
+    # Extract just the function and call it once with a run-id that matches
+    # nothing, forcing a full scan rather than an early return.
+    harness = script.replace("/work/", f"{tmp_path}/work/")
+    probe = (
+        f"ID=no-such-run-id-xyz\nORCH_PID=\n"
+        + harness[harness.index("_orch_is_alive() {"):harness.index("\nif [ -n \"$ORCH_PID\" ]")]
+        + "\n_orch_is_alive; echo \"rc=$?\"\n"
+    )
+    t = time.time()
+    r = subprocess.run(["bash", "-c", probe], capture_output=True, text=True,
+                       timeout=60)
+    elapsed = time.time() - t
+    assert "rc=1" in r.stdout, f"scan should report dead, got: {r.stdout!r}"
+    assert elapsed < 3.0, (
+        f"one liveness scan took {elapsed:.1f}s against "
+        f"{len(list(__import__('pathlib').Path('/proc').glob('[0-9]*')))} "
+        "processes — the scan is forking per process again")

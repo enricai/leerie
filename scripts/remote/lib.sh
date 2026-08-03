@@ -266,20 +266,33 @@ _orch_is_alive() {
   fi
   # Layer 2: /proc scan. Skip cleanly if /proc isn't mounted.
   [ -d /proc ] || return 1
-  for _cmd in /proc/[0-9]*/cmdline; do
-    [ -r "$_cmd" ] || continue
+  # Prefilter with ONE grep instead of forking `tr` once per process.
+  #
+  # The per-process form cost 11.8s at 789 processes on a real host (measured:
+  # user 3.4s, sys 9.0s — almost entirely fork overhead), and this function
+  # re-runs every 2 seconds, so the watcher spent essentially all its time
+  # forking. Two consequences: the "orchestrator exited" banner the host greps
+  # for (and auto-finalize depends on) was delayed by a full scan, and
+  # `tests/test_render_tail_wrapper.py` failed on any host with a few hundred
+  # processes because one scan exceeded its 10s timeout. Measured after:
+  # 0.146s, ~80x faster.
+  #
+  # The glob is the same one the old loop expanded, so this adds no new
+  # ARG_MAX exposure. grep's -l/-a are both in busybox, which is what the Fly
+  # image's /bin/sh provides. NUL-vs-space does not matter for this pattern:
+  # it contains no spaces, so it matches the raw cmdline bytes either way —
+  # the run-id check below still converts NULs so its bounding spaces work.
+  for _cmd in $(grep -la "orchestrator/leerie.py" /proc/[0-9]*/cmdline 2>/dev/null); do
     # Skip our own process — the wrapper script text (passed via
     # bash -c) appears in /proc/self/cmdline and would self-match.
     _cpid="${_cmd#/proc/}"
     _cpid="${_cpid%%/*}"
     [ "$_cpid" = "$$" ] && continue
+    # The pid may exit between grep and here; `tr` then yields nothing and the
+    # bounding-space check below simply does not match.
     _argv=" $(tr '\0' ' ' < "$_cmd" 2>/dev/null) " || continue
     case "$_argv" in
-      *orchestrator/leerie.py*)
-        case "$_argv" in
-          *" ${ID} "*) return 0 ;;
-        esac
-        ;;
+      *" ${ID} "*) return 0 ;;
     esac
   done
   return 1
