@@ -172,25 +172,45 @@ The orchestrator gives you, in your prompt:
      orchestrator wires a graph edge by matching against `provides`. Omit
      `reason` or leave it empty.
    - `extent: "external"` — your research surfaced a real prerequisite that
-     is **not** produced by any code subtask in this plan. It lives outside
-     the build graph: another repo's deploy, an ops runbook, a manual
-     step in a different team's queue, infrastructure already provisioned
-     elsewhere. `reason` is **required and must name the owner** ("Dynamo
-     table provisioned by the API repo's CDK stack", "ops runbook
+     is **not** produced by any code subtask in this plan. Two kinds
+     qualify.
+
+     **Outside the build graph entirely**: another repo's deploy, an ops
+     runbook, a manual step in a different team's queue, infrastructure
+     already provisioned elsewhere.
+
+     **Produced by code, but outside THIS run's scope**: the task names a
+     sibling document, an earlier phase, or another run of the same
+     multi-part deck as the owner of that work. Such a capability *is*
+     producible by a code subtask — just not one belonging to this plan —
+     so the "could a connector subtask produce this?" test below would
+     wrongly send it to `in_plan`, where it can never be satisfied and the
+     run aborts. If the task tells you the work lives elsewhere, believe
+     it: that is `external`.
+
+     In both cases `reason` is **required and must name the owner**
+     ("Dynamo table provisioned by the API repo's CDK stack", "ops runbook
      `runbooks/cutover.md` step 4", "manual: SRE must enable the feature
-     flag in PagerDuty before deploy"). The orchestrator does not try to
-     wire a graph edge — it surfaces these in `plan.json`'s
-     `preconditions` section as deploy notes for the human running the
-     change.
+     flag in PagerDuty before deploy", "phase document `<name>.md` item
+     A1, which the task states is handled by a separate run"). The
+     orchestrator does not try to wire a graph edge — it surfaces these in
+     `plan.json`'s `preconditions` section as deploy notes for the human
+     running the change.
+
+     **If the task says the work is already done, it is not a `requires`
+     at all.** A capability the task describes as *already landed in the
+     codebase* is existing state: verify it against the tree and move on.
+     Declaring a dependency on something that already exists is how a plan
+     acquires an unsatisfiable edge.
 
    `extent: "external"` is not a dumping ground for uncomfortable
    requirements. Before classifying an entry as `external`, ask: *could a
-   small connector subtask in some domain's plan produce this?* If yes, it
-   is `in_plan` and you should let the reconciler wire it. If the
-   capability is fundamentally a runtime or ops state that no code change
-   can produce, it is `external`. The discipline mirrors the reconciler's
-   discipline for `unresolvable`: name the owner concretely, or do not use
-   the channel.
+   small connector subtask in **this plan** produce this?* If yes, it is
+   `in_plan` and you should let the reconciler wire it. If the capability
+   is fundamentally a runtime or ops state that no code change can
+   produce, or the task explicitly assigns it to another run, it is
+   `external`. The discipline mirrors the reconciler's discipline for
+   `unresolvable`: name the owner concretely, or do not use the channel.
 
    **Examples:**
 
@@ -199,7 +219,10 @@ The orchestrator gives you, in your prompt:
      {"tag": "auth-service-extracted", "extent": "in_plan"},
      {"tag": "dynamo-contact-table-present-in-region",
       "extent": "external",
-      "reason": "Dynamo table + GSI provisioned by the api-services repo's CDK stack; backfill cannot run before the cutover deploy lands there."}
+      "reason": "Dynamo table + GSI provisioned by the api-services repo's CDK stack; backfill cannot run before the cutover deploy lands there."},
+     {"tag": "legacy-endpoint-retired",
+      "extent": "external",
+      "reason": "the task assigns this to phase document `<phase-two>.md` item B3, which lands in its own run; no subtask here produces it."}
    ]
    ```
 
