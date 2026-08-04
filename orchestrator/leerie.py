@@ -11295,7 +11295,6 @@ class _StrictOutputProxy:
         self.port = 0
         self.rewritten = 0
         self.passed_through = 0
-        self.upstream_errors = 0
         self.fell_back = 0
         # Split deliberately. Merging these is what made a clean run describe
         # itself as suspect: `unexpected_tool_shape` is the only pass-through
@@ -11403,7 +11402,6 @@ class _StrictOutputProxy:
         (`-vv`): one per worker API call is far too much for normal output.
         """
         if status >= 400:
-            self.upstream_errors += 1
             # Budget PER CLASS. A shared budget is not a milder version of this
             # — it is a different, broken thing: measured live, three transient
             # 529s in the first minutes consumed the whole allowance, so a
@@ -11536,11 +11534,6 @@ class _StrictOutputProxy:
             # keeps the run, which is the same trade the request-side fail-open
             # already makes. Only 400 is retried: 401/403/429 are not schema
             # problems and the original would fail identically.
-            if status == 400:
-                self.schema_errors += 1
-            elif status >= 400:
-                self.transient_errors += 1
-
             if original is not None and status == 400:
                 self._unhardenable.add(fingerprint or "")
                 self.fell_back += 1
@@ -11554,6 +11547,19 @@ class _StrictOutputProxy:
                     self._pool, self._upstream, method.upper(), path,
                     original, headers)
                 desc = "fell back: schema will not compile"
+
+            # Classified on the FINAL status, deliberately — after any
+            # fallback, not before. A 400 the fallback absorbs ends at 200 and
+            # is counted nowhere here, because `fell_back` already reports it
+            # once and correctly; counting it again as an unhandled rejection
+            # would send the operator to "re-run without the flag to confirm" a
+            # problem the proxy just resolved itself. A 400 that survives the
+            # fallback, or one on a request we never rewrote, is genuinely
+            # unhandled and is ours to raise.
+            if status == 400:
+                self.schema_errors += 1
+            elif status >= 400:
+                self.transient_errors += 1
             self._log_exchange(method.upper(), path, status, desc, payload)
 
             out = [f"HTTP/1.1 {status} X".encode("latin-1")]

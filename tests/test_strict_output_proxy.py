@@ -830,7 +830,7 @@ def test_upstream_errors_are_logged_at_every_verbosity(leerie, error_upstream,
     assert len(hits) == 1, f"no upstream-error line at verbosity={verbosity}"
     assert "additionalProperties must be false" in hits[0], (
         "the response body carries the offending schema path — it must survive")
-    assert p.upstream_errors == 1
+    assert p.schema_errors == 1
 
 
 def test_upstream_error_echoes_are_budgeted(leerie, error_upstream, monkeypatch):
@@ -843,7 +843,10 @@ def test_upstream_error_echoes_are_budgeted(leerie, error_upstream, monkeypatch)
     assert len(echoed) == leerie._STRICT_PROXY_ERROR_LOG_MAX
     assert any("counted, not echoed" in l for l in lines)
     # Counted in full even when not echoed — the summary must not under-report.
-    assert p.upstream_errors == n
+    # `schema_errors`, not a merged total: these are 400s on requests that were
+    # never rewritten (the fixture's tool is unnamed), so the fallback does not
+    # absorb them and they are genuinely ours to raise.
+    assert p.schema_errors == n
 
 
 def test_per_request_lines_are_debug_only(leerie, mock_upstream, monkeypatch):
@@ -1757,3 +1760,78 @@ def test_the_unhealthy_run_summary_still_accuses(leerie):
     assert "the rewrite itself is being rejected" in summary
     assert "re-run without the flag" in summary
     assert "fell back to post-hoc validation" in summary
+
+
+def test_an_absorbed_fallback_is_not_also_an_unhandled_rejection(leerie,
+                                                                 rejecting_upstream,
+                                                                 monkeypatch):
+    """A 400 the fallback resolves is reported ONCE, as `fell_back`.
+
+    Counting it again as a schema rejection produces:
+
+        1 schema(s) fell back to post-hoc validation …;
+        1 schema rejection(s) — the rewrite itself is being rejected;
+        re-run without the flag to confirm
+
+    Both clauses describe the same event, and the second sends the operator to
+    chase a problem the proxy already resolved. That is the exact failure this
+    whole change set exists to remove, reintroduced one layer down — the
+    classification therefore keys on the FINAL status, after any fallback.
+    """
+    url, _ = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert p.fell_back == 1, "the fallback did not fire"
+    assert p.schema_errors == 0, (
+        "an absorbed 400 was also counted as an unhandled schema rejection")
+
+
+def test_a_fallback_that_does_not_help_is_still_raised(leerie, monkeypatch):
+    """Anti-vacuity for the test above: if the retried original ALSO fails, the
+    fallback did not save the run and the operator must still hear about it."""
+    calls = []
+
+    def always_400(self, method, path, body, headers):
+        calls.append(body)
+        return 400, [], json.dumps(
+            {"error": {"message": "Schema is too complex."}}).encode()
+
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_upstream", always_400)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert len(calls) == 2, "expected the hardened attempt plus the retry"
+    assert p.fell_back == 1
+    assert p.schema_errors == 1, (
+        "a 400 that survived the fallback must still be raised")
+
+
+def test_no_write_only_error_counter_survives(leerie):
+    """`upstream_errors` was a merged total nothing read once the classes were
+    split — state kept alive only by the tests asserting on it. The file's
+    stated goal is that the control flow reads top-to-bottom in one sitting."""
+    import inspect
+    import pathlib
+    # `inspect.getsource` on the class fails when leerie is imported from a
+    # path the linecache cannot resolve; read the module file directly.
+    src = pathlib.Path(inspect.getfile(leerie)).read_text()
+    assert "upstream_errors" not in src, (
+        "the merged total is back — nothing reads it once the classes split")
+    p = leerie._StrictOutputProxy(max_parallel=1)
+    assert not hasattr(p, "upstream_errors")
