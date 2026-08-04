@@ -159,6 +159,50 @@ class TestNormalizerIsDiscriminating:
         assert out == []
 
 
+class TestDegenerateTagsAreNotAWildcard:
+    """`_REQUIRES_ITEM`'s `tag` carries no `minLength`, so `"---"` and `"___"`
+    are both schema-valid and both normalize to `frozenset()`. Without a guard
+    the empty key is a WILDCARD pairing any two degenerate tags — demoting a
+    real graph edge to a deploy note, the one failure this rule must not have.
+
+    Same class of hole as the empty-`tag_or_dep` guard in
+    `_repair_missing_requires`, which CLAUDE.md records for the same reason.
+    """
+
+    def test_empty_normalized_key_does_not_pair_two_degenerate_tags(self, leerie):
+        assert leerie._tag_key("---") == leerie._tag_key("___") == frozenset()
+        plans = _plans_with("test-1", "___")
+        out = leerie._demote_unresolvable_with_external_twin(
+            plans, [{"sid": "test-1", "tag": "___"}],
+            [_external("---", "feat-001", "degenerate")])
+        assert out == [], "empty normalized key must not act as a wildcard"
+        assert plans[0]["subtasks"][0]["requires"][0]["extent"] == "in_plan"
+
+    def test_a_degenerate_tag_never_pairs_a_real_one(self, leerie):
+        plans = _plans_with("test-1", "---")
+        out = leerie._demote_unresolvable_with_external_twin(
+            plans, [{"sid": "test-1", "tag": "---"}], INCIDENT_EXTERNALS)
+        assert out == []
+
+    def test_exact_match_on_a_degenerate_tag_still_works(self, leerie):
+        """The guard is scoped to the NORMALIZED pass. An exact string match
+        on the same tag is unambiguous and must still demote."""
+        plans = _plans_with("test-1", "---")
+        out = leerie._demote_unresolvable_with_external_twin(
+            plans, [{"sid": "test-1", "tag": "---"}],
+            [_external("---", "feat-001", "degenerate but exact")])
+        assert len(out) == 1 and out[0]["match"] == "exact"
+
+    def test_real_tags_still_pair_after_the_guard(self, leerie):
+        """Anti-vacuity: the guard must not disable normalized matching."""
+        plans = _plans_with("test-013", "webhook-event-types-schema-settled")
+        out = leerie._demote_unresolvable_with_external_twin(
+            plans, [{"sid": "test-013",
+                     "tag": "webhook-event-types-schema-settled"}],
+            INCIDENT_EXTERNALS)
+        assert len(out) == 1 and out[0]["match"] == "singularized"
+
+
 class TestExactWinsOverNormalized:
     def test_exact_match_is_preferred(self, leerie):
         """Normalization must never perturb a case exact matching handles."""

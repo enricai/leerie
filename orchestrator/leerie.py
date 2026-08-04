@@ -16916,9 +16916,18 @@ def _demote_unresolvable_with_external_twin(
         e["tag"]: e for e in external_preconditions if e.get("tag")
     }
     # Exact wins, so normalization can never perturb existing behavior.
+    # An EMPTY normalized key is skipped on both sides: `_REQUIRES_ITEM`'s
+    # `tag` carries no `minLength`, so `"---"` and `"___"` are both
+    # schema-valid and both normalize to frozenset() — which would make the
+    # empty key a wildcard pairing any two degenerate tags. Exact matching
+    # still handles them correctly; only the normalized pass needs the
+    # guard. Same class of hole as the empty-`tag_or_dep` guard in
+    # `_repair_missing_requires` (DESIGN §5).
     normalized: dict[frozenset[str], dict] = {}
     for tag in sorted(exact):
-        normalized.setdefault(_tag_key(tag), exact[tag])
+        key = _tag_key(tag)
+        if key:
+            normalized.setdefault(key, exact[tag])
 
     demoted: list[dict] = []
     for entry in unresolvable_entries:
@@ -16928,7 +16937,8 @@ def _demote_unresolvable_with_external_twin(
         twin = exact.get(tag)
         match = "exact"
         if twin is None:
-            twin = normalized.get(_tag_key(tag))
+            key = _tag_key(tag)
+            twin = normalized.get(key) if key else None
             match = "singularized"
         if twin is None:
             continue
