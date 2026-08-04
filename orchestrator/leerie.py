@@ -20039,6 +20039,64 @@ def _add_depends_on_edge(tree: list[dict], sid: str, dep: str) -> None:
                 return
 
 
+def _expand_multi_value_wiring_defects(
+    defects: list[dict], by_id: dict[str, dict],
+    providers: dict[str, list[str]],
+) -> list[dict]:
+    """Split a `wiring_judge` defect whose `tag_or_dep` names SEVERAL
+    comma-joined values into one defect per value.
+
+    `prompts/wiring_judge.md` asks for a single value ("the capability tag
+    or subtask id the edge concerns") but `SCHEMAS["wiring_judge"]` types
+    the field as a bare `string`, so a comma-joined list is schema-valid.
+    Measured on run 488c42e5: the judge reported one defect naming FOURTEEN
+    subtask ids at once — `bugfix-018` ("Run lint, build, and targeted test
+    suites across all Phase 2a changes") legitimately needed to run after
+    every test subtask. `_repair_missing_requires` resolves `tag_or_dep` by
+    exact lookup, so the whole string matched nothing, the defect was
+    returned unrepaired, and the gate die()d — discarding a valid
+    34-subtask plan over a formatting detail in a finding that was TRUE.
+
+    This is the CLAUDE.md §12 failure mode ("a prompt can ask for any
+    behavior, but a model can drift; a real Python check cannot"): the
+    prompt asked correctly and nothing enforced it. Rather than reject the
+    malformed field, use it — the information it carries is correct, and
+    rejecting it costs a judge round and can kill the run.
+
+    Deliberately conservative, so a well-formed defect is never touched:
+
+    - only `kind == "missing_requires"` (the only repairable shape);
+    - only when the string does NOT already resolve whole (an existing
+      single value, including any tag that legitimately contains a comma,
+      takes the untouched path);
+    - only when EVERY part resolves to a surviving subtask id or a provided
+      tag — a partial match means the judge meant something else, and
+      applying a subset would silently encode a different claim than the
+      one made.
+
+    Each expanded defect keeps the original's `concrete_reason` and records
+    `_expanded_from` for the audit trail. Anything not expanded is returned
+    unchanged and in order."""
+    out: list[dict] = []
+    for d in defects:
+        raw = (d.get("tag_or_dep") or "").strip()
+        if (d.get("kind") != "missing_requires" or "," not in raw
+                or raw in by_id or raw in providers):
+            out.append(d)
+            continue
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) < 2 or not all(
+                p in by_id or p in providers for p in parts):
+            out.append(d)
+            continue
+        for part in parts:
+            expanded = dict(d)
+            expanded["tag_or_dep"] = part
+            expanded["_expanded_from"] = raw
+            out.append(expanded)
+    return out
+
+
 def _repair_missing_requires(
     plans: list[dict], defects: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -20110,6 +20168,15 @@ def _repair_missing_requires(
     for sid, s in by_id.items():
         for tag in s.get("provides", []) or []:
             providers.setdefault(tag, []).append(sid)
+
+    # A defect may name several comma-joined values in a field the prompt
+    # asks to hold one; expand those into one defect per value so the loop
+    # below (and its cycle guard) handles each unchanged.
+    _n_before = len(defects)
+    defects = _expand_multi_value_wiring_defects(defects, by_id, providers)
+    if len(defects) != _n_before:
+        log(f"  wiring-gate: expanded {_n_before} defect(s) into "
+            f"{len(defects)} after splitting comma-joined tag_or_dep values")
 
     repairs: list[dict] = []
     unrepaired: list[dict] = []
