@@ -1257,3 +1257,129 @@ def test_fingerprint_is_stable_and_discriminating(leerie):
     assert leerie._structured_output_fingerprint(b"garbage") is None
     assert leerie._structured_output_fingerprint(
         _wrap({"type": "object"}, name="Other")) is None
+
+
+# --------------------------------------------------------------------------
+# All-required: collapsing optional-subset combinatorics.
+#
+# Strict mode admits every SUBSET of a node's optional properties in any order,
+# so a node with k optionals costs ~2^k grammar paths, multiplied per array
+# element. Measured live (2026-08-04): `planner` — 11 optionals in one
+# `subtasks[]` item — was rejected with "Schema is too complex for
+# compilation"; requiring them takes it to 200.
+#
+# A controlled type experiment established what is expensive per path: 20
+# free-form string properties are rejected, while 20 enums, 20 booleans, 20
+# integers and 20 arrays all compile. Strings are the cost; optionals multiply
+# it.
+# --------------------------------------------------------------------------
+
+
+def test_no_optional_properties_survive_the_transform(leerie):
+    """The property that makes `planner` compile: zero optionals on the wire."""
+    import copy
+    leftover = {}
+    for name, schema in leerie.SCHEMAS.items():
+        s = copy.deepcopy(schema)
+        leerie._strictify_schema(s)
+
+        def walk(node, path="$"):
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    req = set(node.get("required") or [])
+                    opt = [k for k in props if k not in req]
+                    if opt:
+                        leftover.setdefault(name, []).append(f"{path}: {opt}")
+                for k, v in node.items():
+                    walk(v, f"{path}.{k}")
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    walk(v, f"{path}[{i}]")
+        walk(s)
+    assert not leftover, f"optional properties left on the wire: {leftover}"
+
+
+def test_original_schemas_are_not_mutated(leerie):
+    """`_strictify_schema` edits in place, so the transform must run on a COPY.
+
+    If it ever touched `SCHEMAS` itself, the CLI's own validation copy would
+    gain the same `required` list — and then a worker omitting an optional
+    field really would be rejected, which is exactly the PR #153 regression
+    this design claims not to repeat.
+    """
+    import copy
+    before = copy.deepcopy(leerie.SCHEMAS)
+    for name in leerie.SCHEMAS:
+        leerie._strictify_request(_wrap(copy.deepcopy(leerie.SCHEMAS[name])))
+    assert leerie.SCHEMAS == before, "the live SCHEMAS dict was mutated"
+
+
+def test_forcing_a_field_never_makes_a_trivial_value_illegal(leerie):
+    """Every forced field must accept some value the ORIGINAL schema allows.
+
+    An array with `minItems: 0` accepts `[]`; a string with `minLength: 2`
+    does not accept `""`. If a forced field falls in the second class, the
+    grammar would let the model emit a value the CLI then rejects — trading a
+    compile error for a validation error.
+    """
+    offenders = []
+    for name, schema in leerie.SCHEMAS.items():
+        def walk(node, path="$"):
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    req = set(node.get("required") or [])
+                    for k, v in props.items():
+                        if k in req or not isinstance(v, dict):
+                            continue
+                        t = v.get("type")
+                        if t == "string" and (v.get("minLength") or 0) > 0:
+                            offenders.append(f"{name}{path}.{k} minLength")
+                        if t == "array" and (v.get("minItems") or 0) > 0:
+                            offenders.append(f"{name}{path}.{k} minItems")
+                for k, v in node.items():
+                    walk(v, f"{path}.{k}")
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    walk(v, f"{path}[{i}]")
+        walk(schema)
+    assert not offenders, (
+        "forcing these would let the grammar produce a value the CLI rejects: "
+        f"{offenders}")
+
+
+def test_all_required_output_still_validates_against_the_original(leerie):
+    """The seam the whole design rests on: the CLI validates against leerie's
+    ORIGINAL schema, so an output carrying every field must still pass."""
+    jsonschema = pytest.importorskip("jsonschema")
+
+    def synth(node):
+        t = node.get("type")
+        if isinstance(t, list):
+            non_null = [x for x in t if x != "null"]
+            t = non_null[0] if non_null else "null"
+        if t == "object" or (t is None and "properties" in node):
+            return {k: synth(v) for k, v in (node.get("properties") or {}).items()}
+        if t == "array":
+            return []
+        if t == "string":
+            return (node.get("enum") or [""])[0]
+        if t in ("number", "integer"):
+            return node.get("minimum", 0)
+        if t == "boolean":
+            return False
+        return None
+
+    bad = []
+    for name, schema in leerie.SCHEMAS.items():
+        try:
+            jsonschema.validate(synth(schema), schema)
+        except jsonschema.ValidationError as e:
+            # A REQUIRED field carrying minLength is a pre-existing hazard
+            # (the wire schema must strip minLength; the CLI still enforces
+            # it), not something all-required introduces. Out of scope here.
+            if "too short" in str(e):
+                continue
+            bad.append((name, str(e).splitlines()[0][:90]))
+    assert not bad, f"all-fields-present output rejected by the original: {bad}"

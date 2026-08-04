@@ -11110,6 +11110,28 @@ def _strictify_schema(node: object) -> tuple[int, int]:
         if is_object and node.get("additionalProperties") is not False:
             node["additionalProperties"] = False
             hardened += 1
+        # Every optional property becomes required — on the wire only.
+        #
+        # Strict mode must admit every *subset* of a node's optional properties
+        # in any order, so a node with k optionals costs ~2^k grammar paths,
+        # multiplied per array element. That is what made `planner`
+        # uncompilable: 11 optionals in one `subtasks[]` item. Requiring them
+        # collapses 2^11 paths to 1 — measured, it takes `planner` from a 400
+        # ("Schema is too complex for compilation") to a 200.
+        #
+        # Safe because only the *wire* schema changes. The CLI still validates
+        # the worker's output against leerie's ORIGINAL schema, where these
+        # fields remain optional — and a field that is merely *present*
+        # satisfies an optional field's type check. Audited across all 23
+        # schemas: 89 optional fields, none of which becomes illegal when
+        # forced (arrays admit `[]`, and no forced field carries a `minLength`
+        # its trivial value would violate).
+        #
+        # NOT the mistake PR #153 undid. That regression was models *omitting*
+        # required fields and so producing nothing schema-valid; here the
+        # grammar makes omission impossible by construction.
+        if is_object and isinstance(node.get("properties"), dict):
+            node["required"] = sorted(node["properties"])
         for value in node.values():
             h, s = _strictify_schema(value)
             hardened += h
