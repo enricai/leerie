@@ -1974,6 +1974,22 @@ and `MERGE_HEAD` are untouched, the temp index is cleaned up, refs are
 namespaced per run+subtask so two crashes cannot clobber each other, and a
 tree identical to `HEAD^{tree}` returns `None` rather than a ref naming an
 empty diff.
+**`scripts/remote/collect-subtrees.sh` embeds a second copy of
+`SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
+`claude -p --json-schema` directly from bash on the remote machine and cannot
+import the orchestrator. **Any edit to that schema must update both.**
+`tests/test_collect_subtrees_integrator_schema.py` is the guard: it parses the
+`integrator_schema='{...}'` assignment out of the real script and asserts
+whole-object equality with the live `SCHEMAS["integrator"]` — deliberately
+whole-object rather than a spot-check of the fields that last drifted, since
+the next drift will be somewhere else. It exists because the copy **had already
+silently drifted in production** (measured 2026-08-03): it still carried
+`maxLength` 2000/500 on the confidence fields, values the live schema had moved
+off twice since (to 8000/2000, then deleted outright), so remote integrator
+runs were validating worker output against a materially different contract than
+local ones — invisibly, because nothing compared the two. A corpus fixture had
+even named this test file before it existed; the guard was planned and never
+landed, which is precisely how the drift went unnoticed.
 `tests/test_resolve_run_id_autopick.py` covers bare `--resume` auto-picking
 the newest resumable run (`in-progress`/`paused`/`incomplete`), including
 the two traps found by running the design against a real 58-run state dir:
