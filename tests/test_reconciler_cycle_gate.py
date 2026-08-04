@@ -1046,8 +1046,12 @@ def test_format_recommendation_dropped_requires(leerie):
     rendered = leerie._format_recommendation(rec)
     # repr() escapes the embedded quotes and newline so the line stays
     # a valid Python-call literal.
+    # Rendered in the WIRE vocabulary the schema accepts — a drop travels as
+    # `op: "drop_require"` inside `tag_ops`. The model is being told what to
+    # emit, so this must name what it can actually produce.
     assert rendered.startswith(
-        "dropped_requires(sid='feat-001', tag='app-runtime-deps', reason=")
+        "tag_ops(op='drop_require', sid='feat-001', "
+        "tag='app-runtime-deps', reason=")
     assert rendered.endswith(")")
     # reason text is in there, with quote/newline escapes intact.
     assert "Single-quoted" in rendered
@@ -1090,8 +1094,8 @@ def test_matches_recommendation_marks_correct_option(leerie):
     # dropped_requires
     rec_drop = {"op": "dropped_requires", "sid": "a", "tag": "x",
                 "reason": "r", "rationale": "case-1: planner-edge keeper"}
-    matching = "dropped_requires(sid='a', tag='x', ...)"
-    not_matching = "dropped_requires(sid='b', tag='x', ...)"
+    matching = "tag_ops(op='drop_require', sid='a', tag='x', ...)"
+    not_matching = "tag_ops(op='drop_require', sid='b', tag='x', ...)"
     assert leerie._matches_recommendation(matching, rec_drop) is True
     assert leerie._matches_recommendation(not_matching, rec_drop) is False
     # merged_subtasks
