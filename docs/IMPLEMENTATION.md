@@ -3454,6 +3454,31 @@ so batching schemas to save calls trips them and establishes nothing about any
 individual schema. leerie sends exactly one tool per request, and its largest
 single schema carries 14 optional parameters.
 
+**Fail-open on the response too — un-compilable schemas.** A 400 to a *hardened*
+request is answered by re-sending the original, untouched. The proxy records that
+schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical
+`input_schema`) in `_unhardenable`, so the doomed attempt is paid once per run
+rather than once per worker call, and increments `fell_back` — reported in the
+end-of-run summary and logged at *every* verbosity with the API's own reason via
+`_api_error_head`. Only **400** retries; 401/403/429/5xx are not schema problems
+and the original would fail identically.
+
+Measured live across all 23 schemas (2026-08-04, `claude-sonnet-4-5-20250929`):
+**21 compile, 2 do not** — `planner` ("Schema is too complex.") and `reconciler`
+("The compiled grammar is too large"). Not a size effect: `conformer` has 41
+properties and compiles, `planner` has 29 and does not. The driver is optional
+properties **inside array items** (strict mode admits every subset in any order,
+so grammar size multiplies per element): `planner` 11 in one array item,
+`reconciler` 8+3, versus `implementer` 3 and `conformer` 0. With the fallback,
+both return 200 — verified end-to-end through the real proxy against the real
+API.
+
+**Grammar compilation is cached upstream.** First hardened call for a schema
+costs 25–71 s (measured; `implementer` 71.0 s, `fit_judge` 45.3 s); the second
+is ~1.8 s. So the cost is one-time per schema per run, not per worker call —
+which is what makes the flag affordable, and what makes the once-per-run
+`_unhardenable` memo worth having rather than re-probing.
+
 **Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
 request forwarded byte-identical and the no-op logged (a silent loss of the
 guarantee is the dangerous case). Listener cannot bind → `die()`, never a quiet

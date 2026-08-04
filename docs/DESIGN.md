@@ -4932,6 +4932,30 @@ dangerous failure here is a silent one.
 than proceeding unconstrained, so an operator who asked for the guarantee is
 never quietly given the old behaviour.
 
+**Some schemas cannot be constrained at all, and that is survivable.** Not every
+schema compiles into a grammar. Measured against the API across all 23 (2026-08-04),
+two are refused outright — the planner's ("Schema is too complex") and the
+reconciler's ("The compiled grammar is too large"). Size is not the cause: the
+conformer's schema is larger on every count and compiles fine. The cause is
+*optional properties inside array items* — strict mode must accept every subset
+of them in any order, so grammar size multiplies per array element, and those
+two carry twelve each.
+
+The fix is not to make those fields required. That was tried and rejected for a
+different reason and would be a regression here: requiring fields is what made
+workers fail to produce schema-valid output at all (§ *Findings carry a
+severity*, and the same lesson in the overlap judge's `artifact_paths`). Trading
+a lost guarantee for a lost worker is the wrong direction.
+
+So the proxy fails open on the *response* as well as the request: a rejection of
+the hardened request is answered by re-sending the untouched one. That worker
+keeps ordinary post-hoc validation — exactly what it had before the flag existed
+— while every other worker still gets constrained decoding. The alternative is a
+run that cannot plan, which is strictly worse than the problem the flag set out
+to solve. The degradation is logged at every verbosity and counted in the
+end-of-run summary, because a silently lost guarantee is the one outcome this
+design refuses.
+
 The normalisation has a real cost: those stripped keywords were carrying
 validation. Sixteen of the twenty-one are string-length bounds (fifteen
 `minLength`, one `maxLength`) on strings whose consumers already test

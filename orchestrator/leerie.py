@@ -11157,6 +11157,40 @@ def _strictify_request(body: bytes) -> tuple[bytes, str] | None:
             f"strict:true (+{hardened} additionalProperties, -{stripped} unsupported)")
 
 
+def _api_error_head(payload: bytes, limit: int = 160) -> str:
+    """First `limit` chars of an API error's `message`, whitespace-collapsed.
+
+    Operates on the API's own machine-generated error envelope — a mechanical
+    string, not model prose — so reading it here does not cross the
+    language-to-JSON line (CLAUDE.md).
+    """
+    try:
+        text = json.loads(payload)["error"]["message"]
+    except Exception:
+        text = payload[:limit].decode("utf-8", "replace")
+    return " ".join(str(text).split())[:limit]
+
+
+def _structured_output_fingerprint(body: bytes) -> str | None:
+    """Stable id for the schema a request carries, or None if it carries none.
+
+    Identifies "this same schema again" so a schema already proven
+    un-hardenable is not re-hardened, re-rejected and re-sent on every
+    subsequent call by the same worker type.
+    """
+    try:
+        payload = json.loads(body)
+        tools = payload.get("tools")
+        hits = [t for t in tools
+                if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+        if len(hits) != 1:
+            return None
+        canonical = json.dumps(hits[0].get("input_schema"), sort_keys=True)
+    except Exception:
+        return None
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
 class _StrictOutputProxy:
     """One loopback proxy per run, forcing constrained decoding.
 
@@ -11205,6 +11239,14 @@ class _StrictOutputProxy:
         self.rewritten = 0
         self.passed_through = 0
         self.upstream_errors = 0
+        self.fell_back = 0
+        # Schemas the API refuses to compile into a grammar. Measured: 2 of
+        # leerie's 23 (`planner`, `reconciler`) — both carry 12 optional
+        # properties inside array items, and strict mode must accept every
+        # subset of those in any order, so grammar size multiplies per element.
+        # Once a schema lands here it is never hardened again this run, so the
+        # doomed round trip is paid once rather than per worker call.
+        self._unhardenable: set[str] = set()
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(
@@ -11316,6 +11358,8 @@ class _StrictOutputProxy:
         self._writers.add(writer)
         try:
             desc = ""
+            original: bytes | None = None
+            fingerprint: str | None = None
             head = b""
             while b"\r\n\r\n" not in head:
                 chunk = await reader.read(8192)
@@ -11373,15 +11417,50 @@ class _StrictOutputProxy:
                     body += chunk
 
                 if method.upper() == "POST":
-                    swap = _strictify_request(body)
-                    if swap is not None:
-                        body, desc = swap
-                        self.rewritten += 1
-                    else:
+                    fingerprint = _structured_output_fingerprint(body)
+                    if fingerprint is not None and fingerprint in self._unhardenable:
+                        # Already proven un-compilable this run. Sending it
+                        # again would just buy another rejection.
                         self.passed_through += 1
+                    else:
+                        swap = _strictify_request(body)
+                        if swap is not None:
+                            original, (body, desc) = body, swap
+                            self.rewritten += 1
+                        else:
+                            self.passed_through += 1
 
-            status, up_headers, payload = await asyncio.get_running_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            status, up_headers, payload = await loop.run_in_executor(
                 self._pool, self._upstream, method.upper(), path, body, headers)
+
+            # Fail open on the RESPONSE, not just the request. Some schemas
+            # cannot be compiled into a sampling grammar at all — measured, 2 of
+            # leerie's 23: "Schema is too complex" (`planner`) and "The compiled
+            # grammar is too large" (`reconciler`), both carrying 12 optional
+            # properties inside array items, where strict mode must accept every
+            # subset in any order and grammar size multiplies per element.
+            #
+            # Without this the flag 400s every call by those workers, and a run
+            # that cannot plan cannot do anything — a far worse outcome than the
+            # post-hoc validation the flag exists to improve on. Re-sending the
+            # untouched request costs the guarantee for that one worker and
+            # keeps the run, which is the same trade the request-side fail-open
+            # already makes. Only 400 is retried: 401/403/429 are not schema
+            # problems and the original would fail identically.
+            if original is not None and status == 400:
+                self._unhardenable.add(fingerprint or "")
+                self.fell_back += 1
+                self.rewritten -= 1
+                self.passed_through += 1
+                log(f"  strict-output proxy: upstream rejected the hardened "
+                    f"schema ({_api_error_head(payload)}) — retrying WITHOUT "
+                    f"constrained decoding; this worker keeps ordinary "
+                    f"post-hoc validation for the rest of the run")
+                status, up_headers, payload = await loop.run_in_executor(
+                    self._pool, self._upstream, method.upper(), path,
+                    original, headers)
+                desc = "fell back: schema will not compile"
             self._log_exchange(method.upper(), path, status, desc, payload)
 
             out = [f"HTTP/1.1 {status} X".encode("latin-1")]
@@ -25360,6 +25439,9 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
                 + (" — passed-through requests did NOT get constrained "
                    "decoding; the injected tool may have changed upstream"
                    if _STRICT_PROXY.passed_through else "")
+                + (f", {_STRICT_PROXY.fell_back} schema(s) fell back to "
+                   f"post-hoc validation (would not compile into a grammar)"
+                   if _STRICT_PROXY.fell_back else "")
                 + (f", {_STRICT_PROXY.upstream_errors} upstream error(s) — "
                    f"the rewrite itself may be being rejected; re-run without "
                    f"the flag to confirm"

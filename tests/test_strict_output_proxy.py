@@ -863,7 +863,11 @@ def test_the_transform_description_is_not_discarded(leerie):
     docstring. It must reach the log."""
     import inspect
     src = inspect.getsource(leerie._StrictOutputProxy._handle)
-    assert "body, desc = swap" in src
+    # Matched loosely on purpose: the unpacking form has already changed once
+    # (the fallback path needed the pre-transform body kept alongside), and
+    # what must hold is that `desc` is bound from the swap and reaches the log
+    # — not the exact spelling of one assignment.
+    assert "desc) = body, swap" in src or "body, desc = swap" in src
     assert "_log_exchange" in src
 
 
@@ -1065,3 +1069,191 @@ def test_bedrock_detection_behaviour(leerie, env, expected):
     ns = {"os": type("_O", (), {"environ": dict(env)})}
     exec(block, ns)  # noqa: S102 - executing our own extracted source
     assert ns["bedrock_via"] == expected
+
+
+# --------------------------------------------------------------------------
+# Response-side fail-open: some schemas cannot be compiled at all.
+#
+# Measured live against the real API (2026-08-04), 2 of leerie's 23 are
+# rejected outright: `planner` ("Schema is too complex.") and `reconciler`
+# ("The compiled grammar is too large"). Both carry 12 optional properties
+# inside array items — strict mode must accept every subset in any order, so
+# grammar size multiplies per element. `conformer` has 41 properties but only
+# 2 optionals and compiles fine, which is why raw size is the wrong intuition.
+#
+# Without a fallback the flag 400s every call by those workers, and a run that
+# cannot plan cannot do anything.
+# --------------------------------------------------------------------------
+
+
+class _RejectsHardened(http.server.BaseHTTPRequestHandler):
+    """Rejects a request carrying `strict`, accepts the same one without it."""
+
+    protocol_version = "HTTP/1.1"
+    seen: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(n) if n else b""
+        hardened = b'"strict"' in body
+        type(self).seen.append({"hardened": hardened, "body": body})
+        if hardened:
+            payload = json.dumps({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "Schema is too complex."}}).encode()
+            self.send_response(400)
+        else:
+            payload = b'{"ok": true}'
+            self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.fixture()
+def rejecting_upstream():
+    _RejectsHardened.seen = []
+    srv = _Pool(("127.0.0.1", 0), _RejectsHardened)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}", _RejectsHardened.seen
+    srv.shutdown()
+
+
+def test_uncompilable_schema_falls_back_instead_of_failing(leerie,
+                                                           rejecting_upstream,
+                                                           monkeypatch):
+    """The worker must get a 200, not the 400 the hardened request earned."""
+    url, seen = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            data = await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return data, p
+    data, p = asyncio.run(go())
+    assert b'"ok": true' in data, "the caller saw the rejection instead of a retry"
+    assert [s["hardened"] for s in seen] == [True, False], (
+        "expected exactly one hardened attempt then one clean retry")
+    assert p.fell_back == 1
+    # The guarantee was lost for this schema, so it must NOT be counted as
+    # rewritten — that number is what tells an operator what they actually got.
+    assert p.rewritten == 0 and p.passed_through == 1
+
+
+def test_fallback_is_remembered_so_the_doomed_attempt_is_paid_once(
+        leerie, rejecting_upstream, monkeypatch):
+    """A rejected schema is systematic — every call by that worker repeats it.
+    Re-hardening each time would double every request for the whole run."""
+    url, seen = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+    body = _wrap({"type": "object", "properties": {}})
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            for _ in range(4):
+                await _post(port, body)
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert sum(1 for s in seen if s["hardened"]) == 1, (
+        "the un-compilable schema was hardened more than once")
+    assert len(seen) == 5, f"expected 1 doomed + 4 clean, got {len(seen)}"
+    assert p.fell_back == 1
+
+
+def test_a_different_schema_is_still_hardened_after_a_fallback(
+        leerie, mock_upstream, monkeypatch):
+    """The memo is keyed per schema. One worker's un-compilable schema must not
+    disable constrained decoding for every other worker in the run."""
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", mock_upstream)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            p._unhardenable.add(leerie._structured_output_fingerprint(
+                _wrap({"type": "object", "properties": {"a": {"type": "string"}}})))
+            skipped = await _post(port, _wrap(
+                {"type": "object", "properties": {"a": {"type": "string"}}}))
+            other = await _post(port, _wrap(
+                {"type": "object", "properties": {"b": {"type": "string"}}}))
+        finally:
+            await p.stop()
+        return skipped, other, p
+    skipped, other, p = asyncio.run(go())
+    assert b'"saw_strict": false' in skipped, "memoized schema was hardened anyway"
+    assert b'"saw_strict": true' in other, "an unrelated schema lost its hardening"
+    assert p.rewritten == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_only_400_triggers_the_fallback(leerie, monkeypatch, status):
+    """401/403/429/500 are not schema problems — the original would fail the
+    same way, so retrying just doubles the damage."""
+    calls = []
+
+    def fake_upstream(self, method, path, body, headers):
+        calls.append(body)
+        return status, [], b'{"error": {"message": "nope"}}'
+
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_upstream", fake_upstream)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert len(calls) == 1, f"status {status} should not retry"
+    assert p.fell_back == 0
+
+
+def test_fallback_is_logged_at_every_verbosity(leerie, rejecting_upstream,
+                                               monkeypatch):
+    """Losing the guarantee silently is the failure this whole flag is built to
+    avoid. The operator has to be told which worker dropped to post-hoc
+    validation, and the API's own reason is the diagnostic."""
+    url, _ = rejecting_upstream
+    p, lines = _run_against(leerie, url, monkeypatch, 1, "quiet")
+    hits = [l for l in lines if "retrying WITHOUT" in l]
+    assert len(hits) == 1, "the fallback was not surfaced"
+    assert "Schema is too complex" in hits[0], (
+        "the API's own reason must survive into the log")
+    assert p.fell_back == 1
+
+
+def test_api_error_head_reads_the_message_and_survives_junk(leerie):
+    """Operates on the API's machine-generated envelope, so it must not explode
+    on a body that is not the shape it expects."""
+    good = json.dumps({"error": {"message": "Schema is  too\n complex."}}).encode()
+    assert leerie._api_error_head(good) == "Schema is too complex."
+    assert leerie._api_error_head(b"not json at all")  # no exception, some text
+    assert leerie._api_error_head(b"") == ""
+    assert len(leerie._api_error_head(b'{"error":{"message":"' + b"x" * 500)) <= 160
+
+
+def test_fingerprint_is_stable_and_discriminating(leerie):
+    """Same schema -> same id regardless of key order; different schema -> not."""
+    a = _wrap({"type": "object", "properties": {"a": {"type": "string"}}})
+    b = _wrap({"properties": {"a": {"type": "string"}}, "type": "object"})
+    c = _wrap({"type": "object", "properties": {"z": {"type": "string"}}})
+    fa, fb, fc = (leerie._structured_output_fingerprint(x) for x in (a, b, c))
+    assert fa == fb, "key order changed the fingerprint"
+    assert fa != fc, "different schemas collided"
+    assert leerie._structured_output_fingerprint(b"garbage") is None
+    assert leerie._structured_output_fingerprint(
+        _wrap({"type": "object"}, name="Other")) is None
