@@ -1,0 +1,353 @@
+{
+ "_note": "SYNTHETIC shape-matched fixture; no real repo content. See module docstring.",
+ "multi_value": "check-001, check-002, check-003, check-004, check-005, check-006, check-007, check-009, check-012, check-013, check-014, check-015, check-016, check-017",
+ "subtasks": [
+  {
+   "id": "impl-001",
+   "title": "Implement component 001",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-001-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-002",
+   "title": "Implement component 002",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-002-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-003",
+   "title": "Implement component 003",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-003-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-004",
+   "title": "Implement component 004",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-004-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-005",
+   "title": "Implement component 005",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-005-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-006",
+   "title": "Implement component 006",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-006-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-007",
+   "title": "Implement component 007",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-007-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-008",
+   "title": "Implement component 008",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-008-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-009",
+   "title": "Implement component 009",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-009-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-010",
+   "title": "Implement component 010",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-010-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-011",
+   "title": "Implement component 011",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-011-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-012",
+   "title": "Implement component 012",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-012-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-013",
+   "title": "Implement component 013",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-013-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-014",
+   "title": "Implement component 014",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-014-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-015",
+   "title": "Implement component 015",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-015-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-016",
+   "title": "Implement component 016",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-016-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-017",
+   "title": "Implement component 017",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-017-ready"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-001",
+   "title": "Add checks for component 001",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-001-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-002",
+   "title": "Add checks for component 002",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-002-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-003",
+   "title": "Add checks for component 003",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-003-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-004",
+   "title": "Add checks for component 004",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-004-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-005",
+   "title": "Add checks for component 005",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-005-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-006",
+   "title": "Add checks for component 006",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-006-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-007",
+   "title": "Add checks for component 007",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-007-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-009",
+   "title": "Add checks for component 009",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-009-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-012",
+   "title": "Add checks for component 012",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-012-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-013",
+   "title": "Add checks for component 013",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-013-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-014",
+   "title": "Add checks for component 014",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-014-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-015",
+   "title": "Add checks for component 015",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-015-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-016",
+   "title": "Add checks for component 016",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-016-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-017",
+   "title": "Add checks for component 017",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "component-017-checked"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-018",
+   "title": "Run the full verification suite over all changes",
+   "depends_on": [
+    "impl-001",
+    "impl-002",
+    "impl-003"
+   ],
+   "requires": [],
+   "provides": [
+    "verification-complete"
+   ],
+   "_cofile_cluster": null
+  }
+ ],
+ "defects": [
+  {
+   "kind": "missing_requires",
+   "sid": "check-006",
+   "tag_or_dep": "component-006-ready",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "check-014",
+   "tag_or_dep": "component-014-ready",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "impl-018",
+   "tag_or_dep": "check-001, check-002, check-003, check-004, check-005, check-006, check-007, check-009, check-012, check-013, check-014, check-015, check-016, check-017",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  }
+ ]
+}
