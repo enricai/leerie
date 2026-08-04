@@ -43,14 +43,17 @@ _FIXTURE = (Path(__file__).resolve().parent
 # repair learned to read BOTH dependency channels (DESIGN §5): `tag_or_dep`
 # carries a capability tag OR a subtask id, and a multi-provider tag whose
 # providers all share one `_cofile_cluster` is a sub-file split, not a real
-# ambiguity. Five of six now repair fully; the sixth is refused for the one
-# reason the rule is deliberately built to respect — the plan genuinely lacks
-# the work (see the per-run comments and `EXPECTED_CHANNELS`).
+# ambiguity. ALL SIX now repair fully: the sixth (eed1153d) was refused
+# because its `tag_or_dep` joined two real capabilities with " / ", which
+# exact lookup could not resolve; the multi-value expander splits it, and both
+# halves resolve through the tag channel. Was 3/6 (tag channel only, PR #145),
+# then 5/6 (id + cofile channels), now 6/6.
 EXPECTED = {
     "29a6bf8e": (1, 1),    # fully repairable -> run proceeds
     "3a4abba3": (2, 2),    # fully repairable -> run proceeds
     "6146bd2f": (4, 4),    # fully repairable -> run proceeds
-    "eed1153d": (5, 4),    # 1 tag: no provider, and not a subtask id either
+    "eed1153d": (5, 6),    # 6 after the slash-joined defect expands into 2
+                           #   (0.9.110 + the " / " separator); was (5, 4)
     "ad69057f": (11, 11),  # 8 tag + 3 single-cluster fan-out (was: refused)
     "62a19deb": (22, 22),  # every defect names a subtask id (was: refused)
 }
@@ -62,7 +65,7 @@ EXPECTED_CHANNELS = {
     "29a6bf8e": {"tag": 1},
     "3a4abba3": {"tag": 2},
     "6146bd2f": {"tag": 4},
-    "eed1153d": {"tag": 4},
+    "eed1153d": {"tag": 6},
     "ad69057f": {"tag": 8, "cofile_cluster": 3},
     "62a19deb": {"id": 22},
 }
@@ -93,7 +96,12 @@ def test_repair_counts_match_the_measured_corpus(leerie, run):
         f"{run}: repaired {len(repairs)} of {len(live)}, expected {exp_rep}. "
         "The repair rule's acceptance criteria have moved; confirm that is "
         "intended before updating this number")
-    assert len(repairs) + len(unrepaired) <= len(live)
+    # Every input defect is accounted for, but the total can EXCEED len(live):
+    # `_expand_multi_value_wiring_defects` splits a `tag_or_dep` naming several
+    # capabilities into one defect per value, so a single input finding can
+    # legitimately produce several repairs. What must hold is that nothing
+    # vanishes silently.
+    assert len(repairs) + len(unrepaired) >= len(live)
 
 
 @pytest.mark.parametrize("run", sorted(EXPECTED_CHANNELS))
@@ -137,14 +145,17 @@ def test_fully_repaired_runs_schedule_with_producers_first(leerie, run):
     leerie._validate_plan(subtasks)
 
 
-def test_the_one_unrepairable_run_is_refused_for_a_principled_reason(leerie):
-    """`eed1153d` must fail for the documented reason — the plan genuinely
-    lacks the work — not because the repair silently stopped working.
+def test_no_run_is_refused_now_that_multi_value_resolves(leerie):
+    """`eed1153d` was the last refusal, and it is now repairable.
 
-    "No provider" alone is no longer a sufficient explanation: since the
-    repair reads the id channel too, a value with no provider that names a
-    surviving subtask id IS repairable. The refusal is only principled when
-    the value is neither.
+    Its `tag_or_dep` was `'size-field-enum-enforced / integrator-schema-drift-fixed'`
+    — TWO real capabilities joined by " / ", which exact lookup could not
+    resolve. Both halves are provided in that plan, so the multi-value
+    expander splits it and each half repairs through the tag channel.
+
+    The refusal was never principled: the plan did NOT lack the work. It is
+    kept as a named test because "no provider for the joined string" looked
+    like a genuine capability gap and was not.
     """
     data = _corpus()["eed1153d"]
     plans = copy.deepcopy(data["plans"])
@@ -155,16 +166,18 @@ def test_the_one_unrepairable_run_is_refused_for_a_principled_reason(leerie):
             providers.setdefault(tag, []).append(sid)
     live = leerie._live_wiring_defects(
         {"wiring_defects": data["wiring_defects"]})
-    _repairs, unrepaired = leerie._repair_missing_requires(plans, live)
+    repairs, unrepaired = leerie._repair_missing_requires(plans, live)
 
-    assert len(unrepaired) == 1
-    for d in unrepaired:
-        val = (d.get("tag_or_dep") or "").strip()
-        assert not providers.get(val), f"{val!r} has an in-plan provider"
-        assert val not in by_id, (
-            f"{val!r} names a surviving subtask id — the id channel should "
-            "have repaired this rather than refusing it")
-
+    assert unrepaired == [], (
+        "eed1153d should now repair fully via multi-value expansion; "
+        f"still refused: {[d.get('tag_or_dep') for d in unrepaired]}")
+    # and BOTH halves must have been resolved, not just one
+    tags = {r["tag"] for r in repairs}
+    assert "size-field-enum-enforced" in tags
+    assert "integrator-schema-drift-fixed" in tags
+    # each half is genuinely provided — the refusal was not a real capability gap
+    assert providers.get("size-field-enum-enforced")
+    assert providers.get("integrator-schema-drift-fixed")
 
 def test_runs_refused_only_for_counting_split_siblings_now_repair(leerie):
     """Regression pin for the two runs the channel work unblocked.
@@ -186,10 +199,12 @@ def test_runs_refused_only_for_counting_split_siblings_now_repair(leerie):
             "the whole justification for reading both channels")
 
 
-def test_headline_ratio_is_five_of_six(leerie):
+def test_headline_ratio_is_six_of_six(leerie):
     """The number DESIGN and IMPLEMENTATION quote after the channel work.
 
-    Was 3/6 when the repair read the tag channel alone (PR #145).
+    3/6 with the tag channel alone (PR #145) -> 5/6 with the id and
+    single-cofile-cluster channels -> 6/6 once the multi-value expander splits
+    a `tag_or_dep` naming two real capabilities.
     """
     full = 0
     for run, data in _corpus().items():
@@ -199,7 +214,7 @@ def test_headline_ratio_is_five_of_six(leerie):
         _r, unrepaired = leerie._repair_missing_requires(plans, live)
         if live and not unrepaired:
             full += 1
-    assert full == 5, (
-        f"{full}/6 runs now repair fully, not 5/6. The documented trade-off "
+    assert full == 6, (
+        f"{full}/6 runs now repair fully, not 6/6. The documented trade-off "
         "behind detect-repair-then-die has moved; update DESIGN §5 and "
         "IMPLEMENTATION if that is intended")

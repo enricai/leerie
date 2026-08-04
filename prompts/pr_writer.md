@@ -93,9 +93,11 @@ entry, in the order *failed axes → residuals → warnings*. Quote the
 the human reviewer, not your interpretation. Do not invent fixes,
 do not downplay failures, do not omit entries.
 
-`external_preconditions` lists cross-repo prerequisites that the
-planner declared as `requires.extent: external` (out-of-graph
-dependencies). The field is **absent** when no such prerequisites
+`external_preconditions` lists prerequisites the planner declared as
+`requires.extent: external` — work that lives outside this run's build
+graph. That covers another repo's deploy, an ops runbook or manual
+step, and work the task assigns to a separate run (a sibling phase
+document, an earlier phase). The field is **absent** when no such prerequisites
 were declared (the common case). When present, render a
 `## ⚠ Deploy-ordering` section in the PR body (or fold it into an
 equivalent section the template defines). For each entry: one bullet

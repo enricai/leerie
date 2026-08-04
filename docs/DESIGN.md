@@ -445,9 +445,13 @@ entry along one axis:
   unmatched tags; cycle-breaking actions when its mutations close a
   dependency cycle; `unresolvable` as the abort escape hatch).
 - `extent: external` — a real prerequisite the planner is declaring lives
-  outside the build graph. The `reason` field names the owner (other repo,
-  ops runbook, manual step) and why no in-repo subtask could plausibly
-  produce it. The orchestrator filters these out of the matching pass
+  outside *this run's* build graph. Two kinds qualify. **Outside the build
+  graph entirely**: another repo's deploy, an ops runbook, a manual step in
+  another team's queue — nothing a code change here could produce.
+  **Producible by code, but owned by another run**: the task itself names a
+  sibling phase document, an earlier phase, or another run of the same
+  multi-part deck as the owner of that work. In both cases the `reason` field
+  names the owner. The orchestrator filters these out of the matching pass
   entirely — they never enter the reconciler's queue — and instead collects
   them into a `preconditions` section of the assembled plan. The human sees
   the insight as a deploy note rather than a hard edge. When leerie is used
@@ -457,11 +461,50 @@ entry along one axis:
   the sibling is what finalize turns into a deploy-ordering note for that
   member's PR.
 
+The test that separates the two values is **"is it in *this run's* graph?"**
+— not "could any code produce it?". That distinction is load-bearing, and
+stating it only implicitly cost a run: the second kind above is producible by
+a code subtask, so a "could code produce this?" reading forces `in_plan`,
+which by definition has no provider and routes straight to `unresolvable`.
+On a multi-part task deck whose files reference each other, that leaves the
+planner with no correct answer available and aborts the run after the full
+planning spend. The run-group carve-out below is the same principle one scope
+wider — a sibling repo's work is producible by code too, and is `external`
+for exactly this reason.
+
 The planner is the right classifier because it just did the research that
 surfaced the prerequisite — it can answer "is this satisfiable by a code
 change I'm describing?" The reconciler cannot, because asking it to predict
 whether some *other* domain's planner produces a capability is exactly the
 question planners cannot answer about each other.
+
+**The external twin.** Planners run blind, so two of them can classify the
+same capability differently: one recognizes the work belongs to another run
+and says `external`, another says `in_plan`. The `in_plan` one has no
+provider by construction, so it reaches `unresolvable` and kills the run —
+while the evidence that it is out-of-graph sits unread in the externals the
+orchestrator collected moments earlier. Measured on run `1178f696`, both
+fatal entries had such a twin: one exact (`invoice-payment-endpoint-fixed`),
+one differing by a single character (`webhook-event-**types**-schema-settled`
+vs `…-event-**type**-schema-settled`).
+
+So before dying, the orchestrator checks each `unresolvable` entry against
+the collected externals, matching first on the exact tag and then on a
+singularized token set. A hit rewrites the consumer's entry to `external`,
+inheriting the twin's `reason` attributed to the subtask that declared it,
+and the entry is dropped from `unresolvable`.
+
+**Placement is the safety property.** This runs *after* the reconciler has
+emitted its verdict, so it can only ever convert a `die()` into a deploy
+note — never "skip an edge the reconciler would have wired". Running it
+*before* the reconciler was measured demoting three tags the reconciler went
+on to resolve successfully, which would have turned real ordering
+constraints into mere notes. The reconciler resolves far more than it
+aborts (279 resolutions against 4 aborts across the run corpus), so
+preempting it is both expensive and wrong. The normalized pass is
+deliberately narrow — set equality after singularization, never partial
+token overlap — and every demotion is recorded so a wrong pairing is
+auditable rather than silent.
 
 **Collision rule.** If any planner declares `requires: {tag: X, extent:
 external}` and another planner declares `provides: X`, the `provides` wins
@@ -5493,25 +5536,26 @@ mis-wirings:
   `task_coverage_judge` is pure judgment with no code-level floor of its
   own — unlike the instruction-adherence gate's two-layer composition
   (§12), it originally had no PRIMARY deterministic check, only this
-  SECONDARY judge. `check_required_items_coverage` closes that gap the
-  same way: the classifier's structured `required_items` (its own
-  language→JSON extraction of the task's explicit, enumerable
-  requirements — a numbered checklist, not a freeform goal) is set-
-  compared against each subtask's title/`success_criteria_seed` token set,
-  mirroring `check_prescribed_command_coverage`'s normalized token-subset
-  matching. This is model-independent evidence a `task_covered: true`
-  judge verdict cannot override — the judge can still gate on off-task
-  drift or an item the classifier never enumerated (what the floor
-  cannot see), but the floor alone is sufficient to force a re-plan, and
-  is still evaluated (and can still `die()`) even when the judge crashes
-  on every round. `required_items` stays deliberately narrow: an
-  ambiguous or freeform goal is not extracted as an item, since forcing
-  one reproduces the exact freeze class (IMPLEMENTATION.md
-  §"Freeze guard (2026-07-19 incident, root cause A)") that motivated
-  deleting the old mechanical task-file-coverage gate in the first
-  place. The common case —
-  `required_items` empty — costs nothing; the floor short-circuits to
-  `[]`.
+  SECONDARY judge. That gap was closed by a deterministic floor,
+`check_required_items_coverage`, which was **deleted on 2026-08-04**: measured
+across every run that ever carried `required_items`, it passed **0 of 102
+items** — a 100% false-positive rate with no true negative in its history. It
+also violated the *Language-to-JSON* rule, since the items are LLM-written
+sentences and the check token-matched them against subtask titles.
+
+The judge above it is retained but **advisory**. Re-invoked on identical input
+it returned a different finding set 85% of the time (n=20), and the
+intersection across repeated samples was empty — no finding survived a
+re-sample. A finding a judge cannot reproduce on unchanged input is not a
+stable property of that input, and cannot justify discarding a plan.
+
+The principle this establishes: **a judge's terminal authority must be
+proportional to its measured reproducibility, and a judgment layer with no
+mechanical backstop should not be terminal at all.** `wiring_judge` keeps its
+authority (99% of its findings verify true against the plan graph, 69/70) and
+`plan_overlap_judge` keeps its (`NO_FILE_OVERLAP` / `PHANTOM_ARTIFACT` catch
+it asserting the impossible). Coverage has neither — no mechanical check can
+verify "the plan misses work X" without reading prose.
 
   The floor cannot be satisfied by a planner that never saw the
   checklist: `phase_plan` injects `required_items` verbatim into every

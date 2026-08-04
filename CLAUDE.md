@@ -479,6 +479,14 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # leerie.toml. Default: off.
 ./leerie "task" --skip-adherence-check
 
+# Skip the phase 2⅞½ task-coverage review. The gate is ADVISORY since
+# 2026-08-04 (its deterministic floor passed 0 of 102 items ever and was
+# deleted; its judge's findings do not reproduce across re-samples), so
+# this only suppresses the review and its worker call. Also
+# LEERIE_SKIP_COVERAGE_CHECK=1 or `skip_coverage_check = true` in
+# leerie.toml. Default: off.
+./leerie "task" --skip-coverage-check
+
 # Demote the conformer's gating solution_defects completeness axis (DESIGN
 # §9 *The one gating axis: solution completeness*) to advisory: found defects
 # surface as warnings but never re-drive the implementer, block a subtask, or
@@ -1153,11 +1161,18 @@ gates (`PRESCRIBED_CMD_UNRUN`), a goal-only task and a fully-covered
 command never gate, and `check_planner_output` itself carries no separate
 adherence axis to demote to advisory, since the floor is wired only into
 `phase_adherence_gate`, not the planner check loop.
-The task-coverage gate's own PRIMARY deterministic floor —
-`check_required_items_coverage(required_items, subtasks) -> list[str]`,
-sibling to `check_prescribed_command_coverage` and added specifically
-because `phase_planning_coverage_gate` originally had no code-level floor,
-only the `task_coverage_judge` judgment layer — is tested in
+The task-coverage gate is **advisory** (2026-08-04). Its deterministic
+floor, `check_required_items_coverage`, was deleted: it required one
+subtask's token set to be a SUPERSET of a required item's, and across every
+run that ever carried `required_items` it passed **0 of 102 items** — a 100%
+false-positive rate with no true negative in its history. It also violated
+the *Language-to-JSON* rule above, since `required_items` are LLM-written
+sentences. Its judge is retained but non-terminal: re-invoked on identical
+input it returned a different finding set 85% of the time (n=20) and the
+intersection across repeated samples was empty. `tests/test_phase_planning_coverage_gate.py`
+pins the advisory contract and the floor's absence.
+
+
 `tests/test_required_items_coverage.py`: uncovered/covered/partial-coverage
 cases, an empty `required_items` staying silent (the common case — 0 false
 positives by construction), paraphrase coverage via the same normalized

@@ -327,6 +327,7 @@ STATE_FIELDS = (
     "dangerously_skip_permissions",
     "skip_overlap_judge",
     "skip_adherence_check",
+    "skip_coverage_check",
     "skip_completeness_check",
     "skip_satisfied_check",
     "skip_budget_check",
@@ -381,6 +382,14 @@ STATE_FIELDS = (
     # whose every in_plan requires was unresolvable because the provider
     # domain returned 0 subtasks. List of sid strings.
     "speculative_collapse_drops",
+    # external_twin_demotions: unresolvable entries rescued by
+    # _demote_unresolvable_with_external_twin (DESIGN §5 *The external
+    # twin*) — a consumer declared a tag `in_plan` while another subtask
+    # declared the same capability `extent: external`. Each item is
+    # {sid, tag, match: "exact"|"singularized", twin_tag, twin_subtasks}.
+    # Recorded so a wrong singularized pairing is auditable rather than
+    # a silent reshaping of the dependency graph.
+    "external_twin_demotions",
     # plan_overlap_judge / plan_overlap_applied: set by phase_overlap_judge
     # (DESIGN §5 *Cross-domain surface overlap*). plan_overlap_judge stores
     # the full judge worker output (list of collisions with a_sid/b_sid/
@@ -842,6 +851,22 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 # skip_adherence_check in leerie.toml → False.
 SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
 SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-coverage-check bypass (the phase 2⅞½ task-coverage gate — the
+# advisory `task_coverage_judge` review (its deterministic floor was
+# deleted 2026-08-04 — it passed 0 of 102 items, ever)). Sibling to --skip-adherence-check, and
+# added because it was the ONLY planning gate without an operator escape
+# hatch: on run 488c42e5 the judge counted a task item the task itself
+# marked `[DESIGN FIRST]` (deferred by design) as `missing_work`, which no
+# planner could satisfy without violating the task, so every re-plan was
+# rejected again until the round budget ran out. The `deferred` field on
+# `required_items` fixes that specific cause; this flag exists because a
+# judgment worker will always be able to produce a false positive the
+# operator needs to push past. Resolution order:
+# --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
+# skip_coverage_check in leerie.toml → False.
+SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
+SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-completeness-check bypass (the conformer's gating solution_defects
 # axis — DESIGN §9 *The one gating axis: solution completeness*). Unlike the
@@ -4931,6 +4956,23 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_ADHERENCE_CHECK_FILE)
 
 
+def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-coverage-check preference. Order:
+    --skip-coverage-check CLI flag (action='store_true') →
+    LEERIE_SKIP_COVERAGE_CHECK env var →
+    skip_coverage_check in leerie.toml → False.
+
+    When True, `phase_planning_coverage_gate` is not run — neither the
+    advisory `task_coverage_judge` review — so a plan that omits a required item is
+    not caught before `phase_execute` spends. Off by default; use when the
+    gate is demanding work the task does not actually want built."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_COVERAGE_CHECK_ENV,
+        file_key="skip_coverage_check",
+        file_name=SKIP_COVERAGE_CHECK_FILE)
+
+
 def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-completeness-check preference. Order:
     --skip-completeness-check CLI flag (action='store_true') →
@@ -6660,69 +6702,6 @@ def check_prescribed_command_coverage(
             issues.append(
                 f"PRESCRIBED_CMD_UNRUN: prescribed command {cmd!r} is not "
                 "covered by any subtask's runs_commands")
-    return issues
-
-
-def check_required_items_coverage(
-    required_items: list[dict] | None, subtasks: list[dict],
-) -> list[str]:
-    """Deterministic JSON→verdict PRIMARY floor for the task-coverage gate.
-
-    Sibling to `check_prescribed_command_coverage` (same composition
-    pattern: a deterministic floor as the PRIMARY layer, `task_coverage_judge`
-    as the SECONDARY/judgment layer — DESIGN §5 *Migration-surface
-    completeness*, §8 *Independent adversarial verification*). Closes the
-    gap left by `task_coverage_judge` being pure judgment with no code-level
-    floor (a plan can be schema-valid and judged `task_covered: true` while
-    still dropping an item the task explicitly enumerated, if the judge
-    simply misses it).
-
-    Computes `required_items` − ⋃(subtask.title + subtask.success_criteria_seed)
-    under the same normalized (lowercased, stopword-filtered token-SUBSET)
-    matching `check_prescribed_command_coverage` uses — planner-authored
-    structured-ish strings, never the task's own free prose and never
-    `intent`/`investigation_notes` (CLAUDE.md *Language-to-JSON*: Python
-    never re-interprets an LLM's free-text explanation of its own
-    reasoning). A required item is "covered" when some subtask's
-    title+success_criteria_seed token set is a SUPERSET of the item's own
-    salient tokens.
-
-    Short-circuits to `[]` (free) when `required_items` is empty — the
-    common case; the classifier is deliberately instructed to leave this
-    narrow and empty rather than force an ambiguous goal into a checklist
-    entry, since that is exactly the freeze class (IMPLEMENTATION.md
-    §"Freeze guard") the old mechanical task-file-coverage gate was
-    deleted for. This check
-    has no re-plan retry budget of its own tied to a fixed ratio — it feeds
-    into the coverage gate's existing `_run_checked_loop`, which re-plans
-    the whole task on ANY remaining issue (floor or judge), so a stuck
-    floor issue surfaces as ordinary gate exhaustion, not a silent freeze.
-    """
-    items = required_items or []
-    if not items:
-        return []
-
-    subtask_token_sets = [
-        _command_tokens(f"{s.get('title', '')} {s.get('success_criteria_seed', '')}")
-        for s in subtasks
-    ]
-
-    issues: list[str] = []
-    for entry in items:
-        if not isinstance(entry, dict):
-            continue
-        item = (entry.get("item") or "").strip()
-        if not item:
-            continue
-        item_tokens = _command_tokens(item)
-        covered = bool(item_tokens) and any(
-            item_tokens <= st_tokens for st_tokens in subtask_token_sets)
-        if not covered:
-            source_ref = entry.get("source_ref") or ""
-            suffix = f" ({source_ref})" if source_ref else ""
-            issues.append(
-                f"REQUIRED_ITEM_UNCOVERED: required item {item!r}{suffix} "
-                "is not covered by any subtask's title/success_criteria_seed")
     return issues
 
 
@@ -16574,7 +16553,7 @@ async def phase_plan(task: str, st: State, caps: dict,
     # instruction-adherence gate above): feed the classifier's
     # required_items checklist into the planner context so it can echo
     # each item's wording into a subtask's title/success_criteria_seed at
-    # birth — check_required_items_coverage() cannot mechanically verify
+    # birth — no mechanical check can verify
     # coverage of a checklist the planner never saw. Omitted entirely when
     # the classifier found nothing genuinely enumerable, so the common
     # case carries no false framing.
@@ -16852,6 +16831,122 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
                         "domain": sid_domain[s["id"]],
                     })
     return unresolved
+
+
+def _tag_key(tag: str) -> frozenset[str]:
+    """Normalized comparison key for a capability tag.
+
+    Lowercase, split on `-`/`_`, singularize each token, compare as a
+    SET. Deliberately narrow: it pairs `webhook-event-types-schema-settled`
+    with `webhook-event-type-schema-settled` (a real measured collision,
+    run 1178f696) and refuses to pair either with
+    `webhook-event-type-schema-migrated`. A looser "N-of-M tokens
+    overlap" rule was rejected — it would pair genuinely different
+    capabilities, and the cost of a false pairing here is demoting a real
+    graph edge to a mere deploy note.
+
+    The 3-char floor keeps short tokens whose trailing `s` is part of the
+    word (`css`, `dns`) intact."""
+    toks = re.split(r"[-_]+", tag.lower())
+    return frozenset(
+        t[:-1] if len(t) > 3 and t.endswith("s") else t
+        for t in toks if t
+    )
+
+
+def _demote_unresolvable_with_external_twin(
+    plans: list[dict],
+    unresolvable_entries: list[dict],
+    external_preconditions: list[dict],
+) -> list[dict]:
+    """Rescue an `unresolvable` entry whose tag another subtask already
+    declared `extent: external` (DESIGN §5 *The external twin*).
+
+    Planners run blind, so two of them can classify the SAME capability
+    differently: one recognizes the work belongs to another run and says
+    `external`, another says `in_plan`. The `in_plan` one has no provider
+    by construction, so it reaches `unresolvable` and dies — while the
+    evidence that it is out-of-graph sits unread in the externals the
+    orchestrator collected moments earlier. Measured on run 1178f696:
+    BOTH fatal entries had a twin (one exact, one singularized).
+
+    **Placement is the safety property.** This runs AFTER the reconciler
+    has emitted its verdict, so it can only ever convert a `die()` into a
+    deploy note — never "skip an edge the reconciler would have wired".
+    Firing before the reconciler was measured demoting 3 tags the
+    reconciler went on to resolve successfully; the reconciler resolves
+    far more than it aborts (279 resolutions vs 4 aborts across the run
+    corpus), so preempting it is expensive and wrong.
+
+    Returns the demotion records (empty if none). Mutates `plans` in
+    place, rewriting each rescued `requires` entry to `extent: external`
+    with the twin's reason attributed to its source subtask."""
+    if not unresolvable_entries or not external_preconditions:
+        return []
+
+    exact: dict[str, dict] = {
+        e["tag"]: e for e in external_preconditions if e.get("tag")
+    }
+    # Exact wins, so normalization can never perturb existing behavior.
+    # An EMPTY normalized key is skipped on both sides: `_REQUIRES_ITEM`'s
+    # `tag` carries no `minLength`, so `"---"` and `"___"` are both
+    # schema-valid and both normalize to frozenset() — which would make the
+    # empty key a wildcard pairing any two degenerate tags. Exact matching
+    # still handles them correctly; only the normalized pass needs the
+    # guard. Same class of hole as the empty-`tag_or_dep` guard in
+    # `_repair_missing_requires` (DESIGN §5).
+    normalized: dict[frozenset[str], dict] = {}
+    for tag in sorted(exact):
+        key = _tag_key(tag)
+        if key:
+            normalized.setdefault(key, exact[tag])
+
+    demoted: list[dict] = []
+    for entry in unresolvable_entries:
+        sid, tag = entry.get("sid", ""), entry.get("tag", "")
+        if not sid or not tag:
+            continue
+        twin = exact.get(tag)
+        match = "exact"
+        if twin is None:
+            key = _tag_key(tag)
+            twin = normalized.get(key) if key else None
+            match = "singularized"
+        if twin is None:
+            continue
+
+        # Attribute the inherited reason so a wrong normalized pairing is
+        # visible in plan.json rather than silently reshaping the graph.
+        src = ", ".join(twin.get("originating_subtasks") or []) or "unknown"
+        why = next(
+            (r.get("reason") or "" for r in (twin.get("reasons") or [])
+             if (r.get("reason") or "").strip()), "")
+        inherited = (
+            f"{why} (inherited from {src}, which declared "
+            f"`{twin['tag']}` as an out-of-graph prerequisite)"
+        ).strip()
+
+        rewrote = False
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                if s.get("id") != sid:
+                    continue
+                for e in s.get("requires") or []:
+                    if (isinstance(e, dict) and e.get("tag") == tag
+                            and e.get("extent") == "in_plan"):
+                        e["extent"] = "external"
+                        e["reason"] = inherited
+                        rewrote = True
+        if not rewrote:
+            # The entry named a subtask/tag pair no longer in the plan
+            # (e.g. already pruned). Nothing to rescue; let it die.
+            continue
+        demoted.append({
+            "sid": sid, "tag": tag, "match": match,
+            "twin_tag": twin["tag"],
+            "twin_subtasks": list(twin.get("originating_subtasks") or []),
+        })
+    return demoted
 
 
 def _prune_dead_subtasks(
@@ -17607,6 +17702,35 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 u for u in _unresolvable_entries
                 if u["sid"] not in set(_pruned)
             ]
+    # External-twin demotion (DESIGN §5): rescue an unresolvable entry
+    # whose tag another subtask already declared `extent: external`.
+    # Runs AFTER the reconciler's verdict so it can only convert a die()
+    # into a deploy note, never preempt a resolution the reconciler would
+    # have made — see _demote_unresolvable_with_external_twin.
+    _still_unresolvable = output.get("unresolvable", []) or []
+    if _still_unresolvable:
+        _demoted = _demote_unresolvable_with_external_twin(
+            plans, _still_unresolvable,
+            st.data.get("external_preconditions") or [])
+        if _demoted:
+            for d in _demoted:
+                log(f"phase 2½: demoted unresolvable "
+                    f"{d['sid']} requires '{d['tag']}' to extent: external "
+                    f"({d['match']} twin of '{d['twin_tag']}' declared by "
+                    f"{', '.join(d['twin_subtasks']) or 'unknown'})")
+            st.data["external_twin_demotions"] = _demoted
+            st.save()
+            _demoted_pairs = {(d["sid"], d["tag"]) for d in _demoted}
+            output["unresolvable"] = [
+                u for u in _still_unresolvable
+                if (u.get("sid"), u.get("tag")) not in _demoted_pairs
+            ]
+            # The rescued entries are now `external`, so refresh the
+            # collected preconditions: _write_plan persists this list as
+            # plan.json's `preconditions` section.
+            st.data["external_preconditions"] = (
+                _collect_external_preconditions(plans))
+            st.save()
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
     _record_conditional_drops(output)
@@ -19852,6 +19976,156 @@ def _add_depends_on_edge(tree: list[dict], sid: str, dep: str) -> None:
                 return
 
 
+def _expand_multi_value_wiring_defects(
+    defects: list[dict], by_id: dict[str, dict],
+    providers: dict[str, list[str]],
+) -> list[dict]:
+    """Split a `wiring_judge` defect whose `tag_or_dep` names SEVERAL
+    comma-joined values into one defect per value.
+
+    `prompts/wiring_judge.md` asks for a single value ("the capability tag
+    or subtask id the edge concerns") but `SCHEMAS["wiring_judge"]` types
+    the field as a bare `string`, so a comma-joined list is schema-valid.
+    Measured on run 488c42e5: the judge reported one defect naming FOURTEEN
+    subtask ids at once — `bugfix-018` ("Run lint, build, and targeted test
+    suites across all Phase 2a changes") legitimately needed to run after
+    every test subtask. `_repair_missing_requires` resolves `tag_or_dep` by
+    exact lookup, so the whole string matched nothing, the defect was
+    returned unrepaired, and the gate die()d — discarding a valid
+    34-subtask plan over a formatting detail in a finding that was TRUE.
+
+    This is the CLAUDE.md §12 failure mode ("a prompt can ask for any
+    behavior, but a model can drift; a real Python check cannot"): the
+    prompt asked correctly and nothing enforced it. Rather than reject the
+    malformed field, use it — the information it carries is correct, and
+    rejecting it costs a judge round and can kill the run.
+
+    Deliberately conservative, so a well-formed defect is never touched:
+
+    - only `kind == "missing_requires"` (the only repairable shape);
+    - only when the string does NOT already resolve whole (an existing
+      single value, including any tag that legitimately contains a comma,
+      takes the untouched path);
+    - only when EVERY part resolves to a surviving subtask id or a provided
+      tag — a partial match means the judge meant something else, and
+      applying a subset would silently encode a different claim than the
+      one made.
+
+    Each expanded defect keeps the original's `concrete_reason` and records
+    `_expanded_from` for the audit trail. Anything not expanded is returned
+    unchanged and in order."""
+    out: list[dict] = []
+    for d in defects:
+        raw = (d.get("tag_or_dep") or "").strip()
+        # Both separators are measured in the corpus (1 comma-joined and 1
+        # slash-joined across 82 defects). " / " is checked with spaces so a
+        # path-shaped tag (`src/lib/x`) is never split.
+        sep = "," if "," in raw else (" / " if " / " in raw else None)
+        if (d.get("kind") != "missing_requires" or sep is None
+                or raw in by_id or raw in providers):
+            out.append(d)
+            continue
+        parts = [p.strip() for p in raw.split(sep) if p.strip()]
+        if len(parts) < 2 or not all(
+                p in by_id or p in providers for p in parts):
+            out.append(d)
+            continue
+        for part in parts:
+            expanded = dict(d)
+            expanded["tag_or_dep"] = part
+            expanded["_expanded_from"] = raw
+            out.append(expanded)
+    return out
+
+
+def _filter_provably_false_wiring_defects(
+    plans: list[dict], defects: list[dict], dropped: dict,
+) -> tuple[list[dict], list[str]]:
+    """Drop `wiring_judge` findings the plan itself contradicts.
+
+    Returns ``(surviving_defects, notes)``.
+
+    The overlap judge already has this discipline — `NO_FILE_OVERLAP`,
+    `PHANTOM_ARTIFACT` and `DROP_BREAKS_GRAPH` catch it asserting something
+    provably false, and the checked loop re-prompts. The wiring judge had no
+    equivalent, so a finding it could not have substantiated still killed the
+    run.
+
+    Measured across the corpus (2026-08-04): of the 12 residual defects in the
+    six runs that survive today's repair and still die, **10 are provably
+    false** by set membership alone:
+
+      * 4 `broken_by_merge` naming a capability the merged plan STILL
+        provides — in one case provided by the very sid the defect is about;
+      * 3 `broken_by_drop` naming a capability whose provider was dropped with
+        `reason == "already_satisfied"`, i.e. the `satisfied_probe` verified
+        that work already exists on the base tree, so it needs no in-plan
+        provider at all;
+    A third shape — a capability appearing in no plan snapshot at all — was
+    considered and REJECTED as a predicate. It is mechanically
+    indistinguishable from the plan genuinely lacking that work, which
+    `_repair_missing_requires`' own contract already treats as a real,
+    die-worthy finding ("the plan genuinely lacks the capability, not the
+    edge"). Filtering it would suppress exactly the gap the gate exists to
+    catch.
+
+    Two predicates, each pure set membership over structured fields — no
+    prose is read (CLAUDE.md *Language-to-JSON*):
+
+    1. a `broken_by_*` whose capability is still in the provides union: the
+       finding's own premise ("a merge/drop severed this") is false.
+    2. any defect whose capability was provided by an `already_satisfied`
+       drop: satisfied on the base tree.
+
+    **Predicate 1 is deliberately scoped to `broken_by_*`.** A
+    `missing_requires` naming a still-provided capability is the *canonical
+    true* finding — the provider exists and the consumer failed to declare the
+    edge — and must survive. Applying (1) to it would silently disable the
+    gate's main channel, where findings measure 99% true (69/70)."""
+    by_id: dict[str, dict] = {
+        s["id"]: s for plan in plans for s in plan.get("subtasks", []) or []
+    }
+    provided: set[str] = set()
+    for s in by_id.values():
+        provided |= set(s.get("provides") or [])
+
+    satisfied_tags: set[str] = set()
+    dropped_tags: set[str] = set()
+    dropped_ids: set[str] = set(dropped or {})
+    for sid, rec in (dropped or {}).items():
+        tags = set((rec or {}).get("provides") or []) if isinstance(rec, dict) else set()
+        dropped_tags |= tags
+        if isinstance(rec, dict) and rec.get("reason") == "already_satisfied":
+            satisfied_tags |= tags
+            satisfied_tags.add(sid)
+
+    kept: list[dict] = []
+    notes: list[str] = []
+    for d in defects:
+        kind = d.get("kind") or ""
+        sid = d.get("sid") or "?"
+        tag = (d.get("tag_or_dep") or "").strip()
+        if not tag:
+            kept.append(d)
+            continue
+
+        if kind.startswith("broken_by_") and tag in provided:
+            notes.append(
+                f"{kind} {sid} / {tag!r}: capability is still provided by "
+                f"{', '.join(sorted(s for s in by_id if tag in (by_id[s].get('provides') or [])))}"
+                " — the finding's premise is false")
+            continue
+
+        if tag in satisfied_tags:
+            notes.append(
+                f"{kind} {sid} / {tag!r}: provider was dropped as "
+                "already-satisfied — the work exists on the base tree")
+            continue
+
+        kept.append(d)
+    return kept, notes
+
+
 def _repair_missing_requires(
     plans: list[dict], defects: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -19923,6 +20197,15 @@ def _repair_missing_requires(
     for sid, s in by_id.items():
         for tag in s.get("provides", []) or []:
             providers.setdefault(tag, []).append(sid)
+
+    # A defect may name several comma-joined values in a field the prompt
+    # asks to hold one; expand those into one defect per value so the loop
+    # below (and its cycle guard) handles each unchanged.
+    _n_before = len(defects)
+    defects = _expand_multi_value_wiring_defects(defects, by_id, providers)
+    if len(defects) != _n_before:
+        log(f"  wiring-gate: expanded {_n_before} defect(s) into "
+            f"{len(defects)} after splitting comma-joined tag_or_dep values")
 
     repairs: list[dict] = []
     unrepaired: list[dict] = []
@@ -20548,230 +20831,101 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
 async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
                                         caps: dict, models: dict[str, str],
                                         efforts: dict[str, str | None]) -> list[dict]:
-    """Independent adversarial verification of the merged plan's coverage of
-    the task (DESIGN §8 *Independent adversarial verification*). Runs after
-    `phase_adherence_gate` and before the soft-drop filters / `_schedule()` —
-    task coverage is a whole-task property of the MERGED plan set, not a
-    per-domain one, so this attacks `plans` after every planner domain has
-    been reconciled and overlap-judged, exactly like `phase_wiring_gate`
-    attacks the merged plan's graph correctness.
+    """Advisory whole-plan coverage review (DESIGN §8).
 
-    Two-layer composition, same shape as `phase_adherence_gate`'s
-    `check_prescribed_command_coverage` + `adherence_judge`:
+    **This gate does not terminate a run and does not re-plan.** It invokes
+    `task_coverage_judge` once, logs what it finds, and returns `plans`
+    unchanged.
 
-    - PRIMARY (deterministic floor): `check_required_items_coverage`
-      set-compares the classifier's structured `required_items` against
-      the plan's own structured subtask fields. Model-independent, code-
-      enforced (CLAUDE.md §12 "prompts advisory, code enforces").
-    - SECONDARY (judgment): `task_coverage_judge`, whose JSON payload is
-      only the task text and the reconciled subtask set but who also runs
-      with `INSPECT_TOOLS` and reads task-referenced files itself (per its
-      prompt), attacks the union of subtasks for missing work or off-task
-      drift the floor cannot see (an item the classifier never enumerated,
-      or off-task drift, which is not a coverage-of-an-item question at
-      all) and gates on a non-empty `coverage_gaps` array.
+    A deliberate demotion, made on measurement:
 
-    The planner self-grades its own `task_understanding` confidence axis,
-    but that self-grade is anchored to the decomposition the planner already
-    committed to — it cannot see a whole required piece of work that simply
-    never became a subtask, because there is no subtask whose self-review
-    would surface the omission. The self-score is now advisory
-    (`check_planner_output` no longer gates on it).
+    * **Its deterministic floor never worked.** `check_required_items_coverage`
+      required one subtask's `title + success_criteria_seed` tokens to be a
+      SUPERSET of a required item's. Across every run that ever carried
+      `required_items` it passed **0 of 102 items** — a 100% false-positive
+      rate with no true negative in its history. It also violated CLAUDE.md
+      outright: the items are LLM-written sentences, and Python may not
+      "infer meaning from prose… never on an LLM's response". There is no
+      correct threshold, because token-matching prose IS the defect. Deleted,
+      not re-tuned.
 
-    The planner CAN mechanically re-plan on a coverage gap (unlike the
-    overlap-judge or integrator's semantic findings), so this gate re-drives
-    `phase_plan` through the *existing* checked-loop feedback path — fresh
-    planner calls per domain with the found gaps (floor issues and/or judge
-    gaps) folded into the task — bounded by `judgment_check_rounds`, and
-    `die()`s on exhaustion exactly like the adherence/reconciler/wiring
-    gates.
+    * **Its judge does not reproduce.** Re-invoked on identical input,
+      `task_coverage_judge` returned a DIFFERENT finding set 85% of the time
+      (n=20), and the intersection across repeated samples was **empty** — not
+      one finding survived a re-sample. A finding a judge cannot reproduce on
+      unchanged input is not a stable property of that input, and cannot
+      justify discarding a plan that cost hundreds of worker calls.
 
-    A `task_coverage_judge` `WorkerError` (infrastructure crash) degrades:
-    the floor is still fully evaluated (mirrors `phase_adherence_gate`'s
-    degrade path) and the assembled plan is preserved, never discarded,
-    consistent with `_run_checked_loop`'s WorkerError→retry-then-degrade
-    handling.
+    Contrast the gates that keep their authority: the wiring judge's findings
+    are 99% true (69/70, mechanically verified against the plan graph), and
+    the overlap judge has deterministic backstops (`NO_FILE_OVERLAP`,
+    `PHANTOM_ARTIFACT`) catching it assert the impossible. Coverage has
+    neither — no mechanical check can verify "the plan misses work X" without
+    reading prose, which is exactly what the floor got wrong.
 
-    Returns the (possibly re-planned) `plans` list, ready for the soft-drop
-    filters and `_schedule()`."""
-    log("phase 2⅞½: task-coverage gate")
+    Findings are still surfaced: recorded in `state.data["coverage_gate"]` and
+    logged. That keeps #117's insight (an independent reviewer sees what a
+    self-grader cannot) while removing terminal authority the measurements do
+    not support.
+
+    Skipped entirely when `st.data["skip_coverage_check"]` is set."""
+    if st.data.get("skip_coverage_check"):
+        log("phase 2⅞½: task-coverage gate skipped (--skip-coverage-check / "
+            "LEERIE_SKIP_COVERAGE_CHECK / skip_coverage_check=true)")
+        return plans
+    log("phase 2⅞½: task-coverage gate (advisory)")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
     st.save()
 
-    repo_root = Path(os.getcwd())
     sys_prompt = _load_prompt("task_coverage_judge")
-    required_items = st.data.get("required_items") or []
-
-    def _build_payload(cur_plans: list[dict]) -> dict:
-        subtasks = [s for plan in cur_plans for s in plan.get("subtasks", []) or []]
-        return {
-            "subtasks": [
-                {
-                    "id": s.get("id", ""),
-                    "title": s.get("title", ""),
-                    "intent": s.get("intent", ""),
-                    "success_criteria_seed": s.get("success_criteria_seed", ""),
-                }
-                for s in subtasks
-            ],
-        }
-
-    # `cur_plans` is mutable closure state: each re-plan round replaces it
-    # wholesale with a fresh `phase_plan()` result, so `_invoke_judge` and
-    # `_check_coverage` always see the round's current plan.
-    cur_plans: list[list[dict]] = [plans]
-
-    async def _invoke_judge() -> dict:
-        st.bump_workers(caps)
-        payload = _build_payload(cur_plans[0])
-        user_prompt = (
-            "TASK:\n" + task + "\n\n"
-            "RECONCILED SUBTASK SET (the plan to attack):\n" +
-            json.dumps(payload, indent=2) +
-            "\n\nReturn only the JSON object per your schema."
-        )
-        return await claude_p(
-            user_prompt=user_prompt,
+    subtasks = [s for plan in plans for s in plan.get("subtasks", []) or []]
+    payload = {
+        "task": task,
+        "subtasks": [
+            {k: s.get(k) for k in
+             ("id", "title", "intent", "success_criteria_seed",
+              "files_likely_touched", "provides", "requires", "depends_on")}
+            for s in subtasks
+        ],
+    }
+    try:
+        judge_result = await claude_p(
+            "task_coverage_judge",
+            "Review this plan's coverage of the task.\n\n" +
+            json.dumps(payload, indent=2),
             system_prompt=sys_prompt,
-            schema_key="task_coverage_judge", cwd=str(repo_root),
-            allowed_tools=INSPECT_TOOLS, max_turns=30,
-            autonomous=False, caps=caps, st=st,
-            model=models.get("task_coverage_judge", MODEL_DEFAULT),
+            schema_key="task_coverage_judge",
+            cwd=Path(os.getcwd()),
+            autonomous=True,
+            caps=caps,
+            st=st,
+            model=models.get("task_coverage_judge"),
             effort=efforts.get("task_coverage_judge"),
             sid="task_coverage_judge",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
+    except Exception as exc:  # noqa: BLE001 - advisory; never fatal
+        log(f"  coverage-gate: judge failed ({type(exc).__name__}) — "
+            "advisory only, plan unchanged")
+        return plans
 
-    def _check_coverage(judge_result: dict) -> list[str]:
-        floor_issues = check_required_items_coverage(
-            required_items,
-            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
-        )
-        issues = list(floor_issues)
-        for g in judge_result.get("coverage_gaps") or []:
-            if not isinstance(g, dict):
-                continue
-            desc = (g.get("description") or "").strip()
-            ev = (g.get("concrete_evidence") or "").strip()
-            # Anti-gaming: only a gap naming a concrete description AND the
-            # concrete evidence that justifies it gates. A vague entry is
-            # dropped (mirrors the completeness gate's concrete_case rule).
-            if not desc or not ev:
-                continue
-            issues.append(
-                f"COVERAGE_GAP ({g.get('kind', 'coverage_gap')}): "
-                f"{desc} — {ev}")
-        return issues
-
-    replan_round = [0]
-
-    async def _on_feedback(fb: str) -> dict:
-        # The re-plan action IS the feedback: re-invoke phase_plan with the
-        # found coverage gaps folded into the task, so every planner sees
-        # why the merged plan was rejected. No new pause/resume machinery —
-        # this reuses `_run_checked_loop`'s existing retry semantics exactly
-        # like the reconciler/adherence/overlap-judge gates do.
-        replan_round[0] += 1
-        # A re-plan is the largest budget event in a run and was previously
-        # authorised with no budget check at all (DESIGN §13).
-        check_replan_affordable(st, caps, "coverage gate", cur_plans[0])
-        replan_task = (
-            f"{task}\n\n"
-            "IMPORTANT — an independent review of your previous plan found "
-            f"it does not fully cover the task:\n{fb}\n"
-            "Re-plan so every piece of work the task requires is covered by "
-            "some subtask, and drop any subtask whose work does not serve "
-            "the task."
-        )
-        cur_plans[0] = await phase_plan(
-            replan_task, st, caps, models, efforts,
-            replan_round=replan_round[0])
-        # Re-plans run one planner per category in parallel with no
-        # cross-category tag visibility (DESIGN §5), so a re-plan can
-        # reintroduce the exact cross-domain provides/requires drift
-        # phase_reconcile already resolved on the first pass. Re-run it
-        # here so the re-planned output isn't handed to _schedule()/
-        # phase_wiring_gate unreconciled. Short-circuits to a cheap no-op
-        # when the re-plan didn't introduce any new unresolved requires.
-        cur_plans[0] = await phase_reconcile(
-            cur_plans[0], task, st, caps, models, efforts)
-        # This is the LAST gate in the planning pipeline
-        # (reconcile -> overlap-judge -> adherence-gate -> coverage-gate),
-        # so a re-plan here invalidates all three phases upstream of it,
-        # not just the reconciler (DESIGN §5 *A re-plan invalidates every
-        # phase that already ran*).
-        #
-        # Run 19a70d96 (2026-08-01) is why: phase_overlap_judge correctly
-        # merged 8 subtasks down to 4, this gate re-planned, 8 came back
-        # with every duplicate restored, nothing re-detected them, and all
-        # 8 executed until the integration gate refused the merge — 4.7
-        # hours and 164 workers spent on a plan the overlap judge had
-        # already rejected.
-        #
-        # Both re-runs are cheap: phase_overlap_judge cheap-skips
-        # single-planner / <2-subtask plans, and phase_adherence_gate
-        # short-circuits when the task prescribes no procedure (the common
-        # case). Nesting phase_adherence_gate inside this gate's
-        # _run_checked_loop is bounded, not recursive: both loops cap at
-        # judgment_check_rounds, so the worst case is that product.
-        cur_plans[0] = await phase_overlap_judge(
-            cur_plans[0], task, st, caps, models, efforts)
-        cur_plans[0] = await phase_adherence_gate(
-            cur_plans[0], task, st, caps, models, efforts)
-        return {}
-
-    judge_result, gate_warnings = await _run_checked_loop(
-        invoke=_invoke_judge,
-        check=_check_coverage,
-        name="coverage_gate",
-        max_rounds=caps["judgment_check_rounds"],
-        make_feedback_prompt=_on_feedback,
-    )
-    for w in gate_warnings:
-        log(f"  coverage-gate: {w}")
-
-    if judge_result is None:
-        # task_coverage_judge crashed every round — degrade the JUDGMENT
-        # layer only. The floor is model-independent and still fully
-        # evaluated (mirrors phase_adherence_gate's own degrade path):
-        # a crashed judge must never silently waive the deterministic
-        # floor, or a worker-infrastructure failure becomes a way to skip
-        # required-item enforcement.
-        floor_issues = check_required_items_coverage(
-            required_items,
-            [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
-        )
-        if floor_issues:
-            die(
-                "task-coverage gate: task_coverage_judge crashed on every "
-                "round, but the deterministic required-items-coverage "
-                f"floor still found {len(floor_issues)} unaddressed "
-                "issue(s):\n" +
-                "\n".join(f"  • {i}" for i in floor_issues) +
-                "\nThis is model-independent evidence the plan drops "
-                "work the task explicitly enumerated. Refine the task so "
-                "the missing item is unambiguous, then resume."
-            )
-        log("  coverage-gate: task_coverage_judge crashed every round; "
-            "floor is clean, degrading to the assembled plan (unchanged)")
-        return cur_plans[0]
-
-    remaining_issues = _check_coverage(judge_result)
-    if remaining_issues:
-        die(
-            "task-coverage gate exhausted "
-            f"{caps['judgment_check_rounds']} re-plan round(s) without "
-            "producing a plan that covers the task's actual work:\n" +
-            "\n".join(f"  • {i}" for i in remaining_issues) +
-            "\nAn independent review found the merged plan still misses "
-            "required work (or includes off-task work). Refine the task "
-            "description so the required work is unambiguous."
-        )
+    gaps = [g for g in (judge_result or {}).get("coverage_gaps") or []
+            if isinstance(g, dict)
+            and (g.get("description") or "").strip()
+            and (g.get("concrete_evidence") or "").strip()]
+    if gaps:
+        log(f"  ⚠  coverage-gate: {len(gaps)} advisory coverage gap(s) — "
+            "NOT gating (this judge's findings do not reproduce across "
+            "re-samples; see its docstring)")
+        for g in gaps:
+            log(f"       {g.get('kind', 'coverage_gap')}: "
+                f"{(g.get('description') or '')[:180]}")
+    else:
+        log("  coverage-gate: no coverage gaps reported")
 
     st.data["coverage_gate"] = judge_result
     st.save()
-    log("phase 2⅞½: task-coverage gate clean")
-    return cur_plans[0]
+    return plans
 
 
 async def phase_wiring_gate(plans: list[dict], task: str, st: State,
@@ -20889,8 +21043,26 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     # `plans` is mutated in place; `_run_phases` re-runs _schedule() and
     # rewrites plan_snapshot when anything landed, so the wave partition
     # downstream reflects the repaired graph.
-    repairs, unrepaired = _repair_missing_requires(
-        plans, _live_wiring_defects(judge_result))
+    _live = _live_wiring_defects(judge_result)
+    # Drop findings the plan itself contradicts before repairing or dying —
+    # the discipline NO_FILE_OVERLAP/PHANTOM_ARTIFACT already give the overlap
+    # judge, which the wiring judge lacked.
+    # Expand multi-value findings FIRST: a true two-tag finding would
+    # otherwise be discarded by the unsubstantiable predicate, which cannot
+    # resolve the joined string. Measured on run eed1153d, where
+    # 'size-field-enum-enforced / integrator-schema-drift-fixed' names two
+    # capabilities that BOTH exist.
+    _by_id = {s["id"]: s for pl in plans for s in pl.get("subtasks", []) or []}
+    _prov: dict[str, list[str]] = {}
+    for _sid, _s in _by_id.items():
+        for _t in _s.get("provides", []) or []:
+            _prov.setdefault(_t, []).append(_sid)
+    _live = _expand_multi_value_wiring_defects(_live, _by_id, _prov)
+    _live, _false = _filter_provably_false_wiring_defects(
+        plans, _live, st.data.get("dropped_subtasks") or {})
+    for _n in _false:
+        log(f"  wiring-gate: discarded provably-false finding — {_n}")
+    repairs, unrepaired = _repair_missing_requires(plans, _live)
     for r in repairs:
         if r.get("channel") == "id":
             log(f"  wiring-gate: repaired {r['sid']} -> depends_on "
@@ -25678,6 +25850,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
         st.data["skip_adherence_check"] = bool(
             getattr(args, "skip_adherence_check", False))
+        st.data["skip_coverage_check"] = bool(
+            getattr(args, "skip_coverage_check", False))
         st.data["skip_completeness_check"] = bool(
             getattr(args, "skip_completeness_check", False))
         st.data["skip_satisfied_check"] = bool(
@@ -26390,6 +26564,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "before phase_execute spends. "
                          f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
                          "skip_adherence_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-coverage-check", action="store_true",
+                    help="skip the phase 2⅞½ task-coverage gate: the "
+                         "advisory task_coverage_judge review. The gate no "
+                         "longer gates (its floor passed 0 of 102 items and "
+                         "was deleted; its judge's findings do not reproduce "
+                         "across re-samples), so this only suppresses the "
+                         "review and its worker call. "
+                         f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
+                         "skip_coverage_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",
                     help="demote the conformer's gating solution_defects "
                          "completeness axis (DESIGN §9) to advisory: found "
@@ -26791,6 +26974,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # there on entry.
     args.skip_adherence_check = resolve_skip_adherence_check(
         repo_root, args.skip_adherence_check)
+    args.skip_coverage_check = resolve_skip_coverage_check(
+        repo_root, args.skip_coverage_check)
 
     # Resolve --skip-completeness-check (the conformer's gating
     # solution_defects axis, DESIGN §9). Same precedence shape; _orchestrate()
