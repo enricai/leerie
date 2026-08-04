@@ -3,11 +3,20 @@
 
 The point of pinning these structural contracts is mechanical enforcement
 of DESIGN §12 / §8: a worker that skipped self-gating fails its own JSON
-schema before the orchestrator sees the payload. The schema's
-required-ness of the discipline fields is the structural part of the
-gate; the quality of each field's content is model-judged. If a future
-change removes one of these fields without an accompanying DESIGN update,
-this test catches it.
+schema before the orchestrator sees the payload. If a future change removes
+one of these fields without an accompanying DESIGN update, this test catches
+it.
+
+**Scope narrowed 2026-08-03.** The structural part of the gate is now the
+numeric score *axes* plus `basis` — the number every §8 gate actually reads,
+and the evidence it is anchored to. `falsifiers_tested` and
+`contradictions_reconciled` remain schema *properties* and remain asked for by
+every prompt, but are no longer `required`, and `gap_to_close` is gone
+entirely. Requiring all four made the block match `anthropics/claude-code#49747`'s
+trigger profile field-for-field; a live A/B measured 8/8 submissions corrupted
+with that shape versus 0/8 without it. A required field that reliably
+annihilates the payload it validates — including the score the gate reads —
+enforces nothing. See `test_confidence_length_caps.py` for the full contract.
 """
 from __future__ import annotations
 
@@ -29,16 +38,17 @@ def test_planner_schema_status_enum(leerie):
 
 
 def test_planner_schema_confidence_required_fields(leerie):
-    """The four discipline fields are required-when-confidence-is-present.
-    Combined with confidence being top-level required, a planner that
-    skipped any of them fails its own schema."""
+    """The score axes and `basis` are required-when-confidence-is-present.
+    Combined with confidence being top-level required, a planner that emitted
+    no score, or a score with no evidential basis, fails its own schema."""
     conf = leerie.SCHEMAS["planner"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
-    expected = {"task_understanding", "decomposition_quality", "basis",
-                "falsifiers_tested", "contradictions_reconciled",
-                "gap_to_close"}
+    expected = {"task_understanding", "decomposition_quality", "basis"}
     assert expected.issubset(required)
+    for relaxed in ("falsifiers_tested", "contradictions_reconciled"):
+        assert relaxed in conf["properties"], f"{relaxed} deleted, not relaxed"
+        assert relaxed not in required
 
 
 def test_planner_confidence_axes_are_numbers(leerie):
@@ -55,16 +65,14 @@ def test_implementer_schema_top_level_required(leerie):
 
 
 def test_implementer_schema_confidence_required_fields(leerie):
-    """The implementer's confidence object must require the same
-    discipline fields as the planner's (DESIGN §8 — same disciplines,
-    different axes)."""
+    """Same contract as the planner's (DESIGN §8 — same disciplines,
+    different axes): axes + `basis` required, the arrays optional."""
     conf = leerie.SCHEMAS["implementer"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
-    expected = {"root_cause", "solution", "basis",
-                "falsifiers_tested", "contradictions_reconciled",
-                "gap_to_close"}
-    assert expected.issubset(required)
+    assert {"root_cause", "solution", "basis"}.issubset(required)
+    for relaxed in ("falsifiers_tested", "contradictions_reconciled"):
+        assert relaxed in conf["properties"] and relaxed not in required
 
 
 def test_implementer_confidence_axes_are_numbers(leerie):
@@ -83,35 +91,37 @@ def test_conformer_schema_top_level_required(leerie):
 
 
 def test_conformer_schema_confidence_required_fields(leerie):
-    """The conformer's confidence object must require the same
-    discipline fields as planner/implementer (DESIGN §8 — same
-    disciplines, different axes)."""
+    """Same contract as planner/implementer (DESIGN §8 — same disciplines,
+    different axes): axes + `basis` required, the arrays optional."""
     conf = leerie.SCHEMAS["conformer"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
-    expected = {"conformance", "basis", "falsifiers_tested",
-                "contradictions_reconciled", "gap_to_close"}
-    assert expected.issubset(required)
+    assert {"conformance", "basis"}.issubset(required)
+    for relaxed in ("falsifiers_tested", "contradictions_reconciled"):
+        assert relaxed in conf["properties"] and relaxed not in required
 
 
-def test_gap_to_close_keys_match_score_axes(leerie):
-    """The gap_to_close sub-object's keys mirror the score axes so a
-    below-threshold score has a clear field to fill. Catches future
-    drift where someone renames an axis without updating the gap
-    field."""
-    planner_gap = leerie.SCHEMAS["planner"]["properties"]["confidence"]["properties"]["gap_to_close"]
-    assert set(planner_gap["properties"].keys()) == {
-        "task_understanding", "decomposition_quality"}
-    impl_gap = leerie.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]["gap_to_close"]
-    assert set(impl_gap["properties"].keys()) == {"root_cause", "solution"}
-    conformer_gap = leerie.SCHEMAS["conformer"]["properties"]["confidence"]["properties"]["gap_to_close"]
-    assert set(conformer_gap["properties"].keys()) == {"conformance"}
+def test_gap_to_close_is_absent_from_every_confidence_block(leerie):
+    """Replaces the old axis-mirroring test. `gap_to_close` was the block's
+    only nested object — the sharpest edge of #49747's trigger profile — and
+    nothing decided anything on it (its sole consumer was a diagnostic log
+    line naming a blocked planner's gap, now reading `confidence.basis`),
+    so relaxing it to optional would have kept the cost and none of the value.
+    It is removed outright."""
+    for worker in ("planner", "implementer", "conformer", "classifier",
+                   "reconciler", "provision", "plan_overlap_judge",
+                   "integrator", "fit_judge"):
+        conf = leerie.SCHEMAS[worker]["properties"]["confidence"]
+        assert "gap_to_close" not in conf["properties"], worker
+        assert "gap_to_close" not in set(conf["required"]), worker
 
 
 # --- New schemas: classifier, reconciler, provision, overlap judge, integrator ---
 
-_DISCIPLINE_FIELDS = {"basis", "falsifiers_tested",
-                      "contradictions_reconciled", "gap_to_close"}
+# The structural gate is the axes plus `basis`. The two discipline arrays are
+# asked for by every prompt and kept as properties, but no longer required.
+_REQUIRED_FIELDS = {"basis"}
+_OPTIONAL_DISCIPLINE_FIELDS = {"falsifiers_tested", "contradictions_reconciled"}
 
 
 def _assert_confidence_schema(leerie, schema_key: str, axes: list[str]):
@@ -122,16 +132,20 @@ def _assert_confidence_schema(leerie, schema_key: str, axes: list[str]):
     conf = schema["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
-    assert _DISCIPLINE_FIELDS.issubset(required), (
-        f"{schema_key} confidence missing discipline fields: "
-        f"{_DISCIPLINE_FIELDS - required}")
+    assert _REQUIRED_FIELDS.issubset(required), (
+        f"{schema_key} confidence missing required fields: "
+        f"{_REQUIRED_FIELDS - required}")
+    for relaxed in _OPTIONAL_DISCIPLINE_FIELDS:
+        assert relaxed in conf["properties"], (
+            f"{schema_key} deleted {relaxed} rather than relaxing it")
+        assert relaxed not in required, (
+            f"{schema_key} still requires {relaxed}")
     for ax in axes:
         assert ax in required, f"{schema_key} confidence missing axis {ax!r}"
         assert conf["properties"][ax]["type"] == "number", (
             f"{schema_key} confidence.{ax} must be a number")
-    gap = conf["properties"]["gap_to_close"]
-    assert set(gap["properties"].keys()) == set(axes), (
-        f"{schema_key} gap_to_close keys must mirror axes")
+    assert "gap_to_close" not in conf["properties"], (
+        f"{schema_key} reintroduced gap_to_close")
 
 
 @pytest.mark.parametrize("schema_key, axes", [
@@ -151,15 +165,12 @@ def test_confidence_schema_helper_produces_correct_structure(leerie):
     """The _confidence_schema helper builds the same shape regardless
     of the number of axes."""
     single = leerie._confidence_schema(["x"])
-    assert set(single["required"]) == {"x", "basis", "falsifiers_tested",
-                                        "contradictions_reconciled",
-                                        "gap_to_close"}
+    assert set(single["required"]) == {"x", "basis"}
     assert single["properties"]["x"]["type"] == "number"
-    assert set(single["properties"]["gap_to_close"]["properties"].keys()) == {"x"}
+    assert "gap_to_close" not in single["properties"]
 
     multi = leerie._confidence_schema(["a", "b", "c"])
-    assert {"a", "b", "c"}.issubset(set(multi["required"]))
+    assert set(multi["required"]) == {"a", "b", "c", "basis"}
     for ax in ("a", "b", "c"):
         assert multi["properties"][ax]["type"] == "number"
-    assert set(multi["properties"]["gap_to_close"]["properties"].keys()) == {
-        "a", "b", "c"}
+    assert "gap_to_close" not in multi["properties"]

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import ctypes
@@ -776,6 +777,10 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 DANGEROUS_ALLOW_UNCAPPED_ENV = "LEERIE_DANGEROUSLY_ALLOW_UNCAPPED"
 DANGEROUS_ALLOW_UNCAPPED_FILE = SOURCE_OF_TRUTH_FILE
 
+# --dangerously-force-strict-output (DESIGN §7 *Forcing constrained decoding*).
+DANGEROUS_FORCE_STRICT_OUTPUT_ENV = "LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT"
+DANGEROUS_FORCE_STRICT_OUTPUT_FILE = SOURCE_OF_TRUTH_FILE
+
 # --skip-overlap-judge bypass (DESIGN §5 *Cross-domain surface overlap*).
 # Skips the phase 2¾ `plan_overlap_judge` worker even on multi-planner
 # runs. The cheap-skip on single-planner runs is automatic and not
@@ -1119,65 +1124,52 @@ _REQUIRES_ITEM = {
 }
 
 
-# _confidence_schema()'s free-text fields are length-capped as a mitigation
-# for anthropics/claude-code#49747 (open, unfixed as of 2026-07-31): the
-# `claude` CLI intermittently corrupts a StructuredOutput tool call — valid
-# JSON switching mid-payload into legacy XML `<parameter name="...">` tags —
-# correlated with the length of a single tool-call string argument. Observed
-# directly in leerie run d8302c0d46d8... (barnacle, 2026-07-31): the raw
-# `__unparsedToolInput` capture showed the switch happening exactly where the
-# (uncapped) `confidence.basis` field's ~16KB of prose began. This is a CLI
-# decoder-level bug leerie cannot fix; the cap only reduces how often a
-# worker's own output is long enough to trigger it. Revisit once #49747
-# closes upstream.
-# Sized against the MEASURED output distribution, not guessed. Captured across
-# real planner submissions (2026-08-03): `basis` ran 463–1321 chars and list
-# items 130–502. The previous values (2000 / 500) sat directly on that
-# distribution's shoulder, so overflow was routine rather than exceptional —
-# 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8
-# `contradictions_reconciled`), including one live reproduction that missed by
-# TWO characters (502 against the 500 cap) and resubmitted at 260.
-#
-# A cap set at the top of the natural distribution does not shorten output; it
-# converts the tail into rejected work. These values sit ~4x above the measured
-# maximum — clear of normal output — while remaining an order of magnitude
-# below the ~16KB single-argument length at which the #49747 corruption was
-# actually observed, so the mitigation above is intact.
-#
-# The limits are also stated to the workers (`prompts/_confidence.md`). They
-# were previously in no prompt at all, so a worker had no way to comply with a
-# bound it was never told about while being asked for detailed evidence.
-_CONFIDENCE_BASIS_MAX_LENGTH = 8000
-_CONFIDENCE_LIST_ITEM_MAX_LENGTH = 2000
-
-
 def _confidence_schema(axes: list[str]) -> dict:
     """Build the §8 confidence sub-schema for the given score axes.
 
     Every worker that self-gates on confidence uses the same structural
-    discipline (DESIGN §8 / §12): numeric score axes, basis, falsifiers,
-    contradictions, gap-to-close.  This helper DRYs the nine occurrences
-    across SCHEMAS."""
+    discipline (DESIGN §8 / §12).  This helper DRYs the ten occurrences
+    across SCHEMAS.
+
+    FLATTENED 2026-08-03.  Only the numeric axes and `basis` are required;
+    falsifiers and contradictions are asked for by the prompts and kept as
+    optional properties, and `gap_to_close` is gone entirely.  The prior
+    shape — five required fields comprising two arrays, a paragraph-length
+    string and a nested object — is field-for-field the trigger profile in
+    anthropics/claude-code#49747 (open, unfixed), where the decoder flips
+    from JSON to legacy XML `<parameter name="...">` mid-argument on tool
+    calls with many required parameters and verbose string/array mixes.
+
+    A controlled A/B against the live CLI (real fit_judge schema, same
+    prompt and model, n=8 per arm) measured 8/8 first attempts corrupted
+    with the block present and 0/8 without it; corpus-wide, 48.9% of all
+    worker calls (3,778/7,723) were wasted retries.  Requiring the fields
+    bought no enforcement — it destroyed the whole payload including the
+    score the gate reads.  `gap_to_close` went rather than merely being
+    relaxed because it was the only nested object here (the sharpest edge
+    of that profile) and nothing decided anything on it — its sole consumer
+    was a diagnostic log line naming a blocked planner's gap, which now
+    reads `confidence.basis`.
+
+    The `maxLength` caps that used to sit on these fields are gone too:
+    measured non-binding at 0.00% across 6,526 `basis` values and 30,719
+    list items (observed maxima 4,342 and 1,362, against caps of
+    8,000/2,000).  Do NOT "restore" the older 2000/500 pair — those bound
+    on 2.38%/6.32% of real values, i.e. pure rejection pressure.
+    """
     return {
         "type": "object",
-        "required": [*axes, "basis", "falsifiers_tested",
-                     "contradictions_reconciled", "gap_to_close"],
+        "required": [*axes, "basis"],
         "properties": {
             **{ax: {"type": "number"} for ax in axes},
-            "basis": {"type": "string",
-                      "maxLength": _CONFIDENCE_BASIS_MAX_LENGTH},
+            "basis": {"type": "string"},
+            # Optional: the §8 disciplines are carried by the prompts, which
+            # still ask for both.  A missing one costs a judgment; requiring
+            # one cost the entire answer.
             "falsifiers_tested": {
-                "type": "array",
-                "items": {"type": "string",
-                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
+                "type": "array", "items": {"type": "string"}},
             "contradictions_reconciled": {
-                "type": "array",
-                "items": {"type": "string",
-                          "maxLength": _CONFIDENCE_LIST_ITEM_MAX_LENGTH}},
-            "gap_to_close": {
-                "type": "object",
-                "properties": {ax: {"type": "string"} for ax in axes},
-            },
+                "type": "array", "items": {"type": "string"}},
         },
     }
 
@@ -1262,7 +1254,7 @@ SCHEMAS: dict[str, dict] = {
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
             # clear within confidence_rounds emits status="blocked" with an
             # empty subtasks list and the gap analysis in
-            # confidence.gap_to_close. The orchestrator surfaces a blocked
+            # confidence.basis. The orchestrator surfaces a blocked
             # planner as a fatal run condition (the run cannot proceed with
             # no plan); confidence itself remains worker-internal.
             "status": {
@@ -1360,75 +1352,32 @@ SCHEMAS: dict[str, dict] = {
     },
     "reconciler": {
         # Output of the reconciler worker (DESIGN §5). Spawned by
-        # phase_reconcile after phase_plan when the merged planner output
-        # has `requires` capability tags with no matching `provides`. The
-        # worker reasons over the full task + merged subtasks (with their
-        # provides, requires, depends_on, files_likely_touched) and the
-        # list of unresolved tags, then emits eight arrays:
-        #   - 5 resolution actions: renames, added_provides, added_subtasks,
-        #     conditional_drops, dropped_requires (close unresolved-requires
-        #     gaps; the common case). conditional_drops handles planner-
-        #     emitted consumers whose own `intent` declares them conditional
-        #     on an unresolvable precondition. dropped_requires handles
-        #     consumers whose `requires` entry is over-specified — an
-        #     aggregate, coarser synonym, or authoring-time decision the
-        #     same subtask itself records (the consumer stays; only the
-        #     bad edge goes).
-        #   - 2 cycle-breaking-only actions: dependency_edges, merged_subtasks
-        #     (used only in retry mode, when the gate detected the first
-        #     attempt's mutations closed a cycle). dropped_requires also
-        #     plays a cycle-breaking role in retry mode (over-specified
-        #     requires entries that close cycles), but its primary home
-        #     is now resolution.
-        #   - 1 escape hatch: unresolvable (genuine gap with no plausible
-        #     resolution; dies the run with the worker's stated reason).
-        # Each array is independently optional (any can be empty). The
-        # orchestrator applies the seven action arrays mechanically and
-        # runs Tarjan's SCC + a must-include validator over the post-
-        # mutation graph; `unresolvable` aborts before any mutation.
+        # phase_reconcile after phase_plan when the merged planner output has
+        # `requires` capability tags with no matching `provides`.
+        #
+        # SHAPE IS FLATTENED FOR GRAMMAR COMPILATION, and that is load-bearing
+        # rather than cosmetic. The previous nine-array shape was refused
+        # outright under `--dangerously-force-strict-output` ("The compiled
+        # grammar is too large") because it nested an array-of-objects
+        # (`requires`) inside an array-of-objects (`added_subtasks`) — the only
+        # three-deep path in any leerie schema — and repeated the isomorphic
+        # `{sid, tag, reason}` object four times. Measured: the old shape is
+        # rejected in 0.6 s; this one compiles in 51.8 s and round-trips
+        # end-to-end with `structured_output` populated. Seven in-place
+        # reductions (all-required, $defs, stripping descriptions, dropping
+        # subtrees, trimming properties, enum-ifying identifiers) were each
+        # measured and each still refused; only the restructure worked.
+        #
+        # `_expand_reconciler_output` fans this back into the nine arrays the
+        # rest of phase_reconcile has always consumed, so `check_reconciler_output`,
+        # `_apply_reconciler_output` and `_validate_must_include` are untouched.
         "type": "object",
-        "required": ["renames", "added_provides", "added_subtasks",
-                     "conditional_drops",
-                     "dropped_requires", "dependency_edges",
-                     "merged_subtasks", "unresolvable", "confidence"],
+        "required": ["added_subtasks", "added_requires", "tag_ops", "renames",
+                     "dependency_edges", "merged_subtasks", "confidence"],
         "properties": {
-            "renames": {
-                # Rewrite a `requires` tag on one subtask to match an
-                # existing `provides` tag on another. The single most
-                # common case (planners picked different words for the
-                # same thing).
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "from", "to"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "from": {"type": "string"},
-                        "to": {"type": "string"},
-                    },
-                },
-            },
-            "added_provides": {
-                # A subtask actually produces the needed capability but
-                # didn't declare the tag. Add it to that subtask's
-                # `provides`.
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "tag"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "tag": {"type": "string"},
-                    },
-                },
-            },
             "added_subtasks": {
-                # Genuine gap — propose a new subtask to fill it. Shape
-                # mirrors planner-output subtasks (same required fields).
-                # Leerie stamps `_added_by_reconciler: true` on every entry
-                # in `_apply_reconciler_output` — the model has no business
-                # setting it (any guarantee that matters lives in code,
-                # not in the model's response).
+                # Net-new bridging work. `requires` is NOT nested here any
+                # more — it moves to `added_requires`, keyed by sid.
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1440,73 +1389,67 @@ SCHEMAS: dict[str, dict] = {
                         "scope_note": {"type": "string"},
                         "files_likely_touched": {
                             "type": "array", "items": {"type": "string"}},
-                        "depends_on": {"type": "array", "items": {"type": "string"}},
-                        "requires": {"type": "array", "items": _REQUIRES_ITEM},
-                        "provides": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {
+                            "type": "array", "items": {"type": "string"}},
+                        "provides": {
+                            "type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
+                        "size": {"type": "string",
+                                 "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
                     },
                 },
             },
-            "conditional_drops": {
-                # Resolution op #4: drop a planner-emitted consumer subtask
-                # whose own `intent` declares it conditional on an
-                # unresolvable in_plan precondition (DESIGN §5). Used when
-                # the planner authored a subtask as "no-op if X" and no
-                # subtask in any domain produces X. The apply step removes
-                # the named sid from its plan and prunes downstream
-                # depends_on references; the drop is recorded in
-                # state.data["conditional_drops"] for audit (distinct from
-                # state.data["dropped_subtasks"] which records off-tree
-                # soft-drops from _filter_offtree_subtasks). Restricted to
-                # planner-authored consumers — the apply step die()s if
-                # the target sid carries _added_by_reconciler: true
-                # (reconciler-added subtasks have no planner prose to
-                # convert into a structured drop). Silent no-op on missing
-                # sid (mirrors `renames` / `dropped_requires`).
+            "added_requires": {
+                # Lifted out of `added_subtasks.requires`. The subtask->requires
+                # binding is no longer structural, so `_expand_reconciler_output`
+                # re-binds by `sid` and drops entries naming an unknown subtask.
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["sid", "reason"],
+                    "required": ["sid", "tag", "extent"],
                     "properties": {
                         "sid": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "extent": {"type": "string",
+                                   "enum": ["in_plan", "external"]},
                         "reason": {"type": "string"},
                     },
                 },
             },
-            "dropped_requires": {
-                # Resolution op #5 AND Cycle-breaking op #1: remove an
-                # over-specified `extent: in_plan` requires entry.
-                # Resolution mode: the requires entry is an aggregate,
-                # coarser synonym, or authoring-time decision the same
-                # subtask itself records (rather than a code artifact
-                # another subtask produces) — the consumer stays in the
-                # plan, only the bad edge goes.
-                # Cycle-breaking mode: an over-specified requires entry
-                # was what closed a dependency cycle; dropping it breaks
-                # the cycle without removing real subtask coupling.
-                # Apply mechanics are identical in either mode and live in
-                # `_apply_reconciler_output`. Silent no-op on missing
-                # sid/entry (mirrors `renames`).
+            "tag_ops": {
+                # One discriminated array replacing four isomorphic
+                # `{sid, tag, reason}` shapes (added_provides, dropped_requires,
+                # unresolvable, conditional_drops). The discriminator is an
+                # enum, which is cheap to compile; four separate object shapes
+                # were not.
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["sid", "tag", "reason"],
+                    "required": ["op", "sid", "reason"],
                     "properties": {
+                        "op": {"type": "string",
+                               "enum": ["add_provide", "drop_require",
+                                        "unresolvable", "conditional_drop"]},
                         "sid": {"type": "string"},
                         "tag": {"type": "string"},
                         "reason": {"type": "string"},
                     },
                 },
             },
+            "renames": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "from", "to"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                    },
+                },
+            },
             "dependency_edges": {
-                # Cycle-breaking op #2: assert an explicit `depends_on`
-                # ordering between two existing subtasks. Used when both
-                # sides legitimately need each other and one ordering is
-                # the right answer. Both ids must exist — apply step
-                # `die()`s on a missing id (fail-loud, mirrors the
-                # added_subtasks collision check).
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1519,21 +1462,6 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "merged_subtasks": {
-                # Cycle-breaking op #3: collapse two subtasks into one when
-                # the cycle reflects a genuine authoring overlap (signal:
-                # shared `files_likely_touched` between SCC members). The
-                # surviving subtask (`into`) inherits the union of both
-                # halves' provides/requires/depends_on/files_likely_touched,
-                # with self-references dropped (a requires whose tag is now
-                # in provides is removed; `from` is removed from depends_on
-                # entries). Downstream subtasks' depends_on references to
-                # `from` are rewritten to `into`. Tag-based requires need
-                # no rewriting (they match by tag, and `into` carries the
-                # union of provides). Telemetry: surviving subtask gets
-                # `_merged_from: ["<absorbed-id>", ...]`. Optional override
-                # fields let the reconciler restate the merged unit's
-                # contract; absent overrides default to concatenation
-                # (success_criteria_seed) or `into`'s values.
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1545,23 +1473,6 @@ SCHEMAS: dict[str, dict] = {
                         "title": {"type": "string"},
                         "intent": {"type": "string"},
                         "success_criteria_seed": {"type": "string"},
-                    },
-                },
-            },
-            "unresolvable": {
-                # Gap with no plausible resolution. The orchestrator dies
-                # with the worker's `reason` shown verbatim. NOT a valid
-                # response to a cycle — cycle resolution must use one of
-                # the cycle-breaking ops above; the retry prompt enforces
-                # this.
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "tag", "reason"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "tag": {"type": "string"},
-                        "reason": {"type": "string"},
                     },
                 },
             },
@@ -1979,8 +1890,22 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
+                    # `artifact_paths` is asked for by the prompt but NOT
+                    # required (2026-08-03). Requiring it was far more
+                    # destructive than the false positives it was added to
+                    # prevent: this worker produced valid output on only
+                    # 40.9% of its corpus invocations (27/66) while every
+                    # other worker sat at 99.6-100%, and 84 of its 85
+                    # validation failures were the single error
+                    # "'artifact_paths' is a required property" — a
+                    # whole-payload rejection of sound collision analysis in
+                    # the phase runs most often die in. Absence was already
+                    # the designed-for case (see PHANTOM_ARTIFACT's
+                    # `if not paths: continue`), so requiring it bought no
+                    # extra verification — it turned a graceful skip into a
+                    # discarded plan.
                     "required": ["a_sid", "b_sid", "artifact",
-                                 "artifact_paths", "resolution", "reason"],
+                                 "resolution", "reason"],
                     "properties": {
                         "a_sid": {"type": "string"},
                         "b_sid": {"type": "string"},
@@ -2093,7 +2018,7 @@ SCHEMAS: dict[str, dict] = {
         # Read-only (INSPECT_TOOLS), fed the subtask spec and its P6
         # ranked subgraph. Reuses _confidence_schema for the score axis
         # so the same evidence-gate discipline (falsifiers, contradictions,
-        # gap_to_close) applies.
+        # and the gap stated in basis) applies.
         "type": "object",
         "required": ["score", "rationale", "diffuse", "confidence"],
         "properties": {
@@ -2126,7 +2051,15 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "children": {
                 "type": "array",
-                "minItems": 1,
+                # No `minItems` (2026-08-03): an empty array is the valid
+                # answer "this subtask does not split", and
+                # _recursive_decompose already accepts it as a leaf,
+                # deliberately and with its own log line. `minItems: 1` made
+                # that answer unrepresentable — across the corpus the
+                # splitter returned [] 43 times and exactly ONE child 43
+                # more (a single-child split being a no-op), and every empty
+                # return was rejected and retried before the consumer that
+                # already handled it could ever see it.
                 "items": {
                     "type": "object",
                     "required": ["id", "title", "success_criteria_seed"],
@@ -2172,7 +2105,7 @@ SCHEMAS: dict[str, dict] = {
         #
         # Deliberately carries NO _confidence_schema sub-object (unlike
         # fit_judge): the §8 evidence-gate discipline (falsifiers,
-        # contradictions, gap_to_close) is designed for iterative
+        # contradictions, gap stated in basis) is designed for iterative
         # implementer/planner self-assessment: this worker is itself the
         # independent check that replaces a self-report, so a nested
         # self-confidence axis would reintroduce the self-grading bias the
@@ -2273,8 +2206,20 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    # `severity` is asked for but NOT required (2026-08-03).
+                    # Requiring it defeated its own purpose: a judge that
+                    # omitted it produced no schema-valid payload at all, so
+                    # phase_wiring_gate never ran and caught NOTHING. Measured
+                    # across the corpus, every wiring_judge invocation that
+                    # never produced valid output (9 of 66) failed on this one
+                    # field — all 18 of its failing submissions. Both consumers
+                    # already tolerate absence (the `latent_risk` comparisons
+                    # in _live_wiring_defects and in phase_wiring_gate's own
+                    # latent-risk loop), so an unlabelled entry gates:
+                    # the conservative direction, matching DESIGN §8 *Findings
+                    # carry a severity* ("the default is gating").
                     "required": ["kind", "sid", "tag_or_dep",
-                                 "concrete_reason", "severity"],
+                                 "concrete_reason"],
                     "properties": {
                         "kind": {"type": "string",
                                  "enum": ["missing_requires",
@@ -4824,6 +4769,28 @@ def resolve_dangerously_allow_uncapped(
         file_name=DANGEROUS_ALLOW_UNCAPPED_FILE)
 
 
+def resolve_dangerously_force_strict_output(
+        repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --dangerously-force-strict-output preference. Order:
+    --dangerously-force-strict-output CLI flag (action='store_true') →
+    LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT env var →
+    dangerously_force_strict_output in leerie.toml → False.
+
+    When True, worker API traffic is routed through a per-run loopback proxy
+    that sets `strict: true` on the `StructuredOutput` tool Claude Code
+    injects, turning post-hoc schema validation into grammar-constrained
+    decoding (DESIGN §7 *Forcing constrained decoding*).
+
+    Off by default. It reaches an API capability the CLI does not expose and
+    that is undocumented for subscription auth, and it depends on an internal
+    tool name carrying no compatibility guarantee."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=DANGEROUS_FORCE_STRICT_OUTPUT_ENV,
+        file_key="dangerously_force_strict_output",
+        file_name=DANGEROUS_FORCE_STRICT_OUTPUT_FILE)
+
+
 def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-overlap-judge preference. Order:
     --skip-overlap-judge CLI flag (action='store_true') →
@@ -6392,7 +6359,12 @@ async def _recursive_decompose(
         log(f"_recursive_decompose: fit_judge crashed for "
             f"{subtask.get('id', '?')}; accepting as leaf")
         return [subtask]
-    score: float = judge_result.get("score", 0.0)
+    # Range re-imposed in Python: grammar compilation cannot express
+    # `minimum`/`maximum`, and the comparison below has no bound of its
+    # own — an out-of-range score would read as well-fit (DESIGN §7).
+    score: float = _bounded_or_conservative(
+        judge_result.get("score", 0.0), 0.0, 1.0, 0.0,
+        f"fit_judge {subtask.get('id', '?')} score")
 
     # --- leaf check ----------------------------------------------------------
     if score >= threshold or depth >= max_depth:
@@ -6875,6 +6847,90 @@ def check_planner_output(
     # authoritative coverage gate — both remove the self-grading bias of
     # letting the planner grade its own decomposition/coverage.
     return issues
+
+
+_TAG_OP_TARGET = {
+    "add_provide": "added_provides",
+    "drop_require": "dropped_requires",
+    "unresolvable": "unresolvable",
+    "conditional_drop": "conditional_drops",
+}
+
+
+def _expand_reconciler_output(out: dict) -> dict:
+    """Fan the flattened worker output back into leerie's nine-array shape.
+
+    The wire schema is flattened so it compiles under
+    `--dangerously-force-strict-output` (see `SCHEMAS["reconciler"]`), but every
+    consumer downstream — `check_reconciler_output`, `_apply_reconciler_output`,
+    `_validate_must_include`, the cycle diagnostics — was written against the
+    nine arrays and stays that way. This is the only seam that knows both.
+
+    Two structural facts the flattening gives up, restored here:
+
+    * **`tag_ops` is discriminated, not typed.** One array with an `op` enum
+      replaced four isomorphic `{sid, tag, reason}` object shapes. An
+      unrecognised `op` is dropped rather than guessed — silently misfiling a
+      resolution action would mutate the plan in a way the operator never sees.
+    * **`added_requires` is no longer nested inside its subtask.** The binding
+      is by `sid` now, so an entry naming a subtask that does not exist in this
+      output has nothing to attach to. Those are dropped and counted; the
+      caller logs the count, because a dangling requires means the worker
+      believed in a subtask it did not emit.
+
+    Returns a NEW dict; the input is not mutated (the raw worker output is
+    persisted as telemetry and must stay as-emitted).
+    """
+    expanded: dict = {
+        "renames": list(out.get("renames") or []),
+        "dependency_edges": list(out.get("dependency_edges") or []),
+        "merged_subtasks": list(out.get("merged_subtasks") or []),
+        "added_provides": [],
+        "dropped_requires": [],
+        "unresolvable": [],
+        "conditional_drops": [],
+        "added_subtasks": [],
+        "confidence": out.get("confidence") or {},
+    }
+
+    for entry in out.get("tag_ops") or []:
+        if not isinstance(entry, dict):
+            continue
+        # Case-insensitive: constrained decoding does not guarantee the
+        # capitalisation of an enum value, and it fails silently when it drifts.
+        target = _TAG_OP_TARGET.get(str(entry.get("op", "")).strip().lower())
+        if target is None:
+            continue
+        row = {"sid": entry.get("sid", ""), "reason": entry.get("reason", "")}
+        if target != "conditional_drops":
+            row["tag"] = entry.get("tag", "")
+        expanded[target].append(row)
+
+    # Re-bind requires to their subtask by sid.
+    by_sid: dict[str, dict] = {}
+    for sub in out.get("added_subtasks") or []:
+        if not isinstance(sub, dict) or not sub.get("id"):
+            continue
+        copy_of = dict(sub)
+        copy_of["requires"] = []
+        by_sid[str(sub["id"])] = copy_of
+        expanded["added_subtasks"].append(copy_of)
+
+    dangling: list[str] = []
+    for req in out.get("added_requires") or []:
+        if not isinstance(req, dict):
+            continue
+        sub = by_sid.get(str(req.get("sid", "")))
+        if sub is None:
+            dangling.append(f"{req.get('sid')!r}:{req.get('tag')!r}")
+            continue
+        item = {"tag": req.get("tag", ""),
+                "extent": str(req.get("extent", "")).strip().lower()}
+        if req.get("reason"):
+            item["reason"] = req["reason"]
+        sub["requires"].append(item)
+    expanded["_dangling_requires"] = dangling
+    return expanded
 
 
 def check_reconciler_output(
@@ -10867,6 +10923,14 @@ def _tool_result_outcome(event: dict) -> bool | None:
 # file carries the raw stream regardless.
 _REJECTED_PAYLOAD_LOG_MAX = 4000
 
+# Cap on the blocked-planner gap shown inline by `phase_plan`. Much smaller
+# than the payload cap above because this is one line inside a per-category
+# summary rather than a standalone diagnostic dump, and because the value it
+# renders (`confidence.basis`) is prose: measured across real planner
+# submissions it runs a median of ~1.1k characters and up to 4.3k. Enough to
+# see what the planner was missing; the full text is in the per-worker log.
+_BLOCKED_GAP_LOG_MAX = 400
+
 
 def _format_payload_for_log(payload: object) -> str | None:
     """Render a `StructuredOutput` submission for the rejection diagnostic.
@@ -10886,6 +10950,638 @@ def _format_payload_for_log(payload: object) -> str | None:
         text = (text[:_REJECTED_PAYLOAD_LOG_MAX]
                 + f"… [truncated at {_REJECTED_PAYLOAD_LOG_MAX} chars]")
     return text
+
+
+def _format_blocked_gap(confidence: object) -> str:
+    """Render a blocked planner's stated gap for `phase_plan`'s summary line.
+
+    The gap lives in `confidence.basis` — `gap_to_close` was removed from the
+    schema (DESIGN §8) and the prompts now direct a blocked planner to state
+    the missing artifact there instead.
+
+    Two transforms, both because `basis` is free prose rather than the compact
+    dict this line used to render. Whitespace is collapsed so an embedded
+    newline cannot break a one-line per-category summary into several, and the
+    result is truncated with a visible marker — never a silent cut, matching
+    `_format_payload_for_log` above. Measured across real planner submissions,
+    `basis` runs a median of ~1.1k characters and up to 4.3k, so an
+    untruncated line would put multiple KB on one row of the operator's
+    terminal; the full text stays in the per-worker log.
+
+    Returns `""` (not None) for absent, empty or malformed input, so the
+    caller interpolates an empty gap rather than the string "None"."""
+    if not isinstance(confidence, dict):
+        return ""
+    gap = " ".join((confidence.get("basis") or "").split())
+    if len(gap) > _BLOCKED_GAP_LOG_MAX:
+        gap = gap[:_BLOCKED_GAP_LOG_MAX] + "… [truncated; see log]"
+    return gap
+
+
+# --- forced constrained decoding (--dangerously-force-strict-output) --------
+#
+# `claude -p --json-schema` is VALIDATED, not constrained: the CLI injects the
+# schema as a synthetic `StructuredOutput` tool with no `strict: true` and no
+# `output_config` (confirmed from a captured outbound request, 2026-08-04), then
+# checks the result and re-prompts on mismatch. Measured across the run corpus,
+# 2,861 of 9,924 submissions (28.8%) are malformed as a result. Setting
+# `strict: true` compiles the schema into a sampling grammar, which makes those
+# shapes unrepresentable rather than merely rarer. See DESIGN §7 *Forcing
+# constrained decoding*.
+
+# Keywords grammar compilation cannot express. Present in leerie's own schemas
+# 21 times (15 minLength, 1 maxLength, 3 minimum, 2 maximum), so stripping them
+# is not hypothetical. The five numeric bounds are the ones whose loss matters —
+# their consumers compare against a threshold with no range check of their own —
+# so those are re-imposed in Python via `_bounded_or_conservative`.
+_STRICT_UNSUPPORTED_KEYWORDS = frozenset({
+    "minLength", "maxLength", "minimum", "maximum", "multipleOf", "pattern",
+    "oneOf", "not", "if", "then", "else", "dependentSchemas",
+    "patternProperties", "propertyNames", "uniqueItems", "maxItems",
+    "contains", "minProperties", "maxProperties",
+})
+
+# The name Claude Code gives the tool it synthesises from `--json-schema`.
+# Private, unversioned, and may change in any release — which is why every
+# transform below is fail-open rather than assertive.
+_STRICT_OUTPUT_TOOL_NAME = "StructuredOutput"
+
+# Upstream read timeout for the proxy. Matched to `worker_timeout_sec` so the
+# proxy is never the component that gives up first — a shorter bound would kill
+# requests the worker is still legitimately waiting on, converting a slow call
+# into an unexplained worker failure.
+_STRICT_PROXY_TIMEOUT_SEC = DEFAULT_CAPS["worker_timeout_sec"]
+
+# The run's proxy, or None when --dangerously-force-strict-output is off (the
+# default). Module-level because `claude_p` builds each worker's env deep in
+# the call stack and threading it through every caller would touch far more
+# surface than the feature warrants. One per run, owned by `_orchestrate`.
+_STRICT_PROXY: "_StrictOutputProxy | None" = None
+
+# How many upstream error responses get their body echoed before the proxy
+# falls back to counting them. A rejected rewrite is systematic — every worker
+# call fails the same way — so the first few carry all the diagnostic value and
+# the rest would bury the run log they share with every other leerie line.
+_STRICT_PROXY_ERROR_LOG_MAX = 3
+_STRICT_PROXY_ERROR_BODY_MAX = 400
+
+
+def _bounded_or_conservative(value: object, low: float, high: float,
+                             conservative: float, what: str) -> float:
+    """Re-impose a numeric bound that grammar compilation cannot express.
+
+    Strict mode drops `minimum`/`maximum`, and the consumers that read those
+    values compare them against a threshold with no range check of their own —
+    `if score >= threshold` reads an out-of-range score as well-fit. They
+    therefore fail *permissively*, which is the wrong direction for a gate, so
+    the bound moves into Python rather than being lost.
+
+    An out-of-range value returns `conservative`, it is **not clamped to the
+    nearest bound**. Clamping was tried and rejected: on a 0–1 axis it maps 5.0
+    to 1.0, which still clears every threshold and so preserves exactly the
+    permissive failure this exists to prevent. The corpus shows the confusion is
+    real — `fit_judge` emitted `"fit": 8.5` on an axis declared 0–1 — and while
+    that plausibly *meant* 0.85, inferring intent from a malformed number is
+    guessing. A gate must not be cleared by a value it cannot interpret, so the
+    caller passes the safe end of its own range and the run pays a split or a
+    re-plan instead of shipping on a reading nobody can justify.
+
+    Applied unconditionally rather than only under the flag: a value outside the
+    declared range was always a worker bug, and distrusting it is right either
+    way.
+    """
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return conservative
+    if num != num or num in (float("inf"), float("-inf")):  # NaN / ±inf
+        return conservative
+    if num < low or num > high:
+        log(f"  {what}: value {num!r} outside [{low}, {high}] — treating as "
+            f"{conservative} (untrusted, not clamped)")
+        return conservative
+    return num
+
+
+def _strictify_schema(node: object) -> tuple[int, int]:
+    """In-place: make one schema acceptable to grammar compilation.
+
+    Returns `(objects_hardened, keywords_stripped)`.
+
+    Two edits. Every object node gains `additionalProperties: false`, which
+    strict mode requires — the API rejects the request otherwise, naming the
+    offending path. And keywords the grammar cannot express are removed;
+    `minItems` survives only at 0 or 1.
+
+    **"Object node" means three shapes**, not just `{"type": "object"}`: a
+    *union* type containing it (`["object", "null"]`) and a bare `properties`
+    with no declared type also count, and the API requires the same of both.
+    Leaving that term undefined is what let the first implementation ship an
+    equality test against the string — see the comment at the check itself.
+
+    Recurses through `items` as well as `properties`, because leerie nests
+    objects inside arrays (`collisions[]`, `subtasks[]`, `wiring_defects[]`)
+    and a top-level-only pass would leave those unhardened.
+    """
+    hardened = stripped = 0
+    if isinstance(node, dict):
+        for key in list(node):
+            if key in _STRICT_UNSUPPORTED_KEYWORDS:
+                del node[key]
+                stripped += 1
+                continue
+            if key == "minItems" and node[key] not in (0, 1):
+                node[key] = 1
+                stripped += 1
+        # An "object node" is not only `{"type": "object"}`. JSON Schema also
+        # allows a *union* type (`["object", "null"]` — leerie's own
+        # `implementer.clarification_question` is exactly that) and a bare
+        # `properties` with no declared type. The API requires
+        # `additionalProperties: false` on all three, and an equality test
+        # against the string "object" silently skips the last two.
+        #
+        # Measured, not theorised: the equality test shipped, and a live sweep
+        # of all 23 schemas against the real API rejected `implementer` —
+        # "tools.0.custom: For 'object' type, 'additionalProperties' must be
+        # explicitly set to false". That would have 400'd every implementer
+        # call, surfacing only as the retry storm this flag exists to remove.
+        declared = node.get("type")
+        is_object = (
+            declared == "object"
+            or (isinstance(declared, list) and "object" in declared)
+            or (declared is None and "properties" in node))
+        if is_object and node.get("additionalProperties") is not False:
+            node["additionalProperties"] = False
+            hardened += 1
+        # Every optional property becomes required — on the wire only.
+        #
+        # Strict mode must admit every *subset* of a node's optional properties
+        # in any order, so a node with k optionals costs ~2^k grammar paths,
+        # multiplied per array element. That is what made `planner`
+        # uncompilable: 11 optionals in one `subtasks[]` item. Requiring them
+        # collapses 2^11 paths to 1 — measured, it takes `planner` from a 400
+        # ("Schema is too complex for compilation") to a 200.
+        #
+        # Safe because only the *wire* schema changes. The CLI still validates
+        # the worker's output against leerie's ORIGINAL schema, where these
+        # fields remain optional — and a field that is merely *present*
+        # satisfies an optional field's type check. Audited across all 23
+        # schemas: 89 optional fields, none of which becomes illegal when
+        # forced (arrays admit `[]`, and no forced field carries a `minLength`
+        # its trivial value would violate).
+        #
+        # NOT the mistake PR #153 undid. That regression was models *omitting*
+        # required fields and so producing nothing schema-valid; here the
+        # grammar makes omission impossible by construction.
+        if is_object and isinstance(node.get("properties"), dict):
+            node["required"] = sorted(node["properties"])
+        for value in node.values():
+            h, s = _strictify_schema(value)
+            hardened += h
+            stripped += s
+    elif isinstance(node, list):
+        for value in node:
+            h, s = _strictify_schema(value)
+            hardened += h
+            stripped += s
+    return hardened, stripped
+
+
+def _strictify_request(body: bytes) -> tuple[bytes, str] | None:
+    """Rewrite one outbound Messages request to force constrained decoding.
+
+    Returns `(new_body, description)`, or None when the request should be
+    forwarded byte-identical.
+
+    Deliberately fail-open. The tool name and shape are a private interface
+    with no compatibility guarantee, so anything unexpected — renamed, absent,
+    duplicated, missing its schema, or a body that is not JSON at all — leaves
+    the request untouched. The run then behaves exactly as it would without the
+    flag: the guarantee is lost, not the run. Callers log the no-op, because a
+    silent loss is the failure mode worth catching.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return None
+    hits = [t for t in tools
+            if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+    if len(hits) != 1:
+        return None
+    tool = hits[0]
+    if not isinstance(tool.get("input_schema"), dict):
+        return None
+    tool["strict"] = True
+    hardened, stripped = _strictify_schema(tool["input_schema"])
+    return (json.dumps(payload).encode(),
+            f"strict:true (+{hardened} additionalProperties, -{stripped} unsupported)")
+
+
+def _api_error_head(payload: bytes, limit: int = 160) -> str:
+    """First `limit` chars of an API error's `message`, whitespace-collapsed.
+
+    Operates on the API's own machine-generated error envelope — a mechanical
+    string, not model prose — so reading it here does not cross the
+    language-to-JSON line (CLAUDE.md).
+    """
+    try:
+        text = json.loads(payload)["error"]["message"]
+    except Exception:
+        text = payload[:limit].decode("utf-8", "replace")
+    return " ".join(str(text).split())[:limit]
+
+
+def _unexpected_structured_output_shape(body: bytes) -> bool:
+    """True only when a `StructuredOutput` tool is PRESENT but unusable.
+
+    `_strictify_request` declines for several reasons, and they are not equally
+    interesting. The overwhelmingly common one is that the request simply
+    carries no `StructuredOutput` tool — measured against a real 4-turn worker,
+    one of its four `/v1/messages` POSTs arrives with *no tools array at all*,
+    because the CLI injects the tool only on the turns where it wants
+    structured output. That is ordinary traffic and says nothing about anything.
+
+    The interesting case is a tool that IS there and is shaped wrong —
+    duplicated, or missing its `input_schema`. That is the "the private
+    interface changed upstream" signal, and it is what the operator warning
+    exists for. Merging the two made a healthy run report 173 pass-throughs as
+    a suspected upstream change.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    hits = [t for t in tools
+            if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+    if not hits:
+        return False          # no tool at all — normal
+    return len(hits) > 1 or not isinstance(hits[0].get("input_schema"), dict)
+
+
+def _structured_output_fingerprint(body: bytes) -> str | None:
+    """Stable id for the schema a request carries, or None if it carries none.
+
+    Identifies "this same schema again" so a schema already proven
+    un-hardenable is not re-hardened, re-rejected and re-sent on every
+    subsequent call by the same worker type.
+    """
+    try:
+        payload = json.loads(body)
+        tools = payload.get("tools")
+        hits = [t for t in tools
+                if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+        if len(hits) != 1:
+            return None
+        canonical = json.dumps(hits[0].get("input_schema"), sort_keys=True)
+    except Exception:
+        return None
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+class _StrictOutputProxy:
+    """One loopback proxy per run, forcing constrained decoding.
+
+    Workers reach it through `ANTHROPIC_BASE_URL`. Every worker is a child of
+    the orchestrator process (DESIGN §6 *Worker subtree termination*), so they
+    share its network namespace: a `127.0.0.1` listener needs no port mapping
+    on any runtime. On abnormal death the enclosing boundary reaps the listener
+    — the container locally (where the orchestrator is also PID 1), the machine
+    on `--runtime fly` / `ec2`, where it is instead spawned from a bootstrap.
+
+    Every design choice below was forced by a measured failure in a load test of
+    this exact shape, not chosen on taste:
+
+    * **Ephemeral port.** Bind `0` and read back what the OS assigned, so
+      concurrent leerie runs on one host cannot collide and nothing scans.
+    * **Dedicated executor.** asyncio's default pool saturates: 34 of 40
+      concurrent connections survived, the rest died with
+      `ConnectionResetError`. Sized to the wave width plus headroom, it is
+      40/40 and 80/80.
+    * **`reuse_address` + drain on shutdown.** Without closing tracked writers
+      and joining the executor, the port stays unbindable afterwards and a
+      second run in the same container fails to start.
+    * **Client hang-ups are normal.** `ConnectionResetError` / `BrokenPipeError`
+      are caught per connection and never escalate; the CLI hangs up routinely
+      once it has what it needs.
+
+    Upstream is bridged through `urllib` on that executor rather than spoken
+    natively over `asyncio.open_connection`. leerie has no async HTTP dependency
+    (CLAUDE.md: stdlib-preferred), and hand-rolling HTTP/1.1 — chunked encoding,
+    keep-alive, partial reads — is exactly where a proxy in the path of every
+    worker call would acquire subtle bugs.
+    """
+
+    _UPSTREAM = "https://api.anthropic.com"
+
+    def __init__(self, max_parallel: int,
+                 verbosity: str = VERBOSITY_DEFAULT) -> None:
+        self._server: asyncio.base_events.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        # +8 so the pool is never the ceiling: a wave's workers plus the
+        # occasional out-of-band call (token probe, smoke test) must all fit.
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_parallel + 8, thread_name_prefix="strict-proxy")
+        self._verbosity = verbosity
+        self.port = 0
+        self.rewritten = 0
+        self.passed_through = 0
+        self.fell_back = 0
+        # Split deliberately. Merging these is what made a clean run describe
+        # itself as suspect: `unexpected_tool_shape` is the only pass-through
+        # worth warning about, and `schema_errors` the only upstream error the
+        # flag can be responsible for.
+        self.unexpected_tool_shape = 0
+        self.schema_errors = 0
+        self.transient_errors = 0
+        # Schemas the API refuses to compile into a grammar. Measured: 2 of
+        # leerie's 23 (`planner`, `reconciler`) — both carry 12 optional
+        # properties inside array items, and strict mode must accept every
+        # subset of those in any order, so grammar size multiplies per element.
+        # Once a schema lands here it is never hardened again this run, so the
+        # doomed round trip is paid once rather than per worker call.
+        self._unhardenable: set[str] = set()
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", 0, reuse_address=True, backlog=256)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self.port
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await self._server.wait_closed()
+        for writer in list(self._writers):
+            with contextlib.suppress(Exception):
+                writer.close()
+        self._writers.clear()
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    async def _read_chunked(reader: asyncio.StreamReader, rest: bytes) -> bytes:
+        """Decode a chunked request body into its real bytes.
+
+        urllib recomputes `content-length` for the upstream hop, so forwarding
+        the raw framing would describe a body that is not what it says it is.
+        Decoding here keeps the untested-path fallback a correct request rather
+        than a differently-corrupt one.
+        """
+        buf = bytearray(rest)
+        out = bytearray()
+        while True:
+            # `find` + slice rather than `bytes(buf).partition(...)`: the latter
+            # copies the whole remaining buffer once per chunk, which is
+            # quadratic in chunk count — and this path exists precisely for a
+            # large body arriving in many small chunks.
+            cut = buf.find(b"\r\n")
+            while cut == -1:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    return bytes(out)
+                buf += chunk
+                cut = buf.find(b"\r\n")
+            line = bytes(buf[:cut])
+            del buf[:cut + 2]
+            try:
+                size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+            except ValueError:
+                return bytes(out)
+            if size == 0:
+                return bytes(out)
+            while len(buf) < size + 2:
+                chunk = await reader.read(size + 2 - len(buf))
+                if not chunk:
+                    out += buf[:size]
+                    return bytes(out)
+                buf += chunk
+            out += buf[:size]
+            del buf[:size + 2]
+
+    def _upstream(self, method: str, path: str, body: bytes,
+                  headers: dict) -> tuple[int, list, bytes]:
+        """Blocking round-trip, run on the dedicated pool.
+
+        `method` is threaded through rather than assumed: only POST bodies are
+        ever rewritten, but every other verb the CLI issues must reach upstream
+        as itself. Replaying a GET as a POST would corrupt requests this proxy
+        is supposed to pass through untouched.
+        """
+        req = urllib.request.Request(self._UPSTREAM + path,
+                                     data=body if body else None,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=_STRICT_PROXY_TIMEOUT_SEC) as r:
+                return r.status, list(r.headers.items()), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, list(e.headers.items()), e.read()
+
+    def _log_exchange(self, method: str, path: str, status: int,
+                      desc: str, payload: bytes) -> None:
+        """Surface one proxied exchange on the orchestrator's own log stream.
+
+        The proxy runs in the orchestrator process, so `log()` here interleaves
+        with every other leerie line — no separate file to go find.
+
+        An upstream error is logged at *every* verbosity, with its body. This
+        proxy is the only thing in the path that rewrites a request, so a 4xx
+        here is most likely leerie's own edit being rejected — and the response
+        names the offending schema path. Without it the operator sees only
+        workers retrying, which is precisely the misattribution this flag's
+        whole failure mode consists of. Per-request success lines are debug-only
+        (`-vv`): one per worker API call is far too much for normal output.
+        """
+        if status >= 400:
+            # Budget PER CLASS. A shared budget is not a milder version of this
+            # — it is a different, broken thing: measured live, three transient
+            # 529s in the first minutes consumed the whole allowance, so a
+            # later genuine 400 (carrying the API's own message naming the
+            # offending schema path) would have been silently counted instead
+            # of shown. Overload noise must not starve the one channel that can
+            # diagnose this flag.
+            schema_shaped = status == 400
+            seen = self.schema_errors if schema_shaped else self.transient_errors
+            if seen <= _STRICT_PROXY_ERROR_LOG_MAX:
+                if schema_shaped:
+                    # The body names the offending path; it is the whole
+                    # diagnostic, so it is echoed rather than summarised.
+                    snippet = " ".join(
+                        payload[:_STRICT_PROXY_ERROR_BODY_MAX]
+                        .decode("utf-8", "replace").split())
+                    log(f"  strict-output proxy: upstream 400 on {method} "
+                        f"{path} ({desc or 'not rewritten'}) — {snippet}")
+                else:
+                    # Capacity or throttling — nothing to do with the rewrite.
+                    # Say so, so it is not mistaken for one.
+                    log(f"  strict-output proxy: upstream {status} on {method} "
+                        f"{path} — transient (not a schema rejection); "
+                        "retried upstream")
+                if seen == _STRICT_PROXY_ERROR_LOG_MAX:
+                    kind = "schema" if schema_shaped else "transient"
+                    log(f"  strict-output proxy: further {kind} errors will be "
+                        "counted, not echoed (see the end-of-run summary)")
+        elif self._verbosity == "debug":
+            log(f"  strict-output proxy: {method} {path} -> {status} "
+                f"({desc or 'forwarded unmodified'})")
+
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
+        try:
+            desc = ""
+            original: bytes | None = None
+            fingerprint: str | None = None
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(8192)
+                if not chunk:
+                    return
+                head += chunk
+            raw_head, _, rest = head.partition(b"\r\n\r\n")
+            lines = raw_head.split(b"\r\n")
+            request_line = lines[0].decode("latin-1")
+            method, _, tail = request_line.partition(" ")
+            path = tail.rsplit(" ", 1)[0]
+            headers = {}
+            length = 0
+            chunked = False
+            for line in lines[1:]:
+                name, _, value = line.decode("latin-1").partition(":")
+                name, value = name.strip(), value.strip()
+                if name.lower() == "content-length":
+                    length = int(value or 0)
+                if name.lower() == "transfer-encoding" and "chunked" in value.lower():
+                    chunked = True
+                # Host/length/encoding are recomputed by urllib for the
+                # upstream hop; forwarding ours would describe the wrong body.
+                # `transfer-encoding` is in this list rather than popped later
+                # because header names are case-insensitive on the wire: a
+                # `TRANSFER-ENCODING` that survived would reach upstream beside
+                # urllib's computed content-length, and a request carrying both
+                # framing headers is a smuggling shape servers reject.
+                if name.lower() not in ("host", "content-length",
+                                        "accept-encoding", "connection",
+                                        "transfer-encoding"):
+                    headers[name] = value
+
+            # A chunked request body carries no `content-length`, so the
+            # length-driven read below would take whatever landed in the first
+            # packet and forward it as the whole body — a silently truncated
+            # request, which reads downstream as a model error rather than a
+            # proxy bug. Today's CLI always sends `content-length`, but that is
+            # an observation about one client version, not a guarantee. Decode
+            # the framing so the upstream hop gets the real bytes, and never
+            # rewrite a body that arrived on this untested path.
+            if chunked:
+                body = await self._read_chunked(reader, rest)
+                # Counted only for POST, matching the branch below: a GET was
+                # never a candidate for constrained decoding, so counting one
+                # would inflate the pass-through total for no reason.
+                if method.upper() == "POST":
+                    self.passed_through += 1
+            else:
+                body = rest
+                while len(body) < length:
+                    chunk = await reader.read(length - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+
+                if method.upper() == "POST":
+                    fingerprint = _structured_output_fingerprint(body)
+                    if fingerprint is not None and fingerprint in self._unhardenable:
+                        # Already proven un-compilable this run. Sending it
+                        # again would just buy another rejection.
+                        self.passed_through += 1
+                    else:
+                        swap = _strictify_request(body)
+                        if swap is not None:
+                            original, (body, desc) = body, swap
+                            self.rewritten += 1
+                        else:
+                            self.passed_through += 1
+                            # Only a PRESENT-but-unusable tool is worth an
+                            # operator warning; a request with no tool at all
+                            # is ordinary multi-turn traffic.
+                            if _unexpected_structured_output_shape(body):
+                                self.unexpected_tool_shape += 1
+
+            loop = asyncio.get_running_loop()
+            status, up_headers, payload = await loop.run_in_executor(
+                self._pool, self._upstream, method.upper(), path, body, headers)
+
+            # Fail open on the RESPONSE, not just the request. Some schemas
+            # cannot be compiled into a sampling grammar at all — measured, 2 of
+            # leerie's 23: "Schema is too complex" (`planner`) and "The compiled
+            # grammar is too large" (`reconciler`), both carrying 12 optional
+            # properties inside array items, where strict mode must accept every
+            # subset in any order and grammar size multiplies per element.
+            #
+            # Without this the flag 400s every call by those workers, and a run
+            # that cannot plan cannot do anything — a far worse outcome than the
+            # post-hoc validation the flag exists to improve on. Re-sending the
+            # untouched request costs the guarantee for that one worker and
+            # keeps the run, which is the same trade the request-side fail-open
+            # already makes. Only 400 is retried: 401/403/429 are not schema
+            # problems and the original would fail identically.
+            if original is not None and status == 400:
+                self._unhardenable.add(fingerprint or "")
+                self.fell_back += 1
+                self.rewritten -= 1
+                self.passed_through += 1
+                log(f"  strict-output proxy: upstream rejected the hardened "
+                    f"schema ({_api_error_head(payload)}) — retrying WITHOUT "
+                    f"constrained decoding; this worker keeps ordinary "
+                    f"post-hoc validation for the rest of the run")
+                status, up_headers, payload = await loop.run_in_executor(
+                    self._pool, self._upstream, method.upper(), path,
+                    original, headers)
+                desc = "fell back: schema will not compile"
+
+            # Classified on the FINAL status, deliberately — after any
+            # fallback, not before. A 400 the fallback absorbs ends at 200 and
+            # is counted nowhere here, because `fell_back` already reports it
+            # once and correctly; counting it again as an unhandled rejection
+            # would send the operator to "re-run without the flag to confirm" a
+            # problem the proxy just resolved itself. A 400 that survives the
+            # fallback, or one on a request we never rewrote, is genuinely
+            # unhandled and is ours to raise.
+            if status == 400:
+                self.schema_errors += 1
+            elif status >= 400:
+                self.transient_errors += 1
+            self._log_exchange(method.upper(), path, status, desc, payload)
+
+            out = [f"HTTP/1.1 {status} X".encode("latin-1")]
+            for name, value in up_headers:
+                if name.lower() in ("content-length", "transfer-encoding",
+                                    "content-encoding", "connection"):
+                    continue
+                out.append(f"{name}: {value}".encode("latin-1"))
+            out.append(f"content-length: {len(payload)}".encode("latin-1"))
+            out.append(b"connection: close")
+            writer.write(b"\r\n".join(out) + b"\r\n\r\n" + payload)
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            # The CLI hangs up routinely once it has what it needs. Normal.
+            pass
+        except Exception as e:  # noqa: BLE001 - one bad connection must not
+            # take down the listener that every other worker depends on.
+            log(f"  strict-output proxy: connection error ({type(e).__name__}: {e})")
+        finally:
+            self._writers.discard(writer)
+            with contextlib.suppress(Exception):
+                writer.close()
 
 
 # Substrings that identify a *schema* rejection of a structured submission, as
@@ -11940,6 +12636,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if worker_env is None:
             worker_env = os.environ.copy()
         worker_env["CLAUDE_CODE_OAUTH_TOKEN"] = active_token
+    # Forced constrained decoding: point the worker's API traffic at this
+    # run's proxy so it can set `strict: true` on the injected
+    # StructuredOutput tool (DESIGN §7). Composes with the two blocks above —
+    # worker debug, token rotation and strict output are orthogonal.
+    # `main()` has already refused to start if the operator set this variable
+    # themselves, so there is nothing here to clobber.
+    if _STRICT_PROXY is not None:
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        worker_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_STRICT_PROXY.port}"
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -16038,7 +16744,7 @@ async def phase_plan(task: str, st: State, caps: dict,
         n = len(plan.get("subtasks", []))
         status = plan.get("status", "ready")
         if status == "blocked":
-            gap = (plan.get("confidence", {}) or {}).get("gap_to_close", {})
+            gap = _format_blocked_gap(plan.get("confidence"))
             log(f"  {category}: BLOCKED (planner gate) — {n} subtask(s); "
                 f"gap: {gap}")
         else:
@@ -16768,7 +17474,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
 
     async def _spawn_reconciler(up: str) -> dict:
         st.bump_workers(caps)
-        return await claude_p(
+        raw = await claude_p(
             user_prompt=up, system_prompt=sys_prompt,
             schema_key="reconciler", cwd=os.getcwd(),
             allowed_tools=INSPECT_TOOLS, max_turns=30,
@@ -16777,6 +17483,14 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             sid="reconciler",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
+        # The wire schema is flattened so it compiles under strict mode; every
+        # consumer below expects the nine-array shape. This is the only seam
+        # that knows both (see `_expand_reconciler_output`).
+        out = _expand_reconciler_output(raw)
+        for dangler in out.pop("_dangling_requires", []):
+            log(f"  reconciler: dropped added_requires {dangler} — names a "
+                "subtask absent from added_subtasks")
+        return out
 
     def _check_unresolvable(out: dict) -> None:
         """Fail closed on unresolvable BEFORE mutating anything — the
@@ -17003,7 +17717,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 f"reconciler's revised output ignored "
                 f"{len(unaddressed)} named cycle(s):\n{bullets}\n"
                 "Leerie requires every named cycle to be addressed by at "
-                "least one of dropped_requires / dependency_edges / "
+                "least one of drop_require / dependency_edges / "
                 "merged_subtasks. The retry prompt listed the legal "
                 "operations per cycle; the model defied the structural "
                 "constraint. Refine the task or re-run."
@@ -17150,8 +17864,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 f"{len(unaddressed)} named unresolved-requires entry/"
                 f"entries:\n{bullets}\n"
                 "Leerie requires every named unresolved entry to be "
-                "addressed by at least one of renames / added_provides "
-                "/ added_subtasks / conditional_drops / dropped_requires "
+                "addressed by at least one of renames / add_provide "
+                "/ added_subtasks / conditional_drop / drop_require "
                 "/ unresolvable. "
                 "The retry prompt listed the legal operations per entry; "
                 "the model defied the structural constraint. Refine the "
@@ -17660,15 +18374,18 @@ def _format_recommendation(rec: dict) -> str:
     literal-minded model can copy the entire line directly into its
     output without having to interpolate a placeholder. Deterministic.
 
-    The recommendation heuristic only ever emits `dropped_requires`
-    (cases 1/3/4) or `merged_subtasks` (case 2). It never emits
-    `dependency_edges` — that op is reachable only when the model
-    overrides the recommendation, in which case `_format_must_include`
-    (not this function) renders the option string."""
+    The recommendation heuristic only ever emits a drop (cases 1/3/4) or
+    `merged_subtasks` (case 2). It never emits `dependency_edges` — that op is
+    reachable only when the model overrides the recommendation, in which case
+    `_format_must_include` (not this function) renders the option string.
+
+    Rendered in the WIRE vocabulary the schema accepts, not leerie's internal
+    array names: the model is being told what to emit, and a drop travels as
+    `op: "drop_require"` inside `tag_ops`."""
     op = rec.get("op", "")
     reason = repr(rec.get("reason", ""))
     if op == "dropped_requires":
-        return (f"dropped_requires(sid={rec['sid']!r}, "
+        return (f"tag_ops(op='drop_require', sid={rec['sid']!r}, "
                 f"tag={rec['tag']!r}, reason={reason})")
     if op == "merged_subtasks":
         return (f"merged_subtasks(into={rec['into']!r}, "
@@ -17687,9 +18404,12 @@ def _format_must_include(
 
     `output` is the failing attempt-1 reconciler output — used to
     look up each rename's ORIGINAL pre-rename tag so the rendered
-    `dropped_requires` options target the tag the consumer's requires
-    entry actually holds at retry apply time (after the revert
-    restores the pre-mutation state).
+    drop options target the tag the consumer's requires entry actually
+    holds at retry apply time (after the revert restores the
+    pre-mutation state).
+
+    Rendered in the WIRE vocabulary (a drop is `op: "drop_require"` inside
+    `tag_ops`) because this list goes to the model as its legal answer space.
     """
     options: list[str] = []
     # Each rename in the SCC can be dropped. Edge `src -> dst` carries
@@ -17700,7 +18420,8 @@ def _format_must_include(
                 and e["source"].startswith("requires:")):
             tag = _original_tag_for_rename_edge(e, output)
             options.append(
-                f"dropped_requires(sid={e['to']!r}, tag={tag!r}, ...)")
+                f"tag_ops(op='drop_require', sid={e['to']!r}, "
+                f"tag={tag!r}, ...)")
     # For 2-node SCCs, dependency_edges in either direction and
     # merged_subtasks in either direction are also legal answers.
     if len(scc) == 2:
@@ -17744,7 +18465,8 @@ def _build_cycle_retry_prompt(
         "structural signals. You must either emit the recommendation "
         "verbatim or propose an alternative from the bounded set below. "
         "`unresolvable` is NOT a valid response to a cycle — cycles must "
-        "be broken with one of dropped_requires / dependency_edges / "
+        "be broken with one of drop_require (in tag_ops) / "
+        "dependency_edges / "
         "merged_subtasks.\n"
     )
     for i, (scc, rec) in enumerate(zip(sccs, recommendations), 1):
@@ -17882,13 +18604,18 @@ def _matches_recommendation(option_str: str, rec: dict) -> bool:
     """Whether a must-include option string matches the recommendation
     (so the retry prompt can mark it with ← recommended).
 
-    The recommendation is always either `dropped_requires` or
-    `merged_subtasks` (see `_format_recommendation` docstring); no
-    `dependency_edges` branch is reachable here."""
+    The recommendation is always either a drop or `merged_subtasks` (see
+    `_format_recommendation` docstring); no `dependency_edges` branch is
+    reachable here.
+
+    The prefix must track `_format_must_include`'s rendering exactly — both
+    speak the wire vocabulary (`op: "drop_require"` inside `tag_ops`). If the
+    two drift, no option is ever marked recommended and the drift is silent."""
     op = rec.get("op", "")
     if op == "dropped_requires":
         return option_str.startswith(
-            f"dropped_requires(sid={rec['sid']!r}, tag={rec['tag']!r}")
+            f"tag_ops(op='drop_require', sid={rec['sid']!r}, "
+            f"tag={rec['tag']!r}")
     if op == "merged_subtasks":
         return option_str.startswith(
             f"merged_subtasks(into={rec['into']!r}, from={rec['from']!r}")
@@ -18094,14 +18821,14 @@ def _build_unresolved_retry_prompt(
     parts.append(
         "Your previous reconciler output left "
         f"{len(unresolved)} cross-domain `requires` tag(s) still "
-        "unresolved after applying your renames / added_provides / "
+        "unresolved after applying your renames / add_provide ops / "
         "added_subtasks. Leerie has computed string-similarity hints "
         "from the post-mutation `provides` namespace. Use the hints "
         "if they're semantically correct; if a hint is only "
         "textually close (a 'false friend' — e.g. a narrow synonym "
         "for a broader concept), pick a different option from the "
-        "bounded set below. `unresolvable` IS valid here if no real "
-        "producer exists. `dropped_requires` IS also valid: when the "
+        "bounded set below. The `unresolvable` op IS valid here if no real "
+        "producer exists. `drop_require` IS also valid: when the "
         "consumer's own `provides` already covers the work the requires "
         "tag names (an over-specified self-reference rather than a real "
         "cross-subtask dependency), drop the requires entry — the "
@@ -18179,31 +18906,31 @@ def _build_unresolved_retry_prompt(
                 f"(e.g. rename(sid={sid!r}, from={pre_revert_tag!r}, "
                 f"to={top!r}))")
         parts.append(
-            f"    - added_provides: declare an existing subtask "
+            f"    - tag_ops op='add_provide': declare an existing subtask "
             f"actually produces '{pre_revert_tag}' (add it to that "
             f"subtask's provides)")
         parts.append(
             f"    - added_subtasks: add a new connector subtask whose "
             f"provides includes '{pre_revert_tag}'")
         parts.append(
-            f"    - conditional_drops: drop the consumer subtask "
+            f"    - tag_ops op='conditional_drop': drop the consumer subtask "
             f"({sid!r}) wholesale — ONLY if its own `intent` declares "
             "it conditional on this precondition (e.g. 'no-op if X', "
             "'conditionally add', 'otherwise this subtask is dropped'). "
             "Reserved for planner-authored consumers.")
         parts.append(
-            f"    - dropped_requires: drop just this `requires` entry "
+            f"    - tag_ops op='drop_require': drop just this `requires` entry "
             f"from {sid!r} (the consumer stays in the plan) — ONLY if "
             f"the consumer's own `provides` already covers the work "
             f"'{pre_revert_tag}' names, at a different granularity. "
             "I.e. the requires entry is an aggregate, a coarser synonym, "
             "or an authoring-time decision the same subtask itself "
             "records, rather than a code artifact another subtask "
-            "produces. Distinct from `conditional_drops` (which removes "
+            "produces. Distinct from `conditional_drop` (which removes "
             "the whole subtask) — use this when the consumer should "
             "stay but the over-specified self-reference should go.")
         parts.append(
-            f"    - unresolvable: name this as a genuine gap with a "
+            f"    - tag_ops op='unresolvable': name this as a genuine gap with a "
             "one-sentence reason (aborts the run cleanly).")
 
     parts.append(
@@ -19692,10 +20419,15 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
         )
         last_floor_issues[0] = floor_issues
+        # Same reasoning as fit_judge's score: the threshold comparison
+        # carries no range check, so an out-of-range value would silently
+        # clear the gate (DESIGN §7 *Forcing constrained decoding*).
         adherence = judge_result.get("instruction_adherence")
         low_adherence = (
             isinstance(adherence, (int, float))
-            and adherence < _ADHERENCE_GATE_THRESHOLD
+            and _bounded_or_conservative(adherence, 0.0, 10.0, 0.0,
+                                         "adherence_judge instruction_adherence")
+            < _ADHERENCE_GATE_THRESHOLD
         )
         issues = list(floor_issues)
         if low_adherence:
@@ -20704,7 +21436,7 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
         if blocked_domains:
             die("planners produced no subtasks — all relevant domains exited "
                 f"blocked at the evidence gate: {', '.join(blocked_domains)}. "
-                "See each planner's confidence.gap_to_close for what evidence "
+                "See each planner's confidence.basis for what evidence "
                 "would unblock; raise --confidence-rounds or supply the "
                 "missing information and re-run.")
         die("planners produced no subtasks")
@@ -20718,7 +21450,7 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
             f"the planner evidence gate and contributed no subtasks: "
             f"{', '.join(blocked_domains)}. Proceeding with the ready "
             "domains; see the per-category log lines above for each "
-            "blocked planner's gap_to_close.")
+            "blocked planner's stated gap.")
 
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 
@@ -21177,6 +21909,34 @@ def _is_baked_ecosystem_command(command: list[str]) -> bool:
     return False
 
 
+_PROVISION_TIMEOUT_DEFAULT_S = 1800.0
+
+
+def _recipe_timeout_s(entry: dict, max_s: float | None = None) -> float:
+    """Effective per-step timeout for one provision recipe entry.
+
+    The schema declares `timeout_s` as `{"type": "integer", "minimum": 1}`, but
+    grammar compilation cannot express `minimum`, so
+    `--dangerously-force-strict-output` strips it (DESIGN §7). The bound
+    therefore moves into Python — the same treatment `fit_judge.score` and
+    `adherence_judge.instruction_adherence` get, and for the same reason: the
+    consumer has no range check of its own.
+
+    `0` was always handled by the `or` fallback below, but a **negative** is
+    truthy and would reach `wait_for(timeout=-5.0)`, which fires immediately —
+    turning a provisioning step into an instant, unexplained timeout. Upper
+    bound is the worker wall-clock cap: a single install step cannot usefully
+    outlive the worker running it.
+    """
+    ceiling = float(max_s or DEFAULT_CAPS["worker_timeout_sec"])
+    raw = entry.get("timeout_s")
+    if not raw:  # absent, 0, or None — the documented default
+        return _PROVISION_TIMEOUT_DEFAULT_S
+    return _bounded_or_conservative(
+        raw, 1.0, ceiling, _PROVISION_TIMEOUT_DEFAULT_S,
+        f"provision recipe timeout_s for {' '.join(entry.get('command') or ['?'])}")
+
+
 def _format_provision_recipe_section(recipe: list[dict],
                                       *, audience: str) -> str | None:
     """Render the persisted provision recipe as a prompt section, or
@@ -21249,8 +22009,8 @@ def _format_provision_recipe_section(recipe: list[dict],
     for i, e in enumerate(filtered_entries, 1):
         cmd_str = " ".join(e["command"])
         wd = e.get("working_dir", ".")
-        timeout = e.get("timeout_s") or 1800
-        lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout}s)")
+        timeout = _recipe_timeout_s(e)
+        lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout:g}s)")
     return "\n".join(lines)
 
 
@@ -22757,7 +23517,7 @@ async def _capture_conformance_baseline(
         try:
             await _run_streaming(
                 e["command"], cwd=str(wd),
-                timeout=float(e.get("timeout_s") or 1800),
+                timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
         except subprocess.TimeoutExpired:
@@ -24762,6 +25522,25 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
     # Same lifecycle as the sampler — cancelled in the finally so it never
     # outlives the run.
     reaper_task = asyncio.create_task(_zombie_reaper())
+    # Forced constrained decoding (DESIGN §7 *Forcing constrained decoding*).
+    # Started before the first worker so `_STRICT_PROXY` is already listening
+    # when `claude_p` builds a worker env, and torn down in the same finally as
+    # the tasks above so a crash, SIGINT or SIGTERM cannot leave the port held.
+    global _STRICT_PROXY
+    if caps.get("force_strict_output"):
+        _STRICT_PROXY = _StrictOutputProxy(caps["max_parallel"], verbosity)
+        try:
+            port = await _STRICT_PROXY.start()
+        except OSError as e:
+            # Fail closed: continuing would hand the operator ordinary
+            # post-hoc validation while they believe generation is constrained.
+            _STRICT_PROXY = None
+            die(f"--dangerously-force-strict-output: could not start the "
+                f"local proxy on 127.0.0.1 ({e}). Re-run without the flag to "
+                f"use the CLI's ordinary post-hoc validation.")
+        log(f"strict output: rewriting worker API requests via "
+            f"127.0.0.1:{port} — `strict: true` forced on the "
+            f"StructuredOutput tool (--dangerously-force-strict-output)")
     try:
         await _run_phases(args, caps, leerie_dir, st, sot_pref, verbosity,
                           models, efforts)
@@ -24772,6 +25551,58 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
             await sampler_task
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
+        if _STRICT_PROXY is not None:
+            # The pass-through count is the only signal that the private tool
+            # interface changed under us: the run still succeeds, but silently
+            # without the guarantee it was asked for.
+            # Report each category as itself. The previous single-sentence
+            # form described every pass-through as a possible upstream change
+            # and every upstream error as a possible rewrite rejection — so a
+            # run with 395 successful rewrites, zero 400s and zero fallbacks
+            # announced itself as suspect and pointed at a re-run to "confirm"
+            # a problem that did not exist. A summary that cries wolf on a
+            # healthy run is worse than no summary.
+            _p = _STRICT_PROXY
+            parts = [f"strict output: {_p.rewritten} request(s) rewritten, "
+                     f"{_p.passed_through} without a StructuredOutput tool "
+                     f"(normal — the CLI injects it only on turns that ask "
+                     f"for structured output)"]
+            # A RENAMED tool is invisible per-request — it yields zero hits,
+            # exactly like an ordinary turn that never asked for structured
+            # output — so it cannot be caught where the other shape problems
+            # are. Across a whole run it is visible: leerie passes
+            # `--json-schema` to every worker, so if anything was proxied at
+            # all, something must have carried the tool. Nothing rewritten
+            # means the tool is renamed or gone, and the flag has been silently
+            # doing nothing. Fires once per run, so it cannot reintroduce the
+            # per-request false positives this summary exists to remove.
+            if _p.rewritten == 0 and _p.passed_through:
+                parts.append(
+                    "NOTHING was rewritten — the injected tool appears to have "
+                    f"been renamed or removed (expected `{_STRICT_OUTPUT_TOOL_NAME}`). "
+                    "No worker got constrained decoding this run")
+            if _p.unexpected_tool_shape:
+                parts.append(
+                    f"{_p.unexpected_tool_shape} request(s) carried a "
+                    "StructuredOutput tool leerie could not use (duplicated, "
+                    "or no input_schema) — those did NOT get constrained "
+                    "decoding, and the injected tool may have changed upstream")
+            if _p.fell_back:
+                parts.append(
+                    f"{_p.fell_back} schema(s) fell back to post-hoc "
+                    "validation (would not compile into a grammar)")
+            if _p.schema_errors:
+                parts.append(
+                    f"{_p.schema_errors} schema rejection(s) — the rewrite "
+                    "itself is being rejected; re-run without the flag to "
+                    "confirm")
+            if _p.transient_errors:
+                parts.append(
+                    f"{_p.transient_errors} transient upstream error(s) "
+                    "(rate-limit/overload, unrelated to the rewrite)")
+            log("; ".join(parts))
+            await _STRICT_PROXY.stop()
+            _STRICT_PROXY = None
 
 
 async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
@@ -25465,6 +26296,38 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "to a loud warning and runs workers uncapped. Also "
                          f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var or "
                          "dangerously_allow_uncapped=true in leerie.toml.")
+    ap.add_argument("--dangerously-force-strict-output", action="store_true",
+                    help="DANGEROUS: route every worker's API traffic through "
+                         "a per-run loopback proxy that rewrites the outbound "
+                         "request to set `strict: true` on the "
+                         "StructuredOutput tool Claude Code injects, turning "
+                         "post-hoc schema validation into grammar-constrained "
+                         "decoding. Measured: unconstrained generation is the "
+                         "cause of 28.8%% of all worker submissions being "
+                         "malformed (2,861 of 9,924 across the run corpus). "
+                         "FOUR THINGS TO UNDERSTAND FIRST. (1) It reaches an "
+                         "API capability the CLI does not expose and that is "
+                         "not documented for subscription auth — verified "
+                         "working, but undefined against the Consumer terms; "
+                         "that judgement is yours. (2) It matches an internal "
+                         "tool name and shape carrying no compatibility "
+                         "guarantee, which may change in any Claude Code "
+                         "release; leerie then fails OPEN (forwards "
+                         "unmodified), so you lose the guarantee silently — "
+                         "watch for the 'passed through' count in the run "
+                         "summary. (3) Strict cannot express minLength/"
+                         "maxLength/minimum/maximum, so 21 such constraints "
+                         "are stripped from leerie's schemas; the 5 numeric "
+                         "bounds are re-checked in Python, the 16 string ones "
+                         "rely on existing emptiness guards. (4) It sets "
+                         "ANTHROPIC_BASE_URL for workers, which changes other "
+                         "CLI behaviour (MCP tool-search defaults and other "
+                         "first-party-gated paths), and is refused outright if "
+                         "you already set that variable yourself. Default is "
+                         "off — leerie uses the CLI's ordinary post-hoc "
+                         "validation and absorbs the retries. Also "
+                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var or "
+                         "dangerously_force_strict_output=true in leerie.toml.")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
@@ -25962,6 +26825,45 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
         repo_root, args.dangerously_allow_uncapped)
+
+    # Forced constrained decoding (DESIGN §7 *Forcing constrained decoding*).
+    caps["force_strict_output"] = resolve_dangerously_force_strict_output(
+        repo_root, args.dangerously_force_strict_output)
+    if caps["force_strict_output"] and os.environ.get("ANTHROPIC_BASE_URL"):
+        # The flag works by owning ANTHROPIC_BASE_URL. Overriding an operator's
+        # gateway silently would hijack their setup; honouring theirs and
+        # quietly skipping the rewrite would deny the guarantee they asked for.
+        # Both are wrong, so refuse and let them choose.
+        die("--dangerously-force-strict-output needs ANTHROPIC_BASE_URL for "
+            f"its own proxy, but it is already set to "
+            f"{os.environ['ANTHROPIC_BASE_URL']!r}. leerie will not override "
+            "your endpoint, and will not silently run without the constrained "
+            "decoding you asked for. Unset ANTHROPIC_BASE_URL, or drop the "
+            "flag.")
+    # Same contract, second collision: Bedrock. The proxy's upstream is
+    # hardcoded to api.anthropic.com and it owns ANTHROPIC_BASE_URL, which is
+    # the *first-party* endpoint override — Bedrock has its own
+    # (ANTHROPIC_BEDROCK_BASE_URL). So under Bedrock the flag either does
+    # nothing (the CLI never contacts the proxy, and the operator is silently
+    # given post-hoc validation — the exact silent loss the guard above exists
+    # to prevent) or misroutes every worker call to the wrong endpoint. Neither
+    # is distinguishable from a healthy run at the log level, so refuse. The
+    # truthy spellings match the launcher's own detect_bedrock_mode().
+    bedrock_via = (
+        "AWS_BEARER_TOKEN_BEDROCK" if os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        else "CLAUDE_CODE_USE_BEDROCK"
+        if os.environ.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower()
+        in ("1", "true", "yes", "on")
+        else "")
+    if caps["force_strict_output"] and bedrock_via:
+        die(f"--dangerously-force-strict-output cannot be used with Bedrock "
+            f"({bedrock_via} is set). The flag works by pointing workers at a "
+            "local proxy via ANTHROPIC_BASE_URL, which is the first-party "
+            "endpoint override; Bedrock routes elsewhere, so the rewrite would "
+            "either be skipped silently or send every worker call to the wrong "
+            "endpoint. leerie will not silently run without the constrained "
+            "decoding you asked for. Drop the flag, or use subscription/API "
+            "auth for this run.")
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

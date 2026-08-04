@@ -47,8 +47,11 @@ def test_required_fields(leerie):
 def test_wiring_defect_item_shape(leerie):
     item = leerie.SCHEMAS["wiring_judge"]["properties"]["wiring_defects"]["items"]
     assert item["type"] == "object"
+    # `severity` is asked for but NOT required (2026-08-03) — see
+    # test_accepts_defect_without_severity below for why.
     assert set(item["required"]) == {
-        "kind", "sid", "tag_or_dep", "concrete_reason", "severity"}
+        "kind", "sid", "tag_or_dep", "concrete_reason"}
+    assert "severity" in item["properties"]
     assert set(item["properties"]["kind"]["enum"]) == {
         "missing_requires", "missing_provides", "broken_by_merge",
         "broken_by_drop", "orphaned_dependent"}
@@ -139,21 +142,29 @@ def test_rejects_bad_defect_kind(leerie):
         )
 
 
-def test_rejects_defect_missing_severity(leerie):
+def test_accepts_defect_without_severity(leerie):
+    """Requiring `severity` defeated its own purpose. A judge that omitted it
+    produced no schema-valid payload at all, so `phase_wiring_gate` never ran
+    and caught NOTHING — measured across the run corpus, every `wiring_judge`
+    invocation that never produced valid output (9 of 66) failed on this one
+    field, accounting for all 18 of its failing submissions.
+
+    An unlabelled defect still GATES (DESIGN §8 *Findings carry a severity* —
+    "the default is gating"), so this relaxes the payload contract without
+    weakening the gate; `tests/test_phase_wiring_gate.py` pins that behaviour."""
     if not HAS_JSONSCHEMA:
         pytest.skip("jsonschema not available")
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(
-            {
-                "plan_reviewed": True,
-                "wiring_defects": [{
-                    "kind": "missing_requires", "sid": "x",
-                    "tag_or_dep": "y", "concrete_reason": "z",
-                }],
-                "rationale": "x",
-            },
-            leerie.SCHEMAS["wiring_judge"],
-        )
+    jsonschema.validate(
+        {
+            "plan_reviewed": True,
+            "wiring_defects": [{
+                "kind": "missing_requires", "sid": "x",
+                "tag_or_dep": "y", "concrete_reason": "z",
+            }],
+            "rationale": "x",
+        },
+        leerie.SCHEMAS["wiring_judge"],
+    )
 
 
 def test_rejects_bad_severity_value(leerie):

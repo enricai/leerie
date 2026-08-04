@@ -267,7 +267,7 @@ def test_apply_reconciler_output_stamps_added_by_reconciler(leerie):
     # Model emits an added_subtask WITHOUT the flag (or with false —
     # both must be overridden by leerie).
     output = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "added_subtasks": [
             {"id": "feat-100", "title": "new connector",
              "success_criteria_seed": "produces foo",
@@ -279,8 +279,8 @@ def test_apply_reconciler_output_stamps_added_by_reconciler(leerie):
              "size": "small",
              "_added_by_reconciler": False},  # model lies — leerie overrides
         ],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
 
@@ -357,7 +357,7 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
             {"sid": "config-001", "from": "backend-framework",
              "to": "backend-ready"},
         ],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [{
             "id": "feat-100",
             "title": "Bundled foundation",
@@ -366,8 +366,8 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
             "provides": ["cap-a", "cap-b", "cap-c"],
             "requires": [], "depends_on": [],
             "size": "large"}],  # OVERSIZED → size gate fires
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt 2 (size retry): splits the oversized subtask but keeps
     # the cycle-closing renames so the cycle gate still fires.
@@ -378,7 +378,7 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
             {"sid": "config-001", "from": "backend-framework",
              "to": "backend-ready"},
         ],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [
             {"id": "feat-100a", "title": "split-a",
              "success_criteria_seed": "cap-a works",
@@ -393,8 +393,8 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
              "provides": ["cap-c"], "requires": [], "depends_on": [],
              "size": "small"},
         ],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt 3 (cycle retry): the cycle retry's prompt asked the
     # model to break the cycle. With the snapshot refresh in place,
@@ -413,9 +413,9 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
             {"sid": "config-001", "from": "backend-framework",
              "to": "backend-ready"},
         ],
-        "added_provides": [],
+        "added_requires": [],
         "added_subtasks": [],
-        "dropped_requires": [
+        "tag_ops": [
             # Drop the ORIGINAL pre-rename tag (matches the apply
             # step's lookup after the revert restores the snapshot
             # and the rename re-applies — actually: revert puts back
@@ -423,10 +423,10 @@ def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_pa
             # no-ops since the entries are already renamed; then the
             # drop targets the POST-rename tag because that's what's
             # in the entry now).
-            {"sid": "config-001", "tag": "backend-ready",
-             "reason": "break the cycle"},
+            {"op": "drop_require", "sid": "config-001",
+             "tag": "backend-ready", "reason": "break the cycle"},
         ],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
 
     calls: list[dict] = []

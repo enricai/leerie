@@ -1215,6 +1215,7 @@ leerie/
 │   │                              decide_teardown's Fly clean-exit branch, and
 │   │                              `leerie finalize <run-id>` (§7 Host-side finalize)
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a Unix socket; v1+v2); the dropped-privilege orchestrator drives it
+│   ├── verify-strict-schemas.py   maintainer tool: sends every hardened SCHEMAS entry to the real API and reports which compile under strict mode (live creds; outside pytest's testpaths)
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 │   ├── container-entry.sh         container PID 1 (root rootful / mapped-UID rootless): create leerie.slice + launch cgroup broker + cd /work + drop to leerie via runuser (rootful)
 │   ├── install.sh                 one-command installer (curl | bash); preflight git/curl + auto-install
@@ -2294,6 +2295,29 @@ undiagnosable from a log. The `InputValidationError` (unparseable JSON) path
 already logged its payload; this closes the gap for the parseable-but-invalid
 case. Recovering these by hand under `--output-format stream-json` is what
 disproved the 2026-08-03 investigation's leading hypothesis about their cause.
+
+#### Blocked-planner gap diagnostic
+
+`_format_blocked_gap(confidence) -> str` renders a blocked planner's stated
+gap for `phase_plan`'s per-category summary line, capped at
+`_BLOCKED_GAP_LOG_MAX = 400` chars with a visible `… [truncated; see log]`
+marker — never a silent cut, matching `_format_payload_for_log` above.
+
+Two transforms, both because the value is free prose. Whitespace is collapsed
+so an embedded newline cannot split a one-line summary across several rows,
+and the result is truncated: the gap moved from `confidence.gap_to_close` (a
+compact dict, frequently `{}`) to `confidence.basis` when the confidence block
+was flattened (DESIGN §8), and `basis` runs a **median of ~1.1k characters and
+up to 4.3k** across real planner submissions — so an untruncated line would put
+multiple KB on one row of the operator's terminal. The full text stays in the
+per-worker log, which the scheduling gate's own blocked-domain message already
+points at.
+
+Returns `""` rather than `None` for absent, empty or malformed input, so the
+caller interpolates an empty gap instead of the string `"None"`. The cap is
+much smaller than `_REJECTED_PAYLOAD_LOG_MAX` because this is one line inside a
+routine summary rather than a standalone failure dump. Pinned by
+`tests/test_schedule_blocked.py`.
 Pinned by `tests/test_rejected_payload_logging.py`.
 
 Resolution order (highest priority first):
@@ -3313,6 +3337,238 @@ The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
 
+#### Forced constrained decoding — `--dangerously-force-strict-output`
+
+Off by default. Resolved by `resolve_dangerously_force_strict_output(repo_root,
+cli_value)` with
+the standard CLI > env (`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) > `leerie.toml`
+(`dangerously_force_strict_output`) precedence.
+
+**Why it exists.** `--json-schema` is *validated*, not constrained: the CLI
+injects the schema as a synthetic `StructuredOutput` tool with **no
+`strict: true`** and no `output_config` (confirmed from a captured outbound
+request, 2026-08-04). Measured across the run corpus, **2,861 of 9,924
+submissions (28.8%)** are malformed as a result. Setting `strict: true` compiles
+the schema into a sampling grammar and makes those shapes unrepresentable.
+
+**Mechanism.** `_StrictOutputProxy` — an `asyncio.start_server` listener on
+`127.0.0.1`, **one per run**, started in `_orchestrate()` before the first
+worker and closed in its `finally` — which covers normal completion, `die()`,
+and SIGINT. There is deliberately no `_cleanup_on_abnormal_exit` hook: on
+SIGKILL the container boundary reaps the listener (DESIGN §6), which is the same
+guarantee every other worker resource relies on. Workers
+reach it via `ANTHROPIC_BASE_URL` injected into `worker_env`. The orchestrator
+is PID 1 in the container and workers are its children, so loopback needs no
+port mapping.
+
+| property | value | why |
+|---|---|---|
+| port | bind `0`, read back from `server.sockets[0].getsockname()[1]` | no scan, no race, concurrent runs never collide |
+| executor | dedicated `ThreadPoolExecutor(max_parallel + 8)` | the default pool saturates: measured 34/40 connections at 40 concurrent, 40/40 once bounded |
+| socket | `reuse_address=True`, `backlog=256` | without it the port is not rebindable after shutdown |
+| shutdown | close listener, drain tracked writers, `_pool.shutdown(wait=False, cancel_futures=True)` | verified port is rebindable afterwards. `wait=False` keeps Ctrl-C responsive — a blocking join could hold the finally open for a full upstream timeout. Residual: `ThreadPoolExecutor` registers an atexit join, so an upstream call still in flight at exit can delay the interpreter by up to `_STRICT_PROXY_TIMEOUT_SEC`; in the container the boundary reaps first |
+| `ConnectionResetError` / `BrokenPipeError` | caught per connection, non-fatal | normal client hang-up |
+| upstream | executor-bridged `urllib` | leerie has no async HTTP dependency; hand-rolled HTTP/1.1 is where the bugs are. Verified to 80 concurrent (16× default `max_parallel`) |
+| method | parsed from the request line and threaded to `_upstream` | only POST bodies are rewritten; every other verb the CLI issues must reach upstream as itself |
+| chunked request body | decoded by `_read_chunked`, never rewritten | a chunked body carries no `content-length`, so a length-driven read forwards only the first packet — a silently truncated request, which reads downstream as a model error rather than a proxy bug |
+
+**Logging reports categories, never a merged total.** The proxy runs in the
+orchestrator process, so `log()` from the handler interleaves with every other
+leerie line — there is no separate proxy log to go find.
+
+Four counters, deliberately not merged: `passed_through` (no `StructuredOutput`
+tool in the request — ordinary multi-turn traffic, measured at ~25-30% of POSTs
+because the CLI injects the tool only on turns that want structured output),
+`unexpected_tool_shape` (the tool IS present but duplicated or missing its
+`input_schema` — the only pass-through worth warning about), `schema_errors`
+(400s, the flag's own failure mode) and `transient_errors` (429/5xx, unrelated
+to the rewrite). Echo budgets are **per class**.
+
+A **renamed** tool is caught separately, at run level: it yields no matching
+tool per request, exactly like an ordinary turn that never asked for structured
+output, so it cannot be classified where the other shape problems are. If a run
+ends having rewritten nothing while requests were proxied, the summary reports
+a probable rename — once, so it cannot reintroduce per-request false positives.
+
+Recorded because the merged form shipped and misled on the first real run: 395
+rewrites, zero 400s and zero fallbacks reported themselves as *"the injected
+tool may have changed upstream … the rewrite itself may be being rejected;
+re-run without the flag to confirm"*. Three transient 529s had also consumed
+the whole shared echo budget, so a genuine 400 — carrying the API's own message
+naming the offending schema path — would have been counted rather than shown.
+A summary that cries wolf on a healthy run is worse than none: it sends the
+operator chasing nothing and devalues the warning for when it is real. Three levels, emitted by `_log_exchange`:
+
+| when | verbosity | line |
+|---|---|---|
+| listener starts | all | `strict output: rewriting worker API requests via 127.0.0.1:<port> …` |
+| upstream ≥ 400 | **all, including `quiet`** | `strict-output proxy: upstream <status> on <method> <path> (<what was changed>) — <response body>` |
+| upstream < 400 | `debug` (`-vv`) only | `strict-output proxy: <method> <path> -> <status> (<what was changed>)` |
+| run ends | all | rewritten / passed-through / upstream-error counts |
+
+The error line is deliberately not verbosity-gated. This proxy is the only thing
+in the path that rewrites a request, so a 4xx is most likely leerie's own edit
+being rejected — and the response body names the offending schema path. Without
+it the operator sees only workers retrying, which is precisely the
+misattribution this flag's failure mode consists of. Echoes are capped at
+`_STRICT_PROXY_ERROR_LOG_MAX` (3) bodies of `_STRICT_PROXY_ERROR_BODY_MAX` (400)
+chars, because a rejected rewrite is systematic — every worker call fails the
+same way — after which they are counted, not echoed. The count is complete
+regardless, so the end-of-run summary never under-reports.
+
+**Transform** (`_strictify_request(body) -> tuple[bytes, str] | None` — the
+second element describes what changed and is what the log lines below report),
+applied only when
+exactly one tool is named `StructuredOutput` and carries an `input_schema`:
+sets `strict: true`; adds `additionalProperties: false` to every object node
+including inside array `items`; strips `minLength` / `maxLength` / `minimum` /
+`maximum`; clamps `minItems > 1` to `1`. Verified against all 23 entries in
+`SCHEMAS`: **zero residual violations**, 65 `additionalProperties` added, 21
+keywords stripped across 8 schemas.
+
+**"Object node" is three shapes, not one.** `{"type": "object"}`, a *union*
+type containing it (`["object", "null"]`), and a bare `properties` with no
+declared type. The API requires `additionalProperties: false` on all three.
+
+This is recorded because the first implementation tested `type == "object"` and
+shipped: leerie's own `implementer.clarification_question` is
+`{"type": ["object", "null"], …}`, so the API rejected the whole implementer
+schema — *"tools.0.custom: For 'object' type, 'additionalProperties' must be
+explicitly set to false"* — which would have 400'd **every implementer call**,
+the most-used worker in the system, surfacing only as the retry storm this flag
+exists to eliminate.
+
+No unit test caught it, and the one that should have could not: the sweep in
+`tests/test_strict_output_proxy.py::test_every_real_schema_survives_the_transform`
+walks the hardened output using `_STRICT_UNSUPPORTED_KEYWORDS`, the same
+constant `_strictify_schema` consults, so it can only establish
+self-consistency and shares every blind spot the transform has. It was found by
+sending all 23 schemas to the **real API** — which is now a committed tool,
+`scripts/verify-strict-schemas.py`, deliberately outside `pytest.ini`'s
+`testpaths` so the suite stays LLM-free. Re-run it after editing any entry in
+`SCHEMAS` or touching `_strictify_schema`. The lesson generalises: a transform
+targeting an external contract must be verified against that contract, not
+against the developer's model of it. Pinned since by
+`test_every_object_shape_is_hardened` (the three shapes) and
+`test_no_schema_has_an_unhardened_object_shape` (the whole corpus, using an
+independently-spelled definition of "is an object").
+
+**Running the probe.** `python3 scripts/verify-strict-schemas.py`. It sends one
+request per schema and exits **0** every schema compiles / **1** at least one
+was rejected / **2** the control was *not* rejected, so the probe cannot detect
+a rejection and a pass would be meaningless / **3** inconclusive — at least one
+schema was throttled or timed out. **3 is not a pass**: a schema with no verdict
+is unchecked, and the summary names which ones. Expect ~25-45 s per schema;
+grammar compilation for a large schema is genuinely slow, which is why a
+transport failure is reported as "no verdict" and never conflated with a
+rejection.
+
+Two API facts the probe's docstring records, because both are easy to get wrong
+and neither affects leerie itself: a subscription OAuth token **requires the
+Claude Code system-prompt identity** (without it the API answers a bare
+`429 {"message":"Error"}` that reads exactly like quota exhaustion), and the
+20-strict-tool / 24-optional-parameter ceilings are per-**request** aggregates,
+so batching schemas to save calls trips them and establishes nothing about any
+individual schema. leerie sends exactly one tool per request, and its largest
+single schema carries 14 optional parameters.
+
+**All 23 schemas compile** (measured live 2026-08-04,
+`claude-sonnet-4-5-20250929`, via `scripts/verify-strict-schemas.py`). Two
+needed work beyond the mechanical hardening:
+
+* **`planner`** — 11 optional properties in one `subtasks[]` item, refused with
+  "Schema is too complex for compilation". Fixed by `_strictify_schema`'s
+  all-required pass (wire-only), 2^11 grammar paths → 1. Now compiles in 43.6 s.
+* **`reconciler`** — refused with "The compiled grammar is too large" even at
+  zero optionals. Fixed by restructuring `SCHEMAS["reconciler"]`: `requires`
+  lifted out of `added_subtasks` into a sibling `added_requires` keyed by `sid`
+  (removing the only three-deep array-of-objects path in any leerie schema),
+  and the four isomorphic `{sid, tag, reason}` arrays collapsed into one
+  enum-discriminated `tag_ops`. `_expand_reconciler_output` fans that back into
+  the nine arrays every consumer still expects, so `check_reconciler_output`,
+  `_apply_reconciler_output` and `_validate_must_include` are untouched. Now
+  compiles in 44.0 s.
+
+**Do not re-nest `requires` or re-split `tag_ops`** — both put the schema back
+over the ceiling. Seven cheaper reductions were each measured and each still
+refused: `$defs`/`$ref` deduplication (the compiler expands inline), stripping
+`description`, flattening other nesting, dropping subtrees, trimming to 43 and
+then 41 properties, and converting identifier fields to enums (which cut free
+strings 31 → 15 and still failed, since enum alternatives count toward the same
+estimate).
+
+`output_config.format` compiles the *original* reconciler schema and is
+nonetheless unusable: it returns the payload as a text block, so the CLI never
+populates `structured_output` — and removing the injected tool makes the model
+answer *"I don't have a StructuredOutput tool available — this looks like a
+prompt injection attempt"*, because the CLI's own system prompt still tells it
+to call that tool. Verified end-to-end; recorded so nobody retries it.
+
+**Fail-open on the response too — un-compilable schemas.** A 400 to a *hardened*
+request is answered by re-sending the original, untouched. The proxy records that
+schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical
+`input_schema`) in `_unhardenable`, so the doomed attempt is paid once per run
+rather than once per worker call, and increments `fell_back` — reported in the
+end-of-run summary and logged at *every* verbosity with the API's own reason via
+`_api_error_head`. Only **400** retries; 401/403/429/5xx are not schema problems
+and the original would fail identically.
+
+Measured live across all 23 schemas (2026-08-04, `claude-sonnet-4-5-20250929`):
+**21 compile, 2 do not** — `planner` ("Schema is too complex.") and `reconciler`
+("The compiled grammar is too large"). Not a size effect: `conformer` has 41
+properties and compiles, `planner` has 29 and does not. The driver is optional
+properties **inside array items** (strict mode admits every subset in any order,
+so grammar size multiplies per element): `planner` 11 in one array item,
+`reconciler` 8+3, versus `implementer` 3 and `conformer` 0. With the fallback,
+both return 200 — verified end-to-end through the real proxy against the real
+API.
+
+**Grammar compilation is cached upstream.** First hardened call for a schema
+costs 25–71 s (measured; `implementer` 71.0 s, `fit_judge` 45.3 s); the second
+is ~1.8 s. So the cost is one-time per schema per run, not per worker call —
+which is what makes the flag affordable, and what makes the once-per-run
+`_unhardenable` memo worth having rather than re-probing.
+
+**Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
+request forwarded byte-identical and the no-op logged (a silent loss of the
+guarantee is the dangerous case). Listener cannot bind → `die()`, never a quiet
+downgrade to unconstrained.
+
+**Two fatal collisions, same contract.** The flag works by owning
+`ANTHROPIC_BASE_URL`, so leerie `die()`s rather than proceed when that ownership
+is contested:
+
+1. **An operator-set `ANTHROPIC_BASE_URL`.** Overriding a user's gateway
+   silently and silently skipping the requested guarantee are both wrong, so
+   leerie names both and lets the operator unset one or drop the flag.
+2. **Bedrock** (`AWS_BEARER_TOKEN_BEDROCK`, or a truthy `CLAUDE_CODE_USE_BEDROCK`
+   — the same spellings the launcher's `detect_bedrock_mode()` accepts).
+   `ANTHROPIC_BASE_URL` is the *first-party* endpoint override; Bedrock has its
+   own (`ANTHROPIC_BEDROCK_BASE_URL`) and the proxy's upstream is hardcoded to
+   `api.anthropic.com`. So the flag under Bedrock either does nothing — the CLI
+   never contacts the proxy and the operator is silently handed post-hoc
+   validation, the exact failure case 1 exists to prevent — or misroutes every
+   worker call. Neither is distinguishable from a healthy run in the log, so
+   this is a `die()`, not a warning.
+
+**Stripped numeric bounds are re-checked in Python.** Of the 21 stripped
+keywords, 16 are string-length bounds (15 `minLength`, 1 `maxLength`) whose
+consumers already test truthiness. The 5 numeric ones (3 `minimum`, 2 `maximum`)
+do not and fail permissively — `score = judge_result.get("score", 0.0)` then
+`if score >= threshold` would read an out-of-range score as well-fit — so
+`fit_judge.score` (0–1, `_recursive_decompose`),
+`adherence_judge.instruction_adherence` (0–10, `phase_adherence_gate`) and
+`provision.recipe[].timeout_s` (≥1, `_recipe_timeout_s`, used by both the
+prompt-rendering and the baseline-install call sites) go through
+`_bounded_or_conservative`.
+
+These guards run **unconditionally, not only under the flag**: a value outside
+its declared range was always a worker bug, and distrusting it is right whether
+or not strict mode is what removed the bound. `timeout_s` additionally has a
+pre-existing `or 1800` fallback that already absorbed `0`; the guard adds the
+negative case, which is truthy and would otherwise reach
+`wait_for(timeout=-5.0)` and fire instantly.
+
 #### User prompt transport — stdin, not argv
 
 `build()` emits `["claude", "-p", ...]` with **no positional argument
@@ -3747,7 +4003,7 @@ Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 |   • Provision gate | `phase_provision_gate` | independent adversarial verifier of the detected install recipe (DESIGN §8, §6½). One `provision_judge` worker attacks `st.data["provision"]["recipe"]` against the image/runtime — catching the semantic gaps the deterministic `_normalize_pip_installs` / `_validate_provision_recipe` miss (a `pip install` missing `--break-system-packages` on the externally-managed Debian image, a package manager that doesn't match the lockfiles present). A non-empty `recipe_failures` array `die()`s immediately with the judge's concrete `fix` named — **detect-and-die, single pass** (no re-drive: a table recipe re-emits identically and an LLM recipe would re-produce the same defect, so re-driving only burns rounds before dying anyway; a broken recipe is fatal, matching `phase_provision`'s own recipe-validation die). A `provision_judge` `WorkerError` degrades (the deterministic checks already ran). Skipped when no recipe was detected (`kind: none`); runs inside the `plans_after_classify` checkpoint block so a resume past classify skips it. Persists to `state.data["provision_recipe_gate"]`. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_artifact_registry`, `phase_plan` | **First: `phase_artifact_registry`** runs a single read-only `artifact_registry` worker (after classify, before any planner) that emits a small canonical `{description, tag, path}` vocabulary for the artifacts the task will plainly create (DESIGN §5 *Artifact-registry worker*). Persisted to `state.data["artifact_registry"]` (own resume checkpoint, keyed on presence — `[]` is a valid completed state); `phase_plan` injects it into every planner's `ctx_dict` so blind parallel planners prefer the same tag/path. Best-effort/non-fatal — never die()s, returns `[]` when the worker crashes every round or genuinely finds nothing to register; `--skip-repo-map` only suppresses the repo-map context handed to the worker (mirroring `phase_plan`'s own degrade) — the worker still runs and can still return a non-empty list. **Then `phase_plan`:** one planner worker per category, awaited concurrently via `_gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `_recursive_decompose(subtask, depth=0, …)` and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → _validate_plan → _write_plan) receives this expanded flat leaf set unchanged. |
-|   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `_write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits eight arrays — five *resolution* (renames / added_provides / added_subtasks / conditional_drops / dropped_requires), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `dropped_requires` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
+|   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `_write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits eight actions — five *resolution* (renames / add_provide / added_subtasks / conditional_drop / drop_require), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `drop_require` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). **Wire shape vs internal shape:** the four `{sid, tag, reason}` ops travel as one `op`-discriminated `tag_ops` array and a new subtask's `requires` travels in a sibling `added_requires` keyed by sid — both forced by grammar compilation (see §7). `_expand_reconciler_output` fans that into the eight arrays named here before any consumer runs, so every apply step and state field below uses the action names, not the wire names. If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
 |   • Overlap judge *(when 2+ planners)* | `phase_overlap_judge` | spawn one `plan_overlap_judge` worker against the reconciled plan to detect cross-planner **surface collisions** — two subtasks producing the same exported artifact (same component / function / primitive) with incompatible APIs. Schema in `SCHEMAS["plan_overlap_judge"]`. Output: zero or more `collisions`, each with `resolution ∈ {merge, drop_a, drop_b, unresolvable}` and (when `resolution=merge`) a non-empty `merge_feasibility` statement that becomes the merged subtask's unified intent. Orchestrator applies actions mechanically through `_apply_overlap_collisions` with the **anchor-survivor rule**: when one sid appears in 2+ non-`unresolvable` collisions (computed by `_compute_overlap_anchors`), it is the structural anchor of the cluster and survives every merge it participates in — overriding `_apply_overlap_merge`'s default lex-smaller rule (the default is a determinism device with no semantic content). Rationale: membership is bare appearance count and carries no semantic claim — a sid the judge dropped twice is an anchor too, it just never survives to use the hint — but a sid the judge kept returning to is a better merge tie-break than alphabetical order. Do **not** read it as "the broader subtask that absorbs each partner": that is false on 20 of the 64 two-collision combinations (DESIGN §5). Pairs that lack a shared endpoint use the lex-smaller default unchanged. Per-pair: `merge` → `_apply_overlap_merge` (with optional `survivor_hint=anchor_sid` when applicable; union of fields, intent concatenation, downstream `depends_on` rewrites); `drop_*` → `_apply_overlap_drop` (mirrors `conditional_drops` apply step); `unresolvable` → `die()` at plan time with both sids + artifact + judge's reason. The validator also die()s on the keep-and-delete contradiction (`_contradictory_drop_sids`: a `drop_*` whose dropped sid *survives* another collision — kept as a merge endpoint or as the non-dropped side of another `drop_*`. One claim deletes it, another keeps it; no apply order satisfies both. Deliberately **not** anchor membership — a sid dropped by several collisions is an anchor by appearance but is coherent multi-drop output, applied as a cluster by `_apply_multidrop`). **Per-resolution cycle avoidance:** before applying each `merge` / `drop_*`, `_apply_overlap_collisions` tentatively applies it to a copy (`_would_cycle_after`) and, if it would introduce a dependency cycle, skips it (`skipped_would_cycle`) — keeping both subtasks separate for the integrator instead of `die()`ing the run; the final post-merge Tarjan gate is retained only as a never-fires backstop. **Cheap-skip** when fewer than 2 planners produced subtasks, or total subtask count < 2 (no possible cross-planner collision). **Python backstop** asserts every `merge` carries non-empty `merge_feasibility` — caught at `_validate_overlap_judge_output` before any apply. Opt-out via `--skip-overlap-judge` (mirrors `--skip-smoke`; env `LEERIE_SKIP_OVERLAP_JUDGE`; `leerie.toml` `skip_overlap_judge`). Persists full judge output to `state.data["plan_overlap_judge"]` and post-apply mutations to `state.data["plan_overlap_applied"]` for audit. See "Phase 2¾ checks" below. |
 |   • Adherence gate *(when prescribed)* | `phase_adherence_gate` | whole-plan instruction-adherence gate (DESIGN §12 sibling — see "Instruction-adherence gate" above for the full mechanism). Cheap-skip when `st.data["skip_adherence_check"]` or `st.data["prescribed_procedure"].is_prescribed` is falsy — the ~90% goal-only common case pays nothing. Otherwise: deterministic `check_prescribed_command_coverage` floor + `adherence_judge` worker, fed through the existing `_run_checked_loop` (bounded by `judgment_check_rounds`); a violation's feedback callback re-invokes `phase_plan` in full to actually re-plan, then re-invokes `phase_reconcile` **and `phase_overlap_judge`** on the re-planned output (a re-plan runs one planner per category in parallel with no cross-category tag visibility, and can reintroduce cross-domain `provides`/`requires` drift `phase_reconcile` already resolved on the first pass **and the cross-planner surface collisions `phase_overlap_judge` already merged** — DESIGN §5 *A re-plan invalidates every phase that already ran*. It does NOT re-run `phase_planning_coverage_gate`, which sits downstream and has not run yet; `phase_reconcile` short-circuits to a no-op when the re-plan introduced no new unresolved requires). `die()`s on exhaustion; `adherence_judge` `WorkerError` degrades to the floor's own verdict rather than discarding the plan. Persists to `state.data["adherence_gate"]` for audit. |
 |   • Coverage gate | `phase_planning_coverage_gate` | two-layer gate, same composition as the adherence gate: PRIMARY deterministic `check_required_items_coverage(required_items, subtasks)` floor (set-compares the classifier's structured `required_items` against subtask title/`success_criteria_seed` token sets — `REQUIRED_ITEM_UNCOVERED` on a miss) + SECONDARY `task_coverage_judge` independent adversarial verifier of the merged plan's coverage of the task (DESIGN §8 *Independent adversarial verification*), replacing the planner's self-graded `task_understanding` confidence axis (`check_planner_output` no longer gates on it). The judge's JSON payload is only the task text plus the reconciled subtask set (titles/intents/success criteria), but it also runs with `INSPECT_TOOLS` and reads task-referenced files itself per its prompt; it attacks the union of subtasks for missing required work or off-task drift the floor cannot see; a non-empty `coverage_gaps` array OR a non-empty floor result re-drives `phase_plan` via `_run_checked_loop` (bounded by `judgment_check_rounds`) with the found gaps folded into the task, then re-invokes `phase_reconcile`, `phase_overlap_judge` **and** `phase_adherence_gate` on the re-planned output, and `die()`s on exhaustion of that retry loop. A `task_coverage_judge` crash-every-round is a SEPARATE path from that retry loop: it still evaluates the floor before degrading — a WorkerError must never silently waive the deterministic floor — and `die()`s if the floor alone still has issues, without re-invoking `phase_reconcile`/`phase_overlap_judge`/`phase_adherence_gate` (those only fire from a normal judge-driven replan round, never from the crash-degrade branch). It is the last gate in the planning pipeline, so a re-plan here invalidates all three phases upstream of it (DESIGN §5 *A re-plan invalidates every phase that already ran*) — not just the reconciler. Run `19a70d96…` (2026-08-01) is the incident: the overlap judge merged 8 subtasks to 4, this gate re-planned, 8 came back with every duplicate restored, nothing re-detected them, and all 8 executed until the integration gate refused the merge — 4.7 hours and 164 workers spent on a plan the overlap judge had already rejected. (The same run independently surfaced the unrelated migration-surface stopword defect cited elsewhere in this document — one run, two distinct bugs; see DESIGN §5 "Cross-domain surface overlap" for the disambiguating note.) Re-running these is cheap: `phase_adherence_gate` short-circuits on `not prescribed_procedure["is_prescribed"]` and `phase_overlap_judge` cheap-skips single-planner plans. Nesting `phase_adherence_gate` inside this gate's `_run_checked_loop` is bounded, not recursive — both loops cap at `judgment_check_rounds`, so the worst case is that product (9 at the default 3). **Two consequences of the nesting are deliberate and worth knowing when reading a failed run's log.** (1) A re-plan can now `die()` *inside an upstream phase* — `phase_overlap_judge`'s `unresolvable` / contradictory-drop dies and `phase_adherence_gate`'s exhaustion die are all reachable from this gate's feedback callback, so the operator can see an overlap-judge or adherence error emitted while the phase banner still reads the coverage gate. That is a real defect being caught at the first point it becomes visible, not a mis-attribution. (2) The nested calls overwrite their own audit keys (`plan_overlap_judge`, `plan_overlap_applied`, `adherence_gate`), so those hold the **last** verdict rather than the first-pass one; the final verdict is what `resume` and the audit trail need, but a first-pass collision list is not recoverable from state after a re-plan. Note also that `current_phase` is left pointing at the last nested phase rather than at this gate — pre-existing behaviour (`phase_reconcile` already did this), and harmless because the resume cursor keys on `plans_after_*` presence, never on `current_phase`. Runs after `phase_adherence_gate` (so re-planning doesn't waste that gate's spend) and before the phase-3 soft-drop filters/`_schedule()` (so a re-plan never rebuilds an already-scheduled DAG) — task coverage is a whole-task property of the fully-merged plan, not a per-domain one. `task_coverage_judge` `WorkerError` degrades: the assembled plan is preserved, never discarded. Runs in its own `plans_after_coverage_gate` checkpoint block (DESIGN §6 "Resumable planning"). Persists to `state.data["coverage_gate"]` for audit. |
@@ -3893,11 +4149,11 @@ The run-id is the container/machine ID (DESIGN §6), known at container creation
 | reconciler output validated against `SCHEMAS["reconciler"]` | malformed reconciler response (caught by `claude_p`'s schema gate; structurally invalid output is retried once, then escalated) |
 | **size gate** on `added_subtasks` (runs *before* the acyclicity gate) | a reconciler-added subtask emitted with `size: large`. The reconciler-authored subtasks carry `_added_by_reconciler: true` (set in `_apply_reconciler_output`); `_find_oversized_added_subtasks` collects every offender. On detection, leerie tries one size-resolution retry (see "Size-resolution retry loop" below); if the retry still emits `size: large`, `die()` with the offending sids enumerated. The downstream `_validate_plan` size check (line "no `size: large` subtasks" under "Plan validation") is the final backstop and only fires for planner-authored `large` after this retry exhausts; its error message names "planner" vs "reconciler" via the `_added_by_reconciler` flag so the user knows which prompt misbehaved. |
 | **acyclicity gate** (Tarjan SCC over the post-mutation graph; runs *before* the unresolved-requires re-check) | a rename / added_subtask / dependency_edge that closes a dependency cycle. Each individual reconciler mutation can be locally correct yet jointly cycle-creating — e.g. two renames whose targets each provide what the other side requires. Tarjan localizes the SCC; edge attribution names which mutation closed each edge. On detection, leerie tries one cycle-resolution retry (see "Cycle-resolution retry loop" below); if the retry still cycles, `die()` with the SCC + offending mutations enumerated. |
-| **must-include constraint** (apply-step enforcement on retry output) | a retried reconciler output that omits any operation from the bounded set leerie required for each named cycle. The retry prompt lists the legal operations per cycle (`dropped_requires` on either rename, `dependency_edges` in either direction, `merged_subtasks` in either direction); if the revised output doesn't include at least one for each cycle, `die()` with the missing-cycle diagnostic — surfaces "model defied a structural constraint" cleanly, never a silent cycle. |
-| **unresolved-requires retry loop** (recompute unresolved set after applying reconciler output) | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap. Common cause: model invented a new tag in `added_subtasks` and forgot to rename the original consumer's tag to match (captured run `075210`: `deps-008` required `cdk-stacks-authored`; reconciler created `config-011` providing `infra-stacks-authored` and never renamed deps-008's tag). On first detection, leerie tries one retry with a structured prompt that surfaces string-similarity hints from the post-mutation `provides` namespace. If the retry still leaves unresolved tags, `die()` with the structured report. |
-| **unresolved-retry must-include constraint** (apply-step enforcement on retry output) | a retried output that omits any operation addressing the named unresolved entries. Legal addressing: `rename` on the (sid, tag), `added_provides` covering the tag, `added_subtask` whose provides includes the tag, `conditional_drops` on the consumer sid, `dropped_requires` on the (sid, tag) (consumer's `requires` is over-specified — an aggregate or coarser synonym of what the consumer itself provides, not a real cross-subtask dependency; the consumer stays in the plan, only the bad edge goes), or `unresolvable` on the (sid, tag). |
-| **conditional_drops** apply step (DESIGN §5 resolution action) | a planner-emitted consumer subtask whose own `intent` declares it conditional on an unresolvable `extent: in_plan` precondition (signals like "no-op if X", "conditionally add", "drop if Y", "otherwise this subtask is dropped"). The apply step removes the named sid from its plan, prunes downstream `depends_on` references to that sid, and records the drop in `state.data["conditional_drops"]` (keyed by sid → `{reason, from_unresolved_tag}`). Distinct from `state.data["dropped_subtasks"]`, which records off-tree soft-drops from `_filter_offtree_subtasks` (phase 3) — same shape of audit signal, different cause. The apply step `die()`s if the target sid carries `_added_by_reconciler: true` (the op is restricted to planner-authored consumers — a reconciler-added subtask has no planner prose to convert into a structured drop). |
-| **dropped_requires** apply step (DESIGN §5 resolution action — also a cycle-breaking op) | a consumer's `requires` entry that was over-specified by its planner — an aggregate, coarser synonym, or authoring-time decision the same subtask itself records, rather than a code artifact another subtask produces. The apply step removes the named `(sid, tag)` `extent: in_plan` entry from the consumer's `requires` list. The consumer itself stays in the plan (unlike `conditional_drops`, which removes the whole subtask) — only the bad edge goes. Apply mechanics are identical whether the op is emitted as a resolution (unresolved-tag retry, addressing an over-specified self-reference) or a cycle-breaker (the over-specified entry was what closed the cycle). Silent no-op on missing sid/entry, mirroring `renames`. |
+| **must-include constraint** (apply-step enforcement on retry output) | a retried reconciler output that omits any operation from the bounded set leerie required for each named cycle. The retry prompt lists the legal operations per cycle (`drop_require` on either rename, `dependency_edges` in either direction, `merged_subtasks` in either direction); if the revised output doesn't include at least one for each cycle, `die()` with the missing-cycle diagnostic — surfaces "model defied a structural constraint" cleanly, never a silent cycle. |
+| **unresolved-requires retry loop** (recompute unresolved set after applying reconciler output) | the reconciler's renames/added_subtasks/add_provide ops didn't actually close every gap. Common cause: model invented a new tag in `added_subtasks` and forgot to rename the original consumer's tag to match (captured run `075210`: `deps-008` required `cdk-stacks-authored`; reconciler created `config-011` providing `infra-stacks-authored` and never renamed deps-008's tag). On first detection, leerie tries one retry with a structured prompt that surfaces string-similarity hints from the post-mutation `provides` namespace. If the retry still leaves unresolved tags, `die()` with the structured report. |
+| **unresolved-retry must-include constraint** (apply-step enforcement on retry output) | a retried output that omits any operation addressing the named unresolved entries. Legal addressing: `rename` on the (sid, tag), `add_provide` covering the tag, `added_subtask` whose provides includes the tag, `conditional_drop` on the consumer sid, `drop_require` on the (sid, tag) (consumer's `requires` is over-specified — an aggregate or coarser synonym of what the consumer itself provides, not a real cross-subtask dependency; the consumer stays in the plan, only the bad edge goes), or `unresolvable` on the (sid, tag). |
+| **conditional_drops** apply step (DESIGN §5 resolution action; the worker emits it as `op: "conditional_drop"` in `tag_ops`) | a planner-emitted consumer subtask whose own `intent` declares it conditional on an unresolvable `extent: in_plan` precondition (signals like "no-op if X", "conditionally add", "drop if Y", "otherwise this subtask is dropped"). The apply step removes the named sid from its plan, prunes downstream `depends_on` references to that sid, and records the drop in `state.data["conditional_drops"]` (keyed by sid → `{reason, from_unresolved_tag}`). Distinct from `state.data["dropped_subtasks"]`, which records off-tree soft-drops from `_filter_offtree_subtasks` (phase 3) — same shape of audit signal, different cause. The apply step `die()`s if the target sid carries `_added_by_reconciler: true` (the op is restricted to planner-authored consumers — a reconciler-added subtask has no planner prose to convert into a structured drop). |
+| **dropped_requires** apply step (DESIGN §5 resolution action — also a cycle-breaking op; the worker emits it as `op: "drop_require"` in `tag_ops`) | a consumer's `requires` entry that was over-specified by its planner — an aggregate, coarser synonym, or authoring-time decision the same subtask itself records, rather than a code artifact another subtask produces. The apply step removes the named `(sid, tag)` `extent: in_plan` entry from the consumer's `requires` list. The consumer itself stays in the plan (unlike `conditional_drops`, which removes the whole subtask) — only the bad edge goes. Apply mechanics are identical whether the op is emitted as a resolution (unresolved-tag retry, addressing an over-specified self-reference) or a cycle-breaker (the over-specified entry was what closed the cycle). Silent no-op on missing sid/entry, mirroring `renames`. |
 | post-unresolved-retry cycle gate re-run | the retry's revised output reintroduces a cycle (e.g., a rename closes a loop). Same Tarjan check as the primary acyclicity gate; on cycle, `die()` with the SCC report. |
 
 **Size-resolution retry loop.** When the size gate fires on the first
@@ -3948,14 +4204,14 @@ on cycling runs only; non-cycling runs pay nothing extra.
 The recommendation heuristic is deterministic:
 
 1. **Exactly one edge in the SCC is a planner-declared `depends_on`** →
-   recommend `dropped_requires` on the rename that closes the reverse
+   recommend `drop_require` on the rename that closes the reverse
    direction. (Planner ordering wins; the reconciler's rename is the drift.)
 2. **Else SCC members share `files_likely_touched`** → recommend
    `merged_subtasks(into, from)` where `into` is the smaller subtask by
    `success_criteria_seed` length (tie-break: lexicographic sid). The
    subtasks are authoring the same file; one commit will do both pieces of
    work; the shorter-criterion subtask becomes the canonical home.
-3. **Else** → recommend `dropped_requires` on the rename whose `from` tag
+3. **Else** → recommend `drop_require` on the rename whose `from` tag
    had no planner-declared producer in the pre-reconcile graph. (The
    rename was speculative — the tag was never going to resolve to a real
    producer; dropping the requirement is structurally honest.)
@@ -4573,7 +4829,7 @@ regardless of `make_feedback_prompt`.
 | `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `_settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 9 worker schemas (including `fit_judge`; **not** `splitter`, whose output — required `children` only — carries no confidence axis). Its free-text fields carry length caps: `basis` is capped at `_CONFIDENCE_BASIS_MAX_LENGTH` (8000 chars) and each `falsifiers_tested`/`contradictions_reconciled` array item at `_CONFIDENCE_LIST_ITEM_MAX_LENGTH` (2000 chars) — a mitigation for `anthropics/claude-code#49747` (open, unfixed): the `claude` CLI intermittently corrupts a `StructuredOutput` tool call (valid JSON switching mid-payload into legacy XML `<parameter name="...">` tags) correlated with the length of a single tool-call string argument. Observed directly in run `d8302c0d46d8...` (barnacle, 2026-07-31): the raw `__unparsedToolInput` capture showed the corruption starting exactly where the (then-uncapped) `confidence.basis` field's ~16KB of prose began. The cap reduces trigger frequency; it does not fix the upstream CLI bug — revisit once #49747 closes. The caps were RESIZED (from 2000/500) on 2026-08-03 after measuring the actual output distribution: `basis` runs 463–1321 chars and list items 130–502, so the old values sat directly on that distribution's shoulder and overflow was routine rather than exceptional — 29 rejections across two runs (12 `basis`, 9 `falsifiers_tested`, 8 `contradictions_reconciled`), including a live reproduction that missed by TWO characters (502 against the 500 cap). A cap at the top of the natural distribution does not shorten output, it converts the tail into rejected work. The new values sit ~4x above the measured maximum while staying an order of magnitude below the ~16KB at which corruption was actually observed, so the mitigation is intact. They are now also stated to the workers via `prompts/_confidence.md` (included by all 10 confidence-emitting prompts) — previously they appeared in no prompt, so a worker had no way to comply with a bound it was never told about while being asked for detailed evidence. Pinned by `tests/test_confidence_length_caps.py`, which also guards `confidence` staying top-level REQUIRED: making it optional was considered and rejected, since that is a DESIGN §8/§12 structural self-gating contract and accounted for only 4 of the 65 measured failures. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. `confidence` remains top-level REQUIRED (the DESIGN §8/§12 structural self-gating contract is preserved — every gate still reads a real number). Pinned by `tests/test_confidence_length_caps.py`. |
 
 ### Finding severity — gating vs advisory
 
@@ -4641,13 +4897,26 @@ for its `files_likely_touched` set intersection.
 `artifact` is a **logical** label and Python never parses it.
 `prompts/plan_overlap_judge.md` asks for "the colliding exported artifact,
 e.g. `WidgetFrame component`", so it is prose; the judge names the files
-separately in the required `artifact_paths` array, and `PHANTOM_ARTIFACT`
+separately in the `artifact_paths` array, and `PHANTOM_ARTIFACT`
 does plain set membership on that — CLAUDE.md *Language-to-JSON*: Python
 operates only on already-structured data, never on an LLM's response. An
 empty `artifact_paths` means the artifact has no file (a cross-cutting
 convention, say) and there is nothing to verify, so nothing is flagged;
 `minLength: 1` on the items makes a blank entry a schema-gate retry rather
 than something the check filters out at read time.
+
+`artifact_paths` is **asked for but NOT in `collisions[].required`** (changed
+2026-08-03). Requiring it was measured to be far more destructive than the
+false positives it was introduced to prevent: across the run corpus
+`plan_overlap_judge` produced valid output on only **40.9% of its invocations
+(27/66)** while every other worker sat at 99.6–100%, and **84 of its 85
+validation failures were the single error `'artifact_paths' is a required
+property`** — a whole-payload rejection of otherwise-sound collision analysis,
+in the phase runs most often die in. Absence was already the designed-for case
+(the check does `paths = c.get("artifact_paths") or []` then `if not paths:
+continue`), so requiring the field bought no extra verification — it converted
+a graceful "cannot path-check this collision" skip into a discarded plan. See
+DESIGN §5 *Cross-domain surface overlap*.
 
 Both earlier shapes of this check were defects. Path-checking the whole
 `artifact` string false-positived every descriptive name — run `e2882da6…`
@@ -5131,10 +5400,22 @@ Every `fit_judge` and `splitter` invocation calls `st.bump_workers(caps)` before
 (string), `diffuse` (string, narrates the diffuse coupling when score < 0.70),
 `confidence` (sub-schema via `_confidence_schema(["fit"])`).
 
-`SCHEMAS["splitter"]` — required field: `children` (array, `minItems: 1`). Each
+`SCHEMAS["splitter"]` — required field: `children` (array; **no `minItems`** as
+of 2026-08-03 — an empty array is a valid "this does not split" answer). Each
 child mirrors the planner subtask shape: required `id`, `title`,
 `success_criteria_seed`; optional `intent`, `scope_note`, `files_likely_touched`,
 `depends_on`, `requires`, `provides`, `size`, `investigation_notes`.
+
+`minItems: 1` was removed because it made the honest answer unrepresentable:
+across the corpus the splitter returned `[]` 43 times and exactly *one* child 43
+more times (a single-child "split" being a no-op), and every empty return was
+rejected and retried — even though `_recursive_decompose` already accepts "no
+children" as a leaf, deliberately and with its own log line
+(`children = split_result.get("children") or []` → `if not children: return
+[subtask]`). The consumer was already correct; the schema rejected the payload
+before the consumer could see it. **No code change accompanied this** — the
+handling predates it. See DESIGN §5½ (P1) *"This does not split" is a valid
+answer*.
 
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
 (both default to `"medium"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
@@ -5215,9 +5496,11 @@ contract). Persists to `state.data["classification_coverage_gate"]`.
 `SCHEMAS["wiring_judge"]` — required fields: `plan_reviewed` (boolean),
 `wiring_defects` (array of `{kind: enum[missing_requires, missing_provides,
 broken_by_merge, broken_by_drop, orphaned_dependent], sid (string), tag_or_dep
-(string), concrete_reason (string), severity: enum[live_defect,
-latent_risk]}` — a `live_defect` entry ⇒ gate; a `latent_risk` entry is
-logged as a warning and never gates), `rationale` (string). The *semantic*
+(string), concrete_reason (string)}`, each entry also carrying an **optional**
+`severity: enum[live_defect, latent_risk]` — a `live_defect` entry ⇒ gate; a
+`latent_risk` entry is logged as a warning and never gates; an entry with no
+`severity` gates, per DESIGN §8 *Findings carry a severity* ("the default is
+gating")), `rationale` (string). The *semantic*
 half of the plan-wiring check (the *structural* half is the deterministic
 `check_plan_wiring`, below); wired as `phase_wiring_gate` before
 `_validate_plan` — **detect-and-die, single pass**: a `live_defect` entry
@@ -5242,6 +5525,18 @@ written will actually misbehave; `latent_risk` = correct today, fragile to
 a plausible future edit. Only `live_defect` gates; a mixed list still
 gates on its `live_defect` entries (severity narrows what counts as a
 defect, it is not a per-entry bypass).
+
+**Asked for, not `required` (changed 2026-08-03).** Requiring the field
+defeated its own purpose. A judge that omitted it produced no schema-valid
+payload at all, so `phase_wiring_gate` never ran and caught **nothing** —
+measured across the run corpus, **every** `wiring_judge` invocation that never
+produced valid output (9 of 66) failed on this single field, accounting for all
+18 of its failing submissions. Both consumers already tolerate absence
+(`d.get("severity") == "latent_risk"` at `:19098`, `!=` at `:20140`), so an
+unlabelled entry gates — the conservative direction, matching *Findings carry a
+severity*'s "default is gating" rule. One conservatively-gated defect is a
+recoverable false positive; a gate that never runs is not. The prompt still
+asks for it. Pinned by `tests/test_phase_wiring_gate.py`.
 
 `SCHEMAS["provision_judge"]` — required fields: `recipe_reviewed` (boolean),
 `recipe_failures` (array of `{kind: enum[missing_break_system_packages,
@@ -7545,7 +7840,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `_run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. Read by `_write_plan()` and persisted as the `preconditions` section of `plan.json`. Empty list when no planner declared any external requirement (the common case). |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. Two producers, distinguished by shape: `_filter_offtree_subtasks()` drops subtasks whose `files_likely_touched` resolved outside the run's repo root (value `{reasons: [str], files: [str]}`); `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) drops subtasks the `satisfied_probe` judged already met on the base tree (value `{reason: "already_satisfied", evidence: str, checked: [str]}`); and the post-execution no-commits re-probe in `_settle_subtask` records a subtask whose criteria are already met on the run-branch HEAD (value `{reason: "already_satisfied_mid_run", evidence: str, checked: [str]}` — same shape, judged against the run-branch HEAD instead of the base tree; DESIGN §8 *The mid-run sibling case*). The `mid_run` label names the moment the rescue fires (post-execution, this run), not the provenance: it covers both a sibling committing the deliverable this run and a subtask already satisfied on the base tree (DESIGN §8 *Scope*). Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
-| `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. Each value is `{reason: str, from_unresolved_tag: str}` where `reason` quotes the consumer's conditional intent + names why the precondition is false (the reconciler emits this) and `from_unresolved_tag` records which unresolved tag's resolution motivated the drop (looked up from the unresolved set at apply time). Absent when no conditional_drop fired. Distinct audit field from `dropped_subtasks` (off-tree soft drops, phase 3) so the two causes stay separately auditable. |
+| `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drop` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. Each value is `{reason: str, from_unresolved_tag: str}` where `reason` quotes the consumer's conditional intent + names why the precondition is false (the reconciler emits this) and `from_unresolved_tag` records which unresolved tag's resolution motivated the drop (looked up from the unresolved set at apply time). Absent when no conditional_drop fired. Distinct audit field from `dropped_subtasks` (off-tree soft drops, phase 3) so the two causes stay separately auditable. |
 | `speculative_collapse_drops` | list[str] | subtask sids mechanically pruned by dead-subtask elimination (DESIGN §5) — fully-speculative subtasks whose every `in_plan` requires was unresolvable because the provider domain returned 0 subtasks. Recorded before `_check_unresolvable` runs so the audit trail survives even when `die()` fires for remaining unresolvable entries. Absent when no dead-subtask elimination fired. Distinct from `conditional_drops` (LLM-judged, based on conditional prose in intent) and `dropped_subtasks` (off-tree soft drops, phase 3). |
 | `overlap_replan_done` | bool | set once when `phase_overlap_judge` answers an `unresolvable` collision with a **scoped re-plan** instead of `die()`ing (DESIGN §5). Written **after** `check_replan_affordable` passes, never before: the flag records an ATTEMPT, not an intention. Setting it first persisted it while the `plans_after_overlap_judge` checkpoint was never written, so `resume --max-workers N` — the remedy that die() recommends — re-entered the gate, saw the flag and died immediately without ever attempting the re-plan the raised budget afforded. Pinned by `tests/test_scoped_replan.py::test_budget_die_does_not_consume_the_recovery`. Bounds that recovery to a single attempt: a second unresolvable verdict after re-planning dies, since the contradiction is then not something re-planning resolves. Absent on runs that never hit an unresolvable collision — which is 88% of runs reaching the judge (5 of 43 hit one). |
 | `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. Persisted before the apply step (so if a `die()` fires on `unresolvable` or the merge-feasibility backstop the audit record survives). Absent when `phase_overlap_judge` cheap-skipped (single-planner / <2-subtask runs / `--skip-overlap-judge`) or when the judge returned `{collisions: []}`. |
@@ -7655,7 +7950,7 @@ type. Required fields, current shape:
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,
   it emits `blocked` with an empty subtasks list and the gap analysis in
-  `confidence.gap_to_close`. A `ready` plan may also legitimately carry
+  `confidence.basis`. A `ready` plan may also legitimately carry
   an empty `subtasks` list (the cleared-but-empty terminal state — "I
   understand the task, I investigated this domain, the work is already
   satisfied on HEAD"); see DESIGN §8 and the phase 3 `_detect_no_work`
@@ -7665,9 +7960,10 @@ type. Required fields, current shape:
   (array of strings — what would-disprove probes were run and what they
   showed), `contradictions_reconciled` (array of strings — any contradictions
   with the worker's own prior statements, named with the kept version's
-  evidence), `gap_to_close` (object with optional `task_understanding` and
-  `decomposition_quality` strings — populated when either score is below
-  9.0). Each subtask is `{id, title,
+  evidence). `basis` and the two score axes are the only REQUIRED keys; the
+  two arrays are asked for by the prompt but optional, and there is no
+  `gap_to_close` (removed 2026-08-03 — see `_confidence_schema`). When a score
+  is below 9.0 the gap is stated in `basis`. Each subtask is `{id, title,
   success_criteria_seed (all required), intent, scope_note,
   files_likely_touched, depends_on, requires, provides, size,
   investigation_notes, runs_commands}`. **`requires` is an array of objects, not bare
@@ -7718,10 +8014,10 @@ type. Required fields, current shape:
   `_confidence_schema(["root_cause", "solution"])`, not consumed by the
   orchestrator: required keys are
   `root_cause` and `solution` (numbers 1–10), `basis` (string),
-  `falsifiers_tested` (array of strings), `contradictions_reconciled`
-  (array of strings), and `gap_to_close` (object with optional
-  `root_cause` and `solution` strings — populated when either score is
-  below 9.0); see DESIGN §8 for the disciplines these fields make
+  `falsifiers_tested` (array of strings, optional), `contradictions_reconciled`
+  (array of strings, optional). Only the two axes and `basis` are required;
+  when either score is below 9.0 the gap is stated in `basis` (there is no
+  `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
   mechanically required — the schema requires the object itself, so a
   worker that skipped self-gating fails validation before the
   orchestrator reads the payload).
@@ -7778,9 +8074,10 @@ type. Required fields, current shape:
   `summary` (string — one-line description of what the conformance pass
   did), `confidence` (worker-internal self-gate, not consumed by the
   orchestrator: required keys `conformance` (number 1–10), `basis`
-  (string), `falsifiers_tested` (array of strings), `contradictions_reconciled`
-  (array of strings), `gap_to_close` (object — populated when conformance
-  is below 9.0); see DESIGN §8 for the disciplines these fields make
+  (string), `falsifiers_tested` (array of strings, optional),
+  `contradictions_reconciled` (array of strings, optional). Only `conformance`
+  and `basis` are required; when conformance is below 9.0 the gap is stated in
+  `basis` (there is no `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
   mechanically required), and `solution_defects` (array of `{kind:
   enum[unhandled_input, unhandled_path, missing_guard, sibling_site_unedited,
   wrong_selector, decoy_or_shortcut], concrete_case (string, minLength 1),

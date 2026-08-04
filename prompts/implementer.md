@@ -199,25 +199,25 @@ before the orchestrator sees the payload.
    confidently asserting X early and confidently asserting ¬X later without
    flagging the change.
 
-3. **Gap surfacing.** If either score is below 9.0, fill the corresponding
-   field of `gap_to_close` with the *specific artifact* that would close
-   the gap — a file:line citation, a measurement, a probe output, a
-   falsified prediction, a research source — **not an activity to perform.**
+3. **Gap surfacing.** If either score is below 9.0, name in `basis` the
+   *specific artifact* that would close the gap — a file:line citation, a
+   measurement, a probe output, a falsified prediction, a research source —
+   **not an activity to perform.**
    "Verify X" or "investigate further" or "look into it more" are not gaps;
    the artifact that *would result from* those activities is the gap. If a
    stated gap could be paraphrased as "research further," it is too vague —
    restate it as the concrete artifact, or admit the score cannot be raised
    without human input and exit blocked. Run all gap-closing checks in the
-   next iteration, in parallel where independent. When a score reaches 9.0,
-   omit the corresponding key from `gap_to_close`.
+   next iteration, in parallel where independent. Once a score reaches 9.0
+   it needs no stated gap.
 
 **Proceed to step 4 only when every critical gate has hard evidence and both
 scores are ≥ 9.0.** If not, loop — read more code, write a probe or
 reproduction script, run experiments, research — up to the
 `CONFIDENCE_ROUNDS` cap given in your input (default 8). Each loop iteration
 must (a) attempt the falsifier on any claim still below 9.0, (b) reconcile
-any new contradictions with prior iterations, and (c) update `gap_to_close`
-based on what you learned. If you hit the cap without clearing the gates,
+any new contradictions with prior iterations, and (c) restate the remaining
+gap based on what you learned. If you hit the cap without clearing the gates,
 stop and return status `blocked` with the precise missing evidence.
 
 **Mechanical checks.** The orchestrator runs deterministic structural
@@ -383,8 +383,8 @@ Each decision and its evidence/rationale.
 ## Evidence gate status
 Current root_cause / solution scores and which gates are cleared. Include
 which falsifiers were tested with what result, any contradictions you
-reconciled, and (if either score is below 9.0) the specific artifact named
-in `gap_to_close` so the successor can pick up the directed search.
+reconciled, and (if either score is below 9.0) the specific artifact that
+would close the gap, so the successor can pick up the directed search.
 ## Next action
 The exact next step for the successor.
 ## Open unknowns
@@ -412,8 +412,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "solution": 9.2,
     "basis": "which gates carry the evidence",
     "falsifiers_tested": ["<for each major claim: the would-disprove prediction and what was observed>"],
-    "contradictions_reconciled": ["<for each contradiction with a prior statement: which version is kept and the evidence>"],
-    "gap_to_close": {}
+    "contradictions_reconciled": ["<for each contradiction with a prior statement: which version is kept and the evidence>"]
   },
   "checkpoint_path": null,
   "blocker": null,

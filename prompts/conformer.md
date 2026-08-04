@@ -325,11 +325,11 @@ implementer and planner apply:
    pass (decided a residual was actually fixable, or vice versa), name
    the contradiction in `confidence.contradictions_reconciled` along
    with the kept version's evidence. Empty array when there are none.
-3. **Gap surfacing.** If `conformance` is below 9.0, populate
-   `confidence.gap_to_close` with the *specific artifact* that would
+3. **Gap surfacing.** If `conformance` is below 9.0, name in
+   `confidence.basis` the *specific artifact* that would
    close the gap — a file:line citation, a command output, a probe — not
-   an activity to perform. When the score reaches 9.0, leave the object
-   empty.
+   an activity to perform. Once the score reaches 9.0 there is no gap to
+   state.
 
 The orchestrator does not consume this score directly — it loops on
 observable signals (residuals, failed build/lint/test) up to
@@ -387,9 +387,10 @@ Return your structured output. Be precise:
   `concrete_case`/`where` — those fail JSON validation as a skipped discipline.
 - `confidence` *(required, advisory)* — the §8 discipline record built in
   step 6: `{conformance: <number 1–10>, basis: <string>, falsifiers_tested:
-  [<string>, ...], contradictions_reconciled: [<string>, ...],
-  gap_to_close: <object>}`. All five fields are required. This self-score does
-  NOT gate (unlike `solution_defects`) — it is the diagnostic discipline record.
+  [<string>, ...], contradictions_reconciled: [<string>, ...]}`.
+  `conformance` and `basis` are required; the two arrays are asked for but
+  optional. This self-score does NOT gate (unlike `solution_defects`) — it is
+  the diagnostic discipline record.
 - `summary` — one sentence on what this conformance pass accomplished.
 
 ## The honesty rules

@@ -53,10 +53,18 @@ def test_splitter_children_is_array(leerie):
     assert prop["type"] == "array"
 
 
-def test_splitter_children_min_items(leerie):
-    """A split that produces 0 children is a schema error (minItems: 1)."""
+def test_splitter_children_has_no_min_items(leerie):
+    """An empty `children` array is the valid answer "this does not split".
+
+    `minItems: 1` was removed 2026-08-03. It made the honest answer
+    unrepresentable: across the run corpus the splitter returned `[]` 43 times
+    and exactly ONE child 43 more times (a single-child split being a no-op),
+    and every empty return was rejected and retried — even though
+    `_recursive_decompose` already accepts "no children" as a leaf,
+    deliberately and with its own log line. The consumer was correct; the
+    schema rejected the payload before the consumer could see it."""
     prop = leerie.SCHEMAS["splitter"]["properties"]["children"]
-    assert prop.get("minItems") == 1
+    assert "minItems" not in prop
 
 
 def test_splitter_child_required_fields(leerie):
@@ -118,11 +126,22 @@ def test_splitter_accepts_full_child(leerie):
 
 # --- invalid instance rejection --------------------------------------------
 
-def test_splitter_rejects_empty_children(leerie):
+def test_splitter_accepts_empty_children(leerie):
+    """The payload the old `minItems: 1` rejected 43 times."""
     if not HAS_JSONSCHEMA:
-        pytest.skip("jsonschema not available; minItems check requires it")
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({"children": []}, leerie.SCHEMAS["splitter"])
+        pytest.skip("jsonschema not available")
+    jsonschema.validate({"children": []}, leerie.SCHEMAS["splitter"])
+
+
+def test_recursive_decompose_treats_empty_children_as_leaf(leerie):
+    """Guard-the-guard: relaxing the schema is only safe because the consumer
+    already handles the value. Pinned by source inspection because the
+    handling predates the schema change and no code moved with it."""
+    import inspect
+    src = inspect.getsource(leerie._recursive_decompose)
+    assert 'split_result.get("children") or []' in src
+    assert "if not children:" in src
+    assert "return [subtask]" in src
 
 
 def test_splitter_rejects_child_missing_title(leerie):

@@ -254,21 +254,21 @@ It is reconciled by the orchestrator with three mechanisms:
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
   subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits actions across eight arrays. Five
+  `files_likely_touched`) and emits eight actions. Five
   *resolution* actions — `renames` (two tags mean the same thing — rewrite
-  one to match the other), `added_provides` (an existing subtask actually
+  one to match the other), `add_provide` (an existing subtask actually
   produces the capability but didn't declare it), `added_subtasks` (a
-  genuine gap — propose a new subtask to fill it), `conditional_drops`
+  genuine gap — propose a new subtask to fill it), `conditional_drop`
   (drop a planner-emitted consumer subtask whose own `intent` declares it
   conditional on an unresolvable precondition — i.e. the planner authored
   it as "no-op if X" and X turned out to be false; the capability graph
   has no semantics for conditional subtasks, so the reconciler converts
   the planner's prose conditionality into a structured drop),
-  `dropped_requires` (drop the consumer's `requires` entry when it was
+  `drop_require` (drop the consumer's `requires` entry when it was
   over-specified by its planner — an aggregate, coarser synonym, or
   authoring-time decision the same subtask itself records, rather than a
   code artifact another subtask produces; the consumer stays in the plan,
-  only the bad edge goes — `dropped_requires` also plays a cycle-breaking
+  only the bad edge goes — `drop_require` also plays a cycle-breaking
   role, but its primary home is now resolution). Two *cycle-breaking-only*
   actions for when the resolution actions would close a dependency cycle —
   `dependency_edges` (assert an explicit `depends_on` ordering when both
@@ -282,6 +282,19 @@ It is reconciled by the orchestrator with three mechanisms:
   cycle resolution lives in the reconciler worker; the orchestrator computes
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
   graph, and applies the worker's output mechanically.
+
+  **The wire shape is flatter than the action list reads, and deliberately
+  so.** `add_provide` / `drop_require` / `conditional_drop` / `unresolvable`
+  travel as one `tag_ops` array discriminated by an `op` field, and a new
+  subtask's `requires` travels in a sibling `added_requires` keyed by subtask
+  id rather than nested inside the subtask. Neither is a modelling
+  preference: the natural shape — four isomorphic `{sid, tag, reason}` arrays,
+  plus an array-of-objects nested inside an array-of-objects — exceeds what
+  grammar compilation accepts under § *Forcing constrained decoding*, and was
+  refused outright. One adapter fans the wire shape back into the eight
+  arrays before anything else sees it, so the apply steps, the state fields
+  and every check below are written against the action names above, not
+  against the wire names.
 
   **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
   the reconciler).** "No enforced dictionary" (above) is what makes blind
@@ -401,7 +414,7 @@ It is reconciled by the orchestrator with three mechanisms:
   The same retry-with-structural-feedback pattern applies to the second
   failure mode the post-mutation gates catch: **unresolved `requires`
   tags that survive the reconciler's first attempt**. The common cause
-  is the model inventing a new tag in `added_subtasks`/`added_provides`
+  is the model inventing a new tag in `added_subtasks` or an `add_provide`
   without renaming the original consumer's tag to match (two synonyms
   for the same concept that never get unified). The orchestrator
   computes string-similarity hints over the post-mutation `provides`
@@ -463,9 +476,9 @@ hallucinations, or in-plan capabilities the reconciler can neither rename,
 attribute, nor connect. An external prerequisite never reaches that path;
 a planner-declared *conditional* consumer (one whose own `intent` admits
 it should be dropped if its precondition is false) routes through
-`conditional_drops`; and an *over-specified* `requires` entry (an
+`conditional_drop`; and an *over-specified* `requires` entry (an
 aggregate or coarser synonym of what the consumer itself provides, rather
-than a real cross-subtask dependency) routes through `dropped_requires` —
+than a real cross-subtask dependency) routes through `drop_require` —
 `unresolvable` is reserved for unconditional consumers whose required
 capability genuinely cannot be produced AND is not an over-specified
 self-reference.
@@ -486,7 +499,7 @@ The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable; the reconciler's retry loop tries to break it (preferring
-`dropped_requires` / `dependency_edges` / `merged_subtasks` over the cycle-
+`drop_require` / `dependency_edges` / `merged_subtasks` over the cycle-
 closing renames), and if that fails the run aborts with the SCC + the
 mutations that closed it named — never silently broken.
 
@@ -593,10 +606,25 @@ invented path is flagged.
 `artifact` is a free-text label — the judge's own description of what's
 colliding — and Python never parses it (CLAUDE.md *Language-to-JSON*: no
 tokenizing, no stripping punctuation, no testing tokens for path shape). A
-collision instead carries a separate, required `artifact_paths` field: the
+collision instead carries a separate `artifact_paths` field: the
 repo-relative paths the judge names explicitly, which is the only thing
 `PHANTOM_ARTIFACT`'s existence check reads. `artifact` stays purely
 descriptive for a human reading the plan.
+
+`artifact_paths` is **asked for but not schema-required**, because requiring it
+was measured to be far more destructive than the false positives it was
+introduced to prevent. Across the run corpus this phase produced valid output
+on only **40.9% of its invocations** while every other worker sat at 99.6–100%,
+and **84 of its 85 validation failures were the single error
+`'artifact_paths' is a required property`** — a whole-payload rejection of an
+otherwise-sound collision analysis, in the phase runs most often die in.
+
+Absence was already the designed-for case: the check reads
+`paths = c.get("artifact_paths") or []` and skips the collision when empty,
+precisely because a purely logical artifact has no path and there is then
+nothing to verify. Requiring the field therefore bought no additional
+verification — it converted "this collision cannot be path-checked" from a
+graceful skip into a discarded plan.
 
 The judge is biased toward escalation. Before emitting `merge`, it must
 verify the two intents are compositionally consistent — no required-
@@ -944,6 +972,24 @@ plan snapshot rewritten after a repair, so everything downstream — the budget
 preflight, the deterministic wiring re-check, `_validate_plan`, `_write_plan` — sees
 the repaired graph rather than the one the judge rejected.
 
+**Each defect declares a severity, and the severity is asked for rather than
+required.** A `live_defect` gates; a `latent_risk` is logged as a warning only.
+The field exists because the judge could already express "this isn't really a
+defect" — but only in free-text `rationale`, which the gate never reads, so a
+run died on a finding the judge itself had called "a latent fragility rather
+than a live defect" (§12: a judgment must reach code as structured JSON, never
+be stranded in prose).
+
+Making it a *required* field did not serve that purpose; it defeated it. A
+judge that omitted the field produced no schema-valid payload at all, so the
+gate did not run and caught **nothing** — measured across the corpus, every
+`wiring_judge` invocation that never produced valid output failed on exactly
+this one field. The severity channel is therefore optional, and an unlabelled
+defect gates, per *Findings carry a severity* above: **the default is gating**,
+so an incomplete classification keeps the conservative behaviour instead of
+silently weakening a real gate. One conservatively-gated defect is a recoverable
+false positive; a gate that never runs is not.
+
 ### Migration-surface completeness
 
 When a plan introduces a new pattern replacing an old one — a new
@@ -1262,6 +1308,17 @@ Bounds: `DEFAULT_CAPS["decompose_max_depth"] = 5`,
 `DEFAULT_CAPS["decompose_fit_threshold"] = 0.70` (measured),
 `DEFAULT_CAPS["decompose_noprogress_rounds"] = 2`. Every judge/split call
 passes through `st.bump_workers` — a runaway tree hits the worker-cap backstop.
+
+**"This does not split" is a valid answer.** The splitter may return an empty
+`children` array, and that reaches the same leaf disposition as the depth cap
+and the no-progress guard. The schema previously forbade it (`minItems: 1`),
+which made the honest answer unrepresentable: across the corpus the splitter
+returned an empty array 43 times and exactly *one* child 43 more times — and a
+"split" into a single child is a no-op wearing a costume. Every one of those 43
+empty returns was rejected and retried, even though `_recursive_decompose`
+already accepted "no children" as a leaf, deliberately and with its own log
+line. The consumer was correct; the schema rejected the payload before the
+consumer could ever see it.
 
 **A `WorkerError` from either the `fit_judge` call or the coupled-minority
 `splitter` call degrades that node to leaf**, the same disposition the
@@ -4776,6 +4833,52 @@ worker communicate through a strict contract:
 - A worker that fails to produce a schema-valid result is retried once with the
   violation pointed out. A second failure is a hard worker error.
 
+**Validation is post-hoc, not constrained — and that is the dominant source of
+worker failure.** `claude -p --json-schema` does not constrain generation. The
+CLI injects the schema as a synthetic `StructuredOutput` *tool* and checks the
+result afterwards, re-prompting on mismatch; its own reference calls the flag
+"structured output **validation**". Captured from the wire (2026-08-04): the
+outbound request carries `tools[n].name == "StructuredOutput"` with **`strict`
+absent** and no `output_config`.
+
+The consequence is measured, not theoretical. Across the run corpus — every
+`StructuredOutput` submission in every run — **2,861 of 9,924 submissions
+(28.8%) are malformed**, in exactly the three shapes the vendor documents as the
+cost of omitting strict mode: the payload wrapped in a protocol-vocabulary
+container key (`{"input": …}`, `{"output": …}`, 1,648), the decoder flipping to
+legacy XML mid-value (136), bytes the CLI cannot parse at all (261), and
+required fields simply absent (752). None of these is a model being unable to do
+the work — the answers are usually correct and merely unreachable, which is why
+the CLI's own re-prompt loop recovers most of them at the cost of regenerating
+the payload.
+
+**Optional counter-measure: grammar-constrained decoding.** The API can compile
+a schema into a grammar that restricts token sampling, making every one of those
+shapes *unrepresentable* rather than merely rarer. The CLI exposes no way to ask
+for it. leerie can, behind
+`--dangerously-force-strict-output` (§ *Forcing constrained decoding*), by
+routing worker traffic through a loopback proxy that sets `strict: true` on the
+injected tool. It is **off by default**: it rewrites outbound requests to reach
+a capability the CLI does not expose and that is undocumented for subscription
+auth, and it depends on an internal tool name that carries no compatibility
+guarantee.
+
+Because that mechanism works by owning `ANTHROPIC_BASE_URL`, it **cannot
+coexist with an operator-supplied one**. A user who has already pointed that
+variable at a gateway, proxy, or alternative endpoint has a configuration leerie
+must not silently take over — and silently declining to enable the flag would be
+equally wrong, since the run would then lack the guarantee it was asked for.
+leerie therefore refuses to start when both are present, naming both and leaving
+the choice to the operator.
+
+The same reasoning rules out **Bedrock**. `ANTHROPIC_BASE_URL` is the
+first-party endpoint override; Bedrock routes through its own, and the proxy's
+upstream is the first-party API. So under Bedrock the flag is either inert — the
+proxy is never contacted and the operator is silently handed the post-hoc
+validation they explicitly asked to replace — or it misroutes every worker call.
+Since a run cannot tell those apart from a healthy one, leerie refuses that
+combination too rather than guessing.
+
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
 so its failure is converted into a handoff: a fresh implementer can continue.
@@ -4808,6 +4911,109 @@ the integrator's considered judgment that the merge should not stand, and
 still aborts and discards, exactly as *When integration cannot succeed*
 describes. Salvaging a crash does not weaken that: a verdict is a fact about
 the work, a crash is a fact about the machine.
+
+### Forcing constrained decoding
+
+`--dangerously-force-strict-output` converts the schema contract above from
+checked-afterwards into enforced-during-generation. It is off by default.
+
+The mechanism is a **loopback proxy, one per run, started by the orchestrator**.
+Because the orchestrator is PID 1 inside the container and every worker is its
+child (§6 *Worker subtree termination*), they share a network namespace: a
+listener on `127.0.0.1` is reachable by workers with no port mapping and no host
+networking, and the container boundary reaps it if the run dies abnormally. The
+port is chosen by binding to `0` and reading back what the OS assigned, so
+concurrent leerie runs on one host never collide and no port scan is needed.
+
+The proxy rewrites exactly one thing: on a request carrying a single tool named
+`StructuredOutput`, it sets `strict: true` and normalises the schema to the
+subset grammar compilation accepts — `additionalProperties: false` on every
+object, and removal of the keywords strict cannot express. Of that keyword set,
+only four occur in leerie's own schemas today (`minLength`, `maxLength`,
+`minimum`, `maximum`); the rest are stripped defensively against future schema
+edits. Everything else in the request is forwarded untouched.
+
+Two properties make that safe to run in the path of every worker call.
+
+**It fails open.** If the tool is renamed, duplicated, or shaped unexpectedly —
+all of which an upstream release may do without notice — the request is
+forwarded unmodified. The run continues exactly as it would without the flag;
+the guarantee is lost, not the run. That loss is reported, because the
+dangerous failure here is a silent one.
+
+A request that simply carries no such tool is **not** one of those losses, and
+is deliberately not reported: the CLI injects the tool only on turns that ask
+for structured output, so a multi-turn worker always makes some requests
+without it — measured, roughly a quarter to a third of them. Treating those as
+suspected upstream changes made a healthy run describe itself as broken.
+
+The rename case needs its own mechanism, because per request it is
+indistinguishable from that ordinary traffic: both yield no matching tool.
+Across a run it is not — every worker is invoked with a schema, so if anything
+was proxied at all, something must have carried the tool. A run that rewrote
+*nothing* is therefore reported as a probable rename, once, at the end.
+
+**It fails closed at startup.** If the listener cannot bind, the run dies rather
+than proceeding unconstrained, so an operator who asked for the guarantee is
+never quietly given the old behaviour.
+
+**Two distinct limits, and both are undocumented.** The API refuses an
+over-large schema two different ways — *"Schema is too complex for
+compilation"* and *"The compiled grammar is too large"* — and neither string,
+nor any numeric bound, appears in its own documentation. Measured, the drivers
+are: **optional properties**, because strict mode must admit every subset of
+them in any order (2^k paths per node, multiplied per array element); and
+**free-form strings**, which are the expensive element per path (20 string
+properties are refused where 20 enums, booleans, integers or arrays compile).
+Nesting an array-of-objects inside an array-of-objects compounds both.
+
+leerie answers each at the layer that owns it. The proxy forces every optional
+`required` **on the wire only** — collapsing the subset explosion without
+touching the schema the CLI validates against. And the two schemas that still
+would not fit were restructured: the planner's by that transform alone, the
+reconciler's by lifting its nested `requires` array into a sibling keyed by id
+and collapsing four isomorphic `{sid, tag, reason}` arrays into one
+enum-discriminated `tag_ops`. Seven in-place reductions were measured against
+the live API first — `$defs` deduplication, stripping descriptions, dropping
+subtrees, trimming properties, converting identifiers to enums — and every one
+was still refused. Only the restructure worked.
+
+**A schema that still cannot be constrained is survivable.** Not every
+schema compiles into a grammar. Measured against the API across all 23 (2026-08-04),
+two are refused outright — the planner's ("Schema is too complex") and the
+reconciler's ("The compiled grammar is too large"). Size is not the cause: the
+conformer's schema is larger on every count and compiles fine. The cause is
+*optional properties inside array items* — strict mode must accept every subset
+of them in any order, so grammar size multiplies per array element, and those
+two carry twelve each.
+
+The fix is not to make those fields required. That was tried and rejected for a
+different reason and would be a regression here: requiring fields is what made
+workers fail to produce schema-valid output at all (§ *Findings carry a
+severity*, and the same lesson in the overlap judge's `artifact_paths`). Trading
+a lost guarantee for a lost worker is the wrong direction.
+
+So the proxy fails open on the *response* as well as the request: a rejection of
+the hardened request is answered by re-sending the untouched one. That worker
+keeps ordinary post-hoc validation — exactly what it had before the flag existed
+— while every other worker still gets constrained decoding. The alternative is a
+run that cannot plan, which is strictly worse than the problem the flag set out
+to solve. The degradation is logged at every verbosity and counted in the
+end-of-run summary, because a silently lost guarantee is the one outcome this
+design refuses.
+
+The normalisation has a real cost: those stripped keywords were carrying
+validation. Sixteen of the twenty-one are string-length bounds (fifteen
+`minLength`, one `maxLength`) on strings whose consumers already test
+truthiness, so nothing changes. The remaining five are numeric bounds that
+**fail permissively** if dropped — `fit_judge`'s score is compared against a
+threshold with no range check, so an out-of-range value would read as well-fit —
+and leerie therefore re-checks those in Python. That re-check is
+*unconditional*, not gated on the flag: a value outside its declared range was
+always a worker bug, and distrusting it is right whether or not strict mode is
+what removed the bound. The trade is deliberate: structural malformation is what
+actually breaks runs, and value-range violations are both rarer and cheaply
+re-checked.
 
 ---
 
@@ -4861,6 +5067,45 @@ subtask stops and reports itself as *blocked*, stating precisely what evidence
 is missing and whether obtaining it needs something only the user can supply —
 for example a credential that exists nowhere in the codebase. This is the
 narrow, legitimate exception to "never ask the user" (see §11).
+
+**The disciplines are asked for; they are not schema-required.** All three
+disciplines above are carried by the prompts. Falsification and drift
+reconciliation keep an optional property each (`falsifiers_tested`,
+`contradictions_reconciled`); gap surfacing keeps none — the gap is stated in
+`basis`, which is required, so a below-bar score still has to say in writing
+what would raise it. What the schema does not do is list any of the three in
+`required`. That is a deliberate reversal of the original design, forced by
+measurement.
+
+Requiring them made the confidence block a five-required-field object
+containing two arrays, a paragraph-length string, and a nested object — which
+is, field for field, the trigger profile in upstream
+[anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747):
+the model's decoder flips from JSON to legacy XML *mid-argument* on tool calls
+with many required parameters and verbose string/array mixes. A controlled A/B
+against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per
+arm) measured **8 of 8 first attempts corrupted with the block present, 0 of 8
+without it** — every with-block run needing exactly one retry. Corpus-wide,
+**48.9% of all worker calls were wasted retries**.
+
+The trade is therefore not "discipline versus laxity." Requiring the field did
+not buy enforcement — it destroyed the entire payload, *including* the score
+the gate reads, and the worker's correct answer was discarded wholesale. A
+constraint that reliably annihilates the response it is validating enforces
+nothing. Leerie keeps the numeric score axes and `basis` required, so every §8
+gate still reads a real number anchored to a stated evidential basis, and asks
+for falsifiers, contradictions and gaps in the prompt where a missing one costs
+a judgment rather than the whole answer.
+
+`gap_to_close` is removed outright rather than merely relaxed: it was the
+block's only nested object — the sharpest edge of the #49747 profile — and its
+sole consumer was a diagnostic log line naming a blocked planner's gap, which
+now reads `confidence.basis` instead. Nothing decided anything on it.
+
+This is not a retreat from "code enforces" (§12). It is the recognition that a
+*schema* is not the enforcement layer for a discipline whose absence Python can
+check directly on the returned object, at a moment when the object still
+exists.
 
 ### The planner gate
 

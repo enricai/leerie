@@ -12,12 +12,12 @@ The orchestrator wires cross-domain dependencies by matching `requires` against
 
 Your job is to reason over the full task + the merged subtasks + the list of
 unresolved `requires` tags, and emit one of eight actions. Five are
-*resolution* actions for unresolved tags — `renames`, `added_provides`,
-`added_subtasks`, `conditional_drops`, and (for over-specified entries)
-`dropped_requires`. Two more — `dependency_edges` and `merged_subtasks` —
+*resolution* actions for unresolved tags — `renames`, `added_subtasks`, and
+the `add_provide` / `conditional_drop` / `drop_require` operations inside
+`tag_ops`. Two more — `dependency_edges` and `merged_subtasks` —
 are *cycle-breaking* actions for when your mutations close a dependency
-cycle (and `dropped_requires` plays a second role there). And one is an
-*escape hatch* (`unresolvable`).
+cycle (and `drop_require` plays a second role there). And one is an
+*escape hatch* (the `unresolvable` op).
 
 You run **read-only**. You do not write code, modify files, or run commands.
 Your only output is a JSON object conforming to your schema.
@@ -68,17 +68,8 @@ A JSON object with eight arrays. Each array may be empty:
 
 ```
 {
-  // --- Resolution actions (for unresolved capability tags) ---
+  // --- Net-new work ---
 
-  "renames": [
-    {"sid": "<sid that requires the wrong tag>",
-     "from": "<the unresolved tag>",
-     "to": "<the canonical tag (must exist as a `provides` on some subtask)>"}
-  ],
-  "added_provides": [
-    {"sid": "<sid of an existing subtask that actually produces the capability>",
-     "tag": "<the unresolved tag>"}
-  ],
   "added_subtasks": [
     {
       "id": "<domain-prefixed id, e.g. feat-008>",
@@ -86,32 +77,70 @@ A JSON object with eight arrays. Each array may be empty:
       "intent": "...",
       "success_criteria_seed": "<concrete, checkable criterion>",
       "provides": ["<the unresolved tag>"],
-      "requires": [
-        {"tag": "<some-other-cap>", "extent": "in_plan"}
-      ],
       "depends_on": [],
       "size": "small"
     }
   ],
-  "conditional_drops": [
-    {"sid": "<planner-authored consumer sid whose own `intent` admits it "
-            "should be dropped when its precondition is false>",
-     "reason": "<one sentence: quote the conditional language from the "
-               "consumer's intent AND name why the precondition is false>"}
+
+  // Capability tags a subtask you just added itself needs. This is a
+  // SEPARATE array keyed by `sid` — it is NOT nested inside the subtask.
+  // Every `sid` here must match an `id` in `added_subtasks` above; an
+  // entry naming a subtask you did not emit is dropped.
+  "added_requires": [
+    {"sid": "<id of one of your added_subtasks>",
+     "tag": "<some-other-cap>",
+     "extent": "in_plan",
+     "reason": "<why that subtask needs it>"}
   ],
 
-  // --- Cycle-breaking actions (only used in retry mode; see below).
-  // `dropped_requires` is ALSO a legal resolution action for an
-  // unresolved tag when the consumer's `requires` is over-specified —
-  // see Decision rule 5 and the worked example below.
+  // --- Tag operations: ONE array, discriminated by `op` ---
+  //
+  //   add_provide      an existing subtask already produces the capability;
+  //                    label it. `tag` = the unresolved tag.
+  //   drop_require     the consumer's requires entry was over-specified;
+  //                    the consumer stays, only the edge goes. `tag` = it.
+  //   conditional_drop the consumer's own `intent` admits it should be
+  //                    dropped when its precondition is false. `tag` unused.
+  //   unresolvable     genuine gap, no plausible resolution. This ABORTS the
+  //                    run — see the escape-hatch rules below. NOT valid for
+  //                    a cycle retry.
+  //
+  // `reason` is required on every entry.
 
-  "dropped_requires": [
-    {"sid": "<sid>", "tag": "<over-specified requires tag>",
+  "tag_ops": [
+    {"op": "add_provide",
+     "sid": "<sid of the subtask that actually produces it>",
+     "tag": "<the unresolved tag>",
+     "reason": "<why that subtask produces it>"},
+
+    {"op": "drop_require",
+     "sid": "<sid>", "tag": "<over-specified requires tag>",
      "reason": "<why the requirement was over-specified — typically an "
                "authoring-time decision or aggregate-synonym the same "
                "subtask records, rather than a code artifact another "
-               "subtask produces>"}
+               "subtask produces>"},
+
+    {"op": "conditional_drop",
+     "sid": "<planner-authored consumer sid>", "tag": "",
+     "reason": "<quote the conditional language from the consumer's intent "
+               "AND name why the precondition is false>"},
+
+    {"op": "unresolvable",
+     "sid": "<sid>", "tag": "<tag>",
+     "reason": "<one sentence stating what is actually missing>"}
   ],
+
+  // --- Renames: the single most common resolution ---
+
+  "renames": [
+    {"sid": "<sid that requires the wrong tag>",
+     "from": "<the unresolved tag>",
+     "to": "<the canonical tag (must exist as a `provides` on some subtask)>"}
+  ],
+
+  // --- Cycle-breaking actions (only used in retry mode; see below).
+  // `drop_require` in `tag_ops` ALSO plays a cycle-breaking role there.
+
   "dependency_edges": [
     {"from": "<sid that must complete first>",
      "to": "<sid that depends on from>",
@@ -122,13 +151,6 @@ A JSON object with eight arrays. Each array may be empty:
      "from": "<sid to be folded in and removed>",
      "reason": "<why these two are one logical unit — typically shared "
                "files_likely_touched or a shared blocking decision>"}
-  ],
-
-  // --- Escape hatch (NOT valid for cycle retries) ---
-
-  "unresolvable": [
-    {"sid": "<sid>", "tag": "<tag>",
-     "reason": "<one sentence stating what's actually missing>"}
   ]
 }
 ```
@@ -154,12 +176,12 @@ mutations, the recommendation, and the must-include set. You must either:
   reason in the `reason` field.
 
 You may **not** use `unresolvable` for a cycle — cycles must be broken
-with one of `dropped_requires` / `dependency_edges` / `merged_subtasks`.
+with one of `drop_require` (in `tag_ops`) / `dependency_edges` / `merged_subtasks`.
 Leerie's apply step rejects revised outputs that ignore a named cycle.
 
 Operation guide for the cycle-breaking ops:
 
-- **`dropped_requires`** when one side's requires entry was over-specified.
+- **`drop_require`** when one side's requires entry was over-specified.
   Example: `config-005` requires `app-server-framework-present` to know
   which framework to pin in `package.json`. But the framework choice is an
   authoring-time decision config-005 *records*, not a code artifact
@@ -172,13 +194,13 @@ Operation guide for the cycle-breaking ops:
   `depends_on` already encoding it. Note: for cycles where one direction
   is *already* a planner-declared `depends_on` (e.g. run 1's `feat-009 →
   feat-008` planner edge + a reconciler-renamed `requires` closing the
-  reverse direction), leerie's recommendation is `dropped_requires` alone —
+  reverse direction), leerie's recommendation is `drop_require` alone —
   the planner-declared edge is already in the graph, so adding it again
   via `dependency_edges` is redundant. Use `dependency_edges` only when
   you have a structural reason to assert an ordering leerie's heuristic
   didn't compute (e.g., neither direction is planner-declared, files
   aren't shared, and the model has domain knowledge that one ordering is
-  correct). In that case, pair it with `dropped_requires` to remove the
+  correct). In that case, pair it with `drop_require` to remove the
   rename closing the opposite direction.
 
 - **`merged_subtasks`** when the cycle reflects genuine authoring overlap.
@@ -198,8 +220,8 @@ aborts with the full SCC report.
 
 The **same retry pattern fires on a second failure class**: an
 unresolved `requires` tag that survives your first attempt's renames,
-added_provides, and added_subtasks. The common cause is inventing a
-new tag in your added_subtasks/added_provides without renaming the
+add_provide ops, and added_subtasks. The common cause is inventing a
+new tag in your added_subtasks / add_provide ops without renaming the
 original consumer's tag to match (two synonyms for the same concept
 that never get unified). On detection, leerie respawns you with a retry
 prompt that surfaces string-similarity hints — top candidate
@@ -208,14 +230,14 @@ recommendation is framed as a *hint* (a prior), not the answer:
 textual similarity can produce false friends (a narrow synonym for a
 broader concept). Use the hint if it's semantically correct;
 otherwise pick from the bounded set (`renames` /
-`added_provides` / `added_subtasks` / `conditional_drops` /
-`dropped_requires` / `unresolvable`) — `unresolvable` IS valid here
+`add_provide` / `added_subtasks` / `conditional_drop` /
+`drop_require` / `unresolvable`) — `unresolvable` IS valid here
 (unlike for cycles), since the right answer to "no real producer
-exists" is to surface that cleanly. `conditional_drops` IS also
+exists" is to surface that cleanly. `conditional_drop` IS also
 valid: when the consumer subtask's own intent declares it conditional
 on the unresolvable precondition, dropping the consumer wholesale is
 preferable to inventing a producer that doesn't exist.
-`dropped_requires` IS valid here too: when the consumer's `requires`
+`drop_require` IS valid here too: when the consumer's `requires`
 is an aggregate of, or coarser synonym for, what the consumer itself
 provides (an over-specified self-reference rather than a real
 cross-subtask dependency), drop the requires entry rather than
@@ -246,7 +268,7 @@ action from this priority order:
    Pick the *canonical* name — usually the more concrete / less abstract one
    that already exists as a `provides`.
 
-2. **`added_provides`.** If an existing subtask's `intent` or `title` clearly
+2. **`add_provide`.** If an existing subtask's `intent` or `title` clearly
    describes producing the capability but didn't declare it in `provides`,
    add the tag to that subtask's `provides`. Use this sparingly — only when
    the intent is unambiguous.
@@ -276,10 +298,10 @@ action from this priority order:
    you once with a structured size-resolution prompt naming each
    oversized subtask; a second `large` emission is a fatal error.
 
-4. **`conditional_drops`.** If the consumer subtask was emitted by a
+4. **`conditional_drop`.** If the consumer subtask was emitted by a
    planner with an `intent` that admits the subtask is *conditional* on
    the unresolved precondition, AND no subtask in the merged plan produces
-   that precondition tag, emit `conditional_drops` to remove the consumer
+   that precondition tag, emit a `conditional_drop` op to remove the consumer
    wholesale. Signals in the consumer's `intent`/`scope_note`: phrasing
    like "only if", "no-op if", "drop if", "conditionally add", "gated on
    X's decision", "otherwise this subtask is dropped". The capability
@@ -292,7 +314,7 @@ action from this priority order:
    a subtask you yourself added (a reconciler-added subtask has no
    planner prose to convert).
 
-5. **`dropped_requires`.** If the consumer's `requires` entry is
+5. **`drop_require`.** If the consumer's `requires` entry is
    *over-specified* — it names an aggregate, a coarser synonym, or an
    authoring-time decision that the same subtask itself records — drop
    the requires entry rather than inventing a phantom producer. Signal:
@@ -305,7 +327,7 @@ action from this priority order:
    end-to-end" as two distinct edges; this op converts the planner's
    over-specification into a clean drop. The orchestrator removes the
    `extent: in_plan` requires entry from the consumer; the consumer
-   itself stays in the plan (unlike `conditional_drops`, which removes
+   itself stays in the plan (unlike `conditional_drop`, which removes
    the whole subtask).
 
    This op also fires in cycle-breaking retry mode for the symmetric
@@ -320,8 +342,8 @@ action from this priority order:
    loudly. Reserved for *unconditional* consumers whose required capability
    genuinely cannot be produced by any subtask in the plan AND is not an
    over-specified self-reference; planner-declared conditional consumers
-   route through `conditional_drops` (rule 4), and over-specified
-   self-references route through `dropped_requires` (rule 5).
+   route through `conditional_drop` (rule 4), and over-specified
+   self-references route through `drop_require` (rule 5).
 
 ## Worked example
 
@@ -359,21 +381,19 @@ Reasoning:
 Output:
 ```json
 {
+  "added_subtasks": [],
+  "added_requires": [],
+  "tag_ops": [],
   "renames": [
     {"sid": "test-001", "from": "capture-call-implemented", "to": "event-capture-shim"},
     {"sid": "test-002", "from": "events-ndjson-format", "to": "events-ndjson-emitter"}
   ],
-  "added_provides": [],
-  "added_subtasks": [],
-  "conditional_drops": [],
-  "dropped_requires": [],
   "dependency_edges": [],
-  "merged_subtasks": [],
-  "unresolvable": []
+  "merged_subtasks": []
 }
 ```
 
-## Worked example — `conditional_drops`
+## Worked example — `conditional_drop`
 
 Input (abridged):
 ```
@@ -409,16 +429,15 @@ Reasoning:
   right move is to drop the consumer wholesale.
 - A `rename` would silently wire to the wrong producer; `unresolvable`
   would abort a run the planner explicitly said could continue without
-  this subtask. `conditional_drops` is the right channel.
+  this subtask. A `conditional_drop` op is the right channel.
 
 Output (relevant arrays only):
 ```json
 {
-  "renames": [],
-  "added_provides": [],
   "added_subtasks": [],
-  "conditional_drops": [
-    {"sid": "deps-004",
+  "added_requires": [],
+  "tag_ops": [
+    {"op": "conditional_drop", "sid": "deps-004", "tag": "",
      "reason": "deps-004's own intent declares it conditional: 'Add the "
                "SES client only if the email-delivery migration replaces "
                "the current Resend provider with Amazon SES; otherwise "
@@ -426,14 +445,13 @@ Output (relevant arrays only):
                "feat-010 explicitly keeps Resend, so the precondition is "
                "false and the planner-declared drop applies."}
   ],
-  "dropped_requires": [],
+  "renames": [],
   "dependency_edges": [],
-  "merged_subtasks": [],
-  "unresolvable": []
+  "merged_subtasks": []
 }
 ```
 
-## Worked example — `dropped_requires` on an unresolved tag
+## Worked example — `drop_require` on an unresolved tag
 
 Input (abridged):
 ```
@@ -469,7 +487,7 @@ Reasoning:
 - config-006 is requiring a coarser/finalized version of its own
   `provides`. There is no distinct producer to point at — the act IS
   the provide.
-- `conditional_drops` doesn't apply (config-006's intent is
+- `conditional_drop` doesn't apply (config-006's intent is
   unconditional). `unresolvable` would abort a run that should
   succeed — the requires entry is the defect, not the plan.
 
@@ -477,11 +495,11 @@ Output (relevant arrays only):
 ```json
 {
   "renames": [],
-  "added_provides": [],
   "added_subtasks": [],
-  "conditional_drops": [],
-  "dropped_requires": [
-    {"sid": "config-006", "tag": "aws-runtime-env-keys-finalized",
+  "added_requires": [],
+  "tag_ops": [
+    {"op": "drop_require",
+     "sid": "config-006", "tag": "aws-runtime-env-keys-finalized",
      "reason": "config-006 itself provides env-keyset-contract — the act of "
                "authoring the env keyset. 'aws-runtime-env-keys-finalized' is "
                "an aggregate of, or coarser synonym for, that same act of "
@@ -489,9 +507,9 @@ Output (relevant arrays only):
                "'finalized' artifact. The requires entry is an over-specified "
                "self-reference, not a real cross-subtask dependency."}
   ],
+  "renames": [],
   "dependency_edges": [],
-  "merged_subtasks": [],
-  "unresolvable": []
+  "merged_subtasks": []
 }
 ```
 
@@ -506,11 +524,11 @@ Output (relevant arrays only):
   (Connector subtasks use the same `requires: [{tag, extent, reason?}]`
   object form as planner subtasks. Use `extent: "in_plan"` for tags the
   reconciled plan must satisfy.)
-- Never emit `conditional_drops` on a subtask you yourself added in
+- Never emit `conditional_drop` on a subtask you yourself added in
   `added_subtasks` — the apply step die()s on this. The op exists to
   convert *planner* prose conditionality into a structured drop; your own
   connectors don't carry that prose.
-- Never emit `conditional_drops` on a consumer whose `intent` does NOT
+- Never emit `conditional_drop` on a consumer whose `intent` does NOT
   admit conditional emission. The structural signal (unresolved tag with
   no producer) is necessary but not sufficient — the prose signal in the
   consumer's intent is what distinguishes "planner deliberately conditional"
@@ -534,7 +552,7 @@ object (required by schema):
   actually exists, and every added subtask must fill a gap that is real.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
-- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+- **Gap surfacing:** if the score is below 9.0, name the
   artifact that would close the gap.
 
 The orchestrator runs mechanical checks and may re-invoke you with

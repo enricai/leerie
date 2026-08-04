@@ -518,6 +518,23 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # `dangerously_allow_uncapped = true` in leerie.toml:
 ./leerie "task" --dangerously-allow-uncapped
 
+# Force constrained decoding on worker structured output. Off by default.
+# `claude -p --json-schema` validates the model's output AFTER generation and
+# re-prompts on a miss; it does not constrain sampling. This flag starts a
+# per-run loopback proxy, points workers at it via ANTHROPIC_BASE_URL, and
+# rewrites the CLI's injected StructuredOutput tool to carry `strict: true`
+# (hardening the schema so the grammar compiles). DANGEROUS: it edits requests
+# leerie does not own — the CLI's injected tool is a private interface with no
+# compatibility guarantee, and schema keywords the grammar cannot express are
+# stripped (see docs/IMPLEMENTATION.md for the full disclosure). Fail-open:
+# anything unexpected forwards the request untouched. Collides with a
+# pre-set ANTHROPIC_BASE_URL, and with Bedrock (AWS_BEARER_TOKEN_BEDROCK /
+# CLAUDE_CODE_USE_BEDROCK, which route to a different endpoint) — die()s in
+# both cases rather than silently running without the guarantee.
+# Also LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT=1 or
+# `dangerously_force_strict_output = true` in leerie.toml:
+./leerie "task" --dangerously-force-strict-output
+
 # Pick a PR template when the repo has multiple in PULL_REQUEST_TEMPLATE/.
 # Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
 ./leerie "task" --pr-template feature
@@ -919,7 +936,11 @@ bounds (minimum 0, maximum 1), `confidence` using the `"fit"` axis, valid and
 invalid instance acceptance, JSON serializability, and wiring (`fit_judge` in
 `WORKER_TYPES`, not in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER`
 entry at `"medium"`, prompt file exists). `tests/test_splitter_schema.py` covers
-`SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
+`SCHEMAS["splitter"]` — `children` required but with **no `minItems`** (an
+empty array is the valid answer "this does not split"; `minItems:1` was removed
+2026-08-03 after the corpus showed the splitter returning `[]` 43 times and a
+single no-op child 43 more, every empty return rejected and retried even though
+`_recursive_decompose` already accepted it as a leaf), child required
 fields (`id`, `title`, `success_criteria_seed`), optional child fields,
 valid/invalid instances, JSON serializability, the same wiring guards, no
 top-level `files` field (splitter never decides partition), and the child
@@ -1514,6 +1535,20 @@ pins the corrected `phase_wiring_gate` die() message: it no longer recommends
 `--skip-overlap-judge` as a bypass (that flag skips the earlier, distinct
 phase 2¾ overlap judge and does not touch this gate — the old wording sent an
 operator on a `--skip-overlap-judge` retry straight back into the same die()).
+The same file pins that each `wiring_defects` entry's `severity` is **asked for
+but not `required`** (changed 2026-08-03). Requiring it defeated its own
+purpose: a judge that omitted the field produced no schema-valid payload at
+all, so the gate never ran and caught **nothing** — measured across the run
+corpus, every `wiring_judge` invocation that never produced valid output (9 of
+66) failed on this single field, accounting for all 18 of its failing
+submissions; relaxing it took `wiring_judge` to 100% and the global
+never-valid count from 13 to 4. Both consumers already tolerate absence
+(`d.get("severity")` compared against `"latent_risk"` in
+`_live_wiring_defects` and in `phase_wiring_gate`'s latent-risk loop), so an
+unlabelled entry **gates** — the conservative direction, matching DESIGN §8
+*Findings carry a severity* ("the default is gating"). Pinned with
+anti-vacuity coverage that a declared `latent_risk` is still excluded from
+gating, so the relaxation cannot have disabled the severity channel itself.
 The `artifact_registry` worker (DESIGN §5 *Artifact-registry worker*) — a
 pre-planning worker that reads the task plus the global repo-map
 (ranked to fit the token budget only, no task-file seeding) and emits a small
@@ -1956,6 +1991,22 @@ and `MERGE_HEAD` are untouched, the temp index is cleaned up, refs are
 namespaced per run+subtask so two crashes cannot clobber each other, and a
 tree identical to `HEAD^{tree}` returns `None` rather than a ref naming an
 empty diff.
+**`scripts/remote/collect-subtrees.sh` embeds a second copy of
+`SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
+`claude -p --json-schema` directly from bash on the remote machine and cannot
+import the orchestrator. **Any edit to that schema must update both.**
+`tests/test_collect_subtrees_integrator_schema.py` is the guard: it parses the
+`integrator_schema='{...}'` assignment out of the real script and asserts
+whole-object equality with the live `SCHEMAS["integrator"]` — deliberately
+whole-object rather than a spot-check of the fields that last drifted, since
+the next drift will be somewhere else. It exists because the copy **had already
+silently drifted in production** (measured 2026-08-03): it still carried
+`maxLength` 2000/500 on the confidence fields, values the live schema had moved
+off twice since (to 8000/2000, then deleted outright), so remote integrator
+runs were validating worker output against a materially different contract than
+local ones — invisibly, because nothing compared the two. A corpus fixture had
+even named this test file before it existed; the guard was planned and never
+landed, which is precisely how the drift went unnoticed.
 `tests/test_resolve_run_id_autopick.py` covers bare `resume` auto-picking
 the newest resumable run (`in-progress`/`paused`/`incomplete`), including
 the two traps found by running the design against a real 58-run state dir:
@@ -2291,10 +2342,17 @@ no code. `check_overlap_judge_output` treated any `artifact` containing
 spurious `PHANTOM_ARTIFACT` issues on an emission that replays clean. The
 retry those issues forced then expressed one pair's two-file overlap as
 two rows, which the bare pair-repetition gate refused. `artifact` is now a
-prose **label** Python never parses: the judge names the files in a
-required `artifact_paths` array and `PHANTOM_ARTIFACT` does set membership
+prose **label** Python never parses: the judge names the files in an
+`artifact_paths` array and `PHANTOM_ARTIFACT` does set membership
 on that (CLAUDE.md *Language-to-JSON* — never hand-parse an LLM's
-response). Pinned by `TestProsePathParsingAbsent`: `_depunctuate` /
+response). That array is **asked for but no longer `required`** (changed
+2026-08-03): requiring it proved far more destructive than the false positives
+it prevented — `plan_overlap_judge` produced valid output on only 40.9% of its
+corpus invocations (27/66) against 99.6–100% for every other worker, and 84 of
+its 85 validation failures were the lone error `'artifact_paths' is a required
+property`. Absence was already the designed-for case (`if not paths:
+continue`), so the requirement bought no verification and turned a graceful
+skip into a discarded plan. Pinned by `TestProsePathParsingAbsent`: `_depunctuate` /
 `_path_shaped` are gone, the check calls no `.split()`/`.strip()` on
 `artifact`, the schema requires the field with `minLength: 1` items, and
 the prompt actively asks the judge to fill it — a pathless collision

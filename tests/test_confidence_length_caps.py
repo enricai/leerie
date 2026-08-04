@@ -1,133 +1,95 @@
-"""Confidence-block length caps, sized against measured output.
+"""The confidence block's shape — flattened, and with NO length caps.
 
-The caps exist to mitigate `anthropics/claude-code#49747` (the CLI corrupting
-a `StructuredOutput` call, correlated with the length of a single tool-call
-string argument — observed at ~16KB in run `d8302c0d46d8…`). That mitigation
-is real and is NOT removed here.
+Filename is historical: this file owns the "should the confidence block carry
+`maxLength` caps?" question, and as of 2026-08-03 the measured answer is **no**.
 
-What was wrong was the sizing. Measured across real planner submissions
-(2026-08-03): `basis` ran 463–1321 chars and list items 130–502. The old caps
-(2000 / 500) sat directly on that distribution's shoulder, so overflow was
-routine rather than exceptional — **29 rejections across two runs** (12
-`basis`, 9 `falsifiers_tested`, 8 `contradictions_reconciled`), including a
-live reproduction that missed by **two characters** (502 against the 500 cap)
-and resubmitted at 260.
+The caps were introduced to mitigate `anthropics/claude-code#49747` (the CLI
+corrupting a `StructuredOutput` call), resized once from 2000/500 to 8000/2000,
+and are now deleted outright. Measured over the full run corpus — 6,526 `basis`
+values and 30,719 list items — the 8000/2000 pair bound on **0.00%** of real
+output (observed maxima 4,342 and 1,362). A constraint that never binds cannot
+mitigate anything; it was dead schema surface. The earlier 2000/500 pair bound
+on 2.38% and 6.32%, i.e. it was pure rejection pressure.
 
-A cap set at the top of the natural distribution does not shorten output; it
-converts the tail into rejected work.
+**Do not "restore" either pair.** Sizing was never the lever.
 
-Note what this file does NOT change: `confidence` stays **required** at the
-top level. Removing that was considered and rejected — it is a deliberate
-DESIGN §8/§12 structural self-gating contract with its own tests
-(`test_schemas_confidence.py`), and it accounted for only 4 of the 65 measured
-failures against the caps' 29. Overturning a documented discipline mechanism
-needs a DESIGN change and better evidence than that.
+What replaced it is a *shape* change. The old block was five required fields —
+axes + `basis` + two arrays + a nested `gap_to_close` object — which is, field
+for field, #49747's reported trigger profile (many required parameters, arrays
+mixed with paragraph-length strings). A controlled A/B against the live CLI
+(real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8
+first attempts corrupted with the block present and 0/8 without it**. So the
+block is flattened: axes + `basis` required, the two arrays kept as optional
+properties, `gap_to_close` removed entirely (it was the only nested object, and
+its only consumer was a diagnostic log line).
+
+Note what did NOT change: `confidence` stays **required** at the top level.
+That is the DESIGN §8/§12 structural self-gating contract — every gate still
+reads a real number. Only the sub-fields relaxed.
 """
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 
 
-# The measured maxima the caps are sized against. Update these ONLY with a
-# fresh measurement, never to make a failing test pass.
-_MEASURED_MAX_BASIS = 1321
-_MEASURED_MAX_LIST_ITEM = 502
-# The single-argument length at which #49747 corruption was actually observed.
-_OBSERVED_CORRUPTION_LENGTH = 16000
+# Observed maxima across the corpus. Update ONLY with a fresh measurement.
+_MEASURED_MAX_BASIS = 4342
+_MEASURED_MAX_LIST_ITEM = 1362
 
 
-def test_caps_clear_the_measured_distribution(leerie):
-    """A cap at or near the observed maximum guarantees periodic rejection.
-    Require real headroom, not a hairline pass."""
-    assert leerie._CONFIDENCE_BASIS_MAX_LENGTH >= 2 * _MEASURED_MAX_BASIS
-    assert (leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH
-            >= 2 * _MEASURED_MAX_LIST_ITEM)
+def _confidence_workers(leerie) -> list[str]:
+    """Every worker whose schema carries a confidence block.
+
+    Derived, not hardcoded. The hardcoded tuple this replaces listed seven
+    names and therefore silently skipped `conformer`, `implementer` and
+    `rebaser` — a guard that reads as complete while covering 7 of 10. Mirrors
+    `_confidence_prompt_workers` below, and picks up a future confidence
+    worker automatically.
+    """
+    return sorted(
+        name for name, schema in leerie.SCHEMAS.items()
+        if isinstance((schema.get("properties") or {}).get("confidence"), dict))
 
 
-def test_caps_stay_below_the_observed_corruption_length(leerie):
-    """The mitigation must survive the resize. If a cap ever reaches the
-    length at which corruption was actually seen, it has stopped mitigating
-    anything."""
-    assert leerie._CONFIDENCE_BASIS_MAX_LENGTH < _OBSERVED_CORRUPTION_LENGTH
-    assert (leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH
-            < _OBSERVED_CORRUPTION_LENGTH)
+def test_the_derived_worker_set_is_complete(leerie):
+    """Anti-vacuity for every guard below that iterates it.
+
+    The hardcoded tuple this replaced covered 7 of 10, silently skipping
+    `conformer`, `implementer` and `rebaser` — so the guards passed while
+    those three were unchecked. Naming them explicitly makes a future
+    regression to a partial set fail loudly."""
+    workers = set(_confidence_workers(leerie))
+    assert {"conformer", "implementer", "rebaser"} <= workers, (
+        f"previously-unguarded workers missing from the derived set: {workers}")
+    assert len(workers) == 10, f"expected 10 confidence workers, got {sorted(workers)}"
 
 
-def test_the_two_character_overflow_now_passes(leerie):
-    """The exact live reproduction: `falsifiers_tested[3]` at 502 chars was
-    rejected against the 500 cap, costing a full re-submission."""
-    assert 502 <= leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH
+# ----- the caps are gone, and must stay gone --------------------------------
+
+def test_cap_constants_no_longer_exist(leerie):
+    """Deleting the constants is what makes re-adding a cap a deliberate act
+    rather than a one-character edit."""
+    for name in ("_CONFIDENCE_BASIS_MAX_LENGTH",
+                 "_CONFIDENCE_LIST_ITEM_MAX_LENGTH"):
+        assert not hasattr(leerie, name), (
+            f"{name} is back. The caps were measured non-binding at 0.00% "
+            "across 37k real values — re-adding one reintroduces rejection "
+            "pressure and mitigates nothing.")
 
 
-def test_caps_are_still_enforced_in_the_schema(leerie):
-    """Resized, not removed — the schema must still carry maxLength."""
-    conf = leerie.SCHEMAS["planner"]["properties"]["confidence"]["properties"]
-    assert conf["basis"]["maxLength"] == leerie._CONFIDENCE_BASIS_MAX_LENGTH
-    for field in ("falsifiers_tested", "contradictions_reconciled"):
-        assert (conf[field]["items"]["maxLength"]
-                == leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH)
+def test_no_maxlength_anywhere_in_the_confidence_block(leerie):
+    offenders = [w for w in _confidence_workers(leerie)
+                 if "maxLength" in json.dumps(
+                     leerie.SCHEMAS[w]["properties"]["confidence"])]
+    assert not offenders, f"confidence block carries a maxLength: {offenders}"
 
 
-def test_confidence_remains_top_level_required(leerie):
-    """Guard against a future change quietly making `confidence` optional as
-    a shortcut for reducing schema failures. That is a DESIGN §8 contract —
-    change DESIGN first, not the schema."""
-    for worker in ("planner", "classifier", "provision", "reconciler",
-                   "plan_overlap_judge", "integrator", "fit_judge"):
-        assert "confidence" in leerie.SCHEMAS[worker]["required"], worker
-
-
-# ----- prompts must state the limits ---------------------------------------
-
-_CONFIDENCE_PROMPTS = [
-    "classifier", "planner", "reconciler", "provision", "plan_overlap_judge",
-    "integrator", "implementer", "conformer", "fit_judge", "rebaser",
-]
-
-
-@pytest.mark.parametrize("name", _CONFIDENCE_PROMPTS)
-def test_every_confidence_worker_is_told_the_limits(leerie, name):
-    """The caps were previously stated in NO prompt, so a worker had no way to
-    comply with a bound it was never told about while being asked for detailed
-    evidence. A rejection the model could not have avoided is not a gate."""
-    text = leerie._load_prompt(name)
-    assert str(leerie._CONFIDENCE_BASIS_MAX_LENGTH) in text, (
-        f"{name} does not state the basis limit")
-    assert str(leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH) in text, (
-        f"{name} does not state the list-item limit")
-
-
-def test_prompt_numbers_track_the_constants(leerie):
-    """The fragment must not drift from the schema it describes — a prompt
-    stating a stale number is worse than none, since a worker that obeys it is
-    still rejected."""
-    frag = (leerie.PROMPTS / "_confidence.md").read_text()
-    lines = frag.splitlines()
-
-    def _numbers_on_line_mentioning(word: str) -> set[int]:
-        out: set[int] = set()
-        for ln in lines:
-            if word in ln:
-                out |= {int(n) for n in re.findall(r"\*\*(\d+) characters\*\*", ln)}
-        return out
-
-    # Checked per-line, against the specific field each line describes. An
-    # earlier version asserted `"2000 characters" not in frag or <cap> == 2000`,
-    # which the list-item cap of 2000 made ALWAYS TRUE — it could never fail,
-    # so it guarded nothing.
-    assert _numbers_on_line_mentioning("`basis`") == {
-        leerie._CONFIDENCE_BASIS_MAX_LENGTH}
-    for field in ("falsifiers_tested", "contradictions_reconciled"):
-        assert _numbers_on_line_mentioning(field) == {
-            leerie._CONFIDENCE_LIST_ITEM_MAX_LENGTH}, field
-
-
-def test_a_realistic_submission_fits(leerie):
-    """End-to-end sanity against the measured shape: a submission at the
-    observed maxima validates."""
+def test_a_submission_at_the_observed_maximum_validates(leerie):
+    """The falsifier for the whole change: output at the largest size ever
+    actually measured must validate. Under the old 2000/500 caps this payload
+    was rejected outright."""
     jsonschema = pytest.importorskip("jsonschema")
     payload = {
         "domain": "feature-implementation",
@@ -139,8 +101,135 @@ def test_a_realistic_submission_fits(leerie):
             "basis": "x" * _MEASURED_MAX_BASIS,
             "falsifiers_tested": ["y" * _MEASURED_MAX_LIST_ITEM],
             "contradictions_reconciled": ["z" * _MEASURED_MAX_LIST_ITEM],
-            "gap_to_close": {},
         },
     }
     jsonschema.validate(payload, leerie.SCHEMAS["planner"])
     json.dumps(payload)
+
+
+# ----- the flattened shape ---------------------------------------------------
+
+def test_only_axes_and_basis_are_required(leerie):
+    conf = leerie._confidence_schema(["fit"])
+    assert set(conf["required"]) == {"fit", "basis"}
+
+
+def test_the_two_arrays_survive_as_optional_properties(leerie):
+    """Optional, not deleted: the prompts still ask for them, so the §8
+    discipline survives — they simply stop rejecting a correct answer."""
+    conf = leerie._confidence_schema(["fit"])
+    for field in ("falsifiers_tested", "contradictions_reconciled"):
+        assert field in conf["properties"], f"{field} was deleted, not relaxed"
+        assert field not in conf["required"], f"{field} is required again"
+
+
+def test_gap_to_close_is_gone_everywhere(leerie):
+    """It was the block's only nested object — the sharpest edge of #49747's
+    trigger profile — and nothing decided anything on it (its sole consumer
+    was a diagnostic log line, now reading `confidence.basis`)."""
+    assert "gap_to_close" not in leerie._confidence_schema(["fit"])["properties"]
+    for worker in _confidence_workers(leerie):
+        blob = json.dumps(leerie.SCHEMAS[worker])
+        assert "gap_to_close" not in blob, f"{worker} still carries gap_to_close"
+
+
+def test_confidence_block_has_no_nested_object(leerie):
+    """The general form of the rule, so a future nested field is caught even
+    if it is not named `gap_to_close`."""
+    props = leerie._confidence_schema(["fit", "solution"])["properties"]
+    nested = [k for k, v in props.items() if v.get("type") == "object"]
+    assert not nested, f"nested object(s) reintroduced: {nested}"
+
+
+def test_a_partial_confidence_block_validates(leerie):
+    """The shape that used to be rejected: axes + basis, nothing else."""
+    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema.validate(
+        {"fit": 8.5, "basis": "read all three files"},
+        leerie._confidence_schema(["fit"]))
+
+
+def test_a_block_missing_basis_is_still_rejected(leerie):
+    """Anti-vacuity: the relaxation must not have emptied the contract."""
+    jsonschema = pytest.importorskip("jsonschema")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"fit": 8.5}, leerie._confidence_schema(["fit"]))
+
+
+def test_a_block_missing_its_axis_is_still_rejected(leerie):
+    """The axis is the number every §8 gate reads — losing it would silently
+    disable the gate rather than fail it."""
+    jsonschema = pytest.importorskip("jsonschema")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"basis": "x"}, leerie._confidence_schema(["fit"]))
+
+
+def test_confidence_remains_top_level_required(leerie):
+    """Unchanged by the flattening, and deliberately so: making the whole
+    block optional is a DESIGN §8 contract change, not a schema tweak."""
+    for worker in _confidence_workers(leerie):
+        assert "confidence" in leerie.SCHEMAS[worker]["required"], worker
+
+
+# ----- the prompt fragment must not describe limits that no longer exist -----
+
+def test_prompt_fragment_states_no_enforced_limit(leerie):
+    """A prompt claiming a bound that the schema does not enforce is worse
+    than silence: it makes workers truncate real evidence for nothing."""
+    frag = (leerie.PROMPTS / "_confidence.md").read_text()
+    assert "characters**" not in frag, (
+        "_confidence.md still states a hard character limit")
+    for claim in ("rejected outright", "enforced"):
+        assert claim not in frag, f"_confidence.md still claims limits are {claim}"
+
+
+# ----- the fragment must actually reach the workers -------------------------
+#
+# The deleted `test_every_confidence_worker_is_told_the_limits` was,
+# incidentally, the only thing asserting that `_confidence.md` reaches all ten
+# confidence-emitting prompts. Its replacement above checks the fragment's
+# CONTENT but not its INCLUSION, so dropping an `{{include: _confidence.md}}`
+# would silently remove the guidance from that worker with every test green.
+#
+# The worker set is derived from SCHEMAS rather than hardcoded, so a NEW
+# confidence-emitting worker that forgets the include is caught too.
+
+
+def _confidence_prompt_workers(leerie) -> list[str]:
+    out = []
+    for name, schema in leerie.SCHEMAS.items():
+        if "confidence" not in (schema.get("properties") or {}):
+            continue
+        if not (leerie.PROMPTS / f"{name}.md").exists():
+            continue
+        out.append(name)
+    return sorted(out)
+
+
+def test_the_worker_set_is_not_empty(leerie):
+    """Anti-vacuity: a derivation that found nothing would make every
+    parametrized case below vacuously pass."""
+    workers = _confidence_prompt_workers(leerie)
+    assert len(workers) >= 9, f"only found {workers}"
+
+
+def test_every_confidence_prompt_includes_the_fragment(leerie):
+    missing = [w for w in _confidence_prompt_workers(leerie)
+               if "{{include: _confidence.md}}"
+               not in (leerie.PROMPTS / f"{w}.md").read_text()]
+    assert not missing, (
+        f"confidence-emitting prompts missing the fragment include: {missing}")
+
+
+def test_the_include_actually_resolves(leerie):
+    """Stronger than the literal-string check: `_load_prompt` must expand the
+    placeholder, so a renamed or deleted fragment is caught rather than
+    shipping the raw `{{include: …}}` text to the model."""
+    frag = (leerie.PROMPTS / "_confidence.md").read_text().strip()
+    probe = frag.splitlines()[0].lstrip("# ").strip()
+    assert probe, "fragment has no usable first line to probe for"
+    for worker in _confidence_prompt_workers(leerie):
+        text = leerie._load_prompt(worker)
+        assert probe in text, f"{worker}: fragment did not expand"
+        assert "{{include:" not in text, (
+            f"{worker}: an unresolved include placeholder would ship verbatim")

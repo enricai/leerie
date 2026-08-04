@@ -94,7 +94,11 @@ def test_all_blocked_dies_with_informative_message(leerie, capsys):
     assert "bug-fixing" in err
     # The hint points at the knob and the gap field, not just "failed."
     assert "confidence_rounds" in err.lower() or "confidence-rounds" in err
-    assert "gap_to_close" in err
+    # The gap moved from `confidence.gap_to_close` to `confidence.basis` when
+    # the confidence block was flattened (DESIGN §8) — the message must name
+    # a field that still exists, or it sends the operator looking for nothing.
+    assert "confidence.basis" in err
+    assert "gap_to_close" not in err
 
 
 def test_partial_block_emits_warning_and_proceeds(leerie, capsys):
@@ -341,3 +345,75 @@ def test_orchestrate_resume_guard_for_no_work_required():
         assert return_after_guard < next_section, (
             "the `return` must be inside the no_work_required guard "
             "block, not after it.")
+
+
+# ----- the blocked-planner gap diagnostic -----------------------------------
+#
+# `phase_plan`'s per-category summary renders a blocked planner's gap via
+# `_format_blocked_gap`. The gap moved from `confidence.gap_to_close` (a
+# compact dict, frequently `{}`) to `confidence.basis` when the confidence
+# block was flattened (DESIGN §8) — and `basis` is prose, so the line needs
+# collapsing and truncating that the dict never did. Lives here rather than in
+# its own file because this module already owns what the operator sees when
+# planners block.
+
+# The largest `confidence.basis` observed across the run corpus. Imported
+# rather than redefined: `test_confidence_length_caps` owns that measurement
+# (it is the file about basis lengths), and duplicating it would give a single
+# measured fact two places to be updated. Cross-test-file import is the
+# established pattern here — see `tests/test_ec2_launcher_credentials.py` and
+# `tests/test_fetch_branch_leerie_streamback.py`.
+from tests.test_confidence_length_caps import _MEASURED_MAX_BASIS
+
+
+def test_short_gap_passes_through_verbatim(leerie):
+    """The common case must not be mangled by the truncation machinery."""
+    text = "need a deterministic repro for the timeout"
+    assert leerie._format_blocked_gap({"basis": text}) == text
+
+
+def test_a_maximal_basis_is_cut_with_a_visible_marker(leerie):
+    """A silent cut would read as a planner that stopped mid-sentence."""
+    out = leerie._format_blocked_gap({"basis": "x" * _MEASURED_MAX_BASIS})
+    assert out.endswith("… [truncated; see log]")
+    assert len(out) < _MEASURED_MAX_BASIS
+    assert out.startswith("x" * 50)
+
+
+def test_embedded_newlines_collapse_to_one_line(leerie):
+    """`basis` is prose and routinely contains newlines. The summary is one
+    line per category, so a raw newline would split one domain's status across
+    several rows and desynchronise the block."""
+    out = leerie._format_blocked_gap({"basis": "line one\n\nline two\ttabbed"})
+    assert "\n" not in out and "\t" not in out
+    assert out == "line one line two tabbed"
+
+
+@pytest.mark.parametrize("conf", [None, {}, {"basis": ""}, {"basis": None},
+                                  {"fit": 9.0}, "not-a-dict", []])
+def test_absent_or_malformed_confidence_yields_empty_string(leerie, conf):
+    """`""`, never None and never a raise: the caller interpolates this into an
+    f-string, so returning None would print the literal "None" and a raise
+    would kill a run over a diagnostic."""
+    assert leerie._format_blocked_gap(conf) == ""
+
+
+def test_the_cap_still_binds_on_real_output(leerie):
+    """Anti-vacuity, and the whole reason this file exists.
+
+    A cap set above the real distribution is inert — exactly the failure the
+    deleted `maxLength` caps demonstrated (measured non-binding at 0.00%, see
+    `tests/test_confidence_length_caps.py`). Raising this constant past the
+    measured maximum would silently disable the truncation while every other
+    test here kept passing."""
+    assert leerie._BLOCKED_GAP_LOG_MAX < _MEASURED_MAX_BASIS
+
+
+def test_phase_plan_uses_the_helper(leerie):
+    """Source-coupling guard: the helper is inert if the call site inlines its
+    own copy again, which is how this logic shipped untested in the first
+    place."""
+    import inspect
+    src = inspect.getsource(leerie.phase_plan)
+    assert "_format_blocked_gap(" in src
+    assert "BLOCKED (planner gate)" in src

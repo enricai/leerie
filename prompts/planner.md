@@ -317,7 +317,7 @@ The orchestrator gives you, in your prompt:
      any contradictions or quiet retreats, with the kept version and its
      evidence. Empty array when there are none. Same brevity discipline
      as `falsifiers_tested`.
-   - **Gap surfacing (`gap_to_close`):** if either score is below 9.0,
+   - **Gap surfacing:** if either score is below 9.0,
      fill the corresponding field with the *specific artifact* that would
      close the gap — a citation, a measurement, a research source — not
      an activity like "investigate further." Then go obtain that artifact
@@ -329,7 +329,7 @@ The orchestrator gives you, in your prompt:
    `confidence_rounds` cap given in your input (default 8). If you hit
    the cap with either score still below 9.0, emit
    `status: "blocked"` with an empty `subtasks` array and the gap
-   analysis in `confidence.gap_to_close`. The orchestrator will surface
+   analysis in `confidence.basis`. The orchestrator will surface
    the blocker; do not invent subtasks to look unblocked.
 
    **Mechanical checks.** The orchestrator runs deterministic structural
@@ -352,8 +352,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "decomposition_quality": 9.1,
     "basis": "which evidence supports each score",
     "falsifiers_tested": ["<for each major claim: the would-disprove probe and what was observed>"],
-    "contradictions_reconciled": ["<for each contradiction with a prior statement: which version is kept and the evidence>"],
-    "gap_to_close": {}
+    "contradictions_reconciled": ["<for each contradiction with a prior statement: which version is kept and the evidence>"]
   },
   "subtasks": [
     {
@@ -399,7 +398,7 @@ visibility but are not sure it will grep cleanly. An entry with
 
 `status` is `ready` when both confidence scores are ≥ 9.0. When blocked,
 emit `status: "blocked"`, `subtasks: []`, and the gap analysis in
-`confidence.gap_to_close`. Other fields stay as documented.
+`confidence.basis`. Other fields stay as documented.
 
 Rules:
 

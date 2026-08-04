@@ -91,7 +91,7 @@ object (required by schema):
   MERGE_HEAD is gone.
 - **Drift reconciliation (`contradictions_reconciled`):** re-read your own
   prior statements; name any contradictions.
-- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+- **Gap surfacing:** if the score is below 9.0, name the
   artifact that would close the gap.
 
 The orchestrator runs mechanical checks (conflict markers, merge committed)
