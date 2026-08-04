@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import ctypes
@@ -775,6 +776,10 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # leerie.toml → False.
 DANGEROUS_ALLOW_UNCAPPED_ENV = "LEERIE_DANGEROUSLY_ALLOW_UNCAPPED"
 DANGEROUS_ALLOW_UNCAPPED_FILE = SOURCE_OF_TRUTH_FILE
+
+# --dangerously-force-strict-output (DESIGN §7 *Forcing constrained decoding*).
+DANGEROUS_FORCE_STRICT_OUTPUT_ENV = "LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT"
+DANGEROUS_FORCE_STRICT_OUTPUT_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-overlap-judge bypass (DESIGN §5 *Cross-domain surface overlap*).
 # Skips the phase 2¾ `plan_overlap_judge` worker even on multi-planner
@@ -4845,6 +4850,28 @@ def resolve_dangerously_allow_uncapped(
         file_name=DANGEROUS_ALLOW_UNCAPPED_FILE)
 
 
+def resolve_dangerously_force_strict_output(
+        repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --dangerously-force-strict-output preference. Order:
+    --dangerously-force-strict-output CLI flag (action='store_true') →
+    LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT env var →
+    dangerously_force_strict_output in leerie.toml → False.
+
+    When True, worker API traffic is routed through a per-run loopback proxy
+    that sets `strict: true` on the `StructuredOutput` tool Claude Code
+    injects, turning post-hoc schema validation into grammar-constrained
+    decoding (DESIGN §7 *Forcing constrained decoding*).
+
+    Off by default. It reaches an API capability the CLI does not expose and
+    that is undocumented for subscription auth, and it depends on an internal
+    tool name carrying no compatibility guarantee."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=DANGEROUS_FORCE_STRICT_OUTPUT_ENV,
+        file_key="dangerously_force_strict_output",
+        file_name=DANGEROUS_FORCE_STRICT_OUTPUT_FILE)
+
+
 def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --skip-overlap-judge preference. Order:
     --skip-overlap-judge CLI flag (action='store_true') →
@@ -6413,7 +6440,12 @@ async def _recursive_decompose(
         log(f"_recursive_decompose: fit_judge crashed for "
             f"{subtask.get('id', '?')}; accepting as leaf")
         return [subtask]
-    score: float = judge_result.get("score", 0.0)
+    # Range re-imposed in Python: grammar compilation cannot express
+    # `minimum`/`maximum`, and the comparison below has no bound of its
+    # own — an out-of-range score would read as well-fit (DESIGN §7).
+    score: float = _bounded_or_conservative(
+        judge_result.get("score", 0.0), 0.0, 1.0, 0.0,
+        f"fit_judge {subtask.get('id', '?')} score")
 
     # --- leaf check ----------------------------------------------------------
     if score >= threshold or depth >= max_depth:
@@ -10943,6 +10975,413 @@ def _format_blocked_gap(confidence: object) -> str:
     return gap
 
 
+# --- forced constrained decoding (--dangerously-force-strict-output) --------
+#
+# `claude -p --json-schema` is VALIDATED, not constrained: the CLI injects the
+# schema as a synthetic `StructuredOutput` tool with no `strict: true` and no
+# `output_config` (confirmed from a captured outbound request, 2026-08-04), then
+# checks the result and re-prompts on mismatch. Measured across the run corpus,
+# 2,861 of 9,924 submissions (28.8%) are malformed as a result. Setting
+# `strict: true` compiles the schema into a sampling grammar, which makes those
+# shapes unrepresentable rather than merely rarer. See DESIGN §7 *Forcing
+# constrained decoding*.
+
+# Keywords grammar compilation cannot express. Present in leerie's own schemas
+# 21 times (15 minLength, 1 maxLength, 3 minimum, 2 maximum), so stripping them
+# is not hypothetical. The five numeric bounds are the ones whose loss matters —
+# their consumers compare against a threshold with no range check of their own —
+# so those are re-imposed in Python via `_bounded_or_conservative`.
+_STRICT_UNSUPPORTED_KEYWORDS = frozenset({
+    "minLength", "maxLength", "minimum", "maximum", "multipleOf", "pattern",
+    "oneOf", "not", "if", "then", "else", "dependentSchemas",
+    "patternProperties", "propertyNames", "uniqueItems", "maxItems",
+    "contains", "minProperties", "maxProperties",
+})
+
+# The name Claude Code gives the tool it synthesises from `--json-schema`.
+# Private, unversioned, and may change in any release — which is why every
+# transform below is fail-open rather than assertive.
+_STRICT_OUTPUT_TOOL_NAME = "StructuredOutput"
+
+# Upstream read timeout for the proxy. Matched to `worker_timeout_sec` so the
+# proxy is never the component that gives up first — a shorter bound would kill
+# requests the worker is still legitimately waiting on, converting a slow call
+# into an unexplained worker failure.
+_STRICT_PROXY_TIMEOUT_SEC = DEFAULT_CAPS["worker_timeout_sec"]
+
+# The run's proxy, or None when --dangerously-force-strict-output is off (the
+# default). Module-level because `claude_p` builds each worker's env deep in
+# the call stack and threading it through every caller would touch far more
+# surface than the feature warrants. One per run, owned by `_orchestrate`.
+_STRICT_PROXY: "_StrictOutputProxy | None" = None
+
+# How many upstream error responses get their body echoed before the proxy
+# falls back to counting them. A rejected rewrite is systematic — every worker
+# call fails the same way — so the first few carry all the diagnostic value and
+# the rest would bury the run log they share with every other leerie line.
+_STRICT_PROXY_ERROR_LOG_MAX = 3
+_STRICT_PROXY_ERROR_BODY_MAX = 400
+
+
+def _bounded_or_conservative(value: object, low: float, high: float,
+                             conservative: float, what: str) -> float:
+    """Re-impose a numeric bound that grammar compilation cannot express.
+
+    Strict mode drops `minimum`/`maximum`, and the consumers that read those
+    values compare them against a threshold with no range check of their own —
+    `if score >= threshold` reads an out-of-range score as well-fit. They
+    therefore fail *permissively*, which is the wrong direction for a gate, so
+    the bound moves into Python rather than being lost.
+
+    An out-of-range value returns `conservative`, it is **not clamped to the
+    nearest bound**. Clamping was tried and rejected: on a 0–1 axis it maps 5.0
+    to 1.0, which still clears every threshold and so preserves exactly the
+    permissive failure this exists to prevent. The corpus shows the confusion is
+    real — `fit_judge` emitted `"fit": 8.5` on an axis declared 0–1 — and while
+    that plausibly *meant* 0.85, inferring intent from a malformed number is
+    guessing. A gate must not be cleared by a value it cannot interpret, so the
+    caller passes the safe end of its own range and the run pays a split or a
+    re-plan instead of shipping on a reading nobody can justify.
+
+    Applied unconditionally rather than only under the flag: a value outside the
+    declared range was always a worker bug, and distrusting it is right either
+    way.
+    """
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return conservative
+    if num != num or num in (float("inf"), float("-inf")):  # NaN / ±inf
+        return conservative
+    if num < low or num > high:
+        log(f"  {what}: value {num!r} outside [{low}, {high}] — treating as "
+            f"{conservative} (untrusted, not clamped)")
+        return conservative
+    return num
+
+
+def _strictify_schema(node: object) -> tuple[int, int]:
+    """In-place: make one schema acceptable to grammar compilation.
+
+    Returns `(objects_hardened, keywords_stripped)`.
+
+    Two edits. Every object node gains `additionalProperties: false`, which
+    strict mode requires — the API rejects the request otherwise, naming the
+    offending path. And keywords the grammar cannot express are removed;
+    `minItems` survives only at 0 or 1.
+
+    Recurses through `items` as well as `properties`, because leerie nests
+    objects inside arrays (`collisions[]`, `subtasks[]`, `wiring_defects[]`)
+    and a top-level-only pass would leave those unhardened.
+    """
+    hardened = stripped = 0
+    if isinstance(node, dict):
+        for key in list(node):
+            if key in _STRICT_UNSUPPORTED_KEYWORDS:
+                del node[key]
+                stripped += 1
+                continue
+            if key == "minItems" and node[key] not in (0, 1):
+                node[key] = 1
+                stripped += 1
+        if node.get("type") == "object" and node.get("additionalProperties") is not False:
+            node["additionalProperties"] = False
+            hardened += 1
+        for value in node.values():
+            h, s = _strictify_schema(value)
+            hardened += h
+            stripped += s
+    elif isinstance(node, list):
+        for value in node:
+            h, s = _strictify_schema(value)
+            hardened += h
+            stripped += s
+    return hardened, stripped
+
+
+def _strictify_request(body: bytes) -> tuple[bytes, str] | None:
+    """Rewrite one outbound Messages request to force constrained decoding.
+
+    Returns `(new_body, description)`, or None when the request should be
+    forwarded byte-identical.
+
+    Deliberately fail-open. The tool name and shape are a private interface
+    with no compatibility guarantee, so anything unexpected — renamed, absent,
+    duplicated, missing its schema, or a body that is not JSON at all — leaves
+    the request untouched. The run then behaves exactly as it would without the
+    flag: the guarantee is lost, not the run. Callers log the no-op, because a
+    silent loss is the failure mode worth catching.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return None
+    hits = [t for t in tools
+            if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+    if len(hits) != 1:
+        return None
+    tool = hits[0]
+    if not isinstance(tool.get("input_schema"), dict):
+        return None
+    tool["strict"] = True
+    hardened, stripped = _strictify_schema(tool["input_schema"])
+    return (json.dumps(payload).encode(),
+            f"strict:true (+{hardened} additionalProperties, -{stripped} unsupported)")
+
+
+class _StrictOutputProxy:
+    """One loopback proxy per run, forcing constrained decoding.
+
+    Workers reach it through `ANTHROPIC_BASE_URL`. The orchestrator is PID 1
+    inside the container and every worker is its child (DESIGN §6 *Worker
+    subtree termination*), so they share a network namespace: a `127.0.0.1`
+    listener needs no port mapping, and the container boundary reaps it if the
+    run dies abnormally.
+
+    Every design choice below was forced by a measured failure in a load test of
+    this exact shape, not chosen on taste:
+
+    * **Ephemeral port.** Bind `0` and read back what the OS assigned, so
+      concurrent leerie runs on one host cannot collide and nothing scans.
+    * **Dedicated executor.** asyncio's default pool saturates: 34 of 40
+      concurrent connections survived, the rest died with
+      `ConnectionResetError`. Sized to the wave width plus headroom, it is
+      40/40 and 80/80.
+    * **`reuse_address` + drain on shutdown.** Without closing tracked writers
+      and joining the executor, the port stays unbindable afterwards and a
+      second run in the same container fails to start.
+    * **Client hang-ups are normal.** `ConnectionResetError` / `BrokenPipeError`
+      are caught per connection and never escalate; the CLI hangs up routinely
+      once it has what it needs.
+
+    Upstream is bridged through `urllib` on that executor rather than spoken
+    natively over `asyncio.open_connection`. leerie has no async HTTP dependency
+    (CLAUDE.md: stdlib-preferred), and hand-rolling HTTP/1.1 — chunked encoding,
+    keep-alive, partial reads — is exactly where a proxy in the path of every
+    worker call would acquire subtle bugs.
+    """
+
+    _UPSTREAM = "https://api.anthropic.com"
+
+    def __init__(self, max_parallel: int,
+                 verbosity: str = VERBOSITY_DEFAULT) -> None:
+        self._server: asyncio.base_events.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        # +8 so the pool is never the ceiling: a wave's workers plus the
+        # occasional out-of-band call (token probe, smoke test) must all fit.
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_parallel + 8, thread_name_prefix="strict-proxy")
+        self._verbosity = verbosity
+        self.port = 0
+        self.rewritten = 0
+        self.passed_through = 0
+        self.upstream_errors = 0
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", 0, reuse_address=True, backlog=256)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self.port
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await self._server.wait_closed()
+        for writer in list(self._writers):
+            with contextlib.suppress(Exception):
+                writer.close()
+        self._writers.clear()
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    async def _read_chunked(reader: asyncio.StreamReader, rest: bytes) -> bytes:
+        """Decode a chunked request body into its real bytes.
+
+        urllib recomputes `content-length` for the upstream hop, so forwarding
+        the raw framing would describe a body that is not what it says it is.
+        Decoding here keeps the untested-path fallback a correct request rather
+        than a differently-corrupt one.
+        """
+        buf = bytearray(rest)
+        out = bytearray()
+        while True:
+            # `find` + slice rather than `bytes(buf).partition(...)`: the latter
+            # copies the whole remaining buffer once per chunk, which is
+            # quadratic in chunk count — and this path exists precisely for a
+            # large body arriving in many small chunks.
+            cut = buf.find(b"\r\n")
+            while cut == -1:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    return bytes(out)
+                buf += chunk
+                cut = buf.find(b"\r\n")
+            line = bytes(buf[:cut])
+            del buf[:cut + 2]
+            try:
+                size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+            except ValueError:
+                return bytes(out)
+            if size == 0:
+                return bytes(out)
+            while len(buf) < size + 2:
+                chunk = await reader.read(size + 2 - len(buf))
+                if not chunk:
+                    out += buf[:size]
+                    return bytes(out)
+                buf += chunk
+            out += buf[:size]
+            del buf[:size + 2]
+
+    def _upstream(self, method: str, path: str, body: bytes,
+                  headers: dict) -> tuple[int, list, bytes]:
+        """Blocking round-trip, run on the dedicated pool.
+
+        `method` is threaded through rather than assumed: only POST bodies are
+        ever rewritten, but every other verb the CLI issues must reach upstream
+        as itself. Replaying a GET as a POST would corrupt requests this proxy
+        is supposed to pass through untouched.
+        """
+        req = urllib.request.Request(self._UPSTREAM + path,
+                                     data=body if body else None,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=_STRICT_PROXY_TIMEOUT_SEC) as r:
+                return r.status, list(r.headers.items()), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, list(e.headers.items()), e.read()
+
+    def _log_exchange(self, method: str, path: str, status: int,
+                      desc: str, payload: bytes) -> None:
+        """Surface one proxied exchange on the orchestrator's own log stream.
+
+        The proxy runs in the orchestrator process, so `log()` here interleaves
+        with every other leerie line — no separate file to go find.
+
+        An upstream error is logged at *every* verbosity, with its body. This
+        proxy is the only thing in the path that rewrites a request, so a 4xx
+        here is most likely leerie's own edit being rejected — and the response
+        names the offending schema path. Without it the operator sees only
+        workers retrying, which is precisely the misattribution this flag's
+        whole failure mode consists of. Per-request success lines are debug-only
+        (`-vv`): one per worker API call is far too much for normal output.
+        """
+        if status >= 400:
+            self.upstream_errors += 1
+            if self.upstream_errors <= _STRICT_PROXY_ERROR_LOG_MAX:
+                snippet = " ".join(
+                    payload[:_STRICT_PROXY_ERROR_BODY_MAX]
+                    .decode("utf-8", "replace").split())
+                log(f"  strict-output proxy: upstream {status} on {method} "
+                    f"{path} ({desc or 'not rewritten'}) — {snippet}")
+                if self.upstream_errors == _STRICT_PROXY_ERROR_LOG_MAX:
+                    log("  strict-output proxy: further upstream errors will "
+                        "be counted, not echoed (see the end-of-run summary)")
+        elif self._verbosity == "debug":
+            log(f"  strict-output proxy: {method} {path} -> {status} "
+                f"({desc or 'forwarded unmodified'})")
+
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
+        try:
+            desc = ""
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(8192)
+                if not chunk:
+                    return
+                head += chunk
+            raw_head, _, rest = head.partition(b"\r\n\r\n")
+            lines = raw_head.split(b"\r\n")
+            request_line = lines[0].decode("latin-1")
+            method, _, tail = request_line.partition(" ")
+            path = tail.rsplit(" ", 1)[0]
+            headers = {}
+            length = 0
+            chunked = False
+            for line in lines[1:]:
+                name, _, value = line.decode("latin-1").partition(":")
+                name, value = name.strip(), value.strip()
+                if name.lower() == "content-length":
+                    length = int(value or 0)
+                if name.lower() == "transfer-encoding" and "chunked" in value.lower():
+                    chunked = True
+                # Host/length/encoding are recomputed by urllib for the
+                # upstream hop; forwarding ours would describe the wrong body.
+                # `transfer-encoding` is in this list rather than popped later
+                # because header names are case-insensitive on the wire: a
+                # `TRANSFER-ENCODING` that survived would reach upstream beside
+                # urllib's computed content-length, and a request carrying both
+                # framing headers is a smuggling shape servers reject.
+                if name.lower() not in ("host", "content-length",
+                                        "accept-encoding", "connection",
+                                        "transfer-encoding"):
+                    headers[name] = value
+
+            # A chunked request body carries no `content-length`, so the
+            # length-driven read below would take whatever landed in the first
+            # packet and forward it as the whole body — a silently truncated
+            # request, which reads downstream as a model error rather than a
+            # proxy bug. Today's CLI always sends `content-length`, but that is
+            # an observation about one client version, not a guarantee. Decode
+            # the framing so the upstream hop gets the real bytes, and never
+            # rewrite a body that arrived on this untested path.
+            if chunked:
+                body = await self._read_chunked(reader, rest)
+                # Counted only for POST, matching the branch below: the counter
+                # drives an operator warning that the constrained-decoding
+                # guarantee was lost, and a GET was never a candidate for it.
+                if method.upper() == "POST":
+                    self.passed_through += 1
+            else:
+                body = rest
+                while len(body) < length:
+                    chunk = await reader.read(length - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+
+                if method.upper() == "POST":
+                    swap = _strictify_request(body)
+                    if swap is not None:
+                        body, desc = swap
+                        self.rewritten += 1
+                    else:
+                        self.passed_through += 1
+
+            status, up_headers, payload = await asyncio.get_running_loop().run_in_executor(
+                self._pool, self._upstream, method.upper(), path, body, headers)
+            self._log_exchange(method.upper(), path, status, desc, payload)
+
+            out = [f"HTTP/1.1 {status} X".encode("latin-1")]
+            for name, value in up_headers:
+                if name.lower() in ("content-length", "transfer-encoding",
+                                    "content-encoding", "connection"):
+                    continue
+                out.append(f"{name}: {value}".encode("latin-1"))
+            out.append(f"content-length: {len(payload)}".encode("latin-1"))
+            out.append(b"connection: close")
+            writer.write(b"\r\n".join(out) + b"\r\n\r\n" + payload)
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            # The CLI hangs up routinely once it has what it needs. Normal.
+            pass
+        except Exception as e:  # noqa: BLE001 - one bad connection must not
+            # take down the listener that every other worker depends on.
+            log(f"  strict-output proxy: connection error ({type(e).__name__}: {e})")
+        finally:
+            self._writers.discard(writer)
+            with contextlib.suppress(Exception):
+                writer.close()
+
+
 # Substrings that identify a *schema* rejection of a structured submission, as
 # opposed to any other errored tool result. Measured against real worker
 # streams: the CLI emits "Output does not match required schema: …" for a
@@ -11995,6 +12434,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if worker_env is None:
             worker_env = os.environ.copy()
         worker_env["CLAUDE_CODE_OAUTH_TOKEN"] = active_token
+    # Forced constrained decoding: point the worker's API traffic at this
+    # run's proxy so it can set `strict: true` on the injected
+    # StructuredOutput tool (DESIGN §7). Composes with the two blocks above —
+    # worker debug, token rotation and strict output are orthogonal.
+    # `main()` has already refused to start if the operator set this variable
+    # themselves, so there is nothing here to clobber.
+    if _STRICT_PROXY is not None:
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        worker_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_STRICT_PROXY.port}"
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -19746,10 +20195,15 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
         )
         last_floor_issues[0] = floor_issues
+        # Same reasoning as fit_judge's score: the threshold comparison
+        # carries no range check, so an out-of-range value would silently
+        # clear the gate (DESIGN §7 *Forcing constrained decoding*).
         adherence = judge_result.get("instruction_adherence")
         low_adherence = (
             isinstance(adherence, (int, float))
-            and adherence < _ADHERENCE_GATE_THRESHOLD
+            and _bounded_or_conservative(adherence, 0.0, 10.0, 0.0,
+                                         "adherence_judge instruction_adherence")
+            < _ADHERENCE_GATE_THRESHOLD
         )
         issues = list(floor_issues)
         if low_adherence:
@@ -21231,6 +21685,34 @@ def _is_baked_ecosystem_command(command: list[str]) -> bool:
     return False
 
 
+_PROVISION_TIMEOUT_DEFAULT_S = 1800.0
+
+
+def _recipe_timeout_s(entry: dict, max_s: float | None = None) -> float:
+    """Effective per-step timeout for one provision recipe entry.
+
+    The schema declares `timeout_s` as `{"type": "integer", "minimum": 1}`, but
+    grammar compilation cannot express `minimum`, so
+    `--dangerously-force-strict-output` strips it (DESIGN §7). The bound
+    therefore moves into Python — the same treatment `fit_judge.score` and
+    `adherence_judge.instruction_adherence` get, and for the same reason: the
+    consumer has no range check of its own.
+
+    `0` was always handled by the `or` fallback below, but a **negative** is
+    truthy and would reach `wait_for(timeout=-5.0)`, which fires immediately —
+    turning a provisioning step into an instant, unexplained timeout. Upper
+    bound is the worker wall-clock cap: a single install step cannot usefully
+    outlive the worker running it.
+    """
+    ceiling = float(max_s or DEFAULT_CAPS["worker_timeout_sec"])
+    raw = entry.get("timeout_s")
+    if not raw:  # absent, 0, or None — the documented default
+        return _PROVISION_TIMEOUT_DEFAULT_S
+    return _bounded_or_conservative(
+        raw, 1.0, ceiling, _PROVISION_TIMEOUT_DEFAULT_S,
+        f"provision recipe timeout_s for {' '.join(entry.get('command') or ['?'])}")
+
+
 def _format_provision_recipe_section(recipe: list[dict],
                                       *, audience: str) -> str | None:
     """Render the persisted provision recipe as a prompt section, or
@@ -21303,8 +21785,8 @@ def _format_provision_recipe_section(recipe: list[dict],
     for i, e in enumerate(filtered_entries, 1):
         cmd_str = " ".join(e["command"])
         wd = e.get("working_dir", ".")
-        timeout = e.get("timeout_s") or 1800
-        lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout}s)")
+        timeout = _recipe_timeout_s(e)
+        lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout:g}s)")
     return "\n".join(lines)
 
 
@@ -22811,7 +23293,7 @@ async def _capture_conformance_baseline(
         try:
             await _run_streaming(
                 e["command"], cwd=str(wd),
-                timeout=float(e.get("timeout_s") or 1800),
+                timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
         except subprocess.TimeoutExpired:
@@ -24816,6 +25298,25 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
     # Same lifecycle as the sampler — cancelled in the finally so it never
     # outlives the run.
     reaper_task = asyncio.create_task(_zombie_reaper())
+    # Forced constrained decoding (DESIGN §7 *Forcing constrained decoding*).
+    # Started before the first worker so `_STRICT_PROXY` is already listening
+    # when `claude_p` builds a worker env, and torn down in the same finally as
+    # the tasks above so a crash, SIGINT or SIGTERM cannot leave the port held.
+    global _STRICT_PROXY
+    if caps.get("force_strict_output"):
+        _STRICT_PROXY = _StrictOutputProxy(caps["max_parallel"], verbosity)
+        try:
+            port = await _STRICT_PROXY.start()
+        except OSError as e:
+            # Fail closed: continuing would hand the operator ordinary
+            # post-hoc validation while they believe generation is constrained.
+            _STRICT_PROXY = None
+            die(f"--dangerously-force-strict-output: could not start the "
+                f"local proxy on 127.0.0.1 ({e}). Re-run without the flag to "
+                f"use the CLI's ordinary post-hoc validation.")
+        log(f"strict output: rewriting worker API requests via "
+            f"127.0.0.1:{port} — `strict: true` forced on the "
+            f"StructuredOutput tool (--dangerously-force-strict-output)")
     try:
         await _run_phases(args, caps, leerie_dir, st, sot_pref, verbosity,
                           models, efforts)
@@ -24826,6 +25327,21 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
             await sampler_task
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
+        if _STRICT_PROXY is not None:
+            # The pass-through count is the only signal that the private tool
+            # interface changed under us: the run still succeeds, but silently
+            # without the guarantee it was asked for.
+            log(f"strict output: {_STRICT_PROXY.rewritten} request(s) "
+                f"rewritten, {_STRICT_PROXY.passed_through} passed through"
+                + (" — passed-through requests did NOT get constrained "
+                   "decoding; the injected tool may have changed upstream"
+                   if _STRICT_PROXY.passed_through else "")
+                + (f", {_STRICT_PROXY.upstream_errors} upstream error(s) — "
+                   f"the rewrite itself may be being rejected; re-run without "
+                   f"the flag to confirm"
+                   if _STRICT_PROXY.upstream_errors else ""))
+            await _STRICT_PROXY.stop()
+            _STRICT_PROXY = None
 
 
 async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
@@ -25527,6 +26043,38 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "to a loud warning and runs workers uncapped. Also "
                          f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var or "
                          "dangerously_allow_uncapped=true in leerie.toml.")
+    ap.add_argument("--dangerously-force-strict-output", action="store_true",
+                    help="DANGEROUS: route every worker's API traffic through "
+                         "a per-run loopback proxy that rewrites the outbound "
+                         "request to set `strict: true` on the "
+                         "StructuredOutput tool Claude Code injects, turning "
+                         "post-hoc schema validation into grammar-constrained "
+                         "decoding. Measured: unconstrained generation is the "
+                         "cause of 28.8%% of all worker submissions being "
+                         "malformed (2,861 of 9,924 across the run corpus). "
+                         "FOUR THINGS TO UNDERSTAND FIRST. (1) It reaches an "
+                         "API capability the CLI does not expose and that is "
+                         "not documented for subscription auth — verified "
+                         "working, but undefined against the Consumer terms; "
+                         "that judgement is yours. (2) It matches an internal "
+                         "tool name and shape carrying no compatibility "
+                         "guarantee, which may change in any Claude Code "
+                         "release; leerie then fails OPEN (forwards "
+                         "unmodified), so you lose the guarantee silently — "
+                         "watch for the 'passed through' count in the run "
+                         "summary. (3) Strict cannot express minLength/"
+                         "maxLength/minimum/maximum, so 21 such constraints "
+                         "are stripped from leerie's schemas; the 5 numeric "
+                         "bounds are re-checked in Python, the 16 string ones "
+                         "rely on existing emptiness guards. (4) It sets "
+                         "ANTHROPIC_BASE_URL for workers, which changes other "
+                         "CLI behaviour (MCP tool-search defaults and other "
+                         "first-party-gated paths), and is refused outright if "
+                         "you already set that variable yourself. Default is "
+                         "off — leerie uses the CLI's ordinary post-hoc "
+                         "validation and absorbs the retries. Also "
+                         f"{DANGEROUS_FORCE_STRICT_OUTPUT_ENV} env var or "
+                         "dangerously_force_strict_output=true in leerie.toml.")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
@@ -26010,6 +26558,45 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
         repo_root, args.dangerously_allow_uncapped)
+
+    # Forced constrained decoding (DESIGN §7 *Forcing constrained decoding*).
+    caps["force_strict_output"] = resolve_dangerously_force_strict_output(
+        repo_root, args.dangerously_force_strict_output)
+    if caps["force_strict_output"] and os.environ.get("ANTHROPIC_BASE_URL"):
+        # The flag works by owning ANTHROPIC_BASE_URL. Overriding an operator's
+        # gateway silently would hijack their setup; honouring theirs and
+        # quietly skipping the rewrite would deny the guarantee they asked for.
+        # Both are wrong, so refuse and let them choose.
+        die("--dangerously-force-strict-output needs ANTHROPIC_BASE_URL for "
+            f"its own proxy, but it is already set to "
+            f"{os.environ['ANTHROPIC_BASE_URL']!r}. leerie will not override "
+            "your endpoint, and will not silently run without the constrained "
+            "decoding you asked for. Unset ANTHROPIC_BASE_URL, or drop the "
+            "flag.")
+    # Same contract, second collision: Bedrock. The proxy's upstream is
+    # hardcoded to api.anthropic.com and it owns ANTHROPIC_BASE_URL, which is
+    # the *first-party* endpoint override — Bedrock has its own
+    # (ANTHROPIC_BEDROCK_BASE_URL). So under Bedrock the flag either does
+    # nothing (the CLI never contacts the proxy, and the operator is silently
+    # given post-hoc validation — the exact silent loss the guard above exists
+    # to prevent) or misroutes every worker call to the wrong endpoint. Neither
+    # is distinguishable from a healthy run at the log level, so refuse. The
+    # truthy spellings match the launcher's own detect_bedrock_mode().
+    bedrock_via = (
+        "AWS_BEARER_TOKEN_BEDROCK" if os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        else "CLAUDE_CODE_USE_BEDROCK"
+        if os.environ.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower()
+        in ("1", "true", "yes", "on")
+        else "")
+    if caps["force_strict_output"] and bedrock_via:
+        die(f"--dangerously-force-strict-output cannot be used with Bedrock "
+            f"({bedrock_via} is set). The flag works by pointing workers at a "
+            "local proxy via ANTHROPIC_BASE_URL, which is the first-party "
+            "endpoint override; Bedrock routes elsewhere, so the rewrite would "
+            "either be skipped silently or send every worker call to the wrong "
+            "endpoint. leerie will not silently run without the constrained "
+            "decoding you asked for. Drop the flag, or use subscription/API "
+            "auth for this run.")
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

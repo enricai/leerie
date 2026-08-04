@@ -518,6 +518,23 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # `dangerously_allow_uncapped = true` in leerie.toml:
 ./leerie "task" --dangerously-allow-uncapped
 
+# Force constrained decoding on worker structured output. Off by default.
+# `claude -p --json-schema` validates the model's output AFTER generation and
+# re-prompts on a miss; it does not constrain sampling. This flag starts a
+# per-run loopback proxy, points workers at it via ANTHROPIC_BASE_URL, and
+# rewrites the CLI's injected StructuredOutput tool to carry `strict: true`
+# (hardening the schema so the grammar compiles). DANGEROUS: it edits requests
+# leerie does not own — the CLI's injected tool is a private interface with no
+# compatibility guarantee, and schema keywords the grammar cannot express are
+# stripped (see docs/IMPLEMENTATION.md for the full disclosure). Fail-open:
+# anything unexpected forwards the request untouched. Collides with a
+# pre-set ANTHROPIC_BASE_URL, and with Bedrock (AWS_BEARER_TOKEN_BEDROCK /
+# CLAUDE_CODE_USE_BEDROCK, which route to a different endpoint) — die()s in
+# both cases rather than silently running without the guarantee.
+# Also LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT=1 or
+# `dangerously_force_strict_output = true` in leerie.toml:
+./leerie "task" --dangerously-force-strict-output
+
 # Pick a PR template when the repo has multiple in PULL_REQUEST_TEMPLATE/.
 # Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
 ./leerie "task" --pr-template feature
