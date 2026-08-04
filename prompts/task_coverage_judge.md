@@ -49,8 +49,14 @@ or hero sections" is.
 
 Attack the plan against the task. Return an empty `coverage_gaps` array only
 when you genuinely tried to find a gap and could not — that is the correct,
-common answer for a well-planned task. A fabricated gap is worse than an
-honest empty array (it triggers a wasted re-plan).
+common answer for a well-planned task.
+
+Your findings are **advisory**: they are logged for the human running the
+change and recorded in the run's state, but they do not re-plan the work or
+stop the run. Report what you actually find, at the confidence you actually
+have. A fabricated gap is still worse than an honest empty array — it spends a
+person's attention on a defect that is not there — but you are not deciding
+whether the run proceeds, so do not soften a real finding to avoid that.
 
 ## What to return
 
