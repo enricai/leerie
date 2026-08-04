@@ -690,3 +690,119 @@ def test_check_planner_output_ignores_low_task_understanding_confidence(
         "a low task_understanding confidence score must not surface as a "
         "gating issue from check_planner_output"
     )
+
+
+# ===========================================================================
+# --skip-coverage-check (the operator escape hatch)
+# ===========================================================================
+
+class TestSkipCoverageCheck:
+    """Run 488c42e5 died with no way through: the `task_coverage_judge`
+    counted a task item the task ITSELF marked `[DESIGN FIRST]` (deferred by
+    design) as `missing_work`. No planner could satisfy that without
+    contradicting the task, so every re-plan was rejected again — and this
+    was the only planning gate with no skip flag, unlike
+    `--skip-adherence-check` / `--skip-overlap-judge` /
+    `--skip-completeness-check` / `--skip-satisfied-check`."""
+
+    def test_skip_short_circuits_with_zero_worker_calls(
+        self, leerie, monkeypatch, tmp_path
+    ):
+        st = _minimal_state(leerie, tmp_path)
+        st.data["skip_coverage_check"] = True
+        plans = [_plan("feature-implementation", _subtask("feat-001"))]
+
+        async def fail_claude_p(**kwargs):
+            pytest.fail("no worker may be spawned when the gate is skipped")
+
+        async def fail_phase_plan(*a, **k):
+            pytest.fail("phase_plan must not be re-invoked when skipped")
+
+        monkeypatch.setattr(leerie, "claude_p", fail_claude_p)
+        monkeypatch.setattr(leerie, "phase_plan", fail_phase_plan)
+
+        result = asyncio.run(leerie.phase_planning_coverage_gate(
+            plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+        assert result is plans
+
+    def test_skip_does_not_write_a_coverage_gate_verdict(
+        self, leerie, monkeypatch, tmp_path
+    ):
+        """A skipped gate reached no verdict. Writing one would let a later
+        resume believe the gate passed."""
+        st = _minimal_state(leerie, tmp_path)
+        st.data["skip_coverage_check"] = True
+
+        async def fail_claude_p(**kwargs):
+            pytest.fail("unreachable")
+
+        monkeypatch.setattr(leerie, "claude_p", fail_claude_p)
+        asyncio.run(leerie.phase_planning_coverage_gate(
+            [_plan("feature-implementation", _subtask("feat-001"))],
+            "task", st, _caps(leerie), MODELS, EFFORTS))
+        assert "coverage_gate" not in st.data
+
+    def test_gate_still_runs_when_flag_unset(
+        self, leerie, monkeypatch, tmp_path
+    ):
+        """ANTI-VACUITY: the flag must not have disabled the gate outright."""
+        st = _minimal_state(leerie, tmp_path)
+        plans = [_plan("feature-implementation", _subtask("feat-001"))]
+        calls = []
+
+        async def fake_claude_p(**kwargs):
+            calls.append(kwargs)
+            return {"task_covered": True, "coverage_gaps": [],
+                    "rationale": "covered"}
+
+        monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+        monkeypatch.setattr(leerie, "phase_plan", None)
+        asyncio.run(leerie.phase_planning_coverage_gate(
+            plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+        assert len(calls) == 1, "gate must run when the flag is absent"
+
+    def test_falsy_flag_does_not_skip(self, leerie, monkeypatch, tmp_path):
+        """Explicit False must behave as absent, not as truthy-present."""
+        st = _minimal_state(leerie, tmp_path)
+        st.data["skip_coverage_check"] = False
+        calls = []
+
+        async def fake_claude_p(**kwargs):
+            calls.append(kwargs)
+            return {"task_covered": True, "coverage_gaps": [],
+                    "rationale": "covered"}
+
+        monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+        asyncio.run(leerie.phase_planning_coverage_gate(
+            [_plan("feature-implementation", _subtask("feat-001"))],
+            "task", st, _caps(leerie), MODELS, EFFORTS))
+        assert len(calls) == 1
+
+
+class TestSkipCoverageCheckWiring:
+    """Source-coupling: the flag is inert unless resolved and stored."""
+
+    def test_resolver_exists_and_follows_the_bool_pref_pattern(self, leerie):
+        src = inspect.getsource(leerie.resolve_skip_coverage_check)
+        assert "_resolve_bool_pref" in src
+        assert "SKIP_COVERAGE_CHECK_ENV" in src
+        assert 'file_key="skip_coverage_check"' in src
+
+    def test_env_constant_matches_the_documented_name(self, leerie):
+        assert leerie.SKIP_COVERAGE_CHECK_ENV == "LEERIE_SKIP_COVERAGE_CHECK"
+
+    def test_state_field_declared(self, leerie):
+        assert "skip_coverage_check" in leerie.STATE_FIELDS
+
+    def test_short_circuit_precedes_any_work(self, leerie):
+        """The guard must sit before the phase log/state write, or the gate
+        records itself as having started when it did not."""
+        src = inspect.getsource(leerie.phase_planning_coverage_gate)
+        guard = src.index('st.data.get("skip_coverage_check")')
+        logline = src.index('log("phase 2\u215e\u00bd: task-coverage gate")')
+        assert guard < logline
+
+    def test_main_resolves_the_flag(self, leerie):
+        src = inspect.getsource(leerie.main)
+        assert "resolve_skip_coverage_check(" in src
+

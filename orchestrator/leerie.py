@@ -327,6 +327,7 @@ STATE_FIELDS = (
     "dangerously_skip_permissions",
     "skip_overlap_judge",
     "skip_adherence_check",
+    "skip_coverage_check",
     "skip_completeness_check",
     "skip_satisfied_check",
     "skip_budget_check",
@@ -850,6 +851,22 @@ SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
 # skip_adherence_check in leerie.toml → False.
 SKIP_ADHERENCE_CHECK_ENV = "LEERIE_SKIP_ADHERENCE_CHECK"
 SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-coverage-check bypass (the phase 2⅞½ task-coverage gate — the
+# deterministic `check_required_items_coverage` floor plus the
+# `task_coverage_judge` worker). Sibling to --skip-adherence-check, and
+# added because it was the ONLY planning gate without an operator escape
+# hatch: on run 488c42e5 the judge counted a task item the task itself
+# marked `[DESIGN FIRST]` (deferred by design) as `missing_work`, which no
+# planner could satisfy without violating the task, so every re-plan was
+# rejected again until the round budget ran out. The `deferred` field on
+# `required_items` fixes that specific cause; this flag exists because a
+# judgment worker will always be able to produce a false positive the
+# operator needs to push past. Resolution order:
+# --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
+# skip_coverage_check in leerie.toml → False.
+SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
+SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-completeness-check bypass (the conformer's gating solution_defects
 # axis — DESIGN §9 *The one gating axis: solution completeness*). Unlike the
@@ -4937,6 +4954,24 @@ def resolve_skip_adherence_check(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_ADHERENCE_CHECK_ENV,
         file_key="skip_adherence_check",
         file_name=SKIP_ADHERENCE_CHECK_FILE)
+
+
+def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-coverage-check preference. Order:
+    --skip-coverage-check CLI flag (action='store_true') →
+    LEERIE_SKIP_COVERAGE_CHECK env var →
+    skip_coverage_check in leerie.toml → False.
+
+    When True, `phase_planning_coverage_gate` is not run — neither the
+    deterministic `check_required_items_coverage` floor nor the
+    `task_coverage_judge` worker — so a plan that omits a required item is
+    not caught before `phase_execute` spends. Off by default; use when the
+    gate is demanding work the task does not actually want built."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_COVERAGE_CHECK_ENV,
+        file_key="skip_coverage_check",
+        file_name=SKIP_COVERAGE_CHECK_FILE)
 
 
 def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
@@ -20738,6 +20773,20 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     `die()`s on exhaustion exactly like the adherence/reconciler/wiring
     gates.
 
+    Short-circuits entirely when `st.data["skip_coverage_check"]` is set
+    (`--skip-coverage-check` / `LEERIE_SKIP_COVERAGE_CHECK` /
+    `skip_coverage_check` in leerie.toml) — the operator escape hatch every
+    sibling gate already had.
+
+    Short-circuits entirely when `st.data["skip_coverage_check"]` is set
+    (`--skip-coverage-check` / `LEERIE_SKIP_COVERAGE_CHECK` /
+    `skip_coverage_check` in leerie.toml) — the operator escape hatch every
+    sibling planning gate already had. Added after run 488c42e5, where the
+    judge counted a task item the task itself marked deferred
+    (`[DESIGN FIRST]`) as `missing_work`: no planner could satisfy it
+    without contradicting the task, so every re-plan was rejected again and
+    there was no way to push the run through.
+
     A `task_coverage_judge` `WorkerError` (infrastructure crash) degrades:
     the floor is still fully evaluated (mirrors `phase_adherence_gate`'s
     degrade path) and the assembled plan is preserved, never discarded,
@@ -20746,6 +20795,10 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
 
     Returns the (possibly re-planned) `plans` list, ready for the soft-drop
     filters and `_schedule()`."""
+    if st.data.get("skip_coverage_check"):
+        log("phase 2⅞½: task-coverage gate skipped (--skip-coverage-check / "
+            "LEERIE_SKIP_COVERAGE_CHECK / skip_coverage_check=true)")
+        return plans
     log("phase 2⅞½: task-coverage gate")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
     st.save()
@@ -25830,6 +25883,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
         st.data["skip_adherence_check"] = bool(
             getattr(args, "skip_adherence_check", False))
+        st.data["skip_coverage_check"] = bool(
+            getattr(args, "skip_coverage_check", False))
         st.data["skip_completeness_check"] = bool(
             getattr(args, "skip_completeness_check", False))
         st.data["skip_satisfied_check"] = bool(
@@ -26550,6 +26605,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "before phase_execute spends. "
                          f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
                          "skip_adherence_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-coverage-check", action="store_true",
+                    help="skip the phase 2⅞½ task-coverage gate: the "
+                         "deterministic check_required_items_coverage floor "
+                         "and the task_coverage_judge worker. A plan that "
+                         "omits a required item is not caught before "
+                         "phase_execute spends. Use when the gate demands "
+                         "work the task does not want built (e.g. an item "
+                         "the task itself defers). "
+                         f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
+                         "skip_coverage_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",
                     help="demote the conformer's gating solution_defects "
                          "completeness axis (DESIGN §9) to advisory: found "
@@ -26937,6 +27002,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # there on entry.
     args.skip_adherence_check = resolve_skip_adherence_check(
         repo_root, args.skip_adherence_check)
+    args.skip_coverage_check = resolve_skip_coverage_check(
+        repo_root, args.skip_coverage_check)
 
     # Resolve --skip-completeness-check (the conformer's gating
     # solution_defects axis, DESIGN §9). Same precedence shape; _orchestrate()
