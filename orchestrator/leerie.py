@@ -25566,6 +25566,20 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
                      f"{_p.passed_through} without a StructuredOutput tool "
                      f"(normal — the CLI injects it only on turns that ask "
                      f"for structured output)"]
+            # A RENAMED tool is invisible per-request — it yields zero hits,
+            # exactly like an ordinary turn that never asked for structured
+            # output — so it cannot be caught where the other shape problems
+            # are. Across a whole run it is visible: leerie passes
+            # `--json-schema` to every worker, so if anything was proxied at
+            # all, something must have carried the tool. Nothing rewritten
+            # means the tool is renamed or gone, and the flag has been silently
+            # doing nothing. Fires once per run, so it cannot reintroduce the
+            # per-request false positives this summary exists to remove.
+            if _p.rewritten == 0 and _p.passed_through:
+                parts.append(
+                    "NOTHING was rewritten — the injected tool appears to have "
+                    f"been renamed or removed (expected `{_STRICT_OUTPUT_TOOL_NAME}`). "
+                    "No worker got constrained decoding this run")
             if _p.unexpected_tool_shape:
                 parts.append(
                     f"{_p.unexpected_tool_shape} request(s) carried a "

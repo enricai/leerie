@@ -3389,6 +3389,12 @@ because the CLI injects the tool only on turns that want structured output),
 (400s, the flag's own failure mode) and `transient_errors` (429/5xx, unrelated
 to the rewrite). Echo budgets are **per class**.
 
+A **renamed** tool is caught separately, at run level: it yields no matching
+tool per request, exactly like an ordinary turn that never asked for structured
+output, so it cannot be classified where the other shape problems are. If a run
+ends having rewritten nothing while requests were proxied, the summary reports
+a probable rename — once, so it cannot reintroduce per-request false positives.
+
 Recorded because the merged form shipped and misled on the first real run: 395
 rewrites, zero 400s and zero fallbacks reported themselves as *"the injected
 tool may have changed upstream … the rewrite itself may be being rejected;

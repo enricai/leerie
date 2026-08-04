@@ -4935,11 +4935,23 @@ edits. Everything else in the request is forwarded untouched.
 
 Two properties make that safe to run in the path of every worker call.
 
-**It fails open.** If the tool is renamed, absent, duplicated, or shaped
-unexpectedly — all of which an upstream release may do without notice — the
-request is forwarded unmodified. The run continues exactly as it would without
-the flag; the guarantee is lost, not the run. That loss is logged, because the
+**It fails open.** If the tool is renamed, duplicated, or shaped unexpectedly —
+all of which an upstream release may do without notice — the request is
+forwarded unmodified. The run continues exactly as it would without the flag;
+the guarantee is lost, not the run. That loss is reported, because the
 dangerous failure here is a silent one.
+
+A request that simply carries no such tool is **not** one of those losses, and
+is deliberately not reported: the CLI injects the tool only on turns that ask
+for structured output, so a multi-turn worker always makes some requests
+without it — measured, roughly a quarter to a third of them. Treating those as
+suspected upstream changes made a healthy run describe itself as broken.
+
+The rename case needs its own mechanism, because per request it is
+indistinguishable from that ordinary traffic: both yield no matching tool.
+Across a run it is not — every worker is invoked with a schema, so if anything
+was proxied at all, something must have carried the tool. A run that rewrote
+*nothing* is therefore reported as a probable rename, once, at the end.
 
 **It fails closed at startup.** If the listener cannot bind, the run dies rather
 than proceeding unconstrained, so an operator who asked for the guarantee is

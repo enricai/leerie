@@ -818,7 +818,7 @@ def _run_against(leerie, port_url, monkeypatch, n: int, verbosity: str):
 
 
 @pytest.mark.parametrize("verbosity", ["quiet", "normal", "stream", "debug"])
-def test_upstream_errors_are_logged_at_every_verbosity(leerie, error_upstream,
+def test_schema_errors_are_logged_at_every_verbosity(leerie, error_upstream,
                                                        monkeypatch, verbosity):
     """This proxy is the only thing in the path that rewrites a request, so a
     4xx here is most likely leerie's own edit being rejected — and the response
@@ -1835,3 +1835,64 @@ def test_no_write_only_error_counter_survives(leerie):
         "the merged total is back — nothing reads it once the classes split")
     p = leerie._StrictOutputProxy(max_parallel=1)
     assert not hasattr(p, "upstream_errors")
+
+
+def _summary_for(leerie, **counters) -> str:
+    """Render the end-of-run summary for a given set of counters."""
+    import inspect
+    src = inspect.getsource(leerie._orchestrate)
+    start = src.index("_p = _STRICT_PROXY")
+    end = src.index('log("; ".join(parts))') + len('log("; ".join(parts))')
+    block = "\n".join(l[12:] if l.startswith(" " * 12) else l
+                      for l in src[start:end].splitlines())
+    base = {"rewritten": 0, "passed_through": 0, "unexpected_tool_shape": 0,
+            "fell_back": 0, "schema_errors": 0, "transient_errors": 0}
+    base.update(counters)
+    out: list[str] = []
+    exec(block, {"_STRICT_PROXY": type("F", (), base), "log": out.append,
+                 "_STRICT_OUTPUT_TOOL_NAME": leerie._STRICT_OUTPUT_TOOL_NAME})
+    return out[0]
+
+
+def test_a_renamed_tool_is_indistinguishable_per_request(leerie):
+    """Pinned deliberately, so the two mechanisms are not confused later.
+
+    A renamed tool yields no matching hit — exactly like an ordinary turn that
+    never asked for structured output. There is no per-request signal to
+    separate them, which is why the rename check lives at run level instead.
+    """
+    renamed = json.dumps({"model": "m", "messages": [], "tools": [
+        {"name": "StructuredOutputV2", "description": "d",
+         "input_schema": {"type": "object", "properties": {}}}]}).encode()
+    ordinary = json.dumps({"model": "m", "messages": [], "tools": [
+        {"name": "Bash", "input_schema": {}}]}).encode()
+    assert leerie._unexpected_structured_output_shape(renamed) is False
+    assert leerie._unexpected_structured_output_shape(ordinary) is False
+
+
+def test_a_run_that_rewrote_nothing_reports_a_probable_rename(leerie):
+    """DESIGN §7 requires a renamed tool to be reported — "the dangerous
+    failure here is a silent one". Suppressing the per-request false positives
+    removed that signal, so it is restored at run level: leerie passes a schema
+    to every worker, so if anything was proxied, something must have carried
+    the tool. Nothing rewritten means the flag silently did nothing all run."""
+    summary = _summary_for(leerie, rewritten=0, passed_through=50)
+    assert "NOTHING was rewritten" in summary
+    assert "renamed or removed" in summary
+    assert leerie._STRICT_OUTPUT_TOOL_NAME in summary
+
+
+def test_a_healthy_run_never_reports_a_rename(leerie):
+    """Anti-vacuity: the whole point of the change was to stop warning on
+    ordinary pass-throughs, so a run that rewrote anything must stay quiet no
+    matter how many tool-free requests it saw."""
+    summary = _summary_for(leerie, rewritten=395, passed_through=173,
+                           transient_errors=14)
+    assert "NOTHING was rewritten" not in summary
+    assert "renamed or removed" not in summary
+
+
+def test_no_proxied_requests_at_all_is_not_a_rename(leerie):
+    """A run where the proxy saw nothing proves nothing about the tool — the
+    warning must key on `passed_through`, not fire on an empty run."""
+    assert "NOTHING was rewritten" not in _summary_for(leerie)
