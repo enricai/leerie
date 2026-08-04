@@ -3341,6 +3341,112 @@ The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
 
+#### Forced constrained decoding — `--dangerously-force-strict-output`
+
+Off by default. Resolved by `resolve_dangerously_force_strict_output(repo_root,
+cli_value)` with
+the standard CLI > env (`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) > `leerie.toml`
+(`dangerously_force_strict_output`) precedence.
+
+**Why it exists.** `--json-schema` is *validated*, not constrained: the CLI
+injects the schema as a synthetic `StructuredOutput` tool with **no
+`strict: true`** and no `output_config` (confirmed from a captured outbound
+request, 2026-08-04). Measured across the run corpus, **2,861 of 9,924
+submissions (28.8%)** are malformed as a result. Setting `strict: true` compiles
+the schema into a sampling grammar and makes those shapes unrepresentable.
+
+**Mechanism.** `_StrictOutputProxy` — an `asyncio.start_server` listener on
+`127.0.0.1`, **one per run**, started in `_orchestrate()` before the first
+worker and closed in its `finally` — which covers normal completion, `die()`,
+and SIGINT. There is deliberately no `_cleanup_on_abnormal_exit` hook: on
+SIGKILL the container boundary reaps the listener (DESIGN §6), which is the same
+guarantee every other worker resource relies on. Workers
+reach it via `ANTHROPIC_BASE_URL` injected into `worker_env`. The orchestrator
+is PID 1 in the container and workers are its children, so loopback needs no
+port mapping.
+
+| property | value | why |
+|---|---|---|
+| port | bind `0`, read back from `server.sockets[0].getsockname()[1]` | no scan, no race, concurrent runs never collide |
+| executor | dedicated `ThreadPoolExecutor(max_parallel + 8)` | the default pool saturates: measured 34/40 connections at 40 concurrent, 40/40 once bounded |
+| socket | `reuse_address=True`, `backlog=256` | without it the port is not rebindable after shutdown |
+| shutdown | close listener, drain tracked writers, `_pool.shutdown(wait=False, cancel_futures=True)` | verified port is rebindable afterwards. `wait=False` keeps Ctrl-C responsive — a blocking join could hold the finally open for a full upstream timeout. Residual: `ThreadPoolExecutor` registers an atexit join, so an upstream call still in flight at exit can delay the interpreter by up to `_STRICT_PROXY_TIMEOUT_SEC`; in the container the boundary reaps first |
+| `ConnectionResetError` / `BrokenPipeError` | caught per connection, non-fatal | normal client hang-up |
+| upstream | executor-bridged `urllib` | leerie has no async HTTP dependency; hand-rolled HTTP/1.1 is where the bugs are. Verified to 80 concurrent (16× default `max_parallel`) |
+| method | parsed from the request line and threaded to `_upstream` | only POST bodies are rewritten; every other verb the CLI issues must reach upstream as itself |
+| chunked request body | decoded by `_read_chunked`, never rewritten | a chunked body carries no `content-length`, so a length-driven read forwards only the first packet — a silently truncated request, which reads downstream as a model error rather than a proxy bug |
+
+**Logging.** The proxy runs in the orchestrator process, so `log()` from the
+handler interleaves with every other leerie line — there is no separate proxy
+log to go find. Three levels, emitted by `_log_exchange`:
+
+| when | verbosity | line |
+|---|---|---|
+| listener starts | all | `strict output: rewriting worker API requests via 127.0.0.1:<port> …` |
+| upstream ≥ 400 | **all, including `quiet`** | `strict-output proxy: upstream <status> on <method> <path> (<what was changed>) — <response body>` |
+| upstream < 400 | `debug` (`-vv`) only | `strict-output proxy: <method> <path> -> <status> (<what was changed>)` |
+| run ends | all | rewritten / passed-through / upstream-error counts |
+
+The error line is deliberately not verbosity-gated. This proxy is the only thing
+in the path that rewrites a request, so a 4xx is most likely leerie's own edit
+being rejected — and the response body names the offending schema path. Without
+it the operator sees only workers retrying, which is precisely the
+misattribution this flag's failure mode consists of. Echoes are capped at
+`_STRICT_PROXY_ERROR_LOG_MAX` (3) bodies of `_STRICT_PROXY_ERROR_BODY_MAX` (400)
+chars, because a rejected rewrite is systematic — every worker call fails the
+same way — after which they are counted, not echoed. The count is complete
+regardless, so the end-of-run summary never under-reports.
+
+**Transform** (`_strictify_request(body) -> tuple[bytes, str] | None` — the
+second element describes what changed and is what the log lines below report),
+applied only when
+exactly one tool is named `StructuredOutput` and carries an `input_schema`:
+sets `strict: true`; adds `additionalProperties: false` to every object node
+including inside array `items`; strips `minLength` / `maxLength` / `minimum` /
+`maximum`; clamps `minItems > 1` to `1`. Verified against all 23 entries in
+`SCHEMAS`: **zero residual violations**, 64 `additionalProperties` added, 21
+keywords stripped across 8 schemas.
+
+**Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
+request forwarded byte-identical and the no-op logged (a silent loss of the
+guarantee is the dangerous case). Listener cannot bind → `die()`, never a quiet
+downgrade to unconstrained.
+
+**Two fatal collisions, same contract.** The flag works by owning
+`ANTHROPIC_BASE_URL`, so leerie `die()`s rather than proceed when that ownership
+is contested:
+
+1. **An operator-set `ANTHROPIC_BASE_URL`.** Overriding a user's gateway
+   silently and silently skipping the requested guarantee are both wrong, so
+   leerie names both and lets the operator unset one or drop the flag.
+2. **Bedrock** (`AWS_BEARER_TOKEN_BEDROCK`, or a truthy `CLAUDE_CODE_USE_BEDROCK`
+   — the same spellings the launcher's `detect_bedrock_mode()` accepts).
+   `ANTHROPIC_BASE_URL` is the *first-party* endpoint override; Bedrock has its
+   own (`ANTHROPIC_BEDROCK_BASE_URL`) and the proxy's upstream is hardcoded to
+   `api.anthropic.com`. So the flag under Bedrock either does nothing — the CLI
+   never contacts the proxy and the operator is silently handed post-hoc
+   validation, the exact failure case 1 exists to prevent — or misroutes every
+   worker call. Neither is distinguishable from a healthy run in the log, so
+   this is a `die()`, not a warning.
+
+**Stripped numeric bounds are re-checked in Python.** Of the 21 stripped
+keywords, 16 are string-length bounds (15 `minLength`, 1 `maxLength`) whose
+consumers already test truthiness. The 5 numeric ones (3 `minimum`, 2 `maximum`)
+do not and fail permissively — `score = judge_result.get("score", 0.0)` then
+`if score >= threshold` would read an out-of-range score as well-fit — so
+`fit_judge.score` (0–1, `_recursive_decompose`),
+`adherence_judge.instruction_adherence` (0–10, `phase_adherence_gate`) and
+`provision.recipe[].timeout_s` (≥1, `_recipe_timeout_s`, used by both the
+prompt-rendering and the baseline-install call sites) go through
+`_bounded_or_conservative`.
+
+These guards run **unconditionally, not only under the flag**: a value outside
+its declared range was always a worker bug, and distrusting it is right whether
+or not strict mode is what removed the bound. `timeout_s` additionally has a
+pre-existing `or 1800` fallback that already absorbed `0`; the guard adds the
+negative case, which is truthy and would otherwise reach
+`wait_for(timeout=-5.0)` and fire instantly.
+
 #### User prompt transport — stdin, not argv
 
 `build()` emits `["claude", "-p", ...]` with **no positional argument

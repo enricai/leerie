@@ -4820,6 +4820,52 @@ worker communicate through a strict contract:
 - A worker that fails to produce a schema-valid result is retried once with the
   violation pointed out. A second failure is a hard worker error.
 
+**Validation is post-hoc, not constrained — and that is the dominant source of
+worker failure.** `claude -p --json-schema` does not constrain generation. The
+CLI injects the schema as a synthetic `StructuredOutput` *tool* and checks the
+result afterwards, re-prompting on mismatch; its own reference calls the flag
+"structured output **validation**". Captured from the wire (2026-08-04): the
+outbound request carries `tools[n].name == "StructuredOutput"` with **`strict`
+absent** and no `output_config`.
+
+The consequence is measured, not theoretical. Across the run corpus — every
+`StructuredOutput` submission in every run — **2,861 of 9,924 submissions
+(28.8%) are malformed**, in exactly the three shapes the vendor documents as the
+cost of omitting strict mode: the payload wrapped in a protocol-vocabulary
+container key (`{"input": …}`, `{"output": …}`, 1,648), the decoder flipping to
+legacy XML mid-value (136), bytes the CLI cannot parse at all (261), and
+required fields simply absent (752). None of these is a model being unable to do
+the work — the answers are usually correct and merely unreachable, which is why
+the CLI's own re-prompt loop recovers most of them at the cost of regenerating
+the payload.
+
+**Optional counter-measure: grammar-constrained decoding.** The API can compile
+a schema into a grammar that restricts token sampling, making every one of those
+shapes *unrepresentable* rather than merely rarer. The CLI exposes no way to ask
+for it. leerie can, behind
+`--dangerously-force-strict-output` (§ *Forcing constrained decoding*), by
+routing worker traffic through a loopback proxy that sets `strict: true` on the
+injected tool. It is **off by default**: it rewrites outbound requests to reach
+a capability the CLI does not expose and that is undocumented for subscription
+auth, and it depends on an internal tool name that carries no compatibility
+guarantee.
+
+Because that mechanism works by owning `ANTHROPIC_BASE_URL`, it **cannot
+coexist with an operator-supplied one**. A user who has already pointed that
+variable at a gateway, proxy, or alternative endpoint has a configuration leerie
+must not silently take over — and silently declining to enable the flag would be
+equally wrong, since the run would then lack the guarantee it was asked for.
+leerie therefore refuses to start when both are present, naming both and leaving
+the choice to the operator.
+
+The same reasoning rules out **Bedrock**. `ANTHROPIC_BASE_URL` is the
+first-party endpoint override; Bedrock routes through its own, and the proxy's
+upstream is the first-party API. So under Bedrock the flag is either inert — the
+proxy is never contacted and the operator is silently handed the post-hoc
+validation they explicitly asked to replace — or it misroutes every worker call.
+Since a run cannot tell those apart from a healthy one, leerie refuses that
+combination too rather than guessing.
+
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
 so its failure is converted into a handoff: a fresh implementer can continue.
@@ -4852,6 +4898,52 @@ the integrator's considered judgment that the merge should not stand, and
 still aborts and discards, exactly as *When integration cannot succeed*
 describes. Salvaging a crash does not weaken that: a verdict is a fact about
 the work, a crash is a fact about the machine.
+
+### Forcing constrained decoding
+
+`--dangerously-force-strict-output` converts the schema contract above from
+checked-afterwards into enforced-during-generation. It is off by default.
+
+The mechanism is a **loopback proxy, one per run, started by the orchestrator**.
+Because the orchestrator is PID 1 inside the container and every worker is its
+child (§6 *Worker subtree termination*), they share a network namespace: a
+listener on `127.0.0.1` is reachable by workers with no port mapping and no host
+networking, and the container boundary reaps it if the run dies abnormally. The
+port is chosen by binding to `0` and reading back what the OS assigned, so
+concurrent leerie runs on one host never collide and no port scan is needed.
+
+The proxy rewrites exactly one thing: on a request carrying a single tool named
+`StructuredOutput`, it sets `strict: true` and normalises the schema to the
+subset grammar compilation accepts — `additionalProperties: false` on every
+object, and removal of the keywords strict cannot express. Of that keyword set,
+only four occur in leerie's own schemas today (`minLength`, `maxLength`,
+`minimum`, `maximum`); the rest are stripped defensively against future schema
+edits. Everything else in the request is forwarded untouched.
+
+Two properties make that safe to run in the path of every worker call.
+
+**It fails open.** If the tool is renamed, absent, duplicated, or shaped
+unexpectedly — all of which an upstream release may do without notice — the
+request is forwarded unmodified. The run continues exactly as it would without
+the flag; the guarantee is lost, not the run. That loss is logged, because the
+dangerous failure here is a silent one.
+
+**It fails closed at startup.** If the listener cannot bind, the run dies rather
+than proceeding unconstrained, so an operator who asked for the guarantee is
+never quietly given the old behaviour.
+
+The normalisation has a real cost: those stripped keywords were carrying
+validation. Sixteen of the twenty-one are string-length bounds (fifteen
+`minLength`, one `maxLength`) on strings whose consumers already test
+truthiness, so nothing changes. The remaining five are numeric bounds that
+**fail permissively** if dropped — `fit_judge`'s score is compared against a
+threshold with no range check, so an out-of-range value would read as well-fit —
+and leerie therefore re-checks those in Python. That re-check is
+*unconditional*, not gated on the flag: a value outside its declared range was
+always a worker bug, and distrusting it is right whether or not strict mode is
+what removed the bound. The trade is deliberate: structural malformation is what
+actually breaks runs, and value-range violations are both rarer and cheaply
+re-checked.
 
 ---
 
