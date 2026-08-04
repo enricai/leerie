@@ -1383,3 +1383,140 @@ def test_all_required_output_still_validates_against_the_original(leerie):
                 continue
             bad.append((name, str(e).splitlines()[0][:90]))
     assert not bad, f"all-fields-present output rejected by the original: {bad}"
+
+
+# --------------------------------------------------------------------------
+# Reconciler: flattened wire shape + the fan-out adapter.
+#
+# The nine-array shape was refused outright ("The compiled grammar is too
+# large", 0.6 s) because it nested an array-of-objects inside an
+# array-of-objects — the only three-deep path in any leerie schema — and
+# repeated the isomorphic {sid, tag, reason} object four times. Seven in-place
+# reductions were each measured and each still refused; only the restructure
+# worked (51.8 s, and a full end-to-end run with `structured_output` present).
+# --------------------------------------------------------------------------
+
+
+def test_reconciler_wire_shape_is_flat(leerie):
+    """No array-of-objects nested inside another array-of-objects, which is
+    what put the old schema over the ceiling."""
+    def depth_of_object_arrays(node, inside_items=False):
+        worst = 0
+        if isinstance(node, dict):
+            is_obj_array = (node.get("type") == "array"
+                            and isinstance(node.get("items"), dict)
+                            and "properties" in node["items"])
+            if is_obj_array and inside_items:
+                worst = max(worst, 2)
+            for k, v in node.items():
+                worst = max(worst, depth_of_object_arrays(
+                    v, inside_items or is_obj_array))
+        elif isinstance(node, list):
+            for v in node:
+                worst = max(worst, depth_of_object_arrays(v, inside_items))
+        return worst
+    assert depth_of_object_arrays(leerie.SCHEMAS["reconciler"]) == 0, (
+        "an array-of-objects is nested inside another array-of-objects again")
+
+
+def test_reconciler_has_no_repeated_object_shape(leerie):
+    """`add_provide`/`drop_require`/`unresolvable`/`conditional_drop` collapsed
+    into one enum-discriminated array. Enums are cheap; four identical object
+    shapes were not."""
+    props = leerie.SCHEMAS["reconciler"]["properties"]
+    assert "tag_ops" in props
+    ops = props["tag_ops"]["items"]["properties"]["op"]["enum"]
+    assert set(ops) == {"add_provide", "drop_require", "unresolvable",
+                        "conditional_drop"}
+    for gone in ("added_provides", "dropped_requires", "conditional_drops",
+                 "unresolvable"):
+        assert gone not in props, f"{gone} should be a tag_ops op now"
+
+
+def test_expand_fans_tag_ops_into_the_internal_shape(leerie):
+    """Everything downstream still consumes the nine arrays."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [], "added_requires": [], "renames": [],
+        "dependency_edges": [], "merged_subtasks": [], "confidence": {},
+        "tag_ops": [
+            {"op": "add_provide", "sid": "a", "tag": "t1", "reason": "r"},
+            {"op": "drop_require", "sid": "b", "tag": "t2", "reason": "r"},
+            {"op": "unresolvable", "sid": "c", "tag": "t3", "reason": "r"},
+            {"op": "conditional_drop", "sid": "d", "tag": "", "reason": "r"},
+        ],
+    })
+    assert [x["sid"] for x in out["added_provides"]] == ["a"]
+    assert [x["sid"] for x in out["dropped_requires"]] == ["b"]
+    assert [x["sid"] for x in out["unresolvable"]] == ["c"]
+    assert [x["sid"] for x in out["conditional_drops"]] == ["d"]
+    # conditional_drops has no `tag` in the internal shape — its consumer
+    # never reads one, and inventing an empty one would be a silent lie.
+    assert "tag" not in out["conditional_drops"][0]
+
+
+def test_expand_is_case_insensitive_on_enums(leerie):
+    """Constrained decoding does not guarantee enum capitalisation, and it
+    drifts silently — no error, no special stop reason."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [{"id": "s1", "title": "t",
+                            "success_criteria_seed": "c"}],
+        "added_requires": [{"sid": "s1", "tag": "x", "extent": "IN_PLAN"}],
+        "tag_ops": [{"op": "ADD_PROVIDE", "sid": "a", "tag": "t",
+                     "reason": "r"}],
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "confidence": {},
+    })
+    assert len(out["added_provides"]) == 1, "uppercase op was dropped"
+    assert out["added_subtasks"][0]["requires"][0]["extent"] == "in_plan"
+
+
+def test_expand_drops_an_unknown_op_rather_than_guessing(leerie):
+    """Misfiling a resolution action would mutate the plan invisibly."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [], "added_requires": [],
+        "tag_ops": [{"op": "delete_everything", "sid": "a", "reason": "r"}],
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "confidence": {},
+    })
+    assert all(not out[k] for k in ("added_provides", "dropped_requires",
+                                    "unresolvable", "conditional_drops"))
+
+
+def test_expand_rebinds_requires_and_reports_danglers(leerie):
+    """The subtask<->requires binding is no longer structural, so it is
+    re-bound by sid here and a miss is surfaced rather than silently lost."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [{"id": "feat-008", "title": "t",
+                            "success_criteria_seed": "c"}],
+        "added_requires": [
+            {"sid": "feat-008", "tag": "cap-y", "extent": "in_plan"},
+            {"sid": "ghost", "tag": "cap-z", "extent": "in_plan"},
+        ],
+        "tag_ops": [], "renames": [], "dependency_edges": [],
+        "merged_subtasks": [], "confidence": {},
+    })
+    assert out["added_subtasks"][0]["requires"] == [
+        {"tag": "cap-y", "extent": "in_plan"}]
+    assert len(out["_dangling_requires"]) == 1
+
+
+def test_expand_does_not_mutate_the_worker_output(leerie):
+    """The raw envelope is persisted as telemetry and must stay as-emitted."""
+    raw = {"added_subtasks": [{"id": "s", "title": "t",
+                               "success_criteria_seed": "c"}],
+           "added_requires": [{"sid": "s", "tag": "x", "extent": "in_plan"}],
+           "tag_ops": [], "renames": [], "dependency_edges": [],
+           "merged_subtasks": [], "confidence": {}}
+    import copy
+    before = copy.deepcopy(raw)
+    leerie._expand_reconciler_output(raw)
+    assert raw == before
+
+
+def test_spawn_reconciler_routes_through_the_adapter(leerie):
+    """Source-coupling: all three call sites (first attempt, size retry, cycle
+    retry) go through `_spawn_reconciler`, so the adapter must sit there."""
+    import inspect
+    src = inspect.getsource(leerie.phase_reconcile)
+    assert "_expand_reconciler_output(raw)" in src
+    assert "_dangling_requires" in src

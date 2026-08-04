@@ -1,5 +1,15 @@
-"""Schema tests for `SCHEMAS["reconciler"]` — the eight-array output the
+"""Schema tests for `SCHEMAS["reconciler"]` — the flattened output the
 reconciler worker emits (DESIGN §5, §14).
+
+The wire shape is FLAT by necessity, not by taste: the previous nine-array
+shape nested an array-of-objects (`requires`) inside an array-of-objects
+(`added_subtasks`) and repeated the isomorphic `{sid, tag, reason}` object four
+times, which put it over the grammar-compilation ceiling under
+`--dangerously-force-strict-output` ("The compiled grammar is too large").
+`requires` now lives in a top-level `added_requires` keyed by sid, and the four
+repeated shapes collapse into one enum-discriminated `tag_ops`.
+`_expand_reconciler_output` fans it back into the nine arrays every consumer
+still expects, so those tests live in `test_strict_output_proxy.py`.
 
 The schema is consumed by `claude_p()` via `--json-schema` to gate the
 worker's output. We don't have the live `claude` CLI in tests, so the
@@ -17,15 +27,33 @@ import pytest
 
 
 def _full_valid_output() -> dict:
-    """A reconciler output with all eight arrays populated. Useful as a
+    """A reconciler output with every array populated. Useful as a
     baseline; individual tests mutate copies of this."""
     return {
         "renames": [
             {"sid": "test-001", "from": "capture-call-implemented",
              "to": "event-capture-shim"},
         ],
-        "added_provides": [
-            {"sid": "feat-002", "tag": "judge-rubric-defined"},
+        "tag_ops": [
+            {"op": "add_provide", "sid": "feat-002",
+             "tag": "judge-rubric-defined", "reason": "it already emits it"},
+            {"op": "drop_require", "sid": "test-002",
+             "tag": "framework-decision-made",
+             "reason": "The framework choice is recorded by test-002 "
+                       "itself in package.json; no other subtask produces "
+                       "it as a code artifact."},
+            {"op": "conditional_drop", "sid": "deps-004", "tag": "",
+             "reason": "deps-004's own intent declares it conditional "
+                       "('no-op the orchestrator can drop'); no subtask "
+                       "produces the precondition tag."},
+            {"op": "unresolvable", "sid": "test-005",
+             "tag": "magic-thing-that-doesnt-exist",
+             "reason": "No planner produced anything related and no "
+                       "plausible connector subtask can be inferred."},
+        ],
+        "added_requires": [
+            {"sid": "feat-008", "tag": "events-ndjson-emitter",
+             "extent": "in_plan", "reason": "reads what that subtask writes"},
         ],
         "added_subtasks": [
             {
@@ -35,23 +63,10 @@ def _full_valid_output() -> dict:
                 "success_criteria_seed": "verdict_loader.py reads "
                                          "events.ndjson and returns a list of dicts",
                 "provides": ["verdict-loader-implemented"],
-                "requires": [],
                 "depends_on": [],
                 "size": "small",
                 "_added_by_reconciler": True,
             },
-        ],
-        "conditional_drops": [
-            {"sid": "deps-004",
-             "reason": "deps-004's own intent declares it conditional "
-                       "('no-op the orchestrator can drop'); no subtask "
-                       "produces the precondition tag."},
-        ],
-        "dropped_requires": [
-            {"sid": "test-002", "tag": "framework-decision-made",
-             "reason": "The framework choice is recorded by test-002 "
-                       "itself in package.json; no other subtask produces "
-                       "it as a code artifact."},
         ],
         "dependency_edges": [
             {"from": "test-003", "to": "test-004",
@@ -62,12 +77,6 @@ def _full_valid_output() -> dict:
             {"into": "test-006", "from": "test-007",
              "reason": "Both subtasks edit the same bootstrap file and "
                        "wait on the same authoring decision."},
-        ],
-        "unresolvable": [
-            {"sid": "test-005",
-             "tag": "magic-thing-that-doesnt-exist",
-             "reason": "No planner produced anything related and no "
-                       "plausible connector subtask can be inferred."},
         ],
         "confidence": {
             "reconciliation": 9.2,
@@ -88,44 +97,38 @@ def test_reconciler_schema_exists(leerie):
     assert schema["type"] == "object"
 
 
-def test_reconciler_requires_all_eight_arrays(leerie):
-    """All eight arrays must be present in every output — even if empty.
-    Each array is independently optional in content (any can be empty)
-    but the field itself must be there so callers don't crash on a
-    missing key. The eight cover five resolution actions (renames,
-    added_provides, added_subtasks, conditional_drops, dropped_requires
-    — the latter is dual-role and also serves as a cycle-breaker), two
-    cycle-breaking-only actions (dependency_edges, merged_subtasks),
-    and one escape hatch (unresolvable)."""
+def test_reconciler_requires_all_wire_arrays(leerie):
+    """Every wire array must be present in every output, even if empty, so
+    callers never crash on a missing key.
+
+    Seven fields, not nine: the four isomorphic `{sid, tag, reason}` arrays
+    (added_provides, dropped_requires, conditional_drops, unresolvable)
+    collapsed into one enum-discriminated `tag_ops`, and `requires` was lifted
+    out of `added_subtasks` into a top-level `added_requires`. Both changes
+    were forced by grammar compilation, not preference — see the module
+    docstring."""
     schema = leerie.SCHEMAS["reconciler"]
     required = set(schema["required"])
-    assert required == {"renames", "added_provides", "added_subtasks",
-                        "conditional_drops",
-                        "dropped_requires", "dependency_edges",
-                        "merged_subtasks", "unresolvable", "confidence"}
+    assert required == {"added_subtasks", "added_requires", "tag_ops",
+                        "renames", "dependency_edges", "merged_subtasks",
+                        "confidence"}
 
 
-def test_reconciler_conditional_drops_shape(leerie):
-    """conditional_drops drops a planner-emitted consumer subtask whose
-    own intent declared it conditional on an unresolvable in_plan
-    precondition (DESIGN §5). Carries (sid, reason) — `reason` is
-    required so the audit field records WHY the drop happened (typically
-    a quote of the consumer's conditional intent + the structural reason
-    the precondition is false)."""
+def test_reconciler_tag_ops_shape(leerie):
+    """`tag_ops` carries the four operations that were separate arrays.
+
+    `reason` is required on every one so the audit trail records WHY —
+    for a conditional_drop that is typically a quote of the consumer's own
+    conditional intent plus the structural reason its precondition is false.
+    `tag` is optional because conditional_drop has no tag to name."""
     schema = leerie.SCHEMAS["reconciler"]
-    assert "conditional_drops" in schema["properties"]
-    item = schema["properties"]["conditional_drops"]["items"]
-    assert set(item["required"]) == {"sid", "reason"}
-    assert item["properties"]["sid"]["type"] == "string"
-    assert item["properties"]["reason"]["type"] == "string"
+    item = schema["properties"]["tag_ops"]["items"]
+    assert set(item["required"]) == {"op", "sid", "reason"}
+    assert set(item["properties"]["op"]["enum"]) == {
+        "add_provide", "drop_require", "unresolvable", "conditional_drop"}
+    for field in ("sid", "tag", "reason"):
+        assert item["properties"][field]["type"] == "string"
 
-
-def test_reconciler_dropped_requires_shape(leerie):
-    """dropped_requires removes an over-specified extent:in_plan requires
-    entry. Carries (sid, tag, reason) — reason is required so the user
-    sees why the requirement was dropped."""
-    item = leerie.SCHEMAS["reconciler"]["properties"]["dropped_requires"]["items"]
-    assert set(item["required"]) == {"sid", "tag", "reason"}
 
 
 def test_reconciler_dependency_edges_shape(leerie):
@@ -156,11 +159,6 @@ def test_reconciler_rename_shape(leerie):
     assert set(item["required"]) == {"sid", "from", "to"}
 
 
-def test_reconciler_added_provides_shape(leerie):
-    """Each added_provides is (sid, tag)."""
-    item = leerie.SCHEMAS["reconciler"]["properties"]["added_provides"]["items"]
-    assert set(item["required"]) == {"sid", "tag"}
-
 
 def test_reconciler_added_subtasks_shape_matches_planner(leerie):
     """Added subtasks must carry the same required fields as planner
@@ -186,8 +184,11 @@ def test_reconciler_added_subtask_carries_planner_fields(leerie):
     props = (leerie.SCHEMAS["reconciler"]
              ["properties"]["added_subtasks"]["items"]["properties"])
     # Fields the planner schema declares on each subtask.
+    # `requires` is deliberately absent — it lives in the top-level
+    # `added_requires`, keyed by sid, because nesting an array-of-objects
+    # inside an array-of-objects is what broke grammar compilation.
     for field in ("id", "title", "intent", "scope_note", "depends_on",
-                  "requires", "provides", "success_criteria_seed",
+                  "provides", "success_criteria_seed",
                   "size", "investigation_notes"):
         assert field in props, (
             f"reconciler added_subtask schema must include planner field "
@@ -199,12 +200,10 @@ def test_reconciler_added_subtask_carries_planner_fields(leerie):
     assert "_added_by_reconciler" not in props, (
         "`_added_by_reconciler` must not be a model-settable property — "
         "leerie stamps it mechanically in `_apply_reconciler_output`")
+    assert "requires" not in props, (
+        "`requires` must stay lifted into the top-level `added_requires` — "
+        "re-nesting it puts the schema back over the grammar ceiling")
 
-
-def test_reconciler_unresolvable_shape(leerie):
-    """Each unresolvable entry must include reasoning the user will see."""
-    item = leerie.SCHEMAS["reconciler"]["properties"]["unresolvable"]["items"]
-    assert set(item["required"]) == {"sid", "tag", "reason"}
 
 
 def test_reconciler_arrays_can_all_be_empty(leerie):
@@ -213,10 +212,9 @@ def test_reconciler_arrays_can_all_be_empty(leerie):
     do (which in practice means phase_reconcile would have
     short-circuited before calling the worker, but the schema must
     still accept it)."""
-    empty = {"renames": [], "added_provides": [], "added_subtasks": [],
-             "conditional_drops": [],
-             "dropped_requires": [], "dependency_edges": [],
-             "merged_subtasks": [], "unresolvable": [],
+    empty = {"added_subtasks": [], "added_requires": [], "tag_ops": [],
+             "renames": [], "dependency_edges": [],
+             "merged_subtasks": [],
              "confidence": {"reconciliation": 9.0, "basis": "",
                             "falsifiers_tested": [],
                             "contradictions_reconciled": [],

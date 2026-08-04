@@ -1352,75 +1352,32 @@ SCHEMAS: dict[str, dict] = {
     },
     "reconciler": {
         # Output of the reconciler worker (DESIGN §5). Spawned by
-        # phase_reconcile after phase_plan when the merged planner output
-        # has `requires` capability tags with no matching `provides`. The
-        # worker reasons over the full task + merged subtasks (with their
-        # provides, requires, depends_on, files_likely_touched) and the
-        # list of unresolved tags, then emits eight arrays:
-        #   - 5 resolution actions: renames, added_provides, added_subtasks,
-        #     conditional_drops, dropped_requires (close unresolved-requires
-        #     gaps; the common case). conditional_drops handles planner-
-        #     emitted consumers whose own `intent` declares them conditional
-        #     on an unresolvable precondition. dropped_requires handles
-        #     consumers whose `requires` entry is over-specified — an
-        #     aggregate, coarser synonym, or authoring-time decision the
-        #     same subtask itself records (the consumer stays; only the
-        #     bad edge goes).
-        #   - 2 cycle-breaking-only actions: dependency_edges, merged_subtasks
-        #     (used only in retry mode, when the gate detected the first
-        #     attempt's mutations closed a cycle). dropped_requires also
-        #     plays a cycle-breaking role in retry mode (over-specified
-        #     requires entries that close cycles), but its primary home
-        #     is now resolution.
-        #   - 1 escape hatch: unresolvable (genuine gap with no plausible
-        #     resolution; dies the run with the worker's stated reason).
-        # Each array is independently optional (any can be empty). The
-        # orchestrator applies the seven action arrays mechanically and
-        # runs Tarjan's SCC + a must-include validator over the post-
-        # mutation graph; `unresolvable` aborts before any mutation.
+        # phase_reconcile after phase_plan when the merged planner output has
+        # `requires` capability tags with no matching `provides`.
+        #
+        # SHAPE IS FLATTENED FOR GRAMMAR COMPILATION, and that is load-bearing
+        # rather than cosmetic. The previous nine-array shape was refused
+        # outright under `--dangerously-force-strict-output` ("The compiled
+        # grammar is too large") because it nested an array-of-objects
+        # (`requires`) inside an array-of-objects (`added_subtasks`) — the only
+        # three-deep path in any leerie schema — and repeated the isomorphic
+        # `{sid, tag, reason}` object four times. Measured: the old shape is
+        # rejected in 0.6 s; this one compiles in 51.8 s and round-trips
+        # end-to-end with `structured_output` populated. Seven in-place
+        # reductions (all-required, $defs, stripping descriptions, dropping
+        # subtrees, trimming properties, enum-ifying identifiers) were each
+        # measured and each still refused; only the restructure worked.
+        #
+        # `_expand_reconciler_output` fans this back into the nine arrays the
+        # rest of phase_reconcile has always consumed, so `check_reconciler_output`,
+        # `_apply_reconciler_output` and `_validate_must_include` are untouched.
         "type": "object",
-        "required": ["renames", "added_provides", "added_subtasks",
-                     "conditional_drops",
-                     "dropped_requires", "dependency_edges",
-                     "merged_subtasks", "unresolvable", "confidence"],
+        "required": ["added_subtasks", "added_requires", "tag_ops", "renames",
+                     "dependency_edges", "merged_subtasks", "confidence"],
         "properties": {
-            "renames": {
-                # Rewrite a `requires` tag on one subtask to match an
-                # existing `provides` tag on another. The single most
-                # common case (planners picked different words for the
-                # same thing).
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "from", "to"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "from": {"type": "string"},
-                        "to": {"type": "string"},
-                    },
-                },
-            },
-            "added_provides": {
-                # A subtask actually produces the needed capability but
-                # didn't declare the tag. Add it to that subtask's
-                # `provides`.
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "tag"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "tag": {"type": "string"},
-                    },
-                },
-            },
             "added_subtasks": {
-                # Genuine gap — propose a new subtask to fill it. Shape
-                # mirrors planner-output subtasks (same required fields).
-                # Leerie stamps `_added_by_reconciler: true` on every entry
-                # in `_apply_reconciler_output` — the model has no business
-                # setting it (any guarantee that matters lives in code,
-                # not in the model's response).
+                # Net-new bridging work. `requires` is NOT nested here any
+                # more — it moves to `added_requires`, keyed by sid.
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1432,73 +1389,67 @@ SCHEMAS: dict[str, dict] = {
                         "scope_note": {"type": "string"},
                         "files_likely_touched": {
                             "type": "array", "items": {"type": "string"}},
-                        "depends_on": {"type": "array", "items": {"type": "string"}},
-                        "requires": {"type": "array", "items": _REQUIRES_ITEM},
-                        "provides": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {
+                            "type": "array", "items": {"type": "string"}},
+                        "provides": {
+                            "type": "array", "items": {"type": "string"}},
                         "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
+                        "size": {"type": "string",
+                                 "enum": ["small", "medium", "large"]},
                         "investigation_notes": {"type": "string"},
                     },
                 },
             },
-            "conditional_drops": {
-                # Resolution op #4: drop a planner-emitted consumer subtask
-                # whose own `intent` declares it conditional on an
-                # unresolvable in_plan precondition (DESIGN §5). Used when
-                # the planner authored a subtask as "no-op if X" and no
-                # subtask in any domain produces X. The apply step removes
-                # the named sid from its plan and prunes downstream
-                # depends_on references; the drop is recorded in
-                # state.data["conditional_drops"] for audit (distinct from
-                # state.data["dropped_subtasks"] which records off-tree
-                # soft-drops from _filter_offtree_subtasks). Restricted to
-                # planner-authored consumers — the apply step die()s if
-                # the target sid carries _added_by_reconciler: true
-                # (reconciler-added subtasks have no planner prose to
-                # convert into a structured drop). Silent no-op on missing
-                # sid (mirrors `renames` / `dropped_requires`).
+            "added_requires": {
+                # Lifted out of `added_subtasks.requires`. The subtask->requires
+                # binding is no longer structural, so `_expand_reconciler_output`
+                # re-binds by `sid` and drops entries naming an unknown subtask.
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["sid", "reason"],
+                    "required": ["sid", "tag", "extent"],
                     "properties": {
                         "sid": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "extent": {"type": "string",
+                                   "enum": ["in_plan", "external"]},
                         "reason": {"type": "string"},
                     },
                 },
             },
-            "dropped_requires": {
-                # Resolution op #5 AND Cycle-breaking op #1: remove an
-                # over-specified `extent: in_plan` requires entry.
-                # Resolution mode: the requires entry is an aggregate,
-                # coarser synonym, or authoring-time decision the same
-                # subtask itself records (rather than a code artifact
-                # another subtask produces) — the consumer stays in the
-                # plan, only the bad edge goes.
-                # Cycle-breaking mode: an over-specified requires entry
-                # was what closed a dependency cycle; dropping it breaks
-                # the cycle without removing real subtask coupling.
-                # Apply mechanics are identical in either mode and live in
-                # `_apply_reconciler_output`. Silent no-op on missing
-                # sid/entry (mirrors `renames`).
+            "tag_ops": {
+                # One discriminated array replacing four isomorphic
+                # `{sid, tag, reason}` shapes (added_provides, dropped_requires,
+                # unresolvable, conditional_drops). The discriminator is an
+                # enum, which is cheap to compile; four separate object shapes
+                # were not.
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["sid", "tag", "reason"],
+                    "required": ["op", "sid", "reason"],
                     "properties": {
+                        "op": {"type": "string",
+                               "enum": ["add_provide", "drop_require",
+                                        "unresolvable", "conditional_drop"]},
                         "sid": {"type": "string"},
                         "tag": {"type": "string"},
                         "reason": {"type": "string"},
                     },
                 },
             },
+            "renames": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "from", "to"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                    },
+                },
+            },
             "dependency_edges": {
-                # Cycle-breaking op #2: assert an explicit `depends_on`
-                # ordering between two existing subtasks. Used when both
-                # sides legitimately need each other and one ordering is
-                # the right answer. Both ids must exist — apply step
-                # `die()`s on a missing id (fail-loud, mirrors the
-                # added_subtasks collision check).
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1511,21 +1462,6 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "merged_subtasks": {
-                # Cycle-breaking op #3: collapse two subtasks into one when
-                # the cycle reflects a genuine authoring overlap (signal:
-                # shared `files_likely_touched` between SCC members). The
-                # surviving subtask (`into`) inherits the union of both
-                # halves' provides/requires/depends_on/files_likely_touched,
-                # with self-references dropped (a requires whose tag is now
-                # in provides is removed; `from` is removed from depends_on
-                # entries). Downstream subtasks' depends_on references to
-                # `from` are rewritten to `into`. Tag-based requires need
-                # no rewriting (they match by tag, and `into` carries the
-                # union of provides). Telemetry: surviving subtask gets
-                # `_merged_from: ["<absorbed-id>", ...]`. Optional override
-                # fields let the reconciler restate the merged unit's
-                # contract; absent overrides default to concatenation
-                # (success_criteria_seed) or `into`'s values.
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1537,23 +1473,6 @@ SCHEMAS: dict[str, dict] = {
                         "title": {"type": "string"},
                         "intent": {"type": "string"},
                         "success_criteria_seed": {"type": "string"},
-                    },
-                },
-            },
-            "unresolvable": {
-                # Gap with no plausible resolution. The orchestrator dies
-                # with the worker's `reason` shown verbatim. NOT a valid
-                # response to a cycle — cycle resolution must use one of
-                # the cycle-breaking ops above; the retry prompt enforces
-                # this.
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["sid", "tag", "reason"],
-                    "properties": {
-                        "sid": {"type": "string"},
-                        "tag": {"type": "string"},
-                        "reason": {"type": "string"},
                     },
                 },
             },
@@ -6928,6 +6847,90 @@ def check_planner_output(
     # authoritative coverage gate — both remove the self-grading bias of
     # letting the planner grade its own decomposition/coverage.
     return issues
+
+
+_TAG_OP_TARGET = {
+    "add_provide": "added_provides",
+    "drop_require": "dropped_requires",
+    "unresolvable": "unresolvable",
+    "conditional_drop": "conditional_drops",
+}
+
+
+def _expand_reconciler_output(out: dict) -> dict:
+    """Fan the flattened worker output back into leerie's nine-array shape.
+
+    The wire schema is flattened so it compiles under
+    `--dangerously-force-strict-output` (see `SCHEMAS["reconciler"]`), but every
+    consumer downstream — `check_reconciler_output`, `_apply_reconciler_output`,
+    `_validate_must_include`, the cycle diagnostics — was written against the
+    nine arrays and stays that way. This is the only seam that knows both.
+
+    Two structural facts the flattening gives up, restored here:
+
+    * **`tag_ops` is discriminated, not typed.** One array with an `op` enum
+      replaced four isomorphic `{sid, tag, reason}` object shapes. An
+      unrecognised `op` is dropped rather than guessed — silently misfiling a
+      resolution action would mutate the plan in a way the operator never sees.
+    * **`added_requires` is no longer nested inside its subtask.** The binding
+      is by `sid` now, so an entry naming a subtask that does not exist in this
+      output has nothing to attach to. Those are dropped and counted; the
+      caller logs the count, because a dangling requires means the worker
+      believed in a subtask it did not emit.
+
+    Returns a NEW dict; the input is not mutated (the raw worker output is
+    persisted as telemetry and must stay as-emitted).
+    """
+    expanded: dict = {
+        "renames": list(out.get("renames") or []),
+        "dependency_edges": list(out.get("dependency_edges") or []),
+        "merged_subtasks": list(out.get("merged_subtasks") or []),
+        "added_provides": [],
+        "dropped_requires": [],
+        "unresolvable": [],
+        "conditional_drops": [],
+        "added_subtasks": [],
+        "confidence": out.get("confidence") or {},
+    }
+
+    for entry in out.get("tag_ops") or []:
+        if not isinstance(entry, dict):
+            continue
+        # Case-insensitive: constrained decoding does not guarantee the
+        # capitalisation of an enum value, and it fails silently when it drifts.
+        target = _TAG_OP_TARGET.get(str(entry.get("op", "")).strip().lower())
+        if target is None:
+            continue
+        row = {"sid": entry.get("sid", ""), "reason": entry.get("reason", "")}
+        if target != "conditional_drops":
+            row["tag"] = entry.get("tag", "")
+        expanded[target].append(row)
+
+    # Re-bind requires to their subtask by sid.
+    by_sid: dict[str, dict] = {}
+    for sub in out.get("added_subtasks") or []:
+        if not isinstance(sub, dict) or not sub.get("id"):
+            continue
+        copy_of = dict(sub)
+        copy_of["requires"] = []
+        by_sid[str(sub["id"])] = copy_of
+        expanded["added_subtasks"].append(copy_of)
+
+    dangling: list[str] = []
+    for req in out.get("added_requires") or []:
+        if not isinstance(req, dict):
+            continue
+        sub = by_sid.get(str(req.get("sid", "")))
+        if sub is None:
+            dangling.append(f"{req.get('sid')!r}:{req.get('tag')!r}")
+            continue
+        item = {"tag": req.get("tag", ""),
+                "extent": str(req.get("extent", "")).strip().lower()}
+        if req.get("reason"):
+            item["reason"] = req["reason"]
+        sub["requires"].append(item)
+    expanded["_dangling_requires"] = dangling
+    return expanded
 
 
 def check_reconciler_output(
@@ -17396,7 +17399,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
 
     async def _spawn_reconciler(up: str) -> dict:
         st.bump_workers(caps)
-        return await claude_p(
+        raw = await claude_p(
             user_prompt=up, system_prompt=sys_prompt,
             schema_key="reconciler", cwd=os.getcwd(),
             allowed_tools=INSPECT_TOOLS, max_turns=30,
@@ -17405,6 +17408,14 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             sid="reconciler",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
+        # The wire schema is flattened so it compiles under strict mode; every
+        # consumer below expects the nine-array shape. This is the only seam
+        # that knows both (see `_expand_reconciler_output`).
+        out = _expand_reconciler_output(raw)
+        for dangler in out.pop("_dangling_requires", []):
+            log(f"  reconciler: dropped added_requires {dangler} — names a "
+                "subtask absent from added_subtasks")
+        return out
 
     def _check_unresolvable(out: dict) -> None:
         """Fail closed on unresolvable BEFORE mutating anything — the

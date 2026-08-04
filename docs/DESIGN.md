@@ -4932,7 +4932,28 @@ dangerous failure here is a silent one.
 than proceeding unconstrained, so an operator who asked for the guarantee is
 never quietly given the old behaviour.
 
-**Some schemas cannot be constrained at all, and that is survivable.** Not every
+**Two distinct limits, and both are undocumented.** The API refuses an
+over-large schema two different ways — *"Schema is too complex for
+compilation"* and *"The compiled grammar is too large"* — and neither string,
+nor any numeric bound, appears in its own documentation. Measured, the drivers
+are: **optional properties**, because strict mode must admit every subset of
+them in any order (2^k paths per node, multiplied per array element); and
+**free-form strings**, which are the expensive element per path (20 string
+properties are refused where 20 enums, booleans, integers or arrays compile).
+Nesting an array-of-objects inside an array-of-objects compounds both.
+
+leerie answers each at the layer that owns it. The proxy forces every optional
+`required` **on the wire only** — collapsing the subset explosion without
+touching the schema the CLI validates against. And the two schemas that still
+would not fit were restructured: the planner's by that transform alone, the
+reconciler's by lifting its nested `requires` array into a sibling keyed by id
+and collapsing four isomorphic `{sid, tag, reason}` arrays into one
+enum-discriminated `tag_ops`. Seven in-place reductions were measured against
+the live API first — `$defs` deduplication, stripping descriptions, dropping
+subtrees, trimming properties, converting identifiers to enums — and every one
+was still refused. Only the restructure worked.
+
+**A schema that still cannot be constrained is survivable.** Not every
 schema compiles into a grammar. Measured against the API across all 23 (2026-08-04),
 two are refused outright — the planner's ("Schema is too complex") and the
 reconciler's ("The compiled grammar is too large"). Size is not the cause: the

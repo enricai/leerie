@@ -3454,6 +3454,38 @@ so batching schemas to save calls trips them and establishes nothing about any
 individual schema. leerie sends exactly one tool per request, and its largest
 single schema carries 14 optional parameters.
 
+**All 23 schemas compile** (measured live 2026-08-04,
+`claude-sonnet-4-5-20250929`, via `scripts/verify-strict-schemas.py`). Two
+needed work beyond the mechanical hardening:
+
+* **`planner`** — 11 optional properties in one `subtasks[]` item, refused with
+  "Schema is too complex for compilation". Fixed by `_strictify_schema`'s
+  all-required pass (wire-only), 2^11 grammar paths → 1. Now compiles in 43.6 s.
+* **`reconciler`** — refused with "The compiled grammar is too large" even at
+  zero optionals. Fixed by restructuring `SCHEMAS["reconciler"]`: `requires`
+  lifted out of `added_subtasks` into a sibling `added_requires` keyed by `sid`
+  (removing the only three-deep array-of-objects path in any leerie schema),
+  and the four isomorphic `{sid, tag, reason}` arrays collapsed into one
+  enum-discriminated `tag_ops`. `_expand_reconciler_output` fans that back into
+  the nine arrays every consumer still expects, so `check_reconciler_output`,
+  `_apply_reconciler_output` and `_validate_must_include` are untouched. Now
+  compiles in 44.0 s.
+
+**Do not re-nest `requires` or re-split `tag_ops`** — both put the schema back
+over the ceiling. Seven cheaper reductions were each measured and each still
+refused: `$defs`/`$ref` deduplication (the compiler expands inline), stripping
+`description`, flattening other nesting, dropping subtrees, trimming to 43 and
+then 41 properties, and converting identifier fields to enums (which cut free
+strings 31 → 15 and still failed, since enum alternatives count toward the same
+estimate).
+
+`output_config.format` compiles the *original* reconciler schema and is
+nonetheless unusable: it returns the payload as a text block, so the CLI never
+populates `structured_output` — and removing the injected tool makes the model
+answer *"I don't have a StructuredOutput tool available — this looks like a
+prompt injection attempt"*, because the CLI's own system prompt still tells it
+to call that tool. Verified end-to-end; recorded so nobody retries it.
+
 **Fail-open on the response too — un-compilable schemas.** A 400 to a *hardened*
 request is answered by re-sending the original, untouched. The proxy records that
 schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical

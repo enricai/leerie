@@ -102,13 +102,11 @@ def _run2_reconciler_output() -> dict:
              "from": "app-server-framework-present",
              "to": "backend-http-server"},
         ],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [],
+                "dependency_edges": [],
         "merged_subtasks": [],
-        "unresolvable": [],
-    }
+            }
 
 
 def _run1_post_reconcile_plans() -> list[dict]:
@@ -143,13 +141,11 @@ def _run1_reconciler_output() -> dict:
              "from": "data-access-ready",
              "to": "prisma-data-access-ready"},
         ],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [],
+                "dependency_edges": [],
         "merged_subtasks": [],
-        "unresolvable": [],
-    }
+            }
 
 
 # ===========================================================================
@@ -252,9 +248,8 @@ def test_gate_fires_on_connector_cycle(leerie):
     by_id = {s["id"]: s for s in (feat_001, connector)}
 
     output = {
-        "renames": [], "added_provides": [],
-        "added_subtasks": [connector], "dropped_requires": [],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
+        "added_subtasks": [connector],         "dependency_edges": [], "merged_subtasks": [],
     }
 
     _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
@@ -282,7 +277,7 @@ def test_dropped_requires_resolves_run2(leerie):
             "reason": "framework choice is an authoring decision config-005 "
                       "records, not a code artifact",
         }],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
 
@@ -312,13 +307,12 @@ def test_dependency_edges_appends_dedup_and_breaks_cycle(leerie):
     plans = [_plan("feat", a, b)]
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dependency_edges": [
             {"from": "a", "to": "b", "reason": "..."},
             {"from": "a", "to": "b", "reason": "..."},  # dup → dedup
         ],
-        "merged_subtasks": [], "unresolvable": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
     b_after = next(s for plan in plans for s in plan["subtasks"]
@@ -331,12 +325,11 @@ def test_dependency_edges_die_on_missing_id(leerie):
     a = _subtask("a", provides=["a-cap"])
     plans = [_plan("feat", a)]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dependency_edges": [
             {"from": "a", "to": "ghost", "reason": "missing"},
         ],
-        "merged_subtasks": [], "unresolvable": [],
+        "merged_subtasks": [],
     }
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, output)
@@ -357,15 +350,14 @@ def test_merged_subtasks_resolves_run2(leerie):
     plans[0]["subtasks"].append(extra)
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "feat-001", "from": "config-005",
             "reason": "Both edit package.json; reference repos ship "
                       "bootstrap as one unit.",
         }],
-        "unresolvable": [],
-    }
+            }
     leerie._apply_reconciler_output(plans, output)
 
     # `from` (config-005) is removed.
@@ -415,13 +407,12 @@ def test_merged_subtasks_die_on_missing_id(leerie):
     a = _subtask("a", provides=["a"])
     plans = [_plan("feat", a)]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "a", "from": "ghost", "reason": "...",
         }],
-        "unresolvable": [],
-    }
+            }
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, output)
 
@@ -430,13 +421,12 @@ def test_merged_subtasks_die_on_self_merge(leerie):
     a = _subtask("a", provides=["a"])
     plans = [_plan("feat", a)]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "a", "from": "a", "reason": "self",
         }],
-        "unresolvable": [],
-    }
+            }
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, output)
 
@@ -572,13 +562,12 @@ def test_mutation_reversion_via_deep_copy_is_clean(leerie):
     snapshot = copy.deepcopy(plans)
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "feat-001", "from": "config-005", "reason": "...",
         }],
-        "unresolvable": [],
-    }
+            }
     leerie._apply_reconciler_output(plans, output)
     # Confirm we actually mutated something.
     all_ids = {s["id"] for plan in plans for s in plan["subtasks"]}
@@ -657,9 +646,9 @@ def test_must_include_validation_flags_unaddressed_cycle(leerie):
 
     # An "empty" revised output (no cycle-breaking ops at all).
     empty_output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_must_include(empty_output, sccs)
     assert unaddressed == ["config-005 <-> feat-001"]
@@ -677,7 +666,7 @@ def test_must_include_validation_passes_when_drop_addresses_cycle(leerie):
             {"sid": "config-005", "tag": "backend-http-server",
              "reason": "..."},
         ],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == []
@@ -690,13 +679,12 @@ def test_must_include_validation_passes_when_merge_addresses_cycle(leerie):
     sccs = leerie._tarjan_sccs(set(by_id), succ)
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [
             {"into": "feat-001", "from": "config-005", "reason": "..."},
         ],
-        "unresolvable": [],
-    }
+            }
     unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == []
 
@@ -730,7 +718,7 @@ def test_post_retry_detects_newly_introduced_cycle(leerie):
             # Now we add feat-x → config-005, closing a NEW 2-node SCC.
             {"from": "feat-x", "to": "config-005", "reason": "..."},
         ],
-        "merged_subtasks": [], "unresolvable": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
@@ -767,8 +755,8 @@ def test_recommendation_case3_speculative_rename(leerie):
             {"sid": "b", "from": "b-needs-something", "to": "a-real"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
     sccs = leerie._tarjan_sccs(set(by_id), succ)
@@ -821,7 +809,7 @@ def test_dropped_requires_preserves_external_extent(leerie):
             "sid": "feat-a", "tag": "shared-name",
             "reason": "in_plan entry was over-specified",
         }],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
     feat_a = next(s for plan in plans for s in plan["subtasks"]
@@ -848,14 +836,13 @@ def test_merged_subtasks_chain_carries_merged_from(leerie):
     plans = [_plan("feat", a, b, c)]
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [
             {"into": "b", "from": "a", "reason": "..."},
             {"into": "c", "from": "b", "reason": "..."},
         ],
-        "unresolvable": [],
-    }
+            }
     leerie._apply_reconciler_output(plans, output)
     surviving = [s for plan in plans for s in plan["subtasks"]]
     assert len(surviving) == 1
@@ -883,16 +870,15 @@ def test_merged_subtasks_override_fields(leerie):
     plans = [_plan("feat", a, b)]
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "a", "from": "b", "reason": "...",
             "title": "merged unit title",
             "intent": "merged unit intent",
             "success_criteria_seed": "merged unit criterion",
         }],
-        "unresolvable": [],
-    }
+            }
     leerie._apply_reconciler_output(plans, output)
     a_after = next(s for plan in plans for s in plan["subtasks"]
                    if s["id"] == "a")
@@ -922,12 +908,11 @@ def test_merged_subtasks_requires_cleanup_preserves_external(leerie):
     plans = [_plan("feat", a, b)]
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [{
             "into": "a", "from": "b", "reason": "..."}],
-        "unresolvable": [],
-    }
+            }
     leerie._apply_reconciler_output(plans, output)
     a_after = next(s for plan in plans for s in plan["subtasks"]
                    if s["id"] == "a")
@@ -954,12 +939,11 @@ def test_dependency_edges_die_on_self_loop(leerie):
     a = _subtask("a", provides=["a-cap"])
     plans = [_plan("feat", a)]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dependency_edges": [
             {"from": "a", "to": "a", "reason": "self-loop"},
         ],
-        "merged_subtasks": [], "unresolvable": [],
+        "merged_subtasks": [],
     }
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, output)
@@ -1006,8 +990,8 @@ def test_recommendation_case4_lexicographic_tiebreaker(leerie):
             {"sid": "subtask-b", "from": "a-synonym", "to": "a-canonical"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
     sccs = leerie._tarjan_sccs(set(by_id), succ)
@@ -1144,7 +1128,7 @@ def test_must_include_rejects_op_on_non_scc_sid(leerie):
         "dropped_requires": [
             {"sid": "c", "tag": "c-cap", "reason": "unrelated drop"},
         ],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == ["a <-> b"], (
@@ -1254,8 +1238,8 @@ def test_validate_unresolved_must_include_accepts_rename(leerie):
         "renames": [{"sid": "deps-008", "from": "cdk-stacks-authored",
                      "to": "infra-stacks-authored"}],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
@@ -1268,8 +1252,7 @@ def test_validate_unresolved_must_include_accepts_added_provides(leerie):
     output = {
         "renames": [], "added_provides": [{"sid": "config-001",
                                             "tag": "cdk-stacks-authored"}],
-        "added_subtasks": [], "dropped_requires": [],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "added_subtasks": [],         "dependency_edges": [], "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
@@ -1280,11 +1263,11 @@ def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(le
     unresolved = [{"domain": "deps", "sid": "deps-008",
                    "tag": "cdk-stacks-authored"}]
     output = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "added_subtasks": [{"id": "config-011",
                              "provides": ["cdk-stacks-authored"]}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
@@ -1295,8 +1278,8 @@ def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
     unresolved = [{"domain": "deps", "sid": "deps-008",
                    "tag": "cdk-stacks-authored"}]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
         "merged_subtasks": [],
         "unresolvable": [{"sid": "deps-008", "tag": "cdk-stacks-authored",
                           "reason": "no real producer in this plan"}],
@@ -1313,12 +1296,11 @@ def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
     unresolved = [{"domain": "configuration-build", "sid": "config-006",
                    "tag": "aws-runtime-env-keys-finalized"}]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "aws-runtime-env-keys-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
@@ -1340,11 +1322,10 @@ def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(leerie
     # Attempt 2 emits dropped_requires targeting the PRE-revert tag
     # (which is what the consumer's requires actually holds after revert).
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(
         output, unresolved, attempt_1_output) == []
@@ -1363,12 +1344,11 @@ def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(lee
                    "tag": "foo-keys-finalized"}]
     # Attempt 2 emits dropped_requires with the POST-mutation tag.
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "foo-keys-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(
         output, unresolved, attempt_1_output) == []
@@ -1385,12 +1365,11 @@ def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(leerie)
                        "extent": "in_plan"}]},
     ]}]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "aws-runtime-env-keys-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, output)
     sub = plans[0]["subtasks"][0]
@@ -1417,12 +1396,11 @@ def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(leerie):
                           "to": "foo-keys-finalized"}]
     # Attempt 2 emits dropped_requires targeting the POST-mutation tag.
     output2 = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "foo-keys-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
@@ -1447,11 +1425,10 @@ def test_apply_reconciler_output_dropped_requires_pre_revert_in_retry(leerie):
     attempt_1_renames = [{"sid": "config-006", "from": "foo-finalized",
                           "to": "foo-keys-finalized"}]
     output2 = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
@@ -1488,12 +1465,11 @@ def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(leeri
                           "to": "infra-stack-output-names"}]
     # Positive case: strict-equality match on (config-006, foo-keys-finalized).
     output2 = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "foo-keys-finalized",
                               "reason": "self-reference over-specified"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
@@ -1514,12 +1490,11 @@ def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(leeri
          "requires": [{"tag": "foo-keys-finalized", "extent": "in_plan"}]},
     ]}]
     output_bad = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [{"sid": "config-006",
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dropped_requires": [{"sid": "config-006",
                               "tag": "totally-unrelated-tag",
                               "reason": "spurious"}],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(
         plans2, output_bad, attempt_1_renames=attempt_1_renames)
@@ -1540,8 +1515,8 @@ def test_validate_unresolved_must_include_rejects_unrelated_op(leerie):
         "renames": [{"sid": "config-005", "from": "some-other-tag",
                      "to": "infra-stacks-authored"}],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
     assert unaddressed == ["deps/deps-008 requires 'cdk-stacks-authored'"]
@@ -1608,13 +1583,11 @@ def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(leerie):
     output = {
         "renames": [{"sid": "consumer", "from": "foo-original",
                      "to": "bar", "reason": "..."}],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [],
+                "dependency_edges": [],
         "merged_subtasks": [],
-        "unresolvable": [],
-    }
+            }
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}  # exercises the no-recommendation path
@@ -1712,7 +1685,7 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
                     "contradictions_reconciled": [],
                     "gap_to_close": {}}
     attempt_1_output = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "confidence": _recon_conf,
         "added_subtasks": [{
             "id": "config-011",
@@ -1725,8 +1698,8 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
             "depends_on": ["config-001"],
             "size": "medium",
             "_added_by_reconciler": True}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt 2: revised output adds the missing rename on deps-008.
     # The connector definition is preserved; deps-008's tag now matches.
@@ -1734,7 +1707,7 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
         "renames": [{"sid": "deps-008",
                      "from": "cdk-stacks-authored",
                      "to": "infra-stacks-authored"}],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "confidence": _recon_conf,
         "added_subtasks": [{
             "id": "config-011",
@@ -1747,8 +1720,8 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
             "depends_on": ["config-001"],
             "size": "medium",
             "_added_by_reconciler": True}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
 
     calls: list[dict] = []
@@ -1856,7 +1829,7 @@ def test_unresolved_retry_dies_after_attempt_2(
 
     # The broken output (returned on BOTH calls — the model fails to fix).
     broken_output = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "added_subtasks": [{
             "id": "config-011",
             "title": "Author CDK stacks",
@@ -1868,8 +1841,8 @@ def test_unresolved_retry_dies_after_attempt_2(
             "depends_on": ["config-001"],
             "size": "medium",
             "_added_by_reconciler": True}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
 
     calls: list[dict] = []
@@ -1983,8 +1956,8 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
              "to": "backend-http-server"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
         "confidence": _recon_conf2,
     }
     # Attempt 2: model emits the rename + drop leerie's recommendation
@@ -2011,13 +1984,13 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
         # Drop config-005's ORIGINAL `app-server-framework-present`
         # requires entry. This breaks the cycle because config-005 no
         # longer requires anything feat-001 provides.
-        "dropped_requires": [
-            {"sid": "config-005",
+        "tag_ops": [
+            {"op": "drop_require", "sid": "config-005",
              "tag": "app-server-framework-present",
              "reason": "framework decision recorded by config-005 itself, "
                        "not a code artifact feat-001 produces"},
         ],
-        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [], "merged_subtasks": [],
         "confidence": _recon_conf2,
     }
 
@@ -2140,15 +2113,15 @@ def test_cycle_retry_dies_after_attempt_2(
              "to": "backend-http-server"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt 2: model "fixes" the cycle by dropping a requires on a
     # subtask NOT in the SCC. This DOES address some requires but
     # doesn't address the cycle leerie named. The must-include validator
     # must reject and die.
     attempt_2_output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         # Drop targets a tag on a NON-SCC sid (feat-001 and config-005
         # are the SCC; this drop targets feat-001 — but a tag the
         # consumer doesn't have, AND the must-include validator only
@@ -2157,8 +2130,8 @@ def test_cycle_retry_dies_after_attempt_2(
         # any SCC member's tag. Need a fixture that truly fails the
         # validator: emit something the must-include set rejects.
         # Easier: emit nothing addressing the cycle.
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
 
     calls: list[dict] = []
@@ -2218,8 +2191,8 @@ def test_recommend_unresolved_resolution_with_attempt_1_rename(leerie):
             {"sid": "consumer", "from": "foo-original", "to": "bar"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     rec = leerie._recommend_unresolved_resolution(
         "consumer", "bar", providers, attempt_1_output)
@@ -2248,9 +2221,9 @@ def test_recommend_unresolved_resolution_no_rename_in_attempt_1(leerie):
     providers = {"bar-canonical": ["other-subtask"]}
     # Empty attempt-1 output (no renames touched the consumer).
     attempt_1_output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     rec = leerie._recommend_unresolved_resolution(
         "consumer", "bar", providers, attempt_1_output)
@@ -2277,8 +2250,8 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(leerie):
             {"sid": "consumer", "from": "foo-original", "to": "bar"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt-2 emits the leerie-recommended rename: from the PRE-revert
     # tag (foo-original), not the post-mutation tag (bar).
@@ -2288,8 +2261,8 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(leerie):
              "to": "bar-canonical"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
@@ -2315,16 +2288,16 @@ def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(
             {"sid": "consumer", "from": "foo-original", "to": "bar"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     # Attempt-2 declares producer provides the PRE-revert tag.
     attempt_2_output = {
         "renames": [],
         "added_provides": [{"sid": "producer", "tag": "foo-original"}],
         "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
@@ -2343,15 +2316,15 @@ def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(l
             {"sid": "consumer", "from": "foo-original", "to": "bar"},
         ],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     attempt_2_output = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "added_subtasks": [{"id": "connector-001",
                              "provides": ["foo-original"]}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
@@ -2369,13 +2342,11 @@ def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(lee
     output = {
         "renames": [{"sid": "consumer", "from": "foo-original",
                      "to": "bar", "reason": "..."}],
-        "added_provides": [],
+        "tag_ops": [], "added_requires": [],
         "added_subtasks": [],
-        "dropped_requires": [],
-        "dependency_edges": [],
+                "dependency_edges": [],
         "merged_subtasks": [],
-        "unresolvable": [],
-    }
+            }
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}
@@ -2403,8 +2374,8 @@ def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(lee
         "renames": [{"sid": "consumer", "from": "foo-original",
                      "to": "bar", "reason": "..."}],
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
@@ -2427,8 +2398,8 @@ def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(leerie)
     output = {
         "renames": [],  # no rename touched the consumer
         "added_provides": [], "added_subtasks": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unresolved = [{"domain": "deps", "sid": "deps-008",
                    "tag": "cdk-stacks-authored"}]
@@ -2462,11 +2433,11 @@ def test_conditional_drops_removes_subtask_and_prunes_depends_on(leerie):
         _subtask("feat-006", provides=["z"], depends_on=["feat-005"]),
     )]
     out = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "feat-004",
                                "reason": "planner intent declared this conditional"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
@@ -2488,10 +2459,10 @@ def test_conditional_drops_silent_noop_on_unknown_sid(leerie):
         _subtask("feat-001", provides=["x"]),
     )]
     out = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "nonexistent-099", "reason": "n/a"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
@@ -2506,7 +2477,7 @@ def test_conditional_drops_dies_on_reconciler_added_subtask(leerie):
     cannot be satisfied)."""
     plans = [_plan("feature-implementation", _subtask("feat-001"))]
     out = {
-        "renames": [], "added_provides": [],
+        "renames": [], "tag_ops": [], "added_requires": [],
         "added_subtasks": [{
             "id": "feat-008",
             "title": "Reconciler-added connector",
@@ -2514,8 +2485,8 @@ def test_conditional_drops_dies_on_reconciler_added_subtask(leerie):
             "provides": ["new-cap"],
         }],
         "conditional_drops": [{"sid": "feat-008", "reason": "n/a"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, out)
@@ -2542,15 +2513,15 @@ def test_conditional_drops_replays_summarizer_deps004_shape(leerie):
         "test setup precondition: deps-004 should be unresolved before drop")
 
     out = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{
             "sid": "deps-004",
             "reason": ("deps-004's own intent declares it conditional "
                        "('no-op the orchestrator can drop'); feat-010 "
                        "keeps Resend so the precondition is false."),
         }],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
@@ -2571,11 +2542,11 @@ def test_validate_unresolved_must_include_accepts_conditional_drop(leerie):
     unresolved = [{"domain": "deps", "sid": "deps-004",
                    "tag": "email-provider-is-ses"}]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "deps-004",
                                "reason": "planner-declared conditional"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
@@ -2587,11 +2558,11 @@ def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(
     unresolved = [{"domain": "deps", "sid": "deps-004",
                    "tag": "email-provider-is-ses"}]
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "deps-099",
                                "reason": "wrong sid"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
     assert len(unaddressed) == 1
@@ -2628,10 +2599,10 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(leer
         leerie.die("test-die: unresolvable non-empty")
 
     output = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "deps-004",
                                "reason": "would-be drop"}],
-        "dropped_requires": [], "dependency_edges": [],
+        "dependency_edges": [],
         "merged_subtasks": [],
         "unresolvable": [{"sid": "deps-004",
                           "tag": "email-provider-is-ses",
@@ -2691,11 +2662,11 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
 
     # Attempt 1: model emits a drop on deps-004.
     attempt_1 = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "deps-004",
                                "reason": "attempt-1 drop reason"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     _record(attempt_1)
     assert st.data["conditional_drops"] == {
@@ -2713,8 +2684,8 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
         "added_provides": [], "added_subtasks": [],
         "conditional_drops": [{"sid": "feat-099",
                                "reason": "attempt-2 drop reason"}],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
     }
     _record(attempt_2)
     assert st.data["conditional_drops"] == {
@@ -2726,10 +2697,9 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
     # Attempt 3 (hypothetical): model emits no conditional_drops at
     # all. The audit field must clear to {} — not retain feat-099.
     attempt_3 = {
-        "renames": [], "added_provides": [], "added_subtasks": [],
-        "conditional_drops": [],
-        "dropped_requires": [], "dependency_edges": [],
-        "merged_subtasks": [], "unresolvable": [],
+        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
+                "dependency_edges": [],
+        "merged_subtasks": [],
     }
     _record(attempt_3)
     assert st.data["conditional_drops"] == {}, (
