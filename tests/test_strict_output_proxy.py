@@ -101,9 +101,22 @@ def test_minitems_survives_at_one_but_is_clamped_above(leerie):
 
 
 def test_every_real_schema_survives_the_transform(leerie):
-    """The load-bearing test: all 23 shipped schemas must come out clean, or
-    the flag 400s on whichever worker runs first. `reconciler` (11 object
-    nodes) and `conformer` (10) are the stress cases."""
+    """All 23 shipped schemas come out clean under the transform's own rules.
+
+    **What this does and does not establish.** It walks the hardened output
+    looking for residuals using `_STRICT_UNSUPPORTED_KEYWORDS` — the same
+    constant `_strictify_schema` consults — so it proves the transform is
+    self-consistent, *not* that the API accepts the result. It shares any blind
+    spot the transform has, and it did: the union-type bug pinned in
+    `test_every_object_shape_is_hardened` passed this test while the API
+    rejected `implementer` outright.
+
+    The independent checks are its siblings: `test_no_schema_has_an_unhardened_object_shape`
+    (spells out "is an object" separately) and, decisively, the live sweep in
+    `<scratchpad>/verify_strict_live.py`, which sends every schema to the real
+    API. `reconciler` (11 object nodes) and `conformer` (10) are the stress
+    cases here.
+    """
     unsupported = leerie._STRICT_UNSUPPORTED_KEYWORDS
 
     def residual(node, path="$"):
@@ -130,6 +143,87 @@ def test_every_real_schema_survives_the_transform(leerie):
         if bad:
             offenders[name] = bad[:3]
     assert not offenders, f"schemas still violating the strict subset: {offenders}"
+
+
+@pytest.mark.parametrize("node, why", [
+    ({"type": ["object", "null"], "properties": {"a": {"type": "string"}}},
+     "union type — leerie's own implementer.clarification_question"),
+    ({"type": ["null", "object"], "properties": {"a": {"type": "string"}}},
+     "union type, object not first"),
+    ({"properties": {"a": {"type": "string"}}},
+     "properties with no declared type"),
+    ({"type": "object", "properties": {"a": {"type": "string"}}},
+     "the plain case (control)"),
+])
+def test_every_object_shape_is_hardened(leerie, node, why):
+    """`additionalProperties: false` must land on every node the API treats as
+    an object — not only on `{"type": "object"}`.
+
+    Regression, found by a live sweep of all 23 schemas against the real API
+    (2026-08-04): the shipped check was `node.get("type") == "object"`, which is
+    False for the *union* `["object", "null"]`. leerie's own
+    `implementer.clarification_question` is exactly that shape, so the API
+    rejected the implementer schema outright — "tools.0.custom: For 'object'
+    type, 'additionalProperties' must be explicitly set to false".
+
+    That would have 400'd every call by the most-used worker in the system,
+    surfacing only as the retry storm this flag exists to eliminate. No unit
+    test could have caught it: the sweep that was supposed to
+    (`test_every_real_schema_survives_the_transform`) checked the transform's
+    output against the transform's own rule set, so it shared the blind spot.
+    """
+    import copy
+    n = copy.deepcopy(node)
+    leerie._strictify_schema(n)
+    assert n.get("additionalProperties") is False, f"unhardened: {why}"
+
+
+def test_no_schema_has_an_unhardened_object_shape(leerie):
+    """The whole-corpus form of the test above, using an *independent*
+    object-detection rule rather than re-reading `_strictify_schema`'s own.
+
+    This is the check `test_every_real_schema_survives_the_transform` could not
+    perform: that one walks the result looking for `_STRICT_UNSUPPORTED_KEYWORDS`
+    — the same constant the transform consults — so it can only prove
+    self-consistency. Here the notion of "is an object" is spelled out
+    separately, so a narrowing of the transform's own test fails this.
+    """
+    import copy
+
+    def unhardened(node, path="$"):
+        bad = []
+        if isinstance(node, dict):
+            declared = node.get("type")
+            objish = (declared == "object"
+                      or (isinstance(declared, list) and "object" in declared)
+                      or (declared is None and "properties" in node))
+            if objish and node.get("additionalProperties") is not False:
+                bad.append(path)
+            for k, v in node.items():
+                bad += unhardened(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                bad += unhardened(v, f"{path}[{i}]")
+        return bad
+
+    offenders = {}
+    for name, schema in leerie.SCHEMAS.items():
+        s = copy.deepcopy(schema)
+        leerie._strictify_schema(s)
+        bad = unhardened(s)
+        if bad:
+            offenders[name] = bad[:3]
+    assert not offenders, (
+        f"the API rejects these outright: {offenders}")
+
+
+def test_union_type_detection_is_not_a_substring_match(leerie):
+    """A type that merely *contains* the letters of "object" is not an object.
+    Guards a lazy `"object" in str(declared)` implementation."""
+    import copy
+    n = copy.deepcopy({"type": "string", "description": "an object, sort of"})
+    leerie._strictify_schema(n)
+    assert "additionalProperties" not in n, "a string node was hardened"
 
 
 def test_the_real_schema_sweep_is_not_vacuous(leerie):
@@ -769,7 +863,11 @@ def test_the_transform_description_is_not_discarded(leerie):
     docstring. It must reach the log."""
     import inspect
     src = inspect.getsource(leerie._StrictOutputProxy._handle)
-    assert "body, desc = swap" in src
+    # Matched loosely on purpose: the unpacking form has already changed once
+    # (the fallback path needed the pre-transform body kept alongside), and
+    # what must hold is that `desc` is bound from the swap and reaches the log
+    # — not the exact spelling of one assignment.
+    assert "desc) = body, swap" in src or "body, desc = swap" in src
     assert "_log_exchange" in src
 
 
@@ -971,3 +1069,552 @@ def test_bedrock_detection_behaviour(leerie, env, expected):
     ns = {"os": type("_O", (), {"environ": dict(env)})}
     exec(block, ns)  # noqa: S102 - executing our own extracted source
     assert ns["bedrock_via"] == expected
+
+
+# --------------------------------------------------------------------------
+# Response-side fail-open: some schemas cannot be compiled at all.
+#
+# Measured live against the real API (2026-08-04), 2 of leerie's 23 are
+# rejected outright: `planner` ("Schema is too complex.") and `reconciler`
+# ("The compiled grammar is too large"). Both carry 12 optional properties
+# inside array items — strict mode must accept every subset in any order, so
+# grammar size multiplies per element. `conformer` has 41 properties but only
+# 2 optionals and compiles fine, which is why raw size is the wrong intuition.
+#
+# Without a fallback the flag 400s every call by those workers, and a run that
+# cannot plan cannot do anything.
+# --------------------------------------------------------------------------
+
+
+class _RejectsHardened(http.server.BaseHTTPRequestHandler):
+    """Rejects a request carrying `strict`, accepts the same one without it."""
+
+    protocol_version = "HTTP/1.1"
+    seen: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(n) if n else b""
+        hardened = b'"strict"' in body
+        type(self).seen.append({"hardened": hardened, "body": body})
+        if hardened:
+            payload = json.dumps({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "Schema is too complex."}}).encode()
+            self.send_response(400)
+        else:
+            payload = b'{"ok": true}'
+            self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.fixture()
+def rejecting_upstream():
+    _RejectsHardened.seen = []
+    srv = _Pool(("127.0.0.1", 0), _RejectsHardened)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}", _RejectsHardened.seen
+    srv.shutdown()
+
+
+def test_uncompilable_schema_falls_back_instead_of_failing(leerie,
+                                                           rejecting_upstream,
+                                                           monkeypatch):
+    """The worker must get a 200, not the 400 the hardened request earned."""
+    url, seen = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            data = await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return data, p
+    data, p = asyncio.run(go())
+    assert b'"ok": true' in data, "the caller saw the rejection instead of a retry"
+    assert [s["hardened"] for s in seen] == [True, False], (
+        "expected exactly one hardened attempt then one clean retry")
+    assert p.fell_back == 1
+    # The guarantee was lost for this schema, so it must NOT be counted as
+    # rewritten — that number is what tells an operator what they actually got.
+    assert p.rewritten == 0 and p.passed_through == 1
+
+
+def test_fallback_is_remembered_so_the_doomed_attempt_is_paid_once(
+        leerie, rejecting_upstream, monkeypatch):
+    """A rejected schema is systematic — every call by that worker repeats it.
+    Re-hardening each time would double every request for the whole run."""
+    url, seen = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+    body = _wrap({"type": "object", "properties": {}})
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            for _ in range(4):
+                await _post(port, body)
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert sum(1 for s in seen if s["hardened"]) == 1, (
+        "the un-compilable schema was hardened more than once")
+    assert len(seen) == 5, f"expected 1 doomed + 4 clean, got {len(seen)}"
+    assert p.fell_back == 1
+
+
+def test_a_different_schema_is_still_hardened_after_a_fallback(
+        leerie, mock_upstream, monkeypatch):
+    """The memo is keyed per schema. One worker's un-compilable schema must not
+    disable constrained decoding for every other worker in the run."""
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", mock_upstream)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            p._unhardenable.add(leerie._structured_output_fingerprint(
+                _wrap({"type": "object", "properties": {"a": {"type": "string"}}})))
+            skipped = await _post(port, _wrap(
+                {"type": "object", "properties": {"a": {"type": "string"}}}))
+            other = await _post(port, _wrap(
+                {"type": "object", "properties": {"b": {"type": "string"}}}))
+        finally:
+            await p.stop()
+        return skipped, other, p
+    skipped, other, p = asyncio.run(go())
+    assert b'"saw_strict": false' in skipped, "memoized schema was hardened anyway"
+    assert b'"saw_strict": true' in other, "an unrelated schema lost its hardening"
+    assert p.rewritten == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_only_400_triggers_the_fallback(leerie, monkeypatch, status):
+    """401/403/429/500 are not schema problems — the original would fail the
+    same way, so retrying just doubles the damage."""
+    calls = []
+
+    def fake_upstream(self, method, path, body, headers):
+        calls.append(body)
+        return status, [], b'{"error": {"message": "nope"}}'
+
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_upstream", fake_upstream)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert len(calls) == 1, f"status {status} should not retry"
+    assert p.fell_back == 0
+
+
+def test_fallback_is_logged_at_every_verbosity(leerie, rejecting_upstream,
+                                               monkeypatch):
+    """Losing the guarantee silently is the failure this whole flag is built to
+    avoid. The operator has to be told which worker dropped to post-hoc
+    validation, and the API's own reason is the diagnostic."""
+    url, _ = rejecting_upstream
+    p, lines = _run_against(leerie, url, monkeypatch, 1, "quiet")
+    hits = [l for l in lines if "retrying WITHOUT" in l]
+    assert len(hits) == 1, "the fallback was not surfaced"
+    assert "Schema is too complex" in hits[0], (
+        "the API's own reason must survive into the log")
+    assert p.fell_back == 1
+
+
+def test_api_error_head_reads_the_message_and_survives_junk(leerie):
+    """Operates on the API's machine-generated envelope, so it must not explode
+    on a body that is not the shape it expects."""
+    good = json.dumps({"error": {"message": "Schema is  too\n complex."}}).encode()
+    assert leerie._api_error_head(good) == "Schema is too complex."
+    assert leerie._api_error_head(b"not json at all")  # no exception, some text
+    assert leerie._api_error_head(b"") == ""
+    assert len(leerie._api_error_head(b'{"error":{"message":"' + b"x" * 500)) <= 160
+
+
+def test_fingerprint_is_stable_and_discriminating(leerie):
+    """Same schema -> same id regardless of key order; different schema -> not."""
+    a = _wrap({"type": "object", "properties": {"a": {"type": "string"}}})
+    b = _wrap({"properties": {"a": {"type": "string"}}, "type": "object"})
+    c = _wrap({"type": "object", "properties": {"z": {"type": "string"}}})
+    fa, fb, fc = (leerie._structured_output_fingerprint(x) for x in (a, b, c))
+    assert fa == fb, "key order changed the fingerprint"
+    assert fa != fc, "different schemas collided"
+    assert leerie._structured_output_fingerprint(b"garbage") is None
+    assert leerie._structured_output_fingerprint(
+        _wrap({"type": "object"}, name="Other")) is None
+
+
+# --------------------------------------------------------------------------
+# All-required: collapsing optional-subset combinatorics.
+#
+# Strict mode admits every SUBSET of a node's optional properties in any order,
+# so a node with k optionals costs ~2^k grammar paths, multiplied per array
+# element. Measured live (2026-08-04): `planner` — 11 optionals in one
+# `subtasks[]` item — was rejected with "Schema is too complex for
+# compilation"; requiring them takes it to 200.
+#
+# A controlled type experiment established what is expensive per path: 20
+# free-form string properties are rejected, while 20 enums, 20 booleans, 20
+# integers and 20 arrays all compile. Strings are the cost; optionals multiply
+# it.
+# --------------------------------------------------------------------------
+
+
+def test_no_optional_properties_survive_the_transform(leerie):
+    """The property that makes `planner` compile: zero optionals on the wire."""
+    import copy
+    leftover = {}
+    for name, schema in leerie.SCHEMAS.items():
+        s = copy.deepcopy(schema)
+        leerie._strictify_schema(s)
+
+        def walk(node, path="$"):
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    req = set(node.get("required") or [])
+                    opt = [k for k in props if k not in req]
+                    if opt:
+                        leftover.setdefault(name, []).append(f"{path}: {opt}")
+                for k, v in node.items():
+                    walk(v, f"{path}.{k}")
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    walk(v, f"{path}[{i}]")
+        walk(s)
+    assert not leftover, f"optional properties left on the wire: {leftover}"
+
+
+def test_original_schemas_are_not_mutated(leerie):
+    """`_strictify_schema` edits in place, so the transform must run on a COPY.
+
+    If it ever touched `SCHEMAS` itself, the CLI's own validation copy would
+    gain the same `required` list — and then a worker omitting an optional
+    field really would be rejected, which is exactly the PR #153 regression
+    this design claims not to repeat.
+    """
+    import copy
+    before = copy.deepcopy(leerie.SCHEMAS)
+    for name in leerie.SCHEMAS:
+        leerie._strictify_request(_wrap(copy.deepcopy(leerie.SCHEMAS[name])))
+    assert leerie.SCHEMAS == before, "the live SCHEMAS dict was mutated"
+
+
+def test_forcing_a_field_never_makes_a_trivial_value_illegal(leerie):
+    """Every forced field must accept some value the ORIGINAL schema allows.
+
+    An array with `minItems: 0` accepts `[]`; a string with `minLength: 2`
+    does not accept `""`. If a forced field falls in the second class, the
+    grammar would let the model emit a value the CLI then rejects — trading a
+    compile error for a validation error.
+    """
+    offenders = []
+    for name, schema in leerie.SCHEMAS.items():
+        def walk(node, path="$"):
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if isinstance(props, dict):
+                    req = set(node.get("required") or [])
+                    for k, v in props.items():
+                        if k in req or not isinstance(v, dict):
+                            continue
+                        t = v.get("type")
+                        if t == "string" and (v.get("minLength") or 0) > 0:
+                            offenders.append(f"{name}{path}.{k} minLength")
+                        if t == "array" and (v.get("minItems") or 0) > 0:
+                            offenders.append(f"{name}{path}.{k} minItems")
+                for k, v in node.items():
+                    walk(v, f"{path}.{k}")
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    walk(v, f"{path}[{i}]")
+        walk(schema)
+    assert not offenders, (
+        "forcing these would let the grammar produce a value the CLI rejects: "
+        f"{offenders}")
+
+
+def test_all_required_output_still_validates_against_the_original(leerie):
+    """The seam the whole design rests on: the CLI validates against leerie's
+    ORIGINAL schema, so an output carrying every field must still pass.
+
+    `synth` honours `minLength` / `minItems` rather than emitting degenerate
+    values. An earlier version emitted `""` everywhere and exempted the
+    resulting failures by matching the phrase "too short" in the exception —
+    which broke on a newer jsonschema that words the same error
+    "should be non-empty". Matching a library's error prose is brittle by
+    construction; building an instance that genuinely satisfies the schema
+    tests the real claim and depends on no wording at all.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+
+    def synth(node):
+        t = node.get("type")
+        if isinstance(t, list):
+            non_null = [x for x in t if x != "null"]
+            t = non_null[0] if non_null else "null"
+        if t == "object" or (t is None and "properties" in node):
+            return {k: synth(v) for k, v in (node.get("properties") or {}).items()}
+        if t == "array":
+            n = node.get("minItems") or 0
+            item = node.get("items")
+            return [synth(item) for _ in range(n)] if isinstance(item, dict) else []
+        if t == "string":
+            if node.get("enum"):
+                return node["enum"][0]
+            return "x" * max(int(node.get("minLength") or 0), 1)
+        if t in ("number", "integer"):
+            return node.get("minimum", 0)
+        if t == "boolean":
+            return False
+        return None
+
+    bad = []
+    for name, schema in leerie.SCHEMAS.items():
+        try:
+            jsonschema.validate(synth(schema), schema)
+        except jsonschema.ValidationError as e:
+            bad.append((name, str(e).splitlines()[0][:90]))
+    assert not bad, f"all-fields-present output rejected by the original: {bad}"
+
+
+# --------------------------------------------------------------------------
+# Reconciler: flattened wire shape + the fan-out adapter.
+#
+# The nine-array shape was refused outright ("The compiled grammar is too
+# large", 0.6 s) because it nested an array-of-objects inside an
+# array-of-objects — the only three-deep path in any leerie schema — and
+# repeated the isomorphic {sid, tag, reason} object four times. Seven in-place
+# reductions were each measured and each still refused; only the restructure
+# worked (51.8 s, and a full end-to-end run with `structured_output` present).
+# --------------------------------------------------------------------------
+
+
+def test_reconciler_wire_shape_is_flat(leerie):
+    """No array-of-objects nested inside another array-of-objects, which is
+    what put the old schema over the ceiling."""
+    def depth_of_object_arrays(node, inside_items=False):
+        worst = 0
+        if isinstance(node, dict):
+            is_obj_array = (node.get("type") == "array"
+                            and isinstance(node.get("items"), dict)
+                            and "properties" in node["items"])
+            if is_obj_array and inside_items:
+                worst = max(worst, 2)
+            for k, v in node.items():
+                worst = max(worst, depth_of_object_arrays(
+                    v, inside_items or is_obj_array))
+        elif isinstance(node, list):
+            for v in node:
+                worst = max(worst, depth_of_object_arrays(v, inside_items))
+        return worst
+    assert depth_of_object_arrays(leerie.SCHEMAS["reconciler"]) == 0, (
+        "an array-of-objects is nested inside another array-of-objects again")
+
+
+def test_reconciler_has_no_repeated_object_shape(leerie):
+    """`add_provide`/`drop_require`/`unresolvable`/`conditional_drop` collapsed
+    into one enum-discriminated array. Enums are cheap; four identical object
+    shapes were not."""
+    props = leerie.SCHEMAS["reconciler"]["properties"]
+    assert "tag_ops" in props
+    ops = props["tag_ops"]["items"]["properties"]["op"]["enum"]
+    assert set(ops) == {"add_provide", "drop_require", "unresolvable",
+                        "conditional_drop"}
+    for gone in ("added_provides", "dropped_requires", "conditional_drops",
+                 "unresolvable"):
+        assert gone not in props, f"{gone} should be a tag_ops op now"
+
+
+def test_expand_fans_tag_ops_into_the_internal_shape(leerie):
+    """Everything downstream still consumes the nine arrays."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [], "added_requires": [], "renames": [],
+        "dependency_edges": [], "merged_subtasks": [], "confidence": {},
+        "tag_ops": [
+            {"op": "add_provide", "sid": "a", "tag": "t1", "reason": "r"},
+            {"op": "drop_require", "sid": "b", "tag": "t2", "reason": "r"},
+            {"op": "unresolvable", "sid": "c", "tag": "t3", "reason": "r"},
+            {"op": "conditional_drop", "sid": "d", "tag": "", "reason": "r"},
+        ],
+    })
+    assert [x["sid"] for x in out["added_provides"]] == ["a"]
+    assert [x["sid"] for x in out["dropped_requires"]] == ["b"]
+    assert [x["sid"] for x in out["unresolvable"]] == ["c"]
+    assert [x["sid"] for x in out["conditional_drops"]] == ["d"]
+    # conditional_drops has no `tag` in the internal shape — its consumer
+    # never reads one, and inventing an empty one would be a silent lie.
+    assert "tag" not in out["conditional_drops"][0]
+
+
+def test_expand_is_case_insensitive_on_enums(leerie):
+    """Constrained decoding does not guarantee enum capitalisation, and it
+    drifts silently — no error, no special stop reason."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [{"id": "s1", "title": "t",
+                            "success_criteria_seed": "c"}],
+        "added_requires": [{"sid": "s1", "tag": "x", "extent": "IN_PLAN"}],
+        "tag_ops": [{"op": "ADD_PROVIDE", "sid": "a", "tag": "t",
+                     "reason": "r"}],
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "confidence": {},
+    })
+    assert len(out["added_provides"]) == 1, "uppercase op was dropped"
+    assert out["added_subtasks"][0]["requires"][0]["extent"] == "in_plan"
+
+
+def test_expand_drops_an_unknown_op_rather_than_guessing(leerie):
+    """Misfiling a resolution action would mutate the plan invisibly."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [], "added_requires": [],
+        "tag_ops": [{"op": "delete_everything", "sid": "a", "reason": "r"}],
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "confidence": {},
+    })
+    assert all(not out[k] for k in ("added_provides", "dropped_requires",
+                                    "unresolvable", "conditional_drops"))
+
+
+def test_expand_rebinds_requires_and_reports_danglers(leerie):
+    """The subtask<->requires binding is no longer structural, so it is
+    re-bound by sid here and a miss is surfaced rather than silently lost."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [{"id": "feat-008", "title": "t",
+                            "success_criteria_seed": "c"}],
+        "added_requires": [
+            {"sid": "feat-008", "tag": "cap-y", "extent": "in_plan"},
+            {"sid": "ghost", "tag": "cap-z", "extent": "in_plan"},
+        ],
+        "tag_ops": [], "renames": [], "dependency_edges": [],
+        "merged_subtasks": [], "confidence": {},
+    })
+    assert out["added_subtasks"][0]["requires"] == [
+        {"tag": "cap-y", "extent": "in_plan"}]
+    assert len(out["_dangling_requires"]) == 1
+
+
+def test_expand_does_not_mutate_the_worker_output(leerie):
+    """The raw envelope is persisted as telemetry and must stay as-emitted."""
+    raw = {"added_subtasks": [{"id": "s", "title": "t",
+                               "success_criteria_seed": "c"}],
+           "added_requires": [{"sid": "s", "tag": "x", "extent": "in_plan"}],
+           "tag_ops": [], "renames": [], "dependency_edges": [],
+           "merged_subtasks": [], "confidence": {}}
+    import copy
+    before = copy.deepcopy(raw)
+    leerie._expand_reconciler_output(raw)
+    assert raw == before
+
+
+def test_spawn_reconciler_routes_through_the_adapter(leerie):
+    """Source-coupling: all three call sites (first attempt, size retry, cycle
+    retry) go through `_spawn_reconciler`, so the adapter must sit there."""
+    import inspect
+    src = inspect.getsource(leerie.phase_reconcile)
+    assert "_expand_reconciler_output(raw)" in src
+    assert "_dangling_requires" in src
+
+
+# --------------------------------------------------------------------------
+# Retry prompts must speak the vocabulary the schema accepts.
+#
+# leerie builds its reconciler retry prompts in Python. When the wire shape was
+# restructured (four {sid, tag, reason} arrays -> one op-discriminated
+# `tag_ops`; `requires` lifted into `added_requires`), `prompts/reconciler.md`
+# was rewritten but these Python-side prompts were not — so a retry told the
+# model to emit arrays its own schema no longer has. Under
+# `--dangerously-force-strict-output` the grammar makes those keys
+# unrepresentable, so the model *cannot* comply; without the flag it produces
+# output that fails validation. Either way the retry is wasted and the run then
+# dies claiming the model "defied a structural constraint" when leerie asked
+# for the wrong thing.
+#
+# No existing test caught it: every reconciler test stubs the worker's return
+# value, so none reads these strings.
+# --------------------------------------------------------------------------
+
+
+def _reconciler_vocabulary(leerie) -> set[str]:
+    """Every field/op name the reconciler schema actually accepts."""
+    schema = leerie.SCHEMAS["reconciler"]
+    vocab = set(schema["properties"])
+    vocab |= set(schema["properties"]["tag_ops"]["items"]["properties"]["op"]["enum"])
+    return vocab
+
+
+def test_retry_prompts_only_name_ops_the_schema_accepts(leerie):
+    """Checks the RENDERED prompt text, not the source.
+
+    A source scan cannot tell a model-facing string from leerie's own internal
+    op tag (`rec["op"] == "dropped_requires"` is an internal value the
+    recommendation dict legitimately still uses) or from a docstring. Only what
+    is actually emitted matters, so the builders are invoked and their output
+    inspected.
+
+    The accepted vocabulary is derived from `SCHEMAS["reconciler"]` rather than
+    hand-listed, so the next rename is caught too.
+    """
+    vocab = _reconciler_vocabulary(leerie)
+    retired = {"added_provides", "dropped_requires", "conditional_drops"}
+    assert not (retired & vocab), "fixture is stale — these are live again"
+
+    rendered: dict[str, str] = {}
+
+    rec_drop = {"op": "dropped_requires", "sid": "config-001",
+                "tag": "some-cap", "reason": "over-specified"}
+    rendered["_format_recommendation"] = leerie._format_recommendation(rec_drop)
+
+    edges = [{"from": "feat-001", "to": "config-001",
+              "mutation": "rename: 'a' -> 'b'", "source": "requires:b"}]
+    attempt1 = {"renames": [{"sid": "config-001", "from": "a", "to": "b"}]}
+    rendered["_format_must_include"] = "\n".join(
+        leerie._format_must_include(["feat-001", "config-001"], edges, attempt1))
+
+    rendered["_build_unresolved_retry_prompt"] = (
+        leerie._build_unresolved_retry_prompt(
+            [{"sid": "config-001", "tag": "some-cap", "domain": "config"}],
+            {"other-cap": ["feat-001"]},
+            {("config-001", "some-cap"): None},
+            attempt1,
+            "orig",
+        ))
+
+    offenders = {}
+    for name, text in rendered.items():
+        hits = sorted(n for n in retired if n in text)
+        if hits:
+            offenders[name] = hits
+    assert not offenders, (
+        "retry prompts instruct the model to emit arrays the schema no longer "
+        f"has: {offenders}")
+
+
+def test_recommendation_marker_survives_the_vocabulary_change(leerie):
+    """`_matches_recommendation` compares against `_format_must_include`'s
+    rendering. If the two drift, no option is ever marked recommended — and
+    nothing fails, so the drift is silent."""
+    edges = [{"from": "feat-001", "to": "config-001",
+              "mutation": "rename: 'a' -> 'b'", "source": "requires:b"}]
+    attempt1 = {"renames": [{"sid": "config-001", "from": "a", "to": "b"}]}
+    options = leerie._format_must_include(
+        ["feat-001", "config-001"], edges, attempt1)
+    rec = {"op": "dropped_requires", "sid": "config-001", "tag": "a",
+           "reason": "r"}
+    assert any(leerie._matches_recommendation(o, rec) for o in options), (
+        "no rendered option matched the recommendation — _format_must_include "
+        "and _matches_recommendation have drifted apart")

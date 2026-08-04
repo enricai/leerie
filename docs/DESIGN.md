@@ -254,21 +254,21 @@ It is reconciled by the orchestrator with three mechanisms:
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
   subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits actions across eight arrays. Five
+  `files_likely_touched`) and emits eight actions. Five
   *resolution* actions — `renames` (two tags mean the same thing — rewrite
-  one to match the other), `added_provides` (an existing subtask actually
+  one to match the other), `add_provide` (an existing subtask actually
   produces the capability but didn't declare it), `added_subtasks` (a
-  genuine gap — propose a new subtask to fill it), `conditional_drops`
+  genuine gap — propose a new subtask to fill it), `conditional_drop`
   (drop a planner-emitted consumer subtask whose own `intent` declares it
   conditional on an unresolvable precondition — i.e. the planner authored
   it as "no-op if X" and X turned out to be false; the capability graph
   has no semantics for conditional subtasks, so the reconciler converts
   the planner's prose conditionality into a structured drop),
-  `dropped_requires` (drop the consumer's `requires` entry when it was
+  `drop_require` (drop the consumer's `requires` entry when it was
   over-specified by its planner — an aggregate, coarser synonym, or
   authoring-time decision the same subtask itself records, rather than a
   code artifact another subtask produces; the consumer stays in the plan,
-  only the bad edge goes — `dropped_requires` also plays a cycle-breaking
+  only the bad edge goes — `drop_require` also plays a cycle-breaking
   role, but its primary home is now resolution). Two *cycle-breaking-only*
   actions for when the resolution actions would close a dependency cycle —
   `dependency_edges` (assert an explicit `depends_on` ordering when both
@@ -282,6 +282,19 @@ It is reconciled by the orchestrator with three mechanisms:
   cycle resolution lives in the reconciler worker; the orchestrator computes
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
   graph, and applies the worker's output mechanically.
+
+  **The wire shape is flatter than the action list reads, and deliberately
+  so.** `add_provide` / `drop_require` / `conditional_drop` / `unresolvable`
+  travel as one `tag_ops` array discriminated by an `op` field, and a new
+  subtask's `requires` travels in a sibling `added_requires` keyed by subtask
+  id rather than nested inside the subtask. Neither is a modelling
+  preference: the natural shape — four isomorphic `{sid, tag, reason}` arrays,
+  plus an array-of-objects nested inside an array-of-objects — exceeds what
+  grammar compilation accepts under § *Forcing constrained decoding*, and was
+  refused outright. One adapter fans the wire shape back into the eight
+  arrays before anything else sees it, so the apply steps, the state fields
+  and every check below are written against the action names above, not
+  against the wire names.
 
   **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
   the reconciler).** "No enforced dictionary" (above) is what makes blind
@@ -401,7 +414,7 @@ It is reconciled by the orchestrator with three mechanisms:
   The same retry-with-structural-feedback pattern applies to the second
   failure mode the post-mutation gates catch: **unresolved `requires`
   tags that survive the reconciler's first attempt**. The common cause
-  is the model inventing a new tag in `added_subtasks`/`added_provides`
+  is the model inventing a new tag in `added_subtasks` or an `add_provide`
   without renaming the original consumer's tag to match (two synonyms
   for the same concept that never get unified). The orchestrator
   computes string-similarity hints over the post-mutation `provides`
@@ -463,9 +476,9 @@ hallucinations, or in-plan capabilities the reconciler can neither rename,
 attribute, nor connect. An external prerequisite never reaches that path;
 a planner-declared *conditional* consumer (one whose own `intent` admits
 it should be dropped if its precondition is false) routes through
-`conditional_drops`; and an *over-specified* `requires` entry (an
+`conditional_drop`; and an *over-specified* `requires` entry (an
 aggregate or coarser synonym of what the consumer itself provides, rather
-than a real cross-subtask dependency) routes through `dropped_requires` —
+than a real cross-subtask dependency) routes through `drop_require` —
 `unresolvable` is reserved for unconditional consumers whose required
 capability genuinely cannot be produced AND is not an over-specified
 self-reference.
@@ -486,7 +499,7 @@ The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable; the reconciler's retry loop tries to break it (preferring
-`dropped_requires` / `dependency_edges` / `merged_subtasks` over the cycle-
+`drop_require` / `dependency_edges` / `merged_subtasks` over the cycle-
 closing renames), and if that fails the run aborts with the SCC + the
 mutations that closed it named — never silently broken.
 
@@ -4931,6 +4944,51 @@ dangerous failure here is a silent one.
 **It fails closed at startup.** If the listener cannot bind, the run dies rather
 than proceeding unconstrained, so an operator who asked for the guarantee is
 never quietly given the old behaviour.
+
+**Two distinct limits, and both are undocumented.** The API refuses an
+over-large schema two different ways — *"Schema is too complex for
+compilation"* and *"The compiled grammar is too large"* — and neither string,
+nor any numeric bound, appears in its own documentation. Measured, the drivers
+are: **optional properties**, because strict mode must admit every subset of
+them in any order (2^k paths per node, multiplied per array element); and
+**free-form strings**, which are the expensive element per path (20 string
+properties are refused where 20 enums, booleans, integers or arrays compile).
+Nesting an array-of-objects inside an array-of-objects compounds both.
+
+leerie answers each at the layer that owns it. The proxy forces every optional
+`required` **on the wire only** — collapsing the subset explosion without
+touching the schema the CLI validates against. And the two schemas that still
+would not fit were restructured: the planner's by that transform alone, the
+reconciler's by lifting its nested `requires` array into a sibling keyed by id
+and collapsing four isomorphic `{sid, tag, reason}` arrays into one
+enum-discriminated `tag_ops`. Seven in-place reductions were measured against
+the live API first — `$defs` deduplication, stripping descriptions, dropping
+subtrees, trimming properties, converting identifiers to enums — and every one
+was still refused. Only the restructure worked.
+
+**A schema that still cannot be constrained is survivable.** Not every
+schema compiles into a grammar. Measured against the API across all 23 (2026-08-04),
+two are refused outright — the planner's ("Schema is too complex") and the
+reconciler's ("The compiled grammar is too large"). Size is not the cause: the
+conformer's schema is larger on every count and compiles fine. The cause is
+*optional properties inside array items* — strict mode must accept every subset
+of them in any order, so grammar size multiplies per array element, and those
+two carry twelve each.
+
+The fix is not to make those fields required. That was tried and rejected for a
+different reason and would be a regression here: requiring fields is what made
+workers fail to produce schema-valid output at all (§ *Findings carry a
+severity*, and the same lesson in the overlap judge's `artifact_paths`). Trading
+a lost guarantee for a lost worker is the wrong direction.
+
+So the proxy fails open on the *response* as well as the request: a rejection of
+the hardened request is answered by re-sending the untouched one. That worker
+keeps ordinary post-hoc validation — exactly what it had before the flag existed
+— while every other worker still gets constrained decoding. The alternative is a
+run that cannot plan, which is strictly worse than the problem the flag set out
+to solve. The degradation is logged at every verbosity and counted in the
+end-of-run summary, because a silently lost guarantee is the one outcome this
+design refuses.
 
 The normalisation has a real cost: those stripped keywords were carrying
 validation. Sixteen of the twenty-one are string-length bounds (fifteen
