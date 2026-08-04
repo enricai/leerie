@@ -479,6 +479,16 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # leerie.toml. Default: off.
 ./leerie "task" --skip-adherence-check
 
+# Skip the phase 2⅞½ task-coverage gate: the deterministic
+# check_required_items_coverage floor and the task_coverage_judge worker.
+# A plan that omits a required item is not caught before phase_execute
+# spends. Use when the gate demands work the task does not want built —
+# e.g. an item the task itself defers ([DESIGN FIRST]), which no planner
+# can satisfy without contradicting the task. Also
+# LEERIE_SKIP_COVERAGE_CHECK=1 or `skip_coverage_check = true` in
+# leerie.toml. Default: off.
+./leerie "task" --skip-coverage-check
+
 # Demote the conformer's gating solution_defects completeness axis (DESIGN
 # §9 *The one gating axis: solution completeness*) to advisory: found defects
 # surface as warnings but never re-drive the implementer, block a subtask, or
