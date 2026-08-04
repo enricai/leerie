@@ -3377,9 +3377,32 @@ port mapping.
 | method | parsed from the request line and threaded to `_upstream` | only POST bodies are rewritten; every other verb the CLI issues must reach upstream as itself |
 | chunked request body | decoded by `_read_chunked`, never rewritten | a chunked body carries no `content-length`, so a length-driven read forwards only the first packet — a silently truncated request, which reads downstream as a model error rather than a proxy bug |
 
-**Logging.** The proxy runs in the orchestrator process, so `log()` from the
-handler interleaves with every other leerie line — there is no separate proxy
-log to go find. Three levels, emitted by `_log_exchange`:
+**Logging reports categories, never a merged total.** The proxy runs in the
+orchestrator process, so `log()` from the handler interleaves with every other
+leerie line — there is no separate proxy log to go find.
+
+Four counters, deliberately not merged: `passed_through` (no `StructuredOutput`
+tool in the request — ordinary multi-turn traffic, measured at ~25-30% of POSTs
+because the CLI injects the tool only on turns that want structured output),
+`unexpected_tool_shape` (the tool IS present but duplicated or missing its
+`input_schema` — the only pass-through worth warning about), `schema_errors`
+(400s, the flag's own failure mode) and `transient_errors` (429/5xx, unrelated
+to the rewrite). Echo budgets are **per class**.
+
+A **renamed** tool is caught separately, at run level: it yields no matching
+tool per request, exactly like an ordinary turn that never asked for structured
+output, so it cannot be classified where the other shape problems are. If a run
+ends having rewritten nothing while requests were proxied, the summary reports
+a probable rename — once, so it cannot reintroduce per-request false positives.
+
+Recorded because the merged form shipped and misled on the first real run: 395
+rewrites, zero 400s and zero fallbacks reported themselves as *"the injected
+tool may have changed upstream … the rewrite itself may be being rejected;
+re-run without the flag to confirm"*. Three transient 529s had also consumed
+the whole shared echo budget, so a genuine 400 — carrying the API's own message
+naming the offending schema path — would have been counted rather than shown.
+A summary that cries wolf on a healthy run is worse than none: it sends the
+operator chasing nothing and devalues the warning for when it is real. Three levels, emitted by `_log_exchange`:
 
 | when | verbosity | line |
 |---|---|---|

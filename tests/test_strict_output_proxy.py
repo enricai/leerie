@@ -818,7 +818,7 @@ def _run_against(leerie, port_url, monkeypatch, n: int, verbosity: str):
 
 
 @pytest.mark.parametrize("verbosity", ["quiet", "normal", "stream", "debug"])
-def test_upstream_errors_are_logged_at_every_verbosity(leerie, error_upstream,
+def test_schema_errors_are_logged_at_every_verbosity(leerie, error_upstream,
                                                        monkeypatch, verbosity):
     """This proxy is the only thing in the path that rewrites a request, so a
     4xx here is most likely leerie's own edit being rejected — and the response
@@ -830,7 +830,7 @@ def test_upstream_errors_are_logged_at_every_verbosity(leerie, error_upstream,
     assert len(hits) == 1, f"no upstream-error line at verbosity={verbosity}"
     assert "additionalProperties must be false" in hits[0], (
         "the response body carries the offending schema path — it must survive")
-    assert p.upstream_errors == 1
+    assert p.schema_errors == 1
 
 
 def test_upstream_error_echoes_are_budgeted(leerie, error_upstream, monkeypatch):
@@ -843,7 +843,10 @@ def test_upstream_error_echoes_are_budgeted(leerie, error_upstream, monkeypatch)
     assert len(echoed) == leerie._STRICT_PROXY_ERROR_LOG_MAX
     assert any("counted, not echoed" in l for l in lines)
     # Counted in full even when not echoed — the summary must not under-report.
-    assert p.upstream_errors == n
+    # `schema_errors`, not a merged total: these are 400s on requests that were
+    # never rewritten (the fixture's tool is unnamed), so the fallback does not
+    # absorb them and they are genuinely ours to raise.
+    assert p.schema_errors == n
 
 
 def test_per_request_lines_are_debug_only(leerie, mock_upstream, monkeypatch):
@@ -1618,3 +1621,278 @@ def test_recommendation_marker_survives_the_vocabulary_change(leerie):
     assert any(leerie._matches_recommendation(o, rec) for o in options), (
         "no rendered option matched the recommendation — _format_must_include "
         "and _matches_recommendation have drifted apart")
+
+
+# --------------------------------------------------------------------------
+# Self-reporting: say what happened, not the worst thing it could mean.
+#
+# The first real run rewrote 395 requests with zero 400s and zero fallbacks,
+# and reported itself as: "173 passed through — ... the injected tool may have
+# changed upstream, 14 upstream error(s) — the rewrite itself may be being
+# rejected; re-run without the flag to confirm."
+#
+# Every clause was false. One root cause, three symptoms: counters merged
+# distinct categories and the summary then described the merged total using
+# the alarming interpretation. A summary that cries wolf on a healthy run is
+# worse than no summary — it sends the operator chasing a problem that is not
+# there, and it devalues the warning for when it is real.
+# --------------------------------------------------------------------------
+
+
+def test_a_request_with_no_tool_is_not_alarming(leerie):
+    """Measured against a real 4-turn worker: one of its four /v1/messages
+    POSTs arrives with NO tools array at all, because the CLI injects
+    StructuredOutput only on turns that want structured output. 173 of these
+    in the real run. Ordinary traffic."""
+    body = json.dumps({"model": "m", "messages": [],
+                       "tools": [{"name": "Bash", "input_schema": {}}]}).encode()
+    assert leerie._unexpected_structured_output_shape(body) is False
+    assert leerie._unexpected_structured_output_shape(b'{"model":"m"}') is False
+    assert leerie._unexpected_structured_output_shape(b"not json") is False
+
+
+@pytest.mark.parametrize("tools, why", [
+    ([{"name": "StructuredOutput", "input_schema": {}},
+      {"name": "StructuredOutput", "input_schema": {}}], "duplicated"),
+    ([{"name": "StructuredOutput"}], "no input_schema"),
+    ([{"name": "StructuredOutput", "input_schema": "not-a-dict"}],
+     "input_schema is not an object"),
+])
+def test_a_present_but_unusable_tool_is_alarming(leerie, tools, why):
+    """THIS is what the warning was written for — the private, unversioned
+    interface changing shape under us."""
+    body = json.dumps({"model": "m", "messages": [], "tools": tools}).encode()
+    assert leerie._unexpected_structured_output_shape(body) is True, why
+
+
+def test_transient_errors_do_not_starve_the_schema_echo_budget(leerie,
+                                                               monkeypatch):
+    """The regression the real run demonstrated: three 529s consumed the whole
+    allowance, so a later genuine 400 — carrying the API's own message naming
+    the offending schema path — would have been counted, not shown."""
+    lines: list[str] = []
+    monkeypatch.setattr(leerie, "log", lambda m: lines.append(m))
+    p = leerie._StrictOutputProxy(max_parallel=2)
+
+    over = json.dumps({"error": {"message": "Overloaded"}}).encode()
+    for _ in range(leerie._STRICT_PROXY_ERROR_LOG_MAX + 2):
+        p.transient_errors += 1
+        p._log_exchange("POST", "/v1/messages", 529, "", over)
+
+    lines.clear()
+    body = json.dumps({"error": {"message":
+                                 "tools.0.custom: additionalProperties "
+                                 "must be false at #/properties/x"}}).encode()
+    p.schema_errors += 1
+    p._log_exchange("POST", "/v1/messages", 400, "strict:true", body)
+
+    hits = [l for l in lines if "upstream 400" in l]
+    assert len(hits) == 1, "the 400 was swallowed by the transient budget"
+    assert "additionalProperties must be false at #/properties/x" in hits[0], (
+        "the API's own diagnostic must survive — it names the offending path")
+
+
+def test_a_transient_error_is_not_described_as_a_rejection(leerie, monkeypatch):
+    """A 529 has nothing to do with the rewrite; saying it might be sends the
+    operator to re-run without the flag to 'confirm' an unrelated outage."""
+    lines: list[str] = []
+    monkeypatch.setattr(leerie, "log", lambda m: lines.append(m))
+    p = leerie._StrictOutputProxy(max_parallel=2)
+    p.transient_errors += 1
+    p._log_exchange("POST", "/v1/messages", 529, "",
+                    json.dumps({"error": {"message": "Overloaded"}}).encode())
+    assert any("transient (not a schema rejection)" in l for l in lines)
+    assert not any("rejected" in l and "not a schema rejection" not in l
+                   for l in lines)
+
+
+def test_the_healthy_run_summary_makes_no_accusation(leerie):
+    """Replays the real run's exact shape — 395 rewrites, 173 tool-free
+    requests, 14 transient errors, 0 schema errors, 0 fallbacks — and asserts
+    the summary reads as the clean run it was."""
+    import inspect
+    src = inspect.getsource(leerie._orchestrate)
+    start = src.index("_p = _STRICT_PROXY")
+    end = src.index('log("; ".join(parts))') + len('log("; ".join(parts))')
+    block = "\n".join(l[12:] if l.startswith(" " * 12) else l
+                      for l in src[start:end].splitlines())
+
+    class Fake:
+        rewritten, passed_through = 395, 173
+        unexpected_tool_shape = fell_back = schema_errors = 0
+        transient_errors = 14
+    out: list[str] = []
+    exec(block, {"_STRICT_PROXY": Fake, "log": out.append})
+    summary = out[0]
+
+    assert "395 request(s) rewritten" in summary
+    assert "may have changed upstream" not in summary, (
+        "accused the upstream interface of changing on a healthy run")
+    assert "may be being rejected" not in summary, (
+        "accused the rewrite of being rejected with zero schema errors")
+    assert "re-run without the flag" not in summary, (
+        "sent the operator to re-run to confirm a problem that did not exist")
+    assert "transient" in summary and "unrelated to the rewrite" in summary
+
+
+def test_the_unhealthy_run_summary_still_accuses(leerie):
+    """Anti-vacuity: the warnings must still fire when they are true, or the
+    fix is just deletion."""
+    import inspect
+    src = inspect.getsource(leerie._orchestrate)
+    start = src.index("_p = _STRICT_PROXY")
+    end = src.index('log("; ".join(parts))') + len('log("; ".join(parts))')
+    block = "\n".join(l[12:] if l.startswith(" " * 12) else l
+                      for l in src[start:end].splitlines())
+
+    class Fake:
+        rewritten, passed_through = 10, 3
+        unexpected_tool_shape, fell_back = 4, 1
+        schema_errors, transient_errors = 2, 0
+    out: list[str] = []
+    exec(block, {"_STRICT_PROXY": Fake, "log": out.append})
+    summary = out[0]
+
+    assert "may have changed upstream" in summary
+    # Deliberately definite, not hedged: with schema_errors > 0 the rewrite IS
+    # being rejected. The hedge belongs on the upstream-shape claim (inferred
+    # from a private interface), not on a count of observed 400s.
+    assert "the rewrite itself is being rejected" in summary
+    assert "re-run without the flag" in summary
+    assert "fell back to post-hoc validation" in summary
+
+
+def test_an_absorbed_fallback_is_not_also_an_unhandled_rejection(leerie,
+                                                                 rejecting_upstream,
+                                                                 monkeypatch):
+    """A 400 the fallback resolves is reported ONCE, as `fell_back`.
+
+    Counting it again as a schema rejection produces:
+
+        1 schema(s) fell back to post-hoc validation …;
+        1 schema rejection(s) — the rewrite itself is being rejected;
+        re-run without the flag to confirm
+
+    Both clauses describe the same event, and the second sends the operator to
+    chase a problem the proxy already resolved. That is the exact failure this
+    whole change set exists to remove, reintroduced one layer down — the
+    classification therefore keys on the FINAL status, after any fallback.
+    """
+    url, _ = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert p.fell_back == 1, "the fallback did not fire"
+    assert p.schema_errors == 0, (
+        "an absorbed 400 was also counted as an unhandled schema rejection")
+
+
+def test_a_fallback_that_does_not_help_is_still_raised(leerie, monkeypatch):
+    """Anti-vacuity for the test above: if the retried original ALSO fails, the
+    fallback did not save the run and the operator must still hear about it."""
+    calls = []
+
+    def always_400(self, method, path, body, headers):
+        calls.append(body)
+        return 400, [], json.dumps(
+            {"error": {"message": "Schema is too complex."}}).encode()
+
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_upstream", always_400)
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            await _post(port, _wrap({"type": "object", "properties": {}}))
+        finally:
+            await p.stop()
+        return p
+    p = asyncio.run(go())
+    assert len(calls) == 2, "expected the hardened attempt plus the retry"
+    assert p.fell_back == 1
+    assert p.schema_errors == 1, (
+        "a 400 that survived the fallback must still be raised")
+
+
+def test_no_write_only_error_counter_survives(leerie):
+    """`upstream_errors` was a merged total nothing read once the classes were
+    split — state kept alive only by the tests asserting on it. The file's
+    stated goal is that the control flow reads top-to-bottom in one sitting."""
+    import inspect
+    import pathlib
+    # `inspect.getsource` on the class fails when leerie is imported from a
+    # path the linecache cannot resolve; read the module file directly.
+    src = pathlib.Path(inspect.getfile(leerie)).read_text()
+    assert "upstream_errors" not in src, (
+        "the merged total is back — nothing reads it once the classes split")
+    p = leerie._StrictOutputProxy(max_parallel=1)
+    assert not hasattr(p, "upstream_errors")
+
+
+def _summary_for(leerie, **counters) -> str:
+    """Render the end-of-run summary for a given set of counters."""
+    import inspect
+    src = inspect.getsource(leerie._orchestrate)
+    start = src.index("_p = _STRICT_PROXY")
+    end = src.index('log("; ".join(parts))') + len('log("; ".join(parts))')
+    block = "\n".join(l[12:] if l.startswith(" " * 12) else l
+                      for l in src[start:end].splitlines())
+    base = {"rewritten": 0, "passed_through": 0, "unexpected_tool_shape": 0,
+            "fell_back": 0, "schema_errors": 0, "transient_errors": 0}
+    base.update(counters)
+    out: list[str] = []
+    exec(block, {"_STRICT_PROXY": type("F", (), base), "log": out.append,
+                 "_STRICT_OUTPUT_TOOL_NAME": leerie._STRICT_OUTPUT_TOOL_NAME})
+    return out[0]
+
+
+def test_a_renamed_tool_is_indistinguishable_per_request(leerie):
+    """Pinned deliberately, so the two mechanisms are not confused later.
+
+    A renamed tool yields no matching hit — exactly like an ordinary turn that
+    never asked for structured output. There is no per-request signal to
+    separate them, which is why the rename check lives at run level instead.
+    """
+    renamed = json.dumps({"model": "m", "messages": [], "tools": [
+        {"name": "StructuredOutputV2", "description": "d",
+         "input_schema": {"type": "object", "properties": {}}}]}).encode()
+    ordinary = json.dumps({"model": "m", "messages": [], "tools": [
+        {"name": "Bash", "input_schema": {}}]}).encode()
+    assert leerie._unexpected_structured_output_shape(renamed) is False
+    assert leerie._unexpected_structured_output_shape(ordinary) is False
+
+
+def test_a_run_that_rewrote_nothing_reports_a_probable_rename(leerie):
+    """DESIGN §7 requires a renamed tool to be reported — "the dangerous
+    failure here is a silent one". Suppressing the per-request false positives
+    removed that signal, so it is restored at run level: leerie passes a schema
+    to every worker, so if anything was proxied, something must have carried
+    the tool. Nothing rewritten means the flag silently did nothing all run."""
+    summary = _summary_for(leerie, rewritten=0, passed_through=50)
+    assert "NOTHING was rewritten" in summary
+    assert "renamed or removed" in summary
+    assert leerie._STRICT_OUTPUT_TOOL_NAME in summary
+
+
+def test_a_healthy_run_never_reports_a_rename(leerie):
+    """Anti-vacuity: the whole point of the change was to stop warning on
+    ordinary pass-throughs, so a run that rewrote anything must stay quiet no
+    matter how many tool-free requests it saw."""
+    summary = _summary_for(leerie, rewritten=395, passed_through=173,
+                           transient_errors=14)
+    assert "NOTHING was rewritten" not in summary
+    assert "renamed or removed" not in summary
+
+
+def test_no_proxied_requests_at_all_is_not_a_rename(leerie):
+    """A run where the proxy saw nothing proves nothing about the tool — the
+    warning must key on `passed_through`, not fire on an empty run."""
+    assert "NOTHING was rewritten" not in _summary_for(leerie)

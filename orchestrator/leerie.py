@@ -11196,6 +11196,38 @@ def _api_error_head(payload: bytes, limit: int = 160) -> str:
     return " ".join(str(text).split())[:limit]
 
 
+def _unexpected_structured_output_shape(body: bytes) -> bool:
+    """True only when a `StructuredOutput` tool is PRESENT but unusable.
+
+    `_strictify_request` declines for several reasons, and they are not equally
+    interesting. The overwhelmingly common one is that the request simply
+    carries no `StructuredOutput` tool — measured against a real 4-turn worker,
+    one of its four `/v1/messages` POSTs arrives with *no tools array at all*,
+    because the CLI injects the tool only on the turns where it wants
+    structured output. That is ordinary traffic and says nothing about anything.
+
+    The interesting case is a tool that IS there and is shaped wrong —
+    duplicated, or missing its `input_schema`. That is the "the private
+    interface changed upstream" signal, and it is what the operator warning
+    exists for. Merging the two made a healthy run report 173 pass-throughs as
+    a suspected upstream change.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    hits = [t for t in tools
+            if isinstance(t, dict) and t.get("name") == _STRICT_OUTPUT_TOOL_NAME]
+    if not hits:
+        return False          # no tool at all — normal
+    return len(hits) > 1 or not isinstance(hits[0].get("input_schema"), dict)
+
+
 def _structured_output_fingerprint(body: bytes) -> str | None:
     """Stable id for the schema a request carries, or None if it carries none.
 
@@ -11263,8 +11295,14 @@ class _StrictOutputProxy:
         self.port = 0
         self.rewritten = 0
         self.passed_through = 0
-        self.upstream_errors = 0
         self.fell_back = 0
+        # Split deliberately. Merging these is what made a clean run describe
+        # itself as suspect: `unexpected_tool_shape` is the only pass-through
+        # worth warning about, and `schema_errors` the only upstream error the
+        # flag can be responsible for.
+        self.unexpected_tool_shape = 0
+        self.schema_errors = 0
+        self.transient_errors = 0
         # Schemas the API refuses to compile into a grammar. Measured: 2 of
         # leerie's 23 (`planner`, `reconciler`) — both carry 12 optional
         # properties inside array items, and strict mode must accept every
@@ -11364,16 +11402,34 @@ class _StrictOutputProxy:
         (`-vv`): one per worker API call is far too much for normal output.
         """
         if status >= 400:
-            self.upstream_errors += 1
-            if self.upstream_errors <= _STRICT_PROXY_ERROR_LOG_MAX:
-                snippet = " ".join(
-                    payload[:_STRICT_PROXY_ERROR_BODY_MAX]
-                    .decode("utf-8", "replace").split())
-                log(f"  strict-output proxy: upstream {status} on {method} "
-                    f"{path} ({desc or 'not rewritten'}) — {snippet}")
-                if self.upstream_errors == _STRICT_PROXY_ERROR_LOG_MAX:
-                    log("  strict-output proxy: further upstream errors will "
-                        "be counted, not echoed (see the end-of-run summary)")
+            # Budget PER CLASS. A shared budget is not a milder version of this
+            # — it is a different, broken thing: measured live, three transient
+            # 529s in the first minutes consumed the whole allowance, so a
+            # later genuine 400 (carrying the API's own message naming the
+            # offending schema path) would have been silently counted instead
+            # of shown. Overload noise must not starve the one channel that can
+            # diagnose this flag.
+            schema_shaped = status == 400
+            seen = self.schema_errors if schema_shaped else self.transient_errors
+            if seen <= _STRICT_PROXY_ERROR_LOG_MAX:
+                if schema_shaped:
+                    # The body names the offending path; it is the whole
+                    # diagnostic, so it is echoed rather than summarised.
+                    snippet = " ".join(
+                        payload[:_STRICT_PROXY_ERROR_BODY_MAX]
+                        .decode("utf-8", "replace").split())
+                    log(f"  strict-output proxy: upstream 400 on {method} "
+                        f"{path} ({desc or 'not rewritten'}) — {snippet}")
+                else:
+                    # Capacity or throttling — nothing to do with the rewrite.
+                    # Say so, so it is not mistaken for one.
+                    log(f"  strict-output proxy: upstream {status} on {method} "
+                        f"{path} — transient (not a schema rejection); "
+                        "retried upstream")
+                if seen == _STRICT_PROXY_ERROR_LOG_MAX:
+                    kind = "schema" if schema_shaped else "transient"
+                    log(f"  strict-output proxy: further {kind} errors will be "
+                        "counted, not echoed (see the end-of-run summary)")
         elif self._verbosity == "debug":
             log(f"  strict-output proxy: {method} {path} -> {status} "
                 f"({desc or 'forwarded unmodified'})")
@@ -11428,9 +11484,9 @@ class _StrictOutputProxy:
             # rewrite a body that arrived on this untested path.
             if chunked:
                 body = await self._read_chunked(reader, rest)
-                # Counted only for POST, matching the branch below: the counter
-                # drives an operator warning that the constrained-decoding
-                # guarantee was lost, and a GET was never a candidate for it.
+                # Counted only for POST, matching the branch below: a GET was
+                # never a candidate for constrained decoding, so counting one
+                # would inflate the pass-through total for no reason.
                 if method.upper() == "POST":
                     self.passed_through += 1
             else:
@@ -11454,6 +11510,11 @@ class _StrictOutputProxy:
                             self.rewritten += 1
                         else:
                             self.passed_through += 1
+                            # Only a PRESENT-but-unusable tool is worth an
+                            # operator warning; a request with no tool at all
+                            # is ordinary multi-turn traffic.
+                            if _unexpected_structured_output_shape(body):
+                                self.unexpected_tool_shape += 1
 
             loop = asyncio.get_running_loop()
             status, up_headers, payload = await loop.run_in_executor(
@@ -11486,6 +11547,19 @@ class _StrictOutputProxy:
                     self._pool, self._upstream, method.upper(), path,
                     original, headers)
                 desc = "fell back: schema will not compile"
+
+            # Classified on the FINAL status, deliberately — after any
+            # fallback, not before. A 400 the fallback absorbs ends at 200 and
+            # is counted nowhere here, because `fell_back` already reports it
+            # once and correctly; counting it again as an unhandled rejection
+            # would send the operator to "re-run without the flag to confirm" a
+            # problem the proxy just resolved itself. A 400 that survives the
+            # fallback, or one on a request we never rewrote, is genuinely
+            # unhandled and is ours to raise.
+            if status == 400:
+                self.schema_errors += 1
+            elif status >= 400:
+                self.transient_errors += 1
             self._log_exchange(method.upper(), path, status, desc, payload)
 
             out = [f"HTTP/1.1 {status} X".encode("latin-1")]
@@ -25480,18 +25554,52 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
             # The pass-through count is the only signal that the private tool
             # interface changed under us: the run still succeeds, but silently
             # without the guarantee it was asked for.
-            log(f"strict output: {_STRICT_PROXY.rewritten} request(s) "
-                f"rewritten, {_STRICT_PROXY.passed_through} passed through"
-                + (" — passed-through requests did NOT get constrained "
-                   "decoding; the injected tool may have changed upstream"
-                   if _STRICT_PROXY.passed_through else "")
-                + (f", {_STRICT_PROXY.fell_back} schema(s) fell back to "
-                   f"post-hoc validation (would not compile into a grammar)"
-                   if _STRICT_PROXY.fell_back else "")
-                + (f", {_STRICT_PROXY.upstream_errors} upstream error(s) — "
-                   f"the rewrite itself may be being rejected; re-run without "
-                   f"the flag to confirm"
-                   if _STRICT_PROXY.upstream_errors else ""))
+            # Report each category as itself. The previous single-sentence
+            # form described every pass-through as a possible upstream change
+            # and every upstream error as a possible rewrite rejection — so a
+            # run with 395 successful rewrites, zero 400s and zero fallbacks
+            # announced itself as suspect and pointed at a re-run to "confirm"
+            # a problem that did not exist. A summary that cries wolf on a
+            # healthy run is worse than no summary.
+            _p = _STRICT_PROXY
+            parts = [f"strict output: {_p.rewritten} request(s) rewritten, "
+                     f"{_p.passed_through} without a StructuredOutput tool "
+                     f"(normal — the CLI injects it only on turns that ask "
+                     f"for structured output)"]
+            # A RENAMED tool is invisible per-request — it yields zero hits,
+            # exactly like an ordinary turn that never asked for structured
+            # output — so it cannot be caught where the other shape problems
+            # are. Across a whole run it is visible: leerie passes
+            # `--json-schema` to every worker, so if anything was proxied at
+            # all, something must have carried the tool. Nothing rewritten
+            # means the tool is renamed or gone, and the flag has been silently
+            # doing nothing. Fires once per run, so it cannot reintroduce the
+            # per-request false positives this summary exists to remove.
+            if _p.rewritten == 0 and _p.passed_through:
+                parts.append(
+                    "NOTHING was rewritten — the injected tool appears to have "
+                    f"been renamed or removed (expected `{_STRICT_OUTPUT_TOOL_NAME}`). "
+                    "No worker got constrained decoding this run")
+            if _p.unexpected_tool_shape:
+                parts.append(
+                    f"{_p.unexpected_tool_shape} request(s) carried a "
+                    "StructuredOutput tool leerie could not use (duplicated, "
+                    "or no input_schema) — those did NOT get constrained "
+                    "decoding, and the injected tool may have changed upstream")
+            if _p.fell_back:
+                parts.append(
+                    f"{_p.fell_back} schema(s) fell back to post-hoc "
+                    "validation (would not compile into a grammar)")
+            if _p.schema_errors:
+                parts.append(
+                    f"{_p.schema_errors} schema rejection(s) — the rewrite "
+                    "itself is being rejected; re-run without the flag to "
+                    "confirm")
+            if _p.transient_errors:
+                parts.append(
+                    f"{_p.transient_errors} transient upstream error(s) "
+                    "(rate-limit/overload, unrelated to the rewrite)")
+            log("; ".join(parts))
             await _STRICT_PROXY.stop()
             _STRICT_PROXY = None
 
