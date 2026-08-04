@@ -13,7 +13,7 @@ Background (from the plan's finding #1):
 
   The trap: if LEERIE_STATE_DIR (input) or --state-dir (CLI) is forwarded into
   the child's env, all members resolve to the same shared dir and the .owner
-  sidecar refuses the second member. The --group arm therefore rejects both
+  sidecar refuses the second member. The group arm therefore rejects both
   before fan-out (leerie:2808-2813, leerie:2790-2793).
 
 The harness below mirrors _state_dir_default (leerie:502-506) — the exact
@@ -21,7 +21,7 @@ resolution that each group-member subshell runs after cd-ing into its repo.
 We test:
   A) With LEERIE_STATE_HOST_DIR inherited from the "parent", two members in
      repos with distinct basenames still resolve to distinct dirs.
-  B) The --group arm itself rejects LEERIE_STATE_DIR / --state-dir (exercised
+  B) The group arm itself rejects LEERIE_STATE_DIR / --state-dir (exercised
      via the real launcher subprocess tests below).
 
 Model: tests/test_resolve_state_dir.py (_HARNESS pattern).
@@ -271,11 +271,11 @@ class TestDistinctStateDirsUnderInheritedOutputVar:
 
     def test_leerie_state_dir_input_var_does_pin_members(self, tmp_path: Path) -> None:
         """Confirm that LEERIE_STATE_DIR (the *input* var) DOES pin members to
-        a shared dir. This is the trap the --group guard prevents by rejecting
+        a shared dir. This is the trap the group guard prevents by rejecting
         LEERIE_STATE_DIR before fan-out.
 
         This test documents the dangerous behavior: if LEERIE_STATE_DIR were
-        forwarded to children (which --group must NOT do), both members would
+        forwarded to children (which group must NOT do), both members would
         resolve to the same dir and the second .owner check would fail.
         """
         fake_home = tmp_path / "home"
@@ -295,14 +295,14 @@ class TestDistinctStateDirsUnderInheritedOutputVar:
             repo_web, fake_home, {"LEERIE_STATE_DIR": shared_dir}
         )
 
-        # Both resolve to the shared dir — this is why --group must reject it.
+        # Both resolve to the shared dir — this is why group must reject it.
         assert dir_api == shared_dir
         assert dir_web == shared_dir
         assert dir_api == dir_web  # collision: .owner would refuse the 2nd
 
 
 # ---------------------------------------------------------------------------
-# B: --group arm rejects LEERIE_STATE_DIR and --state-dir (launcher level)
+# B: group arm rejects LEERIE_STATE_DIR and --state-dir (launcher level)
 # ---------------------------------------------------------------------------
 
 
@@ -349,9 +349,9 @@ def _run_launcher(
 
 
 class TestGroupLauncherStateDirGuard:
-    """The --group arm rejects LEERIE_STATE_DIR / --state-dir before fan-out.
+    """The group arm rejects LEERIE_STATE_DIR / --state-dir before fan-out.
 
-    This is the REQUIRED Stage-3a guard: the --group arm must not forward
+    This is the REQUIRED Stage-3a guard: the group arm must not forward
     these to children (they would pin all members to one dir and trip .owner
     on the second member).  Modeled on TestStateDirGuard in test_group_launcher.py
     but with a different fixture: no LEERIE_STATE_DIR in the default env, so
@@ -359,7 +359,7 @@ class TestGroupLauncherStateDirGuard:
     """
 
     def test_rejects_leerie_state_dir_env(self, tmp_path: Path) -> None:
-        """--group exits non-zero when LEERIE_STATE_DIR is set in env."""
+        """group exits non-zero when LEERIE_STATE_DIR is set in env."""
         repo_a = tmp_path / "repo-a"
         repo_b = tmp_path / "repo-b"
         _make_git_repo(repo_a)
@@ -367,7 +367,7 @@ class TestGroupLauncherStateDirGuard:
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group", "--repo", str(repo_a), "task a",
+            ["group", "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             env_extra={"LEERIE_STATE_DIR": str(tmp_path / "shared-state")},
             stub=stub, stub_log=stub_log,
@@ -378,13 +378,13 @@ class TestGroupLauncherStateDirGuard:
         assert result.stub_log == ""  # no children spawned
 
     def test_rejects_state_dir_cli_arg(self, tmp_path: Path) -> None:
-        """--group exits non-zero when --state-dir is passed as a CLI arg."""
+        """group exits non-zero when --state-dir is passed as a CLI arg."""
         repo_a = tmp_path / "repo-a"
         _make_git_repo(repo_a)
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group",
+            ["group",
              "--state-dir", str(tmp_path / "custom"),
              "--repo", str(repo_a), "task"],
             stub=stub, stub_log=stub_log,
@@ -395,7 +395,7 @@ class TestGroupLauncherStateDirGuard:
         assert result.stub_log == ""  # no children spawned
 
     def test_group_succeeds_without_state_dir_env(self, tmp_path: Path) -> None:
-        """--group proceeds normally when LEERIE_STATE_DIR is NOT set."""
+        """group proceeds normally when LEERIE_STATE_DIR is NOT set."""
         repo_a = tmp_path / "repo-a"
         repo_b = tmp_path / "repo-b"
         _make_git_repo(repo_a)
@@ -403,7 +403,7 @@ class TestGroupLauncherStateDirGuard:
         stub, stub_log = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group",
+            ["group",
              "--group-id", "deadbeef-1234-4abc-8def-0123456789ab",
              "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
@@ -424,7 +424,7 @@ class TestGroupLauncherStateDirGuard:
         stub, _ = _stub_recorder(tmp_path)
         result = _run_launcher(
             tmp_path,
-            ["--group", "--repo", str(repo_a), "task a",
+            ["group", "--repo", str(repo_a), "task a",
              "--repo", str(repo_b), "task b"],
             env_extra={"LEERIE_STATE_DIR": str(tmp_path / "shared-state")},
             stub=stub,

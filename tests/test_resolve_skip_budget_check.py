@@ -4,7 +4,7 @@ moment*).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_BUDGET_CHECK env
 var → skip_budget_check in leerie.toml → False (the preflight runs by
-default on every fresh run; --resume bypasses it independently because
+default on every fresh run; resume bypasses it independently because
 the resume path enters past _schedule()).
 
 Mirrors test_resolve_skip_overlap_judge.py — both resolvers share

@@ -3,7 +3,7 @@
 Companion to tests/test_finalize_sh_behavior.py (which covers
 scripts/finalize.sh, the in-container verifier). This file covers
 scripts/host-finalize.sh, the host-side push+PR block extracted from
-the leerie launcher to make `leerie --finalize <run-id>` actually finalize
+the leerie launcher to make `leerie finalize <run-id>` actually finalize
 (Audit Drift 7).
 
 The tests source host-finalize.sh in a bash subprocess with stubbed
@@ -364,7 +364,7 @@ def test_skips_when_run_branch_absent_locally(tmp_path):
     Without this guard, the launcher would try to push a non-existent
     branch and fail with `src refspec ... does not match any`. The
     guard backstops fetch-branch.sh's conditional stripper and the
-    --finalize stripper in `leerie`."""
+    finalize stripper in `leerie`."""
     run_dir = _make_run(tmp_path, "noop-run-aaaaaa", run_json={
         "branch": "leerie/runs/noop-run-aaaaaa",
         "working_branch": "main",
@@ -658,7 +658,7 @@ def test_gate_blocks_mid_wave_crashed_run(tmp_path):
     """A run with finished_at (die-path discovery stamp) but
     completed_waves < len(waves) is refused: no push, no PR, return 1 with
     an actionable resume hint. This is the single chokepoint that prevents
-    the launcher / --finalize verb / Fly teardown from pushing a partial
+    the launcher / finalize verb / Fly teardown from pushing a partial
     run branch and opening a premature PR (the PR-#22 incident)."""
     run_dir = _make_run(
         tmp_path, "crash-run-aaaaaa",

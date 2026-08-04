@@ -1,7 +1,7 @@
-"""Tests for the `--resume` consumer half of resumable planning (DESIGN §6
+"""Tests for the `resume` consumer half of resumable planning (DESIGN §6
 "Resumable planning — a per-phase checkpoint cursor, not a `waves` gate";
 bugfix-004). bugfix-003 made every planning phase checkpoint its output
-into a phase-named `plans_after_*` key; this subtask makes `--resume`
+into a phase-named `plans_after_*` key; this subtask makes `resume`
 actually read those keys back and re-enter at the first incomplete phase,
 instead of `die()`ing "cannot resume — run did not reach the scheduling
 phase" for anything short of a fully-scheduled plan.

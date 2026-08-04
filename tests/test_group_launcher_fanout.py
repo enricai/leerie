@@ -1,6 +1,6 @@
-"""Tests for the --group launcher fan-out core contract (Verification §2).
+"""Tests for the group launcher fan-out core contract (Verification §2).
 
-Asserts that `leerie --group --repo A "pA" --repo B "pB" [--brief f]` spawns
+Asserts that `leerie group --repo A "pA" --repo B "pB" [--brief f]` spawns
 one child per member with:
   - cwd set to the member's own repo directory,
   - --group-id <uuid> in argv,
@@ -52,7 +52,7 @@ def _make_git_repo(path: Path) -> None:
 def _stub_recorder(tmp_path: Path) -> tuple[Path, Path]:
     """Build a stub that records 'CWD:<pwd>\\nARGV:<$@>' per invocation.
 
-    The `--group` launcher fans out its members concurrently
+    The `group` launcher fans out its members concurrently
     (``( cd <repo> && … ) &``), so N stub instances run in parallel. A
     shared append log races: the two-line ``printf >>`` is not atomic
     across both lines under concurrency, so blocks interleave and the
@@ -92,7 +92,7 @@ def _run(
         "HOME": str(tmp_path),
         "LEERIE_REPO": str(REPO_ROOT),
         "LEERIE_SELF_CMD": str(stub),
-        # Intentionally NO LEERIE_STATE_DIR so the --group guard passes.
+        # Intentionally NO LEERIE_STATE_DIR so the group guard passes.
     }
     if env_extra:
         env.update(env_extra)
@@ -124,7 +124,7 @@ def test_two_children_spawned(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "prompt for a",
          "--repo", str(repo_b), "prompt for b"],
         stub=stub, log=log,
@@ -140,7 +140,7 @@ def test_relative_launcher_path_resolves_after_member_cd() -> None:
     Regression for the bug the live fly smoke caught: the member subshell
     does `( cd <repo> && "$SELF" … )`. A relative `$0` (`./leerie`, the
     quick-start form) would no longer resolve from the member's cwd
-    ("./leerie: No such file or directory"). The --group arm must resolve an
+    ("./leerie: No such file or directory"). The group arm must resolve an
     absolute self-command *before* the cd.
 
     Driving a real relative-`$0` re-invocation without running the container
@@ -155,7 +155,7 @@ def test_relative_launcher_path_resolves_after_member_cd() -> None:
     assert (
         '_grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"'
         in src
-    ), "the --group arm must build an absolute _grp_self_cmd before fan-out"
+    ), "the group arm must build an absolute _grp_self_cmd before fan-out"
     # Isolate the fan-out subshell (cd into the member repo, then re-invoke).
     marker = 'cd "$_grp_member_repo_abs" || exit 1'
     assert marker in src
@@ -178,7 +178,7 @@ def test_each_child_cds_into_its_repo(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "prompt for a",
          "--repo", str(repo_b), "prompt for b"],
         stub=stub, log=log,
@@ -200,7 +200,7 @@ def test_each_child_receives_group_id(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -221,7 +221,7 @@ def test_each_child_receives_group_id_minted_when_absent(tmp_path: Path) -> None
 
     result = _run(
         tmp_path,
-        ["--group",
+        ["group",
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -243,7 +243,7 @@ def test_child_a_receives_inspect_dir_for_b(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -273,7 +273,7 @@ def test_child_b_receives_inspect_dir_for_a(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
         stub=stub, log=log,
@@ -297,7 +297,7 @@ def test_three_members_each_get_two_inspect_dirs(tmp_path: Path) -> None:
         _make_git_repo(r)
     stub, log = _stub_recorder(tmp_path)
 
-    cli = ["--group", "--group-id", GROUP_ID]
+    cli = ["group", "--group-id", GROUP_ID]
     for r in repos:
         cli += ["--repo", str(r), f"task {r.name}"]
 
@@ -326,7 +326,7 @@ def test_brief_prepended_to_each_childs_prompt(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--brief", str(brief),
          "--repo", str(repo_a), "task a",
          "--repo", str(repo_b), "task b"],
@@ -350,7 +350,7 @@ def test_brief_prepended_before_member_prompt(tmp_path: Path) -> None:
 
     result = _run(
         tmp_path,
-        ["--group", "--group-id", GROUP_ID,
+        ["group", "--group-id", GROUP_ID,
          "--brief", str(brief),
          "--repo", str(repo_a), "PROMPT_A",
          "--repo", str(repo_b), "PROMPT_B"],

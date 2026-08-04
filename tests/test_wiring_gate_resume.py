@@ -1,4 +1,4 @@
-"""`--resume` must not bypass the phase-3 semantic wiring gate.
+"""`resume` must not bypass the phase-3 semantic wiring gate.
 
 Regression pins for run 3a4abba3 (2026-08-01). `phase_wiring_gate` is a
 detect-and-die gate: on a concrete `wiring_defects` entry it `die()`s with
@@ -6,7 +6,7 @@ the defect named. Its skip-on-resume used to be keyed on the presence of
 `plan_snapshot` — but `plan_snapshot` is written a few lines *earlier*, by
 design, so that a die() at either terminal gate does not discard the whole
 planning spend. That made the snapshot present even when the gate had
-FAILED, so the next `--resume` skipped the entire `plan_snapshot` branch,
+FAILED, so the next `resume` skipped the entire `plan_snapshot` branch,
 never re-invoked the gate, and executed the very plan the gate rejected —
 while the die() message claimed the gate had "no bypass flag".
 
@@ -124,10 +124,10 @@ def test_gate_call_is_not_nested_in_the_plan_snapshot_branch(leerie):
 def test_die_message_does_not_claim_resume_cannot_bypass_falsely(leerie):
     """The die() text is the operator's only instruction at that moment.
     It claims the gate has no bypass; that must stay true, and the text
-    now says so explicitly for `--resume`."""
+    now says so explicitly for `resume`."""
     import inspect
     src = inspect.getsource(leerie.phase_wiring_gate)
-    assert "--resume` does not bypass it" in src or (
-        "`--resume` does not bypass" in src), (
-        "the die() message must state that --resume re-runs the gate, "
+    assert "resume` does not bypass it" in src or (
+        "`resume` does not bypass" in src), (
+        "the die() message must state that resume re-runs the gate, "
         "since the pre-fix behaviour silently bypassed it")

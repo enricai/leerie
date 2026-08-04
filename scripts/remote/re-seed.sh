@@ -6,7 +6,7 @@
 # ("a second rsync of current laptop state into the task, user-triggered").
 # Only meaningful when there's a controlled moment to "pick" — i.e., after
 # a pause (Phase 2 sets paused_at + fly_machine_id in the sidecar) or when
-# the user explicitly invokes `leerie --re-seed <run-id>`.
+# the user explicitly invokes `leerie re-seed <run-id>`.
 #
 # Usage (invoked from the leerie launcher):
 #
@@ -120,8 +120,8 @@ re_seed() {
       printf '%s\n' "$remote_dirty" | head -10 >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
-      echo "  Inspect via: leerie --resume $LEERIE_RUN_ID --shell" >&2
-      echo "  Or bypass:   leerie --re-seed $LEERIE_RUN_ID --force" >&2
+      echo "  Inspect via: leerie resume $LEERIE_RUN_ID --shell" >&2
+      echo "  Or bypass:   leerie re-seed $LEERIE_RUN_ID --force" >&2
       return 1
     fi
   fi

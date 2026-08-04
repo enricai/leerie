@@ -12,7 +12,7 @@ anywhere. The script is the orchestrator; each `claude -p` call is a leaf.
 
 Usage:
     leerie "<task description>"
-    leerie --resume
+    leerie resume
     leerie "<task>" --answers answers.json
     leerie "<task>" --clarify             # opt into surfacing intent questions
 
@@ -66,7 +66,7 @@ SCRIPTS = ROOT / "scripts"
 def _read_version() -> str:
     """Single source of truth: `.claude-plugin/plugin.json`'s `version`
     field. Read at every `main()` invocation (the f-string in the
-    `--version` action evaluates eagerly), not at import time. The
+    `version` action evaluates eagerly), not at import time. The
     manifest is part of the distributed plugin, so a missing /
     malformed file means the install is broken and a clear runtime
     error is the right outcome."""
@@ -131,7 +131,7 @@ DEFAULT_CAPS = {
     # another budget (a self-graded axis that could borrow the confidence
     # budget is exactly the class of bug this change removes). Exhaustion is
     # *terminal*: the subtask returns `blocked` with the residual defects
-    # named (fix + --resume), never silently advisory. This is the
+    # named (fix + resume), never silently advisory. This is the
     # per-subtask analog of the plan-phase gates' die()-on-exhaustion, but
     # blocks a single subtask (partial-wave integration still proceeds,
     # DESIGN §3) rather than the whole run. Default 1: the found defects are
@@ -462,7 +462,7 @@ STATE_FIELDS = (
     # key holds the full `plans` list as it stood immediately after the
     # named phase completed and st.save()'d — never at phase entry (see
     # DESIGN's "current_phase alone is NOT a completion signal" warning).
-    # `--resume` walks this sequence in order and re-enters at the first
+    # `resume` walks this sequence in order and re-enters at the first
     # phase whose output key is absent, reusing the persisted `plans` as
     # that phase's input instead of re-deriving it. Absent for a phase
     # that has not yet completed (or on a run that has already reached
@@ -642,7 +642,7 @@ EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # from EXIT_NEEDS_ANSWERS=10 (deferred clarification) and from generic
 # `die()` exit code 1 so the Fly runtime's decide_teardown trap and
 # automation around it can route this case specifically. The error message
-# names a recommended `--max-workers` value. Not resumable: `--resume`
+# names a recommended `--max-workers` value. Not resumable: `resume`
 # re-enters past _schedule(), so the preflight has nothing to gate; a run
 # that died here re-runs from scratch with the recommended cap or a split
 # task.
@@ -650,7 +650,7 @@ EXIT_BUDGET_INFEASIBLE = 11
 
 # Emitted when State.__init__ cannot acquire the run-directory flock
 # because another orchestrator already owns this run. Lets the launcher
-# refuse `--resume` cleanly when an orchestrator is still alive,
+# refuse `resume` cleanly when an orchestrator is still alive,
 # instead of silently spawning a second one that would race on
 # state.json (DESIGN §6 *Single owner per run dir*). 75 aligns with
 # the BSD sysexits.h EX_TEMPFAIL convention.
@@ -660,7 +660,7 @@ EXIT_LOCKED = 75
 # reset time — chiefly the out-of-credits mid-stream kill, where the kill left
 # no `resetsAt` to compute a wake time from (DESIGN §6 *Rate-limited →
 # auto-resume*). We can't know when credits/limits refresh, so we poll: sleep a
-# short fixed interval and re-exec `--resume`. A premature retry (still limited)
+# short fixed interval and re-exec `resume`. A premature retry (still limited)
 # just re-hits the same clean pause and sleeps again — cheap, and bounded by the
 # persisted `max_total_workers` budget so a stuck run never runs away.
 RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
@@ -874,7 +874,7 @@ SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # one subtask), the FINAL-tree completeness gate in _run_final_conformance is
 # always-on and die()s the whole run — a single hallucinated defect on the
 # integrated tree would otherwise block finalize with no escape, and each
-# --resume re-attacks. This flag makes both the per-subtask and final-tree
+# resume re-attacks. This flag makes both the per-subtask and final-tree
 # completeness gates advisory (found defects surface as warnings, never block/
 # die). Use only when the operator knows the completeness judge is producing
 # false positives for this repo. Resolution order: --skip-completeness-check
@@ -2505,7 +2505,7 @@ class RateLimitedExit(BaseException):
         mid-stream kill (an exhaustion `overageDisabledReason`). This
         case does NOT auto-resume: out-of-credits has no reset clock (it
         clears on a top-up / billing cycle, not by waiting), so main()
-        does worktree-only cleanup, logs a --resume hint, and exits
+        does worktree-only cleanup, logs a resume hint, and exits
         EXIT_LOCKED. Looping a fixed backoff against it would only spin
         against the wall and burn the worker budget.
       - raw_message: str — the verbatim message text (or a synthesized
@@ -2513,7 +2513,7 @@ class RateLimitedExit(BaseException):
         surfaced to the user on exit.
 
     Three main() outcomes, keyed on (out_of_credits, reset_at):
-      - out_of_credits=True → pause-and-surface (EXIT_LOCKED, --resume).
+      - out_of_credits=True → pause-and-surface (EXIT_LOCKED, resume).
       - reset_at set → sleep to the reset moment, then auto-resume.
       - reset_at None (unparseable rate-limit) → fixed-backoff auto-resume.
 
@@ -2540,7 +2540,7 @@ class TerminalAuthFailure(BaseException):
     all — every retry fails identically, and the auth/quota backoff loop
     in claude_p() would burn its full `auth_retry_max_sec` budget for
     nothing. main()'s handler treats this the same as the out-of-credits
-    RateLimitedExit case: worktree-only cleanup, a --resume hint, and
+    RateLimitedExit case: worktree-only cleanup, a resume hint, and
     EXIT_LOCKED (state persists; a fresh login can pick the run back up).
     Inherits BaseException for the same reason as RateLimitedExit — it
     must propagate through asyncio's gather and broad `except Exception`
@@ -2587,7 +2587,7 @@ def _detect_session_limit(text: str) -> RateLimitedExit | None:
     than no sleep, so we only return a reset_at when every step of the
     parse succeeds (regex match, integer conversion of hour and minute,
     range checks on each, AM/PM normalization, ZoneInfo lookup).
-    Anything else → reset_at=None and the user gets a manual --resume
+    Anything else → reset_at=None and the user gets a manual resume
     instruction."""
     if not _SESSION_LIMIT_PREFIX.search(text):
         return None
@@ -3011,11 +3011,11 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
     additionally delete the run branch (`leerie/runs/<run-id>`) and
     every subtask branch (`leerie/subtasks/<run-id>/*`), and
-    recursively remove `st.run_dir`. The run is gone; `--resume` can't
+    recursively remove `st.run_dir`. The run is gone; `resume` can't
     recover it.
 
     If `full_purge` is False (SIGTERM/SIGHUP/exception): state.json and
-    the run branch are left intact so `--resume <id>` can
+    the run branch are left intact so `resume <id>` can
     continue the run. This is the conservative default for "external
     process killed me, user probably wants to recover.\""""
     if st is None or st.run_id is None:
@@ -3065,7 +3065,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             # while the old 30s timeout was still in place: cleanup
             # logged "failed", git later pruned the entry on its own
             # bookkeeping pass, and the surviving directory blocked
-            # `--resume`'s new-worktree.sh from re-creating the
+            # `resume`'s new-worktree.sh from re-creating the
             # worktree at the same path. Safe to rm because the path
             # is sandboxed under <state-root>/runs/<run-id>/worktrees/<sid>;
             # we re-check via .resolve() to make sure a symlink or
@@ -3149,7 +3149,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
     """Shared tail of the rate-limit auto-resume path (DESIGN §6 *Rate-limited
     → auto-resume*): worktree-only cleanup (state + run branch preserved),
     sleep `wait_seconds`, then `os.execv` the orchestrator into a fresh
-    `--resume` process.
+    `resume` process.
 
     Returns None when it does not return (the `os.execv` succeeded and replaced
     the process — unreachable code after it). Returns an **exit code** when the
@@ -3159,12 +3159,12 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
       - SIGTERM/SIGHUP during the sleep → 128 + signum (143 / 129)
       - `os.execv` itself failed (should-never-happen; e.g. ENOENT on the
         interpreter) → 75 (EX_TEMPFAIL) — state is preserved, so a manual
-        `--resume` recovers.
+        `resume` recovers.
     In every interrupted/failed case cleanup has already run, so state and the
-    run branch are intact for a manual `--resume`; the caller must NOT re-run
+    run branch are intact for a manual `resume`; the caller must NOT re-run
     cleanup (it leaves `abnormal=False`).
 
-    Cleanup runs BEFORE the sleep so the re-exec'd `--resume` finds a clean
+    Cleanup runs BEFORE the sleep so the re-exec'd `resume` finds a clean
     slate — `_cleanup_on_abnormal_exit` removes every worktree (git-registered
     AND orphaned dirs, then `git worktree prune`). That is a convenience, not
     the guarantee: cleanup cannot run when the process is SIGKILLed, so
@@ -3177,7 +3177,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
 
     We re-exec the orchestrator, not the launcher: the launcher is not baked
     into the container image and would try to spawn a new container. Re-execing
-    `$python $__file__ --resume --run-id <id>` gives a fresh worker budget and a
+    `$python $__file__ resume --run-id <id>` gives a fresh worker budget and a
     fresh asyncio loop; `worker_count` persists in state.json so the
     `max_total_workers` cap survives across re-exec."""
     try:
@@ -3185,14 +3185,14 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
     except BaseException as ce:
         log(f"  cleanup before sleep failed (non-fatal): {ce}")
     log(f"  {reason} — sleeping {wait_seconds}s then auto-resuming; "
-        f"Ctrl-C to stop and resume manually (leerie --resume {st.run_id})")
+        f"Ctrl-C to stop and resume manually (leerie resume {st.run_id})")
     try:
         time.sleep(wait_seconds)
     except KeyboardInterrupt:
         # User bailed on the wait — state + branches already preserved (cleanup
-        # ran above), so a manual --resume picks up cleanly.
+        # ran above), so a manual resume picks up cleanly.
         log("interrupted by user (SIGINT) during rate-limit sleep — state "
-            f"preserved (resume with leerie --resume {st.run_id})")
+            f"preserved (resume with leerie resume {st.run_id})")
         return 130
     except InterruptedBySignal as e:
         # SIGTERM/SIGHUP during the wait (CI cancel, systemd stop, terminal
@@ -3200,20 +3200,20 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
         # main()'s top-level InterruptedBySignal arm does, instead of letting it
         # escape uncaught (a sibling except can't catch it) as a bare traceback.
         log(f"  interrupted by signal ({e}) during rate-limit sleep — state "
-            f"preserved (resume with leerie --resume {st.run_id})")
+            f"preserved (resume with leerie resume {st.run_id})")
         signum = getattr(signal, str(e), None)
         return (128 + int(signum)) if signum else 1
-    log(f"  auto-resuming: exec orchestrator --resume {st.run_id}")
+    log(f"  auto-resuming: exec orchestrator resume {st.run_id}")
     try:
         os.execv(sys.executable,
-                 [sys.executable, __file__, "--resume", "--run-id", st.run_id])
+                 [sys.executable, __file__, "resume", "--run-id", st.run_id])
     except OSError as ex:
         # execv essentially never fails (the interpreter that's running us
         # exists), but if it does the exception would otherwise escape past the
         # sibling except arms as a bare traceback. Cleanup already ran, so fall
         # back to the manual-resume path with EX_TEMPFAIL.
         log(f"  auto-resume exec failed ({ex}); resume manually: "
-            f"leerie --resume {st.run_id}")
+            f"leerie resume {st.run_id}")
         return EXIT_LOCKED  # 75, EX_TEMPFAIL
     # Unreachable: a successful execv replaces the process.
     return None
@@ -3318,7 +3318,7 @@ def _validate_run_json(data: dict) -> None:
        (provision.sh writes the two together; the only way to violate
        this is external mutation).
 
-    Raises ValueError on any violation. Caller (e.g., `leerie --list`)
+    Raises ValueError on any violation. Caller (e.g., `leerie list`)
     decides whether to die, warn, or render as `status=corrupt-sidecar`."""
     if not isinstance(data, dict):
         raise ValueError("run.json must be a JSON object")
@@ -3363,7 +3363,7 @@ def _validate_run_json(data: dict) -> None:
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
-    # and the user is told to recover manually + then `leerie --kill`.
+    # and the user is told to recover manually + then `leerie kill`.
     # Orthogonal to paused/pushed/killed — the machine isn't paused or
     # killed, just has un-synced work — so no mutual exclusion with the
     # other terminal states. Mutex'd against pushed/killed (a synced+
@@ -3383,7 +3383,7 @@ def _validate_run_json(data: dict) -> None:
     if sync_failed_at is not None and fly_machine_id is None:
         raise ValueError(
             "run.json invariant: sync_failed_at is set but fly_machine_id is null; "
-            "the running machine needs a pointer for the user to recover via --finalize/--kill"
+            "the running machine needs a pointer for the user to recover via finalize/kill"
         )
     # `volume_id`: written by provision.sh when FLY_VM_DISK_GB is set.
     # The provision path always writes volume_id and fly_machine_id
@@ -3489,7 +3489,7 @@ def compose_pr_body(state: dict, run_id: str) -> str:
         f"{cost_line}"
         f"- Generated by [leerie{version_suffix}](https://github.com/enricai/leerie) on `{_or_na(working_branch)}`.\n"
         "\n"
-        f"Run `leerie --list` on the host that produced this PR to "
+        f"Run `leerie list` on the host that produced this PR to "
         f"locate full run state (state.json) for run ID `{run_id}`.\n"
     )
     preconditions = state.get("external_preconditions") or []
@@ -3550,8 +3550,8 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
     `state.json` (the orchestrator never wrote one — typically because
     `seed_auth` failed before `phase_classify` completed). These are
     returned with `_orphan=True` and `started_at` synthesized from
-    `fly-machine.json`, so `--list` shows them and `resolve_run_id`
-    accepts them for `--resume`. Without this, runs that died during
+    `fly-machine.json`, so `list` shows them and `resolve_run_id`
+    accepts them for `resume`. Without this, runs that died during
     the initial seed are invisible to both commands and the user has no
     way to recover them other than `ls <state-root>/runs/` + manual machine
     cleanup. (See plan file 2026-06-04 incident: 3 of 4 hung runs hid
@@ -3573,7 +3573,7 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
       with a default.
 
     Both shapes sort together by `started_at` descending (newest
-    first) for stable display in `leerie --list`.
+    first) for stable display in `leerie list`.
 
     Pure read; no writes. Returns [] if `leerie_root/runs` doesn't
     exist."""
@@ -3588,8 +3588,8 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
         if not state_path.is_file():
             # Orphan check: dir with fly-machine.json but no state.json
             # is a pre-classify failure (seed_auth aborted before the
-            # orchestrator wrote state.json). Surface it so `--list`
-            # and `--resume` can reach it. Skip if neither sidecar
+            # orchestrator wrote state.json). Surface it so `list`
+            # and `resume` can reach it. Skip if neither sidecar
             # exists — empty dirs are not runs.
             fly_path = entry / "fly-machine.json"
             if not fly_path.is_file():
@@ -3629,7 +3629,7 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
     return out
 
 
-# Derived statuses (see `_derive_run_status`) that bare `--resume` may
+# Derived statuses (see `_derive_run_status`) that bare `resume` may
 # auto-pick: the run has work left and no operator action is owed first.
 # `seed-failed` / `sync-failed` are resumable but deliberately excluded —
 # both need a human decision, so they are listed rather than chosen.
@@ -3641,7 +3641,7 @@ _AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
 def _run_status_for(run: dict, leerie_root: Path) -> str:
     """Derived status for a `_discover_runs` row.
 
-    Reads the run.json sidecar (same source `leerie --list` consults) and
+    Reads the run.json sidecar (same source `leerie list` consults) and
     hands it to `_derive_run_status` alongside the state.json dict the
     discovery already parsed. Falls back to state.json alone when the
     sidecar is missing or unreadable — status is best-effort UX here, not
@@ -3688,14 +3688,14 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
       when the choice is empty.
 
     `resumable_only` narrows the auto-pick to runs that actually have work
-    left (`_AUTO_RESUMABLE_STATUSES`). `--resume` passes it: a finished run
+    left (`_AUTO_RESUMABLE_STATUSES`). `resume` passes it: a finished run
     has nothing to resume, and `seed-failed` / `sync-failed` need operator
     attention first, so both are listed rather than chosen. Read-only
     consumers (`--report`, `--phase`) do NOT pass it — reporting on a
     completed run is the normal case, and filtering it out would break
     `leerie --report` on a repo whose only run has finished.
 
-    Auto-picking a live run is safe for `--resume`: the run dir's flock
+    Auto-picking a live run is safe for `resume`: the run dir's flock
     rejects a second orchestrator (DESIGN §6 *Single owner per run dir*),
     surfacing as "already running" rather than a double-drive."""
     runs = _discover_runs(leerie_root)
@@ -3706,7 +3706,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
             f"run-id {cli_run_id!r} does not match any known run. "
-            f"Available: {available}. Use `leerie --list` to enumerate."
+            f"Available: {available}. Use `leerie list` to enumerate."
         )
     if not runs:
         die(
@@ -3724,7 +3724,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
         die(
             "no resumable run found (every run is finished, killed, or needs "
             "attention first). Pass an explicit run-id to force one:\n  "
-            f"{available}\nUse `leerie --list` to see full details."
+            f"{available}\nUse `leerie list` to see full details."
         )
     candidates.sort(key=lambda r: _run_recency_key(r, leerie_root))
     picked = candidates[-1]
@@ -3742,10 +3742,10 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
     """Build the per-row hint string for `resolve_run_id`'s
     multiple-runs error message. Combines run_id, derived status,
     started_at, and a last-activity time so the user can tell which
-    run is live without an extra `leerie --list` invocation.
+    run is live without an extra `leerie list` invocation.
 
     Reads run.json from disk for `_derive_run_status` (same source
-    `leerie --list` consults). Falls back gracefully when sidecar or
+    `leerie list` consults). Falls back gracefully when sidecar or
     state.json is unreadable — disambiguation is best-effort UX, not
     a correctness boundary."""
     run_id = run["run_id"]
@@ -3768,7 +3768,7 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
             # ValueError/OverflowError: pathological mtime (NaN, inf) that
             # _format_age's int() would reject. Both are extremely unlikely
             # in practice; this is defense-in-depth so a one-in-a-million
-            # filesystem quirk can't crash --resume startup.
+            # filesystem quirk can't crash resume startup.
             pass
     return (f"{run_id}  status={status}  started={started}  "
             f"last-activity={last_activity}")
@@ -3776,7 +3776,7 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
 
 def _format_age(seconds: float) -> str:
     """Render a duration in seconds as a short human-friendly age:
-    "5s", "3m", "47m", "2h12m", "1d4h", "5d". Used by the --resume
+    "5s", "3m", "47m", "2h12m", "1d4h", "5d". Used by the resume
     disambiguation hint to show how stale each in-flight run is."""
     if seconds < 0:
         seconds = 0
@@ -3794,11 +3794,11 @@ def _format_age(seconds: float) -> str:
     return f"{d}d{h}h ago" if h else f"{d}d ago"
 
 
-# --- run status (consumed by `leerie --list`) -------------------------
+# --- run status (consumed by `leerie list`) -------------------------
 
 # The derived statuses returned by `_derive_run_status`. Status is
 # *derived* from run.json + state.json fields, not stored, so the value
-# rendered by --list is always consistent with the actual on-disk state.
+# rendered by list is always consistent with the actual on-disk state.
 #
 # `seed-failed` is special: it covers run dirs that have a
 # fly-machine.json (machine was provisioned) but no state.json (the
@@ -3828,7 +3828,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
 
     Status is the run's lifecycle dimension; runtime (local vs fly) is a
     separate axis surfaced via `fly_machine_id` and filtered with
-    `--list --runtime <local|fly>`.
+    `list --runtime <local|fly>`.
 
     Order of checks matters — earlier checks fire first:
       0. state_json["_orphan"] set → `seed-failed` (synthesized by
@@ -3843,7 +3843,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       5. pushed_at set             → `done-pushed-no-pr`.
       6. sync_failed_at set        → `sync-failed` (machine still up, work
                                      not on host yet — recover via
-                                     `leerie --finalize` then `--kill`).
+                                     `leerie finalize` then `kill`).
       6½. finished_at set but
           completed_waves <
           len(waves), and no
@@ -3854,8 +3854,8 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
                                      DESIGN §6 *finished_at is a discovery
                                      sentinel, not a completion signal*.
       7. finished_at set           → `done` (run completed, --no-push).
-      8. killed_at set             → `killed` (explicit --kill).
-      9. paused_at set             → `paused` (pause-on-failure or --stop).
+      8. killed_at set             → `killed` (explicit kill).
+      9. paused_at set             → `paused` (pause-on-failure or stop).
      10. otherwise                 → `in-progress`.
 
     Precedence note: push/PR errors fire before the paused/killed checks
@@ -3894,7 +3894,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     # SystemExit handler on a mid-wave abort, NOT a real completion (DESIGN
     # §6 *finished_at is a discovery sentinel, not a completion signal*). A
     # run whose waves are not all integrated is `incomplete`, not `done`,
-    # so --list doesn't mislabel it and finalize doesn't push a partial
+    # so list doesn't mislabel it and finalize doesn't push a partial
     # branch. killed_at/paused_at take precedence (an explicitly
     # stopped/killed run is not "incomplete" in the resumable sense).
     if rj.get("finished_at") and not rj.get("killed_at") and not rj.get("paused_at"):
@@ -3986,7 +3986,7 @@ def _list_runs(
     runtime_filter: str | None = None,
 ) -> None:
     """Render a sortable columnar table of runs to stdout. Used by
-    `leerie --list`. Reads run.json sidecar (commit 4) for status
+    `leerie list`. Reads run.json sidecar (commit 4) for status
     derivation; falls back to state.json fields for runs without a
     sidecar.
 
@@ -4892,7 +4892,7 @@ def resolve_strict_conformer(repo_root: Path, cli_value: bool) -> bool:
     When True, conformer residuals (failed build/lint/test axes or
     unresolved rule violations) cause the subtask to return status
     'blocked' instead of surfacing as advisory warnings. The run can
-    be resumed with --resume after the user fixes the residuals."""
+    be resumed with resume after the user fixes the residuals."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=STRICT_CONFORMER_ENV,
@@ -4984,7 +4984,7 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
     surface as warnings but never re-drive the implementer, block a subtask, or
     die() the final-tree pass. Off by default; use only when the operator knows
     the completeness judge is misfiring for this repo (e.g. a hallucinated
-    defect on the integrated tree is blocking finalize on every --resume)."""
+    defect on the integrated tree is blocking finalize on every resume)."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COMPLETENESS_CHECK_ENV,
@@ -8296,7 +8296,7 @@ def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     `check_branch_has_commits` correctly fails the subtask.
 
     Why a soft drop and not `die()`: a hard fail here is unrecoverable
-    via `--resume`. The resume branch in `_run_phases` does not re-run
+    via `resume`. The resume branch in `_run_phases` does not re-run
     `phase_plan` or this filter, and `state.json["waves"]` is only
     written by `_write_plan` which runs after `_schedule()`. Soft drop
     matches the existing `_warn_cross_planner_file_overlap` pattern at
@@ -8382,7 +8382,7 @@ async def _filter_satisfied_subtasks(
 
     Soft drop, not `die()`: same resume-safety reasoning as
     `_filter_offtree_subtasks` — the drop happens on the plan→_schedule
-    path that `--resume` does not re-run, and `state.json["waves"]` is
+    path that `resume` does not re-run, and `state.json["waves"]` is
     only written by `_write_plan` after `_schedule()`, so a surviving-only
     plan is what gets persisted. The gate is advisory and subordinate to
     the mechanical `check_branch_has_commits` backstop (§12): a
@@ -13130,7 +13130,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # was seen (overage_blocked) and the CLI was terminated before
         # emitting a result event. This is a credit condition, not a worker
         # fault — raise RateLimitedExit(out_of_credits=True) so main()'s
-        # handler pauses-and-surfaces (worktree cleanup + --resume hint +
+        # handler pauses-and-surfaces (worktree cleanup + resume hint +
         # EXIT_LOCKED) rather than the auto-resume path: out-of-credits has
         # no reset clock, so looping a fixed backoff would spin against the
         # wall. A bare WorkerError would instead bypass the auth/quota
@@ -13594,7 +13594,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     so the `Read`/`Grep`/`Glob` sandbox and the allowlisted `Bash` verbs can
     reach sibling repos referenced in the task description. Resolved by
     `resolve_inspect_dirs()` and persisted under `st.data["inspect_dirs"]`
-    so `--resume` honors the original choice.
+    so `resume` honors the original choice.
     """
     # Drift guard: typos in `schema_key` would write orphan rows into
     # calls.ndjson (judge/heal filter by call_type, so an orphan is
@@ -13924,7 +13924,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                             "Claude API connection dropped mid-response "
                             f"after ~{auth_retry_max_sec}s of retries — a "
                             "transient network/gateway transport error. Run "
-                            "--resume to retry.")
+                            f"`leerie resume {st.run_id}` to retry.")
                     # A 529 is transient gateway overload, not a subscription
                     # cap — don't misattribute it. 401/429 (and the text-marker
                     # path) stay on the rolling-usage-cap message.
@@ -13933,12 +13933,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                             "Claude API returned an overloaded (529) error "
                             f"after ~{auth_retry_max_sec}s of retries — the "
                             "Anthropic gateway is under transient load. Run "
-                            "--resume to retry.")
+                            f"`leerie resume {st.run_id}` to retry.")
                     raise WorkerError(
                         "Claude API returned auth/quota error after "
                         f"~{auth_retry_max_sec}s of retries — your Claude "
                         "Code subscription likely hit its rolling usage "
-                        "cap. Run --resume once the window clears.")
+                        f"cap. Run `leerie resume {st.run_id}` once the "
+                        "window clears.")
 
             if envelope.get("is_error"):
                 last_problem = str(envelope.get("api_error_status")
@@ -14083,7 +14084,7 @@ class StateLockedError(Exception):
     The handler at the orchestrator entry point converts this into an
     EXIT_LOCKED process exit; the launcher's rc=75 pivot then attaches
     the user to the live orchestrator's log stream via the smart
-    `--resume` router (DESIGN §6 *Single owner per run dir*, *Smart
+    `resume` router (DESIGN §6 *Single owner per run dir*, *Smart
     resume in remote mode*)."""
 
     def __init__(self, run_dir: Path):
@@ -14215,7 +14216,7 @@ class State:
         if count > caps["max_total_workers"]:
             raise WorkerError(
                 f"worker budget exhausted ({caps['max_total_workers']}). "
-                "State saved; re-run with --resume after raising --max-workers."
+                "State saved; re-run with resume after raising --max-workers."
             )
 
     def add_telemetry(self, envelope: dict) -> None:
@@ -15790,7 +15791,7 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
 def _absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
     """Merge --answers FILE into st.data['answers'] and propagate the
     update to existing subtask spec files. Safe to call on both initial
-    runs and on --resume; a no-op when --answers is not set.
+    runs and on resume; a no-op when --answers is not set.
 
     The reason this is its own helper, separate from `gather_answers`,
     is that the latter runs the classifier-question collection flow
@@ -15973,7 +15974,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     worker runs installs in its own worktree against the shared
     cache instead (DESIGN §6½ "Worker-driven install").
 
-    Skipped on `--resume` when `provision.recipe` is already persisted
+    Skipped on `resume` when `provision.recipe` is already persisted
     (checked by key presence, not truthiness — an empty recipe is a
     valid completed state) — see the resumable-planning re-entry
     pipeline in `_run_phases` (DESIGN §6).
@@ -16003,7 +16004,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     if override is not None:
         log(f"  synthesized mise override at {override.name} "
             f"(go.mod → .go-version equivalent)")
-    # Persist so a `--resume` after this point can re-export the env
+    # Persist so a `resume` after this point can re-export the env
     # var (_orchestrate() re-reads provision state on resume).
     prov["override_file"] = str(override) if override is not None else None
     st.save()
@@ -21098,7 +21099,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "to the plan, or refine the task so the cross-subtask dependencies "
             "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
             "bypass this gate — it only skips the phase 2¾ overlap judge, which "
-            "runs earlier and independently. `--resume` does not bypass it "
+            "runs earlier and independently. `resume` does not bypass it "
             "either: the gate re-runs until it passes, since its skip is keyed "
             "on a verdict this run never reached.)"
         )
@@ -21556,7 +21557,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     launcher polls `finished_at` as the "ready to push" sentinel, and
     there is no run branch to push (none was materialized). `_derive_
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
-    and renders the run as `done` in `leerie --list`.
+    and renders the run as `done` in `leerie list`.
 
     Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
     fail its non-empty-branch check and `cleanup.sh` has no subtask
@@ -22253,7 +22254,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     # shared file. Surface the range explicitly so the implementer stays inside
     # it — a sibling owns the rest of the same file, and edits outside the range
     # risk an integration conflict the sibling would otherwise own cleanly. Read
-    # from the on-disk spec (same source the worker reads) so --resume is
+    # from the on-disk spec (same source the worker reads) so resume is
     # identical to a fresh run.
     region_section = _format_owned_region_section(leerie_dir, sid)
     if region_section is not None:
@@ -23525,7 +23526,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     if caps.get("strict_conformer"):
         # A clobber blocks even when the conformer's own BLT/residuals are
         # clean: it was rolled back above, but strict mode must surface it
-        # for the operator (fix + --resume), not silently complete.
+        # for the operator (fix + resume), not silently complete.
         if clobbered_files:
             blocked_reason = (
                 "strict-conformer: conformer reverted/deleted "
@@ -23643,7 +23644,7 @@ async def _capture_conformance_baseline(
     capture is logged and the run proceeds with no baseline (the conformer
     then falls back to its prior self-judgment). Idempotent: the presence
     of `st.data["conformance"]["_baseline"]` is the completion sentinel, so
-    `--resume` does not re-run it.
+    `resume` does not re-run it.
 
     A RED base is surfaced loudly (a `log()` warning + a
     `run.json.health.base_suite` record) because it usually means leerie's
@@ -23793,7 +23794,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         return
     # Resume idempotence: phase_execute is gated on `completed_waves`
     # but the final pass leaves no per-round sentinel of its own. On
-    # `--resume` after this pass already recorded a result, re-running
+    # `resume` after this pass already recorded a result, re-running
     # would burn worker budget and could overwrite a clean result with
     # a different one. The presence of `_final` in `st.data["conformance"]`
     # is the completion sentinel.
@@ -23985,10 +23986,10 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # working branch; actionable solution_defects gate INDEPENDENT of
     # --strict-conformer (the build/lint/test/clobber residuals below stay
     # strict-only). There is no implementer to re-drive here — every wave has
-    # integrated — so a surviving gap is terminal: die() (fix + --resume),
+    # integrated — so a surviving gap is terminal: die() (fix + resume),
     # matching the strict final_blocked die. --skip-completeness-check demotes
     # this to advisory (a hallucinated defect on the integrated tree would
-    # otherwise block finalize with no escape, re-attacking on every --resume).
+    # otherwise block finalize with no escape, re-attacking on every resume).
     final_defects = _actionable_solution_defects(last_res)
     if final_defects and st.data.get("skip_completeness_check"):
         warnings.append(
@@ -24017,12 +24018,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             for d in final_defects[:3])
         die(f"completeness gate: final-tree conformance found "
             f"{len(final_defects)} unhandled case(s) in the integrated diff: "
-            f"{summary}; run blocked. Fix and --resume.")
+            f"{summary}; run blocked. Fix and resume.")
     if final_blocked:
         why = (f"conformer reverted/deleted integrated file(s): "
                f"{clobbered_files}" if clobbered_files else "has residuals")
         die(f"strict-conformer: final-tree conformance {why}; "
-            "run blocked. Fix and --resume.")
+            "run blocked. Fix and resume.")
 
 
 async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
@@ -24240,7 +24241,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # against HEAD before failing. A retry would only reproduce the
                 # same no-op (the work exists on the branch it is measured
                 # against), exhaust the cap, and kill the wave — a deterministic
-                # loop across --resume. The probe fails safe to None, so a
+                # loop across resume. The probe fails safe to None, so a
                 # genuine lazy no-op still falls through to the retry path.
                 drop = await _probe_criteria_satisfied_on_head(
                     subtask, worktree, st, caps, models, efforts)
@@ -24412,7 +24413,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                         f"[{d.get('kind')}] {(d.get('where') or '').strip()}: "
                         f"{(d.get('concrete_case') or '').strip()}"
                         for d in solution_defects[:3])
-                    + " (fix + --resume)")
+                    + " (fix + resume)")
                 log(f"  {sid}: {blocker}")
                 st.data.setdefault("subtask_status", {})[sid] = "blocked"
                 st.save()
@@ -24606,7 +24607,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       the abort — `git merge --abort` destroys it otherwise, and it is the
       most expensive artifact in the run to recreate. `blocked[sid]` is
       recorded and the die message names the ref and its recovery command;
-      `--resume` retries the integration."""
+      `resume` retries the integration."""
     integrated, integrated_so_far = [], []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:
@@ -24623,7 +24624,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # Spawning an integrator against a missing worktree fails in
             # confusing ways, so abort here with the script's own message.
             # Save state first (local convention — see the two neighboring
-            # die() sites below) so `--resume` can pick up what was done.
+            # die() sites below) so `resume` can pick up what was done.
             reason = (f"integrate.sh precondition failure: "
                       f"{proc.stderr.strip() or proc.stdout.strip() or 'no message'}")
             st.data.setdefault("blocked", {})[sid] = reason
@@ -24698,7 +24699,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 "\nIt crashed before resolving anything; there was "
                 "nothing to rescue.")
             die(f"integrator for {sid} crashed; merge aborted.{hint}\n"
-                f"Re-run with --resume to retry the integration.")
+                f"Re-run with resume to retry the integration.")
         for w in int_warnings:
             log(f"  integrator-{sid}: {w}")
         if ires.get("status") == "resolved":
@@ -24710,7 +24711,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 await run_proc(["git", "merge", "--abort"], cwd=str(staging))
                 die(f"integrator for {sid} returned 'resolved' but {merge_err}. "
                     f"The merge was aborted; {_compute_run_branch(st.run_id)} "
-                    "is clean. Resolve and re-run with --resume.")
+                    "is clean. Resolve and re-run with resume.")
             commit_err = await check_integrator_commit(staging)
             if commit_err:
                 # non-fatal: log and record, but don't undo the integration
@@ -24827,7 +24828,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                         f"broken. The merge has been committed to staging. Either "
                         f"revert it manually and resolve the conflict differently, "
                         f"or accept the finding and revise one of the conflicting "
-                        f"subtasks' approaches, then re-run with --resume."
+                        f"subtasks' approaches, then re-run with resume."
                     )
 
             integrated.append(sid)
@@ -24848,7 +24849,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 f"{_compute_run_branch(st.run_id)} is intact at the last "
                 f"good wave. Resolve the conflict between {sid} and "
                 f"the already-integrated subtasks manually, then re-run with "
-                f"--resume.")
+                f"resume.")
     return integrated
 
 
@@ -24875,7 +24876,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # Base-tree health baseline (DESIGN §9): staging now exists off the
     # base HEAD and no wave has mutated it yet, so this is the earliest
     # accurate snapshot. Advisory + idempotent (sentinel-guarded), so it
-    # runs once on the fresh path and is skipped on --resume. Opt-out via
+    # runs once on the fresh path and is skipped on resume. Opt-out via
     # skip_base_baseline (the full-suite-run cost).
     if not st.data.get("skip_base_baseline"):
         try:
@@ -24898,9 +24899,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     start = st.data.get("completed_waves", 0)
     for wi in range(start, len(waves)):
         wave = waves[wi]
-        # On --resume, skip subtasks already completed in a prior
+        # On resume, skip subtasks already completed in a prior
         # invocation.  Failed/blocked subtasks are retried — that is
-        # the point of --resume.
+        # the point of resume.
         prior = st.data.get("subtask_status", {})
         remaining = [sid for sid in wave if prior.get(sid) != "complete"]
         if not remaining:
@@ -24962,7 +24963,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         if marker_err:
             die(f"wave {wi + 1}: {marker_err}\n"
                 f"Resolve manually in {staging_path}, commit, "
-                "then re-run with --resume.")
+                "then re-run with resume.")
 
         if blocked:
             if integrated:
@@ -24972,7 +24973,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                                   or results[s].get("summary") for s in blocked}
             st.save()
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {st.path}; resolve and re-run with --resume.")
+                f"See {st.path}; resolve and re-run with resume.")
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
@@ -24988,7 +24989,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # rather than advance `completed_waves` onto an un-integrated wave.
         # `blocked` is already empty at this point (the guard above die()s
         # otherwise), so a shortfall here is a genuine invisible skip, not a
-        # reported failure. No `blocked` entry is recorded: `--resume` retries
+        # reported failure. No `blocked` entry is recorded: `resume` retries
         # this wave via `completed_waves` (which the gate leaves un-advanced),
         # not via reading `blocked`, and no consumer reads a wave-level blocked
         # key — the die() message is the complete diagnostic. (Contrast the
@@ -25001,7 +25002,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                 f"integration silently skipped {expected - len(integrated)} "
                 f"subtask(s); refusing to advance onto an un-integrated wave. "
                 f"The subtask work is on the leerie/subtasks/{st.run_id}/* "
-                f"branches; re-run with --resume to retry integration.")
+                f"branches; re-run with resume to retry integration.")
 
         st.data["completed_waves"] = wi + 1
         st.save()
@@ -25565,7 +25566,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     completed = st.data.get("completed_waves", 0)
     if isinstance(waves, list) and completed < len(waves):
         die(f"refusing to finalize: only {completed} of {len(waves)} waves "
-            f"complete. Resume to finish: leerie --resume {st.run_id}")
+            f"complete. Resume to finish: leerie resume {st.run_id}")
     proc = await _run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
@@ -25575,12 +25576,12 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # were stamped *before* finalize.sh (as it was until this fix), a
     # died finalize would leave state byte-identical to a successful one
     # — `finished_at` + `current_phase == "phase 6: finalize"` — and the
-    # `--resume` completion guard (in _run_phases) would declare the run
+    # `resume` completion guard (in _run_phases) would declare the run
     # "already completed" and hand the host launcher an empty run branch
     # to push (which then fails at `gh pr create` with "No commits between
     # ..."). Stamping here keeps a died finalize resumable: `current_phase`
     # stays at its pre-finalize value, the resume guard falls through, and
-    # `--resume` re-enters finalize to re-run finalize.sh's non-empty check.
+    # `resume` re-enters finalize to re-run finalize.sh's non-empty check.
     st.data["current_phase"] = "phase 6: finalize"
     st.save()
     await _run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
@@ -25793,7 +25794,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
         log(f"per-worker logs: {st.run_dir / 'logs'}/")
         # A successfully finalized run must not re-execute phases 4→5→6.
-        # Without this guard, `--resume` on a completed run re-runs
+        # Without this guard, `resume` on a completed run re-runs
         # setup-run.sh + finalize.sh + cleanup.sh, creating a window
         # where a concurrent decide_teardown (from the prior exit's
         # launcher child) can race with the second orchestrator and
@@ -25834,7 +25835,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "cannot resume — state.json has no recorded progress at "
                 "all (not even phase_classify started). This state.json "
                 "is likely corrupt or was hand-edited; inspect it under "
-                f"{st.run_dir} or re-run without --resume."
+                f"{st.run_dir} or re-run without resume."
             )
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
@@ -25870,7 +25871,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
         # mid-execution) is: get a pending-*.json, write an answers
-        # file, re-run with --resume --answers <file>. Without this
+        # file, re-run with resume --answers <file>. Without this
         # call the answers file was silently dropped — the re-spawned
         # worker would re-ask the same question forever. See P5-1.
         _absorb_supplied_answers(args, st, leerie_dir)
@@ -25886,7 +25887,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     if args.answers else None)
     else:
         if not args.task:
-            die("a task description is required (or use --resume)")
+            die("a task description is required (or use resume)")
         task = resolve_task_argument(args.task)
         st.data = {"task": task, "started_at": now(), "worker_count": 0,
                    "source_of_truth_pref": sot_pref,
@@ -25919,13 +25920,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         no_push=getattr(args, "no_push", False))
         # Start-of-run multi-token selection (DESIGN §6 *Multi-token
         # rotation*) — a no-op when CLAUDE_CODE_OAUTH_TOKENS is unset.
-        # Fresh-run only: on --resume, active_oauth_token (if any) is
+        # Fresh-run only: on resume, active_oauth_token (if any) is
         # already persisted in st.data from the original run.
         await _select_active_oauth_token(st, caps)
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
 
-    # From here on, fresh run and `--resume` share one pipeline: every
+    # From here on, fresh run and `resume` share one pipeline: every
     # step below is guarded by "has this phase's output already been
     # persisted?" (DESIGN §6 "Resumable planning — a per-phase checkpoint
     # cursor, not a `waves` gate"), so a fresh run (nothing persisted)
@@ -25944,7 +25945,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 log(f"run id: {st.run_id}")
                 # Initialize run.json with the immutable run-identity
                 # fields (run_id, branch, working_branch, pr_base_branch,
-                # started_at, task) so `leerie --list` can enumerate this
+                # started_at, task) so `leerie list` can enumerate this
                 # run from the moment it has a stable identity — not only
                 # after finalize. Only needed once — a resumed run that
                 # reaches here (paused before phase_classify completed)
@@ -25997,7 +25998,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # does not exist yet at this point in the pipeline
             # (phase_classify produces categories, not a plan) — the empty
             # list is the accurate "this phase's output is safely
-            # persisted" marker that --resume treats as proof phase_classify
+            # persisted" marker that resume treats as proof phase_classify
             # need not be re-invoked.
             st.data["plans_after_classify"] = []
             st.save()
@@ -26044,7 +26045,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-recursive-decompose
-            # `plans`, persisted so --resume can skip re-invoking
+            # `plans`, persisted so resume can skip re-invoking
             # phase_plan (DESIGN §6).
             st.data["plans_after_plan"] = copy.deepcopy(plans)
             st.save()
@@ -26097,7 +26098,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             plans = await phase_overlap_judge(
                 plans, task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-collision-resolution
-            # `plans`, persisted so --resume can skip re-invoking
+            # `plans`, persisted so resume can skip re-invoking
             # phase_overlap_judge (DESIGN §6 *Cross-domain surface
             # overlap*).
             st.data["plans_after_overlap_judge"] = copy.deepcopy(plans)
@@ -26121,7 +26122,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             plans = await phase_adherence_gate(
                 plans, task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-instruction-adherence-
-            # gate `plans`, persisted so --resume can skip re-invoking
+            # gate `plans`, persisted so resume can skip re-invoking
             # phase_adherence_gate (DESIGN §6).
             st.data["plans_after_adherence_gate"] = copy.deepcopy(plans)
             st.save()
@@ -26139,7 +26140,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             plans = await phase_planning_coverage_gate(
                 plans, task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-task-coverage-gate
-            # `plans`, persisted so --resume can skip re-invoking
+            # `plans`, persisted so resume can skip re-invoking
             # phase_planning_coverage_gate (DESIGN §6).
             st.data["plans_after_coverage_gate"] = copy.deepcopy(plans)
             st.save()
@@ -26213,7 +26214,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # spec files and seeds the execution scaffolding, which would
             # make a failed run look half-executable (and the budget
             # preflight below exists precisely to avoid writing those for
-            # a run that cannot win). `--resume` reads this back (DESIGN
+            # a run that cannot win). `resume` reads this back (DESIGN
             # §6 "Budget-check resume") when the run stopped between here
             # and _write_plan().
             st.data["plan_snapshot"] = {"subtasks": subtasks, "waves": waves}
@@ -26250,7 +26251,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # The resume skip is keyed on `wiring_gate` — written ONLY when the
         # gate passes — not on `plan_snapshot`. The snapshot is written a
         # few lines above, BEFORE the gate runs, so it is present even when
-        # the gate die()d; keying the skip on it made `--resume` a silent
+        # the gate die()d; keying the skip on it made `resume` a silent
         # bypass of a gate the run had already failed (run 3a4abba3 reached
         # phase_execute with zero gate invocations, executing the very plan
         # the gate rejected). A clean-pass resume still skips, since
@@ -26280,7 +26281,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # and a recommended --max-workers; opt-out via
         # --skip-budget-check. Once plans are checkpointed per phase
         # (above), a run that stops here IS resumable via plan_snapshot
-        # (DESIGN §6 "Budget-check resume") — the next --resume
+        # (DESIGN §6 "Budget-check resume") — the next resume
         # rehydrates subtasks/waves above and re-runs only this check,
         # rather than dying "Plans are not persisted".
         check_budget_feasibility(st, caps, subtasks, waves)
@@ -26349,10 +26350,14 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 launcher verbs (handled before the container starts):
-  --stop <run-id>       pause a remote Fly machine (resumable via --resume)
-  --kill <run-id>       destroy a remote machine permanently (--force skips prompt)
-  --finalize <run-id>   post-detach finalization (--force/--no-verify/--no-push)
-  --re-seed <run-id>    mid-run host-to-machine re-rsync (--force bypasses safety)
+  resume [run-id]       resume an interrupted run (auto-picks the most recent
+                         resumable run under <state-root>/runs/ if omitted)
+  list                  enumerate in-flight and completed runs (--status STATE
+                         restricts to a derived status; exits without running)
+  stop <run-id>         pause a remote Fly machine (resumable via resume)
+  kill <run-id>         destroy a remote machine permanently (--force skips prompt)
+  finalize <run-id>     post-detach finalization (--force/--no-verify/--no-push)
+  re-seed <run-id>      mid-run host-to-machine re-rsync (--force bypasses safety)
   --shell               drop into bash on resume instead of tailing the log
   --auto-finalize       auto-finalize on clean orchestrator exit during resume
   --no-re-seed          skip auto-reseed on resume
@@ -26363,35 +26368,23 @@ launcher verbs (handled before the container starts):
   --local-build         force local image build (not Fly remote builder)
 
 chain verbs (launcher fast-paths — no container started):
-  --chain-submit        submit a multi-run chain (--wave <files> ...)
-  --chain-status <id>   print a chain snapshot
-  --list-chains         list all chains
-  --chain-kill <id>     cancel a chain and destroy its machines
-  --chain-attach <id>   fetch a chain's event log
+  chain                 submit a multi-run chain (--wave <files> ...)
+  status <id>           print a chain or group snapshot
+  list                  list all runs/chains/groups
+  kill <id>             cancel a chain and destroy its machines
+  attach <id>           fetch a chain's event log
 
 See README.md "Launcher verbs" for full details and sub-flags.""")
-    ap.add_argument("--version", action="version",
-                    version=f"leerie {_read_version()}",
-                    help="print the leerie version and exit")
     ap.add_argument("task", nargs="?",
                     help="the task to execute (literal string, or path to "
                          "a .txt/.md file whose contents are the task)")
-    ap.add_argument("--resume", action="store_true",
-                    help="resume an interrupted run (auto-picks the most "
-                         "recent resumable run under <state-root>/runs/; "
-                         "pass a run-id to choose a specific one). "
-                         "Default: off (start a new run)")
     ap.add_argument("--run-id", metavar="ID",
-                    help="select a specific run by id (for --resume when "
-                         "multiple runs are in flight). See `--list` to "
+                    help="select a specific run by id (for `resume` when "
+                         "multiple runs are in flight). See `list` to "
                          "enumerate.")
-    ap.add_argument("--list", action="store_true", dest="list_runs",
-                    help="enumerate in-flight and completed runs in this "
-                         "repository (run id, started, status, branch). "
-                         "Exits without running _orchestrate. Default: off")
     ap.add_argument("--status", metavar="STATE", dest="status_filter",
                     choices=RUN_STATUSES,
-                    help=f"with --list, restrict the table to runs whose "
+                    help=f"with `list`, restrict the table to runs whose "
                          f"derived status matches STATE. One of: "
                          f"{', '.join(RUN_STATUSES)}.")
     ap.add_argument("--report", metavar="RUN_ID", nargs="?",
@@ -26400,7 +26393,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "token/cost/latency/failure breakdown plus memory "
                          "peak. Pass a run id, or omit it to auto-pick when "
                          "exactly one run exists. Exits without running "
-                         "_orchestrate. See `--list` to enumerate.")
+                         "_orchestrate. See `list` to enumerate.")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--clarify", action="store_true",
@@ -26587,7 +26580,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "implementer, block a subtask, or die() the "
                          "final-tree pass. Use when a false-positive "
                          "completeness defect is blocking finalize on every "
-                         "--resume. "
+                         "resume. "
                          f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
                          "skip_completeness_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
@@ -26616,7 +26609,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "residuals (failed build/lint/test, unresolved rule "
                          "violations) cause the subtask to return 'blocked' "
                          "instead of surfacing as advisory warnings. Resume "
-                         "with --resume after fixing. "
+                         "with resume after fixing. "
                          f"Also {STRICT_CONFORMER_ENV} env or "
                          "strict_conformer in leerie.toml. Default: off.")
     ap.add_argument("--skip-base-baseline", action="store_true",
@@ -26772,9 +26765,23 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "group_id behaves identically to a standalone run "
                          "otherwise. See DESIGN.md §20 and IMPLEMENTATION.md "
                          "'Run-group verbs'.")
-    args = ap.parse_args()
 
-    # --list short-circuits everything else: read <state-root>/runs/* and
+    # `resume` and `list` are bare leading verbs (git-style), not `--flag`s —
+    # they occupy the same argv[1] slot the launcher's own `case "${1:-}"`
+    # dispatch uses. argparse's `task` positional would otherwise swallow
+    # the bare word as a literal task string, so pop it off before parsing
+    # and record it as a plain bool, exactly like the launcher already
+    # does for its own verbs. Never rewritten into a `--flag` anywhere.
+    argv = sys.argv[1:]
+    is_resume = bool(argv) and argv[0] == "resume"
+    is_list = bool(argv) and argv[0] == "list"
+    if is_resume or is_list:
+        argv = argv[1:]
+    args = ap.parse_args(argv)
+    args.resume = is_resume
+    args.list_runs = is_list
+
+    # list short-circuits everything else: read <state-root>/runs/* and
     # exit. No git/CLI checks needed; the user might be inspecting runs
     # from outside a git repo.
     if args.list_runs:
@@ -26786,7 +26793,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         )
         return
 
-    # --report is a read-only telemetry verb; like --list it exits without
+    # --report is a read-only telemetry verb; like list it exits without
     # running _orchestrate. `const=""` (nargs="?") means the flag was passed
     # with no inline id → resolve_run_id auto-picks the sole run.
     if getattr(args, "report", None) is not None:
@@ -26875,16 +26882,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st = State(leerie_root, run_id, repo_root=repo_root)
     except StateLockedError as e:
         # Another orchestrator already owns this run dir (likely the
-        # user ran `--resume` while the original orchestrator was still
+        # user ran `resume` while the original orchestrator was still
         # alive — see DESIGN §6 *Single owner per run dir*). The
         # launcher's flock probe should normally catch this earlier;
         # the check here is the load-bearing one for any code path
         # that bypasses the launcher (manual `python3 leerie.py
-        # --resume`, future verbs, etc.).
+        # resume`, future verbs, etc.).
         log(f"another orchestrator already owns run {run_id!r} "
             f"(holding flock on {e.run_dir}). "
             f"Tail it without spawning a duplicate: "
-            f"`leerie --resume {run_id}`. "
+            f"`leerie resume {run_id}`. "
             f"If the holder is wedged, kill it and retry.")
         sys.exit(EXIT_LOCKED)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
@@ -27086,7 +27093,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # `--phase judge|heal` mutates state.json (writes
             # `dangerously_skip_permissions` below, then runs workers
             # that update telemetry). Running concurrently with the
-            # original orchestrator would race the same way `--resume`
+            # original orchestrator would race the same way `resume`
             # would. Refuse here.
             log(f"cannot run --phase on {phase_run_id!r}: another "
                 f"orchestrator owns the run (holding flock on "
@@ -27199,13 +27206,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # waiting or retrying recovers it. This is a resumable pause, not
         # a hard failure. Copied verbatim from the RateLimitedExit
         # out_of_credits=True arm just below: worktree-only cleanup
-        # (state + run branch preserved), a --resume hint, and
+        # (state + run branch preserved), a resume hint, and
         # EXIT_LOCKED — the launcher's preserve-state pause pivot.
         full_purge = False
         st.save()
         log(f"auth session locked — {e.raw_message}")
         log(f"  run `claude /login` (or refresh CLAUDE_CODE_OAUTH_TOKEN), "
-            f"then resume with: leerie --resume {st.run_id}")
+            f"then resume with: leerie resume {st.run_id}")
         abnormal = False
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
@@ -27236,10 +27243,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         #      reset clock (it clears on a top-up / billing cycle, not by
         #      waiting), so auto-resuming would only spin a fixed backoff
         #      against the wall and burn the worker budget. Instead: worktree
-        #      cleanup, a --resume hint, and EXIT_LOCKED. Checked first.
+        #      cleanup, a resume hint, and EXIT_LOCKED. Checked first.
         #   2. otherwise (rate-limit) → AUTO-RESUME via `_sleep_then_reexec`
         #      (worktree-only cleanup → sleep → os.execv the orchestrator into
-        #      a fresh `--resume --run-id` process). The wait differs:
+        #      a fresh `resume --run-id` process). The wait differs:
         #        - reset_at parsed cleanly → sleep until that moment + 30s.
         #        - reset_at is None (parse failed) → sleep a fixed
         #          RATE_LIMIT_RETRY_BACKOFF_SEC and poll; we can't compute a
@@ -27261,7 +27268,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # doesn't re-run it. EXIT_LOCKED is the launcher's preserve-state
             # pause pivot — reuse it rather than minting a new code.
             log(f"out of credits — {e.raw_message}")
-            log(f"  add credits, then resume with: leerie --resume {st.run_id}")
+            log(f"  add credits, then resume with: leerie resume {st.run_id}")
             abnormal = False
             try:
                 _cleanup_on_abnormal_exit(st, full_purge=False)
@@ -27304,12 +27311,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             rc = _sleep_then_reexec(st, wait_seconds, reason)
             if rc is not None:
                 # Interrupted (SIGINT→130, SIGTERM/SIGHUP→128+signum) or execv
-                # failed (→75). Cleanup already ran; state preserved for --resume.
+                # failed (→75). Cleanup already ran; state preserved for resume.
                 exit_code = rc
             # Otherwise _sleep_then_reexec os.execv'd and never returned.
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved
-        # so the user can --resume. The explicit "throw this away"
+        # so the user can resume. The explicit "throw this away"
         # gesture is `scripts/cleanup.sh --run-id <id> --branches`,
         # not Ctrl-C. asyncio.run already cancelled pending tasks and
         # _invoke's / run_proc's BaseException handlers killed
@@ -27318,7 +27325,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log("interrupted by user (SIGINT) — worktree cleanup; "
-            f"state preserved (resume with leerie --resume {st.run_id})")
+            f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
         try:
@@ -27336,12 +27343,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
         # stop, terminal close). User likely wants to recover; preserve
-        # state and run branch for --resume.
+        # state and run branch for resume.
         abnormal = True
         full_purge = False
         st.save()
         log(f"interrupted by signal ({e}) — worktree cleanup; "
-            f"state preserved (resume with leerie --resume {st.run_id})")
+            f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal.
         try:
@@ -27379,7 +27386,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             try:
                 st.data["finished_at"] = now()
                 # Only persist state.json when it carries meaningful
-                # content.  A failed --resume leaves st.data as a bare
+                # content.  A failed resume leaves st.data as a bare
                 # stub (no "task"); writing that poisons the host-side
                 # file and blocks subsequent resumes with "no usable
                 # task" instead of the clearer "no state.json".

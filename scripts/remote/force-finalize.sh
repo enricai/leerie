@@ -3,18 +3,18 @@
 # run.json on the Fly Machine, after verifying the orchestrator process is
 # dead.
 #
-# When does this run?  `leerie --finalize <run-id> --force`.  Today's
+# When does this run?  `leerie finalize <run-id> --force`.  Today's
 # fetch-branch.sh discovery loop scans .leerie/runs/*/run.json on the machine
 # for entries with `finished_at` set and `pushed_at` unset (DESIGN §6
 # *Finalization*).  When the orchestrator dies before phase_finalize (ENOSPC
 # mid-merge, worker crash, kill -9, etc.), `finished_at` is never written and
 # the discovery loop returns zero — the user cannot recover the work via
-# `leerie --finalize` because the run isn't "finalized" from the host's view.
+# `leerie finalize` because the run isn't "finalized" from the host's view.
 #
 # The recovery procedure is mechanical: SSH in, check the orchestrator is
 # really dead, patch run.json with `finished_at` + audit fields, exit, then
-# re-run --finalize.  Doing this by hand requires knowing internals;
-# automating it via --force keeps the recovery on the user's well-trodden
+# re-run finalize.  Doing this by hand requires knowing internals;
+# automating it via finalize --force keeps the recovery on the user's well-trodden
 # path.
 #
 # Safety belt: this script REFUSES to patch a run where the orchestrator
@@ -75,7 +75,7 @@
 # tests/test_force_finalize_sh.py::test_refuses_when_pid_alive gates on
 # sys.platform == "linux" for the same reason.
 #
-# Usage (sourced by the leerie launcher's --finalize path):
+# Usage (sourced by the leerie launcher's finalize path):
 #
 #   source scripts/remote/force-finalize.sh
 #   force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"
@@ -94,7 +94,7 @@
 #        SSH failure, JSON parse error on the remote side)
 #        Sentinel: REFUSE-*, STOP-FAILED:*, ERROR:*
 #
-# After this returns 0, the caller (`leerie --finalize`) falls through to
+# After this returns 0, the caller (`leerie finalize`) falls through to
 # the normal fetch_branch path.
 
 set -eu -o pipefail
@@ -184,7 +184,7 @@ if data.get("finished_at"):
 
 # /proc cross-check (authoritative liveness signal). orchestrator.pid
 # is written by the launcher between Popen and the child's
-# State.__init__ flock acquisition; if a concurrent --resume's child
+# State.__init__ flock acquisition; if a concurrent resume's child
 # loses the race, its dead pid can land in the file while the real
 # orchestrator (the flock winner) keeps running. The pid-file path
 # below is retained for pid-reuse audit clarity, but the /proc scan
@@ -420,7 +420,7 @@ PYEOF
       local spid="${rest#*:}"
       remote_log "force-finalize: STOP-FAILED — could not kill orchestrator pid $spid for run $rid on machine $machine."
       remote_log "  The process did not die after SIGTERM + SIGKILL. Inspect manually with"
-      remote_log "  \`leerie --resume <run-id> --shell --runtime fly\`, then \`--kill --runtime fly\` when done."
+      remote_log "  \`leerie resume <run-id> --shell --runtime fly\`, then \`leerie kill <run-id> --runtime fly\` when done."
       return 1
       ;;
     REFUSE-ALIVE-SCAN:*)
@@ -429,8 +429,8 @@ PYEOF
       local comm="${rest#*:}"
       remote_log "force-finalize: REFUSED — /proc scan found live orchestrator pid $pid ($comm) for this run on machine $machine."
       remote_log "  The pid file may point at a stillborn process (see DESIGN §6 *Single owner per run dir*); the scan is authoritative."
-      remote_log "  Use \`leerie --kill <run-id> --runtime fly\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
+      remote_log "  Use \`leerie kill <run-id> --runtime fly\` if you really want to abandon the run, or"
+      remote_log "  \`leerie resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-ALIVE:*)
@@ -438,21 +438,21 @@ PYEOF
       local pid="${rest%%:*}"
       local comm="${rest#*:}"
       remote_log "force-finalize: REFUSED — orchestrator pid $pid ($comm) is still alive on machine $machine."
-      remote_log "  Use \`leerie --kill <run-id> --runtime fly\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
+      remote_log "  Use \`leerie kill <run-id> --runtime fly\` if you really want to abandon the run, or"
+      remote_log "  \`leerie resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-NOPID:*)
       local rid="${sentinel#REFUSE-NOPID:}"
       remote_log "force-finalize: REFUSED — run $rid has no orchestrator.pid on machine $machine."
       remote_log "  This usually means the orchestrator failed very early (before phase_classify)."
-      remote_log "  Attach manually with \`leerie --resume <run-id> --shell --runtime fly\` to inspect, then \`--kill --runtime fly\` when done."
+      remote_log "  Attach manually with \`leerie resume <run-id> --shell --runtime fly\` to inspect, then \`leerie kill <run-id> --runtime fly\` when done."
       return 1
       ;;
     REFUSE-MULTI:*)
       local count="${sentinel#REFUSE-MULTI:}"
       remote_log "force-finalize: REFUSED — $count run dirs on machine $machine; can't pick one."
-      remote_log "  Attach manually with \`leerie --resume <run-id> --shell --runtime fly\` to disambiguate."
+      remote_log "  Attach manually with \`leerie resume <run-id> --shell --runtime fly\` to disambiguate."
       return 1
       ;;
     REFUSE-NONE)

@@ -1,5 +1,5 @@
 """Tests for `_discover_runs()` — enumerates `.leerie/runs/*/state.json`
-for `--list` and `--resume` discovery.
+for `list` and `resume` discovery.
 
 Covers: empty repo, single run, multiple runs (sorted), bootstrap dir
 skipped, malformed state.json skipped with warning, non-dict state.json
@@ -44,7 +44,7 @@ def test_discover_runs_single_run(leerie, tmp_path):
 
 
 def test_discover_runs_multiple_runs_sorted_newest_first(leerie, tmp_path):
-    """Newest by `started_at` sorts first, so `--list` shows most-recent at top."""
+    """Newest by `started_at` sorts first, so `list` shows most-recent at top."""
     _make_run(tmp_path, "feat-a-aaaaaa",
               {"task": "a", "started_at": "2026-05-26T10:00:00+00:00"})
     _make_run(tmp_path, "feat-b-bbbbbb",
@@ -94,8 +94,8 @@ def _make_orphan(leerie_root: Path, run_id: str, fly: dict) -> Path:
 def test_discover_runs_surfaces_orphan_with_fly_machine_json(leerie, tmp_path):
     """A run dir with fly-machine.json but no state.json is the
     pre-classify failure case (seed_auth aborted before the orchestrator
-    wrote state.json). _discover_runs must surface it so --list and
-    --resume can reach it. Marked `_orphan=True` with started_at copied
+    wrote state.json). _discover_runs must surface it so list and
+    resume can reach it. Marked `_orphan=True` with started_at copied
     from the fly sidecar."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {
         "fly_app": "leerie",
@@ -127,7 +127,7 @@ def test_discover_runs_skips_malformed_fly_machine_json(leerie, tmp_path, capsys
 
 
 def test_discover_runs_mixed_orphan_and_healthy(leerie, tmp_path):
-    """Orphans and healthy runs coexist in --list — sorted by
+    """Orphans and healthy runs coexist in list — sorted by
     started_at descending like any other rows."""
     _make_orphan(tmp_path, "feat-died-aaa111", {
         "fly_machine_id": "machine-aaa",
@@ -155,7 +155,7 @@ def test_discover_runs_mixed_orphan_and_healthy(leerie, tmp_path):
 
 def test_discover_runs_skips_malformed_json(leerie, tmp_path, capsys):
     """A state.json with invalid JSON triggers a warning log but doesn't
-    raise — `--list` should still work in the presence of corrupted runs."""
+    raise — `list` should still work in the presence of corrupted runs."""
     run_dir = tmp_path / "runs" / "feat-bad-xyz999"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{not valid json")
@@ -192,7 +192,7 @@ def test_discover_runs_handles_missing_started_at(leerie, tmp_path):
 
 def test_discover_runs_preserves_state_fields(leerie, tmp_path):
     """Discovered summary includes the full state.json contents, plus
-    `run_id` and `path` overlay fields — callers (--list) need access to
+    `run_id` and `path` overlay fields — callers (list) need access to
     `categories`, `worker_count`, etc."""
     _make_run(tmp_path, "feat-foo-abc123", {
         "task": "x",

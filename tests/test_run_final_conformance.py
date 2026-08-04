@@ -169,7 +169,7 @@ def test_skipped_when_working_branch_absent(env):
 def test_skipped_on_resume_when_already_complete(env):
     """Resume idempotence: when `st.data["conformance"]["_final"]` is
     already populated, the pass short-circuits without spawning a
-    worker. Without this guard, `--resume` after the final pass
+    worker. Without this guard, `resume` after the final pass
     completed would burn worker budget re-running the conformer and
     potentially overwrite a previously clean result with a different
     one. Mirrors the `completed_waves` gate in `phase_execute`."""

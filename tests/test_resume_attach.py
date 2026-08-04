@@ -1,10 +1,10 @@
-"""Invariants for the `--resume` smart router (DESIGN §6 *Smart resume
+"""Invariants for the `resume` smart router (DESIGN §6 *Smart resume
 in remote mode*).
 
 Two surfaces pinned here:
 
   1. Auto-discovery from $LEERIE_STATE_HOST_DIR/remote/*.json when
-     `--resume` is given without `--run-id`. Mirrors the Strategy B
+     `resume` is given without `--run-id`. Mirrors the Strategy B
      PID-scan that used to live in `scripts/remote/attach.sh:119-166`.
      Single live record → resolves LEERIE_RUN_ID and continues; multiple
      → list and exit; zero → fall through to existing "no Fly machine
@@ -15,12 +15,12 @@ Two surfaces pinned here:
      when `_do_auto="false"`, runs the tail payload via `flyctl ssh
      console -C "sh -s"` with LEERIE_TAIL_RUN_ID prefixed; when
      `_do_auto="true"`, wraps stderr through `tee` and grep-extracts
-     the AUTO_FINALIZE_TOKEN to drive `exec leerie --finalize <id>` on
+     the AUTO_FINALIZE_TOKEN to drive `exec leerie finalize <id>` on
      the host.
 
   3. Coupling: the launcher source must contain the auto-discovery
      block, the rc=75 pivot, and the four sub-mode flags. The
-     `--attach` case-arm and `scripts/remote/attach.sh` must be gone.
+     `attach` case-arm and `scripts/remote/attach.sh` must be gone.
 
 The auto-discovery harness mirrors the launcher dispatch verbatim
 (same pattern as test_launcher_resume_fly_lookup.py). The
@@ -106,11 +106,11 @@ except Exception:
 ' "${_active_records[0]}" 2>/dev/null || true)"
       export LEERIE_RUN_ID
       if [ -n "$LEERIE_RUN_ID" ]; then
-        remote_log "--resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+        remote_log "resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
       fi
       ;;
     *)
-      remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
+      remote_log "resume: multiple active launches — pass the run-id to disambiguate:"
       for _f in "${_active_records[@]}"; do
         python3 -c "
 import json, sys
@@ -311,7 +311,7 @@ def test_tail_helper_autofinalize_sets_token_in_payload(tmp_path: Path):
     `HELPER_RC=...` line that the harness shell ran *after* the
     helper returned."""
     fake = _stub_flyctl(tmp_path, ssh_console_rc=1)  # non-zero so the
-    # exec leerie --finalize branch doesn't fire (would replace this
+    # exec leerie finalize branch doesn't fire (would replace this
     # process and kill the test).
     r = subprocess.run(
         ["bash", "-c", _TAIL_HARNESS, "_",
@@ -341,7 +341,7 @@ def test_tail_helper_autofinalize_sets_token_in_payload(tmp_path: Path):
 
 
 # =========================================================================
-# Coupling: launcher source pins for the new --resume surface
+# Coupling: launcher source pins for the new resume surface
 # =========================================================================
 
 def test_launcher_contains_auto_discovery_block():
@@ -413,32 +413,32 @@ def test_launcher_strips_submode_flags_from_rewritten_args():
     for flag in ("--shell)", "--auto-finalize)"):
         assert flag in launcher, f"Missing case-arm: {flag}"
     # Spot-check that the strip-comment is present.
-    assert "opts into bash shell on the --resume rc=75 pivot" in launcher, (
+    assert "opts into bash shell on the resume rc=75 pivot" in launcher, (
         "--shell filter arm's launcher-only marker missing"
     )
 
 
 def test_attach_case_arm_is_id_dispatched():
-    """The --attach case-arm exists and dispatches by ID type.
+    """The attach case-arm exists and dispatches by ID type.
 
-    Previously --attach was an out-of-band launcher verb that just
+    Previously attach was an out-of-band launcher verb that just
     SSH'd into a Fly machine. That one was removed. Under v5 Shape A
-    --attach is an ID-dispatched verb: UUID → poll
+    attach is an ID-dispatched verb: UUID → poll
     $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by chain_id until
     every chain run reaches a terminal state; non-UUID → not-yet-
-    implemented for run-mode (the existing --resume reattaches
+    implemented for run-mode (the existing resume reattaches
     single runs).
 
     This test pins the behavior so a future regression doesn't
     silently bring back the old attach.sh-driven SSH path.
     """
     launcher = LEERIE.read_text()
-    assert "--attach)" in launcher, (
-        "--attach) case-arm missing from launcher (expected the new "
+    assert "  attach)" in launcher, (
+        "attach) case-arm missing from launcher (expected the new "
         "ID-dispatched chain attach verb)"
     )
     assert "ID-dispatched attach verb" in launcher, (
-        "--attach case-arm exists but is not the new chain-mode "
+        "attach case-arm exists but is not the new chain-mode "
         "implementation — check whether the old SSH-style attach has "
         "been reintroduced."
     )
@@ -466,8 +466,8 @@ def test_lib_sh_exports_tail_with_optional_autofinalize():
     )
     # The host-side exec is what makes auto-finalize work — must use
     # ${LEERIE_REPO}/leerie, not just `leerie`.
-    assert "exec \"${LEERIE_REPO}/leerie\" --finalize" in libsh, (
-        "Helper must exec leerie --finalize via $LEERIE_REPO"
+    assert "exec \"${LEERIE_REPO}/leerie\" finalize" in libsh, (
+        "Helper must exec leerie finalize via $LEERIE_REPO"
     )
 
 
@@ -514,7 +514,7 @@ def test_lib_sh_helper_returns_does_not_exit():
 
     The only valid `exit*` in the helper is `exec` (which replaces
     the process, intentionally taking down the launcher to be
-    replaced by `leerie --finalize`)."""
+    replaced by `leerie finalize`)."""
     libsh = LIB_SH.read_text()
     import re
     match = re.search(
@@ -636,7 +636,7 @@ finally:
   rm -f "$_early_probe_stderr"
 
   if [ "$_early_probe_rc" = "75" ]; then
-    remote_log "--resume: early probe detected live orchestrator — skipping seed"
+    remote_log "resume: early probe detected live orchestrator — skipping seed"
     _attach_to_live_orchestrator
     _skip_seed_launch=true
   fi

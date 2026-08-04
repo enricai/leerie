@@ -2,10 +2,10 @@
 
 The helper is the single source of truth for "where do Claude OAuth
 credentials live on this host" (DRY across the existing STAGE-assembly
-flow and the new --chain credential pack-up). Defined near the top of
+flow and the new chain credential pack-up). Defined near the top of
 the leerie launcher so it's callable from any verb arm.
 
-We test by sourcing the launcher in a sub-bash with --version short-
+We test by sourcing the launcher in a sub-bash with version short-
 circuit so only the function definitions and pre-dispatch code load,
 then invoking the function with a controlled HOME and PATH so the
 fallback chain (env var → Keychain → ~/.claude/.credentials.json) is
@@ -65,7 +65,7 @@ def _invoke_helper(
         sec.write_text(f"#!/bin/sh\nprintf '%s' '{stub_security_returns}'\nexit 0\n")
     sec.chmod(0o755)
 
-    # The launcher does `case "$1" in ... --version) ... ;; esac` early.
+    # The launcher does `case "$1" in ... version) ... ;; esac` early.
     # We can't easily source it because main code paths run unconditionally.
     # Instead, extract the helper function via sed and source just that.
     # Source the launcher in a side bash, but exit before main flow:
@@ -181,7 +181,7 @@ def test_env_var_wins_over_keychain_and_file(tmp_path: Path) -> None:
 def test_returns_nonzero_when_no_creds_available(tmp_path: Path) -> None:
     """Empty Keychain, no file, no env var → rc 1 + empty stdout.
 
-    The launcher's --chain arm treats this as a fatal error with a
+    The launcher's chain arm treats this as a fatal error with a
     user-actionable diagnostic; the STAGE-assembly block falls back to
     the legacy env-var bridge.
     """

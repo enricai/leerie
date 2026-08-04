@@ -11,7 +11,7 @@ leerie container instead of failing there:
 
 Why these four are host-only: they source bash the *host* owns —
 `scripts/host-finalize.sh`, `provision.sh`'s `decide_teardown`, and the
-launcher's own `--finalize` / `no_push` paths — all of which parse run.json
+launcher's own `finalize` / `no_push` paths — all of which parse run.json
 with real `jq`. The harnesses stub `git` and `gh` onto PATH but not `jq`, so
 jq is silently inherited from whichever machine runs pytest. Per DESIGN §6
 *Finalization* those scripts could never succeed in-container anyway (gh

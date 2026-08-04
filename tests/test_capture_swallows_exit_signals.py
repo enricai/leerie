@@ -5,7 +5,7 @@
 Incident (2026-07-19, wave 1 of 4): a run's container OAuth session expired
 mid-wave. `claude_p` correctly raised `TerminalAuthFailure` and `main()`'s
 `except TerminalAuthFailure` handler began its resumable-pause dance
-(worktree-only cleanup, `--resume` hint, `exit_code = EXIT_LOCKED`). But that
+(worktree-only cleanup, `resume` hint, `exit_code = EXIT_LOCKED`). But that
 handler then makes a *best-effort* `capture_repo_deps(...)` call — which
 invokes `claude -p` again, re-hits the still-dead auth, and raises a *second*
 `TerminalAuthFailure`. That exception subclasses `BaseException` (so it

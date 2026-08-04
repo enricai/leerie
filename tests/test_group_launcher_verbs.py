@@ -2,7 +2,7 @@
 
 Two-member group fixture: member A is paused/unpushed (in ~/.leerie/repo-a/),
 member B is pushed/done (in ~/.leerie/repo-b/).  Tests assert that every
-group-scoped verb (--status, --resume, --finalize, --kill, --stop) dispatches
+group-scoped verb (status, resume, finalize, kill, stop) dispatches
 across both dirs and applies the correct eligibility filter.
 
 Mirror of tests/test_chain_launcher_id_dispatch.py: bash subprocess harness
@@ -11,7 +11,7 @@ with LEERIE_SELF_CMD stub to record recursive single-run invocations.
 Key distinction from test_group_launcher.py (test-003):
   - Uses a single shared fixture (paused/unpushed + pushed) across two dirs
     to exercise all verbs against the same state in one place.
-  - Adds --stop dispatch tests (missing from test_group_launcher.py).
+  - Adds stop dispatch tests (missing from test_group_launcher.py).
   - Verifies dual-purpose-verb handling: a UUID that is a group_id (not a
     chain_id) still dispatches correctly via the chain→group fallback path.
 """
@@ -129,17 +129,17 @@ def _run(
 
 
 # ---------------------------------------------------------------------------
-# --status <group-id> across two state dirs
+# status <group-id> across two state dirs
 # ---------------------------------------------------------------------------
 
 
 class TestStatusDispatch:
-    """--status <group-id> renders both members from separate state dirs."""
+    """status <group-id> renders both members from separate state dirs."""
 
     def test_status_lists_both_members(self, tmp_path: Path) -> None:
-        """Both run-ids appear in --status output."""
+        """Both run-ids appear in status output."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert RUN_ID_A in result.stdout
         assert RUN_ID_B in result.stdout
@@ -152,7 +152,7 @@ class TestStatusDispatch:
             "run_id": NON_GROUP_RUN,
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stdout
 
@@ -160,49 +160,49 @@ class TestStatusDispatch:
         """UUID with no matching group members → non-zero exit."""
         state_dir = tmp_path / ".leerie" / "myrepo"
         state_dir.mkdir(parents=True)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode != 0
 
     def test_status_shows_member_count(self, tmp_path: Path) -> None:
         """Output mentions the group has 2 members."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--status", GROUP_ID])
+        result = _run(tmp_path, ["status", GROUP_ID])
         assert result.returncode == 0, result.stderr
         out = result.stdout + result.stderr
         assert "2" in out
 
 
 # ---------------------------------------------------------------------------
-# --list --groups across two state dirs
+# list --groups across two state dirs
 # ---------------------------------------------------------------------------
 
 
 class TestListGroupsDispatch:
-    """--list --groups groups members across all per-repo state dirs."""
+    """list --groups groups members across all per-repo state dirs."""
 
     def test_list_groups_shows_group_id(self, tmp_path: Path) -> None:
-        """--list --groups renders the shared group_id."""
+        """list --groups renders the shared group_id."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert GROUP_ID in result.stdout
 
     def test_list_groups_shows_member_count(self, tmp_path: Path) -> None:
         """Two-member group → 2 appears in the output row."""
         _two_member_fixture(tmp_path)
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert "2" in result.stdout
 
     def test_list_groups_excludes_non_group_run(self, tmp_path: Path) -> None:
-        """Runs without group_id are excluded from --list --groups."""
+        """Runs without group_id are excluded from list --groups."""
         _two_member_fixture(tmp_path)
         sd_c = tmp_path / ".leerie" / "repo-c"
         _write_run(sd_c, NON_GROUP_RUN, {
             "run_id": NON_GROUP_RUN,
             "branch": f"leerie/runs/{NON_GROUP_RUN}",
         })
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stdout
 
@@ -210,27 +210,27 @@ class TestListGroupsDispatch:
         """No group_id-tagged runs → friendly empty message."""
         sd = tmp_path / ".leerie" / "myrepo"
         _write_run(sd, NON_GROUP_RUN, {"run_id": NON_GROUP_RUN})
-        result = _run(tmp_path, ["--list", "--groups"])
+        result = _run(tmp_path, ["list", "--groups"])
         assert result.returncode == 0
         assert "no groups" in (result.stdout + result.stderr).lower()
 
 
 # ---------------------------------------------------------------------------
-# --resume <group-id> eligibility filtering
+# resume <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestResumeDispatch:
-    """--resume <group-id> dispatches single-run --resume for paused members only."""
+    """resume <group-id> dispatches single-run resume for paused members only."""
 
     def test_resume_dispatches_paused_member_only(self, tmp_path: Path) -> None:
-        """Only the paused member (A) gets --resume; pushed member (B) does not."""
+        """Only the paused member (A) gets resume; pushed member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--resume {RUN_ID_A}" in result.stub_log
-        assert f"--resume {RUN_ID_B}" not in result.stub_log
+        assert f"resume {RUN_ID_A}" in result.stub_log
+        assert f"resume {RUN_ID_B}" not in result.stub_log
 
     def test_resume_skips_non_group_run(self, tmp_path: Path) -> None:
         """Non-group paused run in an unrelated state dir is not resumed."""
@@ -244,7 +244,7 @@ class TestResumeDispatch:
             "pause_reason": "worker-error",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
         assert NON_GROUP_RUN not in result.stub_log
 
@@ -258,7 +258,7 @@ class TestResumeDispatch:
             "fly_machine_id": RUN_ID_A,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
         assert "no resumable" in (result.stdout + result.stderr).lower()
 
@@ -273,27 +273,27 @@ class TestResumeDispatch:
             "killed_at": "2026-07-01T10:30:00Z",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
-        assert f"--resume {RUN_ID_A}" not in result.stub_log
+        assert f"resume {RUN_ID_A}" not in result.stub_log
 
 
 # ---------------------------------------------------------------------------
-# --finalize <group-id> eligibility filtering
+# finalize <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestFinalizeDispatch:
-    """--finalize <group-id> dispatches single-run --finalize for unpushed members."""
+    """finalize <group-id> dispatches single-run finalize for unpushed members."""
 
     def test_finalize_dispatches_unpushed_member_only(self, tmp_path: Path) -> None:
-        """Only the unpushed member (A) gets --finalize; pushed member (B) does not."""
+        """Only the unpushed member (A) gets finalize; pushed member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--finalize {RUN_ID_A}" in result.stub_log
-        assert f"--finalize {RUN_ID_B}" not in result.stub_log
+        assert f"finalize {RUN_ID_A}" in result.stub_log
+        assert f"finalize {RUN_ID_B}" not in result.stub_log
 
     def test_finalize_skips_killed_member(self, tmp_path: Path) -> None:
         """A killed member (killed_at set) is not finalized."""
@@ -310,10 +310,10 @@ class TestFinalizeDispatch:
             "group_id": GROUP_ID,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--finalize {RUN_ID_A}" not in result.stub_log
-        assert f"--finalize {RUN_ID_B}" in result.stub_log
+        assert f"finalize {RUN_ID_A}" not in result.stub_log
+        assert f"finalize {RUN_ID_B}" in result.stub_log
 
     def test_finalize_all_pushed_exits_ok(self, tmp_path: Path) -> None:
         """When all members are already pushed, exit 0 cleanly."""
@@ -324,27 +324,27 @@ class TestFinalizeDispatch:
             "pushed_at": "2026-07-01T10:00:00Z",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
-# --kill <group-id> eligibility filtering
+# kill <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestKillDispatch:
-    """--kill <group-id> dispatches single-run --kill for live (fly) members."""
+    """kill <group-id> dispatches single-run kill for live (fly) members."""
 
     def test_kill_dispatches_fly_member_only(self, tmp_path: Path) -> None:
-        """Only fly member (A, has fly_machine_id) gets --kill; local member (B) does not."""
+        """Only fly member (A, has fly_machine_id) gets kill; local member (B) does not."""
         _two_member_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" in result.stub_log
+        assert f"kill {RUN_ID_A}" in result.stub_log
         # Member B has no fly_machine_id → not killed.
-        assert f"--kill {RUN_ID_B}" not in result.stub_log
+        assert f"kill {RUN_ID_B}" not in result.stub_log
 
     def test_kill_skips_already_killed_member(self, tmp_path: Path) -> None:
         """A member with killed_at set is not killed again."""
@@ -362,10 +362,10 @@ class TestKillDispatch:
             "fly_machine_id": RUN_ID_B,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" not in result.stub_log
-        assert f"--kill {RUN_ID_B}" in result.stub_log
+        assert f"kill {RUN_ID_A}" not in result.stub_log
+        assert f"kill {RUN_ID_B}" in result.stub_log
 
     def test_kill_no_live_runs_exits_ok(self, tmp_path: Path) -> None:
         """No live runs → exit 0 with friendly message."""
@@ -377,18 +377,18 @@ class TestKillDispatch:
             "killed_at": "2026-07-01T10:00:00Z",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
         assert "no live runs found" in (result.stdout + result.stderr).lower()
 
 
 # ---------------------------------------------------------------------------
-# --stop <group-id> eligibility filtering
+# stop <group-id> eligibility filtering
 # ---------------------------------------------------------------------------
 
 
 class TestStopDispatch:
-    """--stop <group-id> dispatches single-run --stop for running fly members.
+    """stop <group-id> dispatches single-run stop for running fly members.
 
     'Running' means: fly_machine_id set, no pushed_at, no killed_at, no paused_at.
     The two-member fixture has A as paused (not running) and B as pushed (not running),
@@ -419,13 +419,13 @@ class TestStopDispatch:
         return run_a, run_b
 
     def test_stop_dispatches_running_member_only(self, tmp_path: Path) -> None:
-        """--stop <group-id> stops only the running member, not the paused one."""
+        """stop <group-id> stops only the running member, not the paused one."""
         run_a, run_b = self._running_fixture(tmp_path)
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--stop", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["stop", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--stop {run_a}" in result.stub_log
-        assert f"--stop {run_b}" not in result.stub_log
+        assert f"stop {run_a}" in result.stub_log
+        assert f"stop {run_b}" not in result.stub_log
 
     def test_stop_skips_pushed_member(self, tmp_path: Path) -> None:
         """A pushed member is not stopped (already done)."""
@@ -446,10 +446,10 @@ class TestStopDispatch:
             "pushed_at": "2026-07-01T10:00:00Z",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--stop", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["stop", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--stop {run_a}" in result.stub_log
-        assert f"--stop {run_b}" not in result.stub_log
+        assert f"stop {run_a}" in result.stub_log
+        assert f"stop {run_b}" not in result.stub_log
 
     def test_stop_no_running_runs_exits_ok(self, tmp_path: Path) -> None:
         """All members paused/pushed → exit 0 cleanly."""
@@ -461,7 +461,7 @@ class TestStopDispatch:
             "paused_at": "2026-07-01T10:00:00Z",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--stop", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["stop", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
 
     def test_stop_skips_local_member_no_fly_machine_id(self, tmp_path: Path) -> None:
@@ -473,9 +473,9 @@ class TestStopDispatch:
             # No fly_machine_id.
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--stop", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["stop", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
-        assert f"--stop {RUN_ID_A}" not in result.stub_log
+        assert f"stop {RUN_ID_A}" not in result.stub_log
 
 
 # ---------------------------------------------------------------------------
@@ -499,12 +499,12 @@ class TestDualPurposeVerbFallback:
             "fly_machine_id": RUN_ID_A,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" in result.stub_log
+        assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_resume_group_id_not_chain_id_dispatches(self, tmp_path: Path) -> None:
-        """A group_id-only UUID is dispatched for --resume via group fallback."""
+        """A group_id-only UUID is dispatched for resume via group fallback."""
         sd_a = tmp_path / ".leerie" / "repo-a"
         _write_run(sd_a, RUN_ID_A, {
             "run_id": RUN_ID_A,
@@ -514,9 +514,9 @@ class TestDualPurposeVerbFallback:
             "pause_reason": "worker-error",
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--resume", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["resume", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--resume {RUN_ID_A}" in result.stub_log
+        assert f"resume {RUN_ID_A}" in result.stub_log
 
     def test_chain_id_still_dispatches_when_no_group_runs(self, tmp_path: Path) -> None:
         """A chain_id dispatches via the chain path; group fallback is not tried."""
@@ -528,12 +528,12 @@ class TestDualPurposeVerbFallback:
             "fly_machine_id": RUN_ID_A,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", CHAIN_ID_ONLY], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", CHAIN_ID_ONLY], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--kill {RUN_ID_A}" in result.stub_log
+        assert f"kill {RUN_ID_A}" in result.stub_log
 
     def test_finalize_group_id_not_chain_id_dispatches(self, tmp_path: Path) -> None:
-        """A group_id-only UUID is dispatched for --finalize via group fallback."""
+        """A group_id-only UUID is dispatched for finalize via group fallback."""
         sd_a = tmp_path / ".leerie" / "repo-a"
         _write_run(sd_a, RUN_ID_A, {
             "run_id": RUN_ID_A,
@@ -541,9 +541,9 @@ class TestDualPurposeVerbFallback:
             # No pushed_at → unpushed.
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--finalize", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["finalize", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0, result.stderr
-        assert f"--finalize {RUN_ID_A}" in result.stub_log
+        assert f"finalize {RUN_ID_A}" in result.stub_log
 
     def test_non_group_run_not_dispatched_by_group_id(self, tmp_path: Path) -> None:
         """A run without group_id is never dispatched by a group verb."""
@@ -553,6 +553,6 @@ class TestDualPurposeVerbFallback:
             "fly_machine_id": NON_GROUP_RUN,
         })
         stub, log = _stub_self_cmd(tmp_path)
-        result = _run(tmp_path, ["--kill", GROUP_ID], stub=stub, stub_log=log)
+        result = _run(tmp_path, ["kill", GROUP_ID], stub=stub, stub_log=log)
         assert result.returncode == 0
         assert NON_GROUP_RUN not in result.stub_log

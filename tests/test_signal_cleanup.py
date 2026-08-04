@@ -149,13 +149,13 @@ def test_cleanup_rm_rf_fallback_when_git_leaves_dir(leerie, tmp_path,
     """When `git worktree remove` returns nonzero (or zero) but does NOT
     actually delete the directory — e.g. git already pruned the worktree
     from its registry on a previous pass — the cleanup must fall back to
-    rm -rf so the surviving directory doesn't block --resume's
+    rm -rf so the surviving directory doesn't block resume's
     new-worktree.sh from re-creating the worktree at the same path.
 
     Observed in finalmemoriam on 2026-05-28: an overnight run timed out
     on node_modules under the old 30s cap, cleanup logged a failure,
     git later pruned its registry, and the surviving worktree dir
-    blocked --resume the next morning with
+    blocked resume the next morning with
     `fatal: '...' already exists`."""
     run_id = "feat-x-aaa111"
     run_dir = tmp_path / "runs" / run_id
@@ -176,7 +176,7 @@ def test_cleanup_rm_rf_fallback_when_git_leaves_dir(leerie, tmp_path,
     leerie._cleanup_on_abnormal_exit(st, full_purge=False)
     assert not wt_a.exists(), (
         "cleanup must rm -rf the worktree dir when git worktree remove "
-        "leaves it behind, otherwise --resume's new-worktree.sh will "
+        "leaves it behind, otherwise resume's new-worktree.sh will "
         "fail with 'already exists' when it tries to re-create the "
         "worktree at the same path."
     )
@@ -186,7 +186,7 @@ def test_cleanup_rm_rf_fallback_after_timeout(leerie, tmp_path, monkeypatch):
     """Mirror of the above for the timeout case: subprocess.TimeoutExpired
     is raised mid-removal, but the directory survives (with partial
     contents). Cleanup must still fall back to rm -rf so the surviving
-    dir doesn't block --resume."""
+    dir doesn't block resume."""
     run_id = "feat-x-aaa111"
     run_dir = tmp_path / "runs" / run_id
     wt_a = run_dir / "worktrees" / "feat-001"
@@ -359,7 +359,7 @@ def test_main_rate_limit_sleep_catches_keyboard_interrupt():
         "_sleep_then_reexec must locally catch KeyboardInterrupt around "
         "time.sleep so Ctrl-C during the auto-resume wait produces the "
         "'state preserved' message rather than a silent exit.")
-    assert "os.execv" in helper, "_sleep_then_reexec must re-exec --resume"
+    assert "os.execv" in helper, "_sleep_then_reexec must re-exec resume"
     assert "InterruptedBySignal" in helper, (
         "_sleep_then_reexec must also catch InterruptedBySignal (SIGTERM/"
         "SIGHUP) around time.sleep so it maps to 128+signum rather than "

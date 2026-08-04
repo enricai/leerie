@@ -225,7 +225,7 @@ def test_decide_teardown_rc11_destroys(tmp_path: Path):
     """rc=11 (EXIT_BUDGET_INFEASIBLE, DESIGN §13 *Budget feasibility —
     fail fast at the cheapest moment*) → destroy, not pause.
 
-    A budget-infeasible run is unrecoverable: --resume would die at
+    A budget-infeasible run is unrecoverable: resume would die at
     `_run_phases`'s resume guard (no `waves` field), and the run made
     no commits to finalize. Routing rc=11 to the pause arm would leave
     the user paying for a Fly volume indefinitely. The correct
@@ -243,7 +243,7 @@ def test_decide_teardown_rc11_destroys(tmp_path: Path):
     assert data.get("paused_at") is None
     # Recovery hint coupling test: the rc=11 path must print the
     # budget-specific message, not the rc=10 finalize hint that
-    # would mislead the user into running `leerie --finalize` on a
+    # would mislead the user into running `leerie finalize` on a
     # run with nothing to push.
     assert "budget preflight rejected the plan" in result.stderr
     assert "re-run from the host with the recommended --max-workers" in result.stderr
@@ -267,8 +267,8 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     orchestrator exit, if the sync step that pulls the run branch +
     state back to the host can't succeed, the machine must NOT be
     destroyed — the user's paid LLM work is still on it. The user
-    sees a multi-line WARNING and recovers via `leerie --finalize`,
-    `leerie --resume`, or finally `leerie --kill` once work is safe."""
+    sees a multi-line WARNING and recovers via `leerie finalize`,
+    `leerie resume`, or finally `leerie kill` once work is safe."""
     result, sidecar = _decide_teardown_with_rc(
         tmp_path, "0", run_id="my-run", fetch_branch_succeeds=False,
     )
@@ -278,16 +278,16 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     # whole point is to leave it running so the user can recover.
     assert "machine destroy" not in invocations
     assert "machine stop" not in invocations
-    # Sidecar must record the failure for `leerie --list` to surface.
+    # Sidecar must record the failure for `leerie list` to surface.
     data = json.loads(sidecar.read_text())
     assert data.get("sync_failed_at") is not None
     assert data.get("sync_fail_reason") == "sync-failed-on-clean-exit"
     assert data.get("fly_machine_id") == "mach-test"
     # Recovery guidance must be printed.
     assert "sync from machine to host FAILED" in result.stderr
-    assert "leerie --finalize my-run" in result.stderr
-    assert "leerie --resume my-run" in result.stderr
-    assert "leerie --kill my-run" in result.stderr
+    assert "leerie finalize my-run" in result.stderr
+    assert "leerie resume my-run" in result.stderr
+    assert "leerie kill my-run" in result.stderr
 
 
 def test_decide_teardown_rc130_detaches(tmp_path: Path):
@@ -297,7 +297,7 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     the user stopped watching the local tail — not that they want to destroy
     the run. The orchestrator on the machine is still running. The trap
     must neither destroy nor stop the machine, and must print the hints
-    that point to --resume / --stop / --kill."""
+    that point to resume / stop / kill."""
     result, sidecar = _decide_teardown_with_rc(tmp_path, "130", run_id="my-run-abc")
     assert result.returncode == 0, result.stderr
     # No flyctl invocations at all — the stub never gets called.
@@ -310,9 +310,9 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     assert data.get("killed_at") is None
     # Detach hints must appear in stderr.
     assert "detached from run my-run-abc" in result.stderr
-    assert "leerie --resume my-run-abc" in result.stderr
-    assert "leerie --stop my-run-abc" in result.stderr
-    assert "leerie --kill my-run-abc" in result.stderr
+    assert "leerie resume my-run-abc" in result.stderr
+    assert "leerie stop my-run-abc" in result.stderr
+    assert "leerie kill my-run-abc" in result.stderr
 
 
 def test_decide_teardown_rc143_detaches(tmp_path: Path):
@@ -353,7 +353,7 @@ def test_decide_teardown_rc2_pauses(tmp_path: Path):
 def test_decide_teardown_prints_resume_command(tmp_path: Path):
     """The pause notification includes the resume command verbatim."""
     result, _ = _decide_teardown_with_rc(tmp_path, "1", run_id="my-run-abc")
-    assert "leerie --resume my-run-abc" in result.stderr
+    assert "leerie resume my-run-abc" in result.stderr
 
 
 def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
@@ -674,6 +674,6 @@ def test_launcher_resume_command_format_matches_decide_teardown():
     positional run-id, matching the launcher's positional-arg parsing.
     """
     provision = PROVISION_SH.read_text()
-    assert "leerie --resume ${LEERIE_RUN_ID:-<run-id>}" in provision, (
+    assert "leerie resume ${LEERIE_RUN_ID:-<run-id>}" in provision, (
         "decide_teardown's resume hint string drifted"
     )

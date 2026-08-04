@@ -268,7 +268,7 @@ provision_instance
 
 def test_decide_ec2_teardown_pauses_on_unknown_rc(tmp_path):
     """An unclassified non-zero rc stops (not terminates) the instance —
-    preserves the root EBS volume for later --resume."""
+    preserves the root EBS volume for later resume."""
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)

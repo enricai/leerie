@@ -1,4 +1,4 @@
-"""Tests for `_list_runs()` — the `leerie --list` rendering function.
+"""Tests for `_list_runs()` — the `leerie list` rendering function.
 
 Behavioral tests use `tmp_path` for filesystem isolation. The function
 reads `.leerie/runs/*/state.json` (via _discover_runs) and overlays
@@ -132,10 +132,10 @@ def test_list_runs_falls_back_to_compute_run_branch(leerie, tmp_path, capsys):
     assert "leerie/runs/feat-a-aaaaaa" in out
 
 
-# --- --status filter (DESIGN §6 unified --list) ----------
+# --- status filter (DESIGN §6 unified list) ----------
 
 def test_list_runs_status_filter_in_progress(leerie, tmp_path, capsys):
-    """--list --status in-progress filters to running runs."""
+    """list status in-progress filters to running runs."""
     _make_run(tmp_path, "feat-running-aaaaa",
               {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
     _make_run(tmp_path, "feat-paused-bbbbb",
@@ -151,7 +151,7 @@ def test_list_runs_status_filter_in_progress(leerie, tmp_path, capsys):
 
 
 def test_list_runs_status_filter_killed_remote(leerie, tmp_path, capsys):
-    """--list --status killed isolates killed runs."""
+    """list status killed isolates killed runs."""
     _make_run(tmp_path, "feat-killed-aaaaa",
               {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
               run_json={
@@ -185,7 +185,7 @@ def _make_orphan(root: Path, run_id: str, fly: dict) -> None:
 
 
 def test_list_runs_shows_orphan_with_seed_failed_status(leerie, tmp_path, capsys):
-    """A run dir with only fly-machine.json must appear in --list with
+    """A run dir with only fly-machine.json must appear in list with
     status `seed-failed`. This is the discoverability fix for the
     2026-06-04 incident hangs."""
     _make_orphan(tmp_path, "feat-died-aaa111", {
@@ -201,7 +201,7 @@ def test_list_runs_shows_orphan_with_seed_failed_status(leerie, tmp_path, capsys
 
 
 def test_list_runs_status_filter_seed_failed(leerie, tmp_path, capsys):
-    """--list --status seed-failed isolates orphan runs. This is the
+    """list status seed-failed isolates orphan runs. This is the
     final piece of the discoverability fix: users with a mix of healthy
     and seed-failed runs can list just the broken ones."""
     _make_orphan(tmp_path, "feat-died-aaa111", {

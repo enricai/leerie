@@ -92,7 +92,7 @@ code 10 — not an error, a structured "need answers" signal. The plugin
 skill at [`commands/leerie.md`](../commands/leerie.md) shows the
 questions to the user, writes their answers to
 `<state-root>/answers.json`, and resumes with
-`--resume --answers <state-root>/answers.json`.
+`resume --answers <state-root>/answers.json`.
 
 ## Step 3 — Planning and scheduling
 
@@ -213,7 +213,7 @@ lands in `state['blocked'][<subtask-id>]` and `subtask_status[<id>] =
 "blocked"` inside `<state-root>/runs/<run-id>/state.json`, and Leerie
 exits non-zero. You read the blocker, fix the upstream issue (often by
 editing the task and re-running, sometimes by hand-resolving), then
-`./leerie --resume`. See [`DESIGN.md`](DESIGN.md) §8 for the
+`./leerie resume`. See [`DESIGN.md`](DESIGN.md) §8 for the
 evidence-gated loop logic that produces this signal.
 
 **Integration fails.** The integrator can't merge a subtask branch into
@@ -223,7 +223,7 @@ the run branch stays clean, and exits non-zero. Pull up the conflicting
 branches yourself, resolve, and resume.
 
 **The run is interrupted.** Ctrl-C, system reboot, budget-cap hit. Run
-`./leerie --resume` from the same directory. The resume cursor is
+`./leerie resume` from the same directory. The resume cursor is
 `state['completed_waves']`; finished waves are not re-run. The full state
 schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 
@@ -235,7 +235,7 @@ Leerie does worktree-only cleanup, state and branches survive, and it
 exits non-zero without touching finalize. Re-authenticate (`claude
 /login`, or better, export a `claude setup-token` token — see
 [README "Requirements"](../README.md#requirements)) and run `./leerie
---resume`. See [`DESIGN.md`](DESIGN.md) §6 *Credential strategy* for
+resume`. See [`DESIGN.md`](DESIGN.md) §6 *Credential strategy* for
 why this happens and why the container can't self-heal it.
 
 ## Walking away from a remote run (`--runtime fly`)
@@ -247,12 +247,12 @@ is only watching the log stream. Four verbs cover the full lifecycle:
 | You did | Leerie did | Verb to come back |
 |---|---|---|
 | `leerie "task" --runtime fly` | provisioned a Fly Machine, started the orchestrator detached, opened a tail of its log on your terminal | — (you're attached) |
-| pressed Ctrl-C | detached your local tail; orchestrator on the machine is still running | `leerie --resume <run-id>` |
-| closed your laptop / lost WiFi | same as Ctrl-C — the tail broke but the orchestrator did not | `leerie --resume <run-id>` |
-| ran `leerie --stop <run-id>` | stopped the machine cleanly via `flyctl machine stop`; filesystem preserved on Fly volume | `leerie --resume <run-id> --runtime fly` |
-| ran `leerie --kill <run-id>` | destroyed the machine via `flyctl machine destroy`; run is over | start a new run; this one is gone |
+| pressed Ctrl-C | detached your local tail; orchestrator on the machine is still running | `leerie resume <run-id>` |
+| closed your laptop / lost WiFi | same as Ctrl-C — the tail broke but the orchestrator did not | `leerie resume <run-id>` |
+| ran `leerie stop <run-id>` | stopped the machine cleanly via `flyctl machine stop`; filesystem preserved on Fly volume | `leerie resume <run-id> --runtime fly` |
+| ran `leerie kill <run-id>` | destroyed the machine via `flyctl machine destroy`; run is over | start a new run; this one is gone |
 
-`leerie --resume` is a single smart-router verb: it wakes a paused
+`leerie resume` is a single smart-router verb: it wakes a paused
 machine, attaches to a still-alive orchestrator, or relaunches against
 an alive-but-orphaned machine — automatically, based on what it
 observes. The default action is to tail the orchestrator log; pass
@@ -264,34 +264,34 @@ see a one-line banner:
 
 ```
 [leerie] detached from run <id> (machine <mid> still running)
-       reattach:  leerie --resume <id>
-       pause:     leerie --stop <id>
-       destroy:   leerie --kill <id>
+       reattach:  leerie resume <id>
+       pause:     leerie stop <id>
+       destroy:   leerie kill <id>
 ```
 
-Close your laptop, go wherever. When you come back, `leerie --resume
+Close your laptop, go wherever. When you come back, `leerie resume
 <id>` picks up the orchestrator log where it left off. The
 orchestrator never noticed you were gone.
 
-**Listing runs.** `leerie --list` shows every run (local and remote) in
+**Listing runs.** `leerie list` shows every run (local and remote) in
 one table, with the Fly Machine ID column populated for remote runs.
-Filter by status with `leerie --list --status <state>` (e.g. `paused`,
+Filter by status with `leerie list status <state>` (e.g. `paused`,
 `killed`, `in-progress`) and by runtime with `--runtime <local|fly>`.
-The two axes are orthogonal: `--list --status paused --runtime fly`
+The two axes are orthogonal: `leerie list status paused --runtime fly`
 shows every paused Fly run. The status taxonomy lives in
-`RUN_STATUSES` in `orchestrator/leerie.py`; `leerie --list --status ?`
-prints the full set. `--list --runtime fly` (without `--status`)
+`RUN_STATUSES` in `orchestrator/leerie.py`; `leerie list status ?`
+prints the full set. `leerie list --runtime fly` (without `status`)
 short-circuits to a direct Fly query (`flyctl machines list`) covering
 every machine under the app, regardless of which host repo launched
 them — useful when you've lost track of a machine ID after Ctrl-C.
 
 > **In-flight detached runs** — runs that are still in the bootstrap
 > phase (before classify completes, ~1 min) won't show up in `leerie
-> --list` yet, because `state.json` lives on the Fly Machine until
-> `leerie --finalize` streams it back. **The detach banner that prints
+> list` yet, because `state.json` lives on the Fly Machine until
+> `leerie finalize` streams it back. **The detach banner that prints
 > when you Ctrl-C is the canonical source of the run-id during that
 > window** — copy it. Once classify completes the run appears in
-> `leerie --list` with its final category-prefixed id.
+> `leerie list` with its final category-prefixed id.
 
 **`flyctl` auto-install.** The first time you pass `--runtime fly` on
 a machine without `flyctl`, leerie offers to install it (`brew install
@@ -581,7 +581,7 @@ Use chains for tasks with a fixed ordering — for example: run two
 parallel scaffolds in wave 0, then run a follow-up integration job
 in wave 1 that depends on both.
 
-`leerie --chain` is a **laptop-side wave sequencer** (DESIGN §19).
+`leerie chain` is a **laptop-side wave sequencer** (DESIGN §19).
 It loops over waves on the laptop: for each wave, it fans out N
 parallel `./leerie --runtime fly` invocations (one per prompt file),
 waits for all to finalize on the laptop (existing single-run path),
@@ -595,7 +595,7 @@ GitHub credentials are touched only by the laptop, via the existing
 From inside Claude Code the same chain verbs are available as the
 `/chain` plugin skill at [`commands/chain.md`](../commands/chain.md)
 (submit/status/list/kill/stop/resume/finalize/attach) — the skill
-relays them to the `leerie --chain` / ID-dispatched verbs described
+relays them to the `leerie chain` / ID-dispatched verbs described
 below.
 
 ### Step 1 — Write your prompt files
@@ -626,7 +626,7 @@ profile.
 # two scaffolds run in parallel as wave 0, then the integration job
 # runs in wave 1 once both scaffolds are done. The chain operates
 # against $USER_REPO directly.
-leerie --chain \
+leerie chain \
   --wave prompts/01-scaffold-api.md,prompts/02-scaffold-worker.md \
   --wave prompts/03-integration.md
 ```
@@ -637,13 +637,10 @@ foreground of your terminal — keep it running until the chain
 completes, or Ctrl-C to stop (the trap propagates SIGTERM to every
 in-flight wave child).
 
-`--chain-submit` is kept as a deprecated alias for `--chain`; both
-behave identically.
-
 ### Step 4 — Monitor progress
 
-The single-run verbs (`--status`, `--attach`, `--stop`, `--kill`,
-`--resume`, `--finalize`) are ID-dispatched: pass a UUID and they
+The single-run verbs (`status`, `attach`, `stop`, `kill`,
+`resume`, `finalize`) are ID-dispatched: pass a UUID and they
 operate on the chain (iterating `$LEERIE_STATE_HOST_DIR/runs/*/run.json`
 filtered by `chain_id`); pass a Fly machine id and they operate on
 the single run (unchanged behavior).
@@ -652,10 +649,10 @@ From a different terminal:
 
 ```bash
 # Per-run snapshot of every run in the chain:
-leerie --status <chain-id>
+leerie status <chain-id>
 
 # Poll until every chain run reaches a terminal state:
-leerie --attach <chain-id>
+leerie attach <chain-id>
 ```
 
 ### Step 5 — Worker branches and PRs
@@ -676,10 +673,10 @@ staged base as their starting point.
 ### Step 6 — List active chains
 
 ```bash
-leerie --list --chains
+leerie list chains
 ```
 
-Or via the deprecated alias `leerie --list-chains`. Both iterate
+Both iterate
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json`, group runs by `chain_id`,
 and print one row per chain (chain_id, status, pushed/total runs,
 wave count, started_at).
@@ -688,19 +685,19 @@ wave count, started_at).
 
 ```bash
 # Pause every running chain run:
-leerie --stop <chain-id>
+leerie stop <chain-id>
 
-# Resume every paused chain run; then re-run `leerie --chain --wave ...`
+# Resume every paused chain run; then re-run `leerie chain --wave ...`
 # to continue the wave loop from where it stopped. The wave loop's
 # idempotency check skips waves whose runs are already all pushed.
-leerie --resume <chain-id>
+leerie resume <chain-id>
 
 # Finalize every chain run that isn't pushed yet (push + open PR):
-leerie --finalize <chain-id>
+leerie finalize <chain-id>
 
 # Destroy every chain run's machine (idempotent).
-leerie --kill <chain-id>
+leerie kill <chain-id>
 ```
 
-`--kill <chain-id>` iterates the chain's runs and invokes
-`leerie --kill <run-id>` per run; already-killed runs are skipped.
+`kill <chain-id>` iterates the chain's runs and invokes
+`leerie kill <run-id>` per run; already-killed runs are skipped.

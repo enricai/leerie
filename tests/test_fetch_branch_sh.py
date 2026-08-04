@@ -322,7 +322,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
         `git rev-parse --verify refs/heads/<branch>`
       - skip the bundle step when the probe fails (exit non-zero)
       - succeed overall (return 0)
-      - still stream the state directory back so `leerie --list`
+      - still stream the state directory back so `leerie list`
         shows the run as `done`.
 
     Critically, fetch_branch must NOT use `run.json.no_push` as a
@@ -392,7 +392,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     assert run_branch not in ls_branches.stdout, (
         f"run branch {run_branch} should NOT be created for a no_push run"
     )
-    # But the state directory MUST be streamed back so `leerie --list`
+    # But the state directory MUST be streamed back so `leerie list`
     # can render the run as done on the host.
     host_run_dir = repo / ".leerie" / "runs" / run_id
     assert host_run_dir.exists(), (

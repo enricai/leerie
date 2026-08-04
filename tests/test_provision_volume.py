@@ -541,7 +541,7 @@ def test_resolve_volume_id_from_fly_reads_machine_mounts(tmp_path):
 
     Shape pinned against a live Fly machine: `machine list --json` carries
     `.config.mounts[].volume`, and still does while `state=stopped` (the
-    --stop-then-kill path). `machine status` has no --json flag, so it is
+    stop-then-kill path). `machine status` has no --json flag, so it is
     deliberately not used.
     """
     stub, log = _make_recording_flyctl(tmp_path)
@@ -583,7 +583,7 @@ def test_resolve_volume_id_from_fly_empty_when_no_mounts(tmp_path):
 
 
 def test_kill_with_machine_id_and_no_run_dir_reaps_volume(tmp_path):
-    """GAP 2 (end-to-end): `--kill --machine-id <id>` with no sidecar must
+    """GAP 2 (end-to-end): `kill --machine-id <id>` with no sidecar must
     still reap the volume.
 
     The launcher advertises this flag for "an orphan machine without a
@@ -609,14 +609,14 @@ def test_kill_with_machine_id_and_no_run_dir_reaps_volume(tmp_path):
         "FLY_STUB_MOUNT_VOLUME": "vol_leaked",
     }
     result = _run_bash(
-        f'"{REPO_ROOT / "leerie"}" --kill --machine-id m-orphan\n',
+        f'"{REPO_ROOT / "leerie"}" kill --machine-id m-orphan\n',
         env=env,
         cwd=REPO_ROOT,
     )
     calls = _read_calls(log)
     volume_destroys = [c for c in calls if c[:2] == ["volumes", "destroy"]]
     assert volume_destroys, (
-        f"--kill --machine-id must reap the volume via the Fly lookup; "
+        f"kill --machine-id must reap the volume via the Fly lookup; "
         f"calls={calls} stderr={result.stderr}")
     assert "vol_leaked" in volume_destroys[0], volume_destroys[0]
 

@@ -17,10 +17,7 @@ real time.
 Active call sites (under v5 Shape A): only ``chain.git_ops`` invokes
 ``die()`` on git/gh failures during the laptop-side
 ``synth_merge_branches`` step (the wave loop's only entry into this
-module). The other ``chain.git_ops`` functions
-(``clone_target``/``fetch_branch``/``finalize_run``/etc.) are kept
-for the existing test suite and any future automated paths but are
-not on the active chain code path.
+module).
 """
 from __future__ import annotations
 
@@ -46,7 +43,7 @@ def log(msg: str) -> None:
     """Write a timestamped, prefixed line to stdout.
 
     The caller (typically a ``python3 -c`` invocation from the
-    ``leerie`` launcher's ``--chain`` arm) sees this on stdout in
+    ``leerie`` launcher's ``chain`` arm) sees this on stdout in
     real time.
     """
     print(f"{_iso_now()} {_LOG_PREFIX} {msg}", flush=True)

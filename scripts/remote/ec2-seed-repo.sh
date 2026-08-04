@@ -44,7 +44,7 @@
 #
 # EC2 instances receive no GitHub credentials, mirroring Fly (DESIGN §6
 # *Finalization*): workers commit on the instance, the host pushes via
-# `leerie --finalize`.
+# `leerie finalize`.
 #
 # Usage (called by the leerie launcher after ec2 provisioning succeeds):
 #

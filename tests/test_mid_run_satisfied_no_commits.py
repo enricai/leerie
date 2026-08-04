@@ -8,7 +8,7 @@ mechanical `check_branch_has_commits` no-op gate fails it as `no_commits`. The
 plan-time `_filter_satisfied_subtasks` probe judged the BASE tree and could not
 see the sibling's mid-run commit. A retry reproduces the identical no-op (the
 work exists on the branch the subtask is measured against), the retry cap is
-exhausted, and the wave dies — a deterministic loop that repeats on `--resume`.
+exhausted, and the wave dies — a deterministic loop that repeats on `resume`.
 
 The fix (`_settle_subtask`): before failing a no-commits `complete`, re-run the
 `satisfied_probe` against the subtask's `success_criteria_seed` on the

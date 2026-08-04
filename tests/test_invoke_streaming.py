@@ -229,7 +229,7 @@ def test_invoke_overage_block_plus_truncation_raises_ratelimited(
 
     reset_at is None: the kill left no result envelope carrying a parseable
     resetsAt. out_of_credits=True tells main() to pause-and-surface (exit
-    EXIT_LOCKED with a --resume hint) rather than auto-resume — out-of-credits
+    EXIT_LOCKED with a resume hint) rather than auto-resume — out-of-credits
     has no reset clock."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),

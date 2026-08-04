@@ -219,17 +219,17 @@ fi
 # at /run/leerie-cidfile via nerdctl --cidfile; nerdctl writes it
 # before PID 1 starts, so it's available here.
 #
-# NOT on --resume: a resume container is a *new* container with a new id,
+# NOT on resume: a resume container is a *new* container with a new id,
 # but the run being resumed already has one (the id of the container that
 # first ran it). Injecting here would hand the orchestrator an id matching
 # no run on disk, and resolve_run_id fails closed on an unknown explicit
-# id — so bare `--resume` died instead of auto-picking. An explicit
-# `--resume <id>` survived only because the launcher rewrites it to
+# id — so bare `resume` died instead of auto-picking. An explicit
+# `resume <id>` survived only because the launcher rewrites it to
 # `--run-id <id>` and argparse takes the last occurrence; skipping the
 # injection entirely makes both forms correct by construction.
 _is_resume=false
 for _a in "$@"; do
-  if [ "$_a" = "--resume" ]; then
+  if [ "$_a" = "resume" ]; then
     _is_resume=true
     break
   fi

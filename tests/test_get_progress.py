@@ -80,7 +80,7 @@ def test_failed_skips_conformer_check(leerie):
 
 
 def test_cleared_failed_status_counts_as_running(leerie):
-    """On --resume, phase_execute pops stale failed/blocked entries from
+    """On resume, phase_execute pops stale failed/blocked entries from
     subtask_status before dispatching retries. The absent key should
     make _get_progress count the subtask as running, not done."""
     st = SimpleNamespace(data={

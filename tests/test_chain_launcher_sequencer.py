@@ -1,4 +1,4 @@
-"""Tests for the launcher's --chain wave-sequencer arm (v5 Shape A).
+"""Tests for the launcher's `chain` wave-sequencer arm (v5 Shape A).
 
 The sequencer fans out N background ./leerie --runtime fly invocations
 per wave, waits for all, tags each finalized run.json with chain_id +
@@ -92,7 +92,7 @@ def _build_self_stub(
         mkdir -p "$_state/remote" "$_state/runs/$_mid"
         # Capture prompt (first positional arg before --runtime).
         _prompt="$1"
-        # Find chain-id (passed as --chain-id <uuid>).
+        # Find --chain-id (passed as --chain-id <uuid>).
         _cid=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
@@ -203,7 +203,7 @@ def _run_chain(
     extra_args: list[str] | None = None,
     skip_remote_pointer: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run the launcher's --chain arm with stubs."""
+    """Run the launcher's `chain` arm with stubs."""
     user_repo = tmp_path / "userrepo"
     is_new_repo = not user_repo.exists()
     user_repo.mkdir(exist_ok=True)
@@ -219,7 +219,7 @@ def _run_chain(
     fake_chain_dir, synth_log = _build_synth_merge_stub(tmp_path)
     git_bin_dir, git_log = _stub_git(tmp_path)
 
-    args = ["--chain"]
+    args = ["chain"]
     if extra_args:
         args.extend(extra_args)
     for w in waves:
@@ -306,7 +306,7 @@ def test_multi_wave_chain_id_threaded_to_each_job(tmp_path: Path) -> None:
     p1 = _write_prompt(tmp_path, "b.md")
     result = _run_chain(tmp_path, [[p0], [p1]])
     assert result.returncode == 0, result.stderr
-    # Extract the chain-id used in each invocation.
+    # Extract the --chain-id used in each invocation.
     chain_ids = []
     for line in result.self_log.splitlines():
         if "--chain-id" in line:
@@ -332,7 +332,7 @@ def test_wave_job_failure_pauses_chain(tmp_path: Path) -> None:
     result = _run_chain(tmp_path, [[p]], exit_codes=[1])
     assert result.returncode == 1
     assert "paused" in (result.stdout + result.stderr).lower()
-    assert "--resume" in (result.stdout + result.stderr)
+    assert "resume" in (result.stdout + result.stderr)
 
 
 def test_synth_merge_conflict_pauses_chain(tmp_path: Path) -> None:
@@ -351,14 +351,14 @@ def test_synth_merge_conflict_pauses_chain(tmp_path: Path) -> None:
 
 
 def test_no_waves_errors(tmp_path: Path) -> None:
-    """--chain with no --wave flag → usage error."""
+    """`chain` with no --wave flag → usage error."""
     result = _run_chain(tmp_path, [])
     assert result.returncode == 1
     assert "wave" in (result.stdout + result.stderr).lower()
 
 
 def test_missing_prompt_file_errors(tmp_path: Path) -> None:
-    """--chain with a nonexistent prompt file → error before any spawn."""
+    """`chain` with a nonexistent prompt file → error before any spawn."""
     user_repo = tmp_path / "userrepo"
     user_repo.mkdir()
     _init_git_repo(user_repo)
@@ -381,7 +381,7 @@ def test_missing_prompt_file_errors(tmp_path: Path) -> None:
         "PYTHONPATH": str(fake_chain_dir),
     }
     result = subprocess.run(
-        ["bash", str(LAUNCHER), "--chain", "--wave", "/no/such/prompt.md"],
+        ["bash", str(LAUNCHER), "chain", "--wave", "/no/such/prompt.md"],
         env=env, capture_output=True, text=True, timeout=10,
         cwd=str(user_repo),
     )
@@ -495,16 +495,16 @@ def test_wave_branches_helper(tmp_path: Path) -> None:
 
 def test_resume_skips_done_waves(tmp_path: Path) -> None:
     """If a chain's wave-0 runs are already complete (chain_id +
-    wave_idx + pushed_at all set), re-running `leerie --chain --wave
+    wave_idx + pushed_at all set), re-running `leerie chain --wave
     ...` with the SAME chain_id skips fan-out for wave 0 and proceeds
     directly to wave 1.
 
     The launcher mints chain_id on each invocation, so we exercise
     idempotency by:
-    1. Running --chain once with 2 waves; stubs record 2 invocations.
+    1. Running `chain` once with 2 waves; stubs record 2 invocations.
     2. Manually re-tagging the fixtures so the wave-0 runs look like
        they belong to a NEW chain submission (rewrite chain_id).
-    3. Running --chain again; the launcher mints yet another new
+    3. Running `chain` again; the launcher mints yet another new
        chain_id, so the idempotency check finds NO matching wave-0
        runs and fans out 1 invocation for the new wave-0 prompt.
 
@@ -512,12 +512,12 @@ def test_resume_skips_done_waves(tmp_path: Path) -> None:
     minting means cross-submission resume of an EXACT prompt set
     isn't matched by chain_id alone. The actual resume-across-
     submission flow lives in the chain-scoped verbs (`leerie
-    --resume <chain-id>` per run). The wave-loop idempotency mainly
-    protects WITHIN a single --chain invocation against re-fan-out
+    `resume <chain-id>` per run). The wave-loop idempotency mainly
+    protects WITHIN a single `chain` invocation against re-fan-out
     after a Ctrl-C.
 
     For a complete in-process idempotency proof, we run the SAME
-    --chain invocation TWICE in the same parent shell (impossible
+    `chain` invocation TWICE in the same parent shell (impossible
     via this test harness, since each test gets a fresh tmp_path).
     Instead, we directly invoke _wave_already_done in
     test_wave_already_done_helper above, which is the load-bearing
@@ -544,7 +544,7 @@ def test_resume_skips_done_waves(tmp_path: Path) -> None:
 
 
 def test_chain_forwards_per_job_flags(tmp_path: Path) -> None:
-    """--chain --effort high --dangerously-skip-permissions forwards
+    """`chain` --effort high --dangerously-skip-permissions forwards
     those flags to each per-job ./leerie invocation."""
     p = _write_prompt(tmp_path, "a.md")
     result = _run_chain(
@@ -559,7 +559,7 @@ def test_chain_forwards_per_job_flags(tmp_path: Path) -> None:
 
 
 def test_chain_forwards_equals_form_flags(tmp_path: Path) -> None:
-    """--chain --effort=high forwards the --flag=value form intact."""
+    """`chain` --effort=high forwards the --flag=value form intact."""
     p = _write_prompt(tmp_path, "a.md")
     result = _run_chain(
         tmp_path, [[p]],
@@ -570,7 +570,7 @@ def test_chain_forwards_equals_form_flags(tmp_path: Path) -> None:
 
 
 def test_chain_rejects_target_flag(tmp_path: Path) -> None:
-    """--chain --target <url> exits non-zero with a clear error message
+    """`chain` --target <url> exits non-zero with a clear error message
     (chains operate against $USER_REPO directly; the flag is not
     supported under v5 Shape A)."""
     p = _write_prompt(tmp_path, "a.md")
@@ -585,7 +585,7 @@ def test_chain_rejects_target_flag(tmp_path: Path) -> None:
 
 
 def test_chain_id_flag_pins_chain_id(tmp_path: Path) -> None:
-    """--chain --chain-id <uuid> reuses the supplied UUID instead of
+    """`chain` --chain-id <uuid> reuses the supplied UUID instead of
     minting a fresh one. The wave-loop idempotency check then matches
     prior chain runs and skips fan-out for already-pushed waves.
 
@@ -636,7 +636,7 @@ def test_chain_id_flag_pins_chain_id(tmp_path: Path) -> None:
 
 
 def test_chain_id_flag_rejects_invalid_uuid(tmp_path: Path) -> None:
-    """--chain --chain-id <not-a-uuid> exits 1 with a UUID-format error."""
+    """`chain` --chain-id <not-a-uuid> exits 1 with a UUID-format error."""
     p = _write_prompt(tmp_path, "a.md")
     result = _run_chain(
         tmp_path, [[p]],
@@ -663,7 +663,7 @@ def test_chain_runs_filter_rejects_unknown_verb(tmp_path: Path) -> None:
          f"source '{log_sh}'; "
          f"source <(awk '/^_chain_runs_filter\\(\\)/,/^}}$/' '{LAUNCHER}'); "
          f"LEERIE_STATE_HOST_DIR=/tmp USER_REPO=/tmp "
-         f"_chain_runs_filter 'fake-chain-id' 'stopp'"],  # typo: stopp
+         f"_chain_runs_filter 'fake---chain-id' 'stopp'"],  # typo: stopp
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 2, (
@@ -868,7 +868,7 @@ def test_synth_merge_skipped_when_stage_branch_exists_on_origin(tmp_path: Path) 
         "PYTHONPATH": str(fake_chain_dir),
     }
     result = subprocess.run(
-        ["bash", str(LAUNCHER), "--chain",
+        ["bash", str(LAUNCHER), "chain",
          "--wave", str(p0), "--wave", str(p1)],
         env=env, capture_output=True, text=True, timeout=30,
         cwd=str(user_repo),
@@ -992,7 +992,7 @@ def test_chain_id_tagged_via_fly_machine_json_fallback(tmp_path: Path) -> None:
 def test_chain_runs_filter_running_verb(tmp_path: Path) -> None:
     """The `running` verb matches runs that have fly_machine_id +
     chain_id set and no terminal state (pushed_at / paused_at /
-    killed_at). Used by `--resume <chain-id>` to discover active
+    killed_at). Used by `resume <chain-id>` to discover active
     machines the user can reattach to."""
     state_dir = tmp_path / ".leerie" / "testrepo"
     runs_dir = state_dir / "runs"

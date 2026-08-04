@@ -1,7 +1,7 @@
 """Tests for _absorb_supplied_answers().
 
 This helper closes the load-bearing P5-1 bug: prior to its addition,
-`--resume --answers FILE` silently dropped the answers file because
+`resume --answers FILE` silently dropped the answers file because
 the resume branch of _orchestrate() never read `args.answers`. The
 documented user flow for a non-interactive deferred-question exit
 (Phase-1 classifier OR §11 mid-execution clarification) is:
@@ -9,7 +9,7 @@ documented user flow for a non-interactive deferred-question exit
   1. Initial run hits an underivable question, writes a pending-*.json
      and exits with code 10.
   2. User edits an answers file with the answer.
-  3. User re-runs with `--resume --answers <file>`.
+  3. User re-runs with `resume --answers <file>`.
 
 Step 3 was broken. These tests pin the fix: the helper merges supplied
 answers into state, flushes them to every existing subtask spec, and

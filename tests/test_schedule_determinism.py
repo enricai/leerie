@@ -7,7 +7,7 @@ wave by subtask id (`orchestrator/leerie.py:17374`,
 wave partition is a pure function of the dependency graph plus
 lexicographic ids — independent of dict/set iteration order and of the
 input plan/subtask order. That means a `plans` list persisted to
-state.json and reloaded on `--resume` (a JSON round-trip) rehydrates to
+state.json and reloaded on `resume` (a JSON round-trip) rehydrates to
 a byte-identical _schedule as the original in-memory run.
 
 This test proves the property directly against _schedule() rather than

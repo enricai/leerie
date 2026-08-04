@@ -25,11 +25,11 @@
 #      Unknown distros always fall back to the hint.
 #   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
 #   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
-#   5. Verifies the install with `leerie --version`.
+#   5. Verifies the install with `leerie version`.
 #
 # Leerie runs entirely inside a container (DESIGN §6 / IMPLEMENTATION §0.5),
 # so Python is provisioned by the image at runtime — the host doesn't need
-# Python or `uv` anymore. The launcher's --version fast path returns
+# Python or `uv` anymore. The launcher's `version` fast path returns
 # without spinning up a container.
 #
 # Flags:
@@ -105,7 +105,7 @@ What this does, in order:
      auto-install (fall back to hint + exit 1).
   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
-  5. Verifies the install with `leerie --version`.
+  5. Verifies the install with `leerie version`.
 
 Flags:
   --dry-run                Print actions without executing.
@@ -143,7 +143,9 @@ run() {
 
 have_runnable() {
   # `command -v` returns success for shimmed entries (pyenv) that can't
-  # actually exec — invoke `--version` to confirm it really runs.
+  # actually exec — invoke `--version` to confirm it really runs. (Generic
+  # helper for git/curl/claude/colima/nerdctl, none of which are leerie's
+  # own bare-verb CLI.)
   "$1" --version >/dev/null 2>&1
 }
 
@@ -436,13 +438,13 @@ log "verifying install"
 if [ "$DRY_RUN" = "false" ]; then
   # Run the launcher we just symlinked, not whatever `leerie` already
   # exists on PATH — proves *this* install works end-to-end.
-  if "$LINK" --version; then
+  if "$LINK" version; then
     log "done. Run \`leerie \"your task\"\` from any git repository to start."
   else
-    err "leerie --version failed. The install completed but the binary is not runnable."
+    err "leerie version failed. The install completed but the binary is not runnable."
     exit 1
   fi
 else
-  printf '  $ %s\n' "$LINK --version"
+  printf '  $ %s\n' "$LINK version"
   log "dry-run complete."
 fi

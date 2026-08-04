@@ -59,7 +59,7 @@ clean_one_run() {
       # when git no longer tracks the worktree (already pruned) and so
       # nonzero-exits without touching disk. Without this fallback, a
       # stale worktree directory persists across cleanups and blocks
-      # `--resume`'s new-worktree.sh from re-creating the worktree at
+      # `resume`'s new-worktree.sh from re-creating the worktree at
       # the same path. Path is sandboxed under
       # .leerie/runs/<run-id>/worktrees/<sid>; the leading `[ -d ]` plus
       # the glob restricts scope to that directory's children.

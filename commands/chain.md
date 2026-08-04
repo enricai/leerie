@@ -31,8 +31,8 @@ The single-run verbs (`status`, `kill`, `stop`, `resume`, `finalize`,
 the chain (iterates `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by
 the `chain_id` field, dispatches the single-run verb per discovered
 run); a Fly machine id operates on a single run (historical behavior).
-UUID format: `8-4-4-4-12` hyphenated. The deprecated `--chain-*` aliases
-continue to work via the launcher's shim arms.
+UUID format: `8-4-4-4-12` hyphenated. The five deprecated dash-prefixed
+chain aliases have been hard-removed (no shim) — use the bare verbs below.
 
 ## Steps
 
@@ -47,7 +47,7 @@ and passes its contents as the run prompt to a background
 `--wave` flag order (0, 1, 2, …).
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain \
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" chain \
   --wave <path/to/a1.md,path/to/a2.md> \
   --wave <path/to/b1.md>
 ```
@@ -64,7 +64,7 @@ to all in-flight wave children, each of which runs its own
 When a wave fails or the user Ctrl-Cs mid-chain, the chain pauses.
 To resume:
 
-1. `leerie --resume <chain-id>` — resumes every paused single-run
+1. `leerie resume <chain-id>` — resumes every paused single-run
    in the chain. After each paused run completes, the wave it
    belongs to has all runs `pushed_at`.
 2. Re-submit the chain with `--chain-id` pinned to the prior UUID.
@@ -73,7 +73,7 @@ To resume:
    first incomplete wave:
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain \
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" chain \
   --chain-id <prior-uuid> \
   --wave <same --wave args as the original submission>
 ```
@@ -88,7 +88,7 @@ for that wave transition, resuming at the next wave.
 ### `status` — print a chain snapshot
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --status <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" status <chain-id>
 ```
 
 Iterates `$LEERIE_STATE_HOST_DIR/runs/*/run.json`, filters by the
@@ -99,61 +99,61 @@ status, branch, notes). Status derived from run.json fields
 ### `list` — list chains
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --list --chains
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" list chains
 ```
 
-Or via the deprecated alias `--list-chains`. Iterates run.json files,
+Iterates run.json files,
 groups by `chain_id`, and prints one row per chain
 (chain_id, status, pushed/total, wave count, started_at).
 
 ### `stop` — pause a chain
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --stop <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" stop <chain-id>
 ```
 
 Enumerates running runs in the chain (have `fly_machine_id`, no
-terminal state) and invokes `leerie --stop <run-id>` per run. Each
+terminal state) and invokes `leerie stop <run-id>` per run. Each
 paused run's machine is stopped (preserving filesystem) and run.json
-records `paused_at` + `pause_reason`. Resume with `--resume`.
+records `paused_at` + `pause_reason`. Resume with `resume`.
 
 ### `kill` — destroy a chain
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --kill <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" kill <chain-id>
 ```
 
 Enumerates non-killed runs in the chain and invokes
-`leerie --kill <run-id>` per run. Each run's Fly machine is destroyed
+`leerie kill <run-id>` per run. Each run's Fly machine is destroyed
 and `killed_at` is recorded. Idempotent — already-killed runs are
 skipped.
 
 ### `resume` — resume paused chain runs
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --resume <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" resume <chain-id>
 ```
 
 Enumerates paused runs (`paused_at` set, not `killed_at`) and invokes
-`leerie --resume <run-id>` per run. After paused runs complete, the
-user re-invokes `leerie --chain --wave ...` and the wave loop's
+`leerie resume <run-id>` per run. After paused runs complete, the
+user re-invokes `leerie chain --wave ...` and the wave loop's
 idempotency check skips waves whose runs are all already `pushed_at`,
 continuing from where the chain stopped.
 
 ### `finalize` — push + open PRs for unpushed chain runs
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --finalize <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" finalize <chain-id>
 ```
 
 Enumerates runs with `pushed_at` unset (and not `killed_at`), invokes
-`leerie --finalize <run-id>` per run. Useful when the wave loop was
+`leerie finalize <run-id>` per run. Useful when the wave loop was
 interrupted between orchestrator finalize and laptop push.
 
 ### `attach` — poll until terminal
 
 ```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --attach <chain-id>
+bash "${CLAUDE_PLUGIN_ROOT}/leerie" attach <chain-id>
 ```
 
 Polls `$LEERIE_STATE_HOST_DIR/runs/*/run.json` every 5s. Exits 0 when

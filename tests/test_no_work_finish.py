@@ -5,7 +5,7 @@ When every planner returns `status: "ready"` with empty `subtasks`,
 the orchestrator records the no-work outcome, writes `finished_at` to
 both state.json and run.json, and exits 0. `_derive_run_status` reads
 the `finished_at` + missing `pushed_at` / `pr_url` and renders the run
-as `done` in `leerie --list`.
+as `done` in `leerie list`.
 
 These tests pin the contract end-to-end: state.json gets the audit
 fields, run.json gets `finished_at` + `no_push=True`, and the

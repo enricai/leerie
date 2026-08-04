@@ -1,13 +1,13 @@
-"""Tests for the `leerie` launcher's `--kill` verb routing an EC2 run to
+"""Tests for the `leerie` launcher's `kill` verb routing an EC2 run to
 `terminate_instance()` with fetch-before-terminate ordering (DESIGN §6
 *EC2 runtime lifecycle*, one-way-ratchet invariant).
 
-Before this subtask, an EC2 run-id passed to `--kill` fell through to the
+Before this subtask, an EC2 run-id passed to `kill` fell through to the
 Fly kill path (since no ec2 branch existed there yet — feat-004 wired only
 detection + a fail-closed message) where it was handed to `flyctl` — the
-destroy silently no-ops against a nonexistent Fly machine, `--kill`
+destroy silently no-ops against a nonexistent Fly machine, `kill`
 reports "destroyed", and the EC2 instance survives as an unbounded silent
-cost leak. This module pins the real fix: `--kill` resolves credentials,
+cost leak. This module pins the real fix: `kill` resolves credentials,
 re-resolves the instance's SSH target, syncs run state to the host via
 `_try_fetch_state_for_ec2_teardown` (mirroring `decide_ec2_teardown`'s own
 hook — same ordering rule `ec2-provision.sh:262-272` documents:
@@ -16,7 +16,7 @@ calls `terminate_instance()`.
 
 Harness: invokes the real `leerie` launcher binary end to end (mirroring
 `tests/test_auto_detect_run_runtime.py`'s `_run_launcher` e2e pattern).
-The stub `aws` combines two behaviors behind one binary, since `--kill`'s
+The stub `aws` combines two behaviors behind one binary, since `kill`'s
 EC2 path exercises both surfaces in one run:
 
   - `sts` / `ec2 <action>` subcommands route to the resource-tracking
@@ -58,7 +58,7 @@ INSTANCE_ID = "i-0123456789abcdef0"
 # instance fixture (mirroring test_ec2_fetch_branch.py's _make_stub_aws);
 # everything else (sts, ec2 <action>) delegates to a Python resource-
 # tracking backend (mirroring tests/ec2_stub.py's state machine) so
-# --kill's credential/instance-lifecycle calls are tracked too. Both
+# kill's credential/instance-lifecycle calls are tracked too. Both
 # halves append to the same aws.log / state.json so
 # tests/ec2_stub.py's read_log/read_state/leaked_resources work
 # unmodified.
@@ -221,7 +221,7 @@ def _run_launcher(args: list[str], env: dict) -> subprocess.CompletedProcess:
 def test_fetch_precedes_terminate_by_call_index(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
 
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
@@ -242,7 +242,7 @@ def test_fetch_precedes_terminate_by_call_index(tmp_path):
 def test_successful_kill_leaves_zero_non_terminated_instances_and_no_leaked_volumes(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     state = read_state(aws_dir)
@@ -259,7 +259,7 @@ def test_fetch_failure_leaves_instance_running_not_terminated(tmp_path):
         tmp_path, with_completed_run=False
     )
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
 
     assert result.returncode != 0
     combined = result.stdout + result.stderr
@@ -286,7 +286,7 @@ def test_kill_never_hands_the_run_id_to_flyctl(tmp_path):
     run, on both the success and failure paths."""
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
     assert _read_flyctl_log(aws_dir) == [], "flyctl must never be invoked for an EC2 run"
 
@@ -296,7 +296,7 @@ def test_kill_never_hands_the_run_id_to_flyctl_on_fetch_failure(tmp_path):
         tmp_path, with_completed_run=False
     )
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
     assert result.returncode != 0
     assert _read_flyctl_log(aws_dir) == [], "flyctl must never be invoked for an EC2 run"
 
@@ -309,7 +309,7 @@ def test_kill_never_hands_the_run_id_to_flyctl_on_fetch_failure(tmp_path):
 def test_successful_kill_marks_run_json_killed(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     run_json = json.loads((run_dir / "run.json").read_text())
@@ -324,7 +324,7 @@ def test_kill_bootstraps_run_json_from_ec2_instance_sidecar_when_absent(tmp_path
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
     (run_dir / "run.json").unlink()
 
-    result = _run_launcher(["--kill", "r1", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     run_json = json.loads((run_dir / "run.json").read_text())
@@ -342,7 +342,7 @@ def test_kill_fails_closed_when_no_instance_id_in_sidecar(tmp_path):
     (run_dir / "ec2-instance.json").unlink()
     (run_dir / "run.json").write_text(json.dumps({}))
 
-    result = _run_launcher(["--kill", "r1", "--runtime", "ec2", "--force"], env)
+    result = _run_launcher(["kill", "r1", "--runtime", "ec2", "--force"], env)
 
     assert result.returncode != 0
     assert "no ec2_instance_id found" in result.stderr
@@ -360,7 +360,7 @@ def test_kill_without_force_prompts_for_confirmation(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
     result = subprocess.run(
-        [str(LAUNCHER), "--kill", "r1"],
+        [str(LAUNCHER), "kill", "r1"],
         env=env,
         input="wrong-confirmation\n",
         capture_output=True,
@@ -378,7 +378,7 @@ def test_kill_with_correct_confirmation_proceeds(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
     result = subprocess.run(
-        [str(LAUNCHER), "--kill", "r1"],
+        [str(LAUNCHER), "kill", "r1"],
         env=env,
         input="r1\n",
         capture_output=True,

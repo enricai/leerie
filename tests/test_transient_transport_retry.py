@@ -21,7 +21,8 @@ test_terminal_auth_routing.py (stubbed-_invoke routing + ast coupling):
   - classifier positive/negative corpus (the measured envelope + siblings;
     successful / synthetic / 401-429-529 / prose-only negatives)
   - a drop envelope enters the backoff loop, not the immediate schema loop
-  - budget exhaustion raises a transport-named WorkerError with --resume
+  - budget exhaustion raises a transport-named WorkerError pointing at
+    `leerie resume <run-id>`
   - the two backoff classes partition cleanly (401/429/529 stay auth/quota)
   - source-coupling: the transport classifier is consulted in claude_p
     after terminal-auth, via the combined `_needs_backoff` predicate
@@ -218,8 +219,9 @@ def test_drop_budget_exhaustion_raises_transport_worker_error(
         leerie, monkeypatch, tmp_path):
     """When the drop persists past the backoff budget, claude_p raises a
     WorkerError that names the transport disconnect (not a subscription cap)
-    and points at --resume. Uses auth_retry_max_sec=1 to exhaust after one
-    ~15s sleep (same convention as test_terminal_auth_routing.py)."""
+    and points at the bare `leerie resume <run-id>` verb (not the retired
+    `resume` flag). Uses auth_retry_max_sec=1 to exhaust after one ~15s
+    sleep (same convention as test_terminal_auth_routing.py)."""
     tiny_caps = dict(leerie.DEFAULT_CAPS)
     tiny_caps["auth_retry_max_sec"] = 1
     result, exc, _, n = _call_claude_p(
@@ -232,7 +234,13 @@ def test_drop_budget_exhaustion_raises_transport_worker_error(
         f"exhaustion message must name the transport cause, got: {exc!r}")
     assert "subscription" not in msg, (
         f"a transport drop must not be labeled a subscription cap: {exc!r}")
-    assert "--resume" in str(exc)
+    # _FakeState.run_id is "r1" — pin the bare-verb positional-run-id form,
+    # not just a bare "resume" substring, so a regression to the retired
+    # `resume` flag form is caught.
+    assert "leerie resume r1" in str(exc), (
+        f"must point at the bare `leerie resume <run-id>` verb, got: {exc!r}")
+    assert "--resume" not in str(exc), (
+        f"must not use the retired --resume flag form, got: {exc!r}")
     assert n > 1, "must have retried before exhausting"
 
 

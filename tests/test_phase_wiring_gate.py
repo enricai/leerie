@@ -119,7 +119,7 @@ class TestWiring:
         `plan_snapshot` is written a few lines *earlier*, deliberately, so a
         die() at either terminal gate does not discard the planning spend.
         That means it is present even when the gate FAILED, so keying the
-        skip on it made `--resume` a silent bypass of a gate the run had
+        skip on it made `resume` a silent bypass of a gate the run had
         already failed (run 3a4abba3, 2026-08-01: resumed straight to
         `phase_execute` with zero gate invocations, executing the plan the
         gate had rejected — while the die() message claimed the gate had "no

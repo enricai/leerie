@@ -10,7 +10,7 @@
 # falls back to `.leerie` (repo-relative; used by tests and direct invocations).
 #
 # GENUINELY idempotent: if `leerie/runs/<run-id>` already exists (a run
-# is in progress, or this is a --resume), the branch is LEFT WHERE IT IS.
+# is in progress, or this is a resume), the branch is LEFT WHERE IT IS.
 # It is never force-reset — doing so would discard every integration
 # commit from the waves already completed.
 #
@@ -44,7 +44,7 @@ fi
 # A bare branch named 'leerie' blocks creation of leerie/runs/* and
 # leerie/subtasks/* (git's loose ref store cannot hold a file and a
 # directory at the same path). Defense-in-depth: preflight() checks
-# this too, but --resume skips preflight.
+# this too, but resume skips preflight.
 if git show-ref --verify --quiet refs/heads/leerie; then
   echo "error: branch 'leerie' conflicts with leerie's internal namespace (leerie/runs/*, leerie/subtasks/*)." >&2
   echo "Rename it: git branch -m leerie leerie-old" >&2
@@ -73,7 +73,7 @@ fi
 # `machine stop` SIGKILLs the orchestrator, so `_cleanup_on_abnormal_exit`
 # never runs and the directory outlives its admin entry on the volume.
 # `worktree add` then refuses with "fatal: '<path>' already exists" and every
-# --resume dies in phase 4 — the first one only appears to recover because its
+# resume dies in phase 4 — the first one only appears to recover because its
 # own die() unwinds into the cleanup that removes this directory.
 #
 # `git worktree prune` does NOT cover this: it only drops admin entries whose

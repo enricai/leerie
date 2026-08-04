@@ -198,7 +198,7 @@ WRAPPER
 #   3. If AUTO_FINALIZE_TOKEN is set in the wrapper's environment, prints
 #      that token on the *last* line of stderr instead of (after) the
 #      banner; callers can grep for the token to trigger
-#      `leerie --finalize` automatically. Decoupled from the wrapper itself
+#      `leerie finalize` automatically. Decoupled from the wrapper itself
 #      because exec'ing `leerie` back inside the Fly machine is wrong; the
 #      auto-finalize step has to run on the host.
 #
@@ -330,7 +330,7 @@ echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: orchestrator exit
 # Auto-finalize hook: when the calling host sets AUTO_FINALIZE_TOKEN,
 # print it as the wrapper's last stderr line. The host-side caller
 # greps for the token, captures the final run-id, and exec's
-# `leerie --finalize <id>` on the host (the machine cannot do it; auth
+# `leerie finalize <id>` on the host (the machine cannot do it; auth
 # lives on the host).
 if [ -n "$AUTO_FINALIZE_TOKEN" ]; then
   echo "${AUTO_FINALIZE_TOKEN}${ID}" >&2
@@ -363,7 +363,7 @@ TAIL_SH
 # Behavior when $5="true": captures stderr through a tee + tempfile,
 # greps for `<<LEERIE_AUTOFIN_$$>>${RUN_ID}` (emitted by
 # render_tail_wrapper's last-line stderr hook), and on clean rc=0
-# execs `${LEERIE_REPO}/leerie --finalize <final_id>` on the host so
+# execs `${LEERIE_REPO}/leerie finalize <final_id>` on the host so
 # the host's gh/git auth performs the push. The function then exits
 # (never returns) — either via the exec, or via `exit $rc` on
 # non-zero rc / missing token. The auto-finalize exec replaces this
@@ -404,9 +404,9 @@ $_tail_script"
       final_id="$(grep -oE "${_token}[^ ]+" "$_stderr_capture" 2>/dev/null \
                   | tail -1 | sed "s|^${_token}||")"
       if [ -n "$final_id" ]; then
-        remote_log "auto-finalize: running 'leerie --finalize $final_id'"
+        remote_log "auto-finalize: running 'leerie finalize $final_id'"
         rm -f "$_stderr_capture"
-        exec "${LEERIE_REPO}/leerie" --finalize "$final_id"
+        exec "${LEERIE_REPO}/leerie" finalize "$final_id"
       fi
     fi
     # `return`, not `exit`: this is a sourced function. `exit` here
@@ -441,7 +441,7 @@ $_tail_script"
 # in remote mode*).
 _attach_to_live_orchestrator() {
   if [ "$RESUME_SHELL" = "true" ]; then
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
     local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
     local _shell_payload_q
     _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
@@ -450,7 +450,7 @@ _attach_to_live_orchestrator() {
       --machine "$LEERIE_MACHINE_ID" \
       --command "bash -lc '$_shell_payload_q'" || true
   else
-    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+    remote_log "resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
     local _tail_script
     _tail_script="$(render_tail_wrapper)"
     tail_with_optional_autofinalize \

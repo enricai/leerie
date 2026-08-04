@@ -51,7 +51,7 @@ class TestEachCheckpointIsWrittenAndSaved:
 
     def test_each_assignment_is_saved(self, leerie):
         """An assignment without a following st.save() never reaches disk —
-        the only place --resume can read it back from."""
+        the only place resume can read it back from."""
         src = _phases_src(leerie)
         for key in CHECKPOINT_KEYS_IN_ORDER:
             idx = src.find(f'st.data["{key}"]')

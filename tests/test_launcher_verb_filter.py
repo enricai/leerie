@@ -4,8 +4,8 @@ leaking to the orchestrator's argparse.
 
 The verb dispatch (``case "${1:-}" in``) handles verbs when they appear
 as ``$1`` and ``exit``s before REWRITTEN_ARGS runs.  But if a verb
-appears in a non-$1 position (e.g. ``leerie <id> --finalize --runtime
-fly`` instead of ``leerie --finalize <id> --runtime fly``), the verb
+appears in a non-$1 position (e.g. ``leerie <id> finalize --runtime
+fly`` instead of ``leerie finalize <id> --runtime fly``), the verb
 dispatch does not match and the token falls through to the
 REWRITTEN_ARGS loop.  Without a guard arm, the ``*)`` default forwards
 it to the orchestrator, which rejects it with "unrecognized arguments".
@@ -13,10 +13,15 @@ it to the orchestrator, which rejects it with "unrecognized arguments".
 The guard arm emits an actionable error and ``exit 1``s.
 
 Dual-purpose verbs that the orchestrator also handles are excluded:
-``--list`` (falls through to orchestrator on non-fly path), ``--status``
-(orchestrator uses as ``--list`` filter), ``--version`` (handled by
-argparse version action), ``--resume`` (already forwarded with special
-``_prev_was_resume`` handling).
+``list`` and ``resume`` (their own ``resume|list)`` arm in the
+REWRITTEN_ARGS guard forwards them unmodified at position 1 — the
+orchestrator's argparse understands both as bare leading verbs natively,
+so no translation happens; see test_launcher_list_verb_dispatch.py for
+the direct behavioral pin), ``status`` (orchestrator uses as ``list``
+filter — a distinct flag, not a verb, at the Python layer), ``version``
+(bash-only; the launcher's ``version)`` arm always exits before the
+orchestrator is invoked, so the orchestrator's argparse has no
+``--version``/``version`` surface at all).
 """
 from __future__ import annotations
 
@@ -29,10 +34,10 @@ LEERIE_BASH = REPO_ROOT / "leerie"
 # Verbs intentionally NOT in the guard — handled by the orchestrator
 # too, or forwarded with special logic.
 _DUAL_PURPOSE_VERBS: frozenset[str] = frozenset({
-    "--list",
-    "--status",
-    "--version",
-    "--resume",
+    "list",
+    "status",
+    "version",
+    "resume",
 })
 
 # Top-level verb dispatch arms. Extracted from the ``case "${1:-}" in``
@@ -45,7 +50,14 @@ def _extract_verb_dispatch_verbs() -> set[str]:
     """Extract verb names from the top-level verb dispatch case statement.
 
     Only captures 2-space-indented arms (top-level); skips nested
-    sub-case arms (4+ space indent) and wildcard patterns (``*)``)."""
+    sub-case arms (4+ space indent) and wildcard patterns (``*)``).
+
+    Also skips ``--``-prefixed tokens: the dispatch block's first arm is
+    an early-rejection guard for deprecated ``--verb`` forms (including
+    the five hard-removed ``chain-*`` aliases) — those are old FLAG
+    spellings being rejected, not verb NAMES being dispatched, so they
+    have no "misplaced verb" position to guard against in the
+    REWRITTEN_ARGS loop the way a bare verb name does."""
     src = LEERIE_BASH.read_text()
     # Find the second `case "${1:-}" in` — that's the verb dispatch.
     matches = list(re.finditer(r'^case "\$\{1:-\}" in$', src, re.MULTILINE))
@@ -65,7 +77,7 @@ def _extract_verb_dispatch_verbs() -> set[str]:
             continue
         for token in pattern.split("|"):
             token = token.strip()
-            if token and token != "*":
+            if token and token != "*" and not token.startswith("--"):
                 verbs.add(token)
     return verbs
 
@@ -113,7 +125,7 @@ def test_verb_guard_covers_dispatch_verbs() -> None:
         f"verb (e.g. `leerie <task> {sorted(missing)[0]}`) will leak to "
         f"the orchestrator's argparse. Add the verb(s) to the guard arm "
         f"in `leerie` (the combined case pattern between --auto-finalize "
-        f"and --resume in the REWRITTEN_ARGS filter)."
+        f"and resume in the REWRITTEN_ARGS filter)."
     )
 
 

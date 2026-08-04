@@ -74,11 +74,11 @@ dependencies on the user's behalf.
    Then resume:
 
    ```
-   bash "${CLAUDE_PLUGIN_ROOT}/leerie" --clarify --resume --answers .leerie/answers.json
+   bash "${CLAUDE_PLUGIN_ROOT}/leerie" --clarify resume --answers .leerie/answers.json
    ```
 
-   (If `--resume` reports the run had not reached scheduling, re-run without
-   `--resume`, passing the original task and `--answers .leerie/answers.json`.)
+   (If `resume` reports the run had not reached scheduling, re-run without
+   `resume`, passing the original task and `--answers .leerie/answers.json`.)
 
 4. Relay the orchestrator's final summary to the user. On any non-zero, non-10
    exit, show the error and point them at `.leerie/state.json`. If the

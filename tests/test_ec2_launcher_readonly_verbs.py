@@ -1,20 +1,20 @@
-"""Tests for `--accept-blocked` and `--list` recognizing EC2 runs.
+"""Tests for `accept-blocked` and `list` recognizing EC2 runs.
 
-Before this file, `--accept-blocked` validated `--runtime` against only
+Before this file, `accept-blocked` validated `--runtime` against only
 `fly`/`local` (leerie:1321 pre-fix) and defaulted anything non-fly to
 `local` (leerie:1330 pre-fix), so an EC2 run's `ec2-instance.json`
 sidecar was silently ignored and the mutation was attempted against a
 host-side `state.json` that (unlike the Fly path, where the volume is
 the source of truth) does not exist for an EC2 run until
 `fetch_state_ec2` streams it back at teardown (`scripts/remote/
-ec2-fetch-branch.sh`). `--list`'s runtime-aware view keyed only on
-`fly-machine.json`/`LEERIE_FLY_APP` (leerie:1191 pre-fix), so `--list
+ec2-fetch-branch.sh`). `list`'s runtime-aware view keyed only on
+`fly-machine.json`/`LEERIE_FLY_APP` (leerie:1191 pre-fix), so `list
 --runtime ec2` rendered every run unfiltered instead of restricting to
 EC2 runs, and the underlying row-collection (`_collect_run_rows` in
 `orchestrator/leerie.py`) tracked no EC2 axis at all.
 
-This file pins the fix: `--accept-blocked` now auto-detects EC2 the
-same way `--stop` already does (`_auto_detect_run_runtime`), accepts an
+This file pins the fix: `accept-blocked` now auto-detects EC2 the
+same way `stop` already does (`_auto_detect_run_runtime`), accepts an
 explicit `--runtime ec2`, and — mirroring the Fly path's wake-mutate-
 pause dance — wakes a stopped instance, mutates state.json over SSM
 (`ec2_remote_exec`, DESIGN §6 "Transport substitution for `flyctl ssh
@@ -25,16 +25,16 @@ re-pauses the instance only if this verb woke it. `_collect_run_rows`/
 `--runtime ec2` filters correctly and `--runtime local` excludes both
 Fly and EC2 runs.
 
-Harness: the `--accept-blocked` tests invoke the real `leerie` launcher
+Harness: the `accept-blocked` tests invoke the real `leerie` launcher
 binary against a stubbed `aws` that composes `tests/ec2_stub.py`'s
 stateful EC2 instance tracking with an `ssm start-session` handler
 (absent from `ec2_stub.py` itself, which only tests's the argv-level
 lifecycle) that decodes `ec2_remote_exec`'s base64-wrapped command and
 executes it with the invoking process's stdin drained through — the
-same mechanism `--accept-blocked`'s EC2 branch relies on to pipe the
+same mechanism `accept-blocked`'s EC2 branch relies on to pipe the
 multi-line state-mutation Python program to the remote `python3 -`
 (mirroring `flyctl ssh console -C "python3 -"` on the Fly path).
-`--list` tests exercise `orchestrator/leerie.py`'s `_list_runs()`
+`list` tests exercise `orchestrator/leerie.py`'s `_list_runs()`
 directly (no launcher subprocess, no AWS stub — pure filesystem
 fixtures), mirroring `tests/test_list_runs.py`'s pattern.
 """
@@ -190,7 +190,7 @@ def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str,
 
 def _seed_remote_state(work_dest: Path, run_id: str, state: dict) -> Path:
     """Seed state.json at the rewritten '/work' fixture path — this is
-    what --accept-blocked's EC2 branch actually mutates over SSM (the
+    what accept-blocked's EC2 branch actually mutates over SSM (the
     genuine remote copy; the run dir's *host-side* state.json, if any,
     is a best-effort mirror written afterward)."""
     remote_dir = work_dest / ".leerie" / "runs" / run_id
@@ -228,7 +228,7 @@ def _run(args: list[str], env: dict) -> subprocess.CompletedProcess:
     )
 
 
-# --- --accept-blocked: EC2 runtime resolution ------------------------------
+# --- accept-blocked: EC2 runtime resolution ------------------------------
 
 def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> None:
     """Control: an EC2 sidecar-bearing run must not silently resolve to
@@ -246,7 +246,7 @@ def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> Non
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     # The pre-fix 'local' path's error text ("no state.json at
     # <state_dir>/state.json") must never appear — that would mean the
@@ -270,7 +270,7 @@ def test_accept_blocked_ec2_writes_accept_record(tmp_path: Path) -> None:
     remote_state_path = _seed_remote_state(
         work_dest, RUN_ID, {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     remote = json.loads(remote_state_path.read_text())
@@ -295,7 +295,7 @@ def test_accept_blocked_ec2_explicit_runtime_flag_accepted(tmp_path: Path) -> No
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID, "--runtime", "ec2"], env)
+    result = _run(["accept-blocked", RUN_ID, SID, "--runtime", "ec2"], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     assert "must be 'local', 'fly', or 'ec2'" not in result.stderr
 
@@ -307,7 +307,7 @@ def test_accept_blocked_rejects_unknown_runtime_value(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
     env, _, _ = _env(tmp_path, aws_dir)
-    result = _run(["--accept-blocked", "some-run", "some-sid", "--runtime", "bogus"], env)
+    result = _run(["accept-blocked", "some-run", "some-sid", "--runtime", "bogus"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
 
@@ -326,7 +326,7 @@ def test_accept_blocked_ec2_wakes_stopped_instance_and_repauses(tmp_path: Path) 
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -355,7 +355,7 @@ def test_accept_blocked_ec2_already_running_not_paused_afterward(tmp_path: Path)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -381,7 +381,7 @@ def test_accept_blocked_ec2_missing_instance_id_fails_closed(tmp_path: Path) -> 
     }))
     (run_dir / "run.json").write_text(json.dumps({"run_id": RUN_ID}))
 
-    result = _run(["--accept-blocked", RUN_ID, SID], env)
+    result = _run(["accept-blocked", RUN_ID, SID], env)
     assert result.returncode == 1
     assert "no ec2_instance_id found" in result.stderr
 
@@ -398,7 +398,7 @@ def test_accept_blocked_local_path_unchanged(tmp_path: Path) -> None:
     (run_dir / "state.json").write_text(json.dumps(
         {"subtask_status": {SID: "failed"}}))
 
-    result = _run(["--accept-blocked", run_id, SID], env)
+    result = _run(["accept-blocked", run_id, SID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
     mutated = json.loads((run_dir / "state.json").read_text())
     assert mutated["subtask_status"][SID] == "complete"
@@ -407,7 +407,7 @@ def test_accept_blocked_local_path_unchanged(tmp_path: Path) -> None:
     assert log == []
 
 
-# --- --list: EC2 runtime recognition (Python layer) ------------------------
+# --- list: EC2 runtime recognition (Python layer) ------------------------
 
 def _make_run(root: Path, run_id: str, state: dict,
               run_json: dict | None = None,
@@ -423,8 +423,8 @@ def _make_run(root: Path, run_id: str, state: dict,
 
 def test_list_ec2_run_renders_populated_status_without_fly_app(leerie, tmp_path, capsys, monkeypatch):
     """Control: an EC2 run must render with a populated status column
-    via plain --list, with no LEERIE_FLY_APP set at all — the pre-fix
-    --list --runtime fly arm required LEERIE_FLY_APP and keyed on
+    via plain list, with no LEERIE_FLY_APP set at all — the pre-fix
+    list --runtime fly arm required LEERIE_FLY_APP and keyed on
     fly-machine.json, so an EC2 run's runtime-aware view rendered empty
     columns; the runtime-agnostic default table must not depend on it
     either."""
@@ -448,7 +448,7 @@ def test_list_ec2_run_renders_populated_status_without_fly_app(leerie, tmp_path,
 
 
 def test_list_runtime_ec2_filters_to_ec2_runs_only(leerie, tmp_path, capsys):
-    """Control: --list --runtime ec2 must restrict to EC2 runs — the
+    """Control: list --runtime ec2 must restrict to EC2 runs — the
     pre-fix filter recognized only 'fly'/'local' and silently returned
     every row unfiltered for any other value, including 'ec2'."""
     _make_run(tmp_path, "fly-run-aaaaaa",
@@ -469,7 +469,7 @@ def test_list_runtime_ec2_filters_to_ec2_runs_only(leerie, tmp_path, capsys):
 
 
 def test_list_runtime_local_excludes_ec2_runs(leerie, tmp_path, capsys):
-    """--list --runtime local must exclude EC2 runs too, not just Fly
+    """list --runtime local must exclude EC2 runs too, not just Fly
     ones — the pre-fix 'local' filter was defined as 'not fly', which
     would have wrongly included EC2 runs."""
     _make_run(tmp_path, "local-run-cccccc",

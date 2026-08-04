@@ -2,9 +2,9 @@
 source of truth for the 8-4-4-4-12 hex pattern used by every chain-
 scoped verb arm.
 
-The launcher (`leerie`) parses UUIDs in seven places (`--stop`,
-`--kill`, `--finalize`, `--resume`, `--status`, `--attach`, and the
-`--chain --chain-id` flag). Before the v8 audit DRY refactor, each
+The launcher (`leerie`) parses UUIDs in seven places (`stop`,
+`kill`, `finalize`, `resume`, `status`, `attach`, and the
+`chain --chain-id` flag). Before the v8 audit DRY refactor, each
 arm carried its own inline copy of the same regex; a format change
 required seven coordinated edits, easy to miss one. v8 extracted the
 pattern into a single top-of-file `UUID_PATTERN` constant.
@@ -67,8 +67,8 @@ def test_uuid_pattern_value_is_canonical() -> None:
 def test_uuid_pattern_used_at_expected_call_site_count() -> None:
     """Every chain-scoped UUID check uses the constant. Counts the
     `grep -qiE "$UUID_PATTERN"` invocations and asserts the expected
-    minimum count (7 today: --stop, --kill, --finalize, --resume,
-    --status, --attach, --chain-id).
+    minimum count (7 today: stop, kill, finalize, resume,
+    status, attach, --chain-id).
 
     Uses >= rather than == so adding a new chain-scoped verb that
     consumes UUID_PATTERN doesn't break this test; only DECREASING
@@ -81,8 +81,8 @@ def test_uuid_pattern_used_at_expected_call_site_count() -> None:
     )
     assert len(occurrences) >= 7, (
         f"expected at least 7 `grep -qiE \"$UUID_PATTERN\"` call sites in "
-        f"the launcher (--stop, --kill, --finalize, --resume, --status, "
-        f"--attach, --chain --chain-id); found {len(occurrences)}.\n"
+        f"the launcher (stop, kill, finalize, resume, status, "
+        f"attach, chain --chain-id); found {len(occurrences)}.\n"
         f"A site may have been replaced with an inline regex copy, "
         f"defeating the v8 DRY refactor."
     )

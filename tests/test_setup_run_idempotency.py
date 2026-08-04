@@ -1,13 +1,13 @@
 """Behavioral test for scripts/setup-run.sh staging-worktree idempotency.
 
 Verifies that setup-run.sh re-creates (or reuses) the staging worktree on a
---resume instead of dying with "fatal: '...' already exists".
+resume instead of dying with "fatal: '...' already exists".
 
 Two failures are pinned, both measured against the real script before the fix:
 
 1. Absolute LEERIE_STATE_DIR (the container case, `/leerie-state`). The old
    guard `grep -q "worktree .*/${STAGING_WT}$"` expanded to a double slash and
-   never matched, so `git worktree add` ran unconditionally. Every --resume
+   never matched, so `git worktree add` ran unconditionally. Every resume
    over a surviving staging dir died in phase 4; the *second* identical resume
    then succeeded, because the first one's die() unwound into
    `_cleanup_on_abnormal_exit`, which removed the directory as a side effect.
@@ -77,7 +77,7 @@ def _staging_path(res: subprocess.CompletedProcess) -> str | None:
 def test_second_call_reuses_staging_when_state_dir_absolute(tmp_path: Path) -> None:
     """A second identical call must reuse the staging worktree, not crash.
 
-    This is the reported bug: every `--resume` inside the container (where
+    This is the reported bug: every `resume` inside the container (where
     LEERIE_STATE_DIR=/leerie-state) failed on the first attempt and succeeded
     on the second. Against the unfixed script this assertion fails 128 != 0.
     """

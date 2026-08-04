@@ -12,7 +12,7 @@ TOML. That asymmetry was harmless before the Fly auto-finalize landed:
     `run.json.no_push=true` (from TOML), and `host_finalize`
     short-circuited.
   - On Fly, no auto-finalize existed, so the launcher's
-    `host_no_push=false` only affected the manual `leerie --finalize`
+    `host_no_push=false` only affected the manual `leerie finalize`
     recovery command.
 
 After the Fly auto-finalize landed (decide_teardown now calls

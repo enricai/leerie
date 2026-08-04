@@ -62,7 +62,7 @@ def test_worktree_failure_returns_failed_instead_of_raising(env, monkeypatch):  
 
 
 def test_worktree_failure_is_recorded_in_state(env, monkeypatch):  # noqa: F811
-    """The failure is persisted so --resume and --report can see it."""
+    """The failure is persisted so resume and --report can see it."""
     leerie_mod = env["leerie"]
     calls: list[str] = []
     _stub_raising_run_implementer(leerie_mod, monkeypatch, calls)

@@ -122,8 +122,8 @@ def test_clean_exit_push_failure_keeps_machine_running(tmp_path):
         "available to investigate or retry."
     )
     # Banner mentions the recovery commands.
-    assert "leerie --finalize rid-001" in combined
-    assert "leerie --kill rid-001" in combined
+    assert "leerie finalize rid-001" in combined
+    assert "leerie kill rid-001" in combined
 
 
 def test_clean_exit_missing_run_dir_falls_back_to_manual_hint(tmp_path):
@@ -137,7 +137,7 @@ def test_clean_exit_missing_run_dir_falls_back_to_manual_hint(tmp_path):
     combined = result.stdout + result.stderr
     assert "auto-finalize: pushing + opening PR" not in combined
     assert "[stub] destroy_machine called" in combined
-    assert "leerie --finalize rid-001" in combined
+    assert "leerie finalize rid-001" in combined
 
 
 def test_clean_exit_run_not_finalized_skips_auto_finalize(tmp_path):
@@ -153,7 +153,7 @@ def test_clean_exit_run_not_finalized_skips_auto_finalize(tmp_path):
     host_finalize requires run.json.finished_at + branch fields. The
     decide_teardown guard must skip host_finalize, destroy the
     machine (work is on the host either way), and tell the user how
-    to recover via `leerie --finalize <run-id>` after answering."""
+    to recover via `leerie finalize <run-id>` after answering."""
     result = _run_decide_teardown(
         host_finalize_rc=0, run_dir_exists=True,
         run_finished_at=None, tmp_path=tmp_path,
@@ -194,7 +194,7 @@ def test_clean_exit_missing_host_finalize_sh_falls_back(tmp_path):
     combined = result.stdout + result.stderr
     assert "auto-finalize: pushing + opening PR" not in combined
     assert "[stub] destroy_machine called" in combined
-    assert "leerie --finalize rid-001" in combined
+    assert "leerie finalize rid-001" in combined
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +247,9 @@ decide_teardown
     assert "[stub] destroy_machine called" not in combined
     assert "[stub] stop_machine called" not in combined
     # Run-scoped (existing) commands still shown.
-    assert f"leerie --resume {run_id}" in combined
+    assert f"leerie resume {run_id}" in combined
     # Chain-scoped commands surfaced.
-    assert f"leerie --status {chain_id}" in combined
-    assert f"leerie --attach {chain_id}" in combined
-    assert f"leerie --stop   {chain_id}" in combined
-    assert f"leerie --kill   {chain_id}" in combined
+    assert f"leerie status {chain_id}" in combined
+    assert f"leerie attach {chain_id}" in combined
+    assert f"leerie stop   {chain_id}" in combined
+    assert f"leerie kill   {chain_id}" in combined

@@ -130,7 +130,7 @@ class TestCheckpointFollowsItsPhaseCall:
 
 class TestCheckpointIsSavedImmediately:
     """An assignment without a following st.save() never reaches disk —
-    the only place --resume can read it back from."""
+    the only place resume can read it back from."""
 
     def test_each_checkpoint_followed_by_save(self, leerie):
         src = _phases_src(leerie)

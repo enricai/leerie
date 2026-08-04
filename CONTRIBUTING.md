@@ -31,12 +31,12 @@ git clone https://github.com/enricai/leerie.git
 cd leerie
 pip install -r requirements.txt   # runtime deps — the test suite imports them
 pip install pytest jsonschema     # pytest is the only dev (host-side) dependency
-./leerie --version           # smoke-check; uses the launcher's fast path —
+./leerie version           # smoke-check; uses the launcher's fast path —
                            # does NOT require the container runtime, so
                            # it works on a fresh clone with no Colima.
 ```
 
-Running leerie against a real task (`./leerie "..."` rather than `--version`)
+Running leerie against a real task (`./leerie "..."` rather than `version`)
 requires the container runtime to be installed and started — see
 [`docs/INSTALL.md`](docs/INSTALL.md). Iterating on
 `orchestrator/leerie.py` and running `pytest tests/` is possible without

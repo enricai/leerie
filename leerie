@@ -7,7 +7,7 @@
 # leerie runs inside a container — see docs/IMPLEMENTATION.md §0.5
 # "Container shape" and docs/DESIGN.md §6. This launcher:
 #   1. Resolves its own location (walking symlinks).
-#   2. Fast path: `--version` answers without a container so the installer's
+#   2. Fast path: `version` answers without a container so the installer's
 #      smoke test runs the moment the symlink is in place.
 #   3. Per-OS preflight: verifies a working container runtime.
 #   4. Builds the leerie image once per version, reuses thereafter.
@@ -46,21 +46,21 @@ USER_REPO="$(pwd -P)"
 . "$LEERIE_REPO/scripts/remote/_log.sh"
 
 # Image tag = leerie:<version>. Version comes from plugin.json (single source of
-# truth — same one `leerie --version` reads). The launcher only needs the value
+# truth — same one `leerie version` reads). The launcher only needs the value
 # for tagging, so a minimal extractor avoids needing python/jq at this stage.
 LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 IMAGE_TAG="leerie:$LEERIE_VERSION"
 
 # --- fast paths that don't need the container ----------------------------
-# `leerie --version` should answer immediately without spinning up a container
+# `leerie version` should answer immediately without spinning up a container
 # — used by the installer's end-to-end smoke test and by anyone who just
 # wants to check what's installed.
 #
 # `--help` is NOT short-circuited: forwarding it through the container makes
 # the orchestrator's argparse render the full flag list (worker model
 # overrides, telemetry knobs, etc.) plus an epilog listing launcher-only
-# verbs (--stop, --kill, --finalize, etc.). The first --help pays a
+# verbs (stop, kill, finalize, etc.). The first --help pays a
 # one-time image-build cost; every subsequent invocation reuses the cached
 # image and starts in ~2s.
 
@@ -92,7 +92,7 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 #     for the Fly seed-auth tar pipe) — this is the active path.
 #
 # (The function is also called by chain-aware tests; nothing in the
-# laptop-side --chain wave loop currently invokes it directly, since
+# laptop-side chain wave loop currently invokes it directly, since
 # each per-job ./leerie --runtime fly invocation runs its own
 # STAGE-assembly + seed-auth pipeline.)
 #
@@ -253,15 +253,15 @@ PY
 }
 
 # Read stdin and emit a base64-encoded string (no newlines). Used by
-# --chain to pack the queue spec and Claude creds into env-safe values
+# chain to pack the queue spec and Claude creds into env-safe values
 # without duplicating the same python one-liner per call site.
 _b64_stdin() {
   python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())'
 }
 
 # UUID format pattern (8-4-4-4-12 hex). Used by all chain-scoped verb
-# arms (--stop / --kill / --finalize / --resume / --status / --attach
-# / --chain --chain-id) to distinguish a chain_id from a single-run
+# arms (stop / kill / finalize / resume / status / attach
+# / chain --chain-id) to distinguish a chain_id from a single-run
 # Fly machine id. Case-insensitive grep at the call sites; chain code
 # normalizes to lowercase before string comparison against run.json
 # fields (uuid.uuid4() emits lowercase, so the canonical form is
@@ -269,7 +269,7 @@ _b64_stdin() {
 export UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 # Read a single top-level key from a JSON file. Prints the value
-# (empty string if absent/null/error). Used by --finalize to avoid
+# (empty string if absent/null/error). Used by finalize to avoid
 # repeating the same python3 one-liner.
 _json_get() {
   local file="$1" key="$2"
@@ -284,7 +284,7 @@ except Exception:
 ' "$file" "$key"
 }
 
-# Idempotency probe for the --chain wave loop. Returns 0 (success) when
+# Idempotency probe for the chain wave loop. Returns 0 (success) when
 # every run with chain_id=<id> AND wave_idx=<idx> has pushed_at set,
 # AND the count of such runs equals the expected wave size <n_expected>
 # (so a wave that partially completed in a prior session does not
@@ -324,8 +324,8 @@ PY
 
 # Emit (one per line) every run-id in $LEERIE_STATE_HOST_DIR/runs/
 # that belongs to <chain_id> AND matches the per-verb filter <verb>.
-# Used by the chain-scoped verb arms (--stop, --kill, --finalize,
-# --resume) to enumerate runs for per-run dispatch. The verb name
+# Used by the chain-scoped verb arms (stop, kill, finalize,
+# resume) to enumerate runs for per-run dispatch. The verb name
 # selects a hardcoded filter inside the heredoc (no eval, no
 # injection surface — only known verb names are accepted).
 #
@@ -478,7 +478,7 @@ PY
 }
 
 # Emit (one per line) the branch field of every run with chain_id=<id>
-# AND wave_idx=<idx>. Used by the --chain wave loop to gather wave-N
+# AND wave_idx=<idx>. Used by the chain wave loop to gather wave-N
 # branch names for synth-merge. Works for both the just-fanned path
 # and the resume path (single discovery surface).
 _wave_branches() {
@@ -509,7 +509,7 @@ PY
 }
 
 # Read volume_id from a run's host-side sidecar. provision.sh persists
-# volume_id into both fly-machine.json and run.json. --kill consults
+# volume_id into both fly-machine.json and run.json. kill consults
 # this so the volume is reaped alongside the machine instead of
 # orphaning.
 _resolve_volume_id_from_run_dir() {
@@ -546,7 +546,7 @@ except Exception:
 # persists ec2_instance_id into both ec2-instance.json (unconditional,
 # crash-recovery pointer) and run.json (conditional on LEERIE_RUN_ID being
 # set at provision time). Unlike Fly, the run-id is NOT the instance id
-# for EC2 runs, so --kill/--stop/--resume must read it from a sidecar
+# for EC2 runs, so kill/stop/resume must read it from a sidecar
 # rather than assuming identity.
 _resolve_ec2_instance_id_from_run_dir() {
   local run_dir="$1"
@@ -573,7 +573,7 @@ except Exception:
 
 # --- _resolve_volume_id_from_fly ---------------------------------------
 # Ask Fly which volume a machine has mounted. The fallback for when no
-# sidecar exists (`--kill --machine-id <id>` on an orphan) — without this
+# sidecar exists (`kill --machine-id <id>` on an orphan) — without this
 # the machine is destroyed and its volume leaks, billing forever.
 #
 # MUST be called BEFORE the machine is destroyed: Fly's volume→machine link
@@ -583,11 +583,11 @@ except Exception:
 #
 # Uses `machine list --json` — verified against a live machine to carry
 # `.config.mounts[].volume`, and to keep carrying it while the machine is
-# `stopped` (the --stop-then-kill path). Note `machine status` has NO --json
+# `stopped` (the stop-then-kill path). Note `machine status` has NO --json
 # flag (only -d/--display-config, which embeds JSON in prose), so it is not
 # usable here.
 #
-# Best-effort: any failure prints nothing and returns 0. --kill must still
+# Best-effort: any failure prints nothing and returns 0. kill must still
 # destroy the machine even if the lookup fails — a leaked volume is a
 # billing issue, a machine that won't die is worse.
 _resolve_volume_id_from_fly() {
@@ -705,7 +705,7 @@ _auto_detect_fly_runtime() {
 
 # --- _is_local_container --------------------------------------------------
 # Returns 0 when the given run-id is a live nerdctl container on this host.
-# Used by --stop/--kill to distinguish local runs from Fly runs when no
+# Used by stop/kill to distinguish local runs from Fly runs when no
 # fly-machine.json sidecar exists.
 _is_local_container() {
   local run_id="$1"
@@ -714,7 +714,7 @@ _is_local_container() {
 
 # --- _reap_orphaned_container ---------------------------------------------
 # Fix E (DESIGN §6 *container boundary's hidden precondition*). Before a
-# local --resume spawns a fresh container, kill any container for this run
+# local resume spawns a fresh container, kill any container for this run
 # that is still "Up" but whose owning launcher process is dead — the
 # orphaned-orchestrator-holds-flock wedge (typically after an OOM-killed
 # nerdctl client). Without this, the still-alive orphan holds the run-dir
@@ -749,7 +749,7 @@ _reap_orphaned_container() {
   if kill -0 "$owner_pid" 2>/dev/null; then
     return 0
   fi
-  remote_log "--resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
+  remote_log "resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
   nerdctl kill "$run_id" >/dev/null 2>&1 || true
   # nerdctl --rm removes it on kill; give the kernel a moment to release the
   # run-dir flock before the fresh orchestrator tries to acquire it.
@@ -771,7 +771,7 @@ _reap_orphaned_container() {
 # (two different abs_paths sharing the same basename) are caught at
 # _validate_state_ownership time via the .owner sidecar — see below.
 #
-# Resolved early (before the verb dispatch) so --stop/--kill/--finalize
+# Resolved early (before the verb dispatch) so stop/kill/finalize
 # and other fast-path verbs can use it without the full launcher startup.
 _state_dir_default() {
   local basename
@@ -841,7 +841,7 @@ export LEERIE_STATE_HOST_DIR
 # — e.g. running leerie on /tmp/leerie would resolve to $HOME/.leerie/leerie).
 #
 # Called once after resolution and again from verb arms that need it
-# (skipped for --version, which exits before doing any I/O on the state
+# (skipped for version, which exits before doing any I/O on the state
 # dir). On any anomaly: die() with an actionable message naming the
 # --state-dir / LEERIE_STATE_DIR / leerie.toml overrides.
 _validate_state_ownership() {
@@ -930,20 +930,21 @@ _validate_state_ownership() {
 }
 
 # Verbs that don't touch the local state dir short-circuit the
-# ownership check: --version reports version only; the --chain-* verbs
-# route to the chain Fly app over HTTP and may be invoked from any
+# ownership check: version reports version only; the chain verb
+# routes to the chain Fly app over HTTP and may be invoked from any
 # directory (including non-repo dirs where claiming the basename is
 # undesirable).
 case "${1:-}" in
-  --version|config|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach) ;;
+  version|config|chain) ;;
   *) _validate_state_ownership ;;
 esac
 
 # COUPLING: every verb arm below that `exit`s must also have a guard in
-# the REWRITTEN_ARGS filter loop (~line 3097) so a misplaced verb errors
-# clearly instead of leaking to the orchestrator.
+# the two REWRITTEN_ARGS filter loops — the IS_RESUME positional-run-id
+# loop (~line 3756) and the _value_flags skip-loop (~line 3790) — so a
+# misplaced verb errors clearly instead of leaking to the orchestrator.
 case "${1:-}" in
-  --version)
+  version)
     echo "leerie $LEERIE_VERSION"
     exit 0
     ;;
@@ -1188,19 +1189,22 @@ PY
         ;;
     esac
     ;;
-  --list)
-    # `--list --runtime fly` is a runtime-aware view: query Fly directly
+  list)
+    # `list --runtime fly` is a runtime-aware view: query Fly directly
     # for every machine under FLY_APP, then best-effort cross-reference
     # `$LEERIE_STATE_HOST_DIR/runs/*/{fly-machine.json,run.json}` for the
-    # current repo to fill in run-id columns. Without --runtime fly, this arm restores
-    # the original argv and lets execution continue past the case block;
-    # the orchestrator's argparse handles plain `--list`.
+    # current repo to fill in run-id columns. Without --runtime fly (or
+    # on a flyctl failure/absence fallback), this arm restores the
+    # original argv via `set -- "${_list_rest[@]}"` and lets execution
+    # continue past the case block with `list` back at position 1 of
+    # `$@`. orchestrator/leerie.py's argparse understands the bare `list`
+    # verb natively (mirroring `resume`), so the REWRITTEN_ARGS filter
+    # loop (~line 5354) forwards it through unmodified — no translation.
     #
-    # --list --chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # list chains iterates $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # groups by chain_id, and prints one row per chain. Used by users
-    # (and by the deprecated --list-chains alias) to see what chains
-    # exist in the local state dir.
-    # --list --groups iterates all $HOME/.leerie/*/runs/*/run.json across
+    # to see what chains exist in the local state dir.
+    # list --groups iterates all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, groups by group_id, and prints one row per
     # group. Used to see all run-groups across all repos.
     _list_runtime=""
@@ -1212,20 +1216,20 @@ PY
       case "$1" in
         --runtime) _list_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _list_runtime="${1#--runtime=}"; shift ;;
-        --chains) _list_chains_only=1; shift ;;
+        chains) _list_chains_only=1; shift ;;
         --groups) _list_groups_only=1; shift ;;
         # --runs is the historical default; accept it as a no-op so the
-        # documented `leerie --list --runs` form keeps working.
+        # documented `leerie list --runs` form keeps working.
         --runs)   shift ;;
         *) shift ;;
       esac
     done
 
-    # --list --chains: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
+    # list chains: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # group by chain_id, render one row per chain with run counts +
     # earliest-started + status breakdown. Under v5 Shape A there is no
     # Fly coordinator machine to query; the chain identity lives only
-    # in each run's run.json (set by --chain's wave loop post-finalize).
+    # in each run's run.json (set by chain's wave loop post-finalize).
     if [ "$_list_chains_only" = "1" ]; then
       python3 - "$LEERIE_STATE_HOST_DIR" <<'PY'
 import json, os, sys
@@ -1291,7 +1295,7 @@ PY
       exit 0
     fi
 
-    # --list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
+    # list --groups: iterate all $HOME/.leerie/*/runs/*/run.json across
     # every per-repo state dir, group by group_id, render one row per group.
     if [ "$_list_groups_only" = "1" ]; then
       python3 - "$HOME/.leerie" <<'PY'
@@ -1363,16 +1367,16 @@ PY
 
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
-        echo "leerie: --list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
+        echo "leerie: list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
         exit 1
       fi
       FLY_APP="$LEERIE_FLY_APP"
       USER_REPO="${USER_REPO:-$PWD}"
       if ! command -v flyctl >/dev/null 2>&1; then
-        echo "leerie: --list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
+        echo "leerie: list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
       elif ! _list_json="$(flyctl machines list --app "$FLY_APP" --json 2>&1)"; then
-        echo "leerie: --list --runtime fly: flyctl machines list failed:" >&2
+        echo "leerie: list --runtime fly: flyctl machines list failed:" >&2
         echo "$_list_json" >&2
         echo "  Falling back to local sidecars." >&2
         set -- "${_list_rest[@]}"
@@ -1388,7 +1392,7 @@ raw = os.environ.get("LEERIE_LIST_FLY_JSON", "")
 try:
     machines = json.loads(raw) if raw.strip() else []
 except ValueError as e:
-    print(f"leerie: --list --runtime fly: could not parse flyctl JSON: {e}", file=sys.stderr)
+    print(f"leerie: list --runtime fly: could not parse flyctl JSON: {e}", file=sys.stderr)
     sys.exit(1)
 
 m2r: dict[str, str] = {}
@@ -1441,9 +1445,9 @@ PY
       set -- "${_list_rest[@]}"
     fi
     ;;
-  --accept-blocked)
-    # Mark a blocked/failed subtask as complete so --resume skips it.
-    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]
+  accept-blocked)
+    # Mark a blocked/failed subtask as complete so resume skips it.
+    # Usage: leerie accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]
     #
     # For local runs: modifies $LEERIE_STATE_HOST_DIR/runs/<id>/state.json
     # directly (bind-mounted into the container).
@@ -1459,18 +1463,18 @@ PY
       case "$1" in
         --runtime) _ab_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _ab_runtime="${1#--runtime=}"; shift ;;
-        --*) remote_log "unknown --accept-blocked flag: $1"; exit 1 ;;
+        --*) remote_log "unknown accept-blocked flag: $1"; exit 1 ;;
         *)
           if [ -z "$_ab_run_id" ]; then _ab_run_id="$1"; shift
           elif [ -z "$_ab_sid" ]; then _ab_sid="$1"; shift
-          else remote_log "unexpected --accept-blocked arg: $1"; exit 1
+          else remote_log "unexpected accept-blocked arg: $1"; exit 1
           fi
           ;;
       esac
     done
     if [ -z "$_ab_run_id" ] || [ -z "$_ab_sid" ]; then
-      remote_log "--accept-blocked requires <run-id> <subtask-id>"
-      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
+      remote_log "accept-blocked requires <run-id> <subtask-id>"
+      echo "  Usage: leerie accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
     # Validate both positional args against a strict allowlist BEFORE they
@@ -1483,16 +1487,16 @@ PY
     # quotes, `;`, `/`, `..`, and whitespace. "code enforces" (DESIGN §12).
     case "$_ab_run_id" in
       *[!A-Za-z0-9._-]*)
-        remote_log "--accept-blocked: invalid run-id '$_ab_run_id' (allowed chars: A-Za-z0-9._-)"
+        remote_log "accept-blocked: invalid run-id '$_ab_run_id' (allowed chars: A-Za-z0-9._-)"
         exit 1 ;;
     esac
     case "$_ab_sid" in
       *[!A-Za-z0-9._-]*)
-        remote_log "--accept-blocked: invalid subtask-id '$_ab_sid' (allowed chars: A-Za-z0-9._-)"
+        remote_log "accept-blocked: invalid subtask-id '$_ab_sid' (allowed chars: A-Za-z0-9._-)"
         exit 1 ;;
     esac
     if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ] && [ "$_ab_runtime" != "ec2" ]; then
-      remote_log "--accept-blocked: --runtime must be 'local', 'fly', or 'ec2' (got '$_ab_runtime')"
+      remote_log "accept-blocked: --runtime must be 'local', 'fly', or 'ec2' (got '$_ab_runtime')"
       exit 1
     fi
     _ab_detected="$(_auto_detect_run_runtime "$_ab_run_id" "$_ab_runtime")" || _ab_detected=""
@@ -1503,7 +1507,7 @@ PY
     fi
     _ab_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ab_run_id"
     if [ ! -d "$_ab_state_dir" ]; then
-      remote_log "--accept-blocked: no run dir at $_ab_state_dir"
+      remote_log "accept-blocked: no run dir at $_ab_state_dir"
       exit 1
     fi
     _ab_state_file="$_ab_state_dir/state.json"
@@ -1570,22 +1574,22 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_ab_state_dir")"
       export LEERIE_EC2_INSTANCE_ID
       if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
-        remote_log "--accept-blocked: no ec2_instance_id found for run $_ab_run_id"
+        remote_log "accept-blocked: no ec2_instance_id found for run $_ab_run_id"
         exit 1
       fi
       export LEERIE_RUN_ID="$_ab_run_id"
       _ab_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
       case "$_ab_ec2_state" in
         terminated|shutting-down|"")
-          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          remote_log "accept-blocked: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
           exit 1
           ;;
       esac
       _ab_started_instance=false
       if [ "$_ab_ec2_state" != "running" ]; then
-        remote_log "--accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        remote_log "accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
         if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
-          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          remote_log "accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
           exit 1
         fi
         _ab_started_instance=true
@@ -1607,28 +1611,28 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "--accept-blocked: $_ab_sentinel"
+          remote_log "accept-blocked: $_ab_sentinel"
           ;;
         *)
-          remote_log "--accept-blocked: failed to modify state on instance"
+          remote_log "accept-blocked: failed to modify state on instance"
           [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
           _ab_teardown_ec2
           exit 1
           ;;
       esac
-      # Mirror the mutation onto the host copy so --list / audits stay
+      # Mirror the mutation onto the host copy so list / audits stay
       # consistent (best-effort; host copy is optional — EC2 state.json
       # normally lives only on the instance until fetch-back).
       if [ -f "$_ab_state_file" ]; then
         python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
       fi
       _ab_teardown_ec2
-      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+      remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
       exit 0
     fi
     if [ "$_ab_runtime" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
-        remote_log "--accept-blocked: LEERIE_FLY_APP is required for Fly runs"
+        remote_log "accept-blocked: LEERIE_FLY_APP is required for Fly runs"
         exit 1
       fi
       FLY_APP="${LEERIE_FLY_APP:-}"
@@ -1655,24 +1659,24 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       case "$_ab_mstate" in
         started|starting) : ;;
         stopped)
-          remote_log "--accept-blocked: starting paused machine $LEERIE_MACHINE_ID..."
+          remote_log "accept-blocked: starting paused machine $LEERIE_MACHINE_ID..."
           if ! flyctl machine start "$LEERIE_MACHINE_ID" --app "$FLY_APP" >/dev/null 2>&1; then
-            remote_log "--accept-blocked: flyctl machine start failed for $LEERIE_MACHINE_ID"
+            remote_log "accept-blocked: flyctl machine start failed for $LEERIE_MACHINE_ID"
             exit 1
           fi
           _ab_started_machine=true
           wait_for_started "$LEERIE_MACHINE_ID" || {
-            remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID never reached started state"
+            remote_log "accept-blocked: machine $LEERIE_MACHINE_ID never reached started state"
             stop_machine
             exit 1
           }
           ;;
         destroyed|"")
-          remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID is destroyed or missing — cannot modify state"
+          remote_log "accept-blocked: machine $LEERIE_MACHINE_ID is destroyed or missing — cannot modify state"
           exit 1
           ;;
         *)
-          remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID is in state '$_ab_mstate' — cannot modify state"
+          remote_log "accept-blocked: machine $LEERIE_MACHINE_ID is in state '$_ab_mstate' — cannot modify state"
           exit 1
           ;;
       esac
@@ -1691,7 +1695,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # SSH — a freshly-started machine takes 5-30 s. Correct arg order is
       # (fly_app, machine_id); gate on the return.
       if ! wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID"; then
-        remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID never became SSH-ready"
+        remote_log "accept-blocked: machine $LEERIE_MACHINE_ID never became SSH-ready"
         _ab_teardown
         exit 1
       fi
@@ -1712,34 +1716,34 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
         ACCEPTED:*|NOOP:*)
-          remote_log "--accept-blocked: $_ab_sentinel"
+          remote_log "accept-blocked: $_ab_sentinel"
           ;;
         *)
-          remote_log "--accept-blocked: failed to modify state on machine"
+          remote_log "accept-blocked: failed to modify state on machine"
           [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
           _ab_teardown
           exit 1
           ;;
       esac
-      # Mirror the mutation onto the host copy so --list / audits stay
+      # Mirror the mutation onto the host copy so list / audits stay
       # consistent (best-effort; host copy is optional).
       if [ -f "$_ab_state_file" ]; then
         python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
       fi
       _ab_teardown
-      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+      remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
     else
       # Local: state.json is on the host (bind-mounted into containers).
       if [ ! -f "$_ab_state_file" ]; then
-        remote_log "--accept-blocked: no state.json at $_ab_state_file"
+        remote_log "accept-blocked: no state.json at $_ab_state_file"
         exit 1
       fi
       python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid"
-      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+      remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
     fi
     exit 0
     ;;
-  --re-seed)
+  re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
     # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
     # runtime preflight since it doesn't need a local container.
@@ -1751,23 +1755,23 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --force) _re_seed_force=1; shift ;;
-        --*) remote_log "unknown --re-seed flag: $1"; exit 1 ;;
+        --*) remote_log "unknown re-seed flag: $1"; exit 1 ;;
         *)
           if [ -z "$_re_seed_run_id" ]; then _re_seed_run_id="$1"; shift
-          else remote_log "unexpected --re-seed arg: $1"; exit 1
+          else remote_log "unexpected re-seed arg: $1"; exit 1
           fi
           ;;
       esac
     done
     if [ -z "$_re_seed_run_id" ]; then
-      remote_log "--re-seed requires a <run-id>"
-      echo "  Usage: leerie --re-seed <run-id> [--force]" >&2
+      remote_log "re-seed requires a <run-id>"
+      echo "  Usage: leerie re-seed <run-id> [--force]" >&2
       exit 1
     fi
     export LEERIE_RUN_ID="$_re_seed_run_id"
     [ "$_re_seed_force" = "1" ] && export LEERIE_RE_SEED_FORCE=1
     if [ -z "${LEERIE_FLY_APP:-}" ]; then
-      remote_log "--re-seed: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+      remote_log "re-seed: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
       exit 1
     fi
     # shellcheck disable=SC1091
@@ -1779,15 +1783,15 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     re_seed
     exit $?
     ;;
-  --stop)
+  stop)
     # Fast-path: explicit pause of a run (DESIGN §6 *The user-visible
     # verb surface*). For Fly runs, calls stop_machine; for local runs,
-    # calls nerdctl stop. Resumable via --resume.
+    # calls nerdctl stop. Resumable via resume.
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
     # iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by
-    # chain_id and invoke `leerie --stop <run-id>` per matching
-    # running run (pause the machine; preserve state for --resume).
+    # chain_id and invoke `leerie stop <run-id>` per matching
+    # running run (pause the machine; preserve state for resume).
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
@@ -1811,22 +1815,22 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           if [ -n "$_sp_grp_ids" ]; then
             echo "$_sp_grp_ids" | while read -r _rid; do
               [ -z "$_rid" ] && continue
-              remote_log "--stop: pausing run $_rid (group $_sp_chain)"
-              "${LEERIE_SELF_CMD:-"$0"}" --stop "$_rid" "${_sp_pass_args[@]}" || remote_log "--stop: $_rid failed (continuing)"
+              remote_log "stop: pausing run $_rid (group $_sp_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" stop "$_rid" "${_sp_pass_args[@]}" || remote_log "stop: $_rid failed (continuing)"
             done
-            remote_log "--stop: group $_sp_chain pause pass complete"
+            remote_log "stop: group $_sp_chain pause pass complete"
             exit 0
           fi
         fi
-        remote_log "--stop: no running runs found for chain/group $_sp_chain"
+        remote_log "stop: no running runs found for chain/group $_sp_chain"
         exit 0
       fi
       echo "$_sp_run_ids" | while read -r _rid; do
         [ -z "$_rid" ] && continue
-        remote_log "--stop: pausing run $_rid (chain $_sp_chain)"
-        "${LEERIE_SELF_CMD:-"$0"}" --stop "$_rid" "${_sp_pass_args[@]}" || remote_log "--stop: $_rid failed (continuing)"
+        remote_log "stop: pausing run $_rid (chain $_sp_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" stop "$_rid" "${_sp_pass_args[@]}" || remote_log "stop: $_rid failed (continuing)"
       done
-      remote_log "--stop: chain $_sp_chain pause pass complete"
+      remote_log "stop: chain $_sp_chain pause pass complete"
       exit 0
     fi
     _stop_run_id=""
@@ -1835,34 +1839,34 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       case "$1" in
         --runtime) _stop_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _stop_runtime="${1#--runtime=}"; shift ;;
-        --*) remote_log "unknown --stop flag: $1"; exit 1 ;;
+        --*) remote_log "unknown stop flag: $1"; exit 1 ;;
         *)
           if [ -z "$_stop_run_id" ]; then _stop_run_id="$1"; shift
-          else remote_log "unexpected --stop arg: $1"; exit 1
+          else remote_log "unexpected stop arg: $1"; exit 1
           fi
           ;;
       esac
     done
     if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ] && [ "$_stop_runtime" != "ec2" ]; then
-      remote_log "--stop: --runtime must be 'local', 'fly', or 'ec2' (got '$_stop_runtime')"
+      remote_log "stop: --runtime must be 'local', 'fly', or 'ec2' (got '$_stop_runtime')"
       exit 1
     fi
     if [ -z "$_stop_run_id" ]; then
-      remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id> [--runtime fly|ec2|local]" >&2
+      remote_log "stop requires a <run-id>"
+      echo "  Usage: leerie stop <run-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
     _stop_detected="$(_auto_detect_run_runtime "$_stop_run_id" "$_stop_runtime")" || _stop_detected=""
     if [ -n "$_stop_detected" ]; then
-      remote_log "--stop: auto-detected ${_stop_detected} run; promoting --runtime to ${_stop_detected}"
+      remote_log "stop: auto-detected ${_stop_detected} run; promoting --runtime to ${_stop_detected}"
       _stop_runtime="$_stop_detected"
     elif [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "ec2" ] && _is_local_container "$_stop_run_id"; then
       _stop_runtime="local"
     fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
-      remote_log "--stop: no run dir at $_stop_run_dir"
-      echo "  Check 'leerie --list' for active runs." >&2
+      remote_log "stop: no run dir at $_stop_run_dir"
+      echo "  Check 'leerie list' for active runs." >&2
       exit 1
     fi
     export LEERIE_RUN_ID="$_stop_run_id"
@@ -1873,20 +1877,20 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # --rm on the original nerdctl run auto-removes the container.
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
-      remote_log "--stop: stopping local container $LEERIE_RUN_ID..."
+      remote_log "stop: stopping local container $LEERIE_RUN_ID..."
       nerdctl stop "$_stop_run_id" >/dev/null 2>&1 || true
       _ensure_run_json "$_stop_run_dir" || true
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
         pause_reason "user-requested" || true
-      remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+      remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
       exit 0
     fi
     if [ "$_stop_runtime" = "ec2" ]; then
       # EC2 instance: stop_instance() preserves the root EBS volume
       # (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2 —
       # StopInstances is stop-scoped, never DeleteOnTermination). Resumable
-      # via leerie --resume (once the EC2 --resume path lands).
+      # via leerie resume (once the EC2 resume path lands).
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
       # shellcheck disable=SC1091
@@ -1903,27 +1907,27 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_stop_run_dir")"
       export LEERIE_EC2_INSTANCE_ID
       if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
-        remote_log "--stop: no ec2_instance_id found for run $LEERIE_RUN_ID"
+        remote_log "stop: no ec2_instance_id found for run $LEERIE_RUN_ID"
         exit 1
       fi
       _ensure_run_json "$_stop_run_dir" || true
-      remote_log "--stop: pausing instance $LEERIE_EC2_INSTANCE_ID (run $LEERIE_RUN_ID)"
+      remote_log "stop: pausing instance $LEERIE_EC2_INSTANCE_ID (run $LEERIE_RUN_ID)"
       stop_instance
       update_run_json "$_stop_sidecar" \
         paused_at "$(iso_now)" \
         pause_reason "user-requested" \
         ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
-      remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+      remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
       exit 0
     fi
     if [ "$_stop_runtime" != "fly" ]; then
-      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine, local container, or EC2 instance"
+      remote_log "stop: run $LEERIE_RUN_ID is not a live Fly machine, local container, or EC2 instance"
       echo "  If the container already exited, there is nothing to stop." >&2
-      echo "  Check 'leerie --list' for active runs." >&2
+      echo "  Check 'leerie list' for active runs." >&2
       exit 1
     fi
     if [ -z "${LEERIE_FLY_APP:-}" ]; then
-      remote_log "--stop: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+      remote_log "stop: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
       exit 1
     fi
     FLY_APP="${LEERIE_FLY_APP:-}"
@@ -1935,16 +1939,16 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     LEERIE_MACHINE_ID="$_stop_run_id"
     export LEERIE_MACHINE_ID
     _ensure_run_json "$_stop_run_dir" || true
-    remote_log "--stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)"
+    remote_log "stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)"
     stop_machine
     update_run_json "$_stop_sidecar" \
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
       fly_machine_id "$LEERIE_MACHINE_ID" || true
-    remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+    remote_log "stop: paused. Resume via: leerie resume $LEERIE_RUN_ID"
     exit 0
     ;;
-  --kill)
+  kill)
     # Fast-path: explicit destroy of a run (DESIGN §6 *The user-visible
     # verb surface*). For Fly runs, calls destroy_machine; for local
     # runs, calls nerdctl kill. Confirmation prompt unless --force.
@@ -1952,12 +1956,12 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
     # iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by
-    # chain_id and invoke `leerie --kill <run-id>` per matching live
+    # chain_id and invoke `leerie kill <run-id>` per matching live
     # run (idempotent — already-killed runs are skipped).
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    # Peek for UUID-formatted chain-id / group-id as the first positional arg.
+    # Peek for UUID-formatted --chain-id / group-id as the first positional arg.
     # Chain-id kill: iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json,
     # find runs with matching chain_id, invoke single-run kill on each.
     # Group-id kill: if no chain runs found, try group_id across all state dirs.
@@ -1979,22 +1983,22 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           if [ -n "$_kc_grp_ids" ]; then
             echo "$_kc_grp_ids" | while read -r _rid; do
               [ -z "$_rid" ] && continue
-              remote_log "--kill: destroying run $_rid (group $_kc_chain)"
-              "${LEERIE_SELF_CMD:-"$0"}" --kill "$_rid" "${_kc_pass_args[@]}" || remote_log "--kill: destroy failed for $_rid (continuing)"
+              remote_log "kill: destroying run $_rid (group $_kc_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" kill "$_rid" "${_kc_pass_args[@]}" || remote_log "kill: destroy failed for $_rid (continuing)"
             done
-            remote_log "--kill: group $_kc_chain destroyed"
+            remote_log "kill: group $_kc_chain destroyed"
             exit 0
           fi
         fi
-        remote_log "--kill: no live runs found for chain/group $_kc_chain (already destroyed or never ran)"
+        remote_log "kill: no live runs found for chain/group $_kc_chain (already destroyed or never ran)"
         exit 0
       fi
       echo "$_kc_run_ids" | while read -r _rid; do
         [ -z "$_rid" ] && continue
-        remote_log "--kill: destroying run $_rid (chain $_kc_chain)"
-        "${LEERIE_SELF_CMD:-"$0"}" --kill "$_rid" "${_kc_pass_args[@]}" || remote_log "--kill: destroy failed for $_rid (continuing)"
+        remote_log "kill: destroying run $_rid (chain $_kc_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" kill "$_rid" "${_kc_pass_args[@]}" || remote_log "kill: destroy failed for $_rid (continuing)"
       done
-      remote_log "--kill: chain $_kc_chain destroyed"
+      remote_log "kill: chain $_kc_chain destroyed"
       exit 0
     fi
     _kill_run_id=""
@@ -2011,21 +2015,21 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         --app=*) _kill_app="${1#--app=}"; shift ;;
         --runtime) _kill_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _kill_runtime="${1#--runtime=}"; shift ;;
-        --*) remote_log "unknown --kill flag: $1"; exit 1 ;;
+        --*) remote_log "unknown kill flag: $1"; exit 1 ;;
         *)
           if [ -z "$_kill_run_id" ]; then _kill_run_id="$1"; shift
-          else remote_log "unexpected --kill arg: $1"; exit 1
+          else remote_log "unexpected kill arg: $1"; exit 1
           fi
           ;;
       esac
     done
     if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ] && [ "$_kill_runtime" != "ec2" ]; then
-      remote_log "--kill: --runtime must be 'local', 'fly', or 'ec2' (got '$_kill_runtime')"
+      remote_log "kill: --runtime must be 'local', 'fly', or 'ec2' (got '$_kill_runtime')"
       exit 1
     fi
     _kill_detected="$(_auto_detect_run_runtime "$_kill_run_id" "$_kill_runtime")" || _kill_detected=""
     if [ -n "$_kill_detected" ]; then
-      remote_log "--kill: auto-detected ${_kill_detected} run; promoting --runtime to ${_kill_detected}"
+      remote_log "kill: auto-detected ${_kill_detected} run; promoting --runtime to ${_kill_detected}"
       _kill_runtime="$_kill_detected"
     elif [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "ec2" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
       _kill_runtime="local"
@@ -2036,7 +2040,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     if [ -n "$_kill_run_id" ]; then
       _kill_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_kill_run_id"
       if [ ! -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
-        remote_log "--kill: no run dir at $_kill_run_dir"
+        remote_log "kill: no run dir at $_kill_run_dir"
         echo "  Pass --machine-id <id> to destroy an orphan machine without a sidecar." >&2
         exit 1
       fi
@@ -2048,7 +2052,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # --- local container kill path ---
     if [ "$_kill_runtime" = "local" ]; then
       if [ -z "$_kill_run_id" ]; then
-        remote_log "--kill: no run-id for local container"
+        remote_log "kill: no run-id for local container"
         exit 1
       fi
       if [ "$_kill_force" != "1" ]; then
@@ -2056,13 +2060,13 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           "$_kill_run_id" >&2
         read -r _kill_confirm
         if [ "$_kill_confirm" != "$_kill_run_id" ]; then
-          remote_log "--kill: confirmation mismatch; aborted."
+          remote_log "kill: confirmation mismatch; aborted."
           exit 1
         fi
       fi
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/lib.sh"
-      remote_log "--kill: destroying local container $_kill_run_id"
+      remote_log "kill: destroying local container $_kill_run_id"
       nerdctl kill "$_kill_run_id" >/dev/null 2>&1 || true
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
@@ -2072,13 +2076,13 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
             killed_at "$(iso_now)" || true
         fi
       fi
-      remote_log "--kill: destroyed. Run is no longer resumable."
+      remote_log "kill: destroyed. Run is no longer resumable."
       exit 0
     fi
     # --- EC2 instance kill path ---
     # An EC2 instance id must never fall through to the Fly kill path below:
     # flyctl would silently no-op against a nonexistent Fly machine and
-    # --kill would report "destroyed" while the instance keeps billing.
+    # kill would report "destroyed" while the instance keeps billing.
     #
     # Fetch-before-terminate ordering (DESIGN §6 one-way-ratchet
     # invariant, mirroring decide_ec2_teardown's clean-exit branch in
@@ -2087,7 +2091,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # then-fetch would make paid-for LLM work unrecoverable.
     if [ "$_kill_runtime" = "ec2" ]; then
       if [ -z "$_kill_run_id" ]; then
-        remote_log "--kill: no run-id for EC2 instance"
+        remote_log "kill: no run-id for EC2 instance"
         exit 1
       fi
       _kill_ec2_instance_id=""
@@ -2095,7 +2099,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         _kill_ec2_instance_id="$(_resolve_ec2_instance_id_from_run_dir "$_kill_run_dir")"
       fi
       if [ -z "$_kill_ec2_instance_id" ]; then
-        remote_log "--kill: no ec2_instance_id found in $_kill_run_dir (ec2-instance.json / run.json)"
+        remote_log "kill: no ec2_instance_id found in $_kill_run_dir (ec2-instance.json / run.json)"
         exit 1
       fi
       if [ "$_kill_force" != "1" ]; then
@@ -2103,11 +2107,11 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           "$_kill_ec2_instance_id" "$_kill_run_id" >&2
         read -r _kill_confirm
         if [ "$_kill_confirm" != "$_kill_run_id" ]; then
-          remote_log "--kill: confirmation mismatch; aborted."
+          remote_log "kill: confirmation mismatch; aborted."
           exit 1
         fi
       fi
-      remote_log "--kill: resolving AWS credentials for instance $_kill_ec2_instance_id"
+      remote_log "kill: resolving AWS credentials for instance $_kill_ec2_instance_id"
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
       # shellcheck disable=SC1091
@@ -2150,16 +2154,16 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # duplicating its "source ec2-fetch-branch.sh if present, fail
       # closed if absent" logic. Must run — and succeed — BEFORE
       # terminate_instance below.
-      remote_log "--kill: syncing run branch + state from instance $_kill_ec2_instance_id before terminating"
+      remote_log "kill: syncing run branch + state from instance $_kill_ec2_instance_id before terminating"
       if _try_fetch_state_for_ec2_teardown; then
-        remote_log "--kill: run branch + state synced to host"
+        remote_log "kill: run branch + state synced to host"
       else
-        remote_log "--kill: sync from instance to host FAILED — instance LEFT RUNNING so work is not lost"
-        echo "  Recover manually, then re-run: leerie --kill $_kill_run_id --force" >&2
+        remote_log "kill: sync from instance to host FAILED — instance LEFT RUNNING so work is not lost"
+        echo "  Recover manually, then re-run: leerie kill $_kill_run_id --force" >&2
         echo "  Instance: $_kill_ec2_instance_id (still running on EC2)" >&2
         exit 1
       fi
-      remote_log "--kill: terminating instance $_kill_ec2_instance_id"
+      remote_log "kill: terminating instance $_kill_ec2_instance_id"
       terminate_instance
       if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
         _ensure_run_json "$_kill_run_dir" || true
@@ -2170,18 +2174,18 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
             ec2_instance_id "$_kill_ec2_instance_id" || true
         fi
       fi
-      remote_log "--kill: destroyed. Run is no longer resumable."
+      remote_log "kill: destroyed. Run is no longer resumable."
       exit 0
     fi
     # --- Fly machine kill path ---
     if [ -z "$_kill_machine_id" ]; then
-      remote_log "--kill: run ${_kill_run_id:-unknown} is not a live Fly machine or local container"
-      echo "  Usage: leerie --kill <run-id> [--force]" >&2
-      echo "  Orphan: leerie --kill --machine-id <id> [--app <app>]" >&2
+      remote_log "kill: run ${_kill_run_id:-unknown} is not a live Fly machine or local container"
+      echo "  Usage: leerie kill <run-id> [--force]" >&2
+      echo "  Orphan: leerie kill --machine-id <id> [--app <app>]" >&2
       exit 1
     fi
     if [ "$_kill_runtime" != "fly" ] && [ -z "${_kill_app:-}" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
-      remote_log "--kill: LEERIE_FLY_APP is required (or pass --app <name>). Set it: export LEERIE_FLY_APP=my-app"
+      remote_log "kill: LEERIE_FLY_APP is required (or pass --app <name>). Set it: export LEERIE_FLY_APP=my-app"
       exit 1
     fi
     FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-}}"
@@ -2198,7 +2202,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         "$_kill_machine_id" "$_kill_prompt_target" "$_kill_prompt_label" >&2
       read -r _kill_confirm
       if [ "$_kill_confirm" != "$_kill_prompt_target" ]; then
-        remote_log "--kill: confirmation mismatch; aborted."
+        remote_log "kill: confirmation mismatch; aborted."
         exit 1
       fi
     fi
@@ -2213,7 +2217,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       LEERIE_VOLUME_ID="$(_resolve_volume_id_from_run_dir "$_kill_run_dir")"
     fi
     # No sidecar (or a sidecar with no volume_id) — ask Fly directly. This
-    # is the `--kill --machine-id <id>` orphan path the usage hint above
+    # is the `kill --machine-id <id>` orphan path the usage hint above
     # advertises; without the lookup it destroys the machine and leaks the
     # volume. Must run BEFORE destroy_machine: the association lives only on
     # Fly and vanishes with the machine.
@@ -2221,11 +2225,11 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       LEERIE_VOLUME_ID="$(_resolve_volume_id_from_fly \
         "$_kill_machine_id" "$FLY_APP")"
       if [ -n "$LEERIE_VOLUME_ID" ]; then
-        remote_log "--kill: resolved volume $LEERIE_VOLUME_ID from Fly (no sidecar)"
+        remote_log "kill: resolved volume $LEERIE_VOLUME_ID from Fly (no sidecar)"
       fi
     fi
     export LEERIE_VOLUME_ID
-    remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
+    remote_log "kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       _ensure_run_json "$_kill_run_dir" || true
@@ -2236,10 +2240,10 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           fly_machine_id "$_kill_machine_id" || true
       fi
     fi
-    remote_log "--kill: destroyed. Run is no longer resumable."
+    remote_log "kill: destroyed. Run is no longer resumable."
     exit 0
     ;;
-  --finalize)
+  finalize)
     # Fast-path: post-detach finalization (DESIGN §6 *Detached
     # orchestrator (remote mode)*). The detached orchestrator ran on the
     # Fly Machine; the launcher couldn't synchronously call fetch_branch
@@ -2248,7 +2252,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    # Chain-id / group-id dispatch: `--finalize <uuid>` finalizes every
+    # Chain-id / group-id dispatch: `finalize <uuid>` finalizes every
     # run-id belonging to a chain/group that hasn't already been pushed.
     if [ "$#" -gt 0 ] && echo "$1" | grep -qiE "$UUID_PATTERN"; then
       _fc_chain="$1"; shift
@@ -2267,22 +2271,22 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           if [ -n "$_fc_grp_ids" ]; then
             echo "$_fc_grp_ids" | while read -r _rid; do
               [ -z "$_rid" ] && continue
-              remote_log "--finalize: finalizing run $_rid (group $_fc_chain)"
-              "${LEERIE_SELF_CMD:-"$0"}" --finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "--finalize: $_rid failed (continuing)"
+              remote_log "finalize: finalizing run $_rid (group $_fc_chain)"
+              "${LEERIE_SELF_CMD:-"$0"}" finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "finalize: $_rid failed (continuing)"
             done
-            remote_log "--finalize: group $_fc_chain finalize pass complete"
+            remote_log "finalize: group $_fc_chain finalize pass complete"
             exit 0
           fi
         fi
-        remote_log "--finalize: no pending runs found for chain/group $_fc_chain"
+        remote_log "finalize: no pending runs found for chain/group $_fc_chain"
         exit 0
       fi
       echo "$_fc_run_ids" | while read -r _rid; do
         [ -z "$_rid" ] && continue
-        remote_log "--finalize: finalizing run $_rid (chain $_fc_chain)"
-        "${LEERIE_SELF_CMD:-"$0"}" --finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "--finalize: $_rid failed (continuing)"
+        remote_log "finalize: finalizing run $_rid (chain $_fc_chain)"
+        "${LEERIE_SELF_CMD:-"$0"}" finalize "$_rid" "${_fc_pass_args[@]}" || remote_log "finalize: $_rid failed (continuing)"
       done
-      remote_log "--finalize: chain $_fc_chain finalize pass complete"
+      remote_log "finalize: chain $_fc_chain finalize pass complete"
       exit 0
     fi
     # Pull the run-id (first positional). Then scan remaining args for
@@ -2311,8 +2315,8 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         # Fail loudly on typos like `--foorce` — previously these were
         # silently dropped and the user thought they had passed --force.
         --*)
-          remote_log "--finalize: unknown flag: $_a"
-          echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+          remote_log "finalize: unknown flag: $_a"
+          echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
           exit 1
           ;;
         *)
@@ -2320,8 +2324,8 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           # _fin_run_id from $1). Anything after is a second positional
           # — refuse to silently accept it.
           if [ "$_fin_seen_positional" = "true" ]; then
-            remote_log "--finalize: unexpected extra positional: $_a"
-            echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+            remote_log "finalize: unexpected extra positional: $_a"
+            echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
             exit 1
           fi
           _fin_seen_positional=true
@@ -2335,40 +2339,40 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # empty runtime and the launcher would proceed with the default Fly
     # path — a surprise the operator would not have asked for.
     if [ -n "$_fin_prev" ]; then
-      remote_log "--finalize: $_fin_prev requires a value"
-      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+      remote_log "finalize: $_fin_prev requires a value"
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
     if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ] && [ "$_fin_runtime" != "ec2" ]; then
-      remote_log "--finalize: --runtime must be 'local', 'fly', or 'ec2' (got '$_fin_runtime')"
+      remote_log "finalize: --runtime must be 'local', 'fly', or 'ec2' (got '$_fin_runtime')"
       exit 1
     fi
     if [ "$_fin_runtime" = "local" ]; then
-      remote_log "--finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
+      remote_log "finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
     fi
     if [ "$_fin_runtime" = "ec2" ]; then
-      remote_log "--finalize --runtime ec2: --finalize does not support EC2 runs yet"
+      remote_log "finalize --runtime ec2: finalize does not support EC2 runs yet"
       exit 1
     fi
     _fin_detected="$(_auto_detect_run_runtime "$_fin_run_id" "$_fin_runtime")" || _fin_detected=""
     if [ "$_fin_detected" = "ec2" ]; then
-      remote_log "--finalize: run $_fin_run_id is an EC2 run; --finalize does not support EC2 runs yet"
+      remote_log "finalize: run $_fin_run_id is an EC2 run; finalize does not support EC2 runs yet"
       exit 1
     fi
     if [ "$_fin_detected" = "fly" ]; then
-      remote_log "--finalize: auto-detected Fly run; promoting --runtime to fly"
+      remote_log "finalize: auto-detected Fly run; promoting --runtime to fly"
       _fin_runtime="fly"
     fi
     if [ -z "$_fin_run_id" ]; then
-      remote_log "--finalize requires a <run-id>"
-      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+      remote_log "finalize requires a <run-id>"
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
     _fin_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
-      remote_log "--finalize: no run dir at $_fin_run_dir"
-      remote_log "  Run \`leerie --list\` to see known runs on this host."
+      remote_log "finalize: no run dir at $_fin_run_dir"
+      remote_log "  Run \`leerie list\` to see known runs on this host."
       exit 1
     fi
     # Short-circuit if already finalized (only possible once run.json
@@ -2416,16 +2420,16 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           fi
         fi
         if [ "$_fin_repush" = "true" ]; then
-          remote_log "--finalize: run $_fin_run_id marked pushed but origin is not up to date (partial prior push); re-finalizing."
+          remote_log "finalize: run $_fin_run_id marked pushed but origin is not up to date (partial prior push); re-finalizing."
         else
-          remote_log "--finalize: run $_fin_run_id is already pushed; nothing to do."
+          remote_log "finalize: run $_fin_run_id is already pushed; nothing to do."
           exit 0
         fi
       fi
     fi
     if [ "$_fin_runtime" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
-        remote_log "--finalize: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+        remote_log "finalize: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
         exit 1
       fi
       FLY_APP="$LEERIE_FLY_APP"
@@ -2475,7 +2479,7 @@ except Exception:
     fi
 
     if [ "$_already_synced" = "true" ]; then
-      remote_log "--finalize: run already synced to host; skipping fetch_branch"
+      remote_log "finalize: run already synced to host; skipping fetch_branch"
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
     else
@@ -2504,7 +2508,7 @@ except Exception:
         collect_subtrees_remote "$FLY_APP" "$LEERIE_MACHINE_ID" || {
           remote_log "warning: subtree collection failed; proceeding with whatever is on the run branch"
         }
-        remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
+        remote_log "finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
         if ! fetch_branch; then
           remote_log "error: fetch_branch failed after force-stop + collect"
           exit 1
@@ -2515,20 +2519,20 @@ except Exception:
         # collect subtrees, retry fetch.
         remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=fetch"
         if ! fetch_branch; then
-          remote_log "--finalize: fetch_branch found no finalized run; attempting recovery"
+          remote_log "finalize: fetch_branch found no finalized run; attempting recovery"
           if force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"; then
             # Orchestrator is dead; patched finished_at. Collect subtrees.
             collect_subtrees_remote "$FLY_APP" "$LEERIE_MACHINE_ID" || {
               remote_log "warning: subtree collection failed; proceeding with whatever is on the run branch"
             }
-            remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
+            remote_log "finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
             if ! fetch_branch; then
               remote_log "error: fetch_branch failed after recovery patch + collect"
               exit 1
             fi
           else
             remote_log "  The orchestrator may still be alive. To stop it and finalize, run:"
-            remote_log "    leerie --finalize $_fin_run_id --force"
+            remote_log "    leerie finalize $_fin_run_id --force"
             remote_log "  (--force SIGTERMs the orchestrator process, then collects subtrees.)"
             exit 1
           fi
@@ -2557,8 +2561,8 @@ except Exception:
     # machine by design). That writes no_push=true to run.json on the
     # machine, which fetch_branch copies to the host. The user's actual
     # intent is recorded host-side in the run dir's fly-machine.json
-    # (host_no_push field, set at launch time). On --finalize:
-    #   - if --no-push is on the --finalize CLI, skip push (user
+    # (host_no_push field, set at launch time). On finalize:
+    #   - if --no-push is on the finalize CLI, skip push (user
     #     explicitly opted out at finalize time).
     #   - else, if host_no_push=true was recorded at launch, skip push
     #     (user opted out at launch).
@@ -2615,15 +2619,15 @@ PY
     host_finalize "$_fetched_run_dir"
     exit $?
     ;;
-  --status)
+  status)
     # ID-dispatched status verb.
     # UUID-pattern id (8-4-4-4-12) → try chain_id first (one state dir),
     # then group_id (across all per-repo state dirs under $HOME/.leerie/).
-    # Other ids fall through to the existing --list mechanism (run-level).
+    # Other ids fall through to the existing list mechanism (run-level).
     shift
     _st_id="${1:-}"
     if [ -z "$_st_id" ]; then
-      remote_log "--status: <id> is required (chain-id, group-id, or run-id)"; exit 1
+      remote_log "status: <id> is required (--chain-id, group-id, or run-id)"; exit 1
     fi
     if echo "$_st_id" | grep -qiE "$UUID_PATTERN"; then
       # Try chain_id first (runs in current state dir).
@@ -2749,22 +2753,22 @@ PY
       exit $?
     fi
     # Non-UUID: route to single-run inspection.
-    remote_log "--status: non-UUID id '$_st_id' looks like a run-id"
-    remote_log "  For a single run, inspect with: leerie --list --runtime fly"
-    remote_log "  Then reattach with: leerie --resume $_st_id"
+    remote_log "status: non-UUID id '$_st_id' looks like a run-id"
+    remote_log "  For a single run, inspect with: leerie list --runtime fly"
+    remote_log "  Then reattach with: leerie resume $_st_id"
     exit 1
     ;;
-  --attach)
+  attach)
     # ID-dispatched attach verb.
     # UUID → poll run.json files until all chain runs reach terminal status.
     # Non-UUID → not yet implemented for single runs.
     shift
     _at_id="${1:-}"
     if [ -z "$_at_id" ]; then
-      remote_log "--attach: <id> is required (chain-id or run-id)"; exit 1
+      remote_log "attach: <id> is required (--chain-id or run-id)"; exit 1
     fi
     if echo "$_at_id" | grep -qiE "$UUID_PATTERN"; then
-      remote_log "--attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
+      remote_log "attach: polling $LEERIE_STATE_HOST_DIR for chain $_at_id (Ctrl-C to detach)"
       while :; do
         _at_done="$(python3 - "$LEERIE_STATE_HOST_DIR" "$_at_id" <<'PY'
 import json, sys
@@ -2795,17 +2799,17 @@ PY
         _at_terminal="$(echo "$_at_done" | awk '{print $2}')"
         echo "  chain $_at_id: $_at_terminal/$_at_matched run(s) in terminal state"
         if [ "$_at_matched" -gt 0 ] && [ "$_at_terminal" = "$_at_matched" ]; then
-          remote_log "--attach: chain $_at_id reached terminal state"
+          remote_log "attach: chain $_at_id reached terminal state"
           exit 0
         fi
         sleep 5
       done
     fi
-    remote_log "--attach: run-id attach not yet implemented; use 'leerie --resume $_at_id' to reattach"
+    remote_log "attach: run-id attach not yet implemented; use 'leerie resume $_at_id' to reattach"
     exit 1
     ;;
-  --resume)
-    # ID-dispatch fast-path: `--resume <uuid>` handles chain runs in two
+  resume)
+    # ID-dispatch fast-path: `resume <uuid>` handles chain runs in two
     # tiers: (1) auto-resume paused runs, (2) list running runs for the
     # user to reattach to. If the UUID is a group_id (no chain runs found),
     # dispatch group-scoped resume instead. Non-UUID args fall through to
@@ -2831,13 +2835,13 @@ PY
             if [ -n "$_rs_grp_paused" ]; then
               echo "$_rs_grp_paused" | while read -r _rid; do
                 [ -z "$_rid" ] && continue
-                remote_log "--resume: resuming paused run $_rid (group $_rs_chain)"
-                "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+                remote_log "resume: resuming paused run $_rid (group $_rs_chain)"
+                "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "resume: $_rid failed (continuing with next)"
               done
-              remote_log "--resume: group $_rs_chain resume pass complete"
+              remote_log "resume: group $_rs_chain resume pass complete"
             fi
             if [ -n "$_rs_grp_running" ]; then
-              remote_log "--resume: running group members (reattach with leerie --resume <run-id>):"
+              remote_log "resume: running group members (reattach with leerie resume <run-id>):"
               echo "$_rs_grp_running" | while read -r _rid; do
                 echo "    $_rid"
               done
@@ -2845,20 +2849,20 @@ PY
             exit 0
           fi
         fi
-        remote_log "--resume: no resumable runs found for chain/group $_rs_chain"
+        remote_log "resume: no resumable runs found for chain/group $_rs_chain"
         exit 0
       fi
       # Tier 1: auto-resume paused runs.
       if [ -n "$_rs_paused" ]; then
         echo "$_rs_paused" | while read -r _rid; do
           [ -z "$_rid" ] && continue
-          remote_log "--resume: resuming paused run $_rid (chain $_rs_chain)"
-          "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+          remote_log "resume: resuming paused run $_rid (chain $_rs_chain)"
+          "${LEERIE_SELF_CMD:-"$0"}" resume "$_rid" "${_rs_pass_args[@]}" || remote_log "resume: $_rid failed (continuing with next)"
         done
       fi
       # Tier 2: list running runs for the user to pick.
       if [ -n "$_rs_running" ]; then
-        remote_log "--resume: running chain runs (reattach with leerie --resume <id>):"
+        remote_log "resume: running chain runs (reattach with leerie resume <id>):"
         echo "$_rs_running" | while read -r _rid; do
           [ -z "$_rid" ] && continue
           _rs_rj="$LEERIE_STATE_HOST_DIR/runs/$_rid/run.json"
@@ -2876,15 +2880,15 @@ except Exception:
         done
       fi
       if [ -n "$_rs_paused" ]; then
-        remote_log "--resume: chain $_rs_chain resume pass complete"
+        remote_log "resume: chain $_rs_chain resume pass complete"
         echo ""
-        echo "Re-run 'leerie --chain --wave ...' to resume the wave loop from where it paused."
+        echo "Re-run 'leerie chain --wave ...' to resume the wave loop from where it paused."
       fi
       exit 0
     fi
     # Non-UUID: fall through to the existing run-id resume.
     ;;
-  --chain|--chain-submit)
+  chain)
     # Laptop-side wave sequencer. A chain is N parallel copies of today's
     # single-run --runtime fly flow per wave, with synth-merge between
     # waves to build wave N+1's base branch. The laptop drives everything;
@@ -2898,8 +2902,6 @@ except Exception:
     # *file paths*; the launcher reads each file and sends its contents
     # as the prompt to a backgrounded ./leerie --runtime fly invocation.
     # N waves are supported (wave 0, 1, 2, …).
-    #
-    # --chain-submit is a deprecated alias for --chain.
     #
     # Required env: none chain-specific. The single-run --runtime fly
     # flow that each wave job invokes has its own requirements (gh auth,
@@ -2922,8 +2924,8 @@ except Exception:
         # always operates against $USER_REPO directly (the laptop's
         # cwd). cd into the target repo and re-run.
         --target|--target=*)
-          remote_log "--chain: --target is not supported; chains operate on \$USER_REPO directly."
-          echo "  Cd into the target repo and re-run leerie --chain --wave ..." >&2
+          remote_log "chain: --target is not supported; chains operate on \$USER_REPO directly."
+          echo "  Cd into the target repo and re-run leerie chain --wave ..." >&2
           exit 1
           ;;
         # Per-job flags forwarded to each wave's ./leerie invocation.
@@ -2936,12 +2938,12 @@ except Exception:
             _ch_passthrough+=("$1"); shift
           fi
           ;;
-        *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
+        *) remote_log "chain: unexpected argument: $1"; exit 1 ;;
       esac
     done
     if [ "${#_ch_waves[@]}" -eq 0 ]; then
-      remote_log "--chain: at least one --wave is required"
-      echo "  Usage: leerie --chain --wave <f1,f2,...> [--wave <f3,...>]" >&2
+      remote_log "chain: at least one --wave is required"
+      echo "  Usage: leerie chain --wave <f1,f2,...> [--wave <f3,...>]" >&2
       exit 1
     fi
     # Sanity-check every prompt file before fan-out so we fail fast on
@@ -2955,7 +2957,7 @@ except Exception:
       # UUID" error pointing at the visibly-correct hex value).
       _ch_id_stripped="$(echo "$_ch_id_override" | tr -d '[:space:]')"
       if [ "$_ch_id_stripped" != "$_ch_id_override" ]; then
-        remote_log "--chain: --chain-id value had surrounding whitespace; stripped to '$_ch_id_stripped'"
+        remote_log "chain: --chain-id value had surrounding whitespace; stripped to '$_ch_id_stripped'"
         _ch_id_override="$_ch_id_stripped"
       fi
       unset _ch_id_stripped
@@ -2970,11 +2972,11 @@ except Exception:
       # uppercase letter silently bypasses idempotency and forks the
       # chain into a second chain_id (v8 audit finding S1).
       if ! echo "$_ch_id_override" | grep -qiE "$UUID_PATTERN"; then
-        remote_log "--chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        remote_log "chain: --chain-id value '$_ch_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _ch_id="$(echo "$_ch_id_override" | tr '[:upper:]' '[:lower:]')"
-      remote_log "--chain: pinning chain_id to $_ch_id (resuming prior chain)"
+      remote_log "chain: pinning chain_id to $_ch_id (resuming prior chain)"
     else
       _ch_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
@@ -2988,17 +2990,17 @@ except Exception:
         _job_file="$(echo "$_job_file" | sed 's/^ *//;s/ *$//')"
         [ -z "$_job_file" ] && continue
         if [ ! -f "$_job_file" ]; then
-          remote_log "--chain: prompt file not found: $_job_file"; exit 1
+          remote_log "chain: prompt file not found: $_job_file"; exit 1
         fi
         if [ ! -s "$_job_file" ]; then
-          remote_log "--chain: prompt file is empty: $_job_file"; exit 1
+          remote_log "chain: prompt file is empty: $_job_file"; exit 1
         fi
         _ch_prompts+=("$(cat "$_job_file")")
         _ch_prompt_files+=("$_job_file")
         _w_count=$((_w_count + 1))
       done
       if [ "$_w_count" -eq 0 ]; then
-        remote_log "--chain: wave is empty (no prompt files)"; exit 1
+        remote_log "chain: wave is empty (no prompt files)"; exit 1
       fi
       _ch_jobs_per_wave+=("$_w_count")
     done
@@ -3048,14 +3050,14 @@ except Exception:
     echo "  base branch: $_ch_current_base"
     echo ""
     echo "  Recovery (if a wave pauses on failure):"
-    echo "    leerie --resume $_ch_id"
-    echo "    leerie --chain --chain-id $_ch_id --wave ..."
+    echo "    leerie resume $_ch_id"
+    echo "    leerie chain --chain-id $_ch_id --wave ..."
     echo ""
 
     # Wave loop. Each wave:
     #   - Idempotency: if every wave-N run (filtered by chain_id +
     #     wave_idx) is already pushed_at, skip fan-out (resume from
-    #     a prior --chain invocation that completed this wave).
+    #     a prior chain invocation that completed this wave).
     #   - Else: checkout current_base, fan out N background
     #     ./leerie --runtime fly --chain-id <id>, wait, tag each
     #     run.json with chain_id + wave_idx.
@@ -3081,7 +3083,7 @@ except Exception:
         # Ensure laptop HEAD = current_base so seed-repo.sh ships the
         # right starting state to each worker.
         git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
-          || { remote_log "--chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
+          || { remote_log "chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
 
         # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so
         # we can identify which fly-machine.json files belong to this
@@ -3113,7 +3115,7 @@ except Exception:
         # runs/*/fly-machine.json for matching launcher_pid (survives
         # pointer deletion by destroy_machine in older images). We tag
         # BEFORE the failure check so paused runs are discoverable by
-        # `leerie --resume <chain-id>` / `--kill <chain-id>` / etc.
+        # `leerie resume <chain-id>` / `kill <chain-id>` / etc.
         for _cp in "${_ch_wave_child_pids[@]}"; do
           _ch_mid=""
           _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
@@ -3147,11 +3149,11 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
           echo ""
           echo "Some wave-$_wave_idx jobs paused on failure. To recover:"
           echo "  1. Resume paused runs in this chain:"
-          echo "       leerie --resume $_ch_id"
+          echo "       leerie resume $_ch_id"
           echo "  2. After every paused run is pushed, re-submit the chain"
           echo "     with --chain-id pinning to this chain so the wave loop"
           echo "     skips the already-pushed waves and continues:"
-          echo "       leerie --chain --chain-id $_ch_id --wave ..."
+          echo "       leerie chain --chain-id $_ch_id --wave ..."
           exit 1
         fi
       fi
@@ -3179,9 +3181,9 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
         if git -C "$USER_REPO" ls-remote --exit-code origin "$_ch_next_stage" >/dev/null 2>&1; then
           remote_log "wave $_wave_idx → $((_wave_idx + 1)): stage branch $_ch_next_stage already on origin; skipping synth-merge"
           git -C "$USER_REPO" fetch origin "$_ch_next_stage" >/dev/null 2>&1 \
-            || { remote_log "--chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
+            || { remote_log "chain: failed to fetch existing stage branch $_ch_next_stage"; exit 1; }
           git -C "$USER_REPO" checkout -B "$_ch_next_stage" "origin/$_ch_next_stage" >/dev/null 2>&1 \
-            || { remote_log "--chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
+            || { remote_log "chain: failed to checkout existing stage branch $_ch_next_stage"; exit 1; }
           _ch_current_base="$_ch_next_stage"
           _ch_offset=$((_ch_offset + _n))
           continue
@@ -3223,14 +3225,14 @@ except SynthMergeConflict as exc:
           echo "     loop will detect the now-pushed staging branch and skip"
           echo "     synth-merge for wave-$_wave_idx → $((_wave_idx + 1)),"
           echo "     resuming at wave-$((_wave_idx + 1)):"
-          echo "       leerie --chain --chain-id $_ch_id --wave ..."
+          echo "       leerie chain --chain-id $_ch_id --wave ..."
           exit 1
         fi
         # Push the staged base branch to origin so subsequent wave's
         # workers can use it as their starting point (via seed-repo.sh
         # in their own ./leerie invocation).
         if ! git -C "$USER_REPO" push origin "$_ch_next_stage" >/dev/null 2>&1; then
-          remote_log "--chain: failed to push $_ch_next_stage to origin"
+          remote_log "chain: failed to push $_ch_next_stage to origin"
           exit 1
         fi
         _ch_current_base="$_ch_next_stage"
@@ -3245,55 +3247,10 @@ except SynthMergeConflict as exc:
     echo ""
     remote_log "chain $_ch_id: all ${#_ch_waves[@]} wave(s) complete"
     echo "  All wave PRs are open. Final staging branch: $_ch_current_base"
-    echo "  Inspect: leerie --status $_ch_id  |  leerie --list --chains"
+    echo "  Inspect: leerie status $_ch_id  |  leerie list chains"
     exit 0
     ;;
-  --chain-status)
-    # Deprecated alias for `leerie --status <chain-id>`.
-    # Kept for backward compat with scripts that used the old verb.
-    shift
-    _chain_id="${1:-}"
-    if [ -z "$_chain_id" ]; then
-      remote_log "--chain-status: <chain-id> is required (use 'leerie --status <chain-id>' going forward)"
-      exit 1
-    fi
-    case "$_chain_id" in
-      --*) remote_log "--chain-status: expected <chain-id>, got flag '$_chain_id'"; exit 1 ;;
-    esac
-    exec "$0" --status "$_chain_id"
-    ;;
-  --list-chains)
-    # Deprecated alias for `leerie --list --chains`.
-    shift
-    exec "$0" --list --chains "$@"
-    ;;
-  --chain-kill)
-    # Deprecated alias for `leerie --kill <chain-id>`.
-    shift
-    _ck_chain_id="${1:-}"
-    if [ -z "$_ck_chain_id" ]; then
-      remote_log "--chain-kill: <chain-id> is required (use 'leerie --kill <chain-id>' going forward)"
-      exit 1
-    fi
-    case "$_ck_chain_id" in
-      --*) remote_log "--chain-kill: expected <chain-id>, got flag '$_ck_chain_id'"; exit 1 ;;
-    esac
-    exec "$0" --kill "$_ck_chain_id"
-    ;;
-  --chain-attach)
-    # Deprecated alias for `leerie --attach <chain-id>`.
-    shift
-    _ca_chain_id="${1:-}"
-    if [ -z "$_ca_chain_id" ]; then
-      remote_log "--chain-attach: <chain-id> is required (use 'leerie --attach <chain-id>' going forward)"
-      exit 1
-    fi
-    case "$_ca_chain_id" in
-      --*) remote_log "--chain-attach: expected <chain-id>, got flag '$_ca_chain_id'"; exit 1 ;;
-    esac
-    exec "$0" --attach "$_ca_chain_id"
-    ;;
-  --group)
+  group)
     # Laptop-side run-group fan-out. A group is N ordinary single-repo
     # leerie runs launched together with a shared group_id. Each member
     # runs in its own basename-keyed state directory, on its own run
@@ -3301,13 +3258,13 @@ except SynthMergeConflict as exc:
     # group_id and read-only cross-repo visibility via --inspect-dir.
     #
     # Usage:
-    #   leerie --group \
+    #   leerie group \
     #     --repo <path> "<prompt>" \
     #     --repo <path> "<prompt>" \
     #     [--brief <file>] \
     #     [<per-member-flags>]
     #
-    # Modeled on the --chain arm (leerie:2033) but cd's into each member
+    # Modeled on the chain arm (leerie:2033) but cd's into each member
     # repo so each resolves its own USER_REPO and basename-keyed state
     # directory independently. See DESIGN.md §20 and IMPLEMENTATION.md
     # "Run-group verbs".
@@ -3323,14 +3280,14 @@ except SynthMergeConflict as exc:
           _grp_repo="${2:-}"
           _grp_prompt="${3:-}"
           if [ -z "$_grp_repo" ] || [ -z "$_grp_prompt" ]; then
-            remote_log "--group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
+            remote_log "group: --repo requires two arguments: <path> \"<prompt>\""; exit 1
           fi
           _grp_repos+=("$_grp_repo")
           _grp_prompts+=("$_grp_prompt")
           shift 3
           ;;
         --repo=*)
-          remote_log "--group: --repo does not support = form; use: --repo <path> \"<prompt>\""; exit 1
+          remote_log "group: --repo does not support = form; use: --repo <path> \"<prompt>\""; exit 1
           ;;
         --brief) _grp_brief_file="${2:-}"; shift 2 ;;
         --brief=*) _grp_brief_file="${1#--brief=}"; shift ;;
@@ -3341,7 +3298,7 @@ except SynthMergeConflict as exc:
         # (single repo → shared dir is fine), a group needs each member
         # in its own basename-keyed state dir. Reject both forms.
         --state-dir|--state-dir=*)
-          remote_log "--group: --state-dir is not supported; each member uses its own \$HOME/.leerie/<basename> directory"
+          remote_log "group: --state-dir is not supported; each member uses its own \$HOME/.leerie/<basename> directory"
           echo "  Remove --state-dir or use per-member leerie invocations." >&2
           exit 1
           ;;
@@ -3354,40 +3311,40 @@ except SynthMergeConflict as exc:
             _grp_passthrough+=("$1"); shift
           fi
           ;;
-        *) remote_log "--group: unexpected argument: $1"; exit 1 ;;
+        *) remote_log "group: unexpected argument: $1"; exit 1 ;;
       esac
     done
 
     # State-dir guard: also reject LEERIE_STATE_DIR from the environment.
     if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-      remote_log "--group: LEERIE_STATE_DIR is set in the environment; this would pin all members to one state directory"
-      echo "  Unset LEERIE_STATE_DIR before running --group, or use per-member leerie invocations." >&2
+      remote_log "group: LEERIE_STATE_DIR is set in the environment; this would pin all members to one state directory"
+      echo "  Unset LEERIE_STATE_DIR before running group, or use per-member leerie invocations." >&2
       exit 1
     fi
 
     if [ "${#_grp_repos[@]}" -lt 2 ]; then
-      remote_log "--group: at least two --repo arguments are required"
-      echo "  Usage: leerie --group --repo <path> \"<prompt>\" --repo <path> \"<prompt>\" [--brief <file>]" >&2
+      remote_log "group: at least two --repo arguments are required"
+      echo "  Usage: leerie group --repo <path> \"<prompt>\" --repo <path> \"<prompt>\" [--brief <file>]" >&2
       exit 1
     fi
 
     # Validate each repo is a git repository before fan-out.
     for _gr in "${_grp_repos[@]}"; do
       if [ ! -d "$_gr" ]; then
-        remote_log "--group: repo path not found: $_gr"; exit 1
+        remote_log "group: repo path not found: $_gr"; exit 1
       fi
       if ! git -C "$_gr" rev-parse --git-dir >/dev/null 2>&1; then
-        remote_log "--group: not a git repository: $_gr"; exit 1
+        remote_log "group: not a git repository: $_gr"; exit 1
       fi
     done
 
     # Validate brief file if supplied.
     if [ -n "$_grp_brief_file" ]; then
       if [ ! -f "$_grp_brief_file" ]; then
-        remote_log "--group: brief file not found: $_grp_brief_file"; exit 1
+        remote_log "group: brief file not found: $_grp_brief_file"; exit 1
       fi
       if [ ! -s "$_grp_brief_file" ]; then
-        remote_log "--group: brief file is empty: $_grp_brief_file"; exit 1
+        remote_log "group: brief file is empty: $_grp_brief_file"; exit 1
       fi
       _grp_brief_content="$(cat "$_grp_brief_file")"
     else
@@ -3398,16 +3355,16 @@ except SynthMergeConflict as exc:
     if [ -n "$_grp_id_override" ]; then
       _grp_id_stripped="$(echo "$_grp_id_override" | tr -d '[:space:]')"
       if [ "$_grp_id_stripped" != "$_grp_id_override" ]; then
-        remote_log "--group: --group-id value had surrounding whitespace; stripped to '$_grp_id_stripped'"
+        remote_log "group: --group-id value had surrounding whitespace; stripped to '$_grp_id_stripped'"
         _grp_id_override="$_grp_id_stripped"
       fi
       unset _grp_id_stripped
       if ! echo "$_grp_id_override" | grep -qiE "$UUID_PATTERN"; then
-        remote_log "--group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
+        remote_log "group: --group-id value '$_grp_id_override' is not a valid UUID (expected 8-4-4-4-12 hex)"
         exit 1
       fi
       _grp_id="$(echo "$_grp_id_override" | tr '[:upper:]' '[:lower:]')"
-      remote_log "--group: reusing group_id $_grp_id"
+      remote_log "group: reusing group_id $_grp_id"
     else
       _grp_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
@@ -3457,8 +3414,8 @@ except SynthMergeConflict as exc:
     echo "  members:  ${#_grp_repos[@]}"
     echo ""
     echo "  Recovery (if a member pauses on failure):"
-    echo "    leerie --resume $_grp_id"
-    echo "    leerie --group --group-id $_grp_id --repo ..."
+    echo "    leerie resume $_grp_id"
+    echo "    leerie group --group-id $_grp_id --repo ..."
     echo ""
 
     # Fan-out: background one ./leerie per member.
@@ -3578,7 +3535,7 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
       if [ -n "$_grp_run_json" ] && [ -f "$_grp_run_json" ]; then
         update_run_json "$_grp_run_json" group_id "$_grp_id" || true
       else
-        remote_log "--group: could not locate run.json for member $_grp_member_repo (tag-back skipped)"
+        remote_log "group: could not locate run.json for member $_grp_member_repo (tag-back skipped)"
       fi
     done
 
@@ -3586,13 +3543,13 @@ for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
       remote_log "group $_grp_id: $_grp_failed/${_grp_n} member(s) failed"
       echo ""
       echo "Some group members paused on failure. To recover:"
-      echo "  leerie --resume $_grp_id"
+      echo "  leerie resume $_grp_id"
       exit 1
     fi
 
     echo ""
     remote_log "group $_grp_id: all ${_grp_n} member(s) complete"
-    echo "  Inspect: leerie --status $_grp_id  |  leerie --list --groups"
+    echo "  Inspect: leerie status $_grp_id  |  leerie list --groups"
     exit 0
     ;;
 esac
@@ -3715,7 +3672,7 @@ for arg in "$@"; do
   fi
 done
 
-# --- auto re-seed on --resume (Phase 4) --------------------------------
+# --- auto re-seed on resume (Phase 4) -----------------------------------
 # Default behaviour: when resuming a paused remote run, automatically
 # re-rsync the host's dirty set before re-exec'ing the orchestrator.
 # --no-re-seed opts out (rate-limit auto-resume case where nothing changed).
@@ -3730,12 +3687,12 @@ for arg in "$@"; do
   esac
 done
 
-# --- --resume smart-router sub-mode flags -------------------------------
+# --- resume smart-router sub-mode flags ----------------------------------
 # Launcher-only flags consumed by the rc=75 pivot (DESIGN §6 *Smart
 # resume in remote mode*). Both are stripped from REWRITTEN_ARGS below
 # so the orchestrator's argparse never sees them.
 #   --shell           drop into bash at /work instead of tailing the log
-#   --auto-finalize   exec `leerie --finalize` on clean orchestrator exit
+#   --auto-finalize   exec `leerie finalize` on clean orchestrator exit
 RESUME_SHELL=false
 RESUME_AUTO_FINALIZE=false
 for arg in "$@"; do
@@ -3754,19 +3711,25 @@ export RESUME_AUTO_FINALIZE
 # it's still forwarded via REWRITTEN_ARGS to the orchestrator's argparse.
 LEERIE_RUN_ID=""
 IS_RESUME=false
+# IS_RESUME keys off $1 being exactly the bare `resume` verb, not off
+# scanning every arg for the token — a later positional/flag value that
+# happens to equal "resume" (e.g. `leerie group --repo resume-service ...`)
+# must not false-positive.
+if [ "${1:-}" = "resume" ]; then
+  IS_RESUME=true
+  # Positional run-id: `resume <id>` (mirrors stop / kill convention).
+  # Only capture when the token doesn't start with `--` (not a flag).
+  if [ -n "${2:-}" ] && [ "${2#--}" = "$2" ]; then
+    LEERIE_RUN_ID="$2"
+  fi
+fi
 _prev=""
 for arg in "$@"; do
   if [ "$_prev" = "--run-id" ]; then
     LEERIE_RUN_ID="$arg"
   fi
-  # Positional run-id: `--resume <id>` (mirrors --stop / --kill convention).
-  # Only capture when the token doesn't start with `--` (not a flag).
-  if [ "$_prev" = "--resume" ] && [ -n "$arg" ] && [ "${arg#--}" = "$arg" ]; then
-    LEERIE_RUN_ID="$arg"
-  fi
   case "$arg" in
     --run-id=*) LEERIE_RUN_ID="${arg#--run-id=}" ;;
-    --resume)   IS_RESUME=true ;;
   esac
   _prev="$arg"
 done
@@ -3787,6 +3750,9 @@ export IS_RESUME
 # also take values; cover them with a prefix match.
 LEERIE_TASK_ARG=""
 _prev=""
+_argi=0
+_first_is_resume=false
+[ "${1:-}" = "resume" ] && _first_is_resume=true
 _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
 --worker-pids-max --source-of-truth --runtime --aws-region --aws-profile \
@@ -3796,6 +3762,7 @@ _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --heal-dir --phase --host-no-push --status --report --chain-id \
 --seed-depth --seed-shallow-threshold-mb --group-id "
 for arg in "$@"; do
+  _argi=$((_argi + 1))
   # Skip if this arg is the value of a previous value-taking flag.
   if [ -n "$_prev" ]; then
     case "$_value_flags" in
@@ -3805,8 +3772,11 @@ for arg in "$@"; do
       --model-*|--effort-*) _prev=""; continue ;;
     esac
   fi
-  # Skip positional run-id after --resume (not the task).
-  if [ "$_prev" = "--resume" ] && [ "${arg#--}" = "$arg" ]; then
+  # Skip the bare `resume` verb itself (index 1) and its positional
+  # run-id (index 2) — neither is the task. Index-based, not token-based
+  # (see the IS_RESUME block above for why: a value equal to the literal
+  # word "resume" elsewhere in argv must not be mistaken for the verb).
+  if [ "$_first_is_resume" = "true" ] && { [ "$_argi" -eq 1 ] || { [ "$_argi" -eq 2 ] && [ "${arg#--}" = "$arg" ]; }; }; then
     _prev=""; continue
   fi
   # Skip any --flag (with or without =value).
@@ -3822,7 +3792,7 @@ done
 export LEERIE_TASK_ARG
 
 # --- fail fast on missing task file ---------------------------------------
-# Matches the eager validation --chain already does for prompt files (l.1722).
+# Matches the eager validation chain already does for prompt files (l.1722).
 case "$LEERIE_TASK_ARG" in
   *.txt|*.md|*.TXT|*.MD)
     if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$LEERIE_TASK_ARG" ]; then
@@ -3896,8 +3866,8 @@ for arg in "$@"; do
   fi
 done
 
-# --- auto-detect runtime on --resume --------------------------------------
-# Uses the shared _auto_detect_run_runtime helper. The --resume path
+# --- auto-detect runtime on resume ----------------------------------------
+# Uses the shared _auto_detect_run_runtime helper. The resume path
 # differs from the fast-path verbs: it sets REWRITTEN_ARGS (forwarded to
 # the orchestrator) and uses _RUNTIME_EXPLICIT to distinguish default
 # from user-set. EC2 detection is surfaced here so a paused EC2 run gets
@@ -3911,11 +3881,11 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
    [ "$_RUNTIME_EXPLICIT" = "false" ]; then
   _resume_detected="$(_auto_detect_run_runtime "$LEERIE_RUN_ID" "")" || _resume_detected=""
   if [ "$_resume_detected" = "fly" ]; then
-    remote_log "--resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
+    remote_log "resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
     RUNTIME=fly
     REWRITTEN_ARGS+=("--runtime" "fly")
   elif [ "$_resume_detected" = "ec2" ]; then
-    remote_log "--resume: run $LEERIE_RUN_ID is an EC2 run (ec2-instance.json present); --resume does not support EC2 runs yet"
+    remote_log "resume: run $LEERIE_RUN_ID is an EC2 run (ec2-instance.json present); resume does not support EC2 runs yet"
     exit 1
   fi
 fi
@@ -3926,12 +3896,12 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
   _fly_sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
   if [ -f "$_fly_sidecar" ]; then
     remote_log "warning: resuming a Fly run with --runtime local — host-side state.json may be incomplete"
-    echo "  Consider: leerie --resume $LEERIE_RUN_ID --runtime fly" >&2
+    echo "  Consider: leerie resume $LEERIE_RUN_ID --runtime fly" >&2
   fi
 fi
 
 # Fix E: reap an orphaned still-Up container from a dead launcher before we
-# spawn a fresh one on the local resume path, so --resume self-heals the
+# spawn a fresh one on the local resume path, so resume self-heals the
 # OOM-orphan flock wedge instead of exiting EXIT_LOCKED=75. Runs only for
 # genuine local resumes (after Fly auto-detection above may have flipped
 # RUNTIME to fly).
@@ -4208,7 +4178,7 @@ case "$OS" in
         remote_log "Colima is not installed and we have no terminal to"
         echo "  prompt for sudo / brew install. Run leerie once from a" >&2
         echo "  terminal so the one-time install can complete:" >&2
-        echo "    leerie --version" >&2
+        echo "    leerie version" >&2
         echo "  Or install Colima manually:" >&2
         echo "    brew install colima" >&2
         exit 1
@@ -4284,7 +4254,7 @@ case "$OS" in
         remote_log "nerdctl is not installed and we have no terminal to"
         echo "  prompt for sudo. Run leerie once from a terminal so the" >&2
         echo "  one-time install can complete:" >&2
-        echo "    leerie --version" >&2
+        echo "    leerie version" >&2
         exit 1
       fi
     fi
@@ -5454,13 +5424,18 @@ fi
 # declares only --inspect-dir (no -i alias — see leerie.py:6079), so we
 # intercept exactly that one form and let everything else flow through.
 prev_was_inspect=false
-_prev_was_resume=false
 _prev_was_chain_id=false
 _prev_was_fly_app_rewrite=false
 _prev_was_state_dir_rewrite=false
 _prev_was_seed_knob=false
 _prev_was_ec2_knob=false
+_rw_argi=0
 for arg in "$@"; do
+  _rw_argi=$((_rw_argi + 1))
+  # `resume` and `list` (and any positional run-id after `resume`) flow
+  # through untouched — orchestrator/leerie.py's argparse understands
+  # the bare verb form natively, exactly like the launcher's own
+  # `case "${1:-}"` dispatch one level up. No rewrite needed.
   if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
     _prev_was_state_dir_rewrite=false
     continue
@@ -5493,14 +5468,6 @@ for arg in "$@"; do
     export LEERIE_CHAIN_ID="$arg"
     continue
   fi
-  # Consume positional run-id after --resume: rewrite to --run-id <val>
-  # so the orchestrator sees the canonical form (mirrors --stop/--kill).
-  if $_prev_was_resume && [ "${arg#--}" = "$arg" ]; then
-    _prev_was_resume=false
-    REWRITTEN_ARGS+=("--run-id" "$arg")
-    continue
-  fi
-  _prev_was_resume=false
   case "$arg" in
     --inspect-dir)
       prev_was_inspect=true
@@ -5571,31 +5538,40 @@ for arg in "$@"; do
       # Launcher-only flag (Phase 4); bypasses re_seed's safety check.
       ;;
     --shell)
-      # Launcher-only flag; opts into bash shell on the --resume rc=75 pivot
+      # Launcher-only flag; opts into bash shell on the resume rc=75 pivot
       # (DESIGN §6 *Smart resume in remote mode*). The orchestrator's
       # argparse doesn't know it.
       ;;
     --auto-finalize)
-      # Launcher-only flag; triggers `leerie --finalize` on clean exit via
+      # Launcher-only flag; triggers `leerie finalize` on clean exit via
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    --finalize|--stop|--kill|--re-seed|--accept-blocked|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|--group|config)
+    finalize|stop|kill|re-seed|accept-blocked|attach|chain|group|config|status|version)
       # Launcher-only verbs — normally dispatched at the top-level case
-      # (line ~553) when they appear as $1. If one appears here it was
-      # in a non-$1 position (e.g. `leerie <id> --finalize --runtime fly`
-      # instead of `leerie --finalize <id> --runtime fly`). Error instead
+      # (line ~945) when they appear as $1. If one appears here it was
+      # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
+      # instead of `leerie finalize <id> --runtime fly`). Error instead
       # of leaking to the orchestrator's argparse.
       remote_log "error: '$arg' is a verb and must be the first argument."
       remote_log "  Run: leerie $arg [args...]"
       exit 1
       ;;
-    --resume)
-      # Forward --resume to the orchestrator and mark that the next
-      # non-flag positional token is the run-id (not the task).
-      REWRITTEN_ARGS+=("$arg")
-      _prev_was_resume=true
-      continue
+    resume|list)
+      # Unlike the other launcher verbs above, `resume` and `list` can
+      # legitimately reach this loop AT position 1 (their case arms fall
+      # through instead of exiting — see `resume)`'s non-UUID fallthrough
+      # and `list)`'s plain/failed-flyctl fallthrough) and orchestrator/
+      # leerie.py now understands the bare verb natively, so position 1
+      # must flow through to the orchestrator rather than error. A
+      # non-$1 occurrence is still a user error.
+      if [ "$_rw_argi" -eq 1 ]; then
+        REWRITTEN_ARGS+=("$arg")
+      else
+        remote_log "error: '$arg' is a verb and must be the first argument."
+        remote_log "  Run: leerie $arg [args...]"
+        exit 1
+      fi
       ;;
     *)
       REWRITTEN_ARGS+=("$arg")
@@ -6396,7 +6372,7 @@ if [ "$RUNTIME" = "fly" ]; then
   fi
 
   # run_id = machine_id: set AFTER provision_machine succeeds (see below).
-  # For --resume, LEERIE_RUN_ID is already set from --run-id.
+  # For resume, LEERIE_RUN_ID is already set from --run-id.
 
   # Communicate the host's launch-time push intent to the in-Fly
   # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
@@ -6459,7 +6435,7 @@ if [ "$RUNTIME" = "fly" ]; then
     # shellcheck disable=SC1090
     . "$FETCH_SCRIPT"
 
-    # --resume auto-discovery (Phase 1). Runs only when --resume was
+    # resume auto-discovery (Phase 1). Runs only when resume was
     # passed and no explicit --run-id is set. Scans the per-launcher
     # records under $LEERIE_STATE_HOST_DIR/remote/*.json for entries
     # whose recorded launcher_pid is still alive (kill -0). Exactly
@@ -6495,11 +6471,11 @@ except Exception:
 ' "${_active_records[0]}" 2>/dev/null || true)"
           export LEERIE_RUN_ID
           if [ -n "$LEERIE_RUN_ID" ]; then
-            remote_log "--resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+            remote_log "resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
           fi
           ;;
         *)
-          remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
+          remote_log "resume: multiple active launches — pass the run-id to disambiguate:"
           for _f in "${_active_records[@]}"; do
             python3 -c "
 import json, sys
@@ -6519,7 +6495,7 @@ except Exception:
     # the existing Fly Machine instead of provisioning a new one.
     # (DESIGN §6 Remote pause-on-failure.) Uses the dual-file resolver
     # at leerie:76 — fly-machine.json first, then run.json — to mirror
-    # the existing --stop/--kill/--finalize/--resume behavior. For
+    # the existing stop/kill/finalize/resume behavior. For
     # run_id IS the machine ID (DESIGN §6).
     _paused_mid=""
     if [ -n "$LEERIE_RUN_ID" ] && [ "$container_rc" -eq 0 ]; then
@@ -6544,21 +6520,21 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      # --resume against a run-id whose machine is not found. The
+      # resume against a run-id whose machine is not found. The
       # run_id IS the machine ID, so resume_machine would have found it
       # if it existed. Fail loudly.
-      remote_log "--resume: machine $LEERIE_RUN_ID not found or not resumable"
-      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      remote_log "resume: machine $LEERIE_RUN_ID not found or not resumable"
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif [ "$IS_RESUME" = "true" ]; then
-      # --resume with no --run-id AND auto-discovery found zero active
+      # resume with no --run-id AND auto-discovery found zero active
       # records. Distinct from the per-id error above — no run to point
       # at, so list-style guidance is the right next step.
-      remote_log "--resume: no active remote launchers found"
+      remote_log "resume: no active remote launchers found"
       echo "  No records under $LEERIE_STATE_HOST_DIR/remote/ and" >&2
       echo "  no --run-id was given." >&2
-      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif provision_machine; then
@@ -6575,7 +6551,7 @@ except Exception:
     # the machine is up, BEFORE seed_auth/seed_repo can fail. If anything
     # between here and the orchestrator-detach below errors out,
     # decide_teardown pauses the machine and the user's resume command
-    # (`leerie --resume <run-id> --runtime fly`) needs this file to resolve
+    # (`leerie resume <run-id> --runtime fly`) needs this file to resolve
     # fly_machine_id. provision_machine now writes fly-machine.json directly
     # (provision.sh) so this copy is typically a no-op (guarded by
     # `[ ! -f "$_run_record" ]`). Kept as a fallback for images predating
@@ -6654,7 +6630,7 @@ EARLY_PROBE_PY
         rm -f "$_early_probe_stderr"
 
         if [ "$_early_probe_rc" = "75" ]; then
-          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          remote_log "resume: early probe detected live orchestrator — skipping seed"
           _attach_to_live_orchestrator
           _skip_seed_launch=true
         fi
@@ -6706,7 +6682,7 @@ EARLY_PROBE_PY
         _work_probe="$(printf '%s' "$_work_probe" | tr -d '[:space:]')"
         if [ "$_work_probe_rc" -eq 0 ] && [ "$_work_probe" = "INVALID" ]; then
           # Confirmed round-trip + genuinely unseeded /work → self-heal.
-          remote_log "--resume: /work is not a valid seeded repo (initial seed never completed) — running full seed_repo to self-heal"
+          remote_log "resume: /work is not a valid seeded repo (initial seed never completed) — running full seed_repo to self-heal"
           if ! seed_repo; then
             remote_log "error: self-heal seed_repo failed — aborting remote run"
             container_rc=1
@@ -6718,7 +6694,7 @@ EARLY_PROBE_PY
           # that would obliterate the run branch + per-subtask branches).
           # Skipped when --no-re-seed was passed.
           if [ "$_work_probe_rc" -ne 0 ] || [ "$_work_probe" != "VALID" ]; then
-            remote_log "--resume: /work validity probe was inconclusive (rc=$_work_probe_rc); proceeding with dirty re_seed (not wiping)"
+            remote_log "resume: /work validity probe was inconclusive (rc=$_work_probe_rc); proceeding with dirty re_seed (not wiping)"
           fi
           # shellcheck disable=SC1091
           . "$LEERIE_REPO/scripts/remote/re-seed.sh"
@@ -6737,7 +6713,7 @@ EARLY_PROBE_PY
       # Inspect dirs: rsync each --inspect-dir host path to
       # /inspect/<basename> on the machine. Re-resolved on every run
       # (including resume) so the user can add an inspect dir at
-      # --resume time and expect it to land. The orchestrator already
+      # resume time and expect it to land. The orchestrator already
       # has the rewritten --inspect-dir /inspect/<basename> flags in
       # REWRITTEN_ARGS; this just makes the in-machine paths exist.
       # See docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io)
@@ -6823,7 +6799,7 @@ try:
     except BlockingIOError:
         sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
         sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie --resume " + run_id + " --runtime fly\\n")
+        sys.stderr.write("  leerie resume " + run_id + " --runtime fly\\n")
         sys.exit(75)
 finally:
     os.close(_probe_fd)
@@ -6923,8 +6899,8 @@ with open(log_path, "ab") as log_f:
 # *Single owner per run dir*), the child exits 75 within
 # milliseconds. Writing its pid to orchestrator.pid before the race
 # resolves would overwrite the winning orchestrator's pid with a
-# dead one — the stale-pid contagion that breaks --resume's tail
-# liveness check and --finalize --force's safety belt.
+# dead one — the stale-pid contagion that breaks resume's tail
+# liveness check and finalize --force's safety belt.
 #
 # Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
 # child's State.__init__ flock attempt is ~300-500 ms (Python
@@ -6948,7 +6924,7 @@ for _ in range(10):
 if p.poll() == 75:
     # Stillborn flock-loser — the winner still owns the run. Do not
     # touch the pid file. The launcher's existing rc=75 short-circuit
-    # (~30 lines below in the bash dispatcher) pivots the user's --resume
+    # (~30 lines below in the bash dispatcher) pivots the user's resume
     # to the live-orchestrator attach path via container_rc=130.
     sys.exit(75)
 with open(pid_path, "w") as pid_f:
@@ -7029,7 +7005,7 @@ $_tail_script"
           # which here reflects the TAIL's exit, not the orchestrator's.
           # Per the reclassified table (DESIGN §6), tail-exit cleanly
           # (rc=0 from the wrapper) is treated as "user can finalize"; the
-          # launcher does NOT call fetch_branch from here — `leerie --finalize`
+          # launcher does NOT call fetch_branch from here — `leerie finalize`
           # does that. See *Detached run finalization* in IMPLEMENTATION.md.
           container_rc=$orch_rc
         fi
@@ -7037,7 +7013,7 @@ $_tail_script"
       fi  # _skip_seed_launch
     else
       # Reached when neither resume_machine nor provision_machine
-      # produced a running machine (or --resume strict-fail set
+      # produced a running machine (or resume strict-fail set
       # container_rc=1 above). Surface a hint so the prior log lines
       # aren't the only signal — without this, a user reading the
       # tail sees `creating machine ...` followed by silence.
@@ -7145,9 +7121,9 @@ elif [ "$RUNTIME" = "ec2" ]; then
     # Resume path: if a run-id was given AND its sidecar names an
     # instance, resume that instance instead of provisioning a new one.
     # (DESIGN §6 EC2 runtime lifecycle, "Pause/resume semantics".) Unlike
-    # the Fly branch's PID-record auto-discovery, bare `--resume` with no
+    # the Fly branch's PID-record auto-discovery, bare `resume` with no
     # `--run-id` is not yet supported for EC2 — the operator passes
-    # `--run-id` explicitly, matching how `--resume <run-id> --runtime
+    # `--run-id` explicitly, matching how `resume <run-id> --runtime
     # ec2` is documented. `run_id` IS the instance id conceptually (DESIGN
     # §6 "Run identifier"), but unlike Fly the instance id is not known
     # until create time on a fresh launch, so the sidecar lookup (not the
@@ -7183,8 +7159,8 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      remote_log "--resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
-      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      remote_log "resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
+      echo "  Run 'leerie list' to see known runs, or omit resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
     elif provision_instance; then
@@ -7261,7 +7237,7 @@ EARLY_PROBE_PY
               >/dev/null \
           || _ec2_early_probe_rc=$?
         if [ "$_ec2_early_probe_rc" = "75" ]; then
-          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          remote_log "resume: early probe detected live orchestrator — skipping seed"
           _attach_to_live_orchestrator_ec2
           _ec2_skip_seed_launch=true
         fi
@@ -7318,7 +7294,7 @@ try:
     except BlockingIOError:
         sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
         sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie --resume " + run_id + " --runtime ec2\\n")
+        sys.stderr.write("  leerie resume " + run_id + " --runtime ec2\\n")
         sys.exit(75)
 finally:
     os.close(_probe_fd)
@@ -7385,7 +7361,7 @@ $_ec2_tail_script"
             _ec2_orch_rc=0
             printf '%s' "$_ec2_tail_invocation" | ec2_attach || _ec2_orch_rc=$?
             # On a clean tail exit we cannot read the orchestrator's true
-            # exit code — it ran detached. `leerie --finalize` (not this
+            # exit code — it ran detached. `leerie finalize` (not this
             # launcher) does the fetch, same as the Fly branch.
             container_rc=$_ec2_orch_rc
           fi
@@ -7408,7 +7384,7 @@ else
   # --- local container execution path ----------------------------------
   # --rm: container is removed on exit. Worktrees persist on the host via
   #       the /work bind mount; run state persists via the /leerie-state
-  #       bind mount (LEERIE_STATE_HOST_DIR), so --resume still works.
+  #       bind mount (LEERIE_STATE_HOST_DIR), so `resume` still works.
   # Mount-table rationale lives in docs/IMPLEMENTATION.md §0.5.
   #
   # TTY flags adapt to whether the launcher itself has a controlling terminal:
@@ -7516,13 +7492,13 @@ else
   # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
   # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
   # process tears the container down instead of orphaning it (an orphaned,
-  # still-Up container keeps holding the run-dir flock and wedges --resume).
+  # still-Up container keeps holding the run-dir flock and wedges `resume`).
   # nerdctl run -i normally forwards the signal to PID 1, but this is the
   # backstop for signals that don't get forwarded across the Colima VM
   # boundary or that arrive before/after nerdctl owns the tty.
   #   Limitation, by design: SIGKILL (signal 9, what OOM delivers) is
   #   uncatchable — this trap never runs in the OOM case. The stale-container
-  #   reaper on the next --resume (Fix E) is the backstop for that.
+  #   reaper on the next `resume` (Fix E) is the backstop for that.
   # The EXIT arm reorders vs the outer host-scratch trap (set earlier) so the
   # kill happens BEFORE the cidfile is removed; it then chains the original
   # cleanup so $STAGE and the cidfile are still removed.
@@ -7740,7 +7716,7 @@ if [ "$RUNTIME" != "fly" ]; then
   # exit auto-finalize sees it. It's still in scope here for the local-
   # runtime path.
 
-  # Push + PR creation are shared with the `leerie --finalize <run-id>`
+  # Push + PR creation are shared with the `leerie finalize <run-id>`
   # fast-path; both source scripts/host-finalize.sh and call host_finalize.
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/host-finalize.sh"

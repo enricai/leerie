@@ -16,7 +16,7 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 - **Confidence is the only hard gate.** The implementer self-gates on evidence-anchored confidence in `root_cause` and `solution` (≥9 on both, see DESIGN.md §8) — falsifiers tested, contradictions reconciled, gaps named with concrete artifacts. A worker that cannot justify the score exits `blocked` with the gap analysis. Everything else — tests passing, lint clean, build green, per-criterion satisfaction — is best-effort: surfaced as advisory warnings on the subtask result, never escalated to `failed` or `blocked` by the orchestrator. The criteria file is the implementer's working note, not a gate.
 - **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar.
 - **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
-- **Resumable by design.** A reboot, network blip, budget cap, the Claude Code subscription rate-limit, Ctrl-C, or an external kill (SIGTERM from CI / systemd / a closed terminal) all lose nothing — the run branch is the durable record, worktrees are torn down, and `--resume` picks up from the last completed wave. When the subscription rate-limit hits and the reset time is unambiguously parseable, leerie even auto-resumes after the reset window without manual intervention. The explicit "throw this away" gesture is `scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
+- **Resumable by design.** A reboot, network blip, budget cap, the Claude Code subscription rate-limit, Ctrl-C, or an external kill (SIGTERM from CI / systemd / a closed terminal) all lose nothing — the run branch is the durable record, worktrees are torn down, and `resume` picks up from the last completed wave. When the subscription rate-limit hits and the reset time is unambiguously parseable, leerie even auto-resumes after the reset window without manual intervention. The explicit "throw this away" gesture is `scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
 - **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and per-run state directories never collide. Launch a fix and a feature in parallel without coordination.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -186,12 +186,12 @@ leerie "Fix the login timeout bug and add a regression test"
 leerie path/to/task.md
 
 # Resume an interrupted or budget-capped run. Auto-picks if exactly one
-# in-flight run exists; otherwise pass the run-id (see `--list`).
-leerie --resume
-leerie --resume fix-login-timeout-bug-b81e90
+# in-flight run exists; otherwise pass the run-id (see `list`).
+leerie resume
+leerie resume fix-login-timeout-bug-b81e90
 
 # List in-flight and completed runs in this repository:
-leerie --list
+leerie list
 
 # Skip the default push + PR at finalize (run completes with the run
 # branch local-only; your working branch is unchanged):
@@ -255,46 +255,43 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 # prompt files). Waves execute in order; runs within a wave execute
 # in parallel as separate Fly machines. N waves supported. The chain
 # operates against $USER_REPO directly.
-leerie --chain \
+leerie chain \
   --wave prompts/fetch.md,prompts/lint.md \
   --wave prompts/publish.md
 
 # ID-dispatched verbs: UUID positional → chain scope (iterates
 # run.json filtered by chain_id); Fly machine id → existing
 # single-run scope.
-leerie --status   <chain-id>   # render per-run states from run.json
-leerie --attach   <chain-id>   # poll run.json files every 5s
-leerie --stop     <chain-id>   # pause every running chain run
-leerie --kill     <chain-id>   # destroy every chain run's machine
-leerie --resume   <chain-id>   # resume every paused chain run
-leerie --finalize <chain-id>   # push + open PR for every unpushed run
-leerie --list --chains         # group runs by chain_id
-
-# Deprecated --chain-* aliases (kept for backwards compat) shim to
-# the new verbs above.
+leerie status   <chain-id>   # render per-run states from run.json
+leerie attach   <chain-id>   # poll run.json files every 5s
+leerie stop     <chain-id>   # pause every running chain run
+leerie kill     <chain-id>   # destroy every chain run's machine
+leerie resume   <chain-id>   # resume every paused chain run
+leerie finalize <chain-id>   # push + open PR for every unpushed run
+leerie list chains         # group runs by chain_id
 
 # Run-groups: launch N single-repo leerie runs together as a coordinated
 # unit. Each member runs in its own state dir (basename-keyed), its own
 # branch, and opens its own PR. Members share a group_id and read-only
 # cross-repo visibility via --inspect-dir; the optional --brief file is
 # prepended to every member's prompt.
-leerie --group \
+leerie group \
   --repo ../api     "add /volumes endpoint" \
   --repo ../frontend "add-disk dialog" \
   --brief group-brief.md          # optional shared brief
 
 # Resubmit with an existing group_id (keeps the same group):
-leerie --group --group-id <prior-group-id> \
+leerie group --group-id <prior-group-id> \
   --repo ../api     "add /volumes endpoint" \
   --repo ../frontend "add-disk dialog"
 
 # Group-scoped verbs (UUID → group scope across member state dirs):
-leerie --status   <group-id>   # render per-member run states
-leerie --stop     <group-id>   # pause every running member (Fly runtime only)
-leerie --resume   <group-id>   # resume every paused member run
-leerie --kill     <group-id>   # destroy every member run
-leerie --finalize <group-id>   # push + open PR for every unpushed member
-leerie --list --groups         # list all groups across state dirs
+leerie status   <group-id>   # render per-member run states
+leerie stop     <group-id>   # pause every running member (Fly runtime only)
+leerie resume   <group-id>   # resume every paused member run
+leerie kill     <group-id>   # destroy every member run
+leerie finalize <group-id>   # push + open PR for every unpushed member
+leerie list --groups         # list all groups across state dirs
 ```
 
 Inside Claude Code (after `/plugin install leerie@enricai-leerie`):
@@ -312,10 +309,10 @@ Complete reference for every CLI flag, environment variable, and
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless `--resume`, `--list`, or `--phase` is given. |
-| `--resume` | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
-| `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
-| `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, cost, branch). |
+| `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless the `resume` / `list` verbs or `--phase` is given. |
+| `resume` (verb) | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
+| `--run-id ID` | — | Select a specific run by id (e.g., for `resume` or `--phase` when multiple runs are in flight). |
+| `list` (verb) | off | Enumerate in-flight and completed runs in this repository (run id, started, status, cost, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
@@ -350,8 +347,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
-| `--version` | — | Print `leerie <version>` and exit. |
-| `--status STATE` | — | With `--list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
+| `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
 | `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
 | `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `_build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
@@ -363,9 +359,9 @@ Complete reference for every CLI flag, environment variable, and
 
 ### Launcher verbs
 
-These flags are handled by the bash launcher before the container starts.
-A summary appears in the `leerie --help` epilog; see below for full
-details and sub-flags.
+These bare subcommands are handled by the bash launcher before the
+container starts. A summary appears in the `leerie --help` epilog; see
+below for full details and modifier flags.
 
 **Per-repo configuration (no container required):**
 
@@ -381,19 +377,27 @@ details and sub-flags.
 
 **Lifecycle (remote mode):**
 
-| Flag | Description |
+| Verb | Description |
 |------|-------------|
-| `--stop <run-id> [--runtime local\|fly\|ec2]` | Pause a run — a remote Fly machine, an EC2 instance (`stop-instances`, preserving the root EBS volume), or a local container. Resumable via `--resume` (EC2 `--resume` calls `resume_instance()` and re-resolves the reassigned public IP). |
-| `--kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
-| `--finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
-| `--re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
+| `stop <run-id> [--runtime local\|fly\|ec2]` | Pause a run — a remote Fly machine, an EC2 instance (`stop-instances`, preserving the root EBS volume), or a local container. Resumable via `resume` (EC2 `resume` calls `resume_instance()` and re-resolves the reassigned public IP). |
+| `kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
+| `finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
+| `re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
+| `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
+| `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
+| `accept-blocked <run-id> <subtask-id>` | Accept a blocked subtask so `resume` skips it. |
+| `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see `docs/IMPLEMENTATION.md` "Chain verbs"). |
+| `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see `docs/IMPLEMENTATION.md` "Run-group verbs"). |
+| `version` | Print `leerie <version>` and exit. |
 
-**Resume modifiers (used with `--resume`):**
+`resume` and `list` are documented in the "CLI flags" table above (they interact with the `task` positional and `--run-id`/`--phase`); the rest of the bare verbs are listed here.
+
+**Resume modifiers (used with `resume`):**
 
 | Flag | Description |
 |------|-------------|
 | `--shell` | Drop into a bash shell at `/work` on the machine instead of tailing the orchestrator log. |
-| `--auto-finalize` | On clean orchestrator exit, automatically run `leerie --finalize`. |
+| `--auto-finalize` | On clean orchestrator exit, automatically run `leerie finalize`. |
 | `--no-re-seed` | Skip the automatic re-seed of dirty delta on resume. |
 
 **Build and runtime:**
@@ -445,7 +449,7 @@ details and sub-flags.
 | `LEERIE_BAKE_LANGUAGE_DEPS` | `bake_language_deps` | Include a language-dep `COPY`+`RUN` layer in the auto-generated `.leerie/Dockerfile` (truthy → on). Precedence: `LEERIE_BAKE_LANGUAGE_DEPS` > `leerie.toml` > `.leerie/config.toml` > default `true`. Set to `false` for an apt-only bake. |
 | `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
 | `LEERIE_FLY_APP` | — | Fly.io app name (globally unique). Required when `--runtime fly`. Set via env or `--fly-app`. Launcher-only. |
-| `LEERIE_REGION` | — | Fly region used by per-job `--runtime fly` machines (including those spawned by `leerie --chain`). Unset → default `iad`. Launcher-only. |
+| `LEERIE_REGION` | — | Fly region used by per-job `--runtime fly` machines (including those spawned by `leerie chain`). Unset → default `iad`. Launcher-only. |
 | `LEERIE_AWS_REGION` | `aws_region` | AWS region leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_REGION` credential-chain env var. Overridden by `--aws-region`. Unset → default `None` (region selection left to the AWS credential chain). |
 | `LEERIE_AWS_PROFILE` | `aws_profile` | AWS profile leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_PROFILE` credential-chain env var. Overridden by `--aws-profile`. Unset → default `None`. |
 | `LEERIE_EC2_AMI` | `ec2_ami` | AMI id for the `--runtime ec2` `RunInstances` call. Overridden by `--ec2-ami`. Required for `--runtime ec2`, no default. Launcher-only. |
@@ -620,7 +624,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
 | `scripts/integrate.sh` | Merge a subtask branch into the run branch |
 | `scripts/finalize.sh` | Verify the run branch is non-empty and ready to push. The working branch is never modified locally. The push + `gh pr create` step lives in the **host launcher** (bash + `jq`) and runs after `nerdctl run` exits cleanly, using the host's own auth state — see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Host-side finalize*. Skipped when `--no-push` is set. |
-| `scripts/host-finalize.sh` | Host-side push + PR creation block. Sourced by three call sites: the local-runtime post-run code path in the launcher, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and `leerie --finalize <run-id>` (recovery fast-path). Provides `host_finalize <run-dir>`; uses `pr_title` / `pr_body` from `run.json` when the `pr_writer` worker populated them, otherwise falls back to a deterministic body. |
+| `scripts/host-finalize.sh` | Host-side push + PR creation block. Sourced by three call sites: the local-runtime post-run code path in the launcher, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and `leerie finalize <run-id>` (recovery fast-path). Provides `host_finalize <run-dir>`; uses `pr_title` / `pr_body` from `run.json` when the `pr_writer` worker populated them, otherwise falls back to a deterministic body. |
 | `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `leerie/runs/<id>` run branch *and* `leerie/subtasks/<id>/*` subtask branches. `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head). |
 | `scripts/remote/_log.sh` | Shared `remote_log()` helper — timestamped, repo-tagged stderr lines. Sourced by every other `scripts/remote/*.sh` file so all Fly-mode output is uniformly labeled. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry (source baked in at `/opt/leerie-image/`). Default mode is Fly's remote builder (no host Docker daemon required); `--local-build` / `LEERIE_LOCAL_BUILD=1` opts into the legacy nerdctl/docker path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §0.5 *Registry publish path*. |
@@ -629,21 +633,21 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs. Reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7. |
 | `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which tar-pipes `~/.claude.json` + `~/.claude/` (with `.claude/local` excluded — duplicates the Dockerfile-installed claude CLI) to `/home/leerie/` via `flyctl ssh console -C "tar -xC ..."`, writes git identity to `/home/leerie/.gitconfig`, and pre-warms `claude --version` once so the orchestrator's preflight call hits warm caches. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Worker auth + config seeding*. |
 | `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` (defensively excluded; run state lives outside the repo at `$LEERIE_STATE_HOST_DIR`, not in-repo) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
-| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie --re-seed <run-id>` and the auto-re-seed step on `--resume --runtime fly`. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
-| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. Sourced by the launcher's `RUNTIME=ec2` branch and by `leerie --stop --runtime ec2`, both of which call `resolve_aws_credentials` and export its resolved credentials/region before `ec2-lib.sh`'s `require_aws()` preflight runs. |
-| `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Provides `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning (also called by `leerie --stop --runtime ec2` before pausing), modeled on `require_flyctl()`'s two-stage shape (binary present? → authenticated?) — checks `command -v aws` (actionable install hint if missing, no auto-install) and probes `aws sts get-caller-identity` (with a resolved `--profile`), reusing `bedrock_preflight()`'s exact `aws sso login --profile <profile>` recovery-hint vocabulary on failure. Also provides `resolve_ami()`/`resolve_instance_type()`/`resolve_key_name()`/`resolve_security_group()`/`resolve_subnet_id()`, one required-var read per `LEERIE_EC2_*` var. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
+| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie re-seed <run-id>` and the auto-re-seed step on `resume --runtime fly`. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
+| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. Sourced by the launcher's `RUNTIME=ec2` branch and by `leerie stop --runtime ec2`, both of which call `resolve_aws_credentials` and export its resolved credentials/region before `ec2-lib.sh`'s `require_aws()` preflight runs. |
+| `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Provides `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning (also called by `leerie stop --runtime ec2` before pausing), modeled on `require_flyctl()`'s two-stage shape (binary present? → authenticated?) — checks `command -v aws` (actionable install hint if missing, no auto-install) and probes `aws sts get-caller-identity` (with a resolved `--profile`), reusing `bedrock_preflight()`'s exact `aws sso login --profile <profile>` recovery-hint vocabulary on failure. Also provides `resolve_ami()`/`resolve_instance_type()`/`resolve_key_name()`/`resolve_security_group()`/`resolve_subnet_id()`, one required-var read per `LEERIE_EC2_*` var. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-seed-repo.sh` | EC2 counterpart to `scripts/remote/seed-repo.sh` (DESIGN.md §6 *EC2 runtime lifecycle*, "Seed" row). Same `.gitignore`-aware payload logic (bundle for committed state + porcelain-filtered dirty-delta rsync, `.leerie/` excluded except the three whitelisted config files, shallow-vs-full-bundle threshold) as the Fly path — only the transport differs: `ec2_tar_pipe` (plain `ssh`) for bulk bundle/tar data, `ec2_remote_exec` (SSM Session Manager) for small instance-side commands. Provides `ec2_seed_repo_clone()`, `ec2_seed_repo_dirty()`, and the wrapper `ec2_seed_repo()`. Consumes a new `LEERIE_EC2_SSH_TARGET` env var (the resolved `ssh`-destination for the instance, populated by `ec2-provision.sh`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN.md §6 *EC2 runtime lifecycle*). Exports `provision_instance()`, `wait_for_instance_ready()`, `stop_instance()`, `terminate_instance()`, `decide_ec2_teardown()`. Sourced by the launcher's `RUNTIME=ec2` run-launch dispatch and by the `leerie --stop --runtime ec2` (`stop_instance()`) and `leerie --kill --runtime ec2` (`terminate_instance()`, with fetch-before-terminate ordering) paths. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
+| `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN.md §6 *EC2 runtime lifecycle*). Exports `provision_instance()`, `wait_for_instance_ready()`, `stop_instance()`, `terminate_instance()`, `decide_ec2_teardown()`. Sourced by the launcher's `RUNTIME=ec2` run-launch dispatch and by the `leerie stop --runtime ec2` (`stop_instance()`) and `leerie kill --runtime ec2` (`terminate_instance()`, with fetch-before-terminate ordering) paths. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-resume-instance.sh` | Resume helper for paused EC2 runs — the EC2 counterpart to `scripts/remote/resume-machine.sh`. Exports `resume_instance()`: starts a `stopped` instance (idempotent no-op if already `running`), waits on `wait_for_instance_ready()`, re-resolves `LEERIE_EC2_SSH_TARGET` from the instance's current public IP (EC2 assigns a new one on every stop/start cycle), re-arms the `decide_ec2_teardown` trap, and clears `paused_at`/`pause_reason` on the run sidecar. Never terminates the instance or deletes its volume on any path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-fetch-branch.sh` | EC2 counterpart to `scripts/remote/fetch-branch.sh`, sourced by `ec2-provision.sh`'s `_try_fetch_state_for_ec2_teardown()` hook before `terminate_instance()`. Exports `fetch_state_ec2()`: same four steps as `fetch_branch()` (run discovery, git-bundle stream-back, run-state tar stream-back, best-effort never-clobbering `.leerie/config.toml`/`Dockerfile` stream-back) — transport substituted to `ec2_remote_exec` (SSM, small commands) plus a private binary-safe `ssh` download helper (`_ec2_fetch_ssh`) for bulk data, since `ec2_tar_pipe` is upload-only. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-ssm.sh` | SSM Session Manager transport substitution for `flyctl ssh console`'s launch/attach roles (DESIGN.md §6 *EC2 runtime lifecycle*; the stream-back role is `ec2-fetch-branch.sh`, already shipped). Wired into the launcher's `RUNTIME=ec2` dispatch. Exports `ec2_launch_detached()` / `ec2_attach()`: both bootstrap a short `python3 -`/`sh -s` invocation via `AWS-StartInteractiveCommand` and pipe the real (potentially multi-KB) payload through the session's stdin, since SSM's `--parameters` document parameter is capped at ~4 KB. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
-| `commands/chain.md` | Thin plugin skill — reachable as `/chain` from Claude Code; relays the multi-run chain verbs (submit/status/list/kill/stop/resume/finalize/attach) to `leerie --chain` and the ID-dispatched verbs (DESIGN §19) |
+| `commands/chain.md` | Thin plugin skill — reachable as `/chain` from Claude Code; relays the multi-run chain verbs (submit/status/list/kill/stop/resume/finalize/attach) to `leerie chain` and the ID-dispatched verbs (DESIGN §19) |
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
 | `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
 | `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |
-| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch --config chain/fly.toml`. |
+| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch config chain/fly.toml`. |
 | `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
@@ -692,15 +696,15 @@ for an audit cleanup across every past run).
 - **Exits with code 10** — not an error. Leerie needs clarification
   answers and you are running non-interactively. Read
   `<state-root>/pending-questions.json`, write the answers to
-  `<state-root>/answers.json`, then `./leerie --resume --answers <state-root>/answers.json`
+  `<state-root>/answers.json`, then `./leerie resume --answers <state-root>/answers.json`
   (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`).
   The plugin skill at `commands/leerie.md` handles this relay
   automatically when invoked as `/leerie`.
 
 - **Run interrupted (Ctrl-C, SIGTERM, SIGHUP, CI cancel, terminal close, reboot)** —
   worktrees are torn down but state.json + branches are preserved.
-  Resume with `./leerie --resume` (auto-picks the most recent resumable
-  run) or `./leerie --resume <id>`. Run `leerie --list` to see
+  Resume with `./leerie resume` (auto-picks the most recent resumable
+  run) or `./leerie resume <id>`. Run `leerie list` to see
   what's in flight. The explicit "throw this away" command is
   `scripts/cleanup.sh --run-id <id> --branches` — Ctrl-C alone is
   always safely resumable.
@@ -713,11 +717,11 @@ for an audit cleanup across every past run).
   when it cannot (malformed time, unfamiliar timezone, or a future
   format change) it sleeps a fixed backoff (5 min) and re-resumes,
   polling until the limit clears. Ctrl-C during the wait drops to a
-  manual `--resume`. Auto-resume passes only `--resume <id>`; CLI-only
+  manual `resume`. Auto-resume passes only `resume <id>`; CLI-only
   overrides (`--model`, `--max-workers`, etc.) on the original launch
   are *not* preserved across an auto-resume. Set those via env
   (`LEERIE_*`) or `leerie.toml` if you want them to survive — both
-  channels are re-resolved on every `--resume`.
+  channels are re-resolved on every `resume`.
 
 - **Run hit an expired OAuth session ("OAuth session expired")** — the
   host's interactive login token expired mid-run and a container can't
@@ -725,7 +729,7 @@ for an audit cleanup across every past run).
   the rolling rate-limit above) and pauses resumably at exit code 75
   rather than dying: worktrees are torn down, state and branches are
   preserved. Fix it immediately with `claude /login`, then
-  `./leerie --resume <id>`. To avoid this class of failure entirely on
+  `./leerie resume <id>`. To avoid this class of failure entirely on
   long or unattended runs, mint a durable token with
   `claude setup-token` and export it as `CLAUDE_CODE_OAUTH_TOKEN` before
   launching — see *Requirements* above.
@@ -733,8 +737,8 @@ for an audit cleanup across every past run).
 - **Run ran out of credits** — distinct from a rate-limit: credits
   don't reset on a clock (they return on a top-up or billing cycle), so
   leerie does *not* auto-resume. It tears down worktrees, preserves
-  state and branches, prints an `out of credits — leerie --resume <id>`
-  hint, and exits with code 75. Add credits, then re-run that `--resume`
+  state and branches, prints an `out of credits — leerie resume <id>`
+  hint, and exits with code 75. Add credits, then re-run that `resume`
   command. (An org with "extra usage" disabled at the org level is *not*
   out of credits — that's a benign standing state and never triggers
   this pause.)
@@ -751,7 +755,7 @@ for an audit cleanup across every past run).
   run, use `--all-runs --branches`. Then re-invoke as normal.
 
 - **Push or PR failed at finalize** — the run completed locally. Check
-  `leerie --list` for the run's status (`push-failed` / `pr-failed`)
+  `leerie list` for the run's status (`push-failed` / `pr-failed`)
   and read `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` for the captured stderr.
   The error message at finalize names the exact retry command. Local
   commits are intact on the run branch.
@@ -768,7 +772,7 @@ Yes. Each invocation derives a unique `run_id` and namespaces all of its
 state under `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` and its branches under
 `leerie/runs/<run-id>` (run branch) and `leerie/subtasks/<run-id>/<sid>`
 (subtask branches) — so parallel runs in the same clone never collide.
-Use `--list` to see what's in flight and `--resume <id>` to
+Use `list` to see what's in flight and `resume <id>` to
 resume a specific one.
 
 **Does Leerie work outside a git repository?**
