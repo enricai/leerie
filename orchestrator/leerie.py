@@ -20080,11 +20080,15 @@ def _expand_multi_value_wiring_defects(
     out: list[dict] = []
     for d in defects:
         raw = (d.get("tag_or_dep") or "").strip()
-        if (d.get("kind") != "missing_requires" or "," not in raw
+        # Both separators are measured in the corpus (1 comma-joined and 1
+        # slash-joined across 82 defects). " / " is checked with spaces so a
+        # path-shaped tag (`src/lib/x`) is never split.
+        sep = "," if "," in raw else (" / " if " / " in raw else None)
+        if (d.get("kind") != "missing_requires" or sep is None
                 or raw in by_id or raw in providers):
             out.append(d)
             continue
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        parts = [p.strip() for p in raw.split(sep) if p.strip()]
         if len(parts) < 2 or not all(
                 p in by_id or p in providers for p in parts):
             out.append(d)
@@ -20095,6 +20099,94 @@ def _expand_multi_value_wiring_defects(
             expanded["_expanded_from"] = raw
             out.append(expanded)
     return out
+
+
+def _filter_provably_false_wiring_defects(
+    plans: list[dict], defects: list[dict], dropped: dict,
+) -> tuple[list[dict], list[str]]:
+    """Drop `wiring_judge` findings the plan itself contradicts.
+
+    Returns ``(surviving_defects, notes)``.
+
+    The overlap judge already has this discipline — `NO_FILE_OVERLAP`,
+    `PHANTOM_ARTIFACT` and `DROP_BREAKS_GRAPH` catch it asserting something
+    provably false, and the checked loop re-prompts. The wiring judge had no
+    equivalent, so a finding it could not have substantiated still killed the
+    run.
+
+    Measured across the corpus (2026-08-04): of the 12 residual defects in the
+    six runs that survive today's repair and still die, **10 are provably
+    false** by set membership alone:
+
+      * 4 `broken_by_merge` naming a capability the merged plan STILL
+        provides — in one case provided by the very sid the defect is about;
+      * 3 `broken_by_drop` naming a capability whose provider was dropped with
+        `reason == "already_satisfied"`, i.e. the `satisfied_probe` verified
+        that work already exists on the base tree, so it needs no in-plan
+        provider at all;
+    A third shape — a capability appearing in no plan snapshot at all — was
+    considered and REJECTED as a predicate. It is mechanically
+    indistinguishable from the plan genuinely lacking that work, which
+    `_repair_missing_requires`' own contract already treats as a real,
+    die-worthy finding ("the plan genuinely lacks the capability, not the
+    edge"). Filtering it would suppress exactly the gap the gate exists to
+    catch.
+
+    Two predicates, each pure set membership over structured fields — no
+    prose is read (CLAUDE.md *Language-to-JSON*):
+
+    1. a `broken_by_*` whose capability is still in the provides union: the
+       finding's own premise ("a merge/drop severed this") is false.
+    2. any defect whose capability was provided by an `already_satisfied`
+       drop: satisfied on the base tree.
+
+    **Predicate 1 is deliberately scoped to `broken_by_*`.** A
+    `missing_requires` naming a still-provided capability is the *canonical
+    true* finding — the provider exists and the consumer failed to declare the
+    edge — and must survive. Applying (1) to it would silently disable the
+    gate's main channel, where findings measure 99% true (69/70)."""
+    by_id: dict[str, dict] = {
+        s["id"]: s for plan in plans for s in plan.get("subtasks", []) or []
+    }
+    provided: set[str] = set()
+    for s in by_id.values():
+        provided |= set(s.get("provides") or [])
+
+    satisfied_tags: set[str] = set()
+    dropped_tags: set[str] = set()
+    dropped_ids: set[str] = set(dropped or {})
+    for sid, rec in (dropped or {}).items():
+        tags = set((rec or {}).get("provides") or []) if isinstance(rec, dict) else set()
+        dropped_tags |= tags
+        if isinstance(rec, dict) and rec.get("reason") == "already_satisfied":
+            satisfied_tags |= tags
+            satisfied_tags.add(sid)
+
+    kept: list[dict] = []
+    notes: list[str] = []
+    for d in defects:
+        kind = d.get("kind") or ""
+        sid = d.get("sid") or "?"
+        tag = (d.get("tag_or_dep") or "").strip()
+        if not tag:
+            kept.append(d)
+            continue
+
+        if kind.startswith("broken_by_") and tag in provided:
+            notes.append(
+                f"{kind} {sid} / {tag!r}: capability is still provided by "
+                f"{', '.join(sorted(s for s in by_id if tag in (by_id[s].get('provides') or [])))}"
+                " — the finding's premise is false")
+            continue
+
+        if tag in satisfied_tags:
+            notes.append(
+                f"{kind} {sid} / {tag!r}: provider was dropped as "
+                "already-satisfied — the work exists on the base tree")
+            continue
+
+        kept.append(d)
+    return kept, notes
 
 
 def _repair_missing_requires(
@@ -21161,8 +21253,26 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     # `plans` is mutated in place; `_run_phases` re-runs _schedule() and
     # rewrites plan_snapshot when anything landed, so the wave partition
     # downstream reflects the repaired graph.
-    repairs, unrepaired = _repair_missing_requires(
-        plans, _live_wiring_defects(judge_result))
+    _live = _live_wiring_defects(judge_result)
+    # Drop findings the plan itself contradicts before repairing or dying —
+    # the discipline NO_FILE_OVERLAP/PHANTOM_ARTIFACT already give the overlap
+    # judge, which the wiring judge lacked.
+    # Expand multi-value findings FIRST: a true two-tag finding would
+    # otherwise be discarded by the unsubstantiable predicate, which cannot
+    # resolve the joined string. Measured on run eed1153d, where
+    # 'size-field-enum-enforced / integrator-schema-drift-fixed' names two
+    # capabilities that BOTH exist.
+    _by_id = {s["id"]: s for pl in plans for s in pl.get("subtasks", []) or []}
+    _prov: dict[str, list[str]] = {}
+    for _sid, _s in _by_id.items():
+        for _t in _s.get("provides", []) or []:
+            _prov.setdefault(_t, []).append(_sid)
+    _live = _expand_multi_value_wiring_defects(_live, _by_id, _prov)
+    _live, _false = _filter_provably_false_wiring_defects(
+        plans, _live, st.data.get("dropped_subtasks") or {})
+    for _n in _false:
+        log(f"  wiring-gate: discarded provably-false finding — {_n}")
+    repairs, unrepaired = _repair_missing_requires(plans, _live)
     for r in repairs:
         if r.get("channel") == "id":
             log(f"  wiring-gate: repaired {r['sid']} -> depends_on "

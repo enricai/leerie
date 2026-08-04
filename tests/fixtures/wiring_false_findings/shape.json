@@ -1,0 +1,103 @@
+{
+ "_note": "SYNTHETIC shape-matched fixture; no real repo content.",
+ "subtasks": [
+  {
+   "id": "impl-001",
+   "title": "Implement A",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "cap-a"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-002",
+   "title": "Implement B",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "cap-b"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "impl-003",
+   "title": "Implement C",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "cap-c"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "check-001",
+   "title": "Check A",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "cap-a-checked"
+   ],
+   "_cofile_cluster": null
+  }
+ ],
+ "dropped_subtasks": {
+  "impl-009": {
+   "reason": "already_satisfied",
+   "provides": [
+    "cap-satisfied"
+   ]
+  },
+  "impl-010": {
+   "reason": "off_tree",
+   "provides": [
+    "cap-offtree"
+   ]
+  }
+ },
+ "defects": [
+  {
+   "kind": "broken_by_merge",
+   "sid": "impl-001",
+   "tag_or_dep": "cap-b",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "broken_by_drop",
+   "sid": "check-001",
+   "tag_or_dep": "cap-satisfied",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "check-001",
+   "tag_or_dep": "cap-invented",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "check-001",
+   "tag_or_dep": "cap-a",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "check-001",
+   "tag_or_dep": "cap-b / cap-c",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_provides",
+   "sid": "impl-003",
+   "tag_or_dep": "cap-real-gap",
+   "concrete_reason": "synthetic",
+   "severity": "live_defect"
+  }
+ ]
+}
