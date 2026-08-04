@@ -41,9 +41,11 @@ wrong conclusion when this script was first written:
   limit constrains leerie, which sends exactly one tool per request; its
   largest single schema carries 14 optional parameters.
 
-Exit codes: 0 all compile, 1 at least one rejected, 2 the control failed (the
-probe cannot detect a rejection, so a pass would mean nothing), 3 rate-limited
-before a verdict.
+Exit codes: 0 every schema compiles, 1 at least one was rejected, 2 the control
+failed (the probe cannot detect a rejection, so a pass would mean nothing),
+3 inconclusive — at least one schema never got a verdict, because it was
+throttled or the request timed out. 3 is not a pass: a schema with no verdict
+is unchecked, and the summary names which ones so a re-run can settle them.
 """
 from __future__ import annotations
 
@@ -63,6 +65,10 @@ import leerie  # noqa: E402
 CREDS = pathlib.Path.home() / ".claude" / ".credentials.json"
 URL = "https://api.anthropic.com/v1/messages"
 MODEL = "claude-sonnet-4-5-20250929"
+# Generous: grammar compilation for a large schema is slow, and a premature
+# timeout costs a verdict rather than saving time. Measured, `planner` blew
+# past 120 s.
+READ_TIMEOUT_S = 600
 # The identity a subscription OAuth token is scoped for. See the module
 # docstring — omitting this yields a 429 that looks like quota exhaustion.
 CC_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -94,7 +100,16 @@ def tool_for(name: str, harden: bool) -> dict:
             "input_schema": schema, "strict": True}
 
 
-def send(tool: dict, tok: str) -> tuple[int, str]:
+def send(tool: dict, tok: str) -> tuple[int, str, float]:
+    """Returns `(status, body, elapsed_seconds)`. Status 0 means no verdict.
+
+    A transport failure must NOT propagate. Compiling a large schema into a
+    grammar is slow — measured, `planner` exceeded a 120 s read timeout — and
+    an exception here would abandon the sweep and discard every schema already
+    checked. A timeout is "no verdict for this one", not "this schema is
+    broken", and the two must not be conflated: reporting a slow schema as
+    rejected would send someone hunting a bug that is not there.
+    """
     payload = json.dumps({
         "model": MODEL,
         "max_tokens": 1,  # tool schemas are validated before generation
@@ -107,11 +122,17 @@ def send(tool: dict, tok: str) -> tuple[int, str]:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     })
+    started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+        with urllib.request.urlopen(req, timeout=READ_TIMEOUT_S) as r:
+            return r.status, r.read().decode("utf-8", "replace"), \
+                time.monotonic() - started
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return e.code, e.read().decode("utf-8", "replace"), \
+            time.monotonic() - started
+    except Exception as e:  # noqa: BLE001 - see docstring
+        return 0, f"transport failure: {type(e).__name__}: {e}", \
+            time.monotonic() - started
 
 
 def message_of(resp: str) -> str:
@@ -128,10 +149,10 @@ def main() -> int:
     # Control: a real schema, strict, deliberately NOT hardened. It must be
     # rejected, or this probe cannot tell a compiling schema from a broken one
     # and every "ok" below is worthless.
-    status, resp = send(tool_for(names[0], harden=False), tok)
+    status, resp, _ = send(tool_for(names[0], harden=False), tok)
     print(f"control (strict, un-hardened): {status}  {message_of(resp)[:140]}")
-    if status == 429:
-        print("rate-limited before establishing anything — re-run later.")
+    if status == 429 or status == 0:
+        print("no verdict on the control — re-run later.")
         return 3
     if status == 200:
         print("\nCONTROL PASSED — the probe cannot detect a rejection. "
@@ -141,16 +162,21 @@ def main() -> int:
     print(f"\nprobing {len(names)} schemas, one request each")
     print("-" * 72)
     rejected: dict[str, str] = {}
+    no_verdict: dict[str, str] = {}
     for name in names:
-        status, resp = send(tool_for(name, harden=True), tok)
-        if status == 429:
-            print(f"  RATE {name} — inconclusive; re-run later.")
-            return 3
+        status, resp, secs = send(tool_for(name, harden=True), tok)
         if status == 200:
-            print(f"  ok   {name}")
+            print(f"  ok   {name:24} {secs:6.1f}s")
+        elif status in (0, 429):
+            # Throttled or a transport failure: no information about this
+            # schema either way. Keep going — the remaining schemas are still
+            # worth checking, and abandoning the run would discard every
+            # verdict already earned.
+            no_verdict[name] = message_of(resp)
+            print(f"  ??   {name:24} {secs:6.1f}s  {no_verdict[name][:120]}")
         else:
             rejected[name] = message_of(resp)
-            print(f"  FAIL {name}  {rejected[name][:180]}")
+            print(f"  FAIL {name:24} {secs:6.1f}s  {rejected[name][:160]}")
         time.sleep(1.0)
 
     print("-" * 72)
@@ -160,6 +186,12 @@ def main() -> int:
         for name, why in rejected.items():
             print(f"  {name}: {why}")
         return 1
+    if no_verdict:
+        print(f"\nINCONCLUSIVE — {len(no_verdict)} schema(s) never got a "
+              f"verdict: {', '.join(sorted(no_verdict))}")
+        print(f"  {len(names) - len(no_verdict)} of {len(names)} confirmed "
+              "compiling. Re-run to settle the rest.")
+        return 3
     print(f"\nall {len(names)} schemas compile under strict mode (model={MODEL})")
     return 0
 
