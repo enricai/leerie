@@ -11070,6 +11070,12 @@ def _strictify_schema(node: object) -> tuple[int, int]:
     offending path. And keywords the grammar cannot express are removed;
     `minItems` survives only at 0 or 1.
 
+    **"Object node" means three shapes**, not just `{"type": "object"}`: a
+    *union* type containing it (`["object", "null"]`) and a bare `properties`
+    with no declared type also count, and the API requires the same of both.
+    Leaving that term undefined is what let the first implementation ship an
+    equality test against the string — see the comment at the check itself.
+
     Recurses through `items` as well as `properties`, because leerie nests
     objects inside arrays (`collisions[]`, `subtasks[]`, `wiring_defects[]`)
     and a top-level-only pass would leave those unhardened.

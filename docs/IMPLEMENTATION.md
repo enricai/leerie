@@ -3424,8 +3424,10 @@ No unit test caught it, and the one that should have could not: the sweep in
 walks the hardened output using `_STRICT_UNSUPPORTED_KEYWORDS`, the same
 constant `_strictify_schema` consults, so it can only establish
 self-consistency and shares every blind spot the transform has. It was found by
-sending all 23 schemas to the **real API**
-(`<scratchpad>/verify_strict_live.py`). The lesson generalises: a transform
+sending all 23 schemas to the **real API** — which is now a committed tool,
+`scripts/verify-strict-schemas.py`, deliberately outside `pytest.ini`'s
+`testpaths` so the suite stays LLM-free. Re-run it after editing any entry in
+`SCHEMAS` or touching `_strictify_schema`. The lesson generalises: a transform
 targeting an external contract must be verified against that contract, not
 against the developer's model of it. Pinned since by
 `test_every_object_shape_is_hardened` (the three shapes) and
