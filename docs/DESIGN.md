@@ -5536,25 +5536,26 @@ mis-wirings:
   `task_coverage_judge` is pure judgment with no code-level floor of its
   own — unlike the instruction-adherence gate's two-layer composition
   (§12), it originally had no PRIMARY deterministic check, only this
-  SECONDARY judge. `check_required_items_coverage` closes that gap the
-  same way: the classifier's structured `required_items` (its own
-  language→JSON extraction of the task's explicit, enumerable
-  requirements — a numbered checklist, not a freeform goal) is set-
-  compared against each subtask's title/`success_criteria_seed` token set,
-  mirroring `check_prescribed_command_coverage`'s normalized token-subset
-  matching. This is model-independent evidence a `task_covered: true`
-  judge verdict cannot override — the judge can still gate on off-task
-  drift or an item the classifier never enumerated (what the floor
-  cannot see), but the floor alone is sufficient to force a re-plan, and
-  is still evaluated (and can still `die()`) even when the judge crashes
-  on every round. `required_items` stays deliberately narrow: an
-  ambiguous or freeform goal is not extracted as an item, since forcing
-  one reproduces the exact freeze class (IMPLEMENTATION.md
-  §"Freeze guard (2026-07-19 incident, root cause A)") that motivated
-  deleting the old mechanical task-file-coverage gate in the first
-  place. The common case —
-  `required_items` empty — costs nothing; the floor short-circuits to
-  `[]`.
+  SECONDARY judge. That gap was closed by a deterministic floor,
+`check_required_items_coverage`, which was **deleted on 2026-08-04**: measured
+across every run that ever carried `required_items`, it passed **0 of 102
+items** — a 100% false-positive rate with no true negative in its history. It
+also violated the *Language-to-JSON* rule, since the items are LLM-written
+sentences and the check token-matched them against subtask titles.
+
+The judge above it is retained but **advisory**. Re-invoked on identical input
+it returned a different finding set 85% of the time (n=20), and the
+intersection across repeated samples was empty — no finding survived a
+re-sample. A finding a judge cannot reproduce on unchanged input is not a
+stable property of that input, and cannot justify discarding a plan.
+
+The principle this establishes: **a judge's terminal authority must be
+proportional to its measured reproducibility, and a judgment layer with no
+mechanical backstop should not be terminal at all.** `wiring_judge` keeps its
+authority (99% of its findings verify true against the plan graph, 69/70) and
+`plan_overlap_judge` keeps its (`NO_FILE_OVERLAP` / `PHANTOM_ARTIFACT` catch
+it asserting the impossible). Coverage has neither — no mechanical check can
+verify "the plan misses work X" without reading prose.
 
   The floor cannot be satisfied by a planner that never saw the
   checklist: `phase_plan` injects `required_items` verbatim into every
