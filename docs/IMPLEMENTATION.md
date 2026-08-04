@@ -3404,8 +3404,33 @@ exactly one tool is named `StructuredOutput` and carries an `input_schema`:
 sets `strict: true`; adds `additionalProperties: false` to every object node
 including inside array `items`; strips `minLength` / `maxLength` / `minimum` /
 `maximum`; clamps `minItems > 1` to `1`. Verified against all 23 entries in
-`SCHEMAS`: **zero residual violations**, 64 `additionalProperties` added, 21
+`SCHEMAS`: **zero residual violations**, 65 `additionalProperties` added, 21
 keywords stripped across 8 schemas.
+
+**"Object node" is three shapes, not one.** `{"type": "object"}`, a *union*
+type containing it (`["object", "null"]`), and a bare `properties` with no
+declared type. The API requires `additionalProperties: false` on all three.
+
+This is recorded because the first implementation tested `type == "object"` and
+shipped: leerie's own `implementer.clarification_question` is
+`{"type": ["object", "null"], …}`, so the API rejected the whole implementer
+schema — *"tools.0.custom: For 'object' type, 'additionalProperties' must be
+explicitly set to false"* — which would have 400'd **every implementer call**,
+the most-used worker in the system, surfacing only as the retry storm this flag
+exists to eliminate.
+
+No unit test caught it, and the one that should have could not: the sweep in
+`tests/test_strict_output_proxy.py::test_every_real_schema_survives_the_transform`
+walks the hardened output using `_STRICT_UNSUPPORTED_KEYWORDS`, the same
+constant `_strictify_schema` consults, so it can only establish
+self-consistency and shares every blind spot the transform has. It was found by
+sending all 23 schemas to the **real API**
+(`<scratchpad>/verify_strict_live.py`). The lesson generalises: a transform
+targeting an external contract must be verified against that contract, not
+against the developer's model of it. Pinned since by
+`test_every_object_shape_is_hardened` (the three shapes) and
+`test_no_schema_has_an_unhardened_object_shape` (the whole corpus, using an
+independently-spelled definition of "is an object").
 
 **Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
 request forwarded byte-identical and the no-op logged (a silent loss of the

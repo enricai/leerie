@@ -11084,7 +11084,24 @@ def _strictify_schema(node: object) -> tuple[int, int]:
             if key == "minItems" and node[key] not in (0, 1):
                 node[key] = 1
                 stripped += 1
-        if node.get("type") == "object" and node.get("additionalProperties") is not False:
+        # An "object node" is not only `{"type": "object"}`. JSON Schema also
+        # allows a *union* type (`["object", "null"]` — leerie's own
+        # `implementer.clarification_question` is exactly that) and a bare
+        # `properties` with no declared type. The API requires
+        # `additionalProperties: false` on all three, and an equality test
+        # against the string "object" silently skips the last two.
+        #
+        # Measured, not theorised: the equality test shipped, and a live sweep
+        # of all 23 schemas against the real API rejected `implementer` —
+        # "tools.0.custom: For 'object' type, 'additionalProperties' must be
+        # explicitly set to false". That would have 400'd every implementer
+        # call, surfacing only as the retry storm this flag exists to remove.
+        declared = node.get("type")
+        is_object = (
+            declared == "object"
+            or (isinstance(declared, list) and "object" in declared)
+            or (declared is None and "properties" in node))
+        if is_object and node.get("additionalProperties") is not False:
             node["additionalProperties"] = False
             hardened += 1
         for value in node.values():
@@ -11137,11 +11154,12 @@ def _strictify_request(body: bytes) -> tuple[bytes, str] | None:
 class _StrictOutputProxy:
     """One loopback proxy per run, forcing constrained decoding.
 
-    Workers reach it through `ANTHROPIC_BASE_URL`. The orchestrator is PID 1
-    inside the container and every worker is its child (DESIGN §6 *Worker
-    subtree termination*), so they share a network namespace: a `127.0.0.1`
-    listener needs no port mapping, and the container boundary reaps it if the
-    run dies abnormally.
+    Workers reach it through `ANTHROPIC_BASE_URL`. Every worker is a child of
+    the orchestrator process (DESIGN §6 *Worker subtree termination*), so they
+    share its network namespace: a `127.0.0.1` listener needs no port mapping
+    on any runtime. On abnormal death the enclosing boundary reaps the listener
+    — the container locally (where the orchestrator is also PID 1), the machine
+    on `--runtime fly` / `ec2`, where it is instead spawned from a bootstrap.
 
     Every design choice below was forced by a measured failure in a load test of
     this exact shape, not chosen on taste:

@@ -101,9 +101,22 @@ def test_minitems_survives_at_one_but_is_clamped_above(leerie):
 
 
 def test_every_real_schema_survives_the_transform(leerie):
-    """The load-bearing test: all 23 shipped schemas must come out clean, or
-    the flag 400s on whichever worker runs first. `reconciler` (11 object
-    nodes) and `conformer` (10) are the stress cases."""
+    """All 23 shipped schemas come out clean under the transform's own rules.
+
+    **What this does and does not establish.** It walks the hardened output
+    looking for residuals using `_STRICT_UNSUPPORTED_KEYWORDS` — the same
+    constant `_strictify_schema` consults — so it proves the transform is
+    self-consistent, *not* that the API accepts the result. It shares any blind
+    spot the transform has, and it did: the union-type bug pinned in
+    `test_every_object_shape_is_hardened` passed this test while the API
+    rejected `implementer` outright.
+
+    The independent checks are its siblings: `test_no_schema_has_an_unhardened_object_shape`
+    (spells out "is an object" separately) and, decisively, the live sweep in
+    `<scratchpad>/verify_strict_live.py`, which sends every schema to the real
+    API. `reconciler` (11 object nodes) and `conformer` (10) are the stress
+    cases here.
+    """
     unsupported = leerie._STRICT_UNSUPPORTED_KEYWORDS
 
     def residual(node, path="$"):
@@ -130,6 +143,87 @@ def test_every_real_schema_survives_the_transform(leerie):
         if bad:
             offenders[name] = bad[:3]
     assert not offenders, f"schemas still violating the strict subset: {offenders}"
+
+
+@pytest.mark.parametrize("node, why", [
+    ({"type": ["object", "null"], "properties": {"a": {"type": "string"}}},
+     "union type — leerie's own implementer.clarification_question"),
+    ({"type": ["null", "object"], "properties": {"a": {"type": "string"}}},
+     "union type, object not first"),
+    ({"properties": {"a": {"type": "string"}}},
+     "properties with no declared type"),
+    ({"type": "object", "properties": {"a": {"type": "string"}}},
+     "the plain case (control)"),
+])
+def test_every_object_shape_is_hardened(leerie, node, why):
+    """`additionalProperties: false` must land on every node the API treats as
+    an object — not only on `{"type": "object"}`.
+
+    Regression, found by a live sweep of all 23 schemas against the real API
+    (2026-08-04): the shipped check was `node.get("type") == "object"`, which is
+    False for the *union* `["object", "null"]`. leerie's own
+    `implementer.clarification_question` is exactly that shape, so the API
+    rejected the implementer schema outright — "tools.0.custom: For 'object'
+    type, 'additionalProperties' must be explicitly set to false".
+
+    That would have 400'd every call by the most-used worker in the system,
+    surfacing only as the retry storm this flag exists to eliminate. No unit
+    test could have caught it: the sweep that was supposed to
+    (`test_every_real_schema_survives_the_transform`) checked the transform's
+    output against the transform's own rule set, so it shared the blind spot.
+    """
+    import copy
+    n = copy.deepcopy(node)
+    leerie._strictify_schema(n)
+    assert n.get("additionalProperties") is False, f"unhardened: {why}"
+
+
+def test_no_schema_has_an_unhardened_object_shape(leerie):
+    """The whole-corpus form of the test above, using an *independent*
+    object-detection rule rather than re-reading `_strictify_schema`'s own.
+
+    This is the check `test_every_real_schema_survives_the_transform` could not
+    perform: that one walks the result looking for `_STRICT_UNSUPPORTED_KEYWORDS`
+    — the same constant the transform consults — so it can only prove
+    self-consistency. Here the notion of "is an object" is spelled out
+    separately, so a narrowing of the transform's own test fails this.
+    """
+    import copy
+
+    def unhardened(node, path="$"):
+        bad = []
+        if isinstance(node, dict):
+            declared = node.get("type")
+            objish = (declared == "object"
+                      or (isinstance(declared, list) and "object" in declared)
+                      or (declared is None and "properties" in node))
+            if objish and node.get("additionalProperties") is not False:
+                bad.append(path)
+            for k, v in node.items():
+                bad += unhardened(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                bad += unhardened(v, f"{path}[{i}]")
+        return bad
+
+    offenders = {}
+    for name, schema in leerie.SCHEMAS.items():
+        s = copy.deepcopy(schema)
+        leerie._strictify_schema(s)
+        bad = unhardened(s)
+        if bad:
+            offenders[name] = bad[:3]
+    assert not offenders, (
+        f"the API rejects these outright: {offenders}")
+
+
+def test_union_type_detection_is_not_a_substring_match(leerie):
+    """A type that merely *contains* the letters of "object" is not an object.
+    Guards a lazy `"object" in str(declared)` implementation."""
+    import copy
+    n = copy.deepcopy({"type": "string", "description": "an object, sort of"})
+    leerie._strictify_schema(n)
+    assert "additionalProperties" not in n, "a string node was hardened"
 
 
 def test_the_real_schema_sweep_is_not_vacuous(leerie):
