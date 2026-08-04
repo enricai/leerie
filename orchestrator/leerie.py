@@ -381,6 +381,14 @@ STATE_FIELDS = (
     # whose every in_plan requires was unresolvable because the provider
     # domain returned 0 subtasks. List of sid strings.
     "speculative_collapse_drops",
+    # external_twin_demotions: unresolvable entries rescued by
+    # _demote_unresolvable_with_external_twin (DESIGN §5 *The external
+    # twin*) — a consumer declared a tag `in_plan` while another subtask
+    # declared the same capability `extent: external`. Each item is
+    # {sid, tag, match: "exact"|"singularized", twin_tag, twin_subtasks}.
+    # Recorded so a wrong singularized pairing is auditable rather than
+    # a silent reshaping of the dependency graph.
+    "external_twin_demotions",
     # plan_overlap_judge / plan_overlap_applied: set by phase_overlap_judge
     # (DESIGN §5 *Cross-domain surface overlap*). plan_overlap_judge stores
     # the full judge worker output (list of collisions with a_sid/b_sid/
@@ -16853,6 +16861,112 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     return unresolved
 
 
+def _tag_key(tag: str) -> frozenset[str]:
+    """Normalized comparison key for a capability tag.
+
+    Lowercase, split on `-`/`_`, singularize each token, compare as a
+    SET. Deliberately narrow: it pairs `webhook-event-types-schema-settled`
+    with `webhook-event-type-schema-settled` (a real measured collision,
+    run 1178f696) and refuses to pair either with
+    `webhook-event-type-schema-migrated`. A looser "N-of-M tokens
+    overlap" rule was rejected — it would pair genuinely different
+    capabilities, and the cost of a false pairing here is demoting a real
+    graph edge to a mere deploy note.
+
+    The 3-char floor keeps short tokens whose trailing `s` is part of the
+    word (`css`, `dns`) intact."""
+    toks = re.split(r"[-_]+", tag.lower())
+    return frozenset(
+        t[:-1] if len(t) > 3 and t.endswith("s") else t
+        for t in toks if t
+    )
+
+
+def _demote_unresolvable_with_external_twin(
+    plans: list[dict],
+    unresolvable_entries: list[dict],
+    external_preconditions: list[dict],
+) -> list[dict]:
+    """Rescue an `unresolvable` entry whose tag another subtask already
+    declared `extent: external` (DESIGN §5 *The external twin*).
+
+    Planners run blind, so two of them can classify the SAME capability
+    differently: one recognizes the work belongs to another run and says
+    `external`, another says `in_plan`. The `in_plan` one has no provider
+    by construction, so it reaches `unresolvable` and dies — while the
+    evidence that it is out-of-graph sits unread in the externals the
+    orchestrator collected moments earlier. Measured on run 1178f696:
+    BOTH fatal entries had a twin (one exact, one singularized).
+
+    **Placement is the safety property.** This runs AFTER the reconciler
+    has emitted its verdict, so it can only ever convert a `die()` into a
+    deploy note — never "skip an edge the reconciler would have wired".
+    Firing before the reconciler was measured demoting 3 tags the
+    reconciler went on to resolve successfully; the reconciler resolves
+    far more than it aborts (279 resolutions vs 4 aborts across the run
+    corpus), so preempting it is expensive and wrong.
+
+    Returns the demotion records (empty if none). Mutates `plans` in
+    place, rewriting each rescued `requires` entry to `extent: external`
+    with the twin's reason attributed to its source subtask."""
+    if not unresolvable_entries or not external_preconditions:
+        return []
+
+    exact: dict[str, dict] = {
+        e["tag"]: e for e in external_preconditions if e.get("tag")
+    }
+    # Exact wins, so normalization can never perturb existing behavior.
+    normalized: dict[frozenset[str], dict] = {}
+    for tag in sorted(exact):
+        normalized.setdefault(_tag_key(tag), exact[tag])
+
+    demoted: list[dict] = []
+    for entry in unresolvable_entries:
+        sid, tag = entry.get("sid", ""), entry.get("tag", "")
+        if not sid or not tag:
+            continue
+        twin = exact.get(tag)
+        match = "exact"
+        if twin is None:
+            twin = normalized.get(_tag_key(tag))
+            match = "singularized"
+        if twin is None:
+            continue
+
+        # Attribute the inherited reason so a wrong normalized pairing is
+        # visible in plan.json rather than silently reshaping the graph.
+        src = ", ".join(twin.get("originating_subtasks") or []) or "unknown"
+        why = next(
+            (r.get("reason") or "" for r in (twin.get("reasons") or [])
+             if (r.get("reason") or "").strip()), "")
+        inherited = (
+            f"{why} (inherited from {src}, which declared "
+            f"`{twin['tag']}` as an out-of-graph prerequisite)"
+        ).strip()
+
+        rewrote = False
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                if s.get("id") != sid:
+                    continue
+                for e in s.get("requires") or []:
+                    if (isinstance(e, dict) and e.get("tag") == tag
+                            and e.get("extent") == "in_plan"):
+                        e["extent"] = "external"
+                        e["reason"] = inherited
+                        rewrote = True
+        if not rewrote:
+            # The entry named a subtask/tag pair no longer in the plan
+            # (e.g. already pruned). Nothing to rescue; let it die.
+            continue
+        demoted.append({
+            "sid": sid, "tag": tag, "match": match,
+            "twin_tag": twin["tag"],
+            "twin_subtasks": list(twin.get("originating_subtasks") or []),
+        })
+    return demoted
+
+
 def _prune_dead_subtasks(
     plans: list[dict],
     unresolvable_entries: list[dict],
@@ -17606,6 +17720,35 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 u for u in _unresolvable_entries
                 if u["sid"] not in set(_pruned)
             ]
+    # External-twin demotion (DESIGN §5): rescue an unresolvable entry
+    # whose tag another subtask already declared `extent: external`.
+    # Runs AFTER the reconciler's verdict so it can only convert a die()
+    # into a deploy note, never preempt a resolution the reconciler would
+    # have made — see _demote_unresolvable_with_external_twin.
+    _still_unresolvable = output.get("unresolvable", []) or []
+    if _still_unresolvable:
+        _demoted = _demote_unresolvable_with_external_twin(
+            plans, _still_unresolvable,
+            st.data.get("external_preconditions") or [])
+        if _demoted:
+            for d in _demoted:
+                log(f"phase 2½: demoted unresolvable "
+                    f"{d['sid']} requires '{d['tag']}' to extent: external "
+                    f"({d['match']} twin of '{d['twin_tag']}' declared by "
+                    f"{', '.join(d['twin_subtasks']) or 'unknown'})")
+            st.data["external_twin_demotions"] = _demoted
+            st.save()
+            _demoted_pairs = {(d["sid"], d["tag"]) for d in _demoted}
+            output["unresolvable"] = [
+                u for u in _still_unresolvable
+                if (u.get("sid"), u.get("tag")) not in _demoted_pairs
+            ]
+            # The rescued entries are now `external`, so refresh the
+            # collected preconditions: _write_plan persists this list as
+            # plan.json's `preconditions` section.
+            st.data["external_preconditions"] = (
+                _collect_external_preconditions(plans))
+            st.save()
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
     _record_conditional_drops(output)
