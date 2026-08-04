@@ -254,21 +254,21 @@ It is reconciled by the orchestrator with three mechanisms:
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
   subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits actions across eight arrays. Five
+  `files_likely_touched`) and emits eight actions. Five
   *resolution* actions — `renames` (two tags mean the same thing — rewrite
-  one to match the other), `added_provides` (an existing subtask actually
+  one to match the other), `add_provide` (an existing subtask actually
   produces the capability but didn't declare it), `added_subtasks` (a
-  genuine gap — propose a new subtask to fill it), `conditional_drops`
+  genuine gap — propose a new subtask to fill it), `conditional_drop`
   (drop a planner-emitted consumer subtask whose own `intent` declares it
   conditional on an unresolvable precondition — i.e. the planner authored
   it as "no-op if X" and X turned out to be false; the capability graph
   has no semantics for conditional subtasks, so the reconciler converts
   the planner's prose conditionality into a structured drop),
-  `dropped_requires` (drop the consumer's `requires` entry when it was
+  `drop_require` (drop the consumer's `requires` entry when it was
   over-specified by its planner — an aggregate, coarser synonym, or
   authoring-time decision the same subtask itself records, rather than a
   code artifact another subtask produces; the consumer stays in the plan,
-  only the bad edge goes — `dropped_requires` also plays a cycle-breaking
+  only the bad edge goes — `drop_require` also plays a cycle-breaking
   role, but its primary home is now resolution). Two *cycle-breaking-only*
   actions for when the resolution actions would close a dependency cycle —
   `dependency_edges` (assert an explicit `depends_on` ordering when both
@@ -282,6 +282,19 @@ It is reconciled by the orchestrator with three mechanisms:
   cycle resolution lives in the reconciler worker; the orchestrator computes
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
   graph, and applies the worker's output mechanically.
+
+  **The wire shape is flatter than the action list reads, and deliberately
+  so.** `add_provide` / `drop_require` / `conditional_drop` / `unresolvable`
+  travel as one `tag_ops` array discriminated by an `op` field, and a new
+  subtask's `requires` travels in a sibling `added_requires` keyed by subtask
+  id rather than nested inside the subtask. Neither is a modelling
+  preference: the natural shape — four isomorphic `{sid, tag, reason}` arrays,
+  plus an array-of-objects nested inside an array-of-objects — exceeds what
+  grammar compilation accepts under § *Forcing constrained decoding*, and was
+  refused outright. One adapter fans the wire shape back into the eight
+  arrays before anything else sees it, so the apply steps, the state fields
+  and every check below are written against the action names above, not
+  against the wire names.
 
   **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
   the reconciler).** "No enforced dictionary" (above) is what makes blind
@@ -401,7 +414,7 @@ It is reconciled by the orchestrator with three mechanisms:
   The same retry-with-structural-feedback pattern applies to the second
   failure mode the post-mutation gates catch: **unresolved `requires`
   tags that survive the reconciler's first attempt**. The common cause
-  is the model inventing a new tag in `added_subtasks`/`added_provides`
+  is the model inventing a new tag in `added_subtasks` or an `add_provide`
   without renaming the original consumer's tag to match (two synonyms
   for the same concept that never get unified). The orchestrator
   computes string-similarity hints over the post-mutation `provides`
@@ -463,9 +476,9 @@ hallucinations, or in-plan capabilities the reconciler can neither rename,
 attribute, nor connect. An external prerequisite never reaches that path;
 a planner-declared *conditional* consumer (one whose own `intent` admits
 it should be dropped if its precondition is false) routes through
-`conditional_drops`; and an *over-specified* `requires` entry (an
+`conditional_drop`; and an *over-specified* `requires` entry (an
 aggregate or coarser synonym of what the consumer itself provides, rather
-than a real cross-subtask dependency) routes through `dropped_requires` —
+than a real cross-subtask dependency) routes through `drop_require` —
 `unresolvable` is reserved for unconditional consumers whose required
 capability genuinely cannot be produced AND is not an over-specified
 self-reference.
@@ -486,7 +499,7 @@ The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable; the reconciler's retry loop tries to break it (preferring
-`dropped_requires` / `dependency_edges` / `merged_subtasks` over the cycle-
+`drop_require` / `dependency_edges` / `merged_subtasks` over the cycle-
 closing renames), and if that fails the run aborts with the SCC + the
 mutations that closed it named — never silently broken.
 
