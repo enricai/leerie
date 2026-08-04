@@ -1215,6 +1215,7 @@ leerie/
 │   │                              decide_teardown's Fly clean-exit branch, and
 │   │                              `leerie --finalize <run-id>` (§7 Host-side finalize)
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a Unix socket; v1+v2); the dropped-privilege orchestrator drives it
+│   ├── verify-strict-schemas.py   maintainer tool: sends every hardened SCHEMAS entry to the real API and reports which compile under strict mode (live creds; outside pytest's testpaths)
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 │   ├── container-entry.sh         container PID 1 (root rootful / mapped-UID rootless): create leerie.slice + launch cgroup broker + cd /work + drop to leerie via runuser (rootful)
 │   ├── install.sh                 one-command installer (curl | bash); preflight git/curl + auto-install
@@ -3433,6 +3434,25 @@ against the developer's model of it. Pinned since by
 `test_every_object_shape_is_hardened` (the three shapes) and
 `test_no_schema_has_an_unhardened_object_shape` (the whole corpus, using an
 independently-spelled definition of "is an object").
+
+**Running the probe.** `python3 scripts/verify-strict-schemas.py`. It sends one
+request per schema and exits **0** every schema compiles / **1** at least one
+was rejected / **2** the control was *not* rejected, so the probe cannot detect
+a rejection and a pass would be meaningless / **3** inconclusive — at least one
+schema was throttled or timed out. **3 is not a pass**: a schema with no verdict
+is unchecked, and the summary names which ones. Expect ~25-45 s per schema;
+grammar compilation for a large schema is genuinely slow, which is why a
+transport failure is reported as "no verdict" and never conflated with a
+rejection.
+
+Two API facts the probe's docstring records, because both are easy to get wrong
+and neither affects leerie itself: a subscription OAuth token **requires the
+Claude Code system-prompt identity** (without it the API answers a bare
+`429 {"message":"Error"}` that reads exactly like quota exhaustion), and the
+20-strict-tool / 24-optional-parameter ceilings are per-**request** aggregates,
+so batching schemas to save calls trips them and establishes nothing about any
+individual schema. leerie sends exactly one tool per request, and its largest
+single schema carries 14 optional parameters.
 
 **Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
 request forwarded byte-identical and the no-op logged (a silent loss of the
