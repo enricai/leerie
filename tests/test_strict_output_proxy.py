@@ -1351,7 +1351,16 @@ def test_forcing_a_field_never_makes_a_trivial_value_illegal(leerie):
 
 def test_all_required_output_still_validates_against_the_original(leerie):
     """The seam the whole design rests on: the CLI validates against leerie's
-    ORIGINAL schema, so an output carrying every field must still pass."""
+    ORIGINAL schema, so an output carrying every field must still pass.
+
+    `synth` honours `minLength` / `minItems` rather than emitting degenerate
+    values. An earlier version emitted `""` everywhere and exempted the
+    resulting failures by matching the phrase "too short" in the exception —
+    which broke on a newer jsonschema that words the same error
+    "should be non-empty". Matching a library's error prose is brittle by
+    construction; building an instance that genuinely satisfies the schema
+    tests the real claim and depends on no wording at all.
+    """
     jsonschema = pytest.importorskip("jsonschema")
 
     def synth(node):
@@ -1362,9 +1371,13 @@ def test_all_required_output_still_validates_against_the_original(leerie):
         if t == "object" or (t is None and "properties" in node):
             return {k: synth(v) for k, v in (node.get("properties") or {}).items()}
         if t == "array":
-            return []
+            n = node.get("minItems") or 0
+            item = node.get("items")
+            return [synth(item) for _ in range(n)] if isinstance(item, dict) else []
         if t == "string":
-            return (node.get("enum") or [""])[0]
+            if node.get("enum"):
+                return node["enum"][0]
+            return "x" * max(int(node.get("minLength") or 0), 1)
         if t in ("number", "integer"):
             return node.get("minimum", 0)
         if t == "boolean":
@@ -1376,11 +1389,6 @@ def test_all_required_output_still_validates_against_the_original(leerie):
         try:
             jsonschema.validate(synth(schema), schema)
         except jsonschema.ValidationError as e:
-            # A REQUIRED field carrying minLength is a pre-existing hazard
-            # (the wire schema must strip minLength; the CLI still enforces
-            # it), not something all-required introduces. Out of scope here.
-            if "too short" in str(e):
-                continue
             bad.append((name, str(e).splitlines()[0][:90]))
     assert not bad, f"all-fields-present output rejected by the original: {bad}"
 
@@ -1520,3 +1528,93 @@ def test_spawn_reconciler_routes_through_the_adapter(leerie):
     src = inspect.getsource(leerie.phase_reconcile)
     assert "_expand_reconciler_output(raw)" in src
     assert "_dangling_requires" in src
+
+
+# --------------------------------------------------------------------------
+# Retry prompts must speak the vocabulary the schema accepts.
+#
+# leerie builds its reconciler retry prompts in Python. When the wire shape was
+# restructured (four {sid, tag, reason} arrays -> one op-discriminated
+# `tag_ops`; `requires` lifted into `added_requires`), `prompts/reconciler.md`
+# was rewritten but these Python-side prompts were not — so a retry told the
+# model to emit arrays its own schema no longer has. Under
+# `--dangerously-force-strict-output` the grammar makes those keys
+# unrepresentable, so the model *cannot* comply; without the flag it produces
+# output that fails validation. Either way the retry is wasted and the run then
+# dies claiming the model "defied a structural constraint" when leerie asked
+# for the wrong thing.
+#
+# No existing test caught it: every reconciler test stubs the worker's return
+# value, so none reads these strings.
+# --------------------------------------------------------------------------
+
+
+def _reconciler_vocabulary(leerie) -> set[str]:
+    """Every field/op name the reconciler schema actually accepts."""
+    schema = leerie.SCHEMAS["reconciler"]
+    vocab = set(schema["properties"])
+    vocab |= set(schema["properties"]["tag_ops"]["items"]["properties"]["op"]["enum"])
+    return vocab
+
+
+def test_retry_prompts_only_name_ops_the_schema_accepts(leerie):
+    """Checks the RENDERED prompt text, not the source.
+
+    A source scan cannot tell a model-facing string from leerie's own internal
+    op tag (`rec["op"] == "dropped_requires"` is an internal value the
+    recommendation dict legitimately still uses) or from a docstring. Only what
+    is actually emitted matters, so the builders are invoked and their output
+    inspected.
+
+    The accepted vocabulary is derived from `SCHEMAS["reconciler"]` rather than
+    hand-listed, so the next rename is caught too.
+    """
+    vocab = _reconciler_vocabulary(leerie)
+    retired = {"added_provides", "dropped_requires", "conditional_drops"}
+    assert not (retired & vocab), "fixture is stale — these are live again"
+
+    rendered: dict[str, str] = {}
+
+    rec_drop = {"op": "dropped_requires", "sid": "config-001",
+                "tag": "some-cap", "reason": "over-specified"}
+    rendered["_format_recommendation"] = leerie._format_recommendation(rec_drop)
+
+    edges = [{"from": "feat-001", "to": "config-001",
+              "mutation": "rename: 'a' -> 'b'", "source": "requires:b"}]
+    attempt1 = {"renames": [{"sid": "config-001", "from": "a", "to": "b"}]}
+    rendered["_format_must_include"] = "\n".join(
+        leerie._format_must_include(["feat-001", "config-001"], edges, attempt1))
+
+    rendered["_build_unresolved_retry_prompt"] = (
+        leerie._build_unresolved_retry_prompt(
+            [{"sid": "config-001", "tag": "some-cap", "domain": "config"}],
+            {"other-cap": ["feat-001"]},
+            {("config-001", "some-cap"): None},
+            attempt1,
+            "orig",
+        ))
+
+    offenders = {}
+    for name, text in rendered.items():
+        hits = sorted(n for n in retired if n in text)
+        if hits:
+            offenders[name] = hits
+    assert not offenders, (
+        "retry prompts instruct the model to emit arrays the schema no longer "
+        f"has: {offenders}")
+
+
+def test_recommendation_marker_survives_the_vocabulary_change(leerie):
+    """`_matches_recommendation` compares against `_format_must_include`'s
+    rendering. If the two drift, no option is ever marked recommended — and
+    nothing fails, so the drift is silent."""
+    edges = [{"from": "feat-001", "to": "config-001",
+              "mutation": "rename: 'a' -> 'b'", "source": "requires:b"}]
+    attempt1 = {"renames": [{"sid": "config-001", "from": "a", "to": "b"}]}
+    options = leerie._format_must_include(
+        ["feat-001", "config-001"], edges, attempt1)
+    rec = {"op": "dropped_requires", "sid": "config-001", "tag": "a",
+           "reason": "r"}
+    assert any(leerie._matches_recommendation(o, rec) for o in options), (
+        "no rendered option matched the recommendation — _format_must_include "
+        "and _matches_recommendation have drifted apart")

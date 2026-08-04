@@ -18299,15 +18299,18 @@ def _format_recommendation(rec: dict) -> str:
     literal-minded model can copy the entire line directly into its
     output without having to interpolate a placeholder. Deterministic.
 
-    The recommendation heuristic only ever emits `dropped_requires`
-    (cases 1/3/4) or `merged_subtasks` (case 2). It never emits
-    `dependency_edges` — that op is reachable only when the model
-    overrides the recommendation, in which case `_format_must_include`
-    (not this function) renders the option string."""
+    The recommendation heuristic only ever emits a drop (cases 1/3/4) or
+    `merged_subtasks` (case 2). It never emits `dependency_edges` — that op is
+    reachable only when the model overrides the recommendation, in which case
+    `_format_must_include` (not this function) renders the option string.
+
+    Rendered in the WIRE vocabulary the schema accepts, not leerie's internal
+    array names: the model is being told what to emit, and a drop travels as
+    `op: "drop_require"` inside `tag_ops`."""
     op = rec.get("op", "")
     reason = repr(rec.get("reason", ""))
     if op == "dropped_requires":
-        return (f"dropped_requires(sid={rec['sid']!r}, "
+        return (f"tag_ops(op='drop_require', sid={rec['sid']!r}, "
                 f"tag={rec['tag']!r}, reason={reason})")
     if op == "merged_subtasks":
         return (f"merged_subtasks(into={rec['into']!r}, "
@@ -18326,9 +18329,12 @@ def _format_must_include(
 
     `output` is the failing attempt-1 reconciler output — used to
     look up each rename's ORIGINAL pre-rename tag so the rendered
-    `dropped_requires` options target the tag the consumer's requires
-    entry actually holds at retry apply time (after the revert
-    restores the pre-mutation state).
+    drop options target the tag the consumer's requires entry actually
+    holds at retry apply time (after the revert restores the
+    pre-mutation state).
+
+    Rendered in the WIRE vocabulary (a drop is `op: "drop_require"` inside
+    `tag_ops`) because this list goes to the model as its legal answer space.
     """
     options: list[str] = []
     # Each rename in the SCC can be dropped. Edge `src -> dst` carries
@@ -18339,7 +18345,8 @@ def _format_must_include(
                 and e["source"].startswith("requires:")):
             tag = _original_tag_for_rename_edge(e, output)
             options.append(
-                f"dropped_requires(sid={e['to']!r}, tag={tag!r}, ...)")
+                f"tag_ops(op='drop_require', sid={e['to']!r}, "
+                f"tag={tag!r}, ...)")
     # For 2-node SCCs, dependency_edges in either direction and
     # merged_subtasks in either direction are also legal answers.
     if len(scc) == 2:
@@ -18383,7 +18390,8 @@ def _build_cycle_retry_prompt(
         "structural signals. You must either emit the recommendation "
         "verbatim or propose an alternative from the bounded set below. "
         "`unresolvable` is NOT a valid response to a cycle — cycles must "
-        "be broken with one of dropped_requires / dependency_edges / "
+        "be broken with one of drop_require (in tag_ops) / "
+        "dependency_edges / "
         "merged_subtasks.\n"
     )
     for i, (scc, rec) in enumerate(zip(sccs, recommendations), 1):
@@ -18521,13 +18529,18 @@ def _matches_recommendation(option_str: str, rec: dict) -> bool:
     """Whether a must-include option string matches the recommendation
     (so the retry prompt can mark it with ← recommended).
 
-    The recommendation is always either `dropped_requires` or
-    `merged_subtasks` (see `_format_recommendation` docstring); no
-    `dependency_edges` branch is reachable here."""
+    The recommendation is always either a drop or `merged_subtasks` (see
+    `_format_recommendation` docstring); no `dependency_edges` branch is
+    reachable here.
+
+    The prefix must track `_format_must_include`'s rendering exactly — both
+    speak the wire vocabulary (`op: "drop_require"` inside `tag_ops`). If the
+    two drift, no option is ever marked recommended and the drift is silent."""
     op = rec.get("op", "")
     if op == "dropped_requires":
         return option_str.startswith(
-            f"dropped_requires(sid={rec['sid']!r}, tag={rec['tag']!r}")
+            f"tag_ops(op='drop_require', sid={rec['sid']!r}, "
+            f"tag={rec['tag']!r}")
     if op == "merged_subtasks":
         return option_str.startswith(
             f"merged_subtasks(into={rec['into']!r}, from={rec['from']!r}")
@@ -18733,14 +18746,14 @@ def _build_unresolved_retry_prompt(
     parts.append(
         "Your previous reconciler output left "
         f"{len(unresolved)} cross-domain `requires` tag(s) still "
-        "unresolved after applying your renames / added_provides / "
+        "unresolved after applying your renames / add_provide ops / "
         "added_subtasks. Leerie has computed string-similarity hints "
         "from the post-mutation `provides` namespace. Use the hints "
         "if they're semantically correct; if a hint is only "
         "textually close (a 'false friend' — e.g. a narrow synonym "
         "for a broader concept), pick a different option from the "
-        "bounded set below. `unresolvable` IS valid here if no real "
-        "producer exists. `dropped_requires` IS also valid: when the "
+        "bounded set below. The `unresolvable` op IS valid here if no real "
+        "producer exists. `drop_require` IS also valid: when the "
         "consumer's own `provides` already covers the work the requires "
         "tag names (an over-specified self-reference rather than a real "
         "cross-subtask dependency), drop the requires entry — the "
@@ -18818,31 +18831,31 @@ def _build_unresolved_retry_prompt(
                 f"(e.g. rename(sid={sid!r}, from={pre_revert_tag!r}, "
                 f"to={top!r}))")
         parts.append(
-            f"    - added_provides: declare an existing subtask "
+            f"    - tag_ops op='add_provide': declare an existing subtask "
             f"actually produces '{pre_revert_tag}' (add it to that "
             f"subtask's provides)")
         parts.append(
             f"    - added_subtasks: add a new connector subtask whose "
             f"provides includes '{pre_revert_tag}'")
         parts.append(
-            f"    - conditional_drops: drop the consumer subtask "
+            f"    - tag_ops op='conditional_drop': drop the consumer subtask "
             f"({sid!r}) wholesale — ONLY if its own `intent` declares "
             "it conditional on this precondition (e.g. 'no-op if X', "
             "'conditionally add', 'otherwise this subtask is dropped'). "
             "Reserved for planner-authored consumers.")
         parts.append(
-            f"    - dropped_requires: drop just this `requires` entry "
+            f"    - tag_ops op='drop_require': drop just this `requires` entry "
             f"from {sid!r} (the consumer stays in the plan) — ONLY if "
             f"the consumer's own `provides` already covers the work "
             f"'{pre_revert_tag}' names, at a different granularity. "
             "I.e. the requires entry is an aggregate, a coarser synonym, "
             "or an authoring-time decision the same subtask itself "
             "records, rather than a code artifact another subtask "
-            "produces. Distinct from `conditional_drops` (which removes "
+            "produces. Distinct from `conditional_drop` (which removes "
             "the whole subtask) — use this when the consumer should "
             "stay but the over-specified self-reference should go.")
         parts.append(
-            f"    - unresolvable: name this as a genuine gap with a "
+            f"    - tag_ops op='unresolvable': name this as a genuine gap with a "
             "one-sentence reason (aborts the run cleanly).")
 
     parts.append(
