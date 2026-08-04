@@ -1,0 +1,541 @@
+{
+ "subtasks": [
+  {
+   "id": "bugfix-002",
+   "title": "Migrate billing-contact-panel.tsx to the shared authenticated-fetch client",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "billing-contact-panel-auth-migrated"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-003",
+   "title": "Migrate tax-exemption-panel.tsx to shared authenticated-fetch client and surface reviewNotes for rejected certs + Display cert.reviewNotes for REJECTED tax-exemption certificates (BIL7)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "tax-exemption-panel-fixed",
+    "bil7-review-notes-display"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-004",
+   "title": "Migrate credit-top-up-panel.tsx launchCheckout to shared authenticated-fetch client",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "credit-top-up-panel-auth-migrated"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-005",
+   "title": "Migrate billing-hub-panel.tsx auth-bearing calls to the shared client, add remove-payment-method confirmation, surface real tier-update error, add tier-switch confirmation + Add confirmation dialog before removePaymentMethod (BIL1) + Surface real server error message and add tier-switch confirmation (BIL2)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "billing-hub-panel-fixed",
+    "bil1-remove-payment-method-confirm",
+    "bil2-tier-error-passthrough",
+    "bil2-tier-confirmation",
+    "bil2-tier-error-and-confirmation-fix"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-009-1",
+   "title": "Add edit-mode support to RoleEditor (initialValues/mode prop contract)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "role-editor-edit-mode-props",
+    "rol2-edit-role"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-009-2",
+   "title": "Wire Edit/Duplicate/Delete actions on role cards to RoleEditor and the roles API",
+   "depends_on": [
+    "bugfix-009-1"
+   ],
+   "requires": [
+    {
+     "tag": "role-editor-edit-mode-props",
+     "extent": "in_plan",
+     "reason": "Edit/Duplicate flows need RoleEditor's pre-fill prop contract from bugfix-009-1 before they can be wired up."
+    }
+   ],
+   "provides": [
+    "custom-role-edit-duplicate-delete",
+    "rol2-edit-role",
+    "rol2-duplicate-role",
+    "rol2-delete-role"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-011",
+   "title": "Add Passare apiKey helperText and convert overwrite warning into a confirm-before-toggle dialog",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "passare-integration-warning-fixed",
+    "int1-passare-helper-text",
+    "int1-active-sync-confirm-dialog"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-013",
+   "title": "Add GET .../deliveries and POST .../test webhook endpoint routes + Add GET .../deliveries route for webhook delivery history (WEB2) + Add POST .../test route to dispatch a synthetic test event (WEB2)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "webhook-deliveries-route",
+    "webhook-test-event-route"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-014",
+   "title": "Add send-test-event button and delivery-history table to the webhooks settings page",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "webhook-deliveries-route",
+     "extent": "in_plan"
+    },
+    {
+     "tag": "webhook-test-event-route",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "webhook-delivery-ui",
+    "webhooks-page-delivery-ui"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-015",
+   "title": "Add Create Key action, one-time secret display, and real EmptyState CTA to the API Keys page",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "api-key-creation-ui",
+    "key1-empty-state-cta"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-016",
+   "title": "[DESIGN FIRST] Design and implement API key domain-restriction data model and enforcement",
+   "depends_on": [
+    "bugfix-015"
+   ],
+   "requires": [],
+   "provides": [
+    "api-key-domain-restriction",
+    "key2-domain-model-decision",
+    "key2-domain-enforcement",
+    "key2-allowed-domains-ui"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-017",
+   "title": "Seed a test API key (and test domain once KEY2 lands) in prisma/seed.ts",
+   "depends_on": [
+    "bugfix-016"
+   ],
+   "requires": [
+    {
+     "tag": "api-key-domain-restriction",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "seeded-test-api-key",
+    "key3-seeded-test-api-key"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "bugfix-018",
+   "title": "Run lint, build, and targeted test suites across all Phase 2a changes",
+   "depends_on": [
+    "bugfix-002",
+    "bugfix-003",
+    "bugfix-004",
+    "bugfix-005",
+    "feat-003",
+    "feat-004",
+    "feat-006",
+    "bugfix-009-1",
+    "bugfix-009-2",
+    "test-010",
+    "test-011",
+    "bugfix-011",
+    "bugfix-013",
+    "bugfix-014",
+    "bugfix-015",
+    "bugfix-016",
+    "bugfix-017"
+   ],
+   "requires": [],
+   "provides": [
+    "phase-2a-verified"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "feat-003",
+   "title": "Gate Send With Love credit panels behind the Aftercare feature flag (BIL4)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "bil4-aftercare-gating",
+    "swl-aftercare-gate"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "feat-004",
+   "title": "Harden CreditBalancePanel's error fallback for unprovisioned accounts (BIL4 defense-in-depth)",
+   "depends_on": [
+    "feat-003"
+   ],
+   "requires": [],
+   "provides": [
+    "bil4-credit-balance-error-fallback",
+    "credit-balance-panel-error-hardened"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "feat-006",
+   "title": "Add sticky header (and sticky label columns) to the roles permission matrix (ROL1)",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "rol1-sticky-matrix-header",
+    "roles-matrix-sticky-header"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-001",
+   "title": "Extend billing-hub-panel tests for tier-switch error passthrough and confirmation copy",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "bil2-tier-error-and-confirmation-fix",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "bil2-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-002",
+   "title": "Add billing-hub-panel test for payment-method removal confirmation dialog",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "bil1-remove-payment-method-confirm",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "bil1-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-003",
+   "title": "Add billing/page.test.tsx tests for Aftercare-gated credit panels",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "bil4-aftercare-gating",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "bil4-page-gating-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-004",
+   "title": "Extend credit-panels tests for CreditBalancePanel error-fallback hardening and CreditTopUpPanel auth-fetch/eligibility behavior",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "bil4-credit-balance-error-fallback",
+     "extent": "in_plan"
+    },
+    {
+     "tag": "credit-top-up-panel-auth-migrated",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "bil4-bil5-panel-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-005",
+   "title": "Extend billing-hub-panel tests for BIL3 invoice-payment mode coverage regression guard",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "bil3-regression-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-006",
+   "title": "Add billing-contact-panel and tax-exemption-panel tests for BIL6/BIL7 behavior",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "bil7-review-notes-display",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "bil6-bil7-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-007",
+   "title": "Add sticky-header markup test to roles page permission-matrix suite",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "rol1-sticky-matrix-header",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "rol1-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-008",
+   "title": "Add role-editor edit-mode tests",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "role-editor-edit-mode-props",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "rol2-editor-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-009",
+   "title": "Add roles page tests for custom-role Edit/Duplicate/Delete wiring",
+   "depends_on": [
+    "test-008"
+   ],
+   "requires": [
+    {
+     "tag": "custom-role-edit-duplicate-delete",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "rol2-page-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-010",
+   "title": "Write role-enforcement Vitest integration suite across all built-in roles",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "rol3-role-enforcement-test-coverage",
+    "role-enforcement-test-suite",
+    "rol3-role-enforcement-tests"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-011",
+   "title": "Add nav-visibility permission assertions for the settings/app sidebar",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "rol3-nav-visibility-test-coverage",
+    "role-enforcement-test-suite",
+    "rol3-nav-visibility-tests"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-012",
+   "title": "Add integrations panel tests for Passare helper text and overwrite-confirmation dialog",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "passare-integration-warning-fixed",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "int1-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-013",
+   "title": "Extend webhooks page test for ALL_EVENT_TYPES constant and module-doc alignment",
+   "depends_on": [],
+   "requires": [],
+   "provides": [
+    "web1-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-014",
+   "title": "Add webhooks page and route tests for delivery-history and send-test-event (WEB2)",
+   "depends_on": [
+    "test-013"
+   ],
+   "requires": [
+    {
+     "tag": "webhook-deliveries-route",
+     "extent": "in_plan"
+    },
+    {
+     "tag": "webhook-test-event-route",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "web2-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-015",
+   "title": "Add api-keys page tests for create-key flow and one-time secret display",
+   "depends_on": [],
+   "requires": [
+    {
+     "tag": "api-key-creation-ui",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "key1-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-016",
+   "title": "Add api-keys page and enforcement tests for Allowed Domains display and origin restriction (KEY2)",
+   "depends_on": [
+    "test-015"
+   ],
+   "requires": [
+    {
+     "tag": "api-key-domain-restriction",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "key2-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-017",
+   "title": "Add seed-data verification for a test API key and domain (KEY3)",
+   "depends_on": [
+    "test-015",
+    "test-016"
+   ],
+   "requires": [
+    {
+     "tag": "api-key-creation-ui",
+     "extent": "in_plan"
+    },
+    {
+     "tag": "api-key-domain-restriction",
+     "extent": "in_plan"
+    }
+   ],
+   "provides": [
+    "key3-test-coverage"
+   ],
+   "_cofile_cluster": null
+  },
+  {
+   "id": "test-018",
+   "title": "Run full verification checklist: lint, build, and targeted test suite",
+   "depends_on": [
+    "test-001",
+    "test-002",
+    "test-003",
+    "test-004",
+    "test-005",
+    "test-006",
+    "test-007",
+    "test-009",
+    "test-010",
+    "test-011",
+    "test-012",
+    "test-013",
+    "test-014",
+    "test-015",
+    "test-016",
+    "test-017"
+   ],
+   "requires": [],
+   "provides": [
+    "phase-2a-verification-passed"
+   ],
+   "_cofile_cluster": null
+  }
+ ],
+ "defects": [
+  {
+   "kind": "missing_requires",
+   "sid": "test-006",
+   "tag_or_dep": "billing-contact-panel-auth-migrated",
+   "concrete_reason": "redacted",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "test-014",
+   "tag_or_dep": "webhook-delivery-ui",
+   "concrete_reason": "redacted",
+   "severity": "live_defect"
+  },
+  {
+   "kind": "missing_requires",
+   "sid": "bugfix-018",
+   "tag_or_dep": "test-001, test-002, test-003, test-004, test-005, test-006, test-007, test-009, test-012, test-013, test-014, test-015, test-016, test-017",
+   "concrete_reason": "redacted",
+   "severity": "live_defect"
+  }
+ ]
+}
