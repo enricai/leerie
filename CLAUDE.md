@@ -2617,6 +2617,30 @@ behavioral file pins that narrowing the `except` did not make an advisory
 gate fatal. All were falsified live against each defect reintroduced
 individually.
 
+`leerie resume <run-id>` — the documented positional form — is pinned by
+`tests/test_resume_positional_run_id.py`. It silently ignored the run-id on
+every runtime until 2026-08-05: `main()` popped only `argv[0]` (the verb), so
+a run-id in `argv[1]` bound to argparse's `task` positional, `--run-id` stayed
+`None`, and `resolve_run_id` **auto-picked a different run** — measured live
+against a *running* one, where only the run-directory flock prevented a second
+orchestrator (an idle run would have been resumed silently). `resume` is the
+only verb exposed to this: `stop` / `kill` / `accept-blocked` / `finalize` /
+`status` all `exit` inside the launcher and never reach that argparse.
+`_extract_resume_run_id()` now takes the positional **before** `parse_args`
+(the ordering IS the contract — afterwards `task` has already swallowed it),
+scoped to `resume` because `list` has its own positionals
+(`list status paused`, `list chains`), with a `die()` when a positional and
+`--run-id` disagree. **No existing test could catch it** —
+`test_resolve_run_id*.py` call `resolve_run_id` directly *with* an id, so they
+passed against broken plumbing; nothing crossed the launcher→argparse
+boundary, the same shape as the coverage-gate bug above. Two traps recorded in
+that file: reverting only the *wiring* (helper defined but uncalled) must fail
+— a present-but-inert fix is the failure mode that let the coverage gate ship
+— and the safety proof that `args.task` is read only on the non-resume branch
+walks the AST of `_run_phases`, because the obvious
+`"args.task" not in getsource(main)` passes trivially (the reads are in
+`_run_phases`, not `main`) and proved nothing.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
