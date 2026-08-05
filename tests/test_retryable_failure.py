@@ -43,13 +43,62 @@ def test_terminal_kinds_return_false(leerie, kind):
 
 
 def test_retryable_kinds_constant_matches_documented_set(leerie):
-    """The retryable enum must be exactly the three documented kinds.
+    """The retryable enum must be exactly the four documented kinds.
     Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
     assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
-        {"no_commits", "dirty_worktree", "empty_handoff"}
+        {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup"}
     )
+
+
+def test_worktree_setup_is_retryable(leerie):
+    """A worktree-setup failure is INFRASTRUCTURE, not a broken worker.
+
+    It is raised before any worker runs, so `_retryable_failure`'s stated
+    rationale for terminal ("the worker is broken or dishonest, and
+    re-running it burns a worker invocation for no expected gain") does not
+    hold: re-running is exactly what clears it.
+
+    Regression pin for run 488c42e5 (2026-08-05), which lost `bugfix-009-2`
+    to this after its implementer had already committed — killing the wave
+    with 25 of 26 subtasks complete and leaving `resume` to hit the same
+    wall on every attempt."""
+    assert leerie._retryable_failure("worktree_setup") is True
+
+
+def test_worktree_setup_retries_in_place_and_keeps_the_branch(leerie):
+    """THE DESTRUCTIVE-FIX GUARD.
+
+    Marking the kind retryable is only half correct. The retry path calls
+    `_reset_subtask_worktree`, which runs `git branch -D` on the subtask
+    branch — right for `no_commits` (nothing worth keeping), catastrophic
+    here: the branch can already carry an earlier attempt's commits (488c42e5
+    failed with `de0d3bf` committed). Resetting would turn an infrastructure
+    hiccup into silent loss of paid-for work.
+
+    So the kind must ALSO be in `_INFRASTRUCTURE_FAILURE_KINDS`, and `_settle_subtask`
+    must gate the reset on it. `new-worktree.sh` reuses an existing branch by
+    design, so retrying in place re-attaches to the work."""
+    assert "worktree_setup" in leerie._INFRASTRUCTURE_FAILURE_KINDS
+    assert "git branch -D" in inspect.getsource(
+        leerie._reset_subtask_worktree) or "branch" in inspect.getsource(
+        leerie._reset_subtask_worktree), "reset no longer touches the branch"
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "_INFRASTRUCTURE_FAILURE_KINDS" in src, (
+        "the reset is no longer gated — a worktree_setup retry would "
+        "delete a branch that may hold committed work")
+    i = src.index("_INFRASTRUCTURE_FAILURE_KINDS")
+    j = src.index("await _reset_subtask_worktree")
+    assert i < j, "the guard must precede the reset call"
+
+
+def test_no_commits_still_resets(leerie):
+    """ANTI-VACUITY: the in-place exemption must not disable the reset for
+    the kind that genuinely needs it. `no_commits` means the branch holds
+    nothing, and without the reset the retry hits
+    `fatal: a branch ... already exists`."""
+    assert "no_commits" not in leerie._INFRASTRUCTURE_FAILURE_KINDS
 
 
 # --- coupling test: producer returns must match consumer's accepted set ---
@@ -65,6 +114,8 @@ _PRODUCER_RETRYABLE_KINDS = {
     "dirty_worktree",
     # _validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
     "empty_handoff",
+    # _settle_subtask's `except WorktreeSetupError` arm → "worktree_setup"
+    "worktree_setup",
 }
 
 
@@ -173,3 +224,86 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
         f"Every fail() invocation must pair a structured "
         f"`failure_kind` with a human-readable `reason`."
     )
+
+
+def test_settle_subtask_tags_worktree_setup(leerie):
+    """`_settle_subtask` must catch `WorktreeSetupError` SEPARATELY from the
+    generic `except WorkerError`, which tags everything "broken" (terminal).
+
+    Ordering is load-bearing: `WorktreeSetupError` subclasses `WorkerError`,
+    so a generic handler placed first would swallow it and the kind would
+    never be produced."""
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "except WorktreeSetupError" in src
+    assert '"worktree_setup"' in src
+    assert (src.index("except WorktreeSetupError")
+            < src.index("except WorkerError as e:")), (
+        "WorktreeSetupError must be caught BEFORE the generic WorkerError "
+        "arm — it is a subclass, so a generic-first order swallows it")
+
+
+def test_producer_raises_the_tagged_exception_type(leerie):
+    """The kind is tagged at the producer, never inferred from prose
+    (the discipline `_RETRYABLE_FAILURE_KINDS`' own comment states)."""
+    src = inspect.getsource(leerie._run_implementer)
+    assert "raise WorktreeSetupError(" in src
+    assert issubclass(leerie.WorktreeSetupError, leerie.WorkerError)
+
+
+class TestCategoryIsTheSingleSourceOfTruth:
+    """One membership must drive every consequence.
+
+    The previous shape needed a kind listed in TWO sets (`_RETRYABLE_*` and
+    `_RETRY_IN_PLACE_*`); a kind in only one is silently half-wrong — retried
+    but branch-deleted, or preserved but terminal — and nothing catches it.
+    That hazard is not hypothetical: auditing `raise WorkerError` found 5-6
+    more infrastructure failures (PID exhaustion, OOM-kill, dropped API
+    connection, 529, auth/quota) on the same generic path, so this set will
+    gain members."""
+
+    def test_infrastructure_kinds_are_retryable_by_composition(self, leerie):
+        assert leerie._INFRASTRUCTURE_FAILURE_KINDS <= \
+            leerie._RETRYABLE_FAILURE_KINDS
+        assert leerie._RETRYABLE_FAILURE_KINDS == (
+            leerie._WORKER_RETRYABLE_KINDS
+            | leerie._INFRASTRUCTURE_FAILURE_KINDS), (
+            "the retryable set must be COMPOSED from the two categories, not "
+            "maintained separately — a hand-maintained copy is how a kind "
+            "ends up in one list and not the other")
+
+    def test_the_two_categories_are_disjoint(self, leerie):
+        """A kind is either the worker's doing or it is not."""
+        assert not (leerie._WORKER_RETRYABLE_KINDS
+                    & leerie._INFRASTRUCTURE_FAILURE_KINDS)
+
+    def test_composition_is_not_hand_maintained(self, leerie):
+        """Source guard: `_RETRYABLE_FAILURE_KINDS` must be derived. A literal
+        frozenset here would pass the equality test above today and silently
+        drift the moment a category gains a member."""
+        src = inspect.getsource(leerie)
+        m = re.search(r"^_RETRYABLE_FAILURE_KINDS\s*=\s*(.+)$", src,
+                      re.MULTILINE)
+        assert m, "constant not found"
+        assert "frozenset({" not in m.group(1), (
+            "must be composed from the category sets, not a literal")
+        assert "_INFRASTRUCTURE_FAILURE_KINDS" in m.group(1)
+
+    def test_infrastructure_retry_is_logged(self, leerie):
+        """It used to be silent: `fail()` logs only on terminal or
+        cap-reached, so an operator saw a worker re-run with no explanation.
+        Part of why 488c42e5 was hard to diagnose."""
+        src = inspect.getsource(leerie._settle_subtask)
+        # Strip comments first. The explanatory comment above the call also
+        # contains "infrastructure failure", so a naive substring check is
+        # satisfied by prose even when the log() call is gone — the same trap
+        # CLAUDE.md records for the zombie reaper's docstring. Verified by
+        # mutation: replacing the call with `pass` passed the naive check.
+        code = "\n".join(l for l in src.splitlines()
+                         if not l.strip().startswith("#"))
+        assert 'log(f"  {sid}: infrastructure failure' in code, (
+            "the infrastructure retry is silent again — an operator sees a "
+            "worker re-run with no line explaining why")
+        assert (code.index("_INFRASTRUCTURE_FAILURE_KINDS")
+                < code.index("infrastructure failure")), (
+            "the log must sit inside the category branch")
+
