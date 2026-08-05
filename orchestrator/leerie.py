@@ -12676,11 +12676,15 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # allowance sits unused (P9). `- 2048` reserves headroom for the
     # resident `claude -p` process sharing the same cgroup (see
     # _auto_worker_memory_max's docstring: build + resident claude peaks
-    # around 6.3 GiB, measured against an 8 GiB floor).
+    # around 6.3 GiB, measured against an 8 GiB floor). Auto-derivation
+    # floors at 8 GiB so this is normally >= 6144, but --worker-memory-max /
+    # LEERIE_WORKER_MEMORY_MAX / leerie.toml let an operator set the cap
+    # below 2 GiB explicitly — clamp so V8 is never handed a non-positive
+    # or degenerately small ceiling.
     if worker_memory_max_bytes is not None and _is_node_repo(cwd):
         if worker_env is None:
             worker_env = os.environ.copy()
-        cap_mb = worker_memory_max_bytes // (1024 * 1024) - 2048
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
     proc = await asyncio.create_subprocess_exec(

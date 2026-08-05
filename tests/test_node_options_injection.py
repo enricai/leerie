@@ -114,3 +114,17 @@ def test_invoke_omits_node_options_when_memory_max_is_none(leerie, tmp_path, mon
         monkeypatch, leerie, str(tmp_path),
         worker_memory_max_bytes=None))
     assert env is None or "NODE_OPTIONS" not in env
+
+
+def test_invoke_clamps_node_options_for_small_explicit_memory_max(leerie, tmp_path, monkeypatch):
+    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX can be set below 2 GiB
+    # explicitly (resolve_worker_memory_max has no minimum, unlike the
+    # auto-derive path's 8 GiB floor) — the naive `cap_mb - 2048` derivation
+    # would go negative and hand V8 an invalid --max-old-space-size.
+    import asyncio
+    (tmp_path / "package.json").write_text("{}")
+    env = asyncio.run(_capture_env_and_run(
+        monkeypatch, leerie, str(tmp_path),
+        worker_memory_max_bytes=1 * 1024**3))
+    assert env is not None
+    assert env["NODE_OPTIONS"] == "--max-old-space-size=256"

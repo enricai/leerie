@@ -3897,6 +3897,26 @@ to `calls.ndjson` or logged — only its fingerprint
 (`_token_fingerprint(token)`, a truncated `sha256` hex digest) appears in
 logs or telemetry.
 
+**`NODE_OPTIONS` heap-cap injection (P9).** Node/V8 derives its default
+heap ceiling (~4.2 GiB) from *host* memory, not the worker's cgroup
+`memory.max` — so a build on a Node repo can abort with a V8 heap OOM
+while most of leerie's (larger) per-worker memory allowance sits unused.
+`_invoke` detects a Node repo via `_is_node_repo(cwd)` (presence of
+`package.json`, `pnpm-lock.yaml`, `package-lock.json`, or `yarn.lock` at
+the worker's cwd) and, when `worker_memory_max_bytes` is set, injects
+`NODE_OPTIONS=--max-old-space-size=<N>` into `worker_env` as a fourth
+sibling conditional block alongside the debug/token/strict-proxy blocks
+above. `N = max(worker_memory_max_bytes // (1024*1024) - 2048, 256)` —
+the `-2048` MB reserves headroom for the resident `claude -p` process
+sharing the same cgroup (`_auto_worker_memory_max`'s docstring: build +
+resident claude peaks around 6.3 GiB, measured against an 8 GiB floor);
+the `max(..., 256)` clamp guards the explicit-override path
+(`--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX` / leerie.toml
+`worker_memory_max`, none of which share the auto-derive path's 8 GiB
+floor) from handing V8 a non-positive or degenerately small ceiling. The
+variable is absent entirely for a non-Node repo or when
+`worker_memory_max_bytes` is `None`.
+
 **Start-of-run probe + selection.** After `preflight()` returns and before
 `phase_classify`, if `CLAUDE_CODE_OAUTH_TOKENS` is present, each token is
 probed for remaining runway and the winner becomes
