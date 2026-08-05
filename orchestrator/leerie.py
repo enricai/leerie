@@ -1123,7 +1123,7 @@ def resolve_prompt(call_type: str) -> tuple[str, str, str]:
 # the conformer schema readable.
 _CONFORMER_BLT_PROP = {
     "type": "object",
-    "required": ["ran", "passed", "command", "summary"],
+    "required": ["ran", "passed", "command"],
     "properties": {
         "ran": {"type": "boolean"},
         "passed": {"type": "boolean"},
