@@ -1161,6 +1161,7 @@ gates (`PRESCRIBED_CMD_UNRUN`), a goal-only task and a fully-covered
 command never gate, and `check_planner_output` itself carries no separate
 adherence axis to demote to advisory, since the floor is wired only into
 `phase_adherence_gate`, not the planner check loop.
+
 The task-coverage gate is **advisory** (2026-08-04). Its deterministic
 floor, `check_required_items_coverage`, was deleted: it required one
 subtask's token set to be a SUPERSET of a required item's, and across every
@@ -1172,10 +1173,9 @@ input it returned a different finding set 85% of the time (n=20) and the
 intersection across repeated samples was empty. `tests/test_phase_planning_coverage_gate.py`
 pins the advisory contract and the floor's absence.
 
-
-`migration_targets`' own sibling gap —
-optional and silently no-op on omission — gets a narrower, same-worker
-mechanical cross-check: `performs_replacement: bool` on the subtask schema
+`migration_targets` carries a gap of the same shape — optional on the
+subtask schema, and silently no-op when a planner omits it — closed by a
+narrow, same-worker mechanical cross-check: `performs_replacement: bool` on the subtask schema
 (alongside, not nested inside, `migration_targets` — that object's
 `additionalProperties: False` forces this), and
 `_check_migration_targets_declared(subtasks)` flags `MIGRATION_TARGETS_MISSING`

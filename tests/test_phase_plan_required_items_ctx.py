@@ -9,9 +9,12 @@ floor: without it the planner never sees the classifier's required_items
 checklist, so it cannot plan the work those items name — and the advisory
 `task_coverage_judge` downstream has a real gap to report rather than an
 avoidable one.
-This was caught by an independent re-verification pass after the floor
-itself landed — the floor and its test suite were both correct in
-isolation, but nothing fed the planner the data it needed to satisfy it.
+
+The injection was originally added by an independent re-verification pass
+after the floor landed: the floor and its test suite were both correct in
+isolation, but nothing fed the planner the checklist the floor measured it
+against. The floor is gone; the missing-input defect it exposed is not,
+which is why these tests outlived it.
 
 Verifies:
 - When st.data["required_items"] is non-empty, the ctx JSON blob carries
