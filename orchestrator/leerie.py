@@ -16288,25 +16288,23 @@ def _planner_sample_is_empty_ready(sample: dict, sibling_subtask_counts: list[in
     `_select_best_planner_sample`.
 
     `sibling_subtask_counts` is every OTHER sample's subtask count (this
-    sample excluded). Omitted (the single-sample-mode / no-siblings case),
-    the check degrades to the original exact-empty behavior — `not
-    sample.get("subtasks")` — with no relative comparison possible. When
-    siblings ARE given, exact-empty is always degenerate if any sibling has
-    subtasks (matching the original behavior exactly), and a non-empty
-    sample is additionally near-degenerate when the best sibling has at
+    sample excluded). Exact-empty (`subtasks == []`) is ALWAYS degenerate —
+    unconditional, matching the original behavior exactly (the caller's
+    `elif not ranked: ranked = samples` fallback is what keeps an all-empty
+    set from being wiped out, not this predicate). A non-empty sample is
+    additionally near-degenerate, but only relative to siblings: it is
+    dropped when a sibling's count is given and the best sibling has at
     least `_PLANNER_SAMPLE_DEGENERACY_RATIO`x as many subtasks — comparable
-    sizes (e.g. 8 vs 9) never qualify."""
+    sizes (e.g. 8 vs 9) never qualify, and with no siblings given there is
+    nothing to compare against."""
     if sample.get("status") != "ready":
         return False
     n = len(sample.get("subtasks") or [])
-    if sibling_subtask_counts is None:
-        return n == 0
+    if n == 0:
+        return True
     if not sibling_subtask_counts:
         return False
-    max_sibling = max(sibling_subtask_counts)
-    if n == 0:
-        return max_sibling > 0
-    return max_sibling >= n * _PLANNER_SAMPLE_DEGENERACY_RATIO
+    return max(sibling_subtask_counts) >= n * _PLANNER_SAMPLE_DEGENERACY_RATIO
 
 
 def _select_best_planner_sample(
