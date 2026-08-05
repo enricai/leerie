@@ -13826,7 +13826,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             else:
                 retry_note = (
                     f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
-                    "Return output that conforms exactly to the required schema.")
+                    "Return output that conforms exactly to the required schema. "
+                    "You MUST finish by calling the StructuredOutput tool with "
+                    "your answer — describing the answer in prose is not enough.")
             # Multi-token mid-run failover (DESIGN §6 *Multi-token
             # rotation*) covers BOTH surfaces a rate-limited active token
             # can reach this loop through:

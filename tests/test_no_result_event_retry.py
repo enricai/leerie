@@ -16,7 +16,8 @@ Covers:
   - attempt 1 no-result + attempt 2 valid => claude_p returns the result
   - the attempt-2 prompt names the StructuredOutput tool
   - two no-result attempts still raise WorkerError (worst case unchanged)
-  - a schema-mismatch retry keeps its own (non-StructuredOutput) wording
+  - a schema-mismatch retry now also names the StructuredOutput tool,
+    while keeping its own schema-conformance wording
   - the named/terminal branches above it still RAISE, not return:
     nonzero rc (covers leerie's own deliberate kills) and OOM
 """
@@ -245,15 +246,21 @@ def test_two_no_results_still_raise_worker_error(leerie, monkeypatch, tmp_path):
         _call_claude_p(leerie, monkeypatch, [_SYNTHETIC, _SYNTHETIC], tmp_path)
 
 
-def test_schema_mismatch_retry_keeps_its_own_wording(leerie, monkeypatch, tmp_path):
-    """A missing-structured_output envelope is a *schema* failure, not a
-    session failure: it must not get the StructuredOutput nudge."""
+def test_schema_mismatch_retry_names_structured_output_tool(leerie, monkeypatch, tmp_path):
+    """A missing-structured_output envelope is a *schema* failure (the
+    worker narrated its answer in prose instead of calling the
+    StructuredOutput tool — 100% of leerie-level schema_parse_failed
+    records, per bugfix-007's investigation). The retry note must name the
+    tool explicitly, mirroring the no-result branch's wording, while still
+    keeping its own schema-conformance framing (it is not a session
+    failure, so it need not claim "no result until that tool call")."""
     schema_miss = {"type": "result", "is_error": False, "result": "{}",
                    "structured_output": None}
     _, prompts = _call_claude_p(leerie, monkeypatch, [schema_miss, _VALID], tmp_path)
     assert len(prompts) == 2
     assert "conforms exactly to the required schema" in prompts[1]
-    assert "StructuredOutput" not in prompts[1]
+    assert "StructuredOutput" in prompts[1]
+    assert "describing the answer in prose is not enough" in prompts[1]
 
 
 # ---------------------------------------------------------------------------
