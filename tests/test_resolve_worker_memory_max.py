@@ -272,3 +272,114 @@ def test_node_options_absent_for_non_node_repo(leerie, tmp_path):
         cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
     assert worker_env is None
+
+
+# ---- Source-coupling guard: the tests above vs. _invoke's REAL code -------
+#
+# Every test above replicates `_invoke`'s NODE_OPTIONS block by hand rather
+# than calling `_invoke` (a real async subprocess-spawning function this
+# file's fixtures never exercise). That means none of them would notice if
+# the real block's reserve constant, clamp floor, or gating condition
+# changed. This class extracts the actual source of `_invoke` and asserts,
+# structurally, that the constants/condition the tests assume are still
+# what the shipping code does — so a drift in the real formula/gate fails
+# here even though nothing above calls `_invoke` itself.
+
+import ast
+import inspect
+
+
+def _invoke_node_options_source(leerie) -> str:
+    src = inspect.getsource(leerie._invoke)
+    # Isolate the `if worker_memory_max_bytes is not None and _is_node_repo(...)`
+    # block specifically, not the whole (much larger) function body.
+    marker = "if worker_memory_max_bytes is not None and _is_node_repo(cwd):"
+    assert marker in src, (
+        "_invoke's NODE_OPTIONS gate condition text changed — the tests in "
+        "this file assume `worker_memory_max_bytes is not None and "
+        "_is_node_repo(cwd)` verbatim; update both the gate and this guard "
+        "together if the condition is intentionally changing."
+    )
+    start = src.index(marker)
+    # Grab a generous window after the marker covering the block body.
+    return src[start:start + 400]
+
+
+def test_invoke_node_options_gate_condition_unchanged(leerie):
+    """The gate must require BOTH a resolved memory cap AND a Node repo —
+    an `or` here would set NODE_OPTIONS on non-Node repos (nonsensical) or
+    skip it for Node repos with no memory cap resolved (defeats the fix)."""
+    block = _invoke_node_options_source(leerie)
+    assert "worker_memory_max_bytes is not None and _is_node_repo(cwd)" in block
+
+
+def test_invoke_node_options_reserve_constant_unchanged(leerie):
+    """The 2048 MiB reserve is what the tests above hard-code; a change to
+    this constant in `_invoke` must be reflected in the arithmetic tests
+    too, not silently diverge from what they assert."""
+    block = _invoke_node_options_source(leerie)
+    assert "- 2048" in block, (
+        "The 2048 MiB reserve constant in _invoke's NODE_OPTIONS derivation "
+        "changed — update test_node_options_arithmetic_* to match."
+    )
+
+
+def test_invoke_node_options_clamp_floor_unchanged(leerie):
+    """The clamp floor (256 MiB) prevents a non-positive or degenerate V8
+    heap ceiling when an operator sets a cap below the reserve."""
+    block = _invoke_node_options_source(leerie)
+    assert ", 256)" in block, (
+        "The 256 MiB clamp floor in _invoke's NODE_OPTIONS derivation "
+        "changed — update test_node_options_clamped_when_cap_below_reserve "
+        "to match."
+    )
+
+
+def test_invoke_node_options_env_key_and_format_unchanged(leerie):
+    """The env var name and --max-old-space-size flag format must match
+    what every test above asserts on."""
+    block = _invoke_node_options_source(leerie)
+    assert '"NODE_OPTIONS"' in block
+    assert "--max-old-space-size={cap_mb}" in block
+
+
+def test_invoke_node_options_formula_ast_matches_helper(leerie):
+    """Parse `_invoke`'s real NODE_OPTIONS assignment as an AST and confirm
+    it computes `max(worker_memory_max_bytes // (1024*1024) - 2048, 256)` —
+    structurally, not by substring — so a reformulation that keeps the
+    substrings above (e.g. reordering the max() args, or changing the
+    divisor) still gets caught."""
+    src = inspect.getsource(leerie._invoke)
+    tree = ast.parse(src)
+
+    found = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "cap_mb"
+            ):
+                found.append(node.value)
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    assert found, "no `cap_mb = ...` assignment found inside _invoke"
+    call = found[0]
+    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "max"
+    assert len(call.args) == 2
+    floor_arg = call.args[1]
+    assert isinstance(floor_arg, ast.Constant) and floor_arg.value == 256
+
+    sub_expr = call.args[0]
+    assert isinstance(sub_expr, ast.BinOp) and isinstance(sub_expr.op, ast.Sub)
+    assert isinstance(sub_expr.right, ast.Constant) and sub_expr.right.value == 2048
+
+    floordiv_expr = sub_expr.left
+    assert isinstance(floordiv_expr, ast.BinOp) and isinstance(floordiv_expr.op, ast.FloorDiv)
+    divisor = floordiv_expr.right
+    # 1024 * 1024
+    assert isinstance(divisor, ast.BinOp) and isinstance(divisor.op, ast.Mult)
+    assert isinstance(divisor.left, ast.Constant) and divisor.left.value == 1024
+    assert isinstance(divisor.right, ast.Constant) and divisor.right.value == 1024
