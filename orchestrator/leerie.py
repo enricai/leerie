@@ -410,9 +410,11 @@ STATE_FIELDS = (
     "adherence_gate",
     # coverage_gate: audit record from the phase 2⅞½ task-coverage gate
     # (phase_planning_coverage_gate) — the final task_coverage_judge output
-    # ({task_covered, coverage_gaps, rationale}). Written once the gate
-    # clears (immediately or after re-planning). Absent when the judge
-    # crashed every round (degrade path returns without persisting this).
+    # ({task_covered, coverage_gaps, rationale}). Written once, immediately
+    # after the gate's single direct invocation — the gate is advisory and
+    # never re-plans, so there are no rounds. Absent when that invocation
+    # raised WorkerError or an OSError from process spawn (the degrade path
+    # returns without persisting this).
     "coverage_gate",
     # classification_coverage_gate: audit record from phase_classification_gate
     # (DESIGN §8 *Independent adversarial verification*) — the final

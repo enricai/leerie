@@ -1173,25 +1173,7 @@ intersection across repeated samples was empty. `tests/test_phase_planning_cover
 pins the advisory contract and the floor's absence.
 
 
-`tests/test_required_items_coverage.py`: uncovered/covered/partial-coverage
-cases, an empty `required_items` staying silent (the common case — 0 false
-positives by construction), paraphrase coverage via the same normalized
-token-SUBSET matching `check_prescribed_command_coverage` uses (matched
-against subtask `title`+`success_criteria_seed`, never `intent` or
-`investigation_notes` — CLAUDE.md *Language-to-JSON*), no-subtasks-at-all
-firing for every item, tolerance of missing fields and non-dict/blank
-entries, case-insensitivity, a negative control against shared-stopword-only
-false coverage, and schema shape pins (`SCHEMAS["classifier"]["required_items"]`
-optional, `item` `minLength: 1`, `required_items` registered in
-`STATE_FIELDS`). The gate's own composition — the floor is still fully
-evaluated (and can still `die()`) even when `task_coverage_judge` crashes
-on every round, closing the same "WorkerError silently waives the floor"
-trap `phase_adherence_gate`'s own degrade path already avoided — is pinned
-in `tests/test_phase_planning_coverage_gate.py`: floor-clean-and-judge-clean
-passes unchanged, a floor issue forces a re-plan even when the judge itself
-says `task_covered: true` (the floor's whole reason to exist), and the
-crash-every-round path both still dies when the floor has issues and still
-degrades cleanly when it doesn't. `migration_targets`' own sibling gap —
+`migration_targets`' own sibling gap —
 optional and silently no-op on omission — gets a narrower, same-worker
 mechanical cross-check: `performs_replacement: bool` on the subtask schema
 (alongside, not nested inside, `migration_targets` — that object's
@@ -2620,12 +2602,12 @@ stub captures the real kwargs, then `inspect.signature(leerie.claude_p).bind(...
 binds them against the live signature — generalizing
 `test_recursive_decompose.py`'s C0 guard) paired with
 `TestProgrammingErrorsPropagate`, which pins that the gate catches
-`WorkerError` **only**: a worker failure is an expected advisory degrade, a
-`TypeError` is a leerie bug and must propagate rather than masquerade as one.
-An `OSError` from process spawn degrades too (the gate's docstring promises it
-never terminates a run) and is disjoint from every programming-error class, so
-admitting it re-opens nothing — `TestInfrastructureFailureDegrades` pins both
-halves. `TestBudgetIsCharged` pins the `st.bump_workers(caps)` this call was
+`WorkerError` and `OSError` **only**: a worker failure, or a failure to spawn
+the process at all, is an expected advisory degrade (the gate's docstring
+promises it never terminates a run), while a `TypeError` is a leerie bug and
+must propagate rather than masquerade as one. `OSError` is disjoint from every
+programming-error class, so admitting it re-opens nothing —
+`TestInfrastructureFailureDegrades` pins both halves. `TestBudgetIsCharged` pins the `st.bump_workers(caps)` this call was
 missing (IMPLEMENTATION.md §8 requires it, and `integration_judge` — named in
 that same sentence — already did it), including that the bump sits OUTSIDE the
 `try` so budget exhaustion aborts instead of degrading.

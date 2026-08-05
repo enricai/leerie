@@ -1,11 +1,14 @@
-"""Tests for required_items injection into phase_plan context (the PRIMARY
-floor for the task-coverage gate — DESIGN §8 sibling to the instruction-
-adherence gate's prescribed_procedure injection).
+"""Tests for required_items injection into phase_plan context (DESIGN §8
+sibling to the instruction-adherence gate's prescribed_procedure injection).
 
-Without this injection, check_required_items_coverage() has no way to be
-satisfied: the planner never sees the classifier's required_items
-checklist, so it can never echo an item's wording into a subtask, so
-every declared item reads as REQUIRED_ITEM_UNCOVERED on every real run.
+The deterministic floor this injection was originally built to satisfy,
+`check_required_items_coverage`, was deleted on 2026-08-04 (it passed 0 of
+102 items and token-matched prose, violating *Language-to-JSON*). The
+injection itself remains load-bearing for the reason that outlived the
+floor: without it the planner never sees the classifier's required_items
+checklist, so it cannot plan the work those items name — and the advisory
+`task_coverage_judge` downstream has a real gap to report rather than an
+avoidable one.
 This was caught by an independent re-verification pass after the floor
 itself landed — the floor and its test suite were both correct in
 isolation, but nothing fed the planner the data it needed to satisfy it.
