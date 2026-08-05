@@ -5188,11 +5188,16 @@ subtask count (more = better coverage), tiebreak on first sample
 selection. If all samples for a domain crash, the run aborts.
 
 **Validity gate (runs before scoring).**
-`_planner_sample_is_empty_ready(sample)` returns True for a `status ==
-"ready"` plan with no subtasks. `_select_best_planner_sample` drops those
-samples **before** ranking — but only while at least one non-empty sibling
-survives; if every sample is empty the full set is ranked unchanged, so
-`_detect_no_work`'s terminal route still fires.
+`_planner_sample_is_empty_ready(sample, sibling_subtask_counts=None)`
+returns True for a `status == "ready"` plan that is exactly empty (always,
+unconditionally), or "near-degenerate" — non-empty but with substantially
+fewer subtasks than the largest sibling (`_PLANNER_SAMPLE_DEGENERACY_RATIO`,
+4x) — when `sibling_subtask_counts` (every other sample's subtask count) is
+given. `_select_best_planner_sample` drops those samples **before**
+ranking — but only while at least one surviving sibling is not itself
+dropped; if every sample is empty/near-degenerate relative to the rest the
+full set is ranked unchanged, so `_detect_no_work`'s terminal route still
+fires.
 
 The gate must precede the scoring rather than join it as another sort key:
 `check_planner_output` inspects subtasks, so a plan with none to inspect
