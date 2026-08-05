@@ -172,6 +172,31 @@ def test_new_schema_confidence_structure(leerie, schema_key, axes):
     _assert_confidence_schema(leerie, schema_key, axes)
 
 
+def test_fit_judge_schema_required_fields_relaxed(leerie):
+    """fit_judge is the one schema that loses more than just `confidence`
+    from required (P3): `diffuse` and `rationale` are also relaxed to
+    optional, since both are advisory prose the caller does not gate on.
+    All three remain requested via properties."""
+    fit_judge = leerie.SCHEMAS["fit_judge"]
+    required = set(fit_judge["required"])
+    for relaxed in ("confidence", "diffuse", "rationale"):
+        assert relaxed in fit_judge["properties"], (
+            f"fit_judge deleted {relaxed} rather than relaxing it")
+        assert relaxed not in required, (
+            f"fit_judge still requires {relaxed} (P3)")
+    assert "score" in required
+
+
+def test_rebaser_schema_confidence_not_required(leerie):
+    """rebaser requests confidence (the §8 self-gate) but no longer
+    requires it at the top level (P3)."""
+    rebaser = leerie.SCHEMAS["rebaser"]
+    required = set(rebaser["required"])
+    assert "confidence" in rebaser["properties"]
+    assert "confidence" not in required
+    assert {"status", "final_branch_state"}.issubset(required)
+
+
 def test_confidence_schema_helper_produces_correct_structure(leerie):
     """The _confidence_schema helper builds the same shape regardless
     of the number of axes."""
