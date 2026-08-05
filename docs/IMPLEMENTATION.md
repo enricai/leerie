@@ -4850,7 +4850,7 @@ regardless of `make_feedback_prompt`.
 | `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `_settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. `confidence` remains top-level REQUIRED (the DESIGN §8/§12 structural self-gating contract is preserved — every gate still reads a real number). Pinned by `tests/test_confidence_length_caps.py`. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. **Superseded 2026-08-05 (P3):** `confidence` itself was subsequently dropped from every one of these 10 schemas' top-level `required` array (still declared in `properties`, so a worker that does emit it is still recorded) — the same #49747-corruption risk applied to the required *object itself*, not just its internal fields; a worker that omits the whole self-gate block now still validates. See each worker's own entry above/below for its current required-field list. Pinned by `tests/test_confidence_not_required.py`. `tests/test_confidence_length_caps.py` still covers the sub-schema shape (caps, optional arrays) for callers that do emit it. |
 
 ### Finding severity — gating vs advisory
 
@@ -7993,8 +7993,10 @@ locking).
 `claude_p()` validates each worker's payload against a schema keyed by worker
 type. Required fields, current shape:
 
-- **classifier** — required: `categories` (array), `confidence`
-  (worker-internal self-gate via `_confidence_schema(["classification"])`).
+- **classifier** — required: `categories` (array). Optional (P3,
+  2026-08-05): `confidence` (worker-internal self-gate via
+  `_confidence_schema(["classification"])`, still declared in `properties`
+  but no longer schema-required — see `_confidence_schema`'s entry below).
   Optional: `questions`
   (array of `{id, question, why_underivable?}` — only `id` and `question`
   are required on each question), `source_of_truth_question` (bool). The
@@ -8032,7 +8034,9 @@ type. Required fields, current shape:
   produces post-plan) instead of `die()`ing, and returns `True` so the
   caller (`_run_phases`) stops the pipeline. When unset (the common case),
   behavior is unchanged.
-- **planner** — required: `domain`, `subtasks`, `status`, `confidence`.
+- **planner** — required: `domain`, `subtasks`, `status`. `confidence` is
+  optional (P3, 2026-08-05 — see `_confidence_schema`'s entry below; still
+  declared in `properties`, no longer schema-required).
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,
   it emits `blocked` with an empty subtasks list and the gap analysis in
@@ -8094,23 +8098,24 @@ type. Required fields, current shape:
   `adherence_judge` worker above are wired into `phase_adherence_gate` (a
   whole-plan gate, not `check_planner_output` — see "Instruction-adherence
   gate" above for the phase-level wiring and the `--skip-adherence-check`
-  flag's effect on it). The schema's required-ness of `confidence`
-  and `status` is the structural part of DESIGN §8's discipline: a worker
-  that skipped self-gating fails its own JSON schema before the orchestrator
-  reads the payload.
+  flag's effect on it). The schema's required-ness of
+  `status` is the structural part of DESIGN §8's discipline that survives
+  P3 (2026-08-05): `confidence` itself is no longer schema-required (see
+  `_confidence_schema`'s entry below) — a worker that omits it still
+  validates, since requiring the object was measured to corrupt payloads
+  under anthropics/claude-code#49747 — but `status` still is, so a worker
+  cannot omit its terminal outcome.
 - **implementer** — required: `subtask_id`, `status` (`complete` /
-  `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`),
-  `confidence` (worker-internal self-gate via
-  `_confidence_schema(["root_cause", "solution"])`, not consumed by the
-  orchestrator: required keys are
+  `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`).
+  `confidence` is optional (P3, 2026-08-05 — no longer schema-required, still
+  declared in `properties`): when present, it is the worker-internal
+  self-gate via `_confidence_schema(["root_cause", "solution"])`, not
+  consumed by the orchestrator — shape is
   `root_cause` and `solution` (numbers 1–10), `basis` (string),
   `falsifiers_tested` (array of strings, optional), `contradictions_reconciled`
-  (array of strings, optional). Only the two axes and `basis` are required;
-  when either score is below 9.0 the gap is stated in `basis` (there is no
-  `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
-  mechanically required — the schema requires the object itself, so a
-  worker that skipped self-gating fails validation before the
-  orchestrator reads the payload).
+  (array of strings, optional); when either score is below 9.0 the gap is
+  stated in `basis` (there is no `gap_to_close` — removed 2026-08-03); see
+  DESIGN §8 for the disciplines these fields encode.
   Optional: `branch`, `criteria_results` (array of
   `{criterion, met, evidence}`), `checkpoint_path`, `blocker`, `summary`,
   `clarification_question` (DESIGN §11 mid-execution exception channel:
@@ -8129,13 +8134,17 @@ type. Required fields, current shape:
   not gate the subtask. The retired `criteria_revision_proposal` field
   is no longer in the schema.
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
-  `design-conflict` / `failed`), `confidence` (worker-internal self-gate
-  via `_confidence_schema(["resolution"])`). Optional: `resolution_summary`,
+  `design-conflict` / `failed`). `confidence` is optional (P3, 2026-08-05 —
+  no longer schema-required, still declared in `properties`): when present
+  it is the worker-internal self-gate via `_confidence_schema(["resolution"])`.
+  Optional: `resolution_summary`,
   `diagnosis` (read as a fallback for `resolution_summary` when
   diagnosing a non-`resolved` outcome).
 - **rebaser** — required: `status` (`rebased` / `irreconcilable` / `failed`),
-  `final_branch_state`, `confidence` (`_confidence_schema(["resolution"])`,
-  mirroring `integrator`). Optional: `resolution_summary`, `diagnosis`
+  `final_branch_state`. `confidence` is optional (P3, 2026-08-05 — no
+  longer schema-required, still declared in `properties`): when present it
+  is `_confidence_schema(["resolution"])`, mirroring `integrator`.
+  Optional: `resolution_summary`, `diagnosis`
   (required in practice when `status` is `irreconcilable` — folded into the
   PR body by `scripts/host-finalize.sh`). DESIGN §6 *Finalization*
   "Rebase-onto-base before push": a scoped, fully-agentic exception to §12 —
@@ -8164,13 +8173,7 @@ type. Required fields, current shape:
   `ran: false` when the tool is not applicable to the repo; `passed` is
   irrelevant when `ran: false`),
   `summary` (string — one-line description of what the conformance pass
-  did), `confidence` (worker-internal self-gate, not consumed by the
-  orchestrator: required keys `conformance` (number 1–10), `basis`
-  (string), `falsifiers_tested` (array of strings, optional),
-  `contradictions_reconciled` (array of strings, optional). Only `conformance`
-  and `basis` are required; when conformance is below 9.0 the gap is stated in
-  `basis` (there is no `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
-  mechanically required), and `solution_defects` (array of `{kind:
+  did), and `solution_defects` (array of `{kind:
   enum[unhandled_input, unhandled_path, missing_guard, sibling_site_unedited,
   wrong_selector, decoy_or_shortcut], concrete_case (string, minLength 1),
   where (string, minLength 1), why_ships_a_defect (string, minLength 1)}` — the
@@ -8191,7 +8194,14 @@ type. Required fields, current shape:
   worktree, and every `solution_defects` item carries a non-empty
   `concrete_case` and `where` (a defect without a concrete case is
   non-actionable and dropped, so the gate cannot fire on vague prose) — are
-  enforced by `_validate_conformance_result()`.
+  enforced by `_validate_conformance_result()`. `confidence` is optional
+  (P3, 2026-08-05 — no longer schema-required, still declared in
+  `properties`): when present it is the worker-internal self-gate, not
+  consumed by the orchestrator — shape is `conformance` (number 1–10),
+  `basis` (string), `falsifiers_tested` (array of strings, optional),
+  `contradictions_reconciled` (array of strings, optional); when
+  conformance is below 9.0 the gap is stated in `basis` (there is no
+  `gap_to_close` — removed 2026-08-03).
 - **judge** — required: `passed` (bool — aggregate verdict, true only when all
   three dimensions are true), `dimensions` (object with required boolean fields
   `schema_ok`, `factual_ok`, `hallucination_ok`), `rationale` (str — 1–3
