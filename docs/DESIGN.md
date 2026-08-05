@@ -580,8 +580,13 @@ a re-run of every phase upstream of itself, not just the reconciler.
 The repair is asymmetric because the gates sit at different positions. A
 re-plan from the adherence gate must re-run reconcile and the overlap
 judge; it does not need the coverage gate, which has not run yet and will
-see the re-planned output anyway. A re-plan from the coverage gate must
-re-run reconcile, the overlap judge, **and** the adherence gate. Nesting
+see the re-planned output anyway. The coverage gate itself no longer
+re-plans at all — it was demoted to advisory on 2026-08-04 (§8 *Independent
+adversarial verification*), so the obligation it would otherwise owe
+(reconcile, the overlap judge, **and** the adherence gate — it sits
+furthest downstream) is currently unexercised. It is stated here because
+the rule is positional, not gate-specific: any gate later given re-plan
+authority inherits the obligation of everything upstream of it. Nesting
 a gate inside another gate's retry loop is bounded rather than recursive:
 every gate drives its re-plans through the shared mechanical-feedback
 loop under one round budget, so the worst case is the product of two

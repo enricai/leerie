@@ -350,6 +350,14 @@ def test_budget_check_resume_reruns_only_budget_check_under_raised_cap(
         "plans_after_reconcile": persisted_plans,
         "plans_after_overlap_judge": persisted_plans,
         "plans_after_adherence_gate": persisted_plans,
+        # plans_after_coverage_gate MUST be seeded alongside the others: in
+        # _run_phases it is written BETWEEN adherence_gate and filters, so a
+        # state carrying filters but not this key is one a real run cannot
+        # produce. The resume cursor keys on each checkpoint independently,
+        # so omitting it re-runs the coverage gate — which used to be a
+        # guaranteed no-op (it raised TypeError on every call and its own
+        # broad `except` degraded), and now really invokes a worker.
+        "plans_after_coverage_gate": persisted_plans,
         "plans_after_filters": persisted_plans,
         "plan_snapshot": {
             "subtasks": snapshot_subtasks, "waves": snapshot_waves},

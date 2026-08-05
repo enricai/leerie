@@ -2599,6 +2599,42 @@ between the two flags is unchanged and is load-bearing — requiring both
 would drop the npm and yarn forms, which
 `tests/test_capture_deps.py::test_keeps_node_offline_relink_only` pins.
 
+Every `claude_p` call site in the module is statically checked against the
+real signature by `tests/test_claude_p_call_sites.py` — all-keyword (no
+positionals), every required parameter present, no unknown keyword, and
+`model=` never a defaultless `<dict>.get(k)` (which yields `None` for any
+worker absent from `MODEL_DEFAULT_PER_WORKER` — i.e. most of them, since a
+new worker is *required* to be absent and fall through to `MODEL_DEFAULT`).
+It exists because 0.10.0 shipped `phase_planning_coverage_gate` calling
+`claude_p` with two positionals plus a duplicate `system_prompt=`, and
+omitting the required `allowed_tools`/`max_turns`: it raised `TypeError` on
+**every** invocation, and the gate's own broad `except Exception` logged it
+as a clean advisory degrade. The judge never ran once for a whole release,
+and the log line read like a healthy degrade path. **No stub-based test can
+catch this class** — every test in the suite stubs `claude_p`, and a stub
+accepts any signature — which is exactly why the guard is a static AST sweep
+over the whole module rather than a behavioral pin on one call site. The
+gate's own behavioral counterpart lives in
+`tests/test_phase_planning_coverage_gate.py::TestCallSignature` (a recording
+stub captures the real kwargs, then `inspect.signature(leerie.claude_p).bind(...)`
+binds them against the live signature — generalizing
+`test_recursive_decompose.py`'s C0 guard) paired with
+`TestProgrammingErrorsPropagate`, which pins that the gate catches
+`WorkerError` **only**: a worker failure is an expected advisory degrade, a
+`TypeError` is a leerie bug and must propagate rather than masquerade as one.
+An `OSError` from process spawn degrades too (the gate's docstring promises it
+never terminates a run) and is disjoint from every programming-error class, so
+admitting it re-opens nothing — `TestInfrastructureFailureDegrades` pins both
+halves. `TestBudgetIsCharged` pins the `st.bump_workers(caps)` this call was
+missing (IMPLEMENTATION.md §8 requires it, and `integration_judge` — named in
+that same sentence — already did it), including that the bump sits OUTSIDE the
+`try` so budget exhaustion aborts instead of degrading.
+Both files carry anti-vacuity controls — the static scan asserts it found the
+call sites at all (a scan that finds nothing passes every assertion), and the
+behavioral file pins that narrowing the `except` did not make an advisory
+gate fatal. All were falsified live against each defect reintroduced
+individually.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

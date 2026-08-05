@@ -60,6 +60,11 @@ def st(leerie, tmp_path):
     s.data = {}
     s.run_dir = tmp_path
     s.save = lambda: None
+    # The gate charges the per-run worker budget before invoking the judge
+    # (IMPLEMENTATION.md §8: "after `st.bump_workers(caps)`"). Counting rather
+    # than no-op'ing so a test can assert the charge actually happens.
+    s.bumps = []
+    s.bump_workers = lambda caps: s.bumps.append(caps)
     return s
 
 
@@ -205,3 +210,162 @@ class TestSkipCoverageCheck:
         src = inspect.getsource(leerie.phase_planning_coverage_gate)
         assert (src.index('st.data.get("skip_coverage_check")')
                 < src.index("_load_prompt("))
+
+
+# --- the guard that would have caught the 0.10.0 bug ---------------------- #
+
+class TestCallSignature:
+    """Every other test in this file stubs `claude_p`, and a stub accepts any
+    signature. That is precisely why 0.10.0 shipped a gate whose judge raised
+    `TypeError` on every invocation — two positionals where all-keyword was
+    required, and `allowed_tools`/`max_turns` (both REQUIRED) omitted — while
+    a broad `except Exception` logged it as a clean advisory degrade. The
+    judge never ran once.
+
+    These bind the gate's real kwargs against the real `claude_p` signature,
+    the technique `test_recursive_decompose.py`'s C0 guard already uses."""
+
+    def _call_kwargs(self, leerie) -> dict:
+        """Capture exactly what the gate passes, via a recording stub."""
+        import asyncio
+        captured = {}
+
+        async def rec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return CLEAN
+
+        st = leerie.State.__new__(leerie.State)
+        st.data = {}
+        st.run_dir = "/tmp"
+        st.save = lambda: None
+        st.bumps = []
+        st.bump_workers = lambda caps: st.bumps.append(caps)
+        import unittest.mock as mock
+        with mock.patch.object(leerie, "claude_p", rec):
+            asyncio.run(leerie.phase_planning_coverage_gate(
+                [_plan("d", _subtask("feat-001"))], "task", st,
+                _caps(leerie), {}, {}))
+        return captured
+
+    def test_gate_passes_no_positional_arguments(self, leerie):
+        """The shipped bug: `claude_p("task_coverage_judge", prompt, ...)`
+        bound the worker name to `user_prompt` and the prompt to
+        `system_prompt`, which was ALSO given by keyword."""
+        cap = self._call_kwargs(leerie)
+        assert cap["args"] == (), (
+            f"gate passed positionals {cap['args']!r}; claude_p's first "
+            "params are (user_prompt, system_prompt, ...) and every other "
+            "caller uses all-keyword")
+
+    def test_call_signature_binds_against_the_real_claude_p(self, leerie):
+        """THE GUARD. Binds the captured kwargs against the REAL signature,
+        so a missing required parameter fails here instead of at runtime."""
+        import inspect
+        cap = self._call_kwargs(leerie)
+        inspect.signature(leerie.claude_p).bind(*cap["args"], **cap["kwargs"])
+
+    def test_required_params_are_all_supplied(self, leerie):
+        import inspect
+        cap = self._call_kwargs(leerie)
+        required = {n for n, p in inspect.signature(leerie.claude_p)
+                    .parameters.items()
+                    if p.default is inspect.Parameter.empty}
+        missing = required - set(cap["kwargs"])
+        assert not missing, f"gate omits required claude_p params: {missing}"
+
+    def test_judge_gets_inspect_tools(self, leerie):
+        """Load-bearing, not decoration: the judge's prompt instructs it to
+        read task-referenced files itself. Omitting tools leaves it blind."""
+        cap = self._call_kwargs(leerie)
+        assert cap["kwargs"].get("allowed_tools") == leerie.INSPECT_TOOLS
+
+    def test_model_falls_back_rather_than_passing_none(self, leerie):
+        """`models.get(k)` with no default yields None, which reaches the
+        argv builder and raises at subprocess spawn."""
+        cap = self._call_kwargs(leerie)
+        assert cap["kwargs"].get("model") is not None
+
+
+class TestProgrammingErrorsPropagate:
+    """A worker failure is expected here and degrades. A programming error is
+    not a worker failure and must NOT be reported as an advisory degrade —
+    swallowing it is what hid the broken call for a whole release."""
+
+    def test_typeerror_propagates(self, leerie, st, monkeypatch):
+        import asyncio
+
+        async def boom(*a, **k):
+            raise TypeError("bad call site")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        with pytest.raises(TypeError):
+            _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+
+    def test_workererror_still_degrades(self, leerie, st, monkeypatch):
+        """ANTI-VACUITY: narrowing the except must not make the gate fatal."""
+        plans = [_plan("d", _subtask("feat-001"))]
+
+        async def boom(*a, **k):
+            raise leerie.WorkerError("infrastructure")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        assert _run(leerie, plans, st) is plans
+
+
+class TestBudgetIsCharged:
+    """IMPLEMENTATION.md §8 requires this judge be invoked "after
+    `st.bump_workers(caps)`" — `integration_judge`, named in that same
+    sentence, does. This gate did not, and `claude_p` does not bump
+    internally, so the invocation was invisible to `max_total_workers`."""
+
+    def test_gate_charges_exactly_one_worker(self, leerie, st, monkeypatch):
+        async def fake(*a, **kw): return CLEAN
+        monkeypatch.setattr(leerie, "claude_p", fake)
+        _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+        assert len(st.bumps) == 1, (
+            f"gate charged the budget {len(st.bumps)}x; it invokes the judge "
+            "exactly once")
+
+    def test_budget_exhaustion_aborts_rather_than_degrading(
+            self, leerie, st, monkeypatch):
+        """The bump sits OUTSIDE the try on purpose: a budget-exhaustion
+        WorkerError is the RUN being over budget, not this judge failing, so
+        it must abort instead of being swallowed as an advisory degrade."""
+        def boom(_caps):
+            raise leerie.WorkerError("worker budget exhausted")
+        st.bump_workers = boom
+        with pytest.raises(leerie.WorkerError, match="budget"):
+            _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+
+    def test_skip_flag_charges_nothing(self, leerie, st):
+        """The cheap-skip must stay free."""
+        st.data["skip_coverage_check"] = True
+        _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+        assert st.bumps == []
+
+
+class TestInfrastructureFailureDegrades:
+    """The docstring's own invariant: "This gate does not terminate a run."
+
+    An OSError from process spawn (a missing or unexecutable `claude`) is
+    infrastructure, not a defect in the plan, and must not kill the run —
+    every sibling advisory phase degrades on it. It is disjoint from every
+    programming-error class, so admitting it re-opens nothing."""
+
+    def test_oserror_degrades(self, leerie, st, monkeypatch):
+        plans = [_plan("d", _subtask("feat-001"))]
+
+        async def boom(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory", "claude")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        assert _run(leerie, plans, st) is plans
+
+    def test_typeerror_still_propagates_after_the_widening(
+            self, leerie, st, monkeypatch):
+        """ANTI-VACUITY: admitting OSError must not re-open the TypeError
+        hole that hid the broken call for a whole release."""
+        async def boom(*a, **k):
+            raise TypeError("bad call site")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        with pytest.raises(TypeError):
+            _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+
