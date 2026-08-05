@@ -1,6 +1,7 @@
 """Tests for resolve_skip_coverage_check() — the --skip-coverage-check
-opt-out for the phase 2⅞½ task-coverage gate (deterministic
-`check_required_items_coverage` floor + `task_coverage_judge` worker).
+opt-out for the phase 2⅞½ task-coverage gate (a single advisory
+`task_coverage_judge` invocation since 2026-08-04; the
+`check_required_items_coverage` floor it used to compose with was deleted).
 
 Covers the precedence order: CLI flag → LEERIE_SKIP_COVERAGE_CHECK env
 var → skip_coverage_check in leerie.toml → False (the gate runs on
