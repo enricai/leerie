@@ -22358,27 +22358,37 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
 # producer return the new kind. The coupling test in
 # tests/test_retryable_failure.py asserts every producer's retryable-path
 # return uses a kind in this set.
-# Retryable kinds whose retry must NOT call `_reset_subtask_worktree`.
-# That helper runs `git branch -D` on the subtask branch — correct when the
-# failure means the branch holds nothing worth keeping (`no_commits`), and
-# DESTRUCTIVE when it does. A worktree-setup failure fires before any worker
-# runs, so there is no leftover from this attempt to clear, while an EARLIER
-# attempt's commits may be sitting on that branch: run 488c42e5's
-# `bugfix-009-2` failed this way with `de0d3bf` already committed, and
-# resetting would have deleted it rather than re-attaching. `new-worktree.sh`
-# reuses an existing branch by design, so retrying in place is both safe and
-# the point.
-_RETRY_IN_PLACE_KINDS = frozenset({"worktree_setup"})
-
-_RETRYABLE_FAILURE_KINDS = frozenset({
+# A failure the WORKER did not cause: either no worker ran, or its own
+# behaviour is not implicated. Three consequences follow from that one fact,
+# so this set is the SINGLE place a kind is declared infrastructure and the
+# rest derive from it — a kind listed in only some of them is silently
+# half-wrong, which is the bug class this whole area keeps producing:
+#
+#   1. retryable by definition (re-running IS the remedy)  -> composed below
+#   2. no `_reset_subtask_worktree` — that runs `git branch -D`, and an
+#      earlier attempt's commits may be on that branch (488c42e5's
+#      `bugfix-009-2` failed with `de0d3bf` already committed; resetting
+#      would have deleted it instead of re-attaching)
+#   3. no corrective note — an infrastructure failure says nothing about what
+#      the worker should do differently, so it must not overwrite what the
+#      worker is being told to fix
+#
+# MEASURED CANDIDATES NOT YET MOVED HERE (deliberate): auditing every
+# `raise WorkerError` found `worker {sid} exhausted its PID`, `worker {sid}
+# was OOM-killed`, `Claude API connection dropped mid-response`, 529
+# overloaded, and auth/quota — all infrastructure on the same generic path.
+# Reclassifying them is a behaviour change well past this incident and could
+# mask a real resource problem, so it needs its own evidence. Bundling it
+# here is how the previous response to this incident became containment.
+_INFRASTRUCTURE_FAILURE_KINDS = frozenset({
     "worktree_setup",  # WorktreeSetupError — `new-worktree.sh` could not
-                       # produce the worktree. Infrastructure, not a broken
-                       # worker: no worker ran, and re-running is exactly
-                       # what fixes it. Was terminal ("broken") until run
-                       # 488c42e5 (2026-08-05) lost `bugfix-009-2` to it
-                       # AFTER the implementer had already committed —
-                       # killing the wave with 25 of 26 subtasks complete
-                       # and leaving `resume` to hit the same wall forever.
+                       # produce the worktree. Terminal ("broken") until run
+                       # 488c42e5 (2026-08-05), where it killed a wave with
+                       # 25 of 26 subtasks complete and left `resume` hitting
+                       # the same wall on every attempt.
+})
+
+_WORKER_RETRYABLE_KINDS = frozenset({
     "no_commits",      # check_branch_has_commits — implementer claimed
                        # complete with nothing committed
     "dirty_worktree",  # inline status-porcelain check in _settle_subtask —
@@ -22395,6 +22405,11 @@ _RETRYABLE_FAILURE_KINDS = frozenset({
                        # TimeoutExpired catches. Both are corrective-note
                        # cases — a fresh worker can plausibly do better.
 })
+
+
+# Composed, so ONE membership drives every consequence. A kind declared
+# infrastructure is retryable without anyone having to remember a second list.
+_RETRYABLE_FAILURE_KINDS = _WORKER_RETRYABLE_KINDS | _INFRASTRUCTURE_FAILURE_KINDS
 
 
 def _retryable_failure(kind: str) -> bool:
@@ -24137,10 +24152,21 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         if retries > caps["failed_retries"]:
             log(f"  {sid}: retry cap reached — terminating")
             return res
-        if kind not in _RETRY_IN_PLACE_KINDS:
+        if kind in _INFRASTRUCTURE_FAILURE_KINDS:
+            # Retry in place: no reset (it would `git branch -D` work an
+            # earlier attempt may have committed) and no corrective note (an
+            # infrastructure failure says nothing about what the worker should
+            # do differently, so it must not overwrite what the worker is
+            # being told to fix — in 488c42e5 the pending note named the unmet
+            # criterion the retry existed to deliver). Logged because it was
+            # previously silent: `fail()` logs only on terminal or cap-reached,
+            # so an operator saw a worker re-run with no line explaining why.
+            log(f"  {sid}: infrastructure failure ({kind}) — retrying "
+                f"{retries}/{caps['failed_retries']}: {reason}")
+        else:
             await _reset_subtask_worktree(sid, leerie_dir, st.run_id)
-        continuation = False
-        note = f"Previous attempt failed: {reason}"
+            continuation = False
+            note = f"Previous attempt failed: {reason}"
         return None
 
     while True:

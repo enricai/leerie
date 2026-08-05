@@ -65,14 +65,92 @@ if ! git worktree list --porcelain | grep -qxF "worktree $WT" && [ -d "$WT" ]; t
   rm -rf "$WT"
 fi
 
+# Add with a repair-and-retry.
+#
+# Everything above is CHECK-THEN-ACT, and the checks run against a repo a
+# dozen sibling subtasks are mutating concurrently (`--max-parallel`). Any
+# window between a check and the `add` it selected can invalidate it, so the
+# add must verify its own outcome rather than trust the earlier check. That
+# assumption — not any one race — is the root cause of run 488c42e5 losing
+# `bugfix-009-2` after its implementer had committed: the surviving evidence
+# there is self-contradictory (the admin entry outlived the failure, yet the
+# reuse check missed), which is exactly the kind of detail a correct
+# implementation must not depend on.
+#
+# The repair re-DERIVES state; it never parses git's prose. Modes measured
+# against git 2.53:
+#   M1  path exists, branch free      -> "fatal: '<path>' already exists"
+#                                        repair: remove the orphaned directory
+#   M3  registered, directory gone    -> "use 'add -f' … or 'prune' …"
+#                                        repair: `git worktree prune`
+#   M2  branch checked out elsewhere  -> "already used by worktree at '<other>'"
+#                                        NO repair: forcing would steal a live
+#                                        sibling's branch. Surface it instead —
+#                                        `worktree_setup` is retryable, so the
+#                                        subtask retries rather than dying.
+# Decide the add form from CURRENT state every time this is called. The
+# retry below MUST re-derive it, not reuse the caller's earlier decision:
+# `git worktree add <path> -b <branch> <start>` CREATES THE BRANCH and can
+# still fail on the path, so a retry of the same `-b` form then dies with
+# "a branch named '<branch>' already exists". Measured, not theorised — the
+# race test caught exactly this.
+_create_worktree() {
+  if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    # branch exists (pre-existing, or created by a failed first attempt) —
+    # attach to it, preserving any commits already on it
+    git worktree add "$WT" "$BRANCH"
+  else
+    git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH"
+  fi
+}
+
+# Create with a repair-and-retry.
+#
+# Everything above is CHECK-THEN-ACT, and the checks run against a repo a
+# dozen sibling subtasks are mutating concurrently (`--max-parallel`). Any
+# window between a check and the act it selected can invalidate it, so the
+# operation must verify its own outcome rather than trust the earlier check.
+# That assumption — not any one race — is the root cause of run 488c42e5
+# losing `bugfix-009-2` after its implementer had committed: the surviving
+# evidence there is self-contradictory (the admin entry outlived the failure,
+# yet the reuse check missed), which is exactly the kind of detail a correct
+# implementation must not depend on.
+#
+# The repair re-DERIVES state; it never parses git's prose. Modes measured
+# against git 2.53:
+#   M1  path exists, branch free      -> "fatal: '<path>' already exists"
+#                                        repair: remove the orphaned directory
+#   M3  registered, directory gone    -> "use 'add -f' … or 'prune' …"
+#                                        repair: `git worktree prune`
+#   M5  branch created by a failed
+#       first attempt                 -> "a branch named '<b>' already exists"
+#                                        repair: re-derive -> attach form
+#   M2  branch checked out elsewhere  -> "already used by worktree at '<other>'"
+#                                        NO repair: forcing would steal a live
+#                                        sibling's branch. Surface it instead —
+#                                        `worktree_setup` is retryable, so the
+#                                        subtask retries rather than dying.
+_add_with_repair() {
+  local err
+  if err="$(_create_worktree 2>&1)"; then
+    return 0
+  fi
+  if ! git worktree list --porcelain | grep -qxF "worktree $WT" \
+      && [ -d "$WT" ]; then
+    rm -rf "$WT"
+  fi
+  git worktree prune
+  if err="$(_create_worktree 2>&1)"; then
+    return 0
+  fi
+  printf '%s\n' "$err" >&2
+  return 1
+}
+
 if git worktree list --porcelain | grep -qxF "worktree $WT"; then
   : # already present — reuse it
-elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-  # branch exists but worktree was removed — re-attach
-  git worktree add "$WT" "$BRANCH" >/dev/null
 else
-  # fresh subtask — branch off the current run-branch tip
-  git worktree add "$WT" -b "$BRANCH" "$PARENT_BRANCH" >/dev/null
+  _add_with_repair >/dev/null
 fi
 
 (cd "$WT" && pwd)

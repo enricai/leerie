@@ -5710,18 +5710,46 @@ extend the enum and update the producer in the same change.
 | cross-field invariant violation (other) | Terminal | `"broken"` from `_validate_result` |
 | diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
 | worker-level error (timeout, schema-invalid twice) | Terminal | `"broken"` from `WorkerError` path |
-| `new-worktree.sh` could not create the worktree | Retryable | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it. Was terminal until run `488c42e5` (2026-08-05) lost `bugfix-009-2` to it *after* the implementer had committed, killing the wave with 25 of 26 subtasks complete and leaving `resume` to hit the same wall on every attempt |
+| `new-worktree.sh` could not create the worktree | Retryable (infrastructure) | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it. Was terminal until run `488c42e5` (2026-08-05) lost `bugfix-009-2` to it *after* the implementer had committed, killing the wave with 25 of 26 subtasks complete and leaving `resume` to hit the same wall on every attempt |
+
+**Two categories, one source of truth.** `_INFRASTRUCTURE_FAILURE_KINDS` is
+the single place a kind is declared *not the worker's doing*; everything else
+derives from it, including `_RETRYABLE_FAILURE_KINDS`, which is **composed**
+(`_WORKER_RETRYABLE_KINDS | _INFRASTRUCTURE_FAILURE_KINDS`) rather than
+hand-maintained. A kind listed in only some of several lists is silently
+half-wrong — retried but branch-deleted, or preserved but terminal — and that
+is the bug class this area keeps producing. An infrastructure retry is also
+**logged**; it used to be silent, since `fail()` logs only on terminal or
+cap-reached.
+
+*Measured candidates deliberately not yet moved into the category:* auditing
+every `raise WorkerError` found `worker {sid} exhausted its PID`, `worker
+{sid} was OOM-killed`, `Claude API connection dropped mid-response`, 529
+overloaded, and auth/quota — all infrastructure on the same generic path.
+Reclassifying them is a behaviour change beyond the incident that motivated
+the category and could mask a real resource problem, so it needs its own
+evidence.
 
 **Retry in place vs. reset first.** `fail()` normally calls
 `_reset_subtask_worktree` before looping, which runs `git branch -D` on the
 subtask branch — correct for `no_commits` (the branch holds nothing worth
-keeping) and destructive when it does not. `_RETRY_IN_PLACE_KINDS`
-(currently `{"worktree_setup"}`) names the kinds whose retry must skip that
+keeping) and destructive when it does not. Infrastructure kinds skip that
 reset: a worktree-setup failure fires before any worker runs, so there is no
 leftover from *this* attempt to clear, while an *earlier* attempt's commits
 may be sitting on the branch (`488c42e5`'s `bugfix-009-2` failed with
 `de0d3bf` already committed). `new-worktree.sh` reuses an existing branch by
 design, so retrying in place re-attaches to that work instead of deleting it.
+
+The exemption covers the `continuation` flag and the corrective `note` too,
+not just the reset. An infrastructure failure carries no information about
+what the worker should do differently, so it must not overwrite the state
+that says what the worker should do differently: in `488c42e5` the worktree
+failed while the mechanical-check path had already set `continuation=True`
+and a `_format_check_feedback` note naming the unmet criterion — the pending
+feedback the retry existed to deliver. Overwriting it restarts the worker
+blind to the thing it was sent back to fix, so it misses the same check again
+and burns `implementer_confidence_retries`. Only a *worker* failure earns a
+corrective note, because only a worker failure produced one.
 
 `_settle_subtask` routes every failure through `_retryable_failure` via the
 `fail(kind, reason)` helper. Retryable consumes the retry cap; terminal ends
