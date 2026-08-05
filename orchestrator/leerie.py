@@ -2047,7 +2047,7 @@ SCHEMAS: dict[str, dict] = {
         # so the same evidence-gate discipline (falsifiers, contradictions,
         # and the gap stated in basis) applies.
         "type": "object",
-        "required": ["score", "rationale", "diffuse"],
+        "required": ["score"],
         "properties": {
             # 0–1 Task-Context Fit score. >= decompose_fit_threshold (0.70)
             # means the subtask is a leaf (well-fit; no further splitting).
