@@ -5698,7 +5698,8 @@ at the producer eliminates the prose round-trip.
 The coupling test in `tests/test_retryable_failure.py` enforces that
 every retryable-path return from a producer (`_validate_result`,
 `check_branch_has_commits`, the inline dirty-worktree check,
-`_run_implementer`'s `WorktreeSetupError`) carries a `failure_kind` in
+`_run_implementer`'s `WorktreeSetupError`, `_invoke`'s
+`PidExhaustedError`/`OomKilledError`) carries a `failure_kind` in
 `_RETRYABLE_FAILURE_KINDS`. When adding a new retryable failure mode,
 extend the enum and update the producer in the same change.
 
@@ -5711,6 +5712,8 @@ extend the enum and update the producer in the same change.
 | diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
 | worker-level error (timeout, schema-invalid twice) | Terminal | `"broken"` from `WorkerError` path |
 | `new-worktree.sh` could not create the worktree | Retryable (infrastructure) | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it. Was terminal until run `488c42e5` (2026-08-05) lost `bugfix-009-2` to it *after* the implementer had committed, killing the wave with 25 of 26 subtasks complete and leaving `resume` to hit the same wall on every attempt |
+| worker's cgroup exhausted its PID table (fork denials climbing / at `pids.max`) | Retryable (infrastructure) | `"pid_exhausted"` from `_invoke`'s `PidExhaustedError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a fresh worker gets a clean PID table, which is exactly the remedy the raise site's own log message already promised ("Terminating early so a fresh worker retries with a clean PID table"). Was terminal until this change: `exhausted its PID` fired 9 times across 3 runs |
+| worker's tool subtree (a build/test command) overshot `memory.max` and was kernel-killed mid-turn | Retryable (infrastructure) | `"oom_killed"` from `_invoke`'s `OomKilledError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a resource limit killed it, not the worker's own behaviour, so a fresh attempt is the remedy. Was terminal until this change: `was OOM-killed` fired 11 times across 3 runs, and of the 6 runs that hit PID/OOM, 3 produced no PR |
 
 **Two categories, one source of truth.** `_INFRASTRUCTURE_FAILURE_KINDS` is
 the single place a kind is declared *not the worker's doing*; everything else

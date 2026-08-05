@@ -43,12 +43,13 @@ def test_terminal_kinds_return_false(leerie, kind):
 
 
 def test_retryable_kinds_constant_matches_documented_set(leerie):
-    """The retryable enum must be exactly the four documented kinds.
+    """The retryable enum must be exactly the six documented kinds.
     Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
     assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
-        {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup"}
+        {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup",
+         "pid_exhausted", "oom_killed"}
     )
 
 
@@ -116,6 +117,10 @@ _PRODUCER_RETRYABLE_KINDS = {
     "empty_handoff",
     # _settle_subtask's `except WorktreeSetupError` arm → "worktree_setup"
     "worktree_setup",
+    # _settle_subtask's `except PidExhaustedError` arm → "pid_exhausted"
+    "pid_exhausted",
+    # _settle_subtask's `except OomKilledError` arm → "oom_killed"
+    "oom_killed",
 }
 
 
@@ -248,6 +253,56 @@ def test_producer_raises_the_tagged_exception_type(leerie):
     src = inspect.getsource(leerie._run_implementer)
     assert "raise WorktreeSetupError(" in src
     assert issubclass(leerie.WorktreeSetupError, leerie.WorkerError)
+
+
+def test_pid_and_oom_producers_raise_the_tagged_exception_types(leerie):
+    """PID-exhaustion and OOM-kill are both tagged at their producer,
+    `_invoke`, never inferred from prose. Both raise sites live inside
+    the same function."""
+    src = inspect.getsource(leerie._invoke)
+    assert "raise PidExhaustedError(" in src
+    assert "raise OomKilledError(" in src
+    assert issubclass(leerie.PidExhaustedError, leerie.WorkerError)
+    assert issubclass(leerie.OomKilledError, leerie.WorkerError)
+
+
+def test_settle_subtask_tags_pid_exhausted(leerie):
+    """`_settle_subtask` must catch `PidExhaustedError` SEPARATELY from the
+    generic `except WorkerError`, which tags everything "broken" (terminal).
+
+    Ordering is load-bearing: `PidExhaustedError` subclasses `WorkerError`,
+    so a generic handler placed first would swallow it and the kind would
+    never be produced."""
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "except PidExhaustedError" in src
+    assert '"pid_exhausted"' in src
+    assert (src.index("except PidExhaustedError")
+            < src.index("except WorkerError as e:")), (
+        "PidExhaustedError must be caught BEFORE the generic WorkerError "
+        "arm — it is a subclass, so a generic-first order swallows it")
+
+
+def test_settle_subtask_tags_oom_killed(leerie):
+    """`_settle_subtask` must catch `OomKilledError` SEPARATELY from the
+    generic `except WorkerError`, which tags everything "broken" (terminal).
+
+    Ordering is load-bearing: `OomKilledError` subclasses `WorkerError`,
+    so a generic handler placed first would swallow it and the kind would
+    never be produced."""
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "except OomKilledError" in src
+    assert '"oom_killed"' in src
+    assert (src.index("except OomKilledError")
+            < src.index("except WorkerError as e:")), (
+        "OomKilledError must be caught BEFORE the generic WorkerError "
+        "arm — it is a subclass, so a generic-first order swallows it")
+
+
+def test_pid_exhausted_and_oom_killed_are_retryable(leerie):
+    assert leerie._retryable_failure("pid_exhausted") is True
+    assert leerie._retryable_failure("oom_killed") is True
+    assert "pid_exhausted" in leerie._INFRASTRUCTURE_FAILURE_KINDS
+    assert "oom_killed" in leerie._INFRASTRUCTURE_FAILURE_KINDS
 
 
 class TestCategoryIsTheSingleSourceOfTruth:
