@@ -184,7 +184,7 @@ def test_fit_judge_schema_required_fields_relaxed(leerie):
             f"fit_judge deleted {relaxed} rather than relaxing it")
         assert relaxed not in required, (
             f"fit_judge still requires {relaxed} (P3)")
-    assert "score" in required
+    assert required == {"score"}
 
 
 def test_rebaser_schema_confidence_not_required(leerie):
