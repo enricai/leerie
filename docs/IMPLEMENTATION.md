@@ -8131,8 +8131,10 @@ type. Required fields, current shape:
   documentation files updated to reflect the diff), `tests_updates` (array
   of `{path, reason}` — tests added or amended to cover the diff), `build`,
   `lint`, `tests` (each an object `{ran (bool), passed (bool), command
-  (string), summary (string)}` — `ran: false` when the tool is not
-  applicable to the repo; `passed` is irrelevant when `ran: false`),
+  (string), summary (optional string)}` — only `ran`, `passed`, and
+  `command` are required; `summary` is advisory and may be omitted —
+  `ran: false` when the tool is not applicable to the repo; `passed` is
+  irrelevant when `ran: false`),
   `summary` (string — one-line description of what the conformance pass
   did), `confidence` (worker-internal self-gate, not consumed by the
   orchestrator: required keys `conformance` (number 1–10), `basis`
