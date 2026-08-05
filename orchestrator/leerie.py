@@ -10570,6 +10570,16 @@ class WorkerError(RuntimeError):
     pass
 
 
+class WorktreeSetupError(WorkerError):
+    """`new-worktree.sh` could not produce the subtask's worktree.
+
+    A distinct type because the retry classifier dispatches on a kind tagged
+    at the PRODUCER, never on prose (see `_RETRYABLE_FAILURE_KINDS`). Raised
+    before any worker runs, so it is infrastructure, not a broken or
+    dishonest worker — the distinction `_retryable_failure` turns on.
+    """
+
+
 def _api_error_category(status: int | None) -> str | None:
     """Map a `claude -p` `api_error_status` to a coarse failure category.
 
@@ -22223,7 +22233,8 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     sys_prompt = _load_prompt("implementer")
     proc = await _run_script("new-worktree.sh", sid, st.run_id)
     if proc.returncode != 0:
-        raise WorkerError(f"worktree creation failed for {sid}: {proc.stderr.strip()}")
+        raise WorktreeSetupError(
+            f"worktree creation failed for {sid}: {proc.stderr.strip()}")
     worktree = proc.stdout.strip().splitlines()[-1]
     # The fresh worktree has NO installed deps. The implementer runs
     # installs itself in its own worktree against the shared
@@ -22347,7 +22358,27 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
 # producer return the new kind. The coupling test in
 # tests/test_retryable_failure.py asserts every producer's retryable-path
 # return uses a kind in this set.
+# Retryable kinds whose retry must NOT call `_reset_subtask_worktree`.
+# That helper runs `git branch -D` on the subtask branch — correct when the
+# failure means the branch holds nothing worth keeping (`no_commits`), and
+# DESTRUCTIVE when it does. A worktree-setup failure fires before any worker
+# runs, so there is no leftover from this attempt to clear, while an EARLIER
+# attempt's commits may be sitting on that branch: run 488c42e5's
+# `bugfix-009-2` failed this way with `de0d3bf` already committed, and
+# resetting would have deleted it rather than re-attaching. `new-worktree.sh`
+# reuses an existing branch by design, so retrying in place is both safe and
+# the point.
+_RETRY_IN_PLACE_KINDS = frozenset({"worktree_setup"})
+
 _RETRYABLE_FAILURE_KINDS = frozenset({
+    "worktree_setup",  # WorktreeSetupError — `new-worktree.sh` could not
+                       # produce the worktree. Infrastructure, not a broken
+                       # worker: no worker ran, and re-running is exactly
+                       # what fixes it. Was terminal ("broken") until run
+                       # 488c42e5 (2026-08-05) lost `bugfix-009-2` to it
+                       # AFTER the implementer had already committed —
+                       # killing the wave with 25 of 26 subtasks complete
+                       # and leaving `resume` to hit the same wall forever.
     "no_commits",      # check_branch_has_commits — implementer claimed
                        # complete with nothing committed
     "dirty_worktree",  # inline status-porcelain check in _settle_subtask —
@@ -24106,7 +24137,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         if retries > caps["failed_retries"]:
             log(f"  {sid}: retry cap reached — terminating")
             return res
-        await _reset_subtask_worktree(sid, leerie_dir, st.run_id)
+        if kind not in _RETRY_IN_PLACE_KINDS:
+            await _reset_subtask_worktree(sid, leerie_dir, st.run_id)
         continuation = False
         note = f"Previous attempt failed: {reason}"
         return None
@@ -24116,6 +24148,17 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             res = await _run_implementer(sid, leerie_dir, caps, st, models,
                                         efforts, continuation=continuation,
                                         note=note)
+        except WorktreeSetupError as e:
+            # `new-worktree.sh` failed. Tagged as its own retryable kind
+            # rather than the generic "broken" below: no worker ran, so the
+            # worker is neither broken nor dishonest, and a fresh attempt is
+            # exactly what clears it. `_RETRY_IN_PLACE_KINDS` keeps the retry
+            # from deleting the branch, which may already carry an earlier
+            # attempt's commits (run 488c42e5, `bugfix-009-2`).
+            fail_res = await fail("worktree_setup", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
         except WorkerError as e:
             # Per-subtask infrastructure failure (e.g. `new-worktree.sh`
             # could not create the worktree). `_run_implementer`'s own

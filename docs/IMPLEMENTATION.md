@@ -5697,10 +5697,10 @@ at the producer eliminates the prose round-trip.
 
 The coupling test in `tests/test_retryable_failure.py` enforces that
 every retryable-path return from a producer (`_validate_result`,
-`check_branch_has_commits`, the inline dirty-worktree check) carries a
-`failure_kind` in `_RETRYABLE_FAILURE_KINDS`. When adding a new
-retryable failure mode, extend the enum and update the producer in the
-same change.
+`check_branch_has_commits`, the inline dirty-worktree check,
+`_run_implementer`'s `WorktreeSetupError`) carries a `failure_kind` in
+`_RETRYABLE_FAILURE_KINDS`. When adding a new retryable failure mode,
+extend the enum and update the producer in the same change.
 
 | Failure | Tier | `failure_kind` / source |
 |---------|------|-----------------|
@@ -5710,6 +5710,18 @@ same change.
 | cross-field invariant violation (other) | Terminal | `"broken"` from `_validate_result` |
 | diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
 | worker-level error (timeout, schema-invalid twice) | Terminal | `"broken"` from `WorkerError` path |
+| `new-worktree.sh` could not create the worktree | Retryable | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it. Was terminal until run `488c42e5` (2026-08-05) lost `bugfix-009-2` to it *after* the implementer had committed, killing the wave with 25 of 26 subtasks complete and leaving `resume` to hit the same wall on every attempt |
+
+**Retry in place vs. reset first.** `fail()` normally calls
+`_reset_subtask_worktree` before looping, which runs `git branch -D` on the
+subtask branch — correct for `no_commits` (the branch holds nothing worth
+keeping) and destructive when it does not. `_RETRY_IN_PLACE_KINDS`
+(currently `{"worktree_setup"}`) names the kinds whose retry must skip that
+reset: a worktree-setup failure fires before any worker runs, so there is no
+leftover from *this* attempt to clear, while an *earlier* attempt's commits
+may be sitting on the branch (`488c42e5`'s `bugfix-009-2` failed with
+`de0d3bf` already committed). `new-worktree.sh` reuses an existing branch by
+design, so retrying in place re-attaches to that work instead of deleting it.
 
 `_settle_subtask` routes every failure through `_retryable_failure` via the
 `fail(kind, reason)` helper. Retryable consumes the retry cap; terminal ends

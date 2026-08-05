@@ -28,13 +28,32 @@ esac
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 PARENT_BRANCH="leerie/runs/${RUN_ID}"
 
+# Clear stale admin entries whose directory is gone, so the orphan check and
+# the `worktree add` fallbacks below all see post-prune truth.
+#
+# ORDER IS LOAD-BEARING: this MUST run before the orphan-directory check.
+# `git worktree prune` is itself an operation that CREATES the orphaned state
+# that check exists to repair — it drops the admin entry and leaves the
+# directory on disk. Running the check first and pruning after left a window
+# where the entry vanished with nothing left to notice: the reuse grep below
+# missed, and `worktree add` hit the directory prune had just orphaned.
+#
+# That is not hypothetical. Run 488c42e5 (2026-08-05) lost `bugfix-009-2`
+# this way *after* its implementer had already committed: a mechanical check
+# drove the continuation path, this script ran a second time, and it died on
+# "fatal: '<path>' already exists" — the wave then refused to close with 25 of
+# 26 subtasks complete. Under `--max-parallel` a *sibling's* concurrent prune
+# can drop a live registration the same way, which is the likelier trigger.
+git worktree prune
+
 # Drop an orphaned worktree directory that git no longer knows about.
 # `_cleanup_on_abnormal_exit` deregisters and removes worktrees, but a
-# partial cleanup (or an rmtree that lost a race with git's metadata write)
-# can leave the directory on disk with no registration. `worktree add` then
-# refuses with "fatal: '<path>' already exists", which crashes continuation
-# retries — the same class the `pwd -P` normalisation above addresses, but
-# reached from cleanup rather than from a relative path.
+# partial cleanup (or an rmtree that lost a race with git's metadata write),
+# or the prune immediately above, can leave the directory on disk with no
+# registration. `worktree add` then refuses with "fatal: '<path>' already
+# exists", which crashes continuation retries — the same class the `pwd -P`
+# normalisation above addresses, but reached from cleanup rather than from a
+# relative path.
 #
 # `git worktree prune` does NOT cover this: it only drops admin entries whose
 # directory is *gone*. `--force` does not either: it overrides
@@ -45,11 +64,6 @@ PARENT_BRANCH="leerie/runs/${RUN_ID}"
 if ! git worktree list --porcelain | grep -qxF "worktree $WT" && [ -d "$WT" ]; then
   rm -rf "$WT"
 fi
-# Clear stale admin entries whose directory is gone, so the reuse check below
-# and the `worktree add` fallbacks see post-cleanup truth. Safe under
-# `max_parallel`: prune only touches entries whose directory no longer exists,
-# never a live sibling's.
-git worktree prune
 
 if git worktree list --porcelain | grep -qxF "worktree $WT"; then
   : # already present — reuse it

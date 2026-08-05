@@ -43,13 +43,62 @@ def test_terminal_kinds_return_false(leerie, kind):
 
 
 def test_retryable_kinds_constant_matches_documented_set(leerie):
-    """The retryable enum must be exactly the three documented kinds.
+    """The retryable enum must be exactly the four documented kinds.
     Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
     assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
-        {"no_commits", "dirty_worktree", "empty_handoff"}
+        {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup"}
     )
+
+
+def test_worktree_setup_is_retryable(leerie):
+    """A worktree-setup failure is INFRASTRUCTURE, not a broken worker.
+
+    It is raised before any worker runs, so `_retryable_failure`'s stated
+    rationale for terminal ("the worker is broken or dishonest, and
+    re-running it burns a worker invocation for no expected gain") does not
+    hold: re-running is exactly what clears it.
+
+    Regression pin for run 488c42e5 (2026-08-05), which lost `bugfix-009-2`
+    to this after its implementer had already committed — killing the wave
+    with 25 of 26 subtasks complete and leaving `resume` to hit the same
+    wall on every attempt."""
+    assert leerie._retryable_failure("worktree_setup") is True
+
+
+def test_worktree_setup_retries_in_place_and_keeps_the_branch(leerie):
+    """THE DESTRUCTIVE-FIX GUARD.
+
+    Marking the kind retryable is only half correct. The retry path calls
+    `_reset_subtask_worktree`, which runs `git branch -D` on the subtask
+    branch — right for `no_commits` (nothing worth keeping), catastrophic
+    here: the branch can already carry an earlier attempt's commits (488c42e5
+    failed with `de0d3bf` committed). Resetting would turn an infrastructure
+    hiccup into silent loss of paid-for work.
+
+    So the kind must ALSO be in `_RETRY_IN_PLACE_KINDS`, and `_settle_subtask`
+    must gate the reset on it. `new-worktree.sh` reuses an existing branch by
+    design, so retrying in place re-attaches to the work."""
+    assert "worktree_setup" in leerie._RETRY_IN_PLACE_KINDS
+    assert "git branch -D" in inspect.getsource(
+        leerie._reset_subtask_worktree) or "branch" in inspect.getsource(
+        leerie._reset_subtask_worktree), "reset no longer touches the branch"
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "_RETRY_IN_PLACE_KINDS" in src, (
+        "the reset is no longer gated — a worktree_setup retry would "
+        "delete a branch that may hold committed work")
+    i = src.index("_RETRY_IN_PLACE_KINDS")
+    j = src.index("await _reset_subtask_worktree")
+    assert i < j, "the guard must precede the reset call"
+
+
+def test_no_commits_still_resets(leerie):
+    """ANTI-VACUITY: the in-place exemption must not disable the reset for
+    the kind that genuinely needs it. `no_commits` means the branch holds
+    nothing, and without the reset the retry hits
+    `fatal: a branch ... already exists`."""
+    assert "no_commits" not in leerie._RETRY_IN_PLACE_KINDS
 
 
 # --- coupling test: producer returns must match consumer's accepted set ---
@@ -65,6 +114,8 @@ _PRODUCER_RETRYABLE_KINDS = {
     "dirty_worktree",
     # _validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
     "empty_handoff",
+    # _settle_subtask's `except WorktreeSetupError` arm → "worktree_setup"
+    "worktree_setup",
 }
 
 
@@ -173,3 +224,28 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
         f"Every fail() invocation must pair a structured "
         f"`failure_kind` with a human-readable `reason`."
     )
+
+
+def test_settle_subtask_tags_worktree_setup(leerie):
+    """`_settle_subtask` must catch `WorktreeSetupError` SEPARATELY from the
+    generic `except WorkerError`, which tags everything "broken" (terminal).
+
+    Ordering is load-bearing: `WorktreeSetupError` subclasses `WorkerError`,
+    so a generic handler placed first would swallow it and the kind would
+    never be produced."""
+    src = inspect.getsource(leerie._settle_subtask)
+    assert "except WorktreeSetupError" in src
+    assert '"worktree_setup"' in src
+    assert (src.index("except WorktreeSetupError")
+            < src.index("except WorkerError as e:")), (
+        "WorktreeSetupError must be caught BEFORE the generic WorkerError "
+        "arm — it is a subclass, so a generic-first order swallows it")
+
+
+def test_producer_raises_the_tagged_exception_type(leerie):
+    """The kind is tagged at the producer, never inferred from prose
+    (the discipline `_RETRYABLE_FAILURE_KINDS`' own comment states)."""
+    src = inspect.getsource(leerie._run_implementer)
+    assert "raise WorktreeSetupError(" in src
+    assert issubclass(leerie.WorktreeSetupError, leerie.WorkerError)
+
