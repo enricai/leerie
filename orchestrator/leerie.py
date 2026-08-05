@@ -20888,23 +20888,38 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             for s in subtasks
         ],
     }
+    # ALL-KEYWORD, matching every other claude_p caller. The first cut of
+    # this call passed two positionals and omitted `allowed_tools` and
+    # `max_turns` (both required), so it raised TypeError on every
+    # invocation and the broad `except` below reported it as a clean
+    # advisory degrade — the judge never ran once in 0.10.0. No test caught
+    # it because every test stubs `claude_p`, and a stub accepts any
+    # signature; `test_call_signature_binds_against_the_real_claude_p` is
+    # the guard that would have.
     try:
         judge_result = await claude_p(
-            "task_coverage_judge",
-            "Review this plan's coverage of the task.\n\n" +
+            user_prompt="Review this plan's coverage of the task.\n\n" +
             json.dumps(payload, indent=2),
             system_prompt=sys_prompt,
             schema_key="task_coverage_judge",
-            cwd=Path(os.getcwd()),
-            autonomous=True,
+            cwd=str(Path(os.getcwd())),
+            # INSPECT_TOOLS is load-bearing, not decoration: the judge's
+            # prompt instructs it to read task-referenced files itself.
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            autonomous=False,
             caps=caps,
             st=st,
-            model=models.get("task_coverage_judge"),
+            model=models.get("task_coverage_judge", MODEL_DEFAULT),
             effort=efforts.get("task_coverage_judge"),
             sid="task_coverage_judge",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
-    except Exception as exc:  # noqa: BLE001 - advisory; never fatal
+    except WorkerError as exc:
+        # A worker failure is expected and non-fatal — this gate is
+        # advisory. A programming error (TypeError, AttributeError, ...) is
+        # NOT a worker failure and must propagate: swallowing it is what
+        # hid the broken call above for a whole release.
         log(f"  coverage-gate: judge failed ({type(exc).__name__}) — "
             "advisory only, plan unchanged")
         return plans
