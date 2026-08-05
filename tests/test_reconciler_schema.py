@@ -101,17 +101,18 @@ def test_reconciler_requires_all_wire_arrays(leerie):
     """Every wire array must be present in every output, even if empty, so
     callers never crash on a missing key.
 
-    Seven fields, not nine: the four isomorphic `{sid, tag, reason}` arrays
+    Six fields, not seven: the four isomorphic `{sid, tag, reason}` arrays
     (added_provides, dropped_requires, conditional_drops, unresolvable)
     collapsed into one enum-discriminated `tag_ops`, and `requires` was lifted
     out of `added_subtasks` into a top-level `added_requires`. Both changes
     were forced by grammar compilation, not preference — see the module
-    docstring."""
+    docstring. `confidence` is requested via `properties` but no longer
+    top-level required (P3 — see test_confidence_not_required.py)."""
     schema = leerie.SCHEMAS["reconciler"]
     required = set(schema["required"])
     assert required == {"added_subtasks", "added_requires", "tag_ops",
-                        "renames", "dependency_edges", "merged_subtasks",
-                        "confidence"}
+                        "renames", "dependency_edges", "merged_subtasks"}
+    assert "confidence" in schema["properties"]
 
 
 def test_reconciler_tag_ops_shape(leerie):
@@ -211,7 +212,8 @@ def test_reconciler_arrays_can_all_be_empty(leerie):
     degenerate-but-legitimate case where the worker found nothing to
     do (which in practice means phase_reconcile would have
     short-circuited before calling the worker, but the schema must
-    still accept it)."""
+    still accept it). `confidence` is included as an optional property
+    (P3 — not top-level required) to also exercise its accepted shape."""
     empty = {"added_subtasks": [], "added_requires": [], "tag_ops": [],
              "renames": [], "dependency_edges": [],
              "merged_subtasks": [],
@@ -220,8 +222,10 @@ def test_reconciler_arrays_can_all_be_empty(leerie):
                             "contradictions_reconciled": [],
                             "gap_to_close": {}}}
     required = set(leerie.SCHEMAS["reconciler"]["required"])
-    assert set(empty.keys()) == required, (
-        "fixture and schema must agree on the full set of required fields")
+    assert required <= set(empty.keys()), (
+        "fixture must cover every required field")
+    assert set(empty.keys()) - required == {"confidence"}, (
+        "fixture's only non-required key should be the optional confidence block")
 
 
 def test_reconciler_full_payload_keys_align_with_schema(leerie):
