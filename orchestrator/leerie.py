@@ -4570,6 +4570,16 @@ def _parse_memory_size(value: str, context: str) -> int:
     return n * mult
 
 
+_NODE_MANIFEST_NAMES = (
+    "package.json", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+)
+
+
+def _is_node_repo(cwd: str) -> bool:
+    """Whether `cwd` is a Node/JS repo, by presence of a package manifest."""
+    return any((Path(cwd) / name).exists() for name in _NODE_MANIFEST_NAMES)
+
+
 def _auto_worker_memory_max(max_parallel: int) -> int:
     """Auto-derive a per-worker memory cap from /proc/meminfo.
 
@@ -12683,6 +12693,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if worker_env is None:
             worker_env = os.environ.copy()
         worker_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_STRICT_PROXY.port}"
+    # Node/V8 derives its default heap ceiling (~4.2 GiB) from *host* memory,
+    # not the worker's cgroup memory.max — so on a Node repo, a build can
+    # abort with a V8 heap OOM while most of leerie's (larger) per-worker
+    # allowance sits unused (P9). `- 2048` reserves headroom for the
+    # resident `claude -p` process sharing the same cgroup (see
+    # _auto_worker_memory_max's docstring: build + resident claude peaks
+    # around 6.3 GiB, measured against an 8 GiB floor). Auto-derivation
+    # floors at 8 GiB so this is normally >= 6144, but --worker-memory-max /
+    # LEERIE_WORKER_MEMORY_MAX / leerie.toml let an operator set the cap
+    # below 2 GiB explicitly — clamp so V8 is never handed a non-positive
+    # or degenerately small ceiling.
+    if worker_memory_max_bytes is not None and _is_node_repo(cwd):
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
