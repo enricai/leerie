@@ -1203,7 +1203,7 @@ def _confidence_schema(axes: list[str]) -> dict:
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
-        "required": ["categories", "confidence"],
+        "required": ["categories"],
         "properties": {
             "categories": {"type": "array", "items": {"type": "string"}},
             "questions": {
@@ -1275,7 +1275,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "planner": {
         "type": "object",
-        "required": ["domain", "subtasks", "status", "confidence"],
+        "required": ["domain", "subtasks", "status"],
         "properties": {
             "domain": {"type": "string"},
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
@@ -1400,7 +1400,7 @@ SCHEMAS: dict[str, dict] = {
         # `_apply_reconciler_output` and `_validate_must_include` are untouched.
         "type": "object",
         "required": ["added_subtasks", "added_requires", "tag_ops", "renames",
-                     "dependency_edges", "merged_subtasks", "confidence"],
+                     "dependency_edges", "merged_subtasks"],
         "properties": {
             "added_subtasks": {
                 # Net-new bridging work. `requires` is NOT nested here any
@@ -1508,7 +1508,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "implementer": {
         "type": "object",
-        "required": ["subtask_id", "status", "confidence"],
+        "required": ["subtask_id", "status"],
         "properties": {
             "subtask_id": {"type": "string"},
             "status": {
@@ -1585,7 +1585,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "integrator": {
         "type": "object",
-        "required": ["incoming_subtask", "status", "confidence"],
+        "required": ["incoming_subtask", "status"],
         "properties": {
             "incoming_subtask": {"type": "string"},
             "status": {
@@ -1608,7 +1608,7 @@ SCHEMAS: dict[str, dict] = {
     # reasoned abort).
     "rebaser": {
         "type": "object",
-        "required": ["status", "final_branch_state", "confidence"],
+        "required": ["status", "final_branch_state"],
         "properties": {
             "status": {
                 "type": "string",
@@ -1656,7 +1656,7 @@ SCHEMAS: dict[str, dict] = {
             "subtask_id", "rules_files_read",
             "rule_violations_fixed", "rule_violations_residual",
             "docs_updates", "tests_updates",
-            "build", "lint", "tests", "summary", "confidence",
+            "build", "lint", "tests", "summary",
             "solution_defects",
         ],
         "properties": {
@@ -1844,7 +1844,7 @@ SCHEMAS: dict[str, dict] = {
         # The recipe is structurally bounded here, then mechanically
         # validated by _validate_provision_recipe() (§12 carve-out).
         "type": "object",
-        "required": ["recipe", "confidence"],
+        "required": ["recipe"],
         "properties": {
             "recipe": {
                 "type": "array",
@@ -1909,7 +1909,7 @@ SCHEMAS: dict[str, dict] = {
         #     reason; user revises the task or manually picks a side.
         "type": "object",
         "additionalProperties": False,
-        "required": ["collisions", "confidence"],
+        "required": ["collisions"],
         "properties": {
             "confidence": _confidence_schema(["judgment"]),
             "collisions": {
@@ -2047,7 +2047,7 @@ SCHEMAS: dict[str, dict] = {
         # so the same evidence-gate discipline (falsifiers, contradictions,
         # and the gap stated in basis) applies.
         "type": "object",
-        "required": ["score", "rationale", "diffuse", "confidence"],
+        "required": ["score", "rationale", "diffuse"],
         "properties": {
             # 0–1 Task-Context Fit score. >= decompose_fit_threshold (0.70)
             # means the subtask is a leaf (well-fit; no further splitting).
