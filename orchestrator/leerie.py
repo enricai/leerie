@@ -16292,15 +16292,42 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     log("phase 1½: provision recipe gate clean")
 
 
-def _planner_sample_is_empty_ready(sample: dict) -> bool:
-    """True for a `ready` plan carrying no subtasks.
+# A near-degenerate sample (few subtasks) is dropped only when a sibling
+# found substantially more real work — this many times more, at minimum.
+# Calibrated against the measured winner shapes in the task's P12 writeup:
+# a 1-2 subtask sample losing to a 10+ subtask sibling is the shape to
+# catch; a [8, 9] pair (comparable sizes) must NOT be dropped.
+_PLANNER_SAMPLE_DEGENERACY_RATIO = 4
 
-    Deliberately NOT called "invalid" on its own: this exact shape is the
-    planner's legitimate way to say *this domain has no work*, and
-    `_detect_no_work` routes a run on it. It is only a defect **relative to a
-    sibling sample that found work** — see `_select_best_planner_sample`."""
-    return (sample.get("status") == "ready"
-            and not sample.get("subtasks"))
+
+def _planner_sample_is_empty_ready(sample: dict, sibling_subtask_counts: list[int] | None = None) -> bool:
+    """True for a `ready` plan that is empty, or near-degenerate relative to
+    its siblings.
+
+    Deliberately NOT called "invalid" on its own: an empty or small sample is
+    the planner's legitimate way to say *this domain has little/no work*, and
+    `_detect_no_work` routes a run on the empty case. It is only a defect
+    **relative to a sibling sample that found substantially more work** — see
+    `_select_best_planner_sample`.
+
+    `sibling_subtask_counts` is every OTHER sample's subtask count (this
+    sample excluded). Exact-empty (`subtasks == []`) is ALWAYS degenerate —
+    unconditional, matching the original behavior exactly (the caller's
+    `elif not ranked: ranked = samples` fallback is what keeps an all-empty
+    set from being wiped out, not this predicate). A non-empty sample is
+    additionally near-degenerate, but only relative to siblings: it is
+    dropped when a sibling's count is given and the best sibling has at
+    least `_PLANNER_SAMPLE_DEGENERACY_RATIO`x as many subtasks — comparable
+    sizes (e.g. 8 vs 9) never qualify, and with no siblings given there is
+    nothing to compare against."""
+    if sample.get("status") != "ready":
+        return False
+    n = len(sample.get("subtasks") or [])
+    if n == 0:
+        return True
+    if not sibling_subtask_counts:
+        return False
+    return max(sibling_subtask_counts) >= n * _PLANNER_SAMPLE_DEGENERACY_RATIO
 
 
 def _select_best_planner_sample(
@@ -16310,8 +16337,9 @@ def _select_best_planner_sample(
 
     Validity gate (DESIGN §5 *Selection separates validity from quality*),
     applied BEFORE scoring:
-      0. Drop empty-`ready` samples — but only while a non-empty sibling
-         survives.
+      0. Drop empty- or near-degenerate-`ready` samples — but only while a
+         substantially-larger sibling survives (see
+         `_planner_sample_is_empty_ready`).
 
     Selection criteria (no LLM — avoids self-bias per ACL 2024):
       1. Fewest mechanical-check issues
@@ -16332,11 +16360,20 @@ def _select_best_planner_sample(
     The gate is relative, never absolute. If every sample is empty-`ready`
     the domain genuinely has no work, so the full set is ranked unchanged and
     `_detect_no_work`'s terminal route still fires."""
-    ranked = [s for s in samples if not _planner_sample_is_empty_ready(s)]
-    if ranked and len(ranked) < len(samples):
-        log(f"  {domain}: dropped {len(samples) - len(ranked)} empty sample(s) "
-            f"before ranking — {len(ranked)} sibling(s) found work, so an "
-            f"empty plan is not a usable answer for this domain")
+    counts = [len(s.get("subtasks") or []) for s in samples]
+    is_dropped = [
+        _planner_sample_is_empty_ready(s, counts[:i] + counts[i + 1:])
+        for i, s in enumerate(samples)
+    ]
+    dropped = [s for s, d in zip(samples, is_dropped) if d]
+    ranked = [s for s, d in zip(samples, is_dropped) if not d]
+    if ranked and dropped:
+        kind = "empty" if all(not s.get("subtasks") for s in dropped) \
+            else "empty/near-degenerate"
+        log(f"  {domain}: dropped {len(dropped)} {kind} sample(s) before "
+            f"ranking — {len(ranked)} sibling(s) found substantially more "
+            f"work, so a near-empty plan is not a usable answer for this "
+            f"domain")
     elif not ranked:
         # Every sample is empty: a real no-work verdict, not a degenerate one.
         ranked = samples

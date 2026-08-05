@@ -81,6 +81,51 @@ def test_missing_keys_do_not_raise(leerie):
     assert leerie._planner_sample_is_empty_ready({"subtasks": []}) is False
 
 
+# ----- P12: relative near-degeneracy ---------------------------------------
+
+def test_near_degenerate_sample_dropped_against_a_much_larger_sibling(leerie):
+    """Success-criteria matrix: [0, 12], [1, 15] drop the small sample; [8, 9]
+    (comparable sizes) drops neither."""
+    cases = [
+        ([0, 12], [True, False]),
+        ([1, 15], [True, False]),
+        ([8, 9], [False, False]),
+    ]
+    for counts, expected in cases:
+        samples = [_plan(n) for n in counts]
+        sibling_counts = [
+            [c for j, c in enumerate(counts) if j != i]
+            for i in range(len(counts))
+        ]
+        actual = [
+            leerie._planner_sample_is_empty_ready(s, sibling_counts[i])
+            for i, s in enumerate(samples)
+        ]
+        assert actual == expected, (counts, actual, expected)
+
+
+def test_near_degenerate_sample_dropped_through_the_real_selector(
+        leerie, tmp_path):
+    """End-to-end: a 1-subtask sample loses to a 15-subtask sibling even
+    though it is not exactly empty."""
+    small, large = _plan(1), _plan(15)
+    best = leerie._select_best_planner_sample(
+        [small, large], tmp_path, "feature-implementation")
+    assert best is not small
+    assert len(best["subtasks"]) == 15
+
+
+def test_comparable_sized_samples_are_not_dropped_as_degenerate(
+        leerie, tmp_path):
+    """[8, 9]: neither is degenerate relative to the other, so the existing
+    tiebreak (most subtasks) decides, not the gate."""
+    (tmp_path / "src").mkdir()
+    eight, nine = _plan(8), _plan(9)
+    best = leerie._select_best_planner_sample(
+        [eight, nine], tmp_path, "feature-implementation")
+    assert len(best["subtasks"]) == 9
+
+
 # ----- the gate, through the real selector ---------------------------------
 
 def test_the_reported_failure_empty_no_longer_beats_substantive(
