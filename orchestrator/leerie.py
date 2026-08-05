@@ -1123,7 +1123,7 @@ def resolve_prompt(call_type: str) -> tuple[str, str, str]:
 # the conformer schema readable.
 _CONFORMER_BLT_PROP = {
     "type": "object",
-    "required": ["ran", "passed", "command", "summary"],
+    "required": ["ran", "passed", "command"],
     "properties": {
         "ran": {"type": "boolean"},
         "passed": {"type": "boolean"},
@@ -1203,7 +1203,7 @@ def _confidence_schema(axes: list[str]) -> dict:
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
-        "required": ["categories", "confidence"],
+        "required": ["categories"],
         "properties": {
             "categories": {"type": "array", "items": {"type": "string"}},
             "questions": {
@@ -1275,7 +1275,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "planner": {
         "type": "object",
-        "required": ["domain", "subtasks", "status", "confidence"],
+        "required": ["domain", "subtasks", "status"],
         "properties": {
             "domain": {"type": "string"},
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
@@ -1400,7 +1400,7 @@ SCHEMAS: dict[str, dict] = {
         # `_apply_reconciler_output` and `_validate_must_include` are untouched.
         "type": "object",
         "required": ["added_subtasks", "added_requires", "tag_ops", "renames",
-                     "dependency_edges", "merged_subtasks", "confidence"],
+                     "dependency_edges", "merged_subtasks"],
         "properties": {
             "added_subtasks": {
                 # Net-new bridging work. `requires` is NOT nested here any
@@ -1508,7 +1508,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "implementer": {
         "type": "object",
-        "required": ["subtask_id", "status", "confidence"],
+        "required": ["subtask_id", "status"],
         "properties": {
             "subtask_id": {"type": "string"},
             "status": {
@@ -1585,7 +1585,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "integrator": {
         "type": "object",
-        "required": ["incoming_subtask", "status", "confidence"],
+        "required": ["incoming_subtask", "status"],
         "properties": {
             "incoming_subtask": {"type": "string"},
             "status": {
@@ -1608,7 +1608,7 @@ SCHEMAS: dict[str, dict] = {
     # reasoned abort).
     "rebaser": {
         "type": "object",
-        "required": ["status", "final_branch_state", "confidence"],
+        "required": ["status", "final_branch_state"],
         "properties": {
             "status": {
                 "type": "string",
@@ -1656,7 +1656,7 @@ SCHEMAS: dict[str, dict] = {
             "subtask_id", "rules_files_read",
             "rule_violations_fixed", "rule_violations_residual",
             "docs_updates", "tests_updates",
-            "build", "lint", "tests", "summary", "confidence",
+            "build", "lint", "tests", "summary",
             "solution_defects",
         ],
         "properties": {
@@ -1844,7 +1844,7 @@ SCHEMAS: dict[str, dict] = {
         # The recipe is structurally bounded here, then mechanically
         # validated by _validate_provision_recipe() (§12 carve-out).
         "type": "object",
-        "required": ["recipe", "confidence"],
+        "required": ["recipe"],
         "properties": {
             "recipe": {
                 "type": "array",
@@ -1909,7 +1909,7 @@ SCHEMAS: dict[str, dict] = {
         #     reason; user revises the task or manually picks a side.
         "type": "object",
         "additionalProperties": False,
-        "required": ["collisions", "confidence"],
+        "required": ["collisions"],
         "properties": {
             "confidence": _confidence_schema(["judgment"]),
             "collisions": {
@@ -2047,7 +2047,7 @@ SCHEMAS: dict[str, dict] = {
         # so the same evidence-gate discipline (falsifiers, contradictions,
         # and the gap stated in basis) applies.
         "type": "object",
-        "required": ["score", "rationale", "diffuse", "confidence"],
+        "required": ["score"],
         "properties": {
             # 0–1 Task-Context Fit score. >= decompose_fit_threshold (0.70)
             # means the subtask is a leaf (well-fit; no further splitting).
@@ -4568,6 +4568,16 @@ def _parse_memory_size(value: str, context: str) -> int:
     if n <= 0:
         die(f"{context}: {value!r} must be a positive memory size")
     return n * mult
+
+
+_NODE_MANIFEST_NAMES = (
+    "package.json", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+)
+
+
+def _is_node_repo(cwd: str) -> bool:
+    """Whether `cwd` is a Node/JS repo, by presence of a package manifest."""
+    return any((Path(cwd) / name).exists() for name in _NODE_MANIFEST_NAMES)
 
 
 def _auto_worker_memory_max(max_parallel: int) -> int:
@@ -10603,6 +10613,29 @@ class WorktreeSetupError(WorkerError):
     """
 
 
+class PidExhaustedError(WorkerError):
+    """The worker's cgroup exhausted its PID table (fork denials climbing or
+    `pids.current` at `pids.max`) — every shell-spawning tool call then fails
+    with EAGAIN.
+
+    A distinct type because the retry classifier dispatches on a kind tagged
+    at the PRODUCER, never on prose (see `_RETRYABLE_FAILURE_KINDS`). The
+    worker did not misbehave in a way a corrective note can address — a
+    fresh worker gets a clean PID table, which is exactly the remedy.
+    """
+
+
+class OomKilledError(WorkerError):
+    """The worker's tool subtree (a build/test command) overshot
+    `memory.max` and was killed by the kernel mid-turn.
+
+    A distinct type because the retry classifier dispatches on a kind tagged
+    at the PRODUCER, never on prose (see `_RETRYABLE_FAILURE_KINDS`). Not a
+    broken or dishonest worker — a resource limit killed it — so a
+    corrective note has nothing to correct; a fresh attempt is the remedy.
+    """
+
+
 def _api_error_category(status: int | None) -> str | None:
     """Map a `claude -p` `api_error_status` to a coarse failure category.
 
@@ -12660,6 +12693,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if worker_env is None:
             worker_env = os.environ.copy()
         worker_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_STRICT_PROXY.port}"
+    # Node/V8 derives its default heap ceiling (~4.2 GiB) from *host* memory,
+    # not the worker's cgroup memory.max — so on a Node repo, a build can
+    # abort with a V8 heap OOM while most of leerie's (larger) per-worker
+    # allowance sits unused (P9). `- 2048` reserves headroom for the
+    # resident `claude -p` process sharing the same cgroup (see
+    # _auto_worker_memory_max's docstring: build + resident claude peaks
+    # around 6.3 GiB, measured against an 8 GiB floor). Auto-derivation
+    # floors at 8 GiB so this is normally >= 6144, but --worker-memory-max /
+    # LEERIE_WORKER_MEMORY_MAX / leerie.toml let an operator set the cap
+    # below 2 GiB explicitly — clamp so V8 is never handed a non-positive
+    # or degenerately small ceiling.
+    if worker_memory_max_bytes is not None and _is_node_repo(cwd):
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -12917,7 +12966,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                         f"shell; every Bash call now fails. "
                                         f"Terminating early so a fresh worker "
                                         f"retries with a clean PID table.")
-                                    raise WorkerError(
+                                    raise PidExhaustedError(
                                         f"worker {sid} exhausted its PID "
                                         f"cgroup (pids.current={cur}/{mx}, "
                                         f"fork denials={ev_max}); every "
@@ -13193,7 +13242,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             cmd_desc = f"`{last_bash_cmd}`" if last_bash_cmd else "a command"
             cap_gib = (f"{worker_memory_max_bytes / 1024**3:.1f} GiB"
                        if worker_memory_max_bytes else "unknown")
-            raise WorkerError(
+            raise OomKilledError(
                 f"worker {sid} was OOM-killed on {cmd_desc} "
                 f"(memory.max={cap_gib}) — raise --worker-memory-max or "
                 f"lower --max-parallel")
@@ -13826,7 +13875,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             else:
                 retry_note = (
                     f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
-                    "Return output that conforms exactly to the required schema.")
+                    "Return output that conforms exactly to the required schema. "
+                    "You MUST finish by calling the StructuredOutput tool with "
+                    "your answer — describing the answer in prose is not enough.")
             # Multi-token mid-run failover (DESIGN §6 *Multi-token
             # rotation*) covers BOTH surfaces a rate-limited active token
             # can reach this loop through:
@@ -16269,15 +16320,42 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     log("phase 1½: provision recipe gate clean")
 
 
-def _planner_sample_is_empty_ready(sample: dict) -> bool:
-    """True for a `ready` plan carrying no subtasks.
+# A near-degenerate sample (few subtasks) is dropped only when a sibling
+# found substantially more real work — this many times more, at minimum.
+# Calibrated against the measured winner shapes in the task's P12 writeup:
+# a 1-2 subtask sample losing to a 10+ subtask sibling is the shape to
+# catch; a [8, 9] pair (comparable sizes) must NOT be dropped.
+_PLANNER_SAMPLE_DEGENERACY_RATIO = 4
 
-    Deliberately NOT called "invalid" on its own: this exact shape is the
-    planner's legitimate way to say *this domain has no work*, and
-    `_detect_no_work` routes a run on it. It is only a defect **relative to a
-    sibling sample that found work** — see `_select_best_planner_sample`."""
-    return (sample.get("status") == "ready"
-            and not sample.get("subtasks"))
+
+def _planner_sample_is_empty_ready(sample: dict, sibling_subtask_counts: list[int] | None = None) -> bool:
+    """True for a `ready` plan that is empty, or near-degenerate relative to
+    its siblings.
+
+    Deliberately NOT called "invalid" on its own: an empty or small sample is
+    the planner's legitimate way to say *this domain has little/no work*, and
+    `_detect_no_work` routes a run on the empty case. It is only a defect
+    **relative to a sibling sample that found substantially more work** — see
+    `_select_best_planner_sample`.
+
+    `sibling_subtask_counts` is every OTHER sample's subtask count (this
+    sample excluded). Exact-empty (`subtasks == []`) is ALWAYS degenerate —
+    unconditional, matching the original behavior exactly (the caller's
+    `elif not ranked: ranked = samples` fallback is what keeps an all-empty
+    set from being wiped out, not this predicate). A non-empty sample is
+    additionally near-degenerate, but only relative to siblings: it is
+    dropped when a sibling's count is given and the best sibling has at
+    least `_PLANNER_SAMPLE_DEGENERACY_RATIO`x as many subtasks — comparable
+    sizes (e.g. 8 vs 9) never qualify, and with no siblings given there is
+    nothing to compare against."""
+    if sample.get("status") != "ready":
+        return False
+    n = len(sample.get("subtasks") or [])
+    if n == 0:
+        return True
+    if not sibling_subtask_counts:
+        return False
+    return max(sibling_subtask_counts) >= n * _PLANNER_SAMPLE_DEGENERACY_RATIO
 
 
 def _select_best_planner_sample(
@@ -16287,8 +16365,9 @@ def _select_best_planner_sample(
 
     Validity gate (DESIGN §5 *Selection separates validity from quality*),
     applied BEFORE scoring:
-      0. Drop empty-`ready` samples — but only while a non-empty sibling
-         survives.
+      0. Drop empty- or near-degenerate-`ready` samples — but only while a
+         substantially-larger sibling survives (see
+         `_planner_sample_is_empty_ready`).
 
     Selection criteria (no LLM — avoids self-bias per ACL 2024):
       1. Fewest mechanical-check issues
@@ -16309,11 +16388,20 @@ def _select_best_planner_sample(
     The gate is relative, never absolute. If every sample is empty-`ready`
     the domain genuinely has no work, so the full set is ranked unchanged and
     `_detect_no_work`'s terminal route still fires."""
-    ranked = [s for s in samples if not _planner_sample_is_empty_ready(s)]
-    if ranked and len(ranked) < len(samples):
-        log(f"  {domain}: dropped {len(samples) - len(ranked)} empty sample(s) "
-            f"before ranking — {len(ranked)} sibling(s) found work, so an "
-            f"empty plan is not a usable answer for this domain")
+    counts = [len(s.get("subtasks") or []) for s in samples]
+    is_dropped = [
+        _planner_sample_is_empty_ready(s, counts[:i] + counts[i + 1:])
+        for i, s in enumerate(samples)
+    ]
+    dropped = [s for s, d in zip(samples, is_dropped) if d]
+    ranked = [s for s, d in zip(samples, is_dropped) if not d]
+    if ranked and dropped:
+        kind = "empty" if all(not s.get("subtasks") for s in dropped) \
+            else "empty/near-degenerate"
+        log(f"  {domain}: dropped {len(dropped)} {kind} sample(s) before "
+            f"ranking — {len(ranked)} sibling(s) found substantially more "
+            f"work, so a near-empty plan is not a usable answer for this "
+            f"domain")
     elif not ranked:
         # Every sample is empty: a real no-work verdict, not a degenerate one.
         ranked = samples
@@ -22397,18 +22485,32 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
 #      worker is being told to fix
 #
 # MEASURED CANDIDATES NOT YET MOVED HERE (deliberate): auditing every
-# `raise WorkerError` found `worker {sid} exhausted its PID`, `worker {sid}
-# was OOM-killed`, `Claude API connection dropped mid-response`, 529
-# overloaded, and auth/quota — all infrastructure on the same generic path.
+# `raise WorkerError` also found `Claude API connection dropped mid-response`,
+# 529 overloaded, and auth/quota — infrastructure on the same generic path.
 # Reclassifying them is a behaviour change well past this incident and could
-# mask a real resource problem, so it needs its own evidence. Bundling it
-# here is how the previous response to this incident became containment.
+# mask a real resource problem, so it needs its own evidence. 529/auth
+# already have tenacity backoff inside `claude_p`. Bundling it here is how
+# the previous response to this incident became containment.
 _INFRASTRUCTURE_FAILURE_KINDS = frozenset({
     "worktree_setup",  # WorktreeSetupError — `new-worktree.sh` could not
                        # produce the worktree. Terminal ("broken") until run
                        # 488c42e5 (2026-08-05), where it killed a wave with
                        # 25 of 26 subtasks complete and left `resume` hitting
                        # the same wall on every attempt.
+    "pid_exhausted",   # PidExhaustedError — the worker's cgroup exhausted
+                       # its PID table (fork denials climbing / at
+                       # pids.max); every shell-spawning tool call then
+                       # fails with EAGAIN. Terminal ("broken") until this
+                       # change: `exhausted its PID` fired 9 times across 3
+                       # runs, and the `:12919`-area log message already
+                       # promised "a fresh worker retries with a clean PID
+                       # table" — a promise the implementer path did not
+                       # keep before this fix.
+    "oom_killed",      # OomKilledError — the worker's tool subtree
+                       # overshot memory.max and was kernel-killed
+                       # mid-turn. Terminal ("broken") until this change:
+                       # `was OOM-killed` fired 11 times across 3 runs; of
+                       # the 6 runs that hit PID/OOM, 3 produced no PR.
 })
 
 _WORKER_RETRYABLE_KINDS = frozenset({
@@ -24205,6 +24307,27 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # from deleting the branch, which may already carry an earlier
             # attempt's commits (run 488c42e5, `bugfix-009-2`).
             fail_res = await fail("worktree_setup", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
+        except PidExhaustedError as e:
+            # The worker's cgroup ran out of PID table (fork denials
+            # climbing / at pids.max). Tagged as its own retryable kind
+            # rather than the generic "broken" below: the worker did not
+            # misbehave in a way a corrective note can address — a fresh
+            # worker gets a clean PID table, which is exactly the remedy
+            # the `:12919`-area log message already promised.
+            fail_res = await fail("pid_exhausted", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
+        except OomKilledError as e:
+            # The worker's tool subtree overshot memory.max and was
+            # kernel-killed mid-turn. Tagged as its own retryable kind
+            # rather than the generic "broken" below: a resource limit
+            # killed it, not the worker's own behaviour, so a fresh
+            # attempt is the remedy.
+            fail_res = await fail("oom_killed", str(e))
             if fail_res is not None:
                 return fail_res
             continue

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -350,6 +351,53 @@ def test_schema_rejects_malformed(leerie):
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"satisfied": True, "evidence": "x", "extra": 1}, schema)
+
+
+# ---------------------------------------------------------------------------
+# P10 — evidence-citation requirement
+# ---------------------------------------------------------------------------
+#
+# prompts/satisfied_probe.md was amended so success criteria naming test
+# file paths are judged by coverage/convention rather than a literal
+# colocated-path match, and the probe must cite the specific file+assertion
+# as evidence. Prompt prose cannot be pytest-asserted for LLM behavior
+# (CLAUDE.md's central principle: prompts are advisory, code enforces).
+# What IS mechanically checkable: `evidence` is a required, non-empty-typed
+# field on every satisfied_probe verdict (including satisfied=True — the
+# load-bearing case, since a true verdict soft-drops a subtask), and the
+# prompt file exists and is non-empty (structural-only, mirroring
+# tests/test_prompts_have_no_foreign_identifiers.py's style).
+
+def test_schema_requires_evidence_on_satisfied_true_verdict(leerie):
+    """A satisfied=True verdict with no evidence field must be rejected —
+    the schema is the mechanical backstop for the amended prompt's
+    file+assertion citation instruction."""
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; rejection requires a validator")
+    schema = leerie.SCHEMAS["satisfied_probe"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"satisfied": True}, schema)
+    # evidence must be string-typed (the citation is prose, not structured)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"satisfied": True, "evidence": None}, schema)
+    # a well-formed citation on satisfied=True passes
+    _validate(leerie, {
+        "satisfied": True,
+        "evidence": "tests/test_foo.py::test_bar asserts the new behavior",
+        "checked": ["tests/test_foo.py"],
+    })
+
+
+def test_satisfied_probe_prompt_exists_and_nonempty():
+    """Structural-only check: the prompt file exists and is non-empty.
+    Prose content is not asserted — only a live LLM run can verify the
+    probe actually follows the amended evidence-citation instruction."""
+    prompt_path = os.path.join(
+        os.path.dirname(__file__), "..", "prompts", "satisfied_probe.md")
+    assert os.path.isfile(prompt_path)
+    with open(prompt_path, encoding="utf-8") as f:
+        content = f.read()
+    assert content.strip()
 
 
 # ---------------------------------------------------------------------------

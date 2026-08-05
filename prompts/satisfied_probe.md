@@ -126,6 +126,43 @@ If a subtask asks for translation keys and the file `messages/en.json`
 exists but contains none of the required keys, the criterion is not met —
 inspect the actual content, not just the path.
 
+## Judge test coverage by convention, not by literal path
+
+A success criterion sometimes names a specific test file path (e.g. "add
+`src/app/api/v1/webhooks/route.test.ts`"). That path can be wrong even
+when the described behavior is genuinely covered — planners invent
+plausible-looking paths, but a repo's actual test-location convention
+may differ (for example, tests colocated under a mirrored `tests/`
+directory rather than next to the source file). Do not return `false`
+solely because the literal named path is absent.
+
+Instead: search the repo for its actual convention for tests of this
+kind (`Grep`/`Glob` for the described behavior — the route, function,
+symbol, or feature under test — across the whole tree, not just the
+literal path), and judge whether the described behavior is **actually
+covered** wherever the repo's convention places that coverage. If you
+find equivalent coverage at a different, conventional location, that
+satisfies the criterion — the file path in the criterion text is not
+itself part of what must be true.
+
+This cuts both ways, and the same "cite concrete on-tree facts"
+discipline from above still governs it exactly:
+
+- In **all** cases — literal path match or convention match — your
+  `evidence` must cite the **specific file and the specific
+  assertion(s)** that actually satisfy the criterion (e.g. "`it(...)`
+  block in `src/tests/app/api/v1/webhooks/endpoint-deliveries-route.test.ts`
+  asserting the deliveries route returns 200 with the expected shape"),
+  not merely that a plausibly-named file exists.
+- Do **not** invert this into a license to accept unrelated coverage.
+  A test that happens to exist somewhere but does not actually exercise
+  the described behavior does **not** satisfy the criterion — you must
+  still verify the assertion's content matches what the criterion
+  requires, exactly as the "file existing is not the same as met" rule
+  above already demands. When you cannot find and cite a real covering
+  assertion anywhere on the tree, return `false`; do not credit a
+  near-miss.
+
 ## Output
 
 Return **only** a JSON object per your schema:

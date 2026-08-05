@@ -171,3 +171,215 @@ def test_garbage_file_dies(leerie, repo_root):
     (repo_root / "leerie.toml").write_text("worker_memory_max = garbage\n")
     with pytest.raises(SystemExit):
         leerie.resolve_worker_memory_max(repo_root, max_parallel=4)
+
+
+# ---- _is_node_repo (P9 node-repo detection) --------------------------------
+
+def test_is_node_repo_package_json(leerie, tmp_path):
+    (tmp_path / "package.json").write_text("{}\n")
+    assert leerie._is_node_repo(str(tmp_path)) is True
+
+
+def test_is_node_repo_pnpm_lock(leerie, tmp_path):
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    assert leerie._is_node_repo(str(tmp_path)) is True
+
+
+def test_is_node_repo_package_lock(leerie, tmp_path):
+    (tmp_path / "package-lock.json").write_text("{}\n")
+    assert leerie._is_node_repo(str(tmp_path)) is True
+
+
+def test_is_node_repo_yarn_lock(leerie, tmp_path):
+    (tmp_path / "yarn.lock").write_text("# yarn lockfile v1\n")
+    assert leerie._is_node_repo(str(tmp_path)) is True
+
+
+def test_is_node_repo_false_for_non_node_repo(leerie, tmp_path):
+    (tmp_path / "requirements.txt").write_text("pytest\n")
+    assert leerie._is_node_repo(str(tmp_path)) is False
+
+
+def test_is_node_repo_false_for_empty_dir(leerie, tmp_path):
+    assert leerie._is_node_repo(str(tmp_path)) is False
+
+
+# ---- NODE_OPTIONS derivation (P9) ------------------------------------------
+#
+# The derivation itself (leerie.py ~12707-12711, inside `_invoke`) is:
+#     cap_mb = max(worker_memory_max_bytes // (1024*1024) - 2048, 256)
+#     worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
+# gated on `worker_memory_max_bytes is not None and _is_node_repo(cwd)`.
+# `_invoke` builds the whole subprocess environment inline rather than
+# through a standalone helper, so these tests pin the arithmetic and the
+# gating condition directly (mirroring the derivation's own inline
+# formula) rather than invoking the full async subprocess-spawning
+# function, which the rest of this file's tests never do either.
+
+def _node_options_value(cap_bytes: int) -> str:
+    cap_mb = max(cap_bytes // (1024 * 1024) - 2048, 256)
+    return f"--max-old-space-size={cap_mb}"
+
+
+def test_node_options_arithmetic_8gib_floor(leerie):
+    """8 GiB floor (the common auto-derived case) minus the 2048 MiB
+    reserve for the resident claude process."""
+    cap_bytes = 8 * 1024**3
+    assert _node_options_value(cap_bytes) == "--max-old-space-size=6144"
+
+
+def test_node_options_arithmetic_larger_auto_derived_cap(leerie):
+    """A larger auto-derived cap (e.g. 25.6 GiB from a well-resourced
+    host splitting across max_parallel=4) still subtracts exactly
+    2048 MiB, not a percentage or other scaling."""
+    cap_bytes = (128 * 1024**3) // 5  # matches test_auto_splits_meminfo_across_slots
+    cap_mb = cap_bytes // (1024 * 1024)
+    assert _node_options_value(cap_bytes) == f"--max-old-space-size={cap_mb - 2048}"
+
+
+def test_node_options_clamped_when_cap_below_reserve(leerie):
+    """An operator-set cap below the 2048 MiB reserve (e.g. via
+    --worker-memory-max/LEERIE_WORKER_MEMORY_MAX/leerie.toml) must not
+    produce a non-positive or degenerately small V8 heap ceiling."""
+    cap_bytes = 512 * 1024**2  # 512 MiB, well under the 2048 MiB reserve
+    assert _node_options_value(cap_bytes) == "--max-old-space-size=256"
+
+
+def test_node_options_present_for_node_repo(leerie, tmp_path):
+    """End-to-end: replicate `_invoke`'s gating + derivation inline
+    against a real Node-repo fixture (package.json present)."""
+    (tmp_path / "package.json").write_text("{}\n")
+    worker_memory_max_bytes = 8 * 1024**3
+    worker_env = None
+    if worker_memory_max_bytes is not None and leerie._is_node_repo(str(tmp_path)):
+        import os as _os
+        worker_env = _os.environ.copy()
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
+    assert worker_env is not None
+    assert worker_env["NODE_OPTIONS"] == "--max-old-space-size=6144"
+
+
+def test_node_options_absent_for_non_node_repo(leerie, tmp_path):
+    """The same gating logic against a non-Node repo fixture: no
+    package.json/lockfile present, so NODE_OPTIONS is never set."""
+    (tmp_path / "requirements.txt").write_text("pytest\n")
+    worker_memory_max_bytes = 8 * 1024**3
+    worker_env = None
+    if worker_memory_max_bytes is not None and leerie._is_node_repo(str(tmp_path)):
+        import os as _os
+        worker_env = _os.environ.copy()
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
+    assert worker_env is None
+
+
+# ---- Source-coupling guard: the tests above vs. _invoke's REAL code -------
+#
+# Every test above replicates `_invoke`'s NODE_OPTIONS block by hand rather
+# than calling `_invoke` (a real async subprocess-spawning function this
+# file's fixtures never exercise). That means none of them would notice if
+# the real block's reserve constant, clamp floor, or gating condition
+# changed. This class extracts the actual source of `_invoke` and asserts,
+# structurally, that the constants/condition the tests assume are still
+# what the shipping code does — so a drift in the real formula/gate fails
+# here even though nothing above calls `_invoke` itself.
+
+import ast
+import inspect
+
+
+def _invoke_node_options_source(leerie) -> str:
+    src = inspect.getsource(leerie._invoke)
+    # Isolate the `if worker_memory_max_bytes is not None and _is_node_repo(...)`
+    # block specifically, not the whole (much larger) function body.
+    marker = "if worker_memory_max_bytes is not None and _is_node_repo(cwd):"
+    assert marker in src, (
+        "_invoke's NODE_OPTIONS gate condition text changed — the tests in "
+        "this file assume `worker_memory_max_bytes is not None and "
+        "_is_node_repo(cwd)` verbatim; update both the gate and this guard "
+        "together if the condition is intentionally changing."
+    )
+    start = src.index(marker)
+    # Grab a generous window after the marker covering the block body.
+    return src[start:start + 400]
+
+
+def test_invoke_node_options_gate_condition_unchanged(leerie):
+    """The gate must require BOTH a resolved memory cap AND a Node repo —
+    an `or` here would set NODE_OPTIONS on non-Node repos (nonsensical) or
+    skip it for Node repos with no memory cap resolved (defeats the fix)."""
+    block = _invoke_node_options_source(leerie)
+    assert "worker_memory_max_bytes is not None and _is_node_repo(cwd)" in block
+
+
+def test_invoke_node_options_reserve_constant_unchanged(leerie):
+    """The 2048 MiB reserve is what the tests above hard-code; a change to
+    this constant in `_invoke` must be reflected in the arithmetic tests
+    too, not silently diverge from what they assert."""
+    block = _invoke_node_options_source(leerie)
+    assert "- 2048" in block, (
+        "The 2048 MiB reserve constant in _invoke's NODE_OPTIONS derivation "
+        "changed — update test_node_options_arithmetic_* to match."
+    )
+
+
+def test_invoke_node_options_clamp_floor_unchanged(leerie):
+    """The clamp floor (256 MiB) prevents a non-positive or degenerate V8
+    heap ceiling when an operator sets a cap below the reserve."""
+    block = _invoke_node_options_source(leerie)
+    assert ", 256)" in block, (
+        "The 256 MiB clamp floor in _invoke's NODE_OPTIONS derivation "
+        "changed — update test_node_options_clamped_when_cap_below_reserve "
+        "to match."
+    )
+
+
+def test_invoke_node_options_env_key_and_format_unchanged(leerie):
+    """The env var name and --max-old-space-size flag format must match
+    what every test above asserts on."""
+    block = _invoke_node_options_source(leerie)
+    assert '"NODE_OPTIONS"' in block
+    assert "--max-old-space-size={cap_mb}" in block
+
+
+def test_invoke_node_options_formula_ast_matches_helper(leerie):
+    """Parse `_invoke`'s real NODE_OPTIONS assignment as an AST and confirm
+    it computes `max(worker_memory_max_bytes // (1024*1024) - 2048, 256)` —
+    structurally, not by substring — so a reformulation that keeps the
+    substrings above (e.g. reordering the max() args, or changing the
+    divisor) still gets caught."""
+    src = inspect.getsource(leerie._invoke)
+    tree = ast.parse(src)
+
+    found = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "cap_mb"
+            ):
+                found.append(node.value)
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    assert found, "no `cap_mb = ...` assignment found inside _invoke"
+    call = found[0]
+    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "max"
+    assert len(call.args) == 2
+    floor_arg = call.args[1]
+    assert isinstance(floor_arg, ast.Constant) and floor_arg.value == 256
+
+    sub_expr = call.args[0]
+    assert isinstance(sub_expr, ast.BinOp) and isinstance(sub_expr.op, ast.Sub)
+    assert isinstance(sub_expr.right, ast.Constant) and sub_expr.right.value == 2048
+
+    floordiv_expr = sub_expr.left
+    assert isinstance(floordiv_expr, ast.BinOp) and isinstance(floordiv_expr.op, ast.FloorDiv)
+    divisor = floordiv_expr.right
+    # 1024 * 1024
+    assert isinstance(divisor, ast.BinOp) and isinstance(divisor.op, ast.Mult)
+    assert isinstance(divisor.left, ast.Constant) and divisor.left.value == 1024
+    assert isinstance(divisor.right, ast.Constant) and divisor.right.value == 1024

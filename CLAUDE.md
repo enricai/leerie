@@ -1504,6 +1504,19 @@ already-met criterion" section, scoped explicitly to the pre-schedule call
 site (`surviving_siblings` is absent from the post-execution
 `_probe_criteria_satisfied_on_head` payload, since HEAD there already reflects
 whatever siblings committed — there is no future left to anticipate).
+P10 (evidence-citation requirement — `prompts/satisfied_probe.md`'s amended
+guidance that success criteria naming test file paths are judged by
+coverage/convention rather than a literal colocated-path match, and that the
+probe cite the specific file+assertion as evidence) is pinned at the one
+mechanically-checkable layer in the same file:
+`test_schema_requires_evidence_on_satisfied_true_verdict` asserts
+`SCHEMAS["satisfied_probe"]` rejects a `satisfied=True` verdict missing
+`evidence` or with a non-string `evidence`, and accepts a well-formed
+file+assertion citation; `test_satisfied_probe_prompt_exists_and_nonempty` is
+a structural-only check that the prompt file exists and is non-empty. Prompt
+prose itself is not asserted — only a live LLM run can verify the probe
+actually follows the amended citation instruction (CLAUDE.md's own central
+principle: prompts are advisory, code enforces).
 The dominant real cause behind that same incident batch — a `test-`-domain
 subtask declaring no `requires`/`depends_on` edge to the feature subtask whose
 not-yet-created output it targets — is pinned in

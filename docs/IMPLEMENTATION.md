@@ -3897,6 +3897,26 @@ to `calls.ndjson` or logged — only its fingerprint
 (`_token_fingerprint(token)`, a truncated `sha256` hex digest) appears in
 logs or telemetry.
 
+**`NODE_OPTIONS` heap-cap injection (P9).** Node/V8 derives its default
+heap ceiling (~4.2 GiB) from *host* memory, not the worker's cgroup
+`memory.max` — so a build on a Node repo can abort with a V8 heap OOM
+while most of leerie's (larger) per-worker memory allowance sits unused.
+`_invoke` detects a Node repo via `_is_node_repo(cwd)` (presence of
+`package.json`, `pnpm-lock.yaml`, `package-lock.json`, or `yarn.lock` at
+the worker's cwd) and, when `worker_memory_max_bytes` is set, injects
+`NODE_OPTIONS=--max-old-space-size=<N>` into `worker_env` as a fourth
+sibling conditional block alongside the debug/token/strict-proxy blocks
+above. `N = max(worker_memory_max_bytes // (1024*1024) - 2048, 256)` —
+the `-2048` MB reserves headroom for the resident `claude -p` process
+sharing the same cgroup (`_auto_worker_memory_max`'s docstring: build +
+resident claude peaks around 6.3 GiB, measured against an 8 GiB floor);
+the `max(..., 256)` clamp guards the explicit-override path
+(`--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX` / leerie.toml
+`worker_memory_max`, none of which share the auto-derive path's 8 GiB
+floor) from handing V8 a non-positive or degenerately small ceiling. The
+variable is absent entirely for a non-Node repo or when
+`worker_memory_max_bytes` is `None`.
+
 **Start-of-run probe + selection.** After `preflight()` returns and before
 `phase_classify`, if `CLAUDE_CODE_OAUTH_TOKENS` is present, each token is
 probed for remaining runway and the winner becomes
@@ -4830,7 +4850,7 @@ regardless of `make_feedback_prompt`.
 | `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `_settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. `confidence` remains top-level REQUIRED (the DESIGN §8/§12 structural self-gating contract is preserved — every gate still reads a real number). Pinned by `tests/test_confidence_length_caps.py`. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). **FLATTENED 2026-08-03** to `required: [*axes, "basis"]`. `falsifiers_tested` and `contradictions_reconciled` remain as **optional** properties; `gap_to_close` is **removed entirely**; both `maxLength` caps are **deleted**. The prompts still ask for all three disciplines, but were updated in the same change to direct the gap into `basis` rather than a dedicated field (DESIGN §8 *The disciplines are asked for; they are not schema-required*). Rationale, measured: the previous shape (5 required fields = axes + `basis` + 2 arrays + a nested object) is field-for-field the trigger profile in `anthropics/claude-code#49747` (open, unfixed — the decoder flips from JSON to legacy XML `<parameter name="...">` mid-argument on tool calls with many required parameters and verbose string/array mixes). A controlled A/B against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per arm) measured **8/8 first attempts corrupted with the block present, 0/8 without it** — every with-block run needing exactly one retry; corpus-wide **48.9% of all worker calls (3,778/7,723) were wasted retries**. Requiring the fields bought no enforcement: it destroyed the whole payload *including the score the gate reads*. `gap_to_close` went rather than being relaxed because it was the block's only nested object (the sharpest edge of the #49747 profile) and **nothing decided anything on it** — its sole consumer was a diagnostic log line naming a blocked planner's gap (`phase_plan`, plus two operator-facing messages that named the field), all now pointing at `confidence.basis`. The `maxLength` caps went because they were measured **non-binding at 0.00%** across 6,526 `basis` values and 30,719 list items (observed maxima 4,342 and 1,362, against caps of 8,000/2,000) — dead constraints. **Do NOT "restore" 2000/500**: those bound on 2.38%/6.32% of real values, i.e. pure rejection pressure; the 2026-08-03 resize to 8000/2000 was itself correct but insufficient. **Superseded 2026-08-05 (P3):** `confidence` itself was subsequently dropped from every one of these 10 schemas' top-level `required` array (still declared in `properties`, so a worker that does emit it is still recorded) — the same #49747-corruption risk applied to the required *object itself*, not just its internal fields; a worker that omits the whole self-gate block now still validates. See each worker's own entry above/below for its current required-field list. Pinned by `tests/test_confidence_not_required.py`. `tests/test_confidence_length_caps.py` still covers the sub-schema shape (caps, optional arrays) for callers that do emit it. |
 
 ### Finding severity — gating vs advisory
 
@@ -5188,11 +5208,16 @@ subtask count (more = better coverage), tiebreak on first sample
 selection. If all samples for a domain crash, the run aborts.
 
 **Validity gate (runs before scoring).**
-`_planner_sample_is_empty_ready(sample)` returns True for a `status ==
-"ready"` plan with no subtasks. `_select_best_planner_sample` drops those
-samples **before** ranking — but only while at least one non-empty sibling
-survives; if every sample is empty the full set is ranked unchanged, so
-`_detect_no_work`'s terminal route still fires.
+`_planner_sample_is_empty_ready(sample, sibling_subtask_counts=None)`
+returns True for a `status == "ready"` plan that is exactly empty (always,
+unconditionally), or "near-degenerate" — non-empty but with substantially
+fewer subtasks than the largest sibling (`_PLANNER_SAMPLE_DEGENERACY_RATIO`,
+4x) — when `sibling_subtask_counts` (every other sample's subtask count) is
+given. `_select_best_planner_sample` drops those samples **before**
+ranking — but only while at least one surviving sibling is not itself
+dropped; if every sample is empty/near-degenerate relative to the rest the
+full set is ranked unchanged, so `_detect_no_work`'s terminal route still
+fires.
 
 The gate must precede the scoring rather than join it as another sort key:
 `check_planner_output` inspects subtasks, so a plan with none to inspect
@@ -5698,7 +5723,8 @@ at the producer eliminates the prose round-trip.
 The coupling test in `tests/test_retryable_failure.py` enforces that
 every retryable-path return from a producer (`_validate_result`,
 `check_branch_has_commits`, the inline dirty-worktree check,
-`_run_implementer`'s `WorktreeSetupError`) carries a `failure_kind` in
+`_run_implementer`'s `WorktreeSetupError`, `_invoke`'s
+`PidExhaustedError`/`OomKilledError`) carries a `failure_kind` in
 `_RETRYABLE_FAILURE_KINDS`. When adding a new retryable failure mode,
 extend the enum and update the producer in the same change.
 
@@ -5711,6 +5737,8 @@ extend the enum and update the producer in the same change.
 | diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
 | worker-level error (timeout, schema-invalid twice) | Terminal | `"broken"` from `WorkerError` path |
 | `new-worktree.sh` could not create the worktree | Retryable (infrastructure) | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it. Was terminal until run `488c42e5` (2026-08-05) lost `bugfix-009-2` to it *after* the implementer had committed, killing the wave with 25 of 26 subtasks complete and leaving `resume` to hit the same wall on every attempt |
+| worker's cgroup exhausted its PID table (fork denials climbing / at `pids.max`) | Retryable (infrastructure) | `"pid_exhausted"` from `_invoke`'s `PidExhaustedError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a fresh worker gets a clean PID table, which is exactly the remedy the raise site's own log message already promised ("Terminating early so a fresh worker retries with a clean PID table"). Was terminal until this change: `exhausted its PID` fired 9 times across 3 runs |
+| worker's tool subtree (a build/test command) overshot `memory.max` and was kernel-killed mid-turn | Retryable (infrastructure) | `"oom_killed"` from `_invoke`'s `OomKilledError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a resource limit killed it, not the worker's own behaviour, so a fresh attempt is the remedy. Was terminal until this change: `was OOM-killed` fired 11 times across 3 runs, and of the 6 runs that hit PID/OOM, 3 produced no PR |
 
 **Two categories, one source of truth.** `_INFRASTRUCTURE_FAILURE_KINDS` is
 the single place a kind is declared *not the worker's doing*; everything else
@@ -7965,8 +7993,10 @@ locking).
 `claude_p()` validates each worker's payload against a schema keyed by worker
 type. Required fields, current shape:
 
-- **classifier** — required: `categories` (array), `confidence`
-  (worker-internal self-gate via `_confidence_schema(["classification"])`).
+- **classifier** — required: `categories` (array). Optional (P3,
+  2026-08-05): `confidence` (worker-internal self-gate via
+  `_confidence_schema(["classification"])`, still declared in `properties`
+  but no longer schema-required — see `_confidence_schema`'s entry below).
   Optional: `questions`
   (array of `{id, question, why_underivable?}` — only `id` and `question`
   are required on each question), `source_of_truth_question` (bool). The
@@ -8004,7 +8034,9 @@ type. Required fields, current shape:
   produces post-plan) instead of `die()`ing, and returns `True` so the
   caller (`_run_phases`) stops the pipeline. When unset (the common case),
   behavior is unchanged.
-- **planner** — required: `domain`, `subtasks`, `status`, `confidence`.
+- **planner** — required: `domain`, `subtasks`, `status`. `confidence` is
+  optional (P3, 2026-08-05 — see `_confidence_schema`'s entry below; still
+  declared in `properties`, no longer schema-required).
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,
   it emits `blocked` with an empty subtasks list and the gap analysis in
@@ -8066,23 +8098,24 @@ type. Required fields, current shape:
   `adherence_judge` worker above are wired into `phase_adherence_gate` (a
   whole-plan gate, not `check_planner_output` — see "Instruction-adherence
   gate" above for the phase-level wiring and the `--skip-adherence-check`
-  flag's effect on it). The schema's required-ness of `confidence`
-  and `status` is the structural part of DESIGN §8's discipline: a worker
-  that skipped self-gating fails its own JSON schema before the orchestrator
-  reads the payload.
+  flag's effect on it). The schema's required-ness of
+  `status` is the structural part of DESIGN §8's discipline that survives
+  P3 (2026-08-05): `confidence` itself is no longer schema-required (see
+  `_confidence_schema`'s entry below) — a worker that omits it still
+  validates, since requiring the object was measured to corrupt payloads
+  under anthropics/claude-code#49747 — but `status` still is, so a worker
+  cannot omit its terminal outcome.
 - **implementer** — required: `subtask_id`, `status` (`complete` /
-  `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`),
-  `confidence` (worker-internal self-gate via
-  `_confidence_schema(["root_cause", "solution"])`, not consumed by the
-  orchestrator: required keys are
+  `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`).
+  `confidence` is optional (P3, 2026-08-05 — no longer schema-required, still
+  declared in `properties`): when present, it is the worker-internal
+  self-gate via `_confidence_schema(["root_cause", "solution"])`, not
+  consumed by the orchestrator — shape is
   `root_cause` and `solution` (numbers 1–10), `basis` (string),
   `falsifiers_tested` (array of strings, optional), `contradictions_reconciled`
-  (array of strings, optional). Only the two axes and `basis` are required;
-  when either score is below 9.0 the gap is stated in `basis` (there is no
-  `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
-  mechanically required — the schema requires the object itself, so a
-  worker that skipped self-gating fails validation before the
-  orchestrator reads the payload).
+  (array of strings, optional); when either score is below 9.0 the gap is
+  stated in `basis` (there is no `gap_to_close` — removed 2026-08-03); see
+  DESIGN §8 for the disciplines these fields encode.
   Optional: `branch`, `criteria_results` (array of
   `{criterion, met, evidence}`), `checkpoint_path`, `blocker`, `summary`,
   `clarification_question` (DESIGN §11 mid-execution exception channel:
@@ -8101,13 +8134,17 @@ type. Required fields, current shape:
   not gate the subtask. The retired `criteria_revision_proposal` field
   is no longer in the schema.
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
-  `design-conflict` / `failed`), `confidence` (worker-internal self-gate
-  via `_confidence_schema(["resolution"])`). Optional: `resolution_summary`,
+  `design-conflict` / `failed`). `confidence` is optional (P3, 2026-08-05 —
+  no longer schema-required, still declared in `properties`): when present
+  it is the worker-internal self-gate via `_confidence_schema(["resolution"])`.
+  Optional: `resolution_summary`,
   `diagnosis` (read as a fallback for `resolution_summary` when
   diagnosing a non-`resolved` outcome).
 - **rebaser** — required: `status` (`rebased` / `irreconcilable` / `failed`),
-  `final_branch_state`, `confidence` (`_confidence_schema(["resolution"])`,
-  mirroring `integrator`). Optional: `resolution_summary`, `diagnosis`
+  `final_branch_state`. `confidence` is optional (P3, 2026-08-05 — no
+  longer schema-required, still declared in `properties`): when present it
+  is `_confidence_schema(["resolution"])`, mirroring `integrator`.
+  Optional: `resolution_summary`, `diagnosis`
   (required in practice when `status` is `irreconcilable` — folded into the
   PR body by `scripts/host-finalize.sh`). DESIGN §6 *Finalization*
   "Rebase-onto-base before push": a scoped, fully-agentic exception to §12 —
@@ -8131,16 +8168,12 @@ type. Required fields, current shape:
   documentation files updated to reflect the diff), `tests_updates` (array
   of `{path, reason}` — tests added or amended to cover the diff), `build`,
   `lint`, `tests` (each an object `{ran (bool), passed (bool), command
-  (string), summary (string)}` — `ran: false` when the tool is not
-  applicable to the repo; `passed` is irrelevant when `ran: false`),
+  (string), summary (optional string)}` — only `ran`, `passed`, and
+  `command` are required; `summary` is advisory and may be omitted —
+  `ran: false` when the tool is not applicable to the repo; `passed` is
+  irrelevant when `ran: false`),
   `summary` (string — one-line description of what the conformance pass
-  did), `confidence` (worker-internal self-gate, not consumed by the
-  orchestrator: required keys `conformance` (number 1–10), `basis`
-  (string), `falsifiers_tested` (array of strings, optional),
-  `contradictions_reconciled` (array of strings, optional). Only `conformance`
-  and `basis` are required; when conformance is below 9.0 the gap is stated in
-  `basis` (there is no `gap_to_close` — removed 2026-08-03); see DESIGN §8 for the disciplines these fields make
-  mechanically required), and `solution_defects` (array of `{kind:
+  did), and `solution_defects` (array of `{kind:
   enum[unhandled_input, unhandled_path, missing_guard, sibling_site_unedited,
   wrong_selector, decoy_or_shortcut], concrete_case (string, minLength 1),
   where (string, minLength 1), why_ships_a_defect (string, minLength 1)}` — the
@@ -8161,7 +8194,14 @@ type. Required fields, current shape:
   worktree, and every `solution_defects` item carries a non-empty
   `concrete_case` and `where` (a defect without a concrete case is
   non-actionable and dropped, so the gate cannot fire on vague prose) — are
-  enforced by `_validate_conformance_result()`.
+  enforced by `_validate_conformance_result()`. `confidence` is optional
+  (P3, 2026-08-05 — no longer schema-required, still declared in
+  `properties`): when present it is the worker-internal self-gate, not
+  consumed by the orchestrator — shape is `conformance` (number 1–10),
+  `basis` (string), `falsifiers_tested` (array of strings, optional),
+  `contradictions_reconciled` (array of strings, optional); when
+  conformance is below 9.0 the gap is stated in `basis` (there is no
+  `gap_to_close` — removed 2026-08-03).
 - **judge** — required: `passed` (bool — aggregate verdict, true only when all
   three dimensions are true), `dimensions` (object with required boolean fields
   `schema_ok`, `factual_ok`, `hallucination_ok`), `rationale` (str — 1–3
@@ -8353,7 +8393,7 @@ enforcement functions:
 | `test_rank_repo_map.py` | `_rank_repo_map()` P6 ranking contract: seed-adjacent nodes rank above unrelated nodes (direct seed file, 1-hop neighbor via callee→caller edge, seed symbol biases definer, all connected-chain files before any island file); token-budget enforcement (explicit budget, `DEFAULT_CAPS["repo_map_tokens"]` when `None`, `None` == cap value, empty map returns `""`); binary-search shrink (lower budget → shorter output and fewer files, increasing budgets → non-decreasing lengths, tight budgets respected). Fixture built directly (no `_build_repo_map`); no LLM calls; deterministic. |
 | `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (sonnet via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"medium"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
 | `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `sonnet` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `medium` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
-| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "medium"`, prompt file exists) |
+| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (P3: `score` only — `rationale`, `diffuse`, `confidence` relaxed to optional properties); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "medium"`, prompt file exists) |
 | `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "medium"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
 | `test_recursive_decompose.py` | `_partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `_recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates + emits "no-progress guard" warning to stdout (asserted via capsys), migration path partitions files via `_partition_files()` and invokes the splitter only in label-only mode to title each chunk (distinct titles; distinct deterministic fallback on splitter failure), both `claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps` — C0 regression guard), a passed `repo_map` is injected into fit_judge/splitter prompts and omitted when `None` (G2), bump_workers called before every claude_p |
 | `test_phase_plan_repo_map_ctx.py` | P6 Layer A wiring (`phase_plan` ctx injection, DESIGN §5½ (P6)): repo-map enabled path (ctx contains `repo_map` key, non-empty string, JSON-serializable, known symbol names present, seed_files seeded from `task_file_items`); skip_repo_map=True path (ctx omits `repo_map`, baseline keys `task`/`source_of_truth`/`clarification_answers`/`confidence_rounds` present, values match inputs); empty-repo degrade (`_rank_repo_map` returns `""` → key omitted); exception-swallow degrade (`_build_repo_map` raises → caught silently, ctx emitted without `repo_map`) |

@@ -36,9 +36,9 @@ def test_rebaser_schema_exists(leerie):
 
 
 def test_rebaser_schema_required_fields(leerie):
+    """P3: confidence relaxed out of required."""
     schema = leerie.SCHEMAS["rebaser"]
-    assert set(schema["required"]) == {
-        "status", "final_branch_state", "confidence"}
+    assert set(schema["required"]) == {"status", "final_branch_state"}
 
 
 def test_rebaser_schema_status_enum(leerie):

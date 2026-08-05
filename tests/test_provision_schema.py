@@ -26,9 +26,11 @@ def test_provision_requires_recipe(leerie):
     """Every payload must carry a recipe — a missing key would let the
     LLM fall through to nothing, which is worse than the validator
     rejecting an empty list (the validator would, but only if it gets
-    a list to look at)."""
+    a list to look at). `confidence` is requested via `properties` but is
+    no longer top-level required (P3 — see test_confidence_not_required.py)."""
     schema = leerie.SCHEMAS["provision"]
-    assert set(schema["required"]) == {"recipe", "confidence"}
+    assert set(schema["required"]) == {"recipe"}
+    assert "confidence" in schema["properties"]
 
 
 def test_provision_recipe_is_array_of_objects(leerie):

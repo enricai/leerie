@@ -23,9 +23,14 @@ block is flattened: axes + `basis` required, the two arrays kept as optional
 properties, `gap_to_close` removed entirely (it was the only nested object, and
 its only consumer was a diagnostic log line).
 
-Note what did NOT change: `confidence` stays **required** at the top level.
-That is the DESIGN §8/§12 structural self-gating contract — every gate still
-reads a real number. Only the sub-fields relaxed.
+Update (P3, superseding the note this docstring originally carried):
+`confidence` is no longer top-level required on any of these schemas — see
+`tests/test_confidence_not_required.py` and `tests/test_schemas_confidence.py`.
+It is a self-report field no control flow gates on (the only consumer,
+`_format_blocked_gap`, reads it via `.get("confidence")` and handles `None`);
+requiring it caused the CLI to reject and retry otherwise-valid worker output
+whenever a worker omitted it. `confidence` remains declared in `properties`
+on every schema below, so a worker that does emit it is still recorded.
 """
 from __future__ import annotations
 
@@ -164,11 +169,13 @@ def test_a_block_missing_its_axis_is_still_rejected(leerie):
         jsonschema.validate({"basis": "x"}, leerie._confidence_schema(["fit"]))
 
 
-def test_confidence_remains_top_level_required(leerie):
-    """Unchanged by the flattening, and deliberately so: making the whole
-    block optional is a DESIGN §8 contract change, not a schema tweak."""
+def test_confidence_is_a_declared_property_but_not_required(leerie):
+    """P3: `confidence` is requested via `properties` on every worker schema
+    but is no longer top-level required (see module docstring and
+    tests/test_confidence_not_required.py)."""
     for worker in _confidence_workers(leerie):
-        assert "confidence" in leerie.SCHEMAS[worker]["required"], worker
+        assert "confidence" in leerie.SCHEMAS[worker]["properties"], worker
+        assert "confidence" not in leerie.SCHEMAS[worker]["required"], worker
 
 
 # ----- the prompt fragment must not describe limits that no longer exist -----

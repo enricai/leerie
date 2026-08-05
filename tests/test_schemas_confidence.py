@@ -24,10 +24,14 @@ import pytest
 
 
 def test_planner_schema_top_level_required(leerie):
-    """Planner must emit domain, subtasks, status, and confidence."""
+    """Planner must emit domain, subtasks, and status. confidence is
+    requested (present in properties) but no longer top-level required
+    (P3 — a required field schema-enforced but unconsumed)."""
     planner = leerie.SCHEMAS["planner"]
     required = set(planner["required"])
-    assert {"domain", "subtasks", "status", "confidence"}.issubset(required)
+    assert {"domain", "subtasks", "status"}.issubset(required)
+    assert "confidence" in planner["properties"]
+    assert "confidence" not in required
 
 
 def test_planner_schema_status_enum(leerie):
@@ -58,10 +62,13 @@ def test_planner_confidence_axes_are_numbers(leerie):
 
 
 def test_implementer_schema_top_level_required(leerie):
-    """Implementer must emit subtask_id, status, and confidence."""
+    """Implementer must emit subtask_id and status. confidence is
+    requested (present in properties) but no longer top-level required (P3)."""
     impl = leerie.SCHEMAS["implementer"]
     required = set(impl["required"])
-    assert {"subtask_id", "status", "confidence"}.issubset(required)
+    assert {"subtask_id", "status"}.issubset(required)
+    assert "confidence" in impl["properties"]
+    assert "confidence" not in required
 
 
 def test_implementer_schema_confidence_required_fields(leerie):
@@ -82,12 +89,13 @@ def test_implementer_confidence_axes_are_numbers(leerie):
 
 
 def test_conformer_schema_top_level_required(leerie):
-    """Conformer must emit confidence (the §8 self-gate). Same
-    structural enforcement as planner/implementer — the orchestrator
-    does not read it, but the schema rejects payloads that skip it."""
+    """Conformer requests confidence (the §8 self-gate) but no longer
+    requires it at the top level (P3 — a required field schema-enforced
+    but unconsumed). It remains a property so emitted values still record."""
     conf = leerie.SCHEMAS["conformer"]
     required = set(conf["required"])
-    assert "confidence" in required
+    assert "confidence" in conf["properties"]
+    assert "confidence" not in required
 
 
 def test_conformer_schema_confidence_required_fields(leerie):
@@ -127,8 +135,10 @@ _OPTIONAL_DISCIPLINE_FIELDS = {"falsifiers_tested", "contradictions_reconciled"}
 def _assert_confidence_schema(leerie, schema_key: str, axes: list[str]):
     """Shared structural assertions for any confidence schema."""
     schema = leerie.SCHEMAS[schema_key]
-    assert "confidence" in set(schema["required"]), (
-        f"{schema_key} must require confidence at the top level")
+    assert "confidence" in schema["properties"], (
+        f"{schema_key} must request confidence via properties")
+    assert "confidence" not in set(schema["required"]), (
+        f"{schema_key} must not require confidence at the top level (P3)")
     conf = schema["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
@@ -156,9 +166,57 @@ def _assert_confidence_schema(leerie, schema_key: str, axes: list[str]):
     ("integrator", ["resolution"]),
 ])
 def test_new_schema_confidence_structure(leerie, schema_key, axes):
-    """Every worker schema has a required confidence object with the §8
-    discipline fields and worker-specific numeric score axes."""
+    """Every worker schema has a requested (not top-level-required, P3)
+    confidence object with the §8 discipline fields and worker-specific
+    numeric score axes."""
     _assert_confidence_schema(leerie, schema_key, axes)
+
+
+def test_fit_judge_schema_required_fields_relaxed(leerie):
+    """fit_judge is the one schema that loses more than just `confidence`
+    from required (P3): `diffuse` and `rationale` are also relaxed to
+    optional, since both are advisory prose the caller does not gate on.
+    All three remain requested via properties."""
+    fit_judge = leerie.SCHEMAS["fit_judge"]
+    required = set(fit_judge["required"])
+    for relaxed in ("confidence", "diffuse", "rationale"):
+        assert relaxed in fit_judge["properties"], (
+            f"fit_judge deleted {relaxed} rather than relaxing it")
+        assert relaxed not in required, (
+            f"fit_judge still requires {relaxed} (P3)")
+    assert required == {"score"}
+
+
+def test_rebaser_schema_confidence_not_required(leerie):
+    """rebaser requests confidence (the §8 self-gate) but no longer
+    requires it at the top level (P3)."""
+    rebaser = leerie.SCHEMAS["rebaser"]
+    required = set(rebaser["required"])
+    assert "confidence" in rebaser["properties"]
+    assert "confidence" not in required
+    assert {"status", "final_branch_state"}.issubset(required)
+
+
+def test_conformer_blt_axes_do_not_require_summary(leerie):
+    """P13: _CONFORMER_BLT_PROP is a single shared dict, assigned by
+    reference (not copy) to the conformer schema's build/lint/tests keys
+    (leerie.py:1711-1713). `summary` stays a valid property on each axis
+    but is no longer required. The is-identity check across all three
+    axes guards against a future refactor that copies the dict per-axis
+    and only edits one copy, leaving the others still requiring
+    `summary`."""
+    conformer = leerie.SCHEMAS["conformer"]["properties"]
+    build = conformer["build"]
+    lint = conformer["lint"]
+    tests = conformer["tests"]
+
+    assert build is lint is tests, (
+        "build/lint/tests axes must be the same shared object "
+        "(_CONFORMER_BLT_PROP) so a fix to one covers all three")
+
+    assert "summary" not in set(build["required"])
+    assert "summary" in build["properties"]
+    assert build["properties"]["summary"]["type"] == "string"
 
 
 def test_confidence_schema_helper_produces_correct_structure(leerie):
