@@ -10603,6 +10603,29 @@ class WorktreeSetupError(WorkerError):
     """
 
 
+class PidExhaustedError(WorkerError):
+    """The worker's cgroup exhausted its PID table (fork denials climbing or
+    `pids.current` at `pids.max`) — every shell-spawning tool call then fails
+    with EAGAIN.
+
+    A distinct type because the retry classifier dispatches on a kind tagged
+    at the PRODUCER, never on prose (see `_RETRYABLE_FAILURE_KINDS`). The
+    worker did not misbehave in a way a corrective note can address — a
+    fresh worker gets a clean PID table, which is exactly the remedy.
+    """
+
+
+class OomKilledError(WorkerError):
+    """The worker's tool subtree (a build/test command) overshot
+    `memory.max` and was killed by the kernel mid-turn.
+
+    A distinct type because the retry classifier dispatches on a kind tagged
+    at the PRODUCER, never on prose (see `_RETRYABLE_FAILURE_KINDS`). Not a
+    broken or dishonest worker — a resource limit killed it — so a
+    corrective note has nothing to correct; a fresh attempt is the remedy.
+    """
+
+
 def _api_error_category(status: int | None) -> str | None:
     """Map a `claude -p` `api_error_status` to a coarse failure category.
 
@@ -12917,7 +12940,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                         f"shell; every Bash call now fails. "
                                         f"Terminating early so a fresh worker "
                                         f"retries with a clean PID table.")
-                                    raise WorkerError(
+                                    raise PidExhaustedError(
                                         f"worker {sid} exhausted its PID "
                                         f"cgroup (pids.current={cur}/{mx}, "
                                         f"fork denials={ev_max}); every "
@@ -13193,7 +13216,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             cmd_desc = f"`{last_bash_cmd}`" if last_bash_cmd else "a command"
             cap_gib = (f"{worker_memory_max_bytes / 1024**3:.1f} GiB"
                        if worker_memory_max_bytes else "unknown")
-            raise WorkerError(
+            raise OomKilledError(
                 f"worker {sid} was OOM-killed on {cmd_desc} "
                 f"(memory.max={cap_gib}) — raise --worker-memory-max or "
                 f"lower --max-parallel")
@@ -22397,18 +22420,32 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
 #      worker is being told to fix
 #
 # MEASURED CANDIDATES NOT YET MOVED HERE (deliberate): auditing every
-# `raise WorkerError` found `worker {sid} exhausted its PID`, `worker {sid}
-# was OOM-killed`, `Claude API connection dropped mid-response`, 529
-# overloaded, and auth/quota — all infrastructure on the same generic path.
+# `raise WorkerError` also found `Claude API connection dropped mid-response`,
+# 529 overloaded, and auth/quota — infrastructure on the same generic path.
 # Reclassifying them is a behaviour change well past this incident and could
-# mask a real resource problem, so it needs its own evidence. Bundling it
-# here is how the previous response to this incident became containment.
+# mask a real resource problem, so it needs its own evidence. 529/auth
+# already have tenacity backoff inside `claude_p`. Bundling it here is how
+# the previous response to this incident became containment.
 _INFRASTRUCTURE_FAILURE_KINDS = frozenset({
     "worktree_setup",  # WorktreeSetupError — `new-worktree.sh` could not
                        # produce the worktree. Terminal ("broken") until run
                        # 488c42e5 (2026-08-05), where it killed a wave with
                        # 25 of 26 subtasks complete and left `resume` hitting
                        # the same wall on every attempt.
+    "pid_exhausted",   # PidExhaustedError — the worker's cgroup exhausted
+                       # its PID table (fork denials climbing / at
+                       # pids.max); every shell-spawning tool call then
+                       # fails with EAGAIN. Terminal ("broken") until this
+                       # change: `exhausted its PID` fired 9 times across 3
+                       # runs, and the `:12919`-area log message already
+                       # promised "a fresh worker retries with a clean PID
+                       # table" — a promise the implementer path did not
+                       # keep before this fix.
+    "oom_killed",      # OomKilledError — the worker's tool subtree
+                       # overshot memory.max and was kernel-killed
+                       # mid-turn. Terminal ("broken") until this change:
+                       # `was OOM-killed` fired 11 times across 3 runs; of
+                       # the 6 runs that hit PID/OOM, 3 produced no PR.
 })
 
 _WORKER_RETRYABLE_KINDS = frozenset({
@@ -24205,6 +24242,27 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # from deleting the branch, which may already carry an earlier
             # attempt's commits (run 488c42e5, `bugfix-009-2`).
             fail_res = await fail("worktree_setup", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
+        except PidExhaustedError as e:
+            # The worker's cgroup ran out of PID table (fork denials
+            # climbing / at pids.max). Tagged as its own retryable kind
+            # rather than the generic "broken" below: the worker did not
+            # misbehave in a way a corrective note can address — a fresh
+            # worker gets a clean PID table, which is exactly the remedy
+            # the `:12919`-area log message already promised.
+            fail_res = await fail("pid_exhausted", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
+        except OomKilledError as e:
+            # The worker's tool subtree overshot memory.max and was
+            # kernel-killed mid-turn. Tagged as its own retryable kind
+            # rather than the generic "broken" below: a resource limit
+            # killed it, not the worker's own behaviour, so a fresh
+            # attempt is the remedy.
+            fail_res = await fail("oom_killed", str(e))
             if fail_res is not None:
                 return fail_res
             continue
