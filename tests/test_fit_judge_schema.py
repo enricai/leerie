@@ -50,9 +50,9 @@ def test_fit_judge_schema_exists(leerie):
 
 
 def test_fit_judge_schema_required_fields(leerie):
-    """required must be exactly {score, rationale, diffuse, confidence}."""
+    """required must be exactly {score} (P3: rationale/diffuse/confidence relaxed)."""
     schema = leerie.SCHEMAS["fit_judge"]
-    assert set(schema["required"]) == {"score", "rationale", "diffuse", "confidence"}
+    assert set(schema["required"]) == {"score"}
 
 
 def test_fit_judge_score_is_number(leerie):
