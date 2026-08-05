@@ -8233,6 +8233,24 @@ read it as a post-run harvest.
 
 ### Reporting — the `--report` verb
 
+**`resume` takes its run-id positionally OR as `--run-id`; both are
+equivalent.** `main()` pops the bare verb from `argv[0]`, then — for `resume`
+only — takes an optional leading non-flag positional via
+`_extract_resume_run_id()` **before** `ap.parse_args()`, and assigns it to
+`args.run_id`. The ordering is the contract: after `parse_args` the `task`
+positional has already swallowed the id. Passing both forms with *different*
+values `die()`s rather than silently preferring one. `list` is deliberately
+excluded — it has its own positionals (`list status paused`, `list chains`).
+
+This was broken from the introduction of the positional form until
+2026-08-05: only the verb was popped, so `leerie resume <run-id>` bound the id
+to `task`, left `--run-id` as `None`, and auto-picked a *different* run —
+measured live against a running one, where only the run-directory flock
+prevented a second orchestrator. `resume` is the sole verb exposed to this:
+`stop` / `kill` / `accept-blocked` / `finalize` / `status` all exit inside the
+launcher and never reach this argparse. Pinned by
+`tests/test_resume_positional_run_id.py`.
+
 `leerie --report [RUN_ID]` is a read-only telemetry report for a single run;
 like `list` it exits without running orchestrate. Run selection reuses
 `resolve_run_id` (exact-match a passed id, else auto-pick the most recent

@@ -3678,6 +3678,29 @@ def _run_recency_key(run: dict, leerie_root: Path) -> tuple[int, str]:
         return (0, "")
 
 
+def _extract_resume_run_id(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Split `resume`'s optional positional run-id off the front of argv.
+
+    `leerie resume <run-id>` is the documented interface (CLAUDE.md Quick
+    start) and mirrors the `stop` / `kill` convention — but those verbs are
+    handled entirely inside the launcher, while `resume` is the one verb that
+    round-trips through this argparse. `main()` popped only `argv[0]` (the
+    verb), so a run-id in `argv[1]` bound to the `task` positional, `run_id`
+    stayed None, and `resolve_run_id` AUTO-PICKED A DIFFERENT RUN.
+
+    Measured 2026-08-05: `leerie resume 488c42e5…` announced "auto-picked the
+    most recent resumable run 7859ad30…" — a live run owned by another
+    orchestrator. Only the flock prevented a duplicate; an idle run would have
+    been resumed silently, spending hours on the wrong work.
+
+    Returns `(run_id, remaining_argv)`. A leading `-` means the caller passed
+    flags only, so there is no positional to take.
+    """
+    if argv and not argv[0].startswith("-"):
+        return argv[0], argv[1:]
+    return None, argv
+
+
 def resolve_run_id(leerie_root: Path, cli_run_id: str | None, *,
                    resumable_only: bool = False) -> str:
     """Pick the run_id to operate on.
@@ -26872,7 +26895,18 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     is_list = bool(argv) and argv[0] == "list"
     if is_resume or is_list:
         argv = argv[1:]
+    # `resume <run-id>` — the documented form. Taken BEFORE parse_args, or
+    # argparse binds it to `task` and the run-id is silently discarded.
+    # Only for `resume`: `list` has its own positionals (`list status paused`,
+    # `list chains`) that must reach argparse untouched.
+    positional_run_id, argv = (
+        _extract_resume_run_id(argv) if is_resume else (None, argv))
     args = ap.parse_args(argv)
+    if positional_run_id:
+        if args.run_id and args.run_id != positional_run_id:
+            die(f"conflicting run ids: positional '{positional_run_id}' and "
+                f"--run-id '{args.run_id}'. Pass exactly one.")
+        args.run_id = positional_run_id
     args.resume = is_resume
     args.list_runs = is_list
 

@@ -5433,9 +5433,18 @@ _rw_argi=0
 for arg in "$@"; do
   _rw_argi=$((_rw_argi + 1))
   # `resume` and `list` (and any positional run-id after `resume`) flow
-  # through untouched — orchestrator/leerie.py's argparse understands
-  # the bare verb form natively, exactly like the launcher's own
-  # `case "${1:-}"` dispatch one level up. No rewrite needed.
+  # through untouched — orchestrator/leerie.py pops the bare verb itself,
+  # exactly like the launcher's own `case "${1:-}"` dispatch one level up,
+  # and takes `resume`'s positional run-id via `_extract_resume_run_id`
+  # BEFORE argparse runs.
+  #
+  # That last part was NOT true until 2026-08-05, and this comment used to
+  # assert "No rewrite needed" without it. The orchestrator popped only the
+  # verb, so a positional run-id bound to argparse's `task` positional,
+  # `--run-id` stayed None, and `resolve_run_id` AUTO-PICKED A DIFFERENT RUN
+  # — measured live against a running one, where only the flock prevented a
+  # duplicate orchestrator. Do not restore the shorter claim: forwarding
+  # untouched is correct only because the orchestrator now handles it.
   if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
     _prev_was_state_dir_rewrite=false
     continue
