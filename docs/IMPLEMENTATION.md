@@ -5602,10 +5602,16 @@ Because the call is a single direct `await claude_p(...)` rather than a
 loop-managed one, it carries the full required signature at its own call
 site: all-keyword, `allowed_tools=INSPECT_TOOLS`, `max_turns=30`,
 `autonomous=False`, and `model=models.get("task_coverage_judge",
-MODEL_DEFAULT)`. A `WorkerError` degrades (advisory; the plan is returned
-unchanged) — but **any other exception propagates**, since a programming
-error at the call site is not a worker failure and must not be reported as a
-clean degrade. `tests/test_claude_p_call_sites.py` statically checks this
+MODEL_DEFAULT)`, after `st.bump_workers(caps)` — placed **outside** the
+`try`, matching `_probe_criteria_satisfied_on_head`, since a
+budget-exhaustion `WorkerError` is the run being over budget rather than
+this judge failing and must abort instead of degrading. A `WorkerError` from
+the judge itself, or an `OSError` from process spawn, degrades (advisory;
+the plan is returned unchanged) — the gate never terminates a run. **Any
+other exception propagates**, since a programming error at the call site is
+not a worker failure and must not be reported as a clean degrade; `OSError`
+is disjoint from every programming-error class, so admitting it re-opens
+nothing. `tests/test_claude_p_call_sites.py` statically checks this
 contract across every `claude_p` call site in the module; 0.10.0 shipped
 this one raising `TypeError` on every invocation behind a broad `except`,
 and no stub-based test could see it. Persists to

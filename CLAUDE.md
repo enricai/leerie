@@ -2622,6 +2622,13 @@ binds them against the live signature — generalizing
 `TestProgrammingErrorsPropagate`, which pins that the gate catches
 `WorkerError` **only**: a worker failure is an expected advisory degrade, a
 `TypeError` is a leerie bug and must propagate rather than masquerade as one.
+An `OSError` from process spawn degrades too (the gate's docstring promises it
+never terminates a run) and is disjoint from every programming-error class, so
+admitting it re-opens nothing — `TestInfrastructureFailureDegrades` pins both
+halves. `TestBudgetIsCharged` pins the `st.bump_workers(caps)` this call was
+missing (IMPLEMENTATION.md §8 requires it, and `integration_judge` — named in
+that same sentence — already did it), including that the bump sits OUTSIDE the
+`try` so budget exhaustion aborts instead of degrading.
 Both files carry anti-vacuity controls — the static scan asserts it found the
 call sites at all (a scan that finds nothing passes every assertion), and the
 behavioral file pins that narrowing the `except` did not make an advisory

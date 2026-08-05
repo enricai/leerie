@@ -60,6 +60,11 @@ def st(leerie, tmp_path):
     s.data = {}
     s.run_dir = tmp_path
     s.save = lambda: None
+    # The gate charges the per-run worker budget before invoking the judge
+    # (IMPLEMENTATION.md §8: "after `st.bump_workers(caps)`"). Counting rather
+    # than no-op'ing so a test can assert the charge actually happens.
+    s.bumps = []
+    s.bump_workers = lambda caps: s.bumps.append(caps)
     return s
 
 
@@ -234,6 +239,8 @@ class TestCallSignature:
         st.data = {}
         st.run_dir = "/tmp"
         st.save = lambda: None
+        st.bumps = []
+        st.bump_workers = lambda caps: st.bumps.append(caps)
         import unittest.mock as mock
         with mock.patch.object(leerie, "claude_p", rec):
             asyncio.run(leerie.phase_planning_coverage_gate(
@@ -302,4 +309,63 @@ class TestProgrammingErrorsPropagate:
             raise leerie.WorkerError("infrastructure")
         monkeypatch.setattr(leerie, "claude_p", boom)
         assert _run(leerie, plans, st) is plans
+
+
+class TestBudgetIsCharged:
+    """IMPLEMENTATION.md §8 requires this judge be invoked "after
+    `st.bump_workers(caps)`" — `integration_judge`, named in that same
+    sentence, does. This gate did not, and `claude_p` does not bump
+    internally, so the invocation was invisible to `max_total_workers`."""
+
+    def test_gate_charges_exactly_one_worker(self, leerie, st, monkeypatch):
+        async def fake(*a, **kw): return CLEAN
+        monkeypatch.setattr(leerie, "claude_p", fake)
+        _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+        assert len(st.bumps) == 1, (
+            f"gate charged the budget {len(st.bumps)}x; it invokes the judge "
+            "exactly once")
+
+    def test_budget_exhaustion_aborts_rather_than_degrading(
+            self, leerie, st, monkeypatch):
+        """The bump sits OUTSIDE the try on purpose: a budget-exhaustion
+        WorkerError is the RUN being over budget, not this judge failing, so
+        it must abort instead of being swallowed as an advisory degrade."""
+        def boom(_caps):
+            raise leerie.WorkerError("worker budget exhausted")
+        st.bump_workers = boom
+        with pytest.raises(leerie.WorkerError, match="budget"):
+            _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+
+    def test_skip_flag_charges_nothing(self, leerie, st):
+        """The cheap-skip must stay free."""
+        st.data["skip_coverage_check"] = True
+        _run(leerie, [_plan("d", _subtask("feat-001"))], st)
+        assert st.bumps == []
+
+
+class TestInfrastructureFailureDegrades:
+    """The docstring's own invariant: "This gate does not terminate a run."
+
+    An OSError from process spawn (a missing or unexecutable `claude`) is
+    infrastructure, not a defect in the plan, and must not kill the run —
+    every sibling advisory phase degrades on it. It is disjoint from every
+    programming-error class, so admitting it re-opens nothing."""
+
+    def test_oserror_degrades(self, leerie, st, monkeypatch):
+        plans = [_plan("d", _subtask("feat-001"))]
+
+        async def boom(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory", "claude")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        assert _run(leerie, plans, st) is plans
+
+    def test_typeerror_still_propagates_after_the_widening(
+            self, leerie, st, monkeypatch):
+        """ANTI-VACUITY: admitting OSError must not re-open the TypeError
+        hole that hid the broken call for a whole release."""
+        async def boom(*a, **k):
+            raise TypeError("bad call site")
+        monkeypatch.setattr(leerie, "claude_p", boom)
+        with pytest.raises(TypeError):
+            _run(leerie, [_plan("d", _subtask("feat-001"))], st)
 
