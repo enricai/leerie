@@ -325,6 +325,7 @@ STATE_FIELDS = (
     "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
+    "dangerously_force_strict_output",
     "skip_overlap_judge",
     "skip_adherence_check",
     "skip_coverage_check",
@@ -2563,6 +2564,40 @@ class RateLimitedExit(BaseException):
         self.reset_at = reset_at
         self.raw_message = raw_message
         self.out_of_credits = out_of_credits
+
+
+class ContextOverflow(BaseException):
+    """Raised when Claude Code refuses a prompt *itself* for exceeding the
+    context window it believes the model has.
+
+    Not a server rejection: the CLI emits a synthetic assistant message
+    (`model=<synthetic>`, usage all zeros) and terminates with
+    `terminal_reason: "blocking_limit"` and `result: "Prompt is too long"`
+    without issuing an API call. So retrying identical input cannot
+    succeed — yet before this class existed the envelope fell through to
+    claude_p()'s generic 2-attempt loop and surfaced as `worker failed
+    schema-valid output twice: Prompt is too long`, blaming schema
+    validation for a context-window refusal. That mislabelling is what
+    made the 2026-08-06 incident unreadable: three separate diagnoses were
+    proposed and falsified before the real cause was measured.
+
+    Inherits BaseException for the same reason as TerminalAuthFailure and
+    RateLimitedExit — it must propagate through asyncio's gather and broad
+    `except Exception` handlers. Critically it must NOT be a WorkerError:
+    `_run_checked_loop` deliberately *retries* WorkerError against its
+    whole round budget (CLAUDE.md, crash policy), which for a
+    deterministic refusal is pure waste.
+
+    Treated by main() as a resumable pause (EXIT_LOCKED), because the
+    remedy is an operator change — usually dropping
+    `--dangerously-force-strict-output`, whose `ANTHROPIC_BASE_URL`
+    override is what lowers the ceiling in the first place (see
+    `_model_arg`) — after which `leerie resume` picks the run back up.
+
+    Carries only raw_message: str — the verbatim envelope `result`."""
+    def __init__(self, raw_message: str):
+        super().__init__(raw_message)
+        self.raw_message = raw_message
 
 
 class TerminalAuthFailure(BaseException):
@@ -7432,6 +7467,27 @@ def _format_task_file_references(
     )
 
 
+def _is_same_document(path: Path, text_len: int, text: str) -> bool:
+    """True when `path` holds exactly `text` (modulo surrounding whitespace).
+
+    Used to keep a task file out of its own reference list. The planner is
+    already handed the task verbatim, so listing the file again asks it to
+    re-read content it has — ~71K tokens of pure duplication on the measured
+    incident (185,565 B at the measured 2.6 B/token). `resolve_task_argument` returns the file's stripped contents and
+    discards the path, so identity is re-established by content rather than by
+    plumbing the path through every caller. The size pre-check keeps this from
+    reading large candidates: only a file already within a few bytes of the
+    task's length is opened at all. `text_len` is the task's encoded length,
+    passed in rather than recomputed because this runs once per candidate and
+    the task can be hundreds of KB."""
+    try:
+        if abs(path.stat().st_size - text_len) > 8:
+            return False
+        return path.read_text(errors="replace").strip() == text
+    except (OSError, ValueError):
+        return False
+
+
 def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
     """Find file references in the task string via glob expansion.
 
@@ -7445,20 +7501,56 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
     import glob as _glob
     candidates: list[str] = []
     for token in task.split():
-        token = token.strip("\"'(),;:")
+        # Markdown emphasis is stripped before classification because `*` is
+        # in _GLOB_CHARS: an unstripped bare `*` globs to EVERY file in the
+        # repo root. Measured on a 185 KB markdown task carrying 134 bare `*`
+        # and 217 `**`, that pulled in 18 files / 1.86 MB — LICENSE,
+        # .claude.json and a prior run's 847 KB log among them — all of which
+        # `_format_task_file_references` then told the planner to read.
+        token = token.strip("\"'(),;:").strip("*_`")
         if not token:
             continue
+        # After de-emphasis a reference must still look like a path: some
+        # alphanumeric content, plus an extension or a separator. DESIGN §6
+        # scopes this feature to "files the user explicitly pointed to", and a
+        # stray emphasis marker is not that. `**`, `**Root` and `**log**` fail
+        # here; `spec.md`, `spec-*.md`, `tests/*.py` and `docs/DESIGN.md` pass.
+        if not any(c.isalnum() for c in token):
+            continue
+        # Absolute paths are never repo references, and `repo_root / "/etc/x"`
+        # silently discards the root (pathlib lets an absolute right-hand side
+        # win), so admitting them would reach outside the repo entirely — a
+        # task mentioning `/bin/bash` matched a 1.4 MB binary before this guard.
+        if token.startswith("/"):
+            continue
         has_ext = "." in token and not token.startswith(".")
-        has_glob = any(c in token for c in _GLOB_CHARS)
-        if has_ext or has_glob:
+        has_sep = "/" in token
+        if has_ext or has_sep:
             candidates.append(token)
     matched: list[Path] = []
     seen: set[str] = set()
+    root = repo_root.resolve()
+    task_stripped = task.strip()
+    task_len = len(task_stripped.encode())
     for cand in candidates:
         for expanded in _expand_braces(cand):
             for m in sorted(_glob.glob(str(repo_root / expanded))):
                 p = Path(m)
+                # Containment re-check, independent of the token-level guard
+                # above: `../` segments survive the startswith("/") test and
+                # would otherwise escape the same way. `resolve()` follows
+                # symlinks deliberately — an in-repo symlink whose target sits
+                # outside the repo is an escape by another name, and dropping
+                # it is the conservative reading of "files the user explicitly
+                # pointed to" (DESIGN §6 *Task-referenced file extraction*).
+                try:
+                    if not p.resolve().is_relative_to(root):
+                        continue
+                except (OSError, ValueError):
+                    continue
                 if p.is_file() and str(p) not in seen:
+                    if _is_same_document(p, task_len, task_stripped):
+                        continue
                     seen.add(str(p))
                     matched.append(p)
     return matched
@@ -9672,7 +9764,8 @@ async def _backstop_capture_prior_runs(
         # `except Exception` would let them escape this best-effort call and
         # abort the backstop loop (or, in main()'s exit handlers, skip the
         # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
-        except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -9756,7 +9849,8 @@ def run_recapture_deps(
             ran_any = True
         # See the backstop guard above: TerminalAuthFailure / RateLimitedExit
         # are BaseException subclasses that a bare `except Exception` misses.
-        except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as exc:
             log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
 
     if not ran_any and not force:
@@ -9886,7 +9980,8 @@ def run_rebaser(
     # RateLimitedExit are BaseException subclasses a bare `except Exception`
     # would miss, and this call must never propagate past host-finalize.sh's
     # best-effort rebase step.
-    except (Exception, TerminalAuthFailure, RateLimitedExit) as exc:
+    except (Exception, TerminalAuthFailure, RateLimitedExit,
+            ContextOverflow) as exc:
         return {
             "status": "failed",
             "final_branch_state": "worker invocation error",
@@ -10772,6 +10867,40 @@ def _api_error_category(status: int | None) -> str | None:
     return {401: "auth", 429: "quota", 529: "overload"}.get(status)
 
 
+def _is_context_overflow(envelope: dict) -> bool:
+    """True when Claude Code refused the prompt itself as too long.
+
+    The CLI enforces a context ceiling client-side: it emits a synthetic
+    assistant message (`model=<synthetic>`, usage all zeros) and ends the
+    session with no API call. Retrying identical input is therefore
+    guaranteed to fail the same way, which is why claude_p() raises
+    `ContextOverflow` on a match instead of spending its 2-attempt loop.
+
+    Measured envelope (reproduced twice, arms B and C of the 2026-08-06
+    probe): `is_error: true`, `terminal_reason: "blocking_limit"`,
+    `api_error_status: null`, `result: "Prompt is too long"`, and —
+    misleadingly — `subtype: "success"`, so do NOT key on subtype, the
+    same trap `_is_transient_transport_failure` documents.
+
+    BOTH signals are required. `terminal_reason` alone is insufficient:
+    it is shared with other blocking limits, and the sibling arms of the
+    same probe ended `max_turns` while a healthy run ended `completed`.
+    The text alone is insufficient too — a worker could legitimately
+    discuss the phrase in its own output — so, mirroring
+    `_is_terminal_auth_failure`, this is gated on `is_error` (a
+    successful, schema-valid envelope never matches) and exempts
+    `_leerie_synthetic` envelopes, whose `result` interpolates the
+    worker's raw stderr and could carry the phrase without the CLI having
+    refused anything."""
+    if not envelope.get("is_error"):
+        return False
+    if envelope.get("_leerie_synthetic"):
+        return False
+    if envelope.get("terminal_reason") != "blocking_limit":
+        return False
+    return "prompt is too long" in str(envelope.get("result") or "").lower()
+
+
 def _is_terminal_auth_failure(envelope: dict) -> bool:
     """True when auth cannot recover without a human running `claude
     /login` (or a fresh `CLAUDE_CODE_OAUTH_TOKEN`).
@@ -11185,6 +11314,43 @@ _STRICT_PROXY_TIMEOUT_SEC = DEFAULT_CAPS["worker_timeout_sec"]
 # the call stack and threading it through every caller would touch far more
 # surface than the feature warrants. One per run, owned by `_orchestrate`.
 _STRICT_PROXY: "_StrictOutputProxy | None" = None
+
+# Model aliases with a 1M-token context window. Haiku is absent: it has no 1M
+# variant, so the suffix would be rejected rather than ignored.
+_ONE_M_CONTEXT_MODELS = frozenset({"sonnet", "opus"})
+
+
+def _model_arg(model: str) -> str:
+    """The `--model` value, restoring the 1M window behind the strict proxy.
+
+    Owning `ANTHROPIC_BASE_URL` — which is how `--dangerously-force-strict-output`
+    reaches workers — makes the CLI treat the session as gateway-routed. It then
+    applies a conservative client-side context ceiling instead of the model's
+    native window and refuses an oversized prompt *itself*, emitting a synthetic
+    `Prompt is too long` assistant message (`model=<synthetic>`, usage all zeros)
+    with no API call at all. `[1m]` is the documented way to select the 1M window
+    behind a gateway; on the direct path it is a no-op, since `sonnet` already
+    resolves to Sonnet 5's native 1M.
+
+    Measured on one 225 KB worker payload, same model/tools/cwd, varying only
+    `ANTHROPIC_BASE_URL` (5 arms): direct sustained 235,805 tokens over 20
+    requests with no refusal. Through a *passthrough* proxy that rewrites
+    nothing the CLI refused after 224,127, and through the real strict proxy
+    after 224,247 — two reproductions 120 tokens apart, so the refusal comes
+    from the base-URL override alone, not the schema rewriting. Adding `[1m]`
+    cleared it both times: 261,014 tokens passthrough, 276,579 through the
+    strict proxy, zero refusals. The rewrite is unaffected — rewritten/
+    passed_through/fell_back counters are identical under both aliases, so the
+    suffix does not suppress `StructuredOutput` injection.
+
+    Applied automatically rather than admitted to `MODEL_VALUES`: the suffix is
+    inert whenever the proxy is off, so an operator gains nothing by setting it
+    by hand — and could set it on `haiku`, where the CLI rejects it.
+    """
+    if _STRICT_PROXY is None or model not in _ONE_M_CONTEXT_MODELS:
+        return model
+    return f"{model}[1m]"
+
 
 # How many upstream error responses get their body echoed before the proxy
 # falls back to counting them. A rejected rewrite is systematic — every worker
@@ -13859,7 +14025,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 "--allowedTools", allowed_tools,
                 "--disallowedTools", DISALLOWED_TOOLS,
                 "--max-turns", str(max_turns),
-                "--model", model,
+                "--model", _model_arg(model),
             ])
             # IMPLEMENTATION.md §2 "Effort selection". When effort is None
             # (e.g. satisfied_probe, or the post-run judge/heal workers) the
@@ -13939,7 +14105,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     "call_id": str(uuid.uuid4()),
                     "run_id": st.run_id,
                     "call_type": schema_key,
-                    "model": model,
+                    # The EFFECTIVE value, not the resolved alias: `_model_arg`
+                    # rewrites it on the way to argv (appending `[1m]` behind
+                    # the strict proxy), and telemetry that disagrees with what
+                    # the CLI was handed is worse than none — reconstructing a
+                    # run's real invocation is exactly what this file is for.
+                    "model": _model_arg(model),
                     "system_prompt": system_prompt,
                     "user_content": user_prompt + retry_note,
                     "response_content": str(envelope.get("result") or ""),
@@ -14036,6 +14207,13 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # EXIT_LOCKED pause instead of the generic WorkerError exit(1).
             if _is_terminal_auth_failure(envelope):
                 raise TerminalAuthFailure(str(envelope.get("result") or ""))
+
+            # Client-side context refusal: the CLI never sent a request, so
+            # the 2-attempt loop below would replay identical input and fail
+            # identically, then report it as a *schema* failure. Raised here
+            # instead, before any retry, so the operator sees the real cause.
+            if _is_context_overflow(envelope):
+                raise ContextOverflow(str(envelope.get("result") or ""))
 
             # Envelope-level rotation (surface (a) above): the ACTIVE
             # token is rate-limited (not a transport disconnect, not
@@ -26119,10 +26297,12 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             Path(os.getcwd()), st,
             caps=caps, models=models, efforts=efforts,
         )
-    # TerminalAuthFailure / RateLimitedExit are BaseException subclasses that a
+    # TerminalAuthFailure / RateLimitedExit / ContextOverflow are BaseException
+    # subclasses that a
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
-    except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
+    except (Exception, TerminalAuthFailure, RateLimitedExit,
+            ContextOverflow) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -26341,6 +26521,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["clarify"] = bool(args.clarify)
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
+        # Recorded because this flag changes worker behaviour invisibly: it
+        # owns ANTHROPIC_BASE_URL, which lowers the CLI's context ceiling
+        # (see `_model_arg`). Without it in state, a run's failure cannot be
+        # attributed to the flag after the fact — which is exactly what made
+        # the 2026-08-06 incident take three attempts to diagnose.
+        st.data["dangerously_force_strict_output"] = bool(
+            caps.get("force_strict_output"))
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
         st.data["skip_adherence_check"] = bool(
             getattr(args, "skip_adherence_check", False))
@@ -27704,6 +27891,51 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         exit_message = str(e)
         exit_code = 1
+    except ContextOverflow as e:
+        # Claude Code refused the prompt client-side for exceeding the
+        # context window it believes the model has — no API call was made,
+        # so retrying identical input cannot help. Resumable, because the
+        # remedy is an operator change rather than a wait: the usual cause
+        # is `--dangerously-force-strict-output`, whose ANTHROPIC_BASE_URL
+        # override makes the CLI treat the session as gateway-routed and
+        # apply a conservative ceiling instead of the model's real window.
+        full_purge = False
+        st.save()
+        log(f"context window exceeded — {e.raw_message}")
+        log("  Claude Code refused this prompt itself; no request was sent, "
+            "so a retry would fail identically.")
+        if _STRICT_PROXY is not None:
+            log("  --dangerously-force-strict-output is active: it sets "
+                "ANTHROPIC_BASE_URL, which lowers the CLI's context ceiling. "
+                "Re-running without it is usually enough.")
+        log("  Otherwise shrink what every worker carries: the task text and "
+            "the repo's CLAUDE.md are both loaded into each worker's context.")
+        log(f"  then resume with: leerie resume {st.run_id}")
+        abnormal = False
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except Exception:
+            pass
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½), matching
+        # every other terminating arm. Worth attempting rather than skipping:
+        # dep_capture's payload is manifests plus install commands, bounded by
+        # `_DEPCAP_TOTAL_BUDGET`, a far smaller shape than whatever prompt
+        # overflowed — so it can succeed where the failing worker could not.
+        # Guarded against the whole exit-signal family for the reason the
+        # auth-locked arm documents below: these subclass BaseException, and a
+        # re-raise escaping here would skip the `exit_code` assignment and
+        # crash the run with exit 1 instead of pausing resumably.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as _cap_exc:
+            log(f"capture: non-fatal error during context-overflow pause "
+                f"({_cap_exc})")
+        exit_code = EXIT_LOCKED
+
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —
         # unlike the transient 401/429/529 case, Claude Code sends no
@@ -27731,12 +27963,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 caps=caps, models=models, efforts=efforts,
             ))
         # The auth-locked pause is *guaranteed* to re-hit the same terminal
-        # auth failure inside capture_repo_deps -> claude_p. TerminalAuthFailure
-        # (and RateLimitedExit) subclass BaseException, so a bare
+        # auth failure inside capture_repo_deps -> claude_p. Every member of
+        # the exit-signal family (TerminalAuthFailure, RateLimitedExit,
+        # ContextOverflow) subclasses BaseException, so a bare
         # `except Exception` cannot catch the re-raise: it would escape main()
         # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
         # crash the run with exit 1 — defeating this whole resumable-pause arm.
-        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -27790,7 +28024,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # RateLimitedExit are BaseException subclasses a bare
             # `except Exception` misses, which would skip the `exit_code =
             # EXIT_LOCKED` below and crash the pause with exit 1.
-            except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
+            except (Exception, TerminalAuthFailure, RateLimitedExit,
+                    ContextOverflow) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -27838,10 +28073,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        # TerminalAuthFailure / RateLimitedExit are BaseException subclasses a
+        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
+        # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the cancel arm still reaches its `exit_code = 130`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -27861,10 +28098,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        # TerminalAuthFailure / RateLimitedExit are BaseException subclasses a
+        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
+        # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the signal arm still reaches its `exit_code = 128 + signum`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit) as _cap_exc:
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.

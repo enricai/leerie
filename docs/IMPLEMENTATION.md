@@ -3351,6 +3351,21 @@ request, 2026-08-04). Measured across the run corpus, **2,861 of 9,924
 submissions (28.8%)** are malformed as a result. Setting `strict: true` compiles
 the schema into a sampling grammar and makes those shapes unrepresentable.
 
+**Context-window side effect (`_model_arg`).** Owning `ANTHROPIC_BASE_URL`
+makes the CLI treat the session as gateway-routed, so it applies a
+conservative client-side context ceiling instead of the model's native
+window. `_model_arg(model)` therefore appends `[1m]` — the documented
+gateway-side selector for the 1M window — to any alias in
+`_ONE_M_CONTEXT_MODELS` (`sonnet`, `opus`; **not** `haiku`, which has no 1M
+variant and rejects the suffix) whenever `_STRICT_PROXY` is active. Inert on
+the direct path, where `sonnet` already resolves to Sonnet 5's native 1M.
+Measured over five arms on one 225 KB payload, varying only the base URL:
+direct sustained 235,805 tokens; a *passthrough* proxy that rewrites nothing
+refused after 224,127 and the real strict proxy after 224,247 — so the cause
+is the base-URL override, not the rewrite. Adding `[1m]` cleared both
+(261,014 and 276,579 tokens, the latter completing successfully), with
+rewritten/passed_through/fell_back counters identical under either alias.
+
 **Mechanism.** `_StrictOutputProxy` — an `asyncio.start_server` listener on
 `127.0.0.1`, **one per run**, started in `_orchestrate()` before the first
 worker and closed in its `finally` — which covers normal completion, `die()`,
@@ -3791,6 +3806,28 @@ CLI's own in-session retry (the `claude -p` mid-stream fix landed in CLI
 v2.1.219); leerie sees the drop only once the CLI's retries are exhausted.
 Measured basis and rationale: DESIGN §6 *Cleanup on abnormal exit* (56 of
 58 dropped sids were pure-transport, 83% recovering on a later attempt).
+
+#### Context overflow (client-side refusal)
+
+`_is_context_overflow(envelope)` is checked in `claude_p()` immediately
+after `_is_terminal_auth_failure` and **before** the generic 2-attempt
+loop, raising `ContextOverflow` (a `BaseException`, deliberately **not** a
+`WorkerError` — `_run_checked_loop` retries those across its whole round
+budget). Claude Code enforces a context ceiling client-side: it emits a
+synthetic assistant message (`model=<synthetic>`, usage all zeros) and ends
+the session with **no API call**, so replaying identical input cannot
+succeed. Before this classifier the envelope surfaced as `worker failed
+schema-valid output twice: Prompt is too long`, blaming schema validation
+for a context refusal.
+
+Match requires **both** `terminal_reason == "blocking_limit"` and the
+phrase in `result`: the reason alone is shared with other blocking limits
+(sibling probe arms ended `max_turns`), and the text alone could appear in
+a worker's own correct output. Gated on `is_error` and exempting
+`_leerie_synthetic`, mirroring `_is_terminal_auth_failure`. Do **not** key
+on `subtype`, which is a misleading `"success"`. `main()` treats it as a
+resumable `EXIT_LOCKED` pause and names the likely remedy — dropping
+`--dangerously-force-strict-output` (see `_model_arg` below).
 
 #### Terminal auth failure
 
@@ -4983,7 +5020,8 @@ DESIGN.md §8 for the full rationale and the incident this replaced).
 | Function | Purpose |
 |----------|---------|
 | `_expand_braces(pattern)` | Pre-expands `{a,b}` brace groups that Python's `glob.glob` does not handle. Recursive for nested braces. |
-| `_glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. |
+| `_glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. Tokens are stripped of markdown emphasis (`*`, `_`, backticks) **before** classification and must still look like a path afterwards — some alphanumeric content plus an extension or a `/`. Without that, `*` (a `_GLOB_CHARS` member, and ordinary emphasis in a markdown task) globs to every file in the repo root: measured on a 185 KB task carrying 134 bare `*` and 217 `**`, the planner was handed 18 files / 1.86 MB as required reading, including `LICENSE` and a prior run's 847 KB log. Absolute-path tokens are refused (`repo_root / "/etc/x"` discards the root — pathlib lets an absolute right-hand side win), and every glob result is independently re-checked for containment under `repo_root.resolve()` so `../` segments cannot escape either. The task file never appears in its own list (`_is_same_document`). |
+| `_is_same_document(path, text_len, text)` | True when `path` holds exactly `text` modulo surrounding whitespace. Keeps a task file out of its own reference list: the planner already has the task verbatim, so listing the file asks it to re-read content it holds — ~71K tokens of duplication on the measured incident (185,565 B at the measured 2.6 B/token). `resolve_task_argument` returns stripped contents and discards the path, so identity is re-established by content rather than by threading the path through every caller. A size pre-check (±8 bytes) means only a same-length candidate is ever opened; `text_len` is the task's encoded length, passed in rather than recomputed because this runs once per candidate and the task can be hundreds of KB. |
 | `_repo_rel(path, repo_root)` | Repo-relative string for a path, falling back to its basename when it resolves outside the repo. Pure path arithmetic. |
 | `_format_task_file_references(files, repo_root)` | Names the files the task references so the planner reads them itself. A list of paths and nothing else — it must not open them. `None` when the task names no files. |
 
@@ -7935,6 +7973,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
+| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). Mirrored from `caps["force_strict_output"]`. Recorded because the flag changes worker behaviour invisibly — it owns `ANTHROPIC_BASE_URL`, which makes the CLI treat the session as gateway-routed and apply a conservative client-side context ceiling instead of the model's native window (see `_model_arg`). Without this field a run's failure cannot be attributed to the flag after the fact. |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `skip_coverage_check` | bool | whether the phase 2⅞½ task-coverage gate (a single advisory `task_coverage_judge` invocation since 2026-08-04; the deterministic `check_required_items_coverage` floor it used to compose with was deleted) is suppressed. Resolved from `--skip-coverage-check` / `LEERIE_SKIP_COVERAGE_CHECK` / `skip_coverage_check` in `leerie.toml` / default `False`. When True, the review does not run at all — no gap is surfaced before `phase_execute` spends. Since the gate is advisory, this suppresses the report and its worker call, not a block. Added after run 488c42e5, where the judge counted a task item the task itself deferred as `missing_work` — unsatisfiable by any planner, with no operator override, unlike every sibling gate. Re-resolved fresh on every run, including `resume` |

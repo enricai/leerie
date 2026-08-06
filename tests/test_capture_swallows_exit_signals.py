@@ -109,6 +109,48 @@ _GUARD_FUNCS = [
 ]
 
 
+# Control-flow signals that a best-effort capture must NOT swallow. These are
+# `BaseException` subclasses like the exit signals, but they are raised by
+# leerie's own signal handlers rather than by a worker call, so catching them
+# inside a capture guard would mean a SIGTERM arriving mid-capture is silently
+# ignored. Deliberately an explicit denylist, not an inferred one: a NEW
+# BaseException class fails `test_every_capture_guard_catches_the_exit_signals`
+# until someone classifies it, which is the loud default this file wants.
+_NOT_CAPTURE_SWALLOWED = {"InterruptedBySignal"}
+
+
+def _exit_signal_classes(leerie) -> set:
+    """Every exit-signal class leerie defines, derived rather than listed.
+
+    An exit signal is a `BaseException` subclass that is deliberately NOT an
+    `Exception` subclass, so it propagates through `asyncio.gather` and worker
+    `except Exception` blocks. `TerminalAuthFailure` and `RateLimitedExit` were
+    the original two; `ContextOverflow` (client-side context refusal) joined
+    them later.
+
+    Deriving the set is the point. The hard-coded version of this guard passed
+    green when `ContextOverflow` was added and left out of all eight capture
+    tuples -- re-opening the very escape this file exists to prevent, because a
+    name-by-name check cannot know about a family member it has never heard of.
+    Any future addition is now caught automatically.
+    """
+    out = set()
+    for name, obj in vars(leerie).items():
+        if (isinstance(obj, type) and issubclass(obj, BaseException)
+                and not issubclass(obj, Exception)
+                and obj.__module__ == leerie.__name__
+                and name not in _NOT_CAPTURE_SWALLOWED):
+            out.add(name)
+    return out
+
+
+def test_exit_signal_family_is_discovered(leerie):
+    """Anti-vacuity: a derived guard that discovers nothing asserts nothing."""
+    fam = _exit_signal_classes(leerie)
+    assert {"TerminalAuthFailure", "RateLimitedExit", "ContextOverflow"} <= fam, (
+        f"expected the known exit signals to be discovered, got {sorted(fam)}")
+
+
 def test_every_capture_guard_catches_the_exit_signals(leerie):
     """Every best-effort capture guard must name both TerminalAuthFailure and
     RateLimitedExit alongside Exception. A bare `except Exception` cannot catch
@@ -123,12 +165,11 @@ def test_every_capture_guard_catches_the_exit_signals(leerie):
         for h in handlers:
             names = _handler_type_names(h)
             total += 1
-            assert "TerminalAuthFailure" in names, (
-                f"{fname}: a capture guard does not catch TerminalAuthFailure "
-                f"(names={sorted(names)}) — the 2026-07-19 escape re-opens")
-            assert "RateLimitedExit" in names, (
-                f"{fname}: a capture guard does not catch RateLimitedExit "
-                f"(names={sorted(names)}) — same BaseException escape class")
+            missing = _exit_signal_classes(leerie) - names
+            assert not missing, (
+                f"{fname}: a capture guard does not catch {sorted(missing)} "
+                f"(names={sorted(names)}) — the 2026-07-19 escape re-opens for "
+                f"every exit-signal class it omits")
             assert "Exception" in names, (
                 f"{fname}: a capture guard dropped Exception (names="
                 f"{sorted(names)}) — ordinary capture errors must still be "
@@ -148,8 +189,10 @@ def test_finalize_capture_guard_is_hardened(leerie):
     assert handlers, "phase_finalize: no best-effort capture guard found"
     for h in handlers:
         names = _handler_type_names(h)
-        assert {"TerminalAuthFailure", "RateLimitedExit"} <= names, (
-            f"phase_finalize capture guard not hardened (names={sorted(names)})")
+        missing = _exit_signal_classes(leerie) - names
+        assert not missing, (
+            f"phase_finalize capture guard not hardened; missing "
+            f"{sorted(missing)} (names={sorted(names)})")
 
 
 # ---------------------------------------------------------------------------

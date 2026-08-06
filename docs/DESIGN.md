@@ -2649,6 +2649,30 @@ Claude Code's own remedy for a mid-stream drop is an automatic retry
 backoff is the fresh-session complement for when the CLI's in-session
 retries are exhausted.
 
+**A client-side context refusal is a fourth class, and it is terminal.**
+Claude Code enforces a context ceiling *itself*: when the assembled prompt
+exceeds the window it believes the model has, it emits a synthetic assistant
+message (`model=<synthetic>`, usage all zeros) and ends the session with
+`terminal_reason` = `"blocking_limit"` and result text `"Prompt is too long"`
+— **without issuing an API call at all**. Retrying identical input therefore
+cannot succeed, which puts this in the same bucket as terminal auth rather
+than the transient classes above. `_is_context_overflow` requires *both* that
+`terminal_reason` and the result text: the reason alone is shared with other
+blocking limits, and the text alone could appear in a worker's own correct
+output. It is checked immediately after the terminal-auth classifier and
+before the generic corrective-note retry, and routed to the same resumable
+`EXIT_LOCKED` pause — the remedy is an operator change, not a wait.
+
+Left unclassified this failure was actively misleading rather than merely
+unhandled: the envelope fell through to the two-attempt schema loop and
+surfaced as *"worker failed schema-valid output twice: Prompt is too long,"*
+blaming schema validation for a context refusal. On 2026-08-06 that wording
+cost three successive misdiagnoses before the real cause was measured, which
+is why the pause message names the actual contributors — the task text and
+the repo's CLAUDE.md are both loaded into every worker's context — and, when
+the strict-output proxy is active, names it first (see §7 *Forcing
+constrained decoding*).
+
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
@@ -4991,6 +5015,35 @@ proxy is never contacted and the operator is silently handed the post-hoc
 validation they explicitly asked to replace — or it misroutes every worker call.
 Since a run cannot tell those apart from a healthy one, leerie refuses that
 combination too rather than guessing.
+
+**Owning that variable also costs the model's native context window, and
+leerie has to buy it back.** The Claude Code CLI treats any custom
+`ANTHROPIC_BASE_URL` as an LLM gateway, and behind a gateway it can no longer
+confirm which model actually answers, so it falls back to a conservative
+client-side context ceiling instead of the model's real window. Sonnet 5
+natively carries 1M on the first-party API; behind the proxy the CLI refuses
+prompts at roughly 224K. That refusal is client-side and silent — no API call,
+no server error (see §6 *A client-side context refusal*) — so nothing in the
+run explains why an otherwise-fine prompt was rejected.
+
+The remedy is the documented gateway-side selector: leerie appends `[1m]` to
+the model alias whenever the proxy is active (`_model_arg`), which is a no-op
+on the direct path where the native window already applies. It is scoped to
+the aliases that *have* a 1M variant — `haiku` has none and rejects the
+suffix — and is applied automatically rather than exposed as a flag, since an
+operator gains nothing by setting by hand a value that is inert whenever the
+proxy is off.
+
+Measured across five arms on one 225 KB worker payload, varying only
+`ANTHROPIC_BASE_URL`: direct sustained 235,805 tokens over 20 requests with no
+refusal; a *passthrough* proxy that rewrites nothing refused after 224,127,
+and the real strict proxy after 224,247 — two reproductions 120 tokens apart,
+which is what establishes the base-URL override rather than the schema
+rewriting as the cause. Adding `[1m]` cleared both paths (261,014 and 276,579
+tokens, the latter completing successfully), with the proxy's
+rewritten/passed-through/fell-back counters identical under either alias — so
+the window is bought back without giving up the constrained decoding the flag
+exists for.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
