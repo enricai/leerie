@@ -308,3 +308,121 @@ def test_resume_never_ready_failure_path_never_terminates_or_deletes_volume(tmp_
 
     state = read_state(aws_dir)
     assert state["instances"][iid]["state"] != "terminated", state
+
+
+# ---------------------------------------------------------------------------
+# The seam: the real launcher must actually REACH the dispatch block above
+# ---------------------------------------------------------------------------
+#
+# Everything above this line exercises `extract_ec2_dispatch_block()` — the
+# dispatch code lifted out of the launcher and run standalone. That coverage
+# was correct and stayed green while `leerie resume <ec2-run>` was, in fact,
+# broken for every user: a guard in the resume verb's runtime auto-detect
+# exited 1 roughly 3,000 lines EARLIER, so the block below it was unreachable
+# from any real invocation.
+#
+# Measured against the unmodified launcher before the fix: rc=1, ZERO `aws`
+# calls, and the message "resume: run <id> is an EC2 run (ec2-instance.json
+# present); resume does not support EC2 runs yet".
+#
+# The guard's own stated reason was that promoting `RUNTIME=ec2` would land in
+# the fresh-provision branch and die with an unrelated "not yet wired" message.
+# That was true when written and went stale when the branch was completed and
+# the die removed (`grep -c "not yet wired" leerie` is 0). The guard outlived
+# its reason.
+#
+# So these tests drive the REAL `leerie` binary. They deliberately assert on
+# the seam only — the promotion firing — not on reaching `start-instances`:
+# unlike `stop`/`kill`/`finalize`, which exit inside the early verb-dispatch
+# region, `resume` falls through to an unconditional local container-image
+# build with no skip flag, which a test host without containerd cannot pass.
+# Splitting it this way is not a compromise; the hole was never in the
+# dispatch behaviour, it was in the seam.
+
+
+def _seam_env(tmp_path: Path, aws_dir: Path) -> tuple[dict, Path]:
+    state_dir = tmp_path / ".leerie" / "myrepo"
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    return {
+        "PATH": f"{aws_dir}:/usr/bin:/bin",
+        "USER_REPO": str(tmp_path),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(home),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "LEERIE_STATE_DIR": str(state_dir),
+        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
+        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
+        "AWS_REGION": "us-east-1",
+    }, state_dir
+
+
+def _paused_ec2_run(state_dir: Path, run_id: str, iid: str) -> None:
+    run_dir = state_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ec2-instance.json").write_text(json.dumps({
+        "ec2_instance_id": iid, "region": "us-east-1", "run_id": run_id}))
+    (run_dir / "run.json").write_text(json.dumps({
+        "run_id": run_id, "ec2_instance_id": iid,
+        "paused_at": "2026-08-01T00:00:00+00:00",
+        "pause_reason": "user-requested"}))
+
+
+def _run_launcher(args: list[str], env: dict):
+    import subprocess
+    return subprocess.run(["bash", str(LAUNCHER)] + args,
+                          env=env, capture_output=True, text=True, timeout=120)
+
+
+def test_real_launcher_promotes_runtime_for_a_paused_ec2_run(tmp_path: Path):
+    """THE REGRESSION PIN. Reinstating the guard makes this fail; no
+    extracted-block test can, which is exactly why the bug shipped."""
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    env, state_dir = _seam_env(tmp_path, aws_dir)
+    _paused_ec2_run(state_dir, RUN_ID, "i-00000000000000042")
+
+    err = (_run_launcher(["resume", RUN_ID], env).stderr or "")
+    assert "promoting --runtime to ec2" in err, (
+        "the resume verb must promote RUNTIME=ec2 for a run whose sidecar "
+        f"names an instance, so the dispatch block is reachable. stderr:\n{err}")
+
+
+def test_real_launcher_no_longer_fails_closed_on_ec2_resume(tmp_path: Path):
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    env, state_dir = _seam_env(tmp_path, aws_dir)
+    _paused_ec2_run(state_dir, RUN_ID, "i-00000000000000043")
+
+    err = (_run_launcher(["resume", RUN_ID], env).stderr or "")
+    assert "does not support EC2 runs yet" not in err, err
+
+
+def test_fly_resume_promotion_is_unchanged(tmp_path: Path):
+    """ANTI-REGRESSION: the EC2 arm sits in the same if/elif as the Fly arm.
+    A malformed edit there would silently break Fly resume, which has far more
+    users than EC2."""
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    env, state_dir = _seam_env(tmp_path, aws_dir)
+    run_dir = state_dir / "runs" / "fly-run-0001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "fly-machine.json").write_text(json.dumps(
+        {"fly_machine_id": "5683dcd0", "run_id": "fly-run-0001"}))
+
+    err = (_run_launcher(["resume", "fly-run-0001"], env).stderr or "")
+    assert "promoting --runtime to fly" in err, err
+    assert "promoting --runtime to ec2" not in err, err
+
+
+def test_the_retired_failclosed_string_is_gone_from_the_launcher():
+    """Prior art: tests/test_ec2_launcher_dispatch_e2e.py's grep guard on
+    'not yet wired'. A live die() carrying this text would mean the guard came
+    back; `finalize`'s own message is a separate string checked elsewhere."""
+    src = LAUNCHER.read_text()
+    assert "resume does not support EC2 runs yet" not in src, (
+        "the resume fail-closed guard is back; it makes a fully-implemented, "
+        "separately-tested dispatch path unreachable")

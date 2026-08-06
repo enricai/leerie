@@ -320,6 +320,17 @@ def _run_launcher_under_bash32(args: list[str], env: dict) -> subprocess.Complet
     pytest.param(["stop", RUN_ID], id="stop"),
     pytest.param(["kill", RUN_ID, "--force"], id="kill"),
     pytest.param(["accept-blocked", RUN_ID, "feat-001"], id="accept-blocked"),
+    # `finalize`'s EC2 arm builds TWO optional-arg arrays — `_fin_ec2_creds_args`
+    # for resolve_aws_credentials and `_fin_ec2_aws_args` for the
+    # instance-state probe — so it is exactly this guard's subject. It also
+    # exits inside the early verb-dispatch region, like the three above, so it
+    # completes well within the timeout.
+    #
+    # `resume` is deliberately absent: it promotes the runtime and then falls
+    # through into the launch path's unconditional container-image build, so it
+    # would hit the 30 s timeout rather than exercise anything. Its arrays live
+    # in the `RUNTIME=ec2` dispatch block, which this harness never reaches.
+    pytest.param(["finalize", RUN_ID], id="finalize"),
 ])
 def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
     """Run each newly wired EC2 launcher verb end to end under bash 3.2.
