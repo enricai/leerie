@@ -20385,6 +20385,12 @@ def _filter_defects_already_ordered(
     ordered behind EVERY producer of it, the assertion is false whatever the
     declaration looks like, so the defect must not reach the `die()`.
 
+    Scoped to that kind alone. `_repair_missing_requires` routes every
+    non-repairable defect to its residual, so `broken_by_drop` /
+    `broken_by_merge` arrive here too — and ordering cannot refute those:
+    they assert the WORK is gone, and no amount of scheduling after a subtask
+    restores a capability it no longer provides.
+
     "Every", not "any" — a capability with two producers where `sid` precedes
     only one of them is precisely the judge's complaint about the other, so
     dismissing on a non-empty intersection would wave through the race this
@@ -20430,6 +20436,18 @@ def _filter_defects_already_ordered(
     surviving: list[dict] = []
     notes: list[str] = []
     for d in defects:
+        # Scoped to `missing_requires`, the only kind whose assertion ordering
+        # can refute. A `broken_by_drop` / `broken_by_merge` says the WORK is
+        # gone, not that the order is wrong — being scheduled after a subtask
+        # cannot restore a capability that subtask no longer provides — and
+        # those reach here too, since `_repair_missing_requires` routes every
+        # non-repairable defect to its residual. The upstream
+        # `_filter_provably_false_wiring_defects` does not backstop this: its
+        # `broken_by_*` predicate fires only when the named *capability* is
+        # still provided, and a `tag_or_dep` naming a subtask id is not a tag.
+        if d.get("kind") != "missing_requires":
+            surviving.append(d)
+            continue
         sid = d.get("sid")
         tag = (d.get("tag_or_dep") or "").strip()
         # `tag_or_dep` names a capability tag on one channel and a subtask id
@@ -20605,7 +20623,15 @@ def _repair_missing_requires(
     if unrepaired:
         unrepaired, ordered_notes = _filter_defects_already_ordered(
             plans, unrepaired)
-        already.extend(ordered_notes)
+        # Its own line, not `already`'s: two of the three shapes this drops are
+        # NOT an edge the subtask declares — one is an edge a sibling defect's
+        # repair just added, the other an in-plan `requires` tag. On a gate
+        # whose remaining value is that a dismissal stays reviewable, a message
+        # stating the wrong reason is itself a defect.
+        if ordered_notes:
+            log(f"  wiring-gate: {len(ordered_notes)} defect(s) already "
+                f"ordered behind every producer — ignored "
+                f"({', '.join(ordered_notes)})")
     if already:
         log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
             f"subtask already declares — ignored ({', '.join(already)})")

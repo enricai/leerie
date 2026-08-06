@@ -692,6 +692,49 @@ class TestItStillGatesGenuineDefects:
             "depends_on=['unrelated'] does not order t behind a provider of "
             "cap-y, so the defect is still live")
 
+    def _drop_shape(self, kind):
+        """A `broken_by_*` whose `tag_or_dep` names a PRECEDING subtask id.
+
+        Reaches the re-check because `_repair_missing_requires` routes every
+        non-repairable defect to its residual, and slips past the upstream
+        `_filter_provably_false_wiring_defects` because that predicate fires
+        only when the named *capability* is still provided — a subtask id is
+        not a tag.
+        """
+        plans = _plan([
+            {"id": "p1", "provides": ["cap"], "requires": [],
+             "depends_on": []},
+            {"id": "t", "provides": [], "requires": [], "depends_on": ["p1"]},
+        ])
+        return plans, [{"kind": kind, "sid": "t", "tag_or_dep": "p1",
+                        "concrete_reason": "the dropped work is gone"}]
+
+    def test_broken_by_drop_is_not_dismissed_on_ordering(self, leerie):
+        """Ordering cannot refute a "the work is gone" finding.
+
+        Being scheduled after `p1` does nothing if `p1` no longer provides
+        the capability — so an ordering test must not speak to this kind at
+        all. The re-check is scoped to `missing_requires` for that reason.
+        """
+        plans, defects = self._drop_shape("broken_by_drop")
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"]
+
+    def test_broken_by_merge_is_not_dismissed_on_ordering(self, leerie):
+        plans, defects = self._drop_shape("broken_by_merge")
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"]
+
+    def test_the_same_shape_as_missing_requires_IS_dismissed(self, leerie):
+        """Positive control for the two above.
+
+        Byte-identical but for `kind`, so the scope guard cannot pass by
+        having disabled the re-check wholesale.
+        """
+        plans, defects = self._drop_shape("missing_requires")
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert unrepaired == []
+
     def test_ordered_behind_only_SOME_producers_still_gates(self, leerie):
         """The soundness control: "every producer", never "any producer".
 
@@ -812,3 +855,29 @@ class TestDismissalIsVisible:
         # every producer that justified the dismissal is named, not just one —
         # a one-name log would hide which edge is load-bearing on review.
         assert "p1" in out and "p2" in out
+        # NOT the per-channel message: two of this pass's three dismissal
+        # shapes are not an edge the subtask declares (one is an edge a
+        # sibling's repair just added, the other an in-plan requires tag), so
+        # borrowing that wording would state the wrong reason on a gate whose
+        # remaining value is that dismissals stay reviewable.
+        assert "named an edge the subtask already declares" not in out
+
+    def test_a_genuine_already_declared_skip_keeps_its_own_message(
+            self, leerie, capsys):
+        """The per-channel message must survive — the two are distinct claims.
+
+        Here `t` really does declare the edge the defect names, and it is
+        caught by the channel-local guard, never reaching the re-check.
+        """
+        plans = _plan([
+            {"id": "p1", "provides": ["solo"], "requires": [],
+             "depends_on": []},
+            {"id": "t", "provides": [],
+             "requires": [{"tag": "solo", "extent": "in_plan", "reason": ""}],
+             "depends_on": []},
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "solo", "concrete_reason": ""}]
+        leerie._repair_missing_requires(plans, defects)
+        out = capsys.readouterr().out
+        assert "named an edge the subtask already declares" in out

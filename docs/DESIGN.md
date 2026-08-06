@@ -1040,6 +1040,12 @@ load-bearing:
   soundly, but dismissing on them is a much broader claim to make on a die-only
   gate, so the check stays 1:1 with the graph's own edge definition.
 
+It applies to `missing_requires` alone. The repair loop routes *every*
+non-repairable defect to the same residual, so `broken_by_drop` and
+`broken_by_merge` arrive here too — and ordering cannot refute those: they assert
+the *work* is gone, and no amount of scheduling behind a subtask restores a
+capability it no longer provides.
+
 It runs after the repairs rather than before them because a defect can be mooted
 by an edge a *sibling* defect's repair added, and the judge's emission order is
 arbitrary. (The real run above did not need that — it was refutable as written —

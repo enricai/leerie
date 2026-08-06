@@ -2491,7 +2491,21 @@ dismisses the canonical TRUE finding (that mutation kills 7 tests, 5 of them
 pre-existing). **(c)** Direct edges only, never the transitive closure (a
 further 127 corpus orderings hold only transitively):
 `test_ordering_that_holds_only_TRANSITIVELY_still_gates` pins the scope as a
-decision, not an accident. The pass runs after the repairs rather than before
+decision, not an accident. **The pass is scoped to `kind ==
+"missing_requires"`** — the repair loop routes every non-repairable defect to
+the same residual, so `broken_by_drop`/`broken_by_merge` reach it too, and
+ordering cannot refute those (they assert the *work* is gone; scheduling behind
+a subtask does not restore a capability it no longer provides). The upstream
+`_filter_provably_false_wiring_defects` does not backstop it — that predicate
+fires only when the named *capability* is still provided, and a `tag_or_dep`
+naming a surviving subtask id is not a tag, which was measured dismissing a
+`broken_by_drop` before the guard existed
+(`test_broken_by_drop_is_not_dismissed_on_ordering`, with
+`test_the_same_shape_as_missing_requires_IS_dismissed` as the byte-identical
+positive control so the guard cannot pass by disabling the pass wholesale).
+The pass emits its own log line rather than reusing the per-channel `already`
+wording, since two of its three dismissal shapes are not an edge the subtask
+declares; both messages are pinned in `TestDismissalIsVisible`. The pass runs after the repairs rather than before
 because a residual can also be mooted by an edge a *sibling* defect's repair
 added and emission order is arbitrary — `test_order_independent` emits the
 survivor FIRST, which a pre-filter cannot dismiss. Provably inert on the pinned
