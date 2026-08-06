@@ -3771,11 +3771,21 @@ whose state directory contains a `fly-machine.json` or
 launcher auto-promotes to `fly` or `ec2` respectively via the shared
 `_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
 as a thin Fly-only wrapper for call sites not yet migrated). `stop`,
-`kill`, and `accept-blocked` all wire real EC2 actions;
-`finalize` still fails closed with a "does not support EC2 runs yet"
-message (a separate subtask), and `resume` fails closed the same way
-rather than falling into the launcher's fresh-provision `RUNTIME=ec2`
-branch. `accept-blocked`'s EC2 action mirrors the Fly path's
+`kill`, `accept-blocked`, `finalize` and `resume` all wire real EC2
+actions; no verb fails closed on EC2 any more. `resume` promotes
+`RUNTIME=ec2` exactly as it promotes `fly`, reaching the dispatch
+branch's sidecar → `resume_instance()` path. `finalize` streams the
+completed run back with `fetch_state_ec2()` and then runs the same
+`host_finalize` the Fly path uses; because a *stopped* instance has no
+reachable target and EC2 reassigns its public IP on every stop/start,
+`finalize` wakes a paused instance, fetches, and re-stops it **only if
+finalize is what woke it** — the same wake → act → restore-prior-state
+discipline `accept-blocked` uses below. `finalize --force` is the one
+EC2 gap that remains, and it is a transport boundary rather than an
+omission: the force path drives `force_finalize_remote()` and
+`collect_subtrees_remote()`, both `flyctl ssh console`-only, and
+finalizing without collecting un-integrated subtask branches would push
+an incomplete branch. `accept-blocked`'s EC2 action mirrors the Fly path's
 wake-mutate-pause dance: it resolves AWS credentials, wakes the
 instance via `resume_instance()` if it is stopped, mutates
 `state.json` on the instance over SSM (`ec2_remote_exec` — no ssh

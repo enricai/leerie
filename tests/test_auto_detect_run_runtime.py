@@ -359,29 +359,66 @@ def test_finalize_rejects_bogus_runtime_value(tmp_path):
     assert "must be 'local', 'fly', or 'ec2'" in r.stderr
 
 
-def test_finalize_accepts_explicit_ec2_enum_but_fails_closed(tmp_path):
+# `finalize` and `resume` used to fail closed on EC2 runs. Both now wire a
+# real EC2 action, so these three assert the *new* contract: the run reaches
+# the EC2 arm (rather than the Fly path, which would misdirect an instance id
+# to `flyctl`, or `local`, which would mislabel the run), and any failure is a
+# specific one from inside that arm — never the retired blanket refusal.
+#
+# Full behavioural coverage lives in tests/test_ec2_launcher_finalize.py and
+# tests/test_ec2_launcher_resume.py; these stay narrow, matching this file's
+# scope (detection + enum validation).
+
+
+def test_finalize_accepts_explicit_ec2_enum_and_enters_the_ec2_arm(tmp_path):
     state_dir = tmp_path / "state"
     _make_e2e_run(state_dir, "r1")
     r = _run_launcher(["finalize", "r1", "--runtime", "ec2"], state_dir)
     assert r.returncode != 0
-    assert "does not support EC2 runs yet" in r.stderr
+    assert "does not support EC2 runs yet" not in r.stderr
+    # This fixture writes no ec2_instance_id, so the arm's own fail-closed
+    # fires — proving we reached it rather than the blanket refusal.
+    assert "no ec2_instance_id found" in r.stderr, r.stderr
 
 
-def test_finalize_autodetects_ec2_sidecar_and_fails_closed(tmp_path):
+def test_finalize_autodetects_ec2_sidecar_and_promotes(tmp_path):
     state_dir = tmp_path / "state"
     _make_e2e_run(state_dir, "r1", ec2=True)
     r = _run_launcher(["finalize", "r1"], state_dir)
-    assert r.returncode != 0
-    assert "does not support EC2 runs yet" in r.stderr
+    assert "auto-detected EC2 run; promoting --runtime to ec2" in r.stderr
+    assert "does not support EC2 runs yet" not in r.stderr
 
 
-def test_resume_autodetects_ec2_sidecar_and_fails_closed(tmp_path):
+def _launcher_stderr_after_detection(args: list[str], state_dir: Path,
+                                     timeout: int = 20) -> str:
+    """Run the launcher and return whatever it wrote to stderr, even if it is
+    still going when the timeout fires.
+
+    Every other verb in this file exits promptly inside the early
+    verb-dispatch region. `resume` does not: once detection promotes the
+    runtime it falls through into the launch path, which performs an
+    unconditional local container-image build (not runtime-gated, no skip
+    flag). This file's scope is the DETECTION decision, so waiting on a build
+    irrelevant to the assertion would just make the test slow and flaky."""
+    try:
+        return subprocess.run(
+            [str(REPO_ROOT_LAUNCHER)] + args, env=_launcher_env(state_dir),
+            capture_output=True, text=True, timeout=timeout).stderr
+    except subprocess.TimeoutExpired as exc:
+        err = exc.stderr or ""
+        return err.decode(errors="replace") if isinstance(err, bytes) else err
+
+
+def test_resume_autodetects_ec2_sidecar_and_promotes(tmp_path):
+    """The regression this replaces: the old guard exited 1 here, making the
+    `RUNTIME=ec2` dispatch block's fully-implemented resume path unreachable
+    from any real invocation. See tests/test_ec2_launcher_resume.py."""
     state_dir = tmp_path / "state"
     _make_e2e_run(state_dir, "r1", ec2=True, with_state=True)
-    r = _run_launcher(["resume", "r1"], state_dir)
-    assert r.returncode != 0
-    assert "ec2-instance.json present" in r.stderr
-    assert "does not support EC2 runs yet" in r.stderr
+    err = _launcher_stderr_after_detection(["resume", "r1"], state_dir)
+    assert "ec2-instance.json present" in err, err
+    assert "promoting --runtime to ec2" in err, err
+    assert "does not support EC2 runs yet" not in err, err
 
 
 def test_resume_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):

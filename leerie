@@ -2316,7 +2316,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         # silently dropped and the user thought they had passed --force.
         --*)
           remote_log "finalize: unknown flag: $_a"
-          echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+          echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
           exit 1
           ;;
         *)
@@ -2325,7 +2325,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           # — refuse to silently accept it.
           if [ "$_fin_seen_positional" = "true" ]; then
             remote_log "finalize: unexpected extra positional: $_a"
-            echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+            echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
             exit 1
           fi
           _fin_seen_positional=true
@@ -2340,7 +2340,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # path — a surprise the operator would not have asked for.
     if [ -n "$_fin_prev" ]; then
       remote_log "finalize: $_fin_prev requires a value"
-      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
       exit 1
     fi
     if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ] && [ "$_fin_runtime" != "ec2" ]; then
@@ -2351,22 +2351,17 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       remote_log "finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
     fi
-    if [ "$_fin_runtime" = "ec2" ]; then
-      remote_log "finalize --runtime ec2: finalize does not support EC2 runs yet"
-      exit 1
-    fi
     _fin_detected="$(_auto_detect_run_runtime "$_fin_run_id" "$_fin_runtime")" || _fin_detected=""
-    if [ "$_fin_detected" = "ec2" ]; then
-      remote_log "finalize: run $_fin_run_id is an EC2 run; finalize does not support EC2 runs yet"
-      exit 1
-    fi
     if [ "$_fin_detected" = "fly" ]; then
       remote_log "finalize: auto-detected Fly run; promoting --runtime to fly"
       _fin_runtime="fly"
+    elif [ "$_fin_detected" = "ec2" ]; then
+      remote_log "finalize: auto-detected EC2 run; promoting --runtime to ec2"
+      _fin_runtime="ec2"
     fi
     if [ -z "$_fin_run_id" ]; then
       remote_log "finalize requires a <run-id>"
-      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
       exit 1
     fi
     _fin_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id"
@@ -2480,6 +2475,111 @@ except Exception:
 
     if [ "$_already_synced" = "true" ]; then
       remote_log "finalize: run already synced to host; skipping fetch_branch"
+      _fetched_run_id="$_fin_run_id"
+      _fetched_run_dir="$_fin_run_dir"
+    elif [ "$_fin_runtime" = "ec2" ]; then
+      # EC2 fetch: stream the completed run's branch + state back to the host,
+      # then fall through to host_finalize exactly as the Fly path does.
+      #
+      # `--force` is deliberately NOT supported here, and that is a transport
+      # boundary rather than an oversight. The Fly recovery path drives
+      # force_finalize_remote() and collect_subtrees_remote(), both of which
+      # shell out to `flyctl ssh console` and have no SSM/SSH counterpart
+      # (zero ec2 references in either file). Finalizing without collecting
+      # un-integrated subtask branches would push an INCOMPLETE branch, so
+      # failing closed is the honest outcome.
+      if [ "$_FINALIZE_FORCE" = "true" ]; then
+        remote_log "finalize --force is not supported for EC2 runs: the force path needs force-finalize.sh + collect-subtrees.sh, which are flyctl-transport only"
+        remote_log "  Retry without --force once the orchestrator has exited, or"
+        remote_log "  run \`leerie kill $_fin_run_id\` to sync state and terminate."
+        exit 1
+      fi
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-fetch-branch.sh"
+      _fin_ec2_iid="$(_resolve_ec2_instance_id_from_run_dir "$_fin_run_dir")"
+      if [ -z "$_fin_ec2_iid" ]; then
+        remote_log "finalize: no ec2_instance_id found in $_fin_run_dir (ec2-instance.json / run.json)"
+        exit 1
+      fi
+      _fin_ec2_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _fin_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _fin_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _fin_ec2_creds_exports="$(resolve_aws_credentials ${_fin_ec2_creds_args[@]+"${_fin_ec2_creds_args[@]}"})" || exit 1
+      eval "$_fin_ec2_creds_exports"
+      unset _fin_ec2_creds_args _fin_ec2_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$_fin_ec2_iid"
+      export LEERIE_EC2_INSTANCE_ID
+      # A STOPPED instance has no reachable SSH/SSM target, and EC2 reassigns
+      # the public IP on every stop/start cycle, so a paused run must be woken
+      # before fetch_state_ec2 can reach it. Wake it, fetch, and re-stop it
+      # ONLY if this verb is what woke it — mirroring accept-blocked's EC2 arm,
+      # which does the same wake -> act -> re-pause-if-we-woke-it dance.
+      # Read the region/profile flags one token per line rather than splitting
+      # `$(_aws_region_profile_args)` on whitespace: a named AWS profile may
+      # legitimately contain spaces, and word splitting would shred it into two
+      # arguments (the helper's own docstring calls this out, and every caller
+      # in ec2-provision.sh uses this idiom). A shredded --profile makes the
+      # probe below return empty, which reads as "not stopped" and silently
+      # skips the wake — so the fetch would then run against an unreachable
+      # instance.
+      _fin_ec2_aws_args=()
+      while IFS= read -r _fin_ec2_a; do
+        _fin_ec2_aws_args+=("$_fin_ec2_a")
+      done < <(_aws_region_profile_args)
+      _fin_ec2_state="$(aws ec2 describe-instances --instance-ids "$_fin_ec2_iid" \
+        ${_fin_ec2_aws_args[@]+"${_fin_ec2_aws_args[@]}"} 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d["Reservations"][0]["Instances"][0]["State"]["Name"])
+except Exception:
+    pass
+' || true)"
+      _fin_ec2_woke="false"
+      if [ "$_fin_ec2_state" = "stopped" ] || [ "$_fin_ec2_state" = "stopping" ]; then
+        remote_log "finalize: instance $_fin_ec2_iid is $_fin_ec2_state; waking it to stream the run back"
+        # resume_instance() re-arms `trap decide_ec2_teardown EXIT INT TERM`
+        # for the normal launch path. In finalize that trap could TERMINATE
+        # the instance on exit, which finalize must never do — so neutralize
+        # it both ways: the LEERIE_TEARDOWN_DONE guard short-circuits
+        # decide_ec2_teardown, and the trap is cleared right after.
+        LEERIE_TEARDOWN_DONE=1
+        export LEERIE_TEARDOWN_DONE
+        if ! resume_instance "$_fin_ec2_iid"; then
+          remote_log "finalize: could not wake instance $_fin_ec2_iid; nothing streamed back"
+          exit 1
+        fi
+        trap - EXIT INT TERM
+        _fin_ec2_woke="true"
+      elif _fin_ec2_target="$(_resolve_ssh_target_from_instance "$_fin_ec2_iid")"; then
+        LEERIE_EC2_SSH_TARGET="$_fin_ec2_target"
+        export LEERIE_EC2_SSH_TARGET
+      fi
+      remote_log "finalize: instance=$_fin_ec2_iid run=$_fin_run_id action=fetch"
+      if ! fetch_state_ec2; then
+        # One-way ratchet (DESIGN §6): a failed fetch must not push a partial
+        # branch, and must not leave the instance in a state the operator did
+        # not ask for. Re-stop it if we woke it, then fail.
+        if [ "$_fin_ec2_woke" = "true" ]; then
+          remote_log "finalize: re-stopping instance $_fin_ec2_iid after failed fetch"
+          stop_instance || true
+        fi
+        remote_log "error: fetch_state_ec2 failed; nothing pushed"
+        exit 1
+      fi
+      if [ "$_fin_ec2_woke" = "true" ]; then
+        remote_log "finalize: re-stopping instance $_fin_ec2_iid (finalize woke it)"
+        stop_instance || remote_log "warning: could not re-stop instance $_fin_ec2_iid"
+      fi
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
     else
@@ -3885,8 +3985,19 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
     RUNTIME=fly
     REWRITTEN_ARGS+=("--runtime" "fly")
   elif [ "$_resume_detected" = "ec2" ]; then
-    remote_log "resume: run $LEERIE_RUN_ID is an EC2 run (ec2-instance.json present); resume does not support EC2 runs yet"
-    exit 1
+    # Symmetric with the Fly arm above, deliberately. This previously exited 1
+    # on the grounds that promoting would land in the fresh-provision branch
+    # and hit a placeholder abort -- true when written, false since that
+    # branch was completed and the abort deleted (its text is grep-guarded as
+    # permanently gone by tests/test_ec2_e2e_provision.py and
+    # tests/test_ec2_launcher_dispatch_e2e.py, which is why it is not quoted
+    # here: those guards are plain substring checks over this whole file and
+    # cannot tell a comment from a live abort). The dispatch branch already
+    # resolves a paused instance id from the sidecar and calls
+    # resume_instance(); the guard simply made that unreachable.
+    remote_log "resume: auto-detected EC2 run (ec2-instance.json present); promoting --runtime to ec2"
+    RUNTIME=ec2
+    REWRITTEN_ARGS+=("--runtime" "ec2")
   fi
 fi
 # When the user explicitly set --runtime local on a Fly-originated run,

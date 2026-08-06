@@ -2239,11 +2239,15 @@ run. The second half invokes the real launcher end to end (mirroring
 `tests/test_accept_blocked.py`'s local-path pattern) across `stop`,
 `kill`, `accept-blocked`, and `finalize`: each accepts `ec2`
 alongside `local`/`fly` in its `--runtime` enum validation (rejects other
-bogus values with the updated three-way message). `accept-blocked` and
-`finalize` still fail closed with an explicit "does not support EC2 runs
-yet" message — rather than silently falling through to the Fly path or
-defaulting to `local` — whether `ec2` was passed explicitly or
-auto-detected via the sidecar; the Fly auto-detect regression path (no
+bogus values with the updated three-way message). No verb fails closed on
+EC2 any more: `finalize` and `resume` now promote to `ec2` and enter their
+EC2 arms (covered end to end by `tests/test_ec2_launcher_finalize.py` and
+`tests/test_ec2_launcher_resume.py`), so this file's three EC2 cases assert
+the *promotion* plus an arm-specific failure — never the retired blanket
+refusal. `resume` is the one verb here that does not exit promptly after
+detection (it falls through into the launch path's unconditional container
+image build), so its case captures stderr on timeout rather than waiting;
+the Fly auto-detect regression path (no
 sidecar override, `LEERIE_FLY_APP` unset) still reaches the pre-existing
 Fly-specific error, proving detection promoted to `fly` and reached the
 Fly branch. `stop` and `kill` both wire real EC2 actions (test-001 and
