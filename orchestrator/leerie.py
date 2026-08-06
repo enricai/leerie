@@ -2372,6 +2372,42 @@ SCHEMAS: dict[str, dict] = {
                         "concrete_scenario": {"type": "string"},
                         "location": {"type": "string"},
                         "why_broken": {"type": "string"},
+                        # DESIGN §8 "Location is not coverage": a merge that
+                        # drops a DUPLICATE is textually identical to one that
+                        # drops the only copy, so the parent diffs alone cannot
+                        # tell them apart. The judge is asked to search the
+                        # merged tree and cite equivalent coverage; a
+                        # `dropped_change` that cites a real file plus a
+                        # non-blank assertion is downgraded to advisory.
+                        #
+                        # Deliberately ABSENT from `required` above. Requiring a
+                        # judge field has three times produced a worker emitting
+                        # no schema-valid output at all (`confidence` on 10
+                        # schemas, `artifact_paths` -> 40.9% validity,
+                        # `severity` -> 9/66 wiring_judge runs invalid), and a
+                        # gate that never runs catches nothing. Absence gates --
+                        # the conservative direction, matching `wiring_defects`'
+                        # unlabelled-severity rule.
+                        #
+                        # No `minLength` on these two: an OPTIONAL field
+                        # carrying one is a trap, because
+                        # `--dangerously-force-strict-output` forces every
+                        # property into `required` -- the grammar could then
+                        # emit "" and the CLI's own validator would reject it,
+                        # trading a compile error for a validation error (see
+                        # tests/test_strict_output_proxy.py's
+                        # forcing-a-field-never-makes-a-trivial-value-illegal
+                        # invariant). Blankness is rejected in
+                        # `_coverage_citation_clears` instead, which is the
+                        # right layer anyway: code enforces, schemas describe.
+                        "coverage_elsewhere": {
+                            "type": "object",
+                            "properties": {
+                                "searched": {"type": "boolean"},
+                                "file": {"type": "string"},
+                                "assertion": {"type": "string"},
+                            },
+                        },
                     },
                 },
             },
@@ -6995,6 +7031,91 @@ def _normalize_artifact_path(path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized.lstrip("/")
+
+
+def _coverage_citation_clears(defect: dict, repo_root: Path) -> str | None:
+    """DESIGN §8 *Location is not coverage*. Returns the accepted citation as
+    `"<file>: <assertion>"` when a `dropped_change` defect proves the dropped
+    behavior still lives in the merged tree, or `None` when the defect gates.
+
+    A merge that drops a *duplicate* is textually identical to one that drops
+    the only copy — both remove content present in a parent — so the parent
+    diffs cannot distinguish them. Measured: this gate killed a run at wave 3
+    with 28 subtasks complete over a dropped `describe` block whose assertions
+    were a strict subset of a separate file written 4h45m earlier.
+
+    Only `dropped_change` is eligible: the other four kinds
+    (`reintroduced_conflict`, `call_site_mismatch`, `semantic_regression`,
+    `incomplete_resolution`) describe breakage *introduced* by the merge, which
+    coverage living elsewhere cannot excuse.
+
+    The file-existence test is mechanical and deliberate — the citation is the
+    only thing standing between a real lossy merge and a silent downgrade on
+    the one gate with no operator bypass, so a hallucinated path must not buy
+    one. `searched` is not consulted: a judge that sets it without supplying a
+    usable file/assertion has shown nothing."""
+    if defect.get("kind") != "dropped_change":
+        return None
+    cite = defect.get("coverage_elsewhere")
+    if not isinstance(cite, dict):
+        return None
+    rel = _normalize_artifact_path(str(cite.get("file") or ""))
+    assertion = str(cite.get("assertion") or "").strip()
+    if not rel or not assertion:
+        return None
+    try:
+        resolved = (repo_root / rel).resolve()
+        # A `..` segment survives _normalize_artifact_path (it only strips
+        # leading `./` and `/`), so confine the citation to the merged tree.
+        resolved.relative_to(repo_root.resolve())
+    except (ValueError, OSError):
+        return None
+    if not resolved.is_file():
+        return None
+    return f"{rel}: {assertion}"
+
+
+def _partition_integration_defects(
+        judge_result: dict, repo_root: Path) -> tuple[list[str], list[str]]:
+    """Split an `integration_judge` result's defects into
+    `(gating_issues, advisory_notes)`.
+
+    **Pure, and it must stay pure.** Its adapter inside `integrate_wave`
+    (`_check_integration`) is invoked TWICE per judge result: once by
+    `_run_checked_loop` as its `check=`, and again after the loop to decide the
+    `die()`. Any side effect on this path therefore fires at least twice per
+    defect, and up to `judgment_check_rounds` + 1 times when a `WorkerError`
+    retry re-invokes the judge. So the advisory text is *returned*, and the
+    caller logs it exactly once.
+
+    Both filters live here so neither is duplicated across the two call sites:
+    the pre-existing anti-gaming rule (a defect gates only with a concrete
+    scenario and a location named) and the DESIGN §8 *Location is not coverage*
+    citation downgrade."""
+    gating: list[str] = []
+    advisory: list[str] = []
+    for d in judge_result.get("defects") or []:
+        if not isinstance(d, dict):
+            continue
+        scenario = (d.get("concrete_scenario") or "").strip()
+        location = (d.get("location") or "").strip()
+        # Anti-gaming: a defect gates only with concrete scenario and location
+        # named.
+        if not scenario or not location:
+            continue
+        # DESIGN §8 "Location is not coverage": a dropped DUPLICATE is not
+        # behavioral breakage. Downgrade to advisory only on a citation naming
+        # a file that really exists in the merged tree; absence gates.
+        cleared = _coverage_citation_clears(d, repo_root)
+        if cleared:
+            advisory.append(
+                f"({d.get('kind')}) {location}: {scenario} — "
+                f"equivalent coverage cited at {cleared}")
+            continue
+        gating.append(
+            f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
+            f"{location}: {scenario} — {d.get('why_broken', '')}")
+    return gating, advisory
 
 
 def check_overlap_judge_output(
@@ -20865,6 +20986,26 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             "subtask (as that subtask's runs_commands), not substituted "
             "with hand-authored work."
         )
+        # No `domains=` here, deliberately -- this is NOT an oversight, and it
+        # is not the same situation as `phase_overlap_judge`, which does pass
+        # `domains=_replan_domain_closure(plans, implicated)`. That judge's
+        # findings are PAIRWISE BETWEEN SUBTASKS, so each carries sids a
+        # closure can expand. This gate's findings are plan-global: the
+        # deterministic floor emits `PRESCRIBED_CMD_UNRUN: ...` naming a
+        # COMMAND, and `SCHEMAS["adherence_judge"]["properties"]["violations"]`
+        # is an array of plain STRINGS -- there is no field that could carry a
+        # sid. Nothing here identifies a subtask, so there is nothing to seed a
+        # closure with.
+        #
+        # Scoping this by inventing an attribution the findings do not have
+        # (e.g. bolting a `suggested_domain` onto the judge and guessing when
+        # it is absent) was considered and rejected. When a prescribed command
+        # genuinely cannot be attached to any subtask, the whole plan really is
+        # implicated and re-planning every domain is correct, not wasteful.
+        # This path is rare regardless: repair-before-re-drive means it fired
+        # in 1 run of 130.
+        #
+        # If a future adherence finding DOES carry a sid, use the closure.
         cur_plans[0] = await phase_plan(
             replan_task, st, caps, models, efforts,
             replan_round=replan_round[0])
@@ -25021,20 +25162,12 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 )
 
             def _check_integration(judge_result: dict) -> list[str]:
-                issues: list[str] = []
-                for d in judge_result.get("defects") or []:
-                    if not isinstance(d, dict):
-                        continue
-                    scenario = (d.get("concrete_scenario") or "").strip()
-                    location = (d.get("location") or "").strip()
-                    # Anti-gaming: a defect gates only with concrete scenario
-                    # and location named.
-                    if not scenario or not location:
-                        continue
-                    issues.append(
-                        f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
-                        f"{location}: {scenario} — {d.get('why_broken', '')}")
-                return issues
+                # Thin adapter for `_run_checked_loop`'s `check=` contract.
+                # Deliberately side-effect free: this runs once per round
+                # inside the loop AND again after it, so logging here would
+                # emit each advisory 2-4 times. The post-loop call site logs
+                # the advisory list once.
+                return _partition_integration_defects(judge_result, repo_root)[0]
 
             # No make_feedback_prompt: detect-and-die, single pass. The
             # integrator cannot mechanically fix a semantic finding without
@@ -25055,7 +25188,13 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 log(f"  ⚠  integration-judge for {sid} crashed every round; "
                     "degrading (merge preserved, check_merge_committed already ran)")
             else:
-                remaining_defects = _check_integration(judge_result)
+                # The single place advisories are logged — see
+                # `_partition_integration_defects`' docstring for why this is
+                # not done inside `_check_integration`.
+                remaining_defects, advisories = _partition_integration_defects(
+                    judge_result, repo_root)
+                for a in advisories:
+                    log(f"  ⚠  integration-judge-{sid}: advisory {a}")
                 if remaining_defects:
                     # Found behavioral breakage. Unlike the wiring gate (pre-merge),
                     # we already have a committed merge, so the abort instruction

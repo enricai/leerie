@@ -5646,7 +5646,23 @@ and no stub-based test could see it. Persists to
 (boolean), `defects` (array of `{kind: enum[dropped_change,
 reintroduced_conflict, call_site_mismatch, semantic_regression,
 incomplete_resolution], concrete_scenario (string), location (string),
-why_broken (string)}` — non-empty ⇒ gate), `rationale` (string). Given the
+why_broken (string)}` — non-empty ⇒ gate), `rationale` (string). Each
+`defects` item also carries an **optional** `coverage_elsewhere`
+(`{searched (boolean), file (string), assertion (string)}`) — asked for by
+the prompt, deliberately **not** in the item's `required` list (DESIGN §8
+*Location is not coverage*; requiring a judge field has three times produced
+a worker emitting no schema-valid output at all, and a gate that never runs
+catches nothing). A
+`dropped_change` whose `coverage_elsewhere` names a file that **exists in
+the merged tree** plus a non-blank `assertion` is downgraded to advisory —
+logged, not gating. Absence, a blank field, or a named file absent from
+the tree all gate exactly as before; absence is the conservative
+direction. Blankness and file existence are checked in
+`_coverage_citation_clears`, not by the schema: neither string carries a
+`minLength`, because a `minLength` on an *optional* property breaks the
+`--dangerously-force-strict-output` invariant that forcing a field must
+never make a trivial value illegal. A hallucinated path therefore cannot
+buy a downgrade, and the strict-output grammar stays satisfiable. Given the
 merged result plus both parent diffs and the conflicting subtasks' intents,
 it attacks the merge for behavioral breakage the mechanical conflict-marker
 scan and `check_merge_committed` cannot see — a syntactically clean merge

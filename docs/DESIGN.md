@@ -5583,6 +5583,32 @@ verify "the plan misses work X" without reading prose.
   through the same way a planner can add a subtask, so this gate is
   **detect-and-die, single pass**, mirroring `wiring_judge` /
   `provision_judge`.
+
+  **Location is not coverage.** A merge that drops a *duplicate* is textually
+  indistinguishable from one that drops the only copy — both remove content
+  present in a parent — so reasoning from the parent diffs alone cannot tell
+  them apart. Measured: this gate killed a run at wave 3 with 28 subtasks
+  complete and two waves integrated, over a dropped `describe` block whose
+  assertions were a strict *subset* of a separate test file written 4h45m
+  earlier. The textual claim was true and the behavioral claim was false.
+  `dropped_change` is 10 of the 14 findings this gate has ever emitted, and it
+  has no bypass flag, so this is the failure mode with the most exposure.
+
+  A `dropped_change` is therefore only behavioral if the behavior is absent
+  from the **merged tree**, not merely from the side the merge chose. The judge
+  already holds inspection tools, so it is asked to search the merged tree for
+  equivalent coverage and cite it concretely (file + assertion). A defect
+  carrying a specific citation is advisory; one without still gates. This is
+  the same correction applied to the on-HEAD satisfied-probe — judge by
+  *coverage*, not by *location*.
+
+  The citation is **asked for and never required**. Requiring a field on a
+  judge's schema has three times in this codebase produced a worker that emits
+  no schema-valid output at all, and a gate that never runs catches nothing
+  (§8 *Findings carry a severity* — the default is gating). Absence therefore
+  gates: the exception narrows this gate only when the judge does the extra
+  work and shows it, which keeps the failure direction conservative on the one
+  gate that has no operator bypass.
 - **`plan_overlap_judge`'s own `judgment` self-score is dropped, with no new
   independent verifier.** This worker is already the independent adversarial
   check for cross-planner surface collisions — layering a second judge on

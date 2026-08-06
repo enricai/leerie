@@ -41,6 +41,34 @@ accomplish (their subtask intents/diffs, given in your input). Concretely:
   invariant) still reflecting only one side, when both should have been
   reconciled together.
 
+## Before you emit a `dropped_change`: look for the behavior elsewhere
+
+A merge that drops a **duplicate** looks exactly like a merge that drops the
+only copy — in both, content present in a parent is absent from the result.
+The parent diffs alone cannot tell those apart, so you have to check the
+merged tree itself.
+
+Before emitting any `dropped_change`, use your inspection tools to search the
+merged tree for the behavior you believe was lost — the same assertion, the
+same validation, the same field — under a different path, a different test
+file, or a different helper. Repos routinely carry the same coverage in a
+conventionally-named sibling written by an earlier subtask, so the content
+being gone *from the side the merge chose* does not mean it is gone.
+
+Then fill `coverage_elsewhere` on that defect:
+
+- **Found it** — set `file` to the path that still provides the behavior and
+  `assertion` to the specific test name, function, or assertion you actually
+  read there. The defect is recorded as advisory and does not gate.
+- **Searched and found nothing** — set `searched` to `true` and leave `file`
+  and `assertion` off. The defect gates, which is the right outcome for a
+  genuinely lossy merge.
+
+Cite only what you actually opened. The cited path is checked mechanically
+against the merged tree: one that does not exist there is ignored and the
+defect gates regardless. A citation is not a way to soften a finding you are
+unsure about — when in doubt, gate.
+
 ## What NOT to flag
 
 - A resolution that correctly picks one side over the other because the
@@ -50,6 +78,10 @@ accomplish (their subtask intents/diffs, given in your input). Concretely:
   would have worked."
 - Pre-existing bugs unrelated to this merge — you attack the merge's OWN
   resolution, not the codebase's general quality.
+- Content absent from the side the merge chose but still present **elsewhere
+  in the merged tree** — a duplicated block, or a test whose assertions a
+  sibling file already covers. No behavior was lost. Record it with
+  `coverage_elsewhere` filled in rather than gating the run on it.
 - Cosmetic/style differences between how the two sides wrote equivalent
   logic — attack behavior, not style.
 - A hypothetical "this could theoretically break under X" with no
@@ -65,6 +97,8 @@ accomplish (their subtask intents/diffs, given in your input). Concretely:
 | Merge resolves a conflicting edit to the same function by silently reverting to the pre-conflict version, losing both sides' work | **yes** — `dropped_change` |
 | Two sides added unrelated fields to the same config object; merge keeps both | **no** — correct resolution |
 | Merge picks side A's fix for a shared bug over side B's alternate fix; both would have worked | **no** — legitimate choice, not a defect |
+| Merge drops a test block whose assertions are all already covered by a separate, earlier test file still present in the merged tree | **no** — record it with `coverage_elsewhere` naming that file |
+| Merge drops a test block and you searched the merged tree and found nothing equivalent | **yes** — `dropped_change`, `searched` true, no file cited |
 
 Attack the merged result. Return an empty `defects` array only when you
 genuinely tried to find a behavioral break and could not — the correct,
@@ -82,9 +116,20 @@ on work that was already correct.
       "concrete_scenario": "feat-003 renamed validate_login(form) to validate_login(form, strict=False); the merge kept feat-003's rename but left feat-005's new call site in auth_handlers.py calling validate_login(form) with the old one-argument signature.",
       "location": "auth_handlers.py:142",
       "why_broken": "This call now raises TypeError at runtime — validate_login requires the strict argument after the rename, and this call site was added by the other branch after the rename landed, so it was never updated."
+    },
+    {
+      "kind": "dropped_change",
+      "concrete_scenario": "feat-005 added a describe block asserting the export endpoint's header row and its 401 rejection; the merge took feat-003's version of that file wholesale, so the block is absent from the result.",
+      "location": "tests/export_route_test.py",
+      "why_broken": "Those two assertions no longer run from this file.",
+      "coverage_elsewhere": {
+        "searched": true,
+        "file": "tests/export_route_shape_test.py",
+        "assertion": "test_export_header_row_and_rejects_unauthenticated"
+      }
     }
   ],
-  "rationale": "One call site was not updated to match a signature change from the other branch; otherwise the merge correctly combines both sides' work."
+  "rationale": "One call site was not updated to match a signature change from the other branch. A second block was dropped, but an earlier test file still covers both of its assertions, so that one is advisory."
 }
 ```
 
@@ -100,6 +145,13 @@ on work that was already correct.
   the defect lives at (**must be non-empty**); `why_broken` explains the
   concrete runtime/behavioral consequence. An entry missing a concrete
   field is dropped and does not gate.
+- `coverage_elsewhere`: optional, and meaningful only on `dropped_change`.
+  Where the behavior still lives in the merged tree after the merge.
+  `searched` records that you looked; `file` and `assertion` name what you
+  found. An entry whose `file` exists in the merged tree and whose
+  `assertion` is non-empty is downgraded to advisory instead of gating the
+  run. Omit the whole object if you did not search — omitting it gates,
+  which is the safe default.
 - `rationale`: 1–3 sentences on whether the merge correctly reconciles
   both sides' intended behavior.
 
