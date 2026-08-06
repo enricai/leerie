@@ -998,32 +998,54 @@ depending on which the defect is about. Three shapes are therefore repairable:
 In every case the resulting graph must still be acyclic — trialled against a copy
 before it is applied, using the same cycle definition as every other site.
 
-**Survivors are re-checked against the post-repair graph.** Each channel above
-asks a *channel-local* question — the id arm asks whether the named id is already
-in `depends_on`, the tag arm whether the named tag is already in `requires` —
-and neither asks the one that decides whether the defect is still real: *is this
-subtask already ordered behind a provider of that capability by any means?* The
-judge routinely emits several defects for one subtask, so one defect's repair can
-render another's stated failure impossible. Run `05fdffb8` died exactly there:
+**The residual is re-checked against the ordering the plan actually has.** The
+already-declared guard above is *channel-local* — the id arm asks whether the
+named id is in `depends_on`, the tag arm whether the named tag is in `requires` —
+and, decisively, it sits **downstream of channel selection**. A defect matching no
+channel takes the `else` arm straight to the residual, so the guard is never
+reached on the one path that reaches the `die()`. It existed and was structurally
+dead exactly where it mattered.
+
+Run `05fdffb8` died there, and the finding was false on the plan as written:
 
 ```
-wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (named subtask id)
 • WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
 ```
 
-The id-channel defect added the edge; the tag-channel defect for the same subtask
-named a tag with two rival providers, matched no channel, and fell through to the
-residual. Its stated failure — *"the scheduler can start `test-003` before
-`feat-007-2-2`"* — was already impossible by the time the gate read it. **leerie
-repaired the problem and then died on it**, discarding the whole planning spend on
-a gate with no bypass flag.
+`test-003` **already declared `requires: action-echoed-row-payload`** — the very
+tag reported missing. Requiring an in-plan tag orders a subtask behind *every*
+provider of it, so the judge's stated failure ("the scheduler can start
+`test-003` before `feat-007-2-2`") could not occur. But the tag had two providers
+in different clusters, no channel matched, and the plan died with the whole
+planning spend on a gate with no bypass flag.
 
-So a second pass runs once every repair has been applied, and drops any residual
-defect whose subtask now has a `depends_on` edge to some provider of the named
-capability. It cannot be a pre-filter: the judge's emission order is arbitrary, so
-the tag defect may be evaluated before the id defect lands its edge. Each dismissal
-is logged with the edge responsible, so a judge degrading over time stays visible
-rather than being silently absorbed.
+So after the repair loop, any residual defect whose subtask is already ordered
+behind **every** producer of the named capability is dropped. Three properties are
+load-bearing:
+
+- **Ordering is resolved through `_build_predecessor_graph`**, not read off
+  `depends_on`, for the same reason the cycle trials route through it: so
+  "ordered behind" cannot drift from what the scheduler does. Ordering also comes
+  from `requires` entries with `extent: in_plan`, and across the repair corpus 99
+  of 535 direct orderings (19%) exist *only* through that channel.
+- **Every producer, never any one.** A capability with two producers where the
+  subtask precedes only the first is precisely the judge's complaint about the
+  second; dismissing on a non-empty intersection would wave through the race this
+  gate exists to catch — strictly worse than the over-gating being fixed. The
+  producer set is required non-empty, since the empty set is vacuously a subset
+  and would dismiss every defect naming a capability nothing provides, which is
+  the canonical *true* finding.
+- **Direct edges only, not the transitive closure.** A further 127 corpus
+  orderings hold only transitively. Those would refute the finding just as
+  soundly, but dismissing on them is a much broader claim to make on a die-only
+  gate, so the check stays 1:1 with the graph's own edge definition.
+
+It runs after the repairs rather than before them because a defect can be mooted
+by an edge a *sibling* defect's repair added, and the judge's emission order is
+arbitrary. (The real run above did not need that — it was refutable as written —
+but the ordering is cheap and strictly more powerful.) Each dismissal is logged
+naming the responsible edges, so a judge degrading over time stays visible rather
+than being silently absorbed.
 
 Anything else is refused and the gate dies as before: a value that is neither a
 subtask id nor a provided tag means the plan genuinely lacks the capability rather

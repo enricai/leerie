@@ -20370,6 +20370,96 @@ def _filter_provably_false_wiring_defects(
     return kept, notes
 
 
+def _filter_defects_already_ordered(
+    plans: list[dict], defects: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """Drop `wiring_judge` findings the *repaired* graph already refutes.
+
+    Returns ``(surviving_defects, notes)`` — the post-repair sibling of
+    `_filter_provably_false_wiring_defects`, which runs the same discipline
+    against the plan as the judge saw it. This one has to run afterwards,
+    because what refutes the finding is an edge the repair itself added.
+
+    A `missing_requires` defect asserts one thing: the scheduler can start
+    `sid` before the subtask that produces `tag_or_dep`. If `sid` is already
+    ordered behind EVERY producer of it, the assertion is false whatever the
+    declaration looks like, so the defect must not reach the `die()`.
+
+    "Every", not "any" — a capability with two producers where `sid` precedes
+    only one of them is precisely the judge's complaint about the other, so
+    dismissing on a non-empty intersection would wave through the race this
+    gate exists to catch.
+
+    The judge routinely emits several defects for one subtask, so one
+    defect's repair can moot another's. Run `05fdffb8` (navegando) died on
+    exactly that, having done the repair itself:
+
+        wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (id)
+        • WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
+
+    The id-channel defect added the edge; the tag-channel defect for the same
+    subtask named a tag with two rival providers, matched no repair channel,
+    and fell through to the residual — by which point its stated failure was
+    impossible. ~97 workers of planning spend, on a gate with no bypass flag.
+
+    Ordering is resolved through `_build_predecessor_graph` rather than read
+    off `depends_on` directly, for the same reason `_would_cycle_after` routes
+    its cycle test through it: so "ordered behind" cannot drift from what the
+    scheduler actually does. That is load-bearing, not tidiness — ordering
+    also comes from `requires` entries with `extent: in_plan`, and across the
+    repair corpus **99 of 535 direct orderings (19%) exist only through that
+    channel**. A `depends_on`-only test would keep killing runs whose ordering
+    came through tags, which is the very class of bug this function exists to
+    stop.
+
+    Deliberately DIRECT edges only, never the transitive closure: a further
+    127 corpus orderings hold only transitively, and while those would refute
+    the finding just as soundly, dismissing on them is a much broader claim to
+    make on a gate whose only outcome is death. Staying at the direct-edge
+    definition keeps this check 1:1 with `_build_predecessor_graph`'s own.
+    """
+    if not defects:
+        return defects, []
+
+    subtasks = {
+        s["id"]: s for p in plans for s in (p.get("subtasks") or [])
+        if isinstance(s, dict) and s.get("id")
+    }
+    preds, providers, edge_sources = _build_predecessor_graph(subtasks)
+
+    surviving: list[dict] = []
+    notes: list[str] = []
+    for d in defects:
+        sid = d.get("sid")
+        tag = (d.get("tag_or_dep") or "").strip()
+        # `tag_or_dep` names a capability tag on one channel and a subtask id
+        # on the other (the field is literal and the judge fills it with
+        # either), so resolve both — the assertion being refuted is identical.
+        producers = set(providers.get(tag, []))
+        if tag in subtasks:
+            producers.add(tag)
+        producers.discard(sid)          # a subtask cannot order behind itself
+        # EVERY producer must already precede `sid`, not merely one of them.
+        # A capability with two producers where `sid` is ordered behind only
+        # the first is exactly the judge's complaint about the second, so
+        # dismissing on `&` would be a false dismissal — the run proceeds with
+        # the race the gate exists to catch. `producers` is checked non-empty
+        # because the empty set is vacuously a subset, which would dismiss
+        # every defect naming a capability nothing provides — the canonical
+        # TRUE finding.
+        pred_set = preds.get(sid, set())
+        if producers and producers <= pred_set:
+            notes.append(
+                f"{sid} / {tag} (already ordered behind "
+                + ", ".join(
+                    f"{p} via {edge_sources.get((p, sid), 'depends_on')}"
+                    for p in sorted(producers))
+                + ")")
+            continue
+        surviving.append(d)
+    return surviving, notes
+
+
 def _repair_missing_requires(
     plans: list[dict], defects: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -20509,55 +20599,13 @@ def _repair_missing_requires(
         apply_fn(plans)
         repairs.append({"sid": sid, "tag": tag, "provider": provider,
                         "channel": channel})
-    # Second pass: re-check the survivors against the POST-repair graph.
-    #
-    # The per-defect checks above are CHANNEL-LOCAL — the id arm asks
-    # `tag in depends_on` (where `tag_or_dep` is itself a sid) and the tag arm
-    # asks `tag in declared` (i.e. in `requires`). Neither asks the question
-    # that actually matters: "is `sid` already ordered behind a provider of
-    # `tag` by ANY means?"
-    #
-    # That gap is reachable because the judge routinely emits several defects
-    # for one subtask — measured on run 05fdffb8 (navegando), which died here:
-    #
-    #   wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (id)
-    #   • WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
-    #
-    # The id-channel defect repaired and added the edge; the tag-channel defect
-    # for the SAME subtask named a tag with two providers, matched no channel,
-    # and fell through to `unrepaired`. By then its stated failure — "the
-    # scheduler can start test-003 before feat-007-2-2" — was already
-    # impossible. leerie repaired the problem and then died on it, discarding
-    # ~97 workers of planning spend on a gate with no bypass flag.
-    #
-    # Emission order is arbitrary, so this cannot be a pre-filter: the tag
-    # defect may be evaluated before the id defect lands its edge. It has to
-    # run after every repair has been applied.
+    # The per-defect checks above are channel-LOCAL, so a defect can survive
+    # them and still be moot by the time the loop ends. Re-check the residual
+    # against the POST-repair graph before letting any of it reach the die().
     if unrepaired:
-        by_id_post = {
-            s["id"]: s for p in plans for s in (p.get("subtasks") or [])
-            if isinstance(s, dict) and s.get("id")
-        }
-        provides_post: dict[str, set[str]] = {}
-        for _sid, _s in by_id_post.items():
-            for _t in _s.get("provides", []) or []:
-                provides_post.setdefault(_t, set()).add(_sid)
-        _still_broken = []
-        for d in unrepaired:
-            _sid = d.get("sid")
-            _tag = (d.get("tag_or_dep") or "").strip()
-            _s = by_id_post.get(_sid)
-            _ordered = (
-                set(_s.get("depends_on") or []) & provides_post.get(_tag, set())
-                if _s else set()
-            )
-            if _ordered:
-                already.append(
-                    f"{_sid} / {_tag} (already ordered behind "
-                    f"{sorted(_ordered)[0]} via depends_on)")
-                continue
-            _still_broken.append(d)
-        unrepaired = _still_broken
+        unrepaired, ordered_notes = _filter_defects_already_ordered(
+            plans, unrepaired)
+        already.extend(ordered_notes)
     if already:
         log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
             f"subtask already declares — ignored ({', '.join(already)})")

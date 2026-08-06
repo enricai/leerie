@@ -543,47 +543,113 @@ def _plan(subtasks: list[dict]) -> list[dict]:
 class TestSurvivorsRecheckedAfterRepairs:
     """Regression lock for the run-05fdffb8 shape."""
 
-    def test_tag_defect_dismissed_once_an_id_repair_orders_the_subtask(
-            self, leerie):
-        """THE REGRESSION. Two defects, one subtask: the id one repairs and the
-        tag one must then be recognised as moot."""
+    def test_the_run_05fdffb8_shape_is_dismissed(self, leerie):
+        """THE REGRESSION, reproduced from the real run's `plan_snapshot`.
+
+        `test-003` DID declare `requires: action-echoed-row-payload` — the
+        very tag the judge reported it as missing. Requiring an in-plan tag
+        orders a subtask behind EVERY provider of it, so the judge's stated
+        failure ("the scheduler can start test-003 before feat-007-2-2")
+        was false on the plan as written.
+
+        It died anyway because the existing already-declared guard sits
+        DOWNSTREAM of channel selection: two providers spanning clusters
+        match no channel, so the `else: unrepaired; continue` arm fires and
+        `tag in declared` — computed three lines earlier — is never reached.
+        The guard existed and was structurally dead on the one path that
+        reaches the `die()`.
+        """
         plans = _plan([
             {"id": "feat-007-2-2", "provides": ["action-echoed-row-payload"],
              "requires": [], "depends_on": []},
             {"id": "bugfix-010", "provides": ["action-echoed-row-payload"],
              "requires": [], "depends_on": []},
-            {"id": "test-003", "provides": [], "requires": [], "depends_on": []},
+            {"id": "test-003", "provides": [],
+             "requires": [{"tag": "action-echoed-row-payload",
+                           "extent": "in_plan", "reason": ""}],
+             "depends_on": []},
         ])
-        defects = [
-            {"kind": "missing_requires", "sid": "test-003",
-             "tag_or_dep": "feat-007-2-2", "concrete_reason": "id channel"},
-            {"kind": "missing_requires", "sid": "test-003",
-             "tag_or_dep": "action-echoed-row-payload",
-             "concrete_reason": "tag channel, two providers"},
-        ]
-        repairs, unrepaired = leerie._repair_missing_requires(plans, defects)
-        assert [r["sid"] for r in repairs] == ["test-003"]
+        defects = [{"kind": "missing_requires", "sid": "test-003",
+                    "tag_or_dep": "action-echoed-row-payload",
+                    "concrete_reason": "two providers, no channel matches"}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
         assert unrepaired == [], (
-            "the tag-channel defect is moot once depends_on orders test-003 "
-            f"behind a provider; still reported: {unrepaired}")
+            "test-003 requires the tag, which orders it behind BOTH "
+            f"providers; still reported: {unrepaired}")
 
-    def test_order_independent(self, leerie):
-        """Judge emission order is arbitrary — the tag defect may come first."""
+    def test_ordered_via_an_in_plan_requires_tag_is_also_dismissed(
+            self, leerie):
+        """Ordering comes from BOTH channels, not just `depends_on`.
+
+        `_build_predecessor_graph` makes every provider of an
+        `extent: in_plan` requires-tag a predecessor. Across the repair
+        corpus, 99 of 535 direct orderings (19%) exist ONLY through that
+        channel — so a `depends_on`-only re-check goes on killing runs whose
+        ordering came through tags, which is the very class of bug the
+        re-check exists to stop.
+        """
+        plans = _plan([
+            # both producers of `shared-tag` also provide `schema-v2`
+            {"id": "p1", "provides": ["shared-tag", "schema-v2"],
+             "requires": [], "depends_on": []},
+            {"id": "p2", "provides": ["shared-tag", "schema-v2"],
+             "requires": [], "depends_on": []},
+            # ordered behind BOTH by TAG, with no depends_on anywhere.
+            {"id": "t", "provides": [],
+             "requires": [{"tag": "schema-v2", "extent": "in_plan",
+                           "reason": ""}],
+             "depends_on": []},
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "shared-tag", "concrete_reason": ""}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert unrepaired == [], (
+            "t is already scheduled after p1 and p2 via requires:schema-v2, "
+            "so the defect's stated failure cannot occur; still reported: "
+            f"{unrepaired}")
+
+    def _two_repairs_then_a_survivor(self):
+        """A shape whose survivor is refutable ONLY after both repairs land.
+
+        `shared-tag` has two providers in different clusters, so its defect
+        matches no repair channel. Two id-channel defects each add one
+        `depends_on`; only once BOTH have landed is `t` ordered behind every
+        provider. This is what makes the re-check a second pass rather than a
+        pre-filter — unlike the real run-05fdffb8 shape, which was already
+        refutable on the plan as written.
+        """
         base = [
-            {"id": "p1", "provides": ["shared-tag"], "requires": [], "depends_on": []},
-            {"id": "p2", "provides": ["shared-tag"], "requires": [], "depends_on": []},
+            {"id": "p1", "provides": ["shared-tag"], "requires": [],
+             "depends_on": []},
+            {"id": "p2", "provides": ["shared-tag"], "requires": [],
+             "depends_on": []},
             {"id": "t", "provides": [], "requires": [], "depends_on": []},
         ]
-        tag_first = [
-            {"kind": "missing_requires", "sid": "t", "tag_or_dep": "shared-tag",
-             "concrete_reason": ""},
-            {"kind": "missing_requires", "sid": "t", "tag_or_dep": "p1",
-             "concrete_reason": ""},
-        ]
-        _, unrepaired = leerie._repair_missing_requires(_plan(base), tag_first)
+        survivor = {"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "shared-tag", "concrete_reason": ""}
+        repairs = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": p, "concrete_reason": ""} for p in
+                   ("p1", "p2")]
+        return base, survivor, repairs
+
+    def test_survivor_is_dismissed_once_both_repairs_land(self, leerie):
+        base, survivor, repairs = self._two_repairs_then_a_survivor()
+        _, unrepaired = leerie._repair_missing_requires(
+            _plan(base), repairs + [survivor])
+        assert unrepaired == []
+
+    def test_order_independent(self, leerie):
+        """Judge emission order is arbitrary — the survivor may come FIRST.
+
+        A pre-filter would see `t` with no edges at all and keep the defect,
+        killing the run. Only a post-repair pass can dismiss it.
+        """
+        base, survivor, repairs = self._two_repairs_then_a_survivor()
+        _, unrepaired = leerie._repair_missing_requires(
+            _plan(base), [survivor] + repairs)
         assert unrepaired == [], (
-            "must hold regardless of emission order — this is why the check "
-            "cannot be a pre-filter")
+            "the survivor was emitted before the repairs that moot it — this "
+            "is precisely why the re-check cannot be a pre-filter")
 
 
 class TestItStillGatesGenuineDefects:
@@ -626,6 +692,95 @@ class TestItStillGatesGenuineDefects:
             "depends_on=['unrelated'] does not order t behind a provider of "
             "cap-y, so the defect is still live")
 
+    def test_ordered_behind_only_SOME_producers_still_gates(self, leerie):
+        """The soundness control: "every producer", never "any producer".
+
+        A capability with two producers, where the subtask precedes only the
+        first, is exactly the judge's complaint about the second — `t` can
+        still start before `p2`. Dismissing on a non-empty intersection would
+        wave through the race the gate exists to catch, which is strictly
+        worse than the over-gating this whole re-check was written to fix.
+        """
+        plans = _plan([
+            {"id": "p1", "provides": ["cap"], "requires": [], "depends_on": []},
+            {"id": "p2", "provides": ["cap"], "requires": [], "depends_on": []},
+            {"id": "t", "provides": [], "requires": [], "depends_on": ["p1"]},
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "cap", "concrete_reason": ""}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"], (
+            "t precedes p1 but NOT p2, so the race against p2 is real")
+
+    def test_a_capability_nothing_provides_still_gates(self, leerie):
+        """The empty-set guard.
+
+        `set() <= anything` is vacuously True, so an unguarded subset test
+        would dismiss every defect naming a capability no subtask provides —
+        the canonical TRUE finding (the plan lacks the work, not the edge).
+        """
+        plans = _plan([
+            {"id": "a", "provides": ["other"], "requires": [],
+             "depends_on": []},
+            {"id": "t", "provides": [], "requires": [], "depends_on": ["a"]},
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "nobody-provides-this",
+                    "concrete_reason": ""}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"]
+
+    def test_requires_with_a_NON_in_plan_extent_still_gates(self, leerie):
+        """The sharp control on the requires channel.
+
+        `_build_predecessor_graph` skips any `requires` entry whose `extent`
+        is not `in_plan` — an `external` entry is out-of-graph by planner
+        declaration and creates NO edge, so it cannot refute the finding.
+        This is the case that separates "resolved ordering through the real
+        helper" from "loosely scanned the requires array": the shape is
+        byte-identical to the dismissed test above but for `extent`.
+        """
+        plans = _plan([
+            {"id": "p1", "provides": ["shared-tag", "schema-v2"],
+             "requires": [], "depends_on": []},
+            {"id": "p2", "provides": ["shared-tag"], "requires": [],
+             "depends_on": []},
+            {"id": "t", "provides": [],
+             "requires": [{"tag": "schema-v2", "extent": "external",
+                           "reason": ""}],
+             "depends_on": []},
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "shared-tag", "concrete_reason": ""}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"], (
+            "an external requires entry creates no scheduling edge, so t is "
+            "NOT ordered behind p1 and the defect is still live")
+
+    def test_ordering_that_holds_only_TRANSITIVELY_still_gates(self, leerie):
+        """Pins the deliberate direct-edges-only scope (not an accident).
+
+        A transitive ancestor would refute the finding just as soundly, but
+        dismissing on it is a much broader claim to make on a die-only gate,
+        so the check stays 1:1 with `_build_predecessor_graph`'s own direct
+        edge definition. Change that decision and this test should be
+        updated deliberately, not silently.
+        """
+        plans = _plan([
+            {"id": "producer", "provides": ["cap-x"], "requires": [],
+             "depends_on": []},
+            {"id": "other", "provides": ["cap-x"], "requires": [],
+             "depends_on": []},
+            {"id": "middle", "provides": [], "requires": [],
+             "depends_on": ["producer"]},
+            {"id": "t", "provides": [], "requires": [],
+             "depends_on": ["middle"]},   # after producer, but only via middle
+        ])
+        defects = [{"kind": "missing_requires", "sid": "t",
+                    "tag_or_dep": "cap-x", "concrete_reason": ""}]
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert [u["sid"] for u in unrepaired] == ["t"]
+
     def test_unknown_sid_fails_closed(self, leerie):
         plans = _plan([{"id": "a", "provides": ["cap"], "requires": [],
                         "depends_on": []}])
@@ -640,13 +795,20 @@ class TestDismissalIsVisible:
 
     def test_the_recheck_logs_which_edge_made_it_moot(self, leerie, capsys):
         plans = _plan([
-            {"id": "p1", "provides": ["shared"], "requires": [], "depends_on": []},
-            {"id": "p2", "provides": ["shared"], "requires": [], "depends_on": []},
-            {"id": "t", "provides": [], "requires": [], "depends_on": ["p1"]},
+            {"id": "p1", "provides": ["shared"], "requires": [],
+             "depends_on": []},
+            {"id": "p2", "provides": ["shared"], "requires": [],
+             "depends_on": []},
+            {"id": "t", "provides": [], "requires": [],
+             "depends_on": ["p1", "p2"]},
         ])
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "shared", "concrete_reason": ""}]
-        leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        assert unrepaired == []
         out = capsys.readouterr().out + capsys.readouterr().err
-        assert "already ordered behind" in out or "already declares" in out, (
-            "the dismissal must be logged, naming the edge responsible")
+        assert "already ordered behind" in out, (
+            "the dismissal must be logged, naming the edges responsible")
+        # every producer that justified the dismissal is named, not just one —
+        # a one-name log would hide which edge is load-bearing on review.
+        assert "p1" in out and "p2" in out

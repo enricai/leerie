@@ -2460,7 +2460,43 @@ cluster repairs; the id channel declines a self-reference and respects the
 same cycle guard; the tag channel wins when a value is both a tag and an id; a
 non-`missing_requires` kind, an unknown sid, an empty `tag_or_dep`, and a
 self-provider all decline; an already-declared edge is neither repaired nor
-gating (on both channels). The cycle
+gating (on both channels).
+
+**The already-declared guard is channel-local AND sits downstream of channel
+selection**, so a defect matching no channel takes the `else: unrepaired;
+continue` arm and never reaches `tag in declared` — the guard is structurally
+dead on the only path that reaches the `die()`. Run `05fdffb8…` (navegando)
+died there on a finding that was false as written: `test-003` already declared
+`requires: action-echoed-row-payload`, the very tag reported missing, which
+orders it behind *every* provider — but the tag's two providers spanned
+clusters, so no channel matched and the whole planning spend was lost on a gate
+with no bypass flag. `_filter_defects_already_ordered(plans, defects) ->
+(surviving, notes)` re-checks the residual after the repair loop (same return
+shape as its pre-repair sibling `_filter_provably_false_wiring_defects`; notes
+route into the existing `already` log line). Three properties are load-bearing
+and each has its own killing test. **(a)** Ordering resolves through
+`_build_predecessor_graph`, not `depends_on` — the same reason
+`_would_cycle_after` routes through it — because `requires` entries with
+`extent: in_plan` create edges too and **99 of 535 direct corpus orderings (19%)
+exist only through that channel**; `test_ordered_via_an_in_plan_requires_tag_is_also_dismissed`
+fails against a `depends_on`-only check, and
+`test_requires_with_a_NON_in_plan_extent_still_gates` is the sharp control
+separating "used the real helper" from "loosely scanned the requires array".
+**(b)** *Every* producer must precede the sid, never any one:
+`test_ordered_behind_only_SOME_producers_still_gates` — dismissing on `&` waves
+through the exact race the gate exists to catch, strictly worse than the
+over-gating being fixed — plus `test_a_capability_nothing_provides_still_gates`,
+since `set() <= anything` is vacuously True and an unguarded subset test
+dismisses the canonical TRUE finding (that mutation kills 7 tests, 5 of them
+pre-existing). **(c)** Direct edges only, never the transitive closure (a
+further 127 corpus orderings hold only transitively):
+`test_ordering_that_holds_only_TRANSITIVELY_still_gates` pins the scope as a
+decision, not an accident. The pass runs after the repairs rather than before
+because a residual can also be mooted by an edge a *sibling* defect's repair
+added and emission order is arbitrary — `test_order_independent` emits the
+survivor FIRST, which a pre-filter cannot dismiss. Provably inert on the pinned
+corpus (0 unrepaired defects across all 6 runs, so
+`test_wiring_repair_corpus.py`'s counts cannot move). The cycle
 guard has its own group because it is load-bearing rather than defensive — a
 well-formed but WRONG edge was measured closing a cycle across an entire plan,
 so `test_plan_still_schedules_after_a_skipped_cycle` asserts both that the
