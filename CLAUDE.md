@@ -2711,6 +2711,61 @@ walks the AST of `_run_phases`, because the obvious
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+The `--dangerously-force-strict-output` context-window regression (DESIGN §7
+*Forcing constrained decoding*, §6 *A client-side context refusal*) is covered
+by three files. The defect: the flag works by owning `ANTHROPIC_BASE_URL`, and
+the CLI treats any custom base URL as an **LLM gateway** — behind which it can
+no longer confirm the answering model and falls back to a conservative
+client-side context ceiling instead of Sonnet 5's native 1M. It then refuses
+prompts *itself* at ~224K, emitting a synthetic assistant message
+(`model=<synthetic>`, usage all zeros) with **no API call**.
+`tests/test_strict_proxy_context_window.py` pins `_model_arg`: `sonnet`/`opus`
+gain the `[1m]` suffix only while `_STRICT_PROXY` is active, `haiku` never does
+(it has no 1M variant and the CLI rejects the suffix), a full model id passes
+through untouched, the suffix is not doubled, `_ONE_M_CONTEXT_MODELS` is a
+subset of `MODEL_VALUES` (a typo there would silently disable the fix rather
+than fail), and — the wiring pin — `claude_p`'s source builds `--model` via
+`_model_arg(model)` and no longer contains a bare `"--model", model,`. The
+suffix is applied automatically and is deliberately **not** admitted to
+`MODEL_VALUES`: it is inert whenever the proxy is off, so an operator gains
+nothing by setting it by hand and could set it on `haiku`, where it breaks.
+`tests/test_context_overflow_classifier.py` pins `_is_context_overflow` and
+`ContextOverflow` against verbatim `result` envelopes from that probe. Both
+signals are required — `terminal_reason == "blocking_limit"` **and** the result
+text — because the reason alone is shared (sibling arms ended `max_turns`, a
+healthy run `completed`) and the text alone can appear in a worker's own
+correct output; `subtype` is a misleading `"success"` and must never be keyed
+on, the same trap `_is_transient_transport_failure` documents. Gated on
+`is_error` and exempting `_leerie_synthetic`, mirroring
+`_is_terminal_auth_failure`, plus disjointness pins against both auth
+classifiers. `ContextOverflow` subclasses `BaseException` and explicitly **not**
+`WorkerError` — `_run_checked_loop` retries WorkerError across its whole round
+budget, which for a deterministic client-side refusal is pure waste — and
+source-coupling guards require `claude_p` to raise before the generic
+two-attempt failure and `main()` to route it to a resumable `EXIT_LOCKED` pause
+whose message never says "schema". That message is the point: unclassified,
+this surfaced as *"worker failed schema-valid output twice: Prompt is too
+long,"* which cost three successive misdiagnoses on 2026-08-06. When extracting
+the handler arm in a test, split on `"\n    except "` (a top-level handler), not
+a bare `"except "` — the latter truncates at the inner `except Exception:`
+guarding the cleanup call and hides the `exit_code` assignment after it.
+`tests/test_task_file_globbing.py` covers the independent `_glob_task_references`
+defect the same incident surfaced but which did **not** cause it (the failing
+run's very first request was already over the ceiling, before the planner read
+anything): markdown emphasis is stripped before glob classification, since `*`
+is a `_GLOB_CHARS` member and `glob("*")` matches every file in the repo root —
+measured, that handed the planner 18 files / 1.86 MB as required reading,
+including `LICENSE`, `.claude.json` and a prior run's 847 KB log. Pinned: prose
+(`*`, `**`, `**Root**`, `_em_`, backticks) resolves nothing; genuine references
+(`spec.md`, `tests/*.py`, `docs/DESIGN.md`, `spec.{md,txt}`, and a path wrapped
+in bold) still resolve; absolute paths and `../` traversal resolve nothing —
+admitting separator-bearing tokens without that guard reached **outside the
+repo** (`repo_root / "/bin/sh"` discards the root, so a task mentioning
+`/bin/bash` matched a 1.4 MB binary), which is why containment is re-checked
+against `repo_root.resolve()` independently of the token-level test; and a task
+file never lists itself, while a same-named file with *different* contents
+still does. Falsification is recorded: replaying the pre-fix token filter
+against the prose-only fixture matches 4 files where the test expects none.
 The two read-mostly verbs that still assumed a two-runtime world —
 `accept-blocked` (validated `--runtime` against only `fly`/`local` and
 defaulted anything non-fly to `local`, silently mislabeling an EC2 run)
