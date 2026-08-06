@@ -20509,6 +20509,55 @@ def _repair_missing_requires(
         apply_fn(plans)
         repairs.append({"sid": sid, "tag": tag, "provider": provider,
                         "channel": channel})
+    # Second pass: re-check the survivors against the POST-repair graph.
+    #
+    # The per-defect checks above are CHANNEL-LOCAL — the id arm asks
+    # `tag in depends_on` (where `tag_or_dep` is itself a sid) and the tag arm
+    # asks `tag in declared` (i.e. in `requires`). Neither asks the question
+    # that actually matters: "is `sid` already ordered behind a provider of
+    # `tag` by ANY means?"
+    #
+    # That gap is reachable because the judge routinely emits several defects
+    # for one subtask — measured on run 05fdffb8 (navegando), which died here:
+    #
+    #   wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (id)
+    #   • WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
+    #
+    # The id-channel defect repaired and added the edge; the tag-channel defect
+    # for the SAME subtask named a tag with two providers, matched no channel,
+    # and fell through to `unrepaired`. By then its stated failure — "the
+    # scheduler can start test-003 before feat-007-2-2" — was already
+    # impossible. leerie repaired the problem and then died on it, discarding
+    # ~97 workers of planning spend on a gate with no bypass flag.
+    #
+    # Emission order is arbitrary, so this cannot be a pre-filter: the tag
+    # defect may be evaluated before the id defect lands its edge. It has to
+    # run after every repair has been applied.
+    if unrepaired:
+        by_id_post = {
+            s["id"]: s for p in plans for s in (p.get("subtasks") or [])
+            if isinstance(s, dict) and s.get("id")
+        }
+        provides_post: dict[str, set[str]] = {}
+        for _sid, _s in by_id_post.items():
+            for _t in _s.get("provides", []) or []:
+                provides_post.setdefault(_t, set()).add(_sid)
+        _still_broken = []
+        for d in unrepaired:
+            _sid = d.get("sid")
+            _tag = (d.get("tag_or_dep") or "").strip()
+            _s = by_id_post.get(_sid)
+            _ordered = (
+                set(_s.get("depends_on") or []) & provides_post.get(_tag, set())
+                if _s else set()
+            )
+            if _ordered:
+                already.append(
+                    f"{_sid} / {_tag} (already ordered behind "
+                    f"{sorted(_ordered)[0]} via depends_on)")
+                continue
+            _still_broken.append(d)
+        unrepaired = _still_broken
     if already:
         log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
             f"subtask already declares — ignored ({', '.join(already)})")

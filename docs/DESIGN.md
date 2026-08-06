@@ -998,6 +998,33 @@ depending on which the defect is about. Three shapes are therefore repairable:
 In every case the resulting graph must still be acyclic — trialled against a copy
 before it is applied, using the same cycle definition as every other site.
 
+**Survivors are re-checked against the post-repair graph.** Each channel above
+asks a *channel-local* question — the id arm asks whether the named id is already
+in `depends_on`, the tag arm whether the named tag is already in `requires` —
+and neither asks the one that decides whether the defect is still real: *is this
+subtask already ordered behind a provider of that capability by any means?* The
+judge routinely emits several defects for one subtask, so one defect's repair can
+render another's stated failure impossible. Run `05fdffb8` died exactly there:
+
+```
+wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (named subtask id)
+• WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
+```
+
+The id-channel defect added the edge; the tag-channel defect for the same subtask
+named a tag with two rival providers, matched no channel, and fell through to the
+residual. Its stated failure — *"the scheduler can start `test-003` before
+`feat-007-2-2`"* — was already impossible by the time the gate read it. **leerie
+repaired the problem and then died on it**, discarding the whole planning spend on
+a gate with no bypass flag.
+
+So a second pass runs once every repair has been applied, and drops any residual
+defect whose subtask now has a `depends_on` edge to some provider of the named
+capability. It cannot be a pre-filter: the judge's emission order is arbitrary, so
+the tag defect may be evaluated before the id defect lands its edge. Each dismissal
+is logged with the edge responsible, so a judge degrading over time stays visible
+rather than being silently absorbed.
+
 Anything else is refused and the gate dies as before: a value that is neither a
 subtask id nor a provided tag means the plan genuinely lacks the capability rather
 than the edge, and a tag with several providers spanning *different* clusters is
