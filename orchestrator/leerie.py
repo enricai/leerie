@@ -20373,56 +20373,47 @@ def _filter_provably_false_wiring_defects(
 def _filter_defects_already_ordered(
     plans: list[dict], defects: list[dict],
 ) -> tuple[list[dict], list[str]]:
-    """Drop `wiring_judge` findings the *repaired* graph already refutes.
+    """Drop `missing_requires` findings the plan's own ordering refutes.
 
     Returns ``(surviving_defects, notes)`` — the post-repair sibling of
     `_filter_provably_false_wiring_defects`, which runs the same discipline
-    against the plan as the judge saw it. This one has to run afterwards,
-    because what refutes the finding is an edge the repair itself added.
+    against the plan as the judge saw it.
 
-    A `missing_requires` defect asserts one thing: the scheduler can start
-    `sid` before the subtask that produces `tag_or_dep`. If `sid` is already
-    ordered behind EVERY producer of it, the assertion is false whatever the
-    declaration looks like, so the defect must not reach the `die()`.
+    Such a defect asserts one thing: the scheduler can start `sid` before the
+    subtask producing `tag_or_dep`. If `sid` is already ordered behind every
+    producer of it, that is false however the declarations look, so the defect
+    must not reach the `die()`.
 
-    Scoped to that kind alone. `_repair_missing_requires` routes every
-    non-repairable defect to its residual, so `broken_by_drop` /
-    `broken_by_merge` arrive here too — and ordering cannot refute those:
-    they assert the WORK is gone, and no amount of scheduling after a subtask
-    restores a capability it no longer provides.
+    It exists because `_repair_missing_requires`'s own already-declared guard
+    sits DOWNSTREAM of channel selection: a defect matching no repair channel
+    takes the `else: unrepaired; continue` arm and never reaches
+    `tag in declared`, computed a few lines earlier. The guard is therefore
+    dead on the one path that reaches the `die()`. Run `05fdffb8` (navegando)
+    lost ~97 workers of planning spend there, on a finding that was false as
+    written — `test-003` already declared `requires:
+    action-echoed-row-payload`, the very tag reported missing, which orders it
+    behind BOTH providers; but those two providers spanned clusters, so no
+    channel matched.
 
-    "Every", not "any" — a capability with two producers where `sid` precedes
-    only one of them is precisely the judge's complaint about the other, so
-    dismissing on a non-empty intersection would wave through the race this
-    gate exists to catch.
+    It runs after the repair loop rather than before it because a residual can
+    also be mooted by an edge a SIBLING defect's repair added, and the judge's
+    emission order is arbitrary. (The run above did not need that ordering —
+    it was refutable as written — but the placement is free and strictly more
+    powerful.)
 
-    The judge routinely emits several defects for one subtask, so one
-    defect's repair can moot another's. Run `05fdffb8` (navegando) died on
-    exactly that, having done the repair itself:
+    Ordering resolves through `_build_predecessor_graph` rather than off
+    `depends_on`, for the same reason `_would_cycle_after` routes its cycle
+    test through it: so "ordered behind" cannot drift from what `_schedule`
+    does. Load-bearing, not tidiness — `requires` entries with
+    `extent: in_plan` create edges too, and across the repair corpus 99 of 535
+    direct orderings (19%) exist ONLY through that channel, so a
+    `depends_on`-only test would go on killing runs whose ordering came
+    through tags: the very class of bug this function exists to stop.
 
-        wiring-gate: repaired test-003 -> depends_on 'feat-007-2-2' (id)
-        • WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
-
-    The id-channel defect added the edge; the tag-channel defect for the same
-    subtask named a tag with two rival providers, matched no repair channel,
-    and fell through to the residual — by which point its stated failure was
-    impossible. ~97 workers of planning spend, on a gate with no bypass flag.
-
-    Ordering is resolved through `_build_predecessor_graph` rather than read
-    off `depends_on` directly, for the same reason `_would_cycle_after` routes
-    its cycle test through it: so "ordered behind" cannot drift from what the
-    scheduler actually does. That is load-bearing, not tidiness — ordering
-    also comes from `requires` entries with `extent: in_plan`, and across the
-    repair corpus **99 of 535 direct orderings (19%) exist only through that
-    channel**. A `depends_on`-only test would keep killing runs whose ordering
-    came through tags, which is the very class of bug this function exists to
-    stop.
-
-    Deliberately DIRECT edges only, never the transitive closure: a further
-    127 corpus orderings hold only transitively, and while those would refute
-    the finding just as soundly, dismissing on them is a much broader claim to
-    make on a gate whose only outcome is death. Staying at the direct-edge
-    definition keeps this check 1:1 with `_build_predecessor_graph`'s own.
+    Deliberately DIRECT edges only, never the transitive closure — a further
+    127 corpus orderings hold only transitively, and while those refute the
+    finding just as soundly, dismissing on them is a far broader claim to make
+    on a gate whose only outcome is death.
     """
     if not defects:
         return defects, []
