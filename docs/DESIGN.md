@@ -998,6 +998,61 @@ depending on which the defect is about. Three shapes are therefore repairable:
 In every case the resulting graph must still be acyclic — trialled against a copy
 before it is applied, using the same cycle definition as every other site.
 
+**The residual is re-checked against the ordering the plan actually has.** The
+already-declared guard above is *channel-local* — the id arm asks whether the
+named id is in `depends_on`, the tag arm whether the named tag is in `requires` —
+and, decisively, it sits **downstream of channel selection**. A defect matching no
+channel takes the `else` arm straight to the residual, so the guard is never
+reached on the one path that reaches the `die()`. It existed and was structurally
+dead exactly where it mattered.
+
+Run `05fdffb8` died there, and the finding was false on the plan as written:
+
+```
+• WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
+```
+
+`test-003` **already declared `requires: action-echoed-row-payload`** — the very
+tag reported missing. Requiring an in-plan tag orders a subtask behind *every*
+provider of it, so the judge's stated failure ("the scheduler can start
+`test-003` before `feat-007-2-2`") could not occur. But the tag had two providers
+in different clusters, no channel matched, and the plan died with the whole
+planning spend on a gate with no bypass flag.
+
+So after the repair loop, any residual defect whose subtask is already ordered
+behind **every** producer of the named capability is dropped. Three properties are
+load-bearing:
+
+- **Ordering is resolved through `_build_predecessor_graph`**, not read off
+  `depends_on`, for the same reason the cycle trials route through it: so
+  "ordered behind" cannot drift from what the scheduler does. Ordering also comes
+  from `requires` entries with `extent: in_plan`, and across the repair corpus 99
+  of 535 direct orderings (19%) exist *only* through that channel.
+- **Every producer, never any one.** A capability with two producers where the
+  subtask precedes only the first is precisely the judge's complaint about the
+  second; dismissing on a non-empty intersection would wave through the race this
+  gate exists to catch — strictly worse than the over-gating being fixed. The
+  producer set is required non-empty, since the empty set is vacuously a subset
+  and would dismiss every defect naming a capability nothing provides, which is
+  the canonical *true* finding.
+- **Direct edges only, not the transitive closure.** A further 127 corpus
+  orderings hold only transitively. Those would refute the finding just as
+  soundly, but dismissing on them is a much broader claim to make on a die-only
+  gate, so the check stays 1:1 with the graph's own edge definition.
+
+It applies to `missing_requires` alone. The repair loop routes *every*
+non-repairable defect to the same residual, so `broken_by_drop` and
+`broken_by_merge` arrive here too — and ordering cannot refute those: they assert
+the *work* is gone, and no amount of scheduling behind a subtask restores a
+capability it no longer provides.
+
+It runs after the repairs rather than before them because a defect can be mooted
+by an edge a *sibling* defect's repair added, and the judge's emission order is
+arbitrary. (The real run above did not need that — it was refutable as written —
+but the ordering is cheap and strictly more powerful.) Each dismissal is logged
+naming the responsible edges, so a judge degrading over time stays visible rather
+than being silently absorbed.
+
 Anything else is refused and the gate dies as before: a value that is neither a
 subtask id nor a provided tag means the plan genuinely lacks the capability rather
 than the edge, and a tag with several providers spanning *different* clusters is
