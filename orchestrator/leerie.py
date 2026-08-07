@@ -23667,6 +23667,7 @@ async def _run_checked_loop(
     name: str,
     max_rounds: int,
     make_feedback_prompt: Callable[[str], Awaitable[dict]] | None = None,
+    log_path: Path | None = None,
 ) -> tuple[dict | None, list[str]]:
     """Generic mechanical-feedback retry loop (CRITIC pattern).
 
@@ -23734,7 +23735,16 @@ async def _run_checked_loop(
     on legitimate, still-improving retries. Equality is the correct
     signal for "this is not new information"; a strict subset is new
     information (fewer open issues) and must be allowed to keep
-    retrying, bounded as always by ``max_rounds``."""
+    retrying, bounded as always by ``max_rounds``.
+
+    *log_path* is optional. When given, each round's per-worker JSONL log
+    is scanned via `_detect_malformed_tool_envelope` (N6) after `invoke()`
+    returns; a hit is appended to that round's issue list as a gating
+    `MALFORMED_TOOL_ENVELOPE` finding, forcing one additional round through
+    the same `make_feedback_prompt` mechanism as any other found issue —
+    a malformed tool-call envelope (e.g. `{"Bash": {...}}` instead of
+    `{...}`) is otherwise dropped by the CLI with no retry and no other
+    signal that the call never happened."""
     warnings: list[str] = []
     last_res: dict | None = None
     seen_issue_sets: list[frozenset[str]] = []
@@ -23773,6 +23783,14 @@ async def _run_checked_loop(
             break
 
         all_issues = check(last_res)
+        if log_path is not None and _detect_malformed_tool_envelope(log_path):
+            all_issues = [
+                *all_issues,
+                "MALFORMED_TOOL_ENVELOPE: worker submitted a malformed "
+                "tool-call envelope (e.g. `{\"Bash\": {...}}` instead of "
+                "`{...}`) — the CLI rejected it with an 'unexpected "
+                "parameter' error and the call was lost; retry with the "
+                "tool's plain input shape (no extra wrapper key)."]
         # Advisory findings are surfaced but never re-invoke (DESIGN
         # §"Findings carry a severity; only gating findings re-invoke").
         # Everything below this line reasons about `issues` — the gating
@@ -23996,6 +24014,48 @@ def _count_orphaned_bg_axis(log_path: Path,
         # worker simply stopped doing things related to this axis —
         # not an orphan-by-retry, so we do not append.
     return orphans
+
+
+# Exact wording the Claude Code CLI returns when a worker submits a tool
+# call whose top-level input is wrapped in an extra envelope layer (e.g.
+# `{"Bash": {"command": ...}}` instead of the plain `{"command": ...}` the
+# tool schema expects) — an `InputValidationError` naming the bogus
+# top-level key as an "unexpected parameter". The call is simply lost with
+# no retry when this happens (N6). Deliberately narrow: this matches only
+# this specific wording, never the generic `tool-fail` tag — ~81% of
+# tool-fails are benign deliberate absence probes (e.g. `ls` on a path that
+# may not exist) and must not force a retry round.
+_MALFORMED_TOOL_ENVELOPE_MARKER = "unexpected parameter"
+
+
+def _detect_malformed_tool_envelope(log_path: Path) -> bool:
+    """True when this worker's per-worker JSONL log contains at least one
+    tool-result error matching the malformed-envelope shape above.
+
+    Reuses the same `_iter_log_tool_use`-style tolerant JSONL scan as
+    `_emit_bash_axis_warnings` / `_count_orphaned_bg_axis`: any line that
+    isn't valid JSON, or any event that doesn't carry the expected
+    message/content shape, is skipped silently rather than raising — a
+    single malformed log line must not break detection for the whole
+    worker."""
+    if not log_path.is_file():
+        return False
+    for line in log_path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "user":
+            continue
+        for b in (event.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") != "tool_result" or not b.get("is_error"):
+                continue
+            text = _extract_tool_result_text(b).lower()
+            if _MALFORMED_TOOL_ENVELOPE_MARKER in text:
+                return True
+    return False
 
 
 def _emit_bash_axis_warnings(log_path: Path, round_label: str,
@@ -25383,6 +25443,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             name=f"integrator-{sid}",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_integrator_fb,
+            log_path=leerie_dir / "logs" / f"integrator-{sid}.log",
         )
         if ires is None:
             # The integrator crashed every round (infrastructure: PID
