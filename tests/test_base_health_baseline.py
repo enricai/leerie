@@ -116,6 +116,45 @@ def test_baseline_section_green_only_when_an_axis_actually_passed(leerie):
     assert "GREEN" not in out2
 
 
+# --- _format_baseline_green_message (bugfix-002) -------------------------
+
+def test_green_message_names_only_measured_axes(leerie):
+    baseline = {"axes": {
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": True, "measured": False, "passed": None,
+                 "summary": "eslint: command not found"},
+        "tests": {"ran": True, "measured": False, "passed": None,
+                  "summary": "pytest: command not found"},
+    }}
+    out = leerie._format_baseline_green_message(baseline)
+    assert "GREEN (build)" in out
+    assert "lint" not in out.split("GREEN (build)")[0]
+    assert "could not be measured" in out
+    assert "lint/tests could not be measured" in out
+
+
+def test_green_message_all_axes_measured(leerie):
+    baseline = {"axes": {
+        "build": {"ran": True, "measured": True, "passed": True},
+        "lint": {"ran": True, "measured": True, "passed": True},
+        "tests": {"ran": True, "measured": True, "passed": True},
+    }}
+    out = leerie._format_baseline_green_message(baseline)
+    assert "GREEN (build/lint/tests)" in out
+    assert "could not be measured" not in out
+
+
+def test_green_message_no_axes_measured(leerie):
+    baseline = {"axes": {
+        "build": {"ran": False, "measured": False, "passed": None},
+        "lint": {"ran": False, "measured": False, "passed": None},
+        "tests": {"ran": False, "measured": False, "passed": None},
+    }}
+    out = leerie._format_baseline_green_message(baseline)
+    assert "GREEN" not in out
+    assert "could not be measured" in out
+
+
 def test_baseline_section_measured_is_mandatory_no_legacy_default(leerie):
     """`measured` is a mandatory field (no legacy support): an axis dict
     without it is NOT treated as a measured pass/fail. A `passed: False`
