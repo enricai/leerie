@@ -2726,10 +2726,20 @@ have removed the launcher's only validation silently. It is now named and
 owned, with a derived guard (`_files_checking_launcher_syntax`) asserting some
 file still runs `bash -n` against the launcher — scanning `tests/` rather than
 naming itself, so moving the check again is fine and deleting it is not. The
-scan requires the invocation shape *and* a launcher reference in the same file,
-since `container-entry.sh` is `bash -n`-checked elsewhere and must not be
-mistaken for launcher coverage; an anti-vacuity test requires the scan to find
-its own file, so a broken scan fails as a broken scan.
+scan is **structural**: it walks each test file's AST for a `run(...)` call
+whose argv list literal contains both `bash` and `-n` *and* references the
+launcher, matching what this repo reaches for when the shape of a call is the
+assertion (`test_state_fields`'s write sweep, `test_claude_p_call_sites`, the
+`args.resume` branch walk). A text scan for those facts appearing *anywhere in
+the same file* is not equivalent and was the first version: co-occurrence is
+not connection, and `container-entry.sh` is `bash -n`-checked in
+`test_container_entry_run_id.py`. Falsified — with the real check gutted and a
+decoy file that runs `bash -n` on something else while mentioning `LAUNCHER`,
+the text predicate matched both files and passed while coverage was gone; the
+AST predicate fires. An anti-vacuity test requires the scan to find its own
+file, so a broken scan fails as a broken scan. The parse suppresses warnings:
+reading every test file surfaces other files' `SyntaxWarning`s, at least one
+deliberate and documented as not-to-be-fixed (`test_ec2_seed_repo.py`'s `\/`).
 **Known shortfall, deliberately not papered over:** `bash -n` does not catch
 the backtick class — a balanced pair inside what reads as a comment is parsed
 as command substitution, silently dropping that text from the script sent to a
