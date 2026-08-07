@@ -2736,6 +2736,21 @@ an absent commit yields no empty parens. Launcher-side: the `git` call carries
 user knob, and the auto-forward only carries exported vars), and it is **not**
 on the forwarding denylist — unlike `LEERIE_VERSION`, which is host-only for the
 image tag.
+**Two traps this file exists to pin, both of which shipped broken once.** (1)
+`_run_phases` initialises state in *two* branches — `if args.resume:` uses
+subscript assignments, the fresh-run `else:` a dict literal — so the key must be
+written in both. The original test compared `src.index()` of two strings that
+both live in the resume branch, so it passed while the field was absent from
+every fresh run, i.e. the common case and the whole point of the field. The
+replacement walks `_run_phases`'s AST, locates the `args.resume` `If` node, and
+requires the key in `body` **and** `orelse`, with an anti-vacuity control
+asserting the same walk finds `leerie_version` (known to be in both) so a broken
+walk fails as a broken walk rather than a missing key. (2) The local `-e`
+forward covers only `--runtime local`; Fly/EC2 build their own `child_env` in
+the launch heredoc, so the value must be forwarded there too — JSON-encoded via
+`_leerie_commit_json`, since that heredoc is unquoted, and the new name added to
+the `${...}` allowlist in `tests/test_bedrock_bearer_token.py` or its
+stray-substitution scan fails (verified live: it does).
 The `--dangerously-force-strict-output` context-window regression (DESIGN §7
 *Forcing constrained decoding*, §6 *A client-side context refusal*) is covered
 by three files. The defect: the flag works by owning `ANTHROPIC_BASE_URL`, and

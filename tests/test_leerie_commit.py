@@ -18,6 +18,7 @@ import json
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator"))
@@ -67,10 +68,58 @@ class TestWriteSite:
         assert 'os.environ.get("LEERIE_COMMIT") or None' in src, (
             "an unset LEERIE_COMMIT must record None, not an empty string")
 
-    def test_written_beside_the_version(self):
-        src = self._write_src()
-        assert (src.index('st.data["leerie_version"]')
-                < src.index('st.data["leerie_commit"]'))
+    def test_written_in_BOTH_state_init_branches(self):
+        """The resume path and the fresh path are separate initialisations.
+
+        `_run_phases` sets state under `if args.resume:` with subscript
+        assignments, and under its `else:` with a dict literal. The original
+        version of this test compared `src.index(...)` of two strings, both of
+        which live in the resume branch — so it passed while the key was absent
+        from the fresh path entirely, which is the overwhelmingly common case
+        and the one the field exists for. A source-order check across a
+        two-branch function cannot tell you which branch it covered.
+
+        This walks the AST instead and requires the key in each branch.
+        """
+        import ast
+        import inspect
+        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
+        resume_ifs = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)
+        ]
+        assert resume_ifs, "could not locate the `if args.resume:` split"
+        node = resume_ifs[0]
+        assert node.orelse, "the fresh-run `else:` branch was not found"
+
+        def mentions(body) -> bool:
+            return any("leerie_commit" in ast.unparse(s) for s in body)
+
+        assert mentions(node.body), "resume branch does not record leerie_commit"
+        assert mentions(node.orelse), (
+            "FRESH-RUN branch does not record leerie_commit — the field would "
+            "be null for every non-resume run")
+
+    def test_both_branches_also_record_the_version(self):
+        """Anti-vacuity control for the test above.
+
+        If the branch-finding logic were wrong (wrong node, empty bodies), the
+        `leerie_commit` assertions could pass or fail for reasons unrelated to
+        the key. `leerie_version` is known to be in both branches, so it must
+        be found by the same walk — if it is not, the walk is broken, not the
+        code.
+        """
+        import ast
+        import inspect
+        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
+        node = [n for n in ast.walk(tree)
+                if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)][0]
+
+        def mentions(body) -> bool:
+            return any("leerie_version" in ast.unparse(s) for s in body)
+
+        assert mentions(node.body) and mentions(node.orelse), (
+            "the branch walk is broken — leerie_version is known to be in both")
 
 
 class TestRoundTrip:
@@ -148,3 +197,24 @@ class TestLauncher:
         r = subprocess.run(["bash", "-n", str(REPO / "leerie")],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
+
+    def test_forwarded_on_the_fly_ec2_path_too(self):
+        """The local `-e` forward covers only `--runtime local`.
+
+        Remote runs build their own `child_env` in the Fly launch heredoc. A
+        field that records only on the local path is absent exactly where
+        attribution is hardest, which is how this shipped.
+        """
+        assert 'child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}' in LAUNCHER
+
+    def test_remote_value_is_json_encoded(self):
+        """The launch heredoc is unquoted, so raw substitution is unsafe.
+
+        A sha carries no injection risk itself, but the encoding is the
+        established pattern (`_host_tz_json`, `_bedrock_*_json`) adopted after a
+        raw value broke out of a Python literal — and deviating from it silently
+        is what the stray-substitution guard exists to prevent.
+        """
+        assert "_leerie_commit_json=\"$(python3 -c 'import json, sys; " \
+               "print(json.dumps(sys.argv[1]))'" in LAUNCHER
+        assert '"${LEERIE_COMMIT:-}"' in LAUNCHER
