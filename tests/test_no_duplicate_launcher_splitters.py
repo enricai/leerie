@@ -20,9 +20,13 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 OWNER = "launcher_blocks.py"
 
-# The load-bearing token of the derivation. Any file re-deriving launch blocks
-# has to match the block marker somehow, and this is the shape it takes.
-_MARKER = "child_env = dict"
+# The load-bearing token of the derivation, in its ESCAPED regex form. Prose
+# describing the concept writes the marker plainly (`child_env = dict(...)`);
+# only an actual implementation escapes the paren for `re`. Matching the plain
+# substring instead would report a file that merely *documents* why the
+# derivation is shared as if it re-implemented it — and the natural response to
+# a false-positive guard is to weaken it, which is how guards die.
+_MARKER = r"child_env = dict\("
 
 
 def _files_matching_marker() -> dict[str, int]:

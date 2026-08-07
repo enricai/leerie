@@ -24,10 +24,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator"))
 import leerie  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 # One shared derivation of the launcher's launch blocks — see
 # tests/launcher_blocks.py for why it is not re-implemented per consumer.
-from launcher_blocks import launch_env_blocks  # noqa: E402
+from tests.launcher_blocks import launch_env_blocks  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = (REPO / "leerie").read_text()

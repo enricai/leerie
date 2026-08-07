@@ -2721,7 +2721,11 @@ that would otherwise be replicated per consumer: the block marker, the `\nPY\n`
 terminator, and the preamble window searched for the `--runtime` label. Both
 `test_leerie_commit.py` (LEERIE_COMMIT forwarding) and
 `test_bedrock_bearer_token.py` (stray-`${...}` and backtick scans) import
-`launch_env_blocks()` from it; a neutral module rather than a cross-test import
+`launch_env_blocks()` from it — package-qualified as
+`from tests.launcher_blocks import ...`, the same form every shared test module
+here uses (`tests.ec2_stub`, `tests.conftest`), with no `sys.path` juggling:
+`tests/__init__.py` exists, so `tests` is a real package. A neutral module
+rather than a cross-test import
 because the two consumers are unrelated concerns and neither should own it
 (`tests/ec2_stub.py` is the precedent for the shape). It reads the launcher
 itself rather than taking the source as an argument, so callers holding a `str`

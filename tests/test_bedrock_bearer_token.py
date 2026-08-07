@@ -21,16 +21,13 @@ from __future__ import annotations
 
 import json
 import re
-import sys
-from pathlib import Path as _Path
-
-sys.path.insert(0, str(_Path(__file__).resolve().parent))
-# One shared derivation of the launcher's launch blocks — see
-# tests/launcher_blocks.py for why it is not re-implemented per consumer.
-from launcher_blocks import launch_env_blocks  # noqa: E402
 import shutil
 import subprocess
 from pathlib import Path
+
+# One shared derivation of the launcher's launch blocks — see
+# tests/launcher_blocks.py for why it is not re-implemented per consumer.
+from tests.launcher_blocks import launch_env_blocks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
