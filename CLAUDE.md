@@ -1626,7 +1626,15 @@ guard that the normalization runs before `prov["recipe"] = recipe` in
 not measure," folded into neither GREEN nor RED, by both
 `_format_baseline_section` and `_base_health_payload`), and pins that `measured`
 is a mandatory field with no legacy default (a `passed: False` axis missing
-`measured` is not surfaced RED).
+`measured` is not surfaced RED). The same file also pins the N8 fix — every
+BLT axis command `_capture_conformance_baseline` runs is invoked as the exact
+argv `["bash", "-c", cmd]`, never a login shell (`-lc`), since a login shell
+sources `/etc/profile`/`~/.bash_profile` and discards Docker-ENV-only PATH
+additions (e.g. mise's shims dir) — a source pin, an end-to-end argv-capture
+pin driving `_capture_conformance_baseline` with `_run_streaming` stubbed, and
+a regression control that reproduces the PATH-loss mechanism itself (an
+env-only PATH entry resolves under `bash -c` and is lost under `bash -lc`)
+against real subprocesses, with no container required.
 The standalone AWS credential/profile/region resolution helper
 (`scripts/remote/aws-credentials.sh`, EC2 runtime) is tested in
 `tests/test_aws_credentials.py` by sourcing the real script against a fake
