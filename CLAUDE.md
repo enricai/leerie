@@ -2752,7 +2752,20 @@ their own unquoted `<<PY` heredoc. Both must forward the value, JSON-encoded
 (`_leerie_commit_json` / `_ec2_leerie_commit_json`) like every other
 substitution there; the Fly name additionally goes in the `${...}` allowlist in
 `tests/test_bedrock_bearer_token.py` or its stray-substitution scan fails
-(verified live: it does — EC2 has no equivalent scan, which is its own gap).
+(verified live: it does).
+**Both heredoc scans are themselves derived**, over every launch block rather
+than the one Fly slice they originally hard-coded: `_launch_env_blocks()` in
+`tests/test_bedrock_bearer_token.py` feeds both the stray-`${...}` allowlist
+scan and the backtick scan, each with a per-runtime allowlist
+(`_KNOWN_HEREDOC_SUBSTITUTIONS`). Before that, the scans covered a 31-line
+`TZ`→`AWS_REGION` slice of the Fly body and were **structurally blind** to the
+EC2 heredoc — an unquoted `<<PY` with identical failure modes: an unbound
+`${VAR}` anywhere in the body, comments included, aborts the launcher under
+`set -euo pipefail`, and a balanced backtick pair is read as command
+substitution, silently dropping that text from the script sent to the machine
+(`bash -n` does not catch it; `shellcheck -x` does). Falsified in both
+directions: injecting either defect into the EC2 body now fails naming `ec2`,
+and the old slice provably did not contain it.
 **The guard is derived, not enumerated**: `_child_env_blocks()` finds every
 `child_env = dict(os.environ)` in the launcher and requires each to forward the
 var, so a third runtime fails automatically. This exists because the
