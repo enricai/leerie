@@ -16,7 +16,6 @@ a run or write a misleading empty string.
 """
 import json
 import re
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -199,11 +198,6 @@ class TestLauncher:
         m = re.search(r"_leerie_env_denylist=\"[^\"]*\"", LAUNCHER, re.S)
         assert m, "denylist not found"
         assert "LEERIE_COMMIT" not in m.group(0)
-
-    def test_launcher_still_parses(self):
-        r = subprocess.run(["bash", "-n", str(REPO / "leerie")],
-                           capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr
 
     def test_every_remote_launch_block_forwards_it(self):
         """EVERY orchestrator launch path must forward this, not just the one

@@ -2714,6 +2714,29 @@ walks the AST of `_run_phases`, because the obvious
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+`tests/test_launcher_integrity.py` is the **only** thing that checks the
+`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh`
+and the launcher has no `.sh` extension nor lives there, while `syntax.yml`
+AST-parses Python only. No test runs shellcheck at all — every occurrence of
+the word under `tests/` is prose describing this gap. So a `bash -n`-level
+syntax error in a 7k-line launcher would otherwise ship green.
+That check first appeared inside `test_leerie_commit.py`, a file about one
+state field, where it was coverage by accident: restructuring that file would
+have removed the launcher's only validation silently. It is now named and
+owned, with a derived guard (`_files_checking_launcher_syntax`) asserting some
+file still runs `bash -n` against the launcher — scanning `tests/` rather than
+naming itself, so moving the check again is fine and deleting it is not. The
+scan requires the invocation shape *and* a launcher reference in the same file,
+since `container-entry.sh` is `bash -n`-checked elsewhere and must not be
+mistaken for launcher coverage; an anti-vacuity test requires the scan to find
+its own file, so a broken scan fails as a broken scan.
+**Known shortfall, deliberately not papered over:** `bash -n` does not catch
+the backtick class — a balanced pair inside what reads as a comment is parsed
+as command substitution, silently dropping that text from the script sent to a
+remote machine. leerie has shipped that defect once; it was caught by diffing
+`shellcheck -x leerie`, with `bash -n` clean throughout. Linting the whole
+launcher with shellcheck is the real fix and needs a measured baseline of
+pre-existing findings first.
 `tests/launcher_blocks.py` is the **single** derivation of the launcher's
 orchestrator launch blocks — the `child_env = dict(os.environ)` regions inside
 each unquoted `<<PY` heredoc, one per remote runtime. It owns three constants
