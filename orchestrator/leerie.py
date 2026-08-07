@@ -24270,6 +24270,34 @@ def _format_baseline_section(baseline: dict | None) -> str | None:
     return "\n".join(lines)
 
 
+def _format_baseline_green_message(baseline: dict) -> str:
+    """Render the phase-4 GREEN log line naming only axes that were
+    actually measured, instead of hardcoding "(build/lint/tests)"
+    regardless of which axes' commands existed and ran (bugfix-002).
+
+    Called only when `red_axes` is empty, so every axis here is either
+    measured-and-passed or unmeasured — never measured-and-failed."""
+    axes = baseline.get("axes") or {}
+    measured = [a for a in ("build", "lint", "tests")
+                if (axes.get(a) or {}).get("ran")
+                and (axes.get(a) or {}).get("measured")]
+    unmeasured = [a for a in ("build", "lint", "tests")
+                  if (axes.get(a) or {}).get("ran")
+                  and not (axes.get(a) or {}).get("measured")]
+    if not measured:
+        return ("phase 4: base tree health could not be measured on any "
+                "axis (build/lint/tests) — no runner was available for "
+                "any of them. Failures on these axes will not be "
+                "attributed to this run.")
+    msg = (f"phase 4: base tree is GREEN ({'/'.join(measured)}) — new "
+           f"{'/'.join(measured)} failures will be attributed to this run.")
+    if unmeasured:
+        msg += (f" ({'/'.join(unmeasured)} could not be measured — no "
+                "runner was available; failures on these axes will not "
+                "be attributed to this run.)")
+    return msg
+
+
 async def _capture_conformance_baseline(
         leerie_dir: Path, st: State, caps: dict) -> None:
     """Record base-tree build/lint/test health once per run (DESIGN §9
@@ -24354,7 +24382,7 @@ async def _capture_conformance_baseline(
             continue
         try:
             rc, tail = await _run_streaming(
-                ["bash", "-lc", cmd], cwd=str(staging), timeout=timeout,
+                ["bash", "-c", cmd], cwd=str(staging), timeout=timeout,
                 log_path=log_path, label=f"baseline-{axis}: {cmd}",
                 verbosity=verbosity)
             summary = (tail or "").strip()[-400:]
@@ -24406,8 +24434,7 @@ async def _capture_conformance_baseline(
                         health={"base_suite": {"status": "red",
                                                "red_axes": red}})
     else:
-        log("phase 4: base tree is GREEN (build/lint/tests) — new "
-            "build/lint/test failures will be attributed to this run.")
+        log(_format_baseline_green_message(baseline))
         _write_run_json(st.run_dir,
                         health={"base_suite": {"status": "green",
                                                "red_axes": []}})
