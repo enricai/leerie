@@ -52,6 +52,15 @@ LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 IMAGE_TAG="leerie:$LEERIE_VERSION"
 
+# The commit the launcher is actually running, recorded alongside the version.
+# plugin.json only moves on a `chore(release):` commit, while install.sh tracks
+# `main` (DEFAULT_REF), so every run between releases reports the same version
+# whether or not it carries a given fix — enough to look attributable, not
+# enough to attribute. Empty when $LEERIE_REPO is not a git checkout (a tarball
+# install), which is a normal state, never an error: `rev-parse` is local-only,
+# so this cannot hang, and a failure here must never fail a run.
+LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD 2>/dev/null || true)"
+
 # --- fast paths that don't need the container ----------------------------
 # `leerie version` should answer immediately without spinning up a container
 # — used by the installer's end-to-end smoke test and by anyone who just
@@ -7735,6 +7744,10 @@ else
     # orchestrator's cwd=/work falls back to basename "work" and every line
     # reads [leerie] [work]. Mirrors the Fly path's child_env["USER_REPO"].
     -e "USER_REPO=$(basename "$USER_REPO")"
+    # Explicit rather than relying on the LEERIE_* auto-forward below: this is
+    # launcher-computed, not a user knob, and the forward only carries vars
+    # that are exported.
+    -e "LEERIE_COMMIT=${LEERIE_COMMIT:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host

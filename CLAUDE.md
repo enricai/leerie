@@ -2004,7 +2004,10 @@ empty diff.
 **`scripts/remote/collect-subtrees.sh` embeds a second copy of
 `SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
 `claude -p --json-schema` directly from bash on the remote machine and cannot
-import the orchestrator. **Any edit to that schema must update both.**
+import the orchestrator. **Any edit to that schema must update both.** That same
+direct invocation also puts the script outside the `--dangerously-force-strict-output`
+path — it runs only after the orchestrator (which owns the proxy) has exited, so
+output there is schema-validated but not constrained during generation.
 `tests/test_collect_subtrees_integrator_schema.py` is the guard: it parses the
 `integrator_schema='{...}'` assignment out of the real script and asserts
 whole-object equality with the live `SCHEMAS["integrator"]` — deliberately
@@ -2711,6 +2714,28 @@ walks the AST of `_run_phases`, because the obvious
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+`tests/test_leerie_commit.py` pins the `leerie_commit` state field, which
+disambiguates `leerie_version`. `plugin.json` only moves on a `chore(release):`
+commit while `install.sh` tracks `main` (`DEFAULT_REF`), so every run between
+releases records the same version whether or not it carries a given fix — a bug
+report citing `v0.11.1` cannot be placed on either side of it. The launcher
+computes the short sha (`git -C "$LEERIE_REPO" rev-parse --short HEAD`) and
+forwards it as `LEERIE_COMMIT`; the orchestrator records it beside the version.
+Pinned: the key is in `STATE_FIELDS`, **adjacent to `leerie_version`** (the two
+are only useful together, and adjacency is what stops one moving without the
+other) and carries an IMPLEMENTATION.md §8 row; the write reads the env var and
+uses `or None` — **load-bearing**, since an empty `LEERIE_COMMIT` arrives
+whenever leerie was installed from a tarball or an older launcher runs against a
+newer orchestrator, and recording `""` would render as a real-but-blank sha in
+the PR footer; a real `State.save()` round-trip preserves both a sha and a
+`null`; the rendered suffix appends `(sha)` only when both parts are present, so
+an absent commit yields no empty parens. Launcher-side: the `git` call carries
+`2>/dev/null || true` so a non-checkout install cannot abort under `set -e`
+(absence is a normal state, never an error), it is forwarded explicitly with
+`-e` rather than via the `LEERIE_*` auto-forward (it is launcher-computed, not a
+user knob, and the auto-forward only carries exported vars), and it is **not**
+on the forwarding denylist — unlike `LEERIE_VERSION`, which is host-only for the
+image tag.
 The `--dangerously-force-strict-output` context-window regression (DESIGN §7
 *Forcing constrained decoding*, §6 *A client-side context refusal*) is covered
 by three files. The defect: the flag works by owning `ANTHROPIC_BASE_URL`, and

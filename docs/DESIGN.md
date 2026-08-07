@@ -5016,6 +5016,25 @@ validation they explicitly asked to replace — or it misroutes every worker cal
 Since a run cannot tell those apart from a healthy one, leerie refuses that
 combination too rather than guessing.
 
+**The guarantee is scoped to a run's workers, and one LLM call sits outside
+it by construction.** The proxy is owned by the orchestrator process and torn
+down when that process exits. The recovery integrator in
+`scripts/remote/collect-subtrees.sh` invokes `claude -p` directly, and it runs
+only *after* the orchestrator is confirmed dead — the `finalize --force` path
+calls it following a force-stop, and the non-force path only as recovery once
+`force_finalize_remote` has succeeded, which by design refuses while the run is
+alive. There is therefore no proxy left to route it through, and the later
+`finalize` invocation need not even carry the flag. Erasing this boundary would
+mean standing up a second proxy on the machine purely for a post-mortem salvage
+step, which buys a generation-time guarantee on an operation that is not part
+of the run.
+
+So it is stated rather than closed. That integrator still validates its output
+against its own copy of `SCHEMAS["integrator"]` — output is checked, just not
+constrained during generation. The distinction matters because the failure this
+section otherwise refuses to permit is silence: an operator who asked for
+constrained decoding should know exactly which calls got it.
+
 **Owning that variable also costs the model's native context window, and
 leerie has to buy it back.** The Claude Code CLI treats any custom
 `ANTHROPIC_BASE_URL` as an LLM gateway, and behind a gateway it can no longer
