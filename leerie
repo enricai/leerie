@@ -6882,6 +6882,11 @@ print(json.dumps(sys.argv[1:]))
         # exactly the kind of value likely to contain such bytes), applied
         # to every substituted value here for consistency.
         _host_tz_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$_host_tz")"
+        # JSON-encoded like every other heredoc substitution: the heredoc is
+        # unquoted, so a raw value could break out of the Python literal. A sha
+        # is alphanumeric and carries no such risk, but the pattern is the
+        # pattern — and the stray-substitution guard fails loudly if skipped.
+        _leerie_commit_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
         _bedrock_bearer_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_BEARER_TOKEN_BEDROCK:-}")"
         _bedrock_use_bedrock_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_USE_BEDROCK:-1}")"
         _bedrock_bearer_region_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${AWS_REGION:-}")"
@@ -6959,6 +6964,10 @@ child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 # (e.g. /etc/localtime not a symlink), the substitution yields ""
 # and Python's astimezone() falls back to UTC — same as today.
 child_env["TZ"] = ${_host_tz_json}
+# Recorded beside leerie_version in state.json. Forwarded here as well as on
+# the local nerdctl path: a remote run that records only the version cannot be
+# attributed to a commit, and remote is where that matters most.
+child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
 # Bedrock bearer-token activation (AWS_BEARER_TOKEN_BEDROCK) -- takes
 # precedence over the SSO/profile block below, mirroring the nerdctl path's
 # AUTH_MOUNTS ordering above. Every value is JSON-encoded host-side before

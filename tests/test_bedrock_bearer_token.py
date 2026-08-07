@@ -451,7 +451,8 @@ def test_child_env_heredoc_body_has_no_stray_unbound_var_substitution() -> None:
     `${...}` form inside this region."""
     block = _extract_child_env_bedrock_block()
     known = {
-        "_host_tz_json", "_bedrock_bearer_token_json", "_bedrock_use_bedrock_json",
+        "_host_tz_json", "_leerie_commit_json",
+        "_bedrock_bearer_token_json", "_bedrock_use_bedrock_json",
         "_bedrock_bearer_region_json", "_BEDROCK_BEARER_ACTIVE", "_bedrock_profile_json",
         "_BEDROCK_ACTIVE", "_bedrock_region_json",
     }

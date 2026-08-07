@@ -26606,7 +26606,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "strict_conformer": bool(args.strict_conformer),
                    "skip_base_baseline": bool(args.skip_base_baseline),
                    "skip_repo_map": bool(args.skip_repo_map),
-                   "leerie_version": _read_version()}
+                   "leerie_version": _read_version(),
+                   # Must stay beside leerie_version in BOTH branches: the
+                   # resume path above sets these as subscript assignments,
+                   # this fresh path as a dict literal, and a source-order
+                   # check cannot tell which branch it covered — which is
+                   # exactly how this key shipped absent from the common path.
+                   "leerie_commit": os.environ.get("LEERIE_COMMIT") or None}
         st.save()
         # Fail-closed containment gate + recording, before the first
         # worker (phase_classify below). Must come after the
