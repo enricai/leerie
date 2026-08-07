@@ -434,6 +434,58 @@ def test_fly_heredoc_values_are_json_encoded_not_raw() -> None:
     assert "child_env[\"AWS_BEARER_TOKEN_BEDROCK\"] = ${_bedrock_bearer_token_json}" in src
 
 
+# Intentional `${...}` substitution names, per launch heredoc. Both heredocs are
+# unquoted `<<PY`, so bash expands every `${...}`-shaped token in their bodies --
+# including inside what reads as a Python comment. Anything not listed here is
+# either a typo or prose that will be expanded anyway.
+_KNOWN_HEREDOC_SUBSTITUTIONS = {
+    "fly": {
+        "_host_tz_json", "_leerie_commit_json",
+        "_oauth_token_json", "_oauth_tokens_json",
+        "_bedrock_bearer_token_json", "_bedrock_use_bedrock_json",
+        "_bedrock_bearer_region_json", "_BEDROCK_BEARER_ACTIVE",
+        "_bedrock_profile_json", "_BEDROCK_ACTIVE", "_bedrock_region_json",
+    },
+    "ec2": {
+        "_ec2_host_tz", "_ec2_leerie_commit_json",
+        "_ec2_oauth_token_json", "_ec2_oauth_tokens_json",
+    },
+}
+
+
+def _launch_env_blocks() -> list[tuple[str, str]]:
+    """Every orchestrator launch heredoc's env block, as (runtime, body).
+
+    Derived rather than enumerated. These scans originally covered the Fly
+    body only -- a narrow `child_env["TZ"]`-to-`AWS_REGION` slice -- while the
+    EC2 launch heredoc, an unquoted `<<PY` with the identical failure modes,
+    had no coverage at all. Deriving the set means a third runtime is scanned
+    the day it is added.
+    """
+    src = LAUNCHER.read_text()
+    out: list[tuple[str, str]] = []
+    for m in re.finditer(r"child_env = dict\(os\.environ\)", src):
+        end = src.find("\nPY\n", m.start())
+        body = src[m.start():end if end > 0 else len(src)]
+        preamble = src[max(0, m.start() - 1200):m.start()]
+        out.append(("ec2" if "--runtime ec2" in preamble else "fly", body))
+    return out
+
+
+def test_launch_block_discovery_is_not_vacuous() -> None:
+    """A splitter that finds nothing makes both scans below pass trivially."""
+    blocks = _launch_env_blocks()
+    assert len(blocks) >= 2, (
+        f"expected at least the fly and ec2 launch heredocs, found "
+        f"{len(blocks)} -- the splitter is broken, so the scans prove nothing")
+    assert {rt for rt, _ in blocks} == set(_KNOWN_HEREDOC_SUBSTITUTIONS), (
+        "discovered runtimes do not match the allowlist keys")
+    for rt, body in blocks:
+        assert 'child_env["USER_REPO"]' in body, (
+            f"{rt} block lacks USER_REPO -- the slice is wrong")
+
+
+
 def test_child_env_heredoc_body_has_no_stray_unbound_var_substitution() -> None:
     """Regression guard for a second, more severe defect found alongside the
     injection one: the heredoc is UNQUOTED (`<<PY`, not `<<'PY'`), so bash
@@ -449,23 +501,18 @@ def test_child_env_heredoc_body_has_no_stray_unbound_var_substitution() -> None:
     `bash: line N: VAR: unbound variable` when the surrounding script is
     executed. Only the KNOWN, intentional substitution names may appear in
     `${...}` form inside this region."""
-    block = _extract_child_env_bedrock_block()
-    known = {
-        "_host_tz_json", "_leerie_commit_json",
-        "_bedrock_bearer_token_json", "_bedrock_use_bedrock_json",
-        "_bedrock_bearer_region_json", "_BEDROCK_BEARER_ACTIVE", "_bedrock_profile_json",
-        "_BEDROCK_ACTIVE", "_bedrock_region_json",
-    }
-    found = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", block))
-    unexpected = found - known
-    assert not unexpected, (
-        f"unexpected ${{...}}-shaped substitution(s) in the unquoted Fly "
-        f"heredoc body: {sorted(unexpected)} — if these are meant to be "
-        f"literal text (e.g. inside a comment), the heredoc's unquoted "
-        f"nature means bash will still try to substitute them, crashing "
-        f"under `set -u` if unset. Rephrase the comment to avoid the "
-        f"${{...}} shape entirely."
-    )
+    for runtime, block in _launch_env_blocks():
+        known = _KNOWN_HEREDOC_SUBSTITUTIONS[runtime]
+        found = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", block))
+        unexpected = found - known
+        assert not unexpected, (
+            f"unexpected ${{...}}-shaped substitution(s) in the unquoted "
+            f"{runtime} heredoc body: {sorted(unexpected)} — if these are meant "
+            f"to be literal text (e.g. inside a comment), the heredoc's "
+            f"unquoted nature means bash will still try to substitute them, "
+            f"crashing under `set -u` if unset. Rephrase the comment to avoid "
+            f"the ${{...}} shape entirely."
+        )
 
 
 def test_child_env_heredoc_body_has_no_backtick_characters() -> None:
@@ -484,14 +531,15 @@ def test_child_env_heredoc_body_has_no_backtick_characters() -> None:
     `git stash` is how this was originally caught; `bash -n` alone does not
     catch it. This heredoc's content is pure Python, which never needs a
     literal backtick, so the invariant is simply: none allowed."""
-    block = _extract_child_env_bedrock_block()
-    assert "`" not in block, (
-        "a backtick character appeared in the unquoted Fly heredoc body — "
-        "bash will treat a balanced pair as command substitution even "
-        "inside a comment, corrupting the script and printing a spurious "
-        "syntax error to the user on every launch. Rephrase to avoid "
-        "backticks entirely (e.g. drop inline code-formatting in prose)."
-    )
+    for runtime, block in _launch_env_blocks():
+        assert "`" not in block, (
+            f"a backtick character appeared in the unquoted {runtime} heredoc "
+            f"body — bash will treat a balanced pair as command substitution "
+            f"even inside a comment, corrupting the script and printing a "
+            f"spurious syntax error to the user on every launch. Rephrase to "
+            f"avoid backticks entirely (e.g. drop inline code-formatting in "
+            f"prose)."
+        )
 
 
 def test_fly_heredoc_bearer_precedes_sso_elif() -> None:

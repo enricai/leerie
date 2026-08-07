@@ -28,6 +28,26 @@ REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = (REPO / "leerie").read_text()
 
 
+
+def _child_env_blocks() -> list[tuple[str, str]]:
+    """Every in-heredoc orchestrator launch env block, as (runtime, source).
+
+    Derived from the launcher rather than enumerated: each remote runtime
+    builds its own `child_env = dict(os.environ)` inside its launch heredoc,
+    and a hard-coded list silently stops covering a runtime the moment one is
+    added. The runtime label comes from the `--runtime <rt>` string in the
+    duplicate-run message just above each block.
+    """
+    out: list[tuple[str, str]] = []
+    for m in re.finditer(r"child_env = dict\(os\.environ\)", LAUNCHER):
+        end = LAUNCHER.find("\nPY\n", m.start())
+        block = LAUNCHER[m.start():end if end > 0 else len(LAUNCHER)]
+        preamble = LAUNCHER[max(0, m.start() - 1200):m.start()]
+        rt = "ec2" if "--runtime ec2" in preamble else "fly"
+        out.append((rt, block))
+    return out
+
+
 class TestStateSurface:
     def test_declared_in_state_fields(self):
         # Guard-the-guard for the parity sweep in test_state_fields.py: that
@@ -198,14 +218,52 @@ class TestLauncher:
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
 
-    def test_forwarded_on_the_fly_ec2_path_too(self):
-        """The local `-e` forward covers only `--runtime local`.
+    def test_every_remote_launch_block_forwards_it(self):
+        """EVERY orchestrator launch path must forward this, not just the one
+        in front of whoever last edited it.
 
-        Remote runs build their own `child_env` in the Fly launch heredoc. A
-        field that records only on the local path is absent exactly where
-        attribution is hardest, which is how this shipped.
+        The local `-e` forward covers only `--runtime local`; remote runtimes
+        build their own `child_env` inside their launch heredocs, and there are
+        **two** of them (fly and ec2). #182 added the fly one and shipped
+        claiming ec2 worked -- its test asserted a single hard-coded fly string
+        while being named `..._fly_ec2_path_too`. So this derives the set from
+        the launcher instead of listing it: a third runtime fails here
+        automatically.
         """
-        assert 'child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}' in LAUNCHER
+        blocks = _child_env_blocks()
+        missing = [rt for rt, blk in blocks
+                   if 'child_env["LEERIE_COMMIT"]' not in blk]
+        assert not missing, (
+            f"launch block(s) {missing} do not forward LEERIE_COMMIT — the "
+            f"field records null for those runtimes")
+
+    def test_launch_block_discovery_is_not_vacuous(self):
+        """A splitter that finds nothing makes the test above pass trivially.
+
+        Two independent controls: at least two blocks exist (fly + ec2), and
+        every block sets `USER_REPO`, which is known present in both. If either
+        fails, the splitter is broken — and it fails *as* a broken splitter
+        rather than masquerading as a missing key.
+        """
+        blocks = _child_env_blocks()
+        assert len(blocks) >= 2, (
+            f"expected at least the fly and ec2 launch blocks, found "
+            f"{len(blocks)} — the block splitter is broken")
+        for rt, blk in blocks:
+            assert 'child_env["USER_REPO"]' in blk, (
+                f"block {rt} lacks USER_REPO — the slice is wrong, so the "
+                f"LEERIE_COMMIT result above cannot be trusted")
+
+    def test_remote_values_are_json_encoded(self):
+        """Both launch heredocs are unquoted `<<PY`, so raw substitution is
+        unsafe. A sha carries no injection risk, but deviating silently from
+        the established `*_json` pattern is what the Fly stray-substitution
+        guard exists to prevent."""
+        for name in ("_leerie_commit_json", "_ec2_leerie_commit_json"):
+            assert (f"""{name}="$(python3 -c 'import json, sys; """
+                    f"""print(json.dumps(sys.argv[1]))'""") in LAUNCHER, (
+                f"{name} is not JSON-encoded host-side")
+        assert '"${LEERIE_COMMIT:-}"' in LAUNCHER
 
     def test_remote_value_is_json_encoded(self):
         """The launch heredoc is unquoted, so raw substitution is unsafe.
