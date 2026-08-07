@@ -2746,11 +2746,22 @@ replacement walks `_run_phases`'s AST, locates the `args.resume` `If` node, and
 requires the key in `body` **and** `orelse`, with an anti-vacuity control
 asserting the same walk finds `leerie_version` (known to be in both) so a broken
 walk fails as a broken walk rather than a missing key. (2) The local `-e`
-forward covers only `--runtime local`; Fly/EC2 build their own `child_env` in
-the launch heredoc, so the value must be forwarded there too — JSON-encoded via
-`_leerie_commit_json`, since that heredoc is unquoted, and the new name added to
-the `${...}` allowlist in `tests/test_bedrock_bearer_token.py` or its
-stray-substitution scan fails (verified live: it does).
+forward covers only `--runtime local`, and there are **two** further launch
+blocks — Fly and EC2 each build their own `child_env = dict(os.environ)` inside
+their own unquoted `<<PY` heredoc. Both must forward the value, JSON-encoded
+(`_leerie_commit_json` / `_ec2_leerie_commit_json`) like every other
+substitution there; the Fly name additionally goes in the `${...}` allowlist in
+`tests/test_bedrock_bearer_token.py` or its stray-substitution scan fails
+(verified live: it does — EC2 has no equivalent scan, which is its own gap).
+**The guard is derived, not enumerated**: `_child_env_blocks()` finds every
+`child_env = dict(os.environ)` in the launcher and requires each to forward the
+var, so a third runtime fails automatically. This exists because the
+hard-coded version shipped covering Fly only while being *named*
+`..._fly_ec2_path_too` — EC2 recorded null and a reviewer caught it, not the
+suite. Two anti-vacuity controls are mandatory alongside it, since a splitter
+that finds nothing passes everything: at least two blocks must be found, and
+every block must also set `USER_REPO` (known present in both), so a broken
+slice fails as a broken slice rather than as a missing key.
 The `--dangerously-force-strict-output` context-window regression (DESIGN §7
 *Forcing constrained decoding*, §6 *A client-side context refusal*) is covered
 by three files. The defect: the flag works by owning `ANTHROPIC_BASE_URL`, and

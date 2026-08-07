@@ -7408,6 +7408,7 @@ print(json.dumps(sys.argv[1:]))
           # break out of a raw Python string literal on this remote machine.
           _ec2_oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
           _ec2_oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
+          _ec2_leerie_commit_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
           _ec2_launch_script="$(cat <<PY
 import fcntl, os, pwd, subprocess, sys, time
 argv = ${_ec2_launch_argv_json}
@@ -7444,6 +7445,10 @@ child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = "${_ec2_host_tz}"
+# Recorded beside leerie_version in state.json. Every orchestrator launch
+# path must forward this -- local, fly AND ec2 -- or the field is null for
+# whichever runtime is missed, which is how ec2 was skipped once already.
+child_env["LEERIE_COMMIT"] = ${_ec2_leerie_commit_json}
 # CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty JSON string
 # is falsy) so the in-machine orchestrator's multi-token probe/rotation
 # (DESIGN §6 *Multi-token rotation*) sees the full list, not just the single
