@@ -4665,25 +4665,82 @@ def _is_node_repo(cwd: str) -> bool:
     return any((Path(cwd) / name).exists() for name in _NODE_MANIFEST_NAMES)
 
 
-def _auto_worker_memory_max(max_parallel: int) -> int:
-    """Auto-derive a per-worker memory cap from /proc/meminfo.
+# N9 (PENDING_ISSUES.md): every concurrent leerie run shares ONE
+# `leerie.slice` cgroup with a single enforced `memory.max` — measured live,
+# `_auto_worker_memory_max`'s /proc/meminfo basis sized each worker as if its
+# run owned the whole host, so N concurrent runs' workers could jointly
+# demand 2.3x the shared slice's actual budget (individual workers get
+# SIGKILLed by the kernel OOM killer inside their own cgroup when the shared
+# slice hits its cap, even though the slice-wide backstop itself holds).
+# `_WORKER_BUILD_PEAK_BYTES` is the measured combined build+resident-claude
+# peak (_auto_worker_memory_max's docstring, below) that admission is gated
+# against: below this, a build-running worker is at real risk of an in-cgroup
+# OOM kill rather than merely "tight".
+_WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
+_WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
+_WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
 
-    The goal: distribute the VM's RAM across `max_parallel + 1` slots
-    so one slot remains for the orchestrator + system processes
-    (sshd, lima-guestagent, etc.) outside any worker cgroup. Floored
-    at 8 GiB per worker — the worker cgroup holds the build/test
+
+def _cgroup_slice_info() -> tuple[int, int] | None:
+    """Read-only query of the shared `leerie.slice` budget and live worker
+    concurrency, via the broker's `slice` verb (N9). Returns
+    `(memory_max_bytes, live_sibling_count)`, or None when the broker is
+    unreachable/errors/has no usable hierarchy (containment off) or reports
+    no configured slice ceiling (`memory_max_bytes == -1`) — callers must
+    treat None as "no slice-wide budget known" and fall back to a basis that
+    does not need it, never assume unlimited."""
+    try:
+        resp = _cgroup_request("slice")
+    except OSError:
+        return None
+    parts = resp.split()
+    if len(parts) != 3 or parts[0] != "OK":
+        return None
+    try:
+        mem_max, siblings = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    if mem_max <= 0:
+        return None
+    return (mem_max, siblings)
+
+
+def _slice_worker_memory_max(slice_max_bytes: int, live_siblings: int,
+                             max_parallel: int) -> int:
+    """Pure divisor (N9's chosen formula): split the shared slice budget
+    across live sibling workers PLUS this run's own worst-case concurrency
+    (`max_parallel`) PLUS one slot for the orchestrator/system processes
+    outside any worker cgroup — mirroring `_auto_worker_memory_max`'s prior
+    `total // (max_parallel + 1)` shape, but against the shared slice ceiling
+    and live cross-run concurrency instead of host RAM and this run alone.
+    Shrinks automatically as sibling runs start and grows back as they
+    finish, because the shared slice IS the shared state (no lockfile/
+    registry needed — PENDING_ISSUES.md N9). Floored at 256 MiB purely to
+    keep the result sane (positive, non-degenerate) when the slice is
+    already saturated; whether that number is actually enough for a build is
+    the admission gate's job (`_await_worker_memory_admission`), not this
+    function's."""
+    per_worker = slice_max_bytes // (live_siblings + max_parallel + 1)
+    return max(per_worker, 256 * 1024**2)
+
+
+def _auto_worker_memory_max_legacy(max_parallel: int) -> int:
+    """The pre-N9 basis: distribute /proc/meminfo MemTotal across
+    `max_parallel + 1` slots, floored at 8 GiB. Used as `_auto_worker_memory_max`'s
+    fallback when the shared-slice basis is unavailable (no broker / no
+    cgroup containment / `--dangerously-allow-uncapped`) — in that
+    situation there is no shared-slice enforcement to rely on either, so
+    sizing as if this run owns the host is the closest approximation left.
+
+    Floored at 8 GiB per worker — the worker cgroup holds the build/test
     subprocess tree AND the resident `claude -p` process at the same
     time (claude stays alive running the build via Bash and streaming
     its output), and live in-container measurement showed a Next.js/
     Turbopack build alone peaking at 4.16 GiB, build + resident claude
-    at ~6.3 GiB. The prior 4 GiB clamp was below that combined peak, so
-    no VM size could auto-derive enough for a build-running worker; an
-    8 GiB floor gives margin over the measured 6.3 GiB peak. The
-    aggregate `leerie.slice` memory.max (scripts/container-entry.sh) is
-    the real VM-OOM backstop, so this per-worker floor can be generous
-    — multi-worker waves stay bounded by that slice cap, not by this
-    per-worker number; build-heavy waves should pair a generous
-    per-worker cap with a lower --max-parallel.
+    at ~6.3 GiB (`_WORKER_BUILD_PEAK_BYTES`). The prior 4 GiB clamp was
+    below that combined peak, so no VM size could auto-derive enough for
+    a build-running worker; an 8 GiB floor gives margin over the
+    measured 6.3 GiB peak.
 
     Falls back to 2 GiB if /proc/meminfo is unreadable (non-Linux,
     sandboxed test, etc.). The cgroup write itself will detect a
@@ -4701,6 +4758,68 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
         return 2 * 1024**3
     per_worker = total // (max_parallel + 1)
     return max(per_worker, 8 * 1024**3)
+
+
+def _auto_worker_memory_max(max_parallel: int) -> int:
+    """Auto-derive a per-worker memory cap.
+
+    N9-corrected basis: the aggregate `leerie.slice` memory.max
+    (scripts/container-entry.sh) is shared by every concurrent leerie run on
+    the host, not owned exclusively by this one — so the per-worker cap is
+    now derived from that shared budget (`_slice_worker_memory_max`, divided
+    across live sibling workers + this run's own `max_parallel` + one
+    orchestrator/system slot) rather than /proc/meminfo, which sized each
+    worker as if this run owned the whole host and let concurrent runs
+    jointly overcommit the shared slice (measured 2.3x — PENDING_ISSUES.md
+    N9). Falls back to the legacy /proc/meminfo basis
+    (`_auto_worker_memory_max_legacy`) when the shared-slice budget can't be
+    read (no broker, no cgroup containment, `--dangerously-allow-uncapped`)
+    — there the shared-slice enforcement this basis depends on is absent
+    anyway."""
+    info = _cgroup_slice_info()
+    if info is None:
+        return _auto_worker_memory_max_legacy(max_parallel)
+    slice_max_bytes, live_siblings = info
+    return _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
+
+
+async def _await_worker_memory_admission(
+        max_parallel: int,
+        build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES,
+        poll_interval_sec: float = _WORKER_MEMORY_ADMISSION_POLL_SEC,
+        max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> None:
+    """Admission gate (N9 DECISION 2026-08-06): before spawning a new
+    worker, block while admitting it would drive the shared per-worker
+    allocation below the measured build peak — rather than admitting it
+    regardless and letting the kernel OOM-kill it mid-build. Returns
+    (admits) immediately when no shared-slice budget is readable (no
+    broker / containment off — nothing to gate against) or once the
+    computed per-worker share is >= `build_peak_bytes`.
+
+    Bounded at `max_wait_sec` (default 10 min) rather than blocking
+    forever: a long-running sibling worker that never releases its slot
+    would otherwise wedge this run's admission indefinitely. On timeout,
+    admits anyway and logs — a late-admitted worker risking an in-cgroup
+    OOM kill is the pre-N9 status quo, not a new failure mode, and is
+    strictly better than a run that never makes progress."""
+    waited = 0.0
+    while True:
+        info = _cgroup_slice_info()
+        if info is None:
+            return
+        slice_max_bytes, live_siblings = info
+        cap = _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
+        if cap >= build_peak_bytes:
+            return
+        if waited >= max_wait_sec:
+            log(f"  worker memory admission wait exceeded "
+                f"{max_wait_sec:.0f}s (shared slice would allocate "
+                f"{cap / 1024**3:.1f} GiB/worker, below the "
+                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor); "
+                f"admitting anyway")
+            return
+        await asyncio.sleep(poll_interval_sec)
+        waited += poll_interval_sec
 
 
 def resolve_worker_memory_max(repo_root: Path,
@@ -12918,7 +13037,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
-                  active_token: str | None = None) -> dict:
+                  active_token: str | None = None,
+                  max_parallel: int | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -12952,7 +13072,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     with per-invocation, with no container restart. Passed explicitly
     rather than mutated via ambient `os.environ` because the orchestrator
     runs many `claude -p` workers concurrently (`asyncio.gather` under
-    `Semaphore(max_parallel)`); mutating process-global env would race."""
+    `Semaphore(max_parallel)`); mutating process-global env would race.
+
+    `max_parallel`, when given, arms the N9 slice-aware admission gate
+    (`_await_worker_memory_admission`): before spawning, block while
+    admitting this worker would drive the shared `leerie.slice`
+    per-worker allocation below the measured build-peak floor. None
+    (the default) skips the gate — used by callers with no run-level
+    `max_parallel` context, e.g. the startup smoke test."""
+    if max_parallel is not None:
+        await _await_worker_memory_admission(max_parallel)
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -14089,7 +14218,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          DEFAULT_CAPS["worker_pids_max"]),
                                      run_id=st.run_id,
                                      active_token=st.data.get(
-                                         "active_oauth_token"))
+                                         "active_oauth_token"),
+                                     max_parallel=caps.get("max_parallel"))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry

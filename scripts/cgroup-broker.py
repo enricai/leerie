@@ -44,6 +44,11 @@ Protocol (newline-terminated, one request per connection):
   create <sid> <mem_bytes> <pids_max>  -> OK | ERR <msg>
   enroll <sid> <pid>            -> OK | ERR <msg>
   destroy <sid>                 -> OK | ERR <msg>
+  stat <sid>                    -> OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill> | ERR <msg>
+  slice                         -> OK <leerie.slice memory.max, -1 if unset> <live sibling worker cgroups>
+                                    (N9: read-only, used to size a new worker's
+                                    memory cap against the shared slice budget
+                                    rather than /proc/meminfo)
 
 `<sid>` is validated against `^[A-Za-z0-9._-]+$` and only ever composed
 into `leerie-w-<sid>` under the fixed slice — no path traversal. `<pid>`,
@@ -271,6 +276,50 @@ def _v1_stat(sid: str) -> tuple[int, int, int, int]:
             _memory_events_oom(f"{mdir}/memory.events"))
 
 
+# --- slice-wide read (N9: per-worker sizing must be aware of the shared
+# leerie.slice budget and how many sibling worker cgroups are actually
+# live right now, not merely how many exist — see N17: finished runs'
+# empty leerie-w-* dirs persist, so a bare directory count overcounts). --
+
+def _slice_dir() -> str:
+    return f"{V2_ROOT}/{SLICE}" if _HIER == "v2" else f"{V1_ROOT}/memory/{SLICE}"
+
+
+def _slice_memory_max() -> int:
+    # v2: unified memory.max under the slice. v1: split memory controller's
+    # memory.limit_in_bytes. Either may read "max"/be absent (no configured
+    # ceiling) -> -1, meaning "no shared budget known" to the caller.
+    path = (f"{V2_ROOT}/{SLICE}/memory.max" if _HIER == "v2"
+            else f"{V1_ROOT}/memory/{SLICE}/memory.limit_in_bytes")
+    raw = _read(path).strip()
+    if not raw or raw == "max":
+        return -1
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+
+
+def _live_sibling_count() -> int:
+    # A worker cgroup is "live" iff it currently has enrolled processes —
+    # cgroup.procs is non-empty. Finished runs' cgroups persist empty (N17)
+    # and must not be counted; counting bare `leerie-w-*` directories
+    # overcounted 7x when this was measured live.
+    d = _slice_dir()
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return 0
+    procs_name = "cgroup.procs"
+    count = 0
+    for name in entries:
+        if not name.startswith("leerie-w-"):
+            continue
+        if _read(f"{d}/{name}/{procs_name}").strip():
+            count += 1
+    return count
+
+
 # --- dispatch --------------------------------------------------------------
 
 def _valid_sid(sid: str) -> bool:
@@ -311,6 +360,8 @@ def _do(verb: str, args: list[str]) -> str:
             return "ERR bad sid"
         cur, mx, ev, oom = stat(sid)
         return f"OK {cur} {mx} {ev} {oom}"
+    if verb == "slice":
+        return f"OK {_slice_memory_max()} {_live_sibling_count()}"
     return f"ERR unknown verb {verb}"
 
 
