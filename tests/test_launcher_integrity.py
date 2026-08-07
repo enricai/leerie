@@ -30,19 +30,18 @@ pre-existing findings first, which is why it is not attempted here.
 """
 from __future__ import annotations
 
-import re
+import ast
 import subprocess
+import warnings
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "leerie"
 TESTS_DIR = Path(__file__).resolve().parent
 
-# What a launcher syntax check looks like, whoever writes it. Matched against
-# test sources so the guard below finds the check wherever it lives rather than
-# hard-coding this file's name — the same derive-don't-enumerate discipline as
-# `tests/launcher_blocks.py`.
-_BASH_N = re.compile(r'"bash",\s*"-n"')
+# Names that, appearing inside the SAME argv list as `bash -n`, identify the
+# launcher as the thing being checked.
+_LAUNCHER_REFS = ("LAUNCHER", "leerie")
 
 
 def test_launcher_parses() -> None:
@@ -52,19 +51,56 @@ def test_launcher_parses() -> None:
     assert r.returncode == 0, f"leerie does not parse:\n{r.stderr}"
 
 
+def _checks_launcher_syntax(argv: ast.expr) -> bool:
+    """True when `argv` is a list literal running `bash -n` on the launcher.
+
+    Both facts must hold *within the same list*. An earlier version tested for
+    `bash -n` and a launcher reference anywhere in the same file, which is not
+    evidence the two are connected: a file running `bash -n` against something
+    else while separately mentioning `LAUNCHER` would have counted as coverage,
+    letting the guard below pass while the real check was gone — precisely the
+    failure it exists to catch. `container-entry.sh` is `bash -n`-checked in
+    `test_container_entry_run_id.py` and must not be mistaken for the launcher.
+    """
+    if not isinstance(argv, ast.List):
+        return False
+    literals = {e.value for e in argv.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    if not {"bash", "-n"} <= literals:
+        return False
+    return any(ref in ast.unparse(argv) for ref in _LAUNCHER_REFS)
+
+
 def _files_checking_launcher_syntax() -> list[str]:
     """Test files that run `bash -n` against the launcher specifically.
 
-    Requires both the invocation shape and a reference to the launcher path in
-    the same file — `container-entry.sh` is also `bash -n`-checked elsewhere,
-    and that must not be mistaken for coverage of the launcher.
+    Structural rather than textual, matching what this repo reaches for when
+    the *shape* of a call is the thing being asserted (`test_state_fields`'s
+    `st.data` write sweep, `test_claude_p_call_sites`, the `args.resume` branch
+    walk in `test_leerie_commit.py`).
     """
     out: list[str] = []
     for path in sorted(TESTS_DIR.rglob("*.py")):
-        text = path.read_text(errors="replace")
-        if _BASH_N.search(text) and 'LAUNCHER' in text or (
-                _BASH_N.search(text) and '"leerie"' in text):
-            out.append(path.name)
+        try:
+            # Warnings suppressed: parsing every test file surfaces other
+            # files' SyntaxWarnings, at least one of which is deliberate and
+            # documented as not-to-be-fixed (test_ec2_seed_repo.py's `\/`,
+            # where the surrounding bash relies on Python collapsing the
+            # escape). CI's syntax.yml already parses them all; this guard
+            # should not re-report someone else's intentional choice.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = ast.parse(path.read_text(errors="replace"),
+                                 filename=str(path))
+        except SyntaxError:  # not ours to police; syntax.yml covers it
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and node.args
+                    and getattr(node.func, "attr", getattr(node.func, "id", None))
+                    == "run"
+                    and _checks_launcher_syntax(node.args[0])):
+                out.append(path.name)
+                break
     return out
 
 
