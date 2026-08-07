@@ -22305,6 +22305,12 @@ def check_budget_feasibility(st: State, caps: dict,
             f"still fire if the estimate was correct).",
             code=EXIT_BUDGET_INFEASIBLE,
         )
+    log(
+        f"budget feasibility: cap {cap} ok for total estimate "
+        f"{total_estimate:g} ({already_spent} spent + "
+        f"{remaining_estimate:g} remaining, × margin {margin} = "
+        f"{total_estimate * margin:g})"
+    )
 
 
 def _repair_prescribed_commands(plans: list[dict],

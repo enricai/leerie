@@ -258,3 +258,49 @@ def test_state_field_registered(leerie):
     test_state_fields.py will catch the drift between the runtime
     state-write site and the canonical schema in IMPLEMENTATION.md §8."""
     assert "skip_budget_check" in leerie.STATE_FIELDS
+
+
+def test_passing_path_logs_resolved_cap_and_total_estimate(leerie, monkeypatch):
+    """N18: a passing check_budget_feasibility() call must not be a
+    silent success — it should log the resolved cap and total estimate
+    so the numbers are observable even when the run never dies. Falsify
+    by removing the added log() call: this test then fails since no
+    lines are captured."""
+    lines = []
+    monkeypatch.setattr(leerie, "log", lambda msg: lines.append(msg))
+    st = _FakeState(worker_count=2)
+    caps = _default_caps(leerie)
+    leerie.check_budget_feasibility(st, caps, _make_subtasks(3), _make_waves(1))
+    assert len(lines) == 1
+    cap = caps["max_total_workers"]
+    remaining_estimate = (
+        3 * caps["subtask_call_estimate"] + 1 + caps["conformance_rounds"] + 1
+    )
+    total_estimate = 2 + remaining_estimate
+    assert str(cap) in lines[0]
+    assert f"{total_estimate:g}" in lines[0]
+
+
+def test_skip_flag_suppresses_the_pass_log(leerie, monkeypatch):
+    """The `--skip-budget-check` early return must not emit the passing-
+    path log line — there is no resolved cap/estimate to report."""
+    lines = []
+    monkeypatch.setattr(leerie, "log", lambda msg: lines.append(msg))
+    st = _FakeState(worker_count=2, skip=True)
+    caps = _default_caps(leerie)
+    leerie.check_budget_feasibility(st, caps, _make_subtasks(3), _make_waves(1))
+    assert lines == []
+
+
+def test_failing_path_still_dies_without_the_pass_log(leerie, monkeypatch):
+    """The die() branch must remain unaffected by the new log() line —
+    it should not additionally emit the passing-path message before
+    dying."""
+    lines = []
+    monkeypatch.setattr(leerie, "log", lambda msg: lines.append(msg))
+    st = _FakeState(worker_count=0)
+    caps = _default_caps(leerie)
+    caps["max_total_workers"] = 1
+    with pytest.raises(SystemExit):
+        leerie.check_budget_feasibility(st, caps, _make_subtasks(100), _make_waves(10))
+    assert lines == []
