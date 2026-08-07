@@ -24354,7 +24354,7 @@ async def _capture_conformance_baseline(
             continue
         try:
             rc, tail = await _run_streaming(
-                ["bash", "-lc", cmd], cwd=str(staging), timeout=timeout,
+                ["bash", "-c", cmd], cwd=str(staging), timeout=timeout,
                 log_path=log_path, label=f"baseline-{axis}: {cmd}",
                 verbosity=verbosity)
             summary = (tail or "").strip()[-400:]
