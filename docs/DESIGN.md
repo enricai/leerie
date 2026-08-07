@@ -2256,9 +2256,11 @@ a regression rather than "unnecessary brittleness":
   the PR body — without re-deriving or second-guessing *how* the worker
   reached that verdict.
 - **Never blocking the run.** Every branch of this logic (worktree-creation
-  failure, a successful rebase, a resolved conflict, an aborted rebase) falls
-  through to a push; the rebase step is strictly best-effort and never returns
-  non-zero, pauses, or blocks finalize.
+  failure, a successful rebase, a resolved conflict, an aborted rebase, a
+  worker seam failure, or a worker response that comes back malformed —
+  unparseable or missing a usable `status` field despite the seam itself
+  exiting cleanly) falls through to a push; the rebase step is strictly
+  best-effort and never returns non-zero, pauses, or blocks finalize.
 
 Two flags control push and PR independently of body composition:
 
