@@ -244,6 +244,28 @@ def test_pid_exhaustion_attaches_pids_stat_to_warnings(env):
                         "surfaced as advisory" for w in warnings)
 
 
+def test_run_conformer_reraises_pid_exhausted_error(env, monkeypatch):
+    """`_run_conformer` itself must re-raise `PidExhaustedError` — not
+    swallow it under the generic `except WorkerError` (of which it is a
+    subclass) the way an ordinary crashed worker is swallowed."""
+    c = env["leerie"]
+
+    async def _fake_claude_p(*args, **kwargs):
+        raise c.PidExhaustedError(
+            "worker t1-conformer exhausted its PID cgroup "
+            "(pids.current=2048/2048, fork denials=7); every "
+            "shell-spawning tool call fails with EAGAIN")
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    with pytest.raises(c.PidExhaustedError, match="pids.current=2048/2048"):
+        asyncio.run(c._run_conformer(
+            env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+            env["st"], env["models"], {"conformer": None}, rules_files=[],
+            blt_commands={"build": "", "lint": "", "test": ""},
+            diff_base=env["run_branch"]))
+
+
 # --- protected path: conformer commits get rolled back --------------------
 
 def test_protected_path_commit_is_rolled_back(env):
