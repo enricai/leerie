@@ -4736,9 +4736,15 @@ ensure_base_in_buildkit_ns() {
     return 0
   fi
   remote_log "copying base image into buildkit namespace (one-time; ~15-20s)..."
-  if ! nerdctl save "$IMAGE_TAG" | nerdctl --namespace buildkit load >/dev/null 2>&1; then
+  local _save_load_tar _save_load_err
+  _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
+  _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
+  if ! { nerdctl save -o "$_save_load_tar" "$IMAGE_TAG" && \
+         nerdctl --namespace buildkit load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
     remote_log "warning: could not copy base image into buildkit namespace — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+    remote_log "warning: save/load error output: $(cat "$_save_load_err")"
   fi
+  rm -f "$_save_load_tar" "$_save_load_err"
 }
 
 # Build the per-repo derived image. Caller has already verified the build
@@ -5359,7 +5365,7 @@ PY
            --build-arg BASE_IMAGE="$IMAGE_TAG" \
            --build-arg HOST_UID="$(id -u)" \
            --build-arg HOST_GID="$(id -g)" \
-           -t "__leerie_lang_probe_$$" \
+           -t "leerie-lang-probe:$$" \
            -f "$_leerie_dockerfile" \
            "$USER_REPO" \
            >/dev/null 2>&1; then
@@ -5384,7 +5390,7 @@ PY
         mv "$_gen_df_tmp2" "$_leerie_dockerfile"
         unset _gen_df_tmp2 _pkg2
       else
-        nerdctl image rm "__leerie_lang_probe_$$" >/dev/null 2>&1 || true
+        nerdctl image rm "leerie-lang-probe:$$" >/dev/null 2>&1 || true
       fi
     fi
   fi
