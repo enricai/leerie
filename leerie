@@ -4469,6 +4469,33 @@ _warn_if_leerie_stale() {
 }
 _warn_if_leerie_stale || true
 
+# --- in-repo tee-log warning ---------------------------------------------
+# Operators commonly run `leerie task | tee leerie-<task>.log`, and the log
+# lands in $USER_REPO by default — which is bind-mounted whole into every
+# worker's container at /work (DESIGN §2). A worker can then `cat`/`grep`
+# its own orchestration log, including gate vocabulary and internal check
+# names, defeating judge independence (e.g. an adherence/wiring judge
+# reading the very log that would tell it what verdict is expected).
+#
+# Detection-and-warn only (N5). The correct-default fix — writing the log
+# outside the repo via --log-file — is separate work; this check never
+# blocks the run, only alerts before it proceeds.
+_warn_if_log_in_repo() {
+  local _f
+  for _f in "$USER_REPO"/leerie-*.log; do
+    [ -e "$_f" ] || continue
+    remote_log "warning: found $(basename "$_f") inside the repo root" \
+               "($USER_REPO)."
+    echo "  This directory is bind-mounted whole into every worker" >&2
+    echo "  container. If this file is your \`tee\` target for this" >&2
+    echo "  run's output, workers can read their own orchestration log —" >&2
+    echo "  including judge/gate names — undermining judge independence." >&2
+    echo "  Move the log outside the repo (e.g. \`leerie task | tee" >&2
+    echo "  /tmp/leerie-task.log\`)." >&2
+  done
+}
+_warn_if_log_in_repo || true
+
 # --- host preflight: git repo + gh + jq ---------------------------------
 # These checks moved out of the orchestrator (DESIGN §6 *Finalization*).
 # The launcher does the host-side push + PR after the container exits,

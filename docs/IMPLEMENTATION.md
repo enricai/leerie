@@ -241,6 +241,24 @@ plain process exec, not in-session orchestration). §6 *Worker subtree
 termination* and §0.5 of this document describe what runs inside the
 container the launcher starts.
 
+### In-repo tee-log warning (N5)
+
+Operators commonly run `leerie task | tee leerie-<task>.log`, and the log
+lands in `$USER_REPO` by default — which is bind-mounted whole into every
+worker's container at `/work`. A worker can then `cat`/`grep` its own
+orchestration log, including gate vocabulary and internal check names,
+defeating judge independence.
+
+`_warn_if_log_in_repo()` runs immediately after the stale-install warning,
+before host preflight. It globs `"$USER_REPO"/leerie-*.log`, and for each
+match logs a warning naming the file plus the bind-mount risk. **Detection
+and warning only** — it never blocks the run; relocating the default log
+destination (`--log-file`) is separate work.
+
+Mirrors `_warn_if_leerie_stale()`'s detection-and-warn shape and is tested
+the same way (`tests/test_log_in_repo_warning.py`, extracting the function
+verbatim from the launcher).
+
 ---
 
 ### `config`
