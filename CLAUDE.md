@@ -2714,6 +2714,58 @@ walks the AST of `_run_phases`, because the obvious
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+`tests/test_launcher_integrity.py` is the **only** thing that checks the
+`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh`
+and the launcher has no `.sh` extension nor lives there, while `syntax.yml`
+AST-parses Python only. No test runs shellcheck at all — every occurrence of
+the word under `tests/` is prose describing this gap. So a `bash -n`-level
+syntax error in a 7k-line launcher would otherwise ship green.
+That check first appeared inside `test_leerie_commit.py`, a file about one
+state field, where it was coverage by accident: restructuring that file would
+have removed the launcher's only validation silently. It is now named and
+owned, with a derived guard (`_files_checking_launcher_syntax`) asserting some
+file still runs `bash -n` against the launcher — scanning `tests/` rather than
+naming itself, so moving the check again is fine and deleting it is not. The
+scan requires the invocation shape *and* a launcher reference in the same file,
+since `container-entry.sh` is `bash -n`-checked elsewhere and must not be
+mistaken for launcher coverage; an anti-vacuity test requires the scan to find
+its own file, so a broken scan fails as a broken scan.
+**Known shortfall, deliberately not papered over:** `bash -n` does not catch
+the backtick class — a balanced pair inside what reads as a comment is parsed
+as command substitution, silently dropping that text from the script sent to a
+remote machine. leerie has shipped that defect once; it was caught by diffing
+`shellcheck -x leerie`, with `bash -n` clean throughout. Linting the whole
+launcher with shellcheck is the real fix and needs a measured baseline of
+pre-existing findings first.
+`tests/launcher_blocks.py` is the **single** derivation of the launcher's
+orchestrator launch blocks — the `child_env = dict(os.environ)` regions inside
+each unquoted `<<PY` heredoc, one per remote runtime. It owns three constants
+that would otherwise be replicated per consumer: the block marker, the `\nPY\n`
+terminator, and the preamble window searched for the `--runtime` label. Both
+`test_leerie_commit.py` (LEERIE_COMMIT forwarding) and
+`test_bedrock_bearer_token.py` (stray-`${...}` and backtick scans) import
+`launch_env_blocks()` from it — package-qualified as
+`from tests.launcher_blocks import ...`, the same form every shared test module
+here uses (`tests.ec2_stub`, `tests.conftest`), with no `sys.path` juggling:
+`tests/__init__.py` exists, so `tests` is a real package. A neutral module
+rather than a cross-test import
+because the two consumers are unrelated concerns and neither should own it
+(`tests/ec2_stub.py` is the precedent for the shape). It reads the launcher
+itself rather than taking the source as an argument, so callers holding a `str`
+or a `Path` are equally served.
+**Why a shared module and not two local copies**: PRs #180–#183 each replaced a
+hard-coded enumeration with a derivation after a missed instance shipped —
+`ContextOverflow` in 1 of 9 capture guards, `leerie_commit` in 1 of 2
+state-init branches, then 1 of 2 launch blocks (that last one caught by a
+reviewer, not the suite). The derivation was then written twice, once per
+consumer. Two copies of a *rule* drift exactly the way two copies of a *list*
+do. `tests/test_no_duplicate_launcher_splitters.py` enforces the single owner
+and carries two anti-vacuity controls, since a scan that matches nothing would
+certify 'no duplicates' forever: the marker must be found *inside* the owner,
+and at least two other files must actually import `launch_env_blocks`. The
+load-bearing falsification is breaking the shared splitter and confirming
+guards in **both** consuming files fail — that is what proves they share it
+rather than merely importing it.
 `tests/test_leerie_commit.py` pins the `leerie_commit` state field, which
 disambiguates `leerie_version`. `plugin.json` only moves on a `chore(release):`
 commit while `install.sh` tracks `main` (`DEFAULT_REF`), so every run between

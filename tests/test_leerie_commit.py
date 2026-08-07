@@ -16,7 +16,6 @@ a run or write a misleading empty string.
 """
 import json
 import re
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -24,28 +23,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator"))
 import leerie  # noqa: E402
 
+# One shared derivation of the launcher's launch blocks — see
+# tests/launcher_blocks.py for why it is not re-implemented per consumer.
+from tests.launcher_blocks import launch_env_blocks  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = (REPO / "leerie").read_text()
 
 
 
-def _child_env_blocks() -> list[tuple[str, str]]:
-    """Every in-heredoc orchestrator launch env block, as (runtime, source).
-
-    Derived from the launcher rather than enumerated: each remote runtime
-    builds its own `child_env = dict(os.environ)` inside its launch heredoc,
-    and a hard-coded list silently stops covering a runtime the moment one is
-    added. The runtime label comes from the `--runtime <rt>` string in the
-    duplicate-run message just above each block.
-    """
-    out: list[tuple[str, str]] = []
-    for m in re.finditer(r"child_env = dict\(os\.environ\)", LAUNCHER):
-        end = LAUNCHER.find("\nPY\n", m.start())
-        block = LAUNCHER[m.start():end if end > 0 else len(LAUNCHER)]
-        preamble = LAUNCHER[max(0, m.start() - 1200):m.start()]
-        rt = "ec2" if "--runtime ec2" in preamble else "fly"
-        out.append((rt, block))
-    return out
 
 
 class TestStateSurface:
@@ -213,11 +199,6 @@ class TestLauncher:
         assert m, "denylist not found"
         assert "LEERIE_COMMIT" not in m.group(0)
 
-    def test_launcher_still_parses(self):
-        r = subprocess.run(["bash", "-n", str(REPO / "leerie")],
-                           capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr
-
     def test_every_remote_launch_block_forwards_it(self):
         """EVERY orchestrator launch path must forward this, not just the one
         in front of whoever last edited it.
@@ -230,7 +211,7 @@ class TestLauncher:
         the launcher instead of listing it: a third runtime fails here
         automatically.
         """
-        blocks = _child_env_blocks()
+        blocks = launch_env_blocks()
         missing = [rt for rt, blk in blocks
                    if 'child_env["LEERIE_COMMIT"]' not in blk]
         assert not missing, (
@@ -245,7 +226,7 @@ class TestLauncher:
         fails, the splitter is broken — and it fails *as* a broken splitter
         rather than masquerading as a missing key.
         """
-        blocks = _child_env_blocks()
+        blocks = launch_env_blocks()
         assert len(blocks) >= 2, (
             f"expected at least the fly and ec2 launch blocks, found "
             f"{len(blocks)} — the block splitter is broken")
