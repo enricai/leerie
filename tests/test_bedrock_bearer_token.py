@@ -21,6 +21,13 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+# One shared derivation of the launcher's launch blocks — see
+# tests/launcher_blocks.py for why it is not re-implemented per consumer.
+from launcher_blocks import launch_env_blocks  # noqa: E402
 import shutil
 import subprocess
 from pathlib import Path
@@ -453,28 +460,9 @@ _KNOWN_HEREDOC_SUBSTITUTIONS = {
 }
 
 
-def _launch_env_blocks() -> list[tuple[str, str]]:
-    """Every orchestrator launch heredoc's env block, as (runtime, body).
-
-    Derived rather than enumerated. These scans originally covered the Fly
-    body only -- a narrow `child_env["TZ"]`-to-`AWS_REGION` slice -- while the
-    EC2 launch heredoc, an unquoted `<<PY` with the identical failure modes,
-    had no coverage at all. Deriving the set means a third runtime is scanned
-    the day it is added.
-    """
-    src = LAUNCHER.read_text()
-    out: list[tuple[str, str]] = []
-    for m in re.finditer(r"child_env = dict\(os\.environ\)", src):
-        end = src.find("\nPY\n", m.start())
-        body = src[m.start():end if end > 0 else len(src)]
-        preamble = src[max(0, m.start() - 1200):m.start()]
-        out.append(("ec2" if "--runtime ec2" in preamble else "fly", body))
-    return out
-
-
 def test_launch_block_discovery_is_not_vacuous() -> None:
     """A splitter that finds nothing makes both scans below pass trivially."""
-    blocks = _launch_env_blocks()
+    blocks = launch_env_blocks()
     assert len(blocks) >= 2, (
         f"expected at least the fly and ec2 launch heredocs, found "
         f"{len(blocks)} -- the splitter is broken, so the scans prove nothing")
@@ -501,7 +489,7 @@ def test_child_env_heredoc_body_has_no_stray_unbound_var_substitution() -> None:
     `bash: line N: VAR: unbound variable` when the surrounding script is
     executed. Only the KNOWN, intentional substitution names may appear in
     `${...}` form inside this region."""
-    for runtime, block in _launch_env_blocks():
+    for runtime, block in launch_env_blocks():
         known = _KNOWN_HEREDOC_SUBSTITUTIONS[runtime]
         found = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", block))
         unexpected = found - known
@@ -531,7 +519,7 @@ def test_child_env_heredoc_body_has_no_backtick_characters() -> None:
     `git stash` is how this was originally caught; `bash -n` alone does not
     catch it. This heredoc's content is pure Python, which never needs a
     literal backtick, so the invariant is simply: none allowed."""
-    for runtime, block in _launch_env_blocks():
+    for runtime, block in launch_env_blocks():
         assert "`" not in block, (
             f"a backtick character appeared in the unquoted {runtime} heredoc "
             f"body — bash will treat a balanced pair as command substitution "

@@ -2714,6 +2714,31 @@ walks the AST of `_run_phases`, because the obvious
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+`tests/launcher_blocks.py` is the **single** derivation of the launcher's
+orchestrator launch blocks — the `child_env = dict(os.environ)` regions inside
+each unquoted `<<PY` heredoc, one per remote runtime. It owns three constants
+that would otherwise be replicated per consumer: the block marker, the `\nPY\n`
+terminator, and the preamble window searched for the `--runtime` label. Both
+`test_leerie_commit.py` (LEERIE_COMMIT forwarding) and
+`test_bedrock_bearer_token.py` (stray-`${...}` and backtick scans) import
+`launch_env_blocks()` from it; a neutral module rather than a cross-test import
+because the two consumers are unrelated concerns and neither should own it
+(`tests/ec2_stub.py` is the precedent for the shape). It reads the launcher
+itself rather than taking the source as an argument, so callers holding a `str`
+or a `Path` are equally served.
+**Why a shared module and not two local copies**: PRs #180–#183 each replaced a
+hard-coded enumeration with a derivation after a missed instance shipped —
+`ContextOverflow` in 1 of 9 capture guards, `leerie_commit` in 1 of 2
+state-init branches, then 1 of 2 launch blocks (that last one caught by a
+reviewer, not the suite). The derivation was then written twice, once per
+consumer. Two copies of a *rule* drift exactly the way two copies of a *list*
+do. `tests/test_no_duplicate_launcher_splitters.py` enforces the single owner
+and carries two anti-vacuity controls, since a scan that matches nothing would
+certify 'no duplicates' forever: the marker must be found *inside* the owner,
+and at least two other files must actually import `launch_env_blocks`. The
+load-bearing falsification is breaking the shared splitter and confirming
+guards in **both** consuming files fail — that is what proves they share it
+rather than merely importing it.
 `tests/test_leerie_commit.py` pins the `leerie_commit` state field, which
 disambiguates `leerie_version`. `plugin.json` only moves on a `chore(release):`
 commit while `install.sh` tracks `main` (`DEFAULT_REF`), so every run between
