@@ -7750,7 +7750,12 @@ un-integrated subtask branches on the machine and merges them into the
 run branch via `setup-run.sh` (idempotent) + `integrate.sh`.
 Conflicts are resolved by spawning `claude -p` with the integrator
 prompt and schema (same invocation as `integrate_wave()` in the
-orchestrator). The integrator runs in the staging worktree with the
+orchestrator). That direct invocation puts this script **outside** the
+`--dangerously-force-strict-output` path: `collect_subtrees_remote` runs only
+after the orchestrator — which owns the proxy — has exited, so there is no
+listener left to reach. Output is still schema-validated by the script's
+embedded `SCHEMAS["integrator"]` copy; it is not constrained during
+generation. See DESIGN §7 *Forcing constrained decoding*. The integrator runs in the staging worktree with the
 merge left in-progress. On success, the merge commit is verified
 (`MERGE_HEAD` must not exist, no staged-but-uncommitted changes). On
 failure, the merge is aborted and the branch is skipped. Wave ordering from
@@ -8008,6 +8013,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `_run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 | `pr_base_branch` | str | the final branch this run's PR merges into — overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (resolved by `resolve_pr_base_branch`, CLI > env > file precedence, mirroring `resolve_pr_template`). Defaults to `working_branch` when unset (`resolve_pr_base_branch(...) or working_branch`, computed once at run start alongside `working_branch`). Mirrored to `run.json.pr_base_branch`. This is the PR base ONLY — never the diff fork-point, which stays `working_branch` (`rev_range = working_branch..run_branch`; `_run_final_conformance`'s `DIFF_BASE`); overloading `working_branch` for both roles would corrupt the diff base if the override branch isn't the actual fork point. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json` at the time the run started (or resumed). Persisted so the PR footer and Run metadata block can show the exact version that produced the run, which aids debugging when a run was produced by an older release. |
+| `leerie_commit` | str \| null | short sha of `$LEERIE_REPO`'s HEAD at run start, forwarded by the launcher as `LEERIE_COMMIT`. `null` when leerie was installed from a tarball rather than a git checkout — a normal state, never an error (the launcher's `rev-parse` is local-only and its failure can never fail a run). Recorded because `leerie_version` alone cannot attribute a run: `plugin.json` only moves on a `chore(release):` commit while `install.sh` tracks `main` (`DEFAULT_REF`), so every run between releases reports the same version whether or not it carries a given fix. Rendered beside the version in the PR footer / Run-metadata block as `v0.11.1 (abc1234)`. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. Combined with the sibling sentinel file `<run_dir>/dep_capture.done`, this makes the next-run backstop idempotent: the backstop skips runs whose sentinel file is present, and the cancel-arm capture skips already-captured runs. Absent on runs where capture was skipped or has not yet run. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by

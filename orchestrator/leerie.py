@@ -455,6 +455,13 @@ STATE_FIELDS = (
     # the time the run started (or resumed). Persisted so the PR footer can
     # show the exact version that produced the run, which aids debugging.
     "leerie_version",
+    # leerie_commit: the short sha of $LEERIE_REPO's HEAD at run start, from
+    # the launcher's LEERIE_COMMIT. None when leerie was installed from a
+    # tarball rather than a checkout. Recorded because leerie_version alone
+    # cannot attribute a run: plugin.json only moves on a `chore(release):`
+    # commit while install.sh tracks `main`, so every run between releases
+    # reports the same version whether or not it carries a given fix.
+    "leerie_commit",
     # dep_capture_done: set to True in state.json and written as a sentinel
     # file (<run_dir>/dep_capture.done) after capture_repo_deps completes a
     # successful write. The run-start backstop checks the sentinel file to
@@ -3529,7 +3536,14 @@ def compose_pr_body(state: dict, run_id: str) -> str:
     worker_count = state.get("worker_count")
     working_branch = state.get("working_branch")
     leerie_version = state.get("leerie_version")
+    # The commit disambiguates the version: plugin.json only moves on a
+    # release commit while install.sh tracks `main`, so `v0.11.1` alone cannot
+    # tell a reader whether a given post-release fix was present. Omitted
+    # entirely when absent (tarball install), rather than rendered empty.
+    leerie_commit = state.get("leerie_commit")
     version_suffix = f" v{leerie_version}" if leerie_version else ""
+    if version_suffix and leerie_commit:
+        version_suffix = f"{version_suffix} ({leerie_commit})"
     duration = _format_run_duration(started_at, finished_at)
     # Cost line — rendered only when the telemetry aggregate is present (it is
     # absent on pre-classify orphans). Keep the bash fallback in
@@ -26542,6 +26556,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
         st.data["leerie_version"] = _read_version()
+        # `or None` rather than the bare value: an unset or empty
+        # LEERIE_COMMIT (tarball install, or a launcher predating this field)
+        # must record absence, not an empty string that reads as a real sha.
+        st.data["leerie_commit"] = os.environ.get("LEERIE_COMMIT") or None
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
         # loaded and this resume is past the completed/no-work short-
