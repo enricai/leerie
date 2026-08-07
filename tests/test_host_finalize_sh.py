@@ -63,9 +63,21 @@ def _make_run(tmp_path: Path, run_id: str, run_json: dict,
 
 def _run_host_finalize(tmp_path: Path, run_dir: Path,
                        git_body: str = "exit 0",
-                       gh_body: str = "echo https://github.com/o/r/pull/1") -> subprocess.CompletedProcess:
+                       gh_body: str = "echo https://github.com/o/r/pull/1",
+                       python3_body: str | None = None,
+                       extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Source host-finalize.sh in bash with stubbed git/gh and call
-    host_finalize <run_dir>. Returns the CompletedProcess."""
+    host_finalize <run_dir>. Returns the CompletedProcess.
+
+    `python3_body`, if given, stubs `python3` (the rebaser seam) with a
+    controlled payload instead of letting the real interpreter attempt (and
+    fail) to import orchestrator/leerie.py. `extra_env` merges into the
+    subprocess environment (e.g. LEERIE_REPO/LEERIE_STATE_HOST_DIR, which
+    the rebaser seam reads and which are otherwise left unset — under
+    `set -u` an unset reference there already routes into the seam-failure
+    branch, which is what every other test in this file implicitly relies
+    on; tests that need a deterministic, non-empty rebaser payload should
+    set these explicitly via python3_body + extra_env instead)."""
     _make_stub_bin(tmp_path, "git", git_body)
     _make_stub_bin(tmp_path, "gh", gh_body)
     # No-op `sleep` so the gh-pr-create retry loop's backoff
@@ -74,6 +86,8 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     # logic is still verified (the loop iterates and re-invokes `gh`,
     # visible in gh.log); only the delay is removed.
     _make_stub_bin(tmp_path, "sleep", "exit 0")
+    if python3_body is not None:
+        _make_stub_bin(tmp_path, "python3", python3_body)
     user_repo = run_dir.parent.parent.parent  # .leerie/runs/<id>/.. → .leerie → repo
     # Run under `set -euo pipefail` to match production faithfully:
     # host-finalize.sh is always sourced INTO the launcher, which sets
@@ -83,13 +97,16 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     # but abort finalize in production. Matching shell options here is
     # what makes those `|| true` guards actually verified.
     script = f"set -euo pipefail; . {HOST_FINALIZE_SH}; host_finalize {run_dir}"
+    env = {
+        "PATH": f"{tmp_path}:/usr/bin:/bin",
+        "USER_REPO": str(user_repo),
+        "HOME": str(tmp_path),
+    }
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", "-c", script],
-        env={
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-            "USER_REPO": str(user_repo),
-            "HOME": str(tmp_path),
-        },
+        env=env,
         capture_output=True, text=True, check=False,
     )
 
@@ -854,3 +871,74 @@ exit 0
     git_log = (tmp_path / "git.log").read_text()
     push_invoked = any("push" in line.split() for line in git_log.splitlines())
     assert push_invoked, git_log
+
+
+# --- rebase case statement `*` fallback arm (N24: persist the disposition
+#     instead of discarding $_rebaser_json) -------------------------------
+
+def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
+    """A malformed (non-JSON, rc=0) rebaser payload takes the case
+    statement's `*` fallback arm. It must print the truncated raw payload
+    and the jq parse exit code to stderr, and persist both — plus a
+    rebase_disposition_status marker — onto run.json, rather than
+    discarding $_rebaser_json entirely.
+
+    Falsify by reverting the log/persist additions in the `*)` arm: the
+    stderr assertions and the run.json field assertions below then fail."""
+    run_dir = _make_run(
+        tmp_path, "rebase-fallback-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/rebase-fallback-aaaaaa",
+            "working_branch": "main",
+            "pr_base_branch": "main",
+            "finished_at": "2026-08-07T00:00:00+00:00",
+        },
+    )
+    r = _run_host_finalize(
+        tmp_path, run_dir,
+        python3_body='echo "not json at all"; exit 0',
+        extra_env={
+            "LEERIE_REPO": str(REPO_ROOT),
+            "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert "rebaser returned no usable status" in r.stderr
+    assert "not json at all" in r.stderr
+    assert "jq_rc=" in r.stderr
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("rebase_disposition_status") == "unusable"
+    assert after.get("rebase_disposition_jq_rc") not in (None, "0")
+    assert after.get("rebase_disposition_raw_json") == "not json at all"
+    # The rebase failure is best-effort and must never block finalize.
+    assert after.get("pushed_at") is not None
+
+
+def test_rebase_fallback_arm_persists_null_raw_json_when_payload_empty(tmp_path):
+    """A seam-failure shape (rc != 0, empty stdout) also lands in the `*`
+    fallback arm. The empty raw payload persists as JSON null (via
+    _host_finalize_update_run_json's empty-value-becomes-null convention),
+    still distinguishable from "the rebase never ran" (field absent)."""
+    run_dir = _make_run(
+        tmp_path, "rebase-fallback-empty-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/rebase-fallback-empty-aaaaaa",
+            "working_branch": "main",
+            "pr_base_branch": "main",
+            "finished_at": "2026-08-07T00:00:00+00:00",
+        },
+    )
+    r = _run_host_finalize(
+        tmp_path, run_dir,
+        python3_body="exit 1",
+        extra_env={
+            "LEERIE_REPO": str(REPO_ROOT),
+            "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert "rebaser python seam failed" in r.stderr
+    assert "rebaser returned no usable status" in r.stderr
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("rebase_disposition_status") == "unusable"
+    assert after.get("rebase_disposition_raw_json") is None
