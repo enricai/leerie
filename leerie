@@ -7816,8 +7816,21 @@ else
       # Do NOT cat the file afterward: tail already streamed it, and a cat would
       # duplicate the entire log on every clean run.
       sleep 0.3
-      kill "$_tail_pid" 2>/dev/null || true
+      # When teeing, $_tail_pid names only `tee` (the pipeline's last
+      # process, per $!) — `tail` itself is a distinct process that would
+      # otherwise survive the kill, orphan under init, and sit blocked on
+      # its now-pipe-broken stdout forever (a `tail -f` on a since-deleted
+      # file never gets the write that would trigger its SIGPIPE exit).
+      # Recover its PID from the job table right here, rather than at
+      # backgrounding time — a `jobs`/command-substitution fork issued
+      # immediately after starting the pipeline measurably delays the
+      # pipe's first bytes reaching our stdout, which is exactly what
+      # the sleep above exists to avoid.
+      _tail_writer_pid="$(jobs -l %% 2>/dev/null \
+        | awk '/tail -n/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit} }')"
+      kill "$_tail_pid" ${_tail_writer_pid:+"$_tail_writer_pid"} 2>/dev/null || true
       _tail_pid=""
+      _tail_writer_pid=""
     fi
     # Clear _run_log after removing it so a later trap-driven _reap_tail is a
     # true no-op rather than re-rm'ing an already-deleted path (single-shot).
@@ -7916,9 +7929,7 @@ else
     # When a --log-file target is writable, tee that same stream into it —
     # no enclosing subshell, so $! names the pipeline's last process (tee
     # when teeing, tail otherwise, matching the pre-teeing behavior exactly).
-    # Killing that last process closes the pipe tail writes into; tail then
-    # exits on its own next write via SIGPIPE, so _reap_tail's single
-    # `kill "$_tail_pid"` still tears the whole chain down.
+    _tail_writer_pid=""
     if [ -n "$_log_tee_target" ]; then
       tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &
     else

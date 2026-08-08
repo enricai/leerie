@@ -2270,10 +2270,14 @@ after a best-effort `mkdir -p` of its parent directory) — `$_run_log`
 itself is a scratch file removed at exit; `LEERIE_LOG_FILE_RESOLVED` is
 the durable copy. No enclosing subshell around the pipeline: `$!` names
 tee (the pipeline's last process) when teeing, or tail itself when not —
-identical to the pre-teeing behavior in the non-teeing case — so
-`_reap_tail`'s existing single `kill "$_tail_pid"` still tears the whole
-chain down (killing tee closes the pipe tail writes into; tail exits on
-its own next write via `SIGPIPE`).
+identical to the pre-teeing behavior in the non-teeing case. When teeing,
+`$_tail_pid` names only `tee`; `tail` itself is a distinct process in the
+pipeline that does not reliably exit on its own — a `tail -f` on a
+since-deleted file never gets the write that would trigger a `SIGPIPE`
+once its stdout pipe is broken, so it would otherwise survive `_reap_tail`
+and orphan under init. `_reap_tail` therefore also recovers `tail`'s PID
+from the job table (`jobs -l %%`) at reap time and kills it alongside
+`$_tail_pid`.
 
 Deliberately **not** wired for the `-it` interactive/`--clarify` path: it
 uses a real pty with no intermediate `tail`/`tee` process (piping its
