@@ -565,6 +565,17 @@ export LEERIE_MODEL_DEP_CAPTURE=opus
 ./leerie list status paused
 ./leerie list status seed-failed
 
+# Persist leerie's own combined stdout+stderr to a file (N5b), replacing the
+# manual `leerie task | tee leerie-task.log` habit -- a tee target left
+# inside the repo gets bind-mounted whole into every worker container,
+# letting a worker read its own orchestration log. Default lands under the
+# state dir, never under the repo. CLI > env > leerie.toml (log_file), same
+# precedence as --state-dir. Wired for the local runtime only (--runtime
+# fly/ec2 have no in-repo bind-mount to leak through).
+export LEERIE_LOG_FILE=~/logs/leerie-task.log
+./leerie "task" --log-file /tmp/leerie-task.log
+# …or commit a leerie.toml at the repo root with: log_file = /tmp/leerie-task.log
+
 # Verbosity: default is `stream` (one-line summary per worker event).
 # Per-worker logs are always written to <state-root>/logs/<sid>.log.
 ./leerie "task" -q       # normal (pre-streaming terse output)

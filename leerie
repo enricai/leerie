@@ -909,6 +909,12 @@ esac
 
 export LEERIE_LOG_FILE_RESOLVED
 
+# Ensure the resolved log file's parent directory exists so the local-runtime
+# teeing wired below (bugfix-002) can append to it without a manual mkdir —
+# best-effort: an unwritable/uncreatable parent just leaves teeing disabled
+# further down, mirroring the existing "$_run_log unwritable" fallback.
+mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true
+
 # .owner sidecar: claims this state dir for USER_REPO so two different
 # repos sharing a basename cannot silently write into the same tree.
 # Also catches the case where the resolved path is the leerie install
@@ -7788,6 +7794,20 @@ else
     _run_log="$LEERIE_STATE_HOST_DIR/.runlog-$$"
     : > "$_run_log" 2>/dev/null || _run_log=""   # fall back to direct if unwritable
   fi
+  # N5b/bugfix-002: tee the decoupled stream into the resolved --log-file
+  # path so the launcher itself replaces the operator's manual
+  # `leerie task | tee <path>` habit (N5's leak vector — a tee target left
+  # inside $USER_REPO gets bind-mounted whole into every worker container).
+  # Only wired for the piped/non-TTY case above: that's the only shape the
+  # decoupled run-log mechanism exists for, and it's the shape the manual
+  # `| tee` habit itself replaces. Best-effort: an unwritable/uncreatable
+  # log file silently disables teeing rather than failing the run.
+  _log_tee_target=""
+  if [ -n "$_run_log" ] && [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then
+    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then
+      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"
+    fi
+  fi
   _reap_tail() {
     if [ -n "${_tail_pid:-}" ]; then
       # Let tail drain the final write before we kill it — otherwise a
@@ -7893,7 +7913,17 @@ else
   if [ -n "$_run_log" ]; then
     # Decoupled: nerdctl → run-log file; a tail WE own streams the file to our
     # own stdout so the SSH mux never holds our stdout pipe (see above).
-    ( tail -n +1 -f "$_run_log" 2>/dev/null ) &
+    # When a --log-file target is writable, tee that same stream into it —
+    # no enclosing subshell, so $! names the pipeline's last process (tee
+    # when teeing, tail otherwise, matching the pre-teeing behavior exactly).
+    # Killing that last process closes the pipe tail writes into; tail then
+    # exits on its own next write via SIGPIPE, so _reap_tail's single
+    # `kill "$_tail_pid"` still tears the whole chain down.
+    if [ -n "$_log_tee_target" ]; then
+      tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &
+    else
+      tail -n +1 -f "$_run_log" 2>/dev/null &
+    fi
     _tail_pid=$!
     nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 || container_rc=$?
     # Stop the tail and flush any trailing bytes it hasn't printed yet.
