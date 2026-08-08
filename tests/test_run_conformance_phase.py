@@ -671,7 +671,7 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
     assert "auto-backgrounded" in state["feedbacks"][1]
 
 
-def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
+def test_pattern_a_multi_invocation_now_injects_feedback(env):
     """When the conformer runs the same axis multiple times in one round
     (Pattern A: repetition), that warning is now threaded into the next
     round's feedback too, exactly like the auto-backgrounded (Pattern B)
