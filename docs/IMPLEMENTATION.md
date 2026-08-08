@@ -3543,8 +3543,15 @@ schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical
 `input_schema`) in `_unhardenable`, so the doomed attempt is paid once per run
 rather than once per worker call, and increments `fell_back` — reported in the
 end-of-run summary and logged at *every* verbosity with the API's own reason via
-`_api_error_head`. Only **400** retries; 401/403/429/5xx are not schema problems
-and the original would fail identically.
+`_api_error_head`. The log line also names the rejected worker TYPE
+(`worker=<type>`, or `worker=unknown` when the fingerprint matches no known
+schema): `_fingerprint_to_worker_type()` builds a fingerprint→worker-type map
+once from `SCHEMAS`, using the same canonicalization
+`_structured_output_fingerprint` applies to a request's `input_schema`, and
+`_worker_type_for_fingerprint()` looks up the request's already-computed
+fingerprint at the log call site — so a future grammar-compile timeout is
+self-attributing from the log alone. Only **400** retries; 401/403/429/5xx are
+not schema problems and the original would fail identically.
 
 Measured live across all 23 schemas (2026-08-04, `claude-sonnet-4-5-20250929`):
 **21 compile, 2 do not** — `planner` ("Schema is too complex.") and `reconciler`
