@@ -330,7 +330,21 @@ $_diagnosis"
           echo "[leerie] finalize: rebase not applied ($_rebaser_status); pushing $run_branch as-is" >&2
           ;;
         *)
+          # The one artifact that would identify why the rebase degraded is
+          # $_rebaser_json — don't discard it. Truncate to keep the sidecar
+          # and stderr bounded (the payload can carry a full worker
+          # transcript on a crash) and record the jq parse status alongside
+          # it, since a non-zero jq rc here means the JSON itself was
+          # unparseable rather than merely missing `.status`.
+          local _rebaser_json_trunc _rebaser_jq_rc=0
+          printf '%s' "$_rebaser_json" | jq -e '.status // ""' >/dev/null 2>&1 || _rebaser_jq_rc=$?
+          _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | head -c 2000)"
           echo "[leerie] finalize: rebaser returned no usable status; pushing $run_branch as-is" >&2
+          echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $_rebaser_json_trunc" >&2
+          _host_finalize_update_run_json "$run_json" \
+            "rebase_disposition_status=unusable" \
+            "rebase_disposition_jq_rc=$_rebaser_jq_rc" \
+            "rebase_disposition_raw_json=$_rebaser_json_trunc"
           ;;
       esac
       git -C "$USER_REPO" update-ref -d "$_rebase_scratch_ref" \
