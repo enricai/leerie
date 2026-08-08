@@ -346,6 +346,51 @@ exit 0
     assert after.get("pushed_at") is None
 
 
+def test_diagnoses_husky_pre_push_hook_failure(tmp_path):
+    """git push fails with a husky pre-push hook failure buried under an
+    unrelated cosmetic warning → the diagnostic names the hook and points
+    at --no-verify, alongside (not instead of) the raw stderr."""
+    run_dir = _make_run(tmp_path, "feat-h-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-h-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
+  echo "npm warn config production Use --omit=dev instead." >&2
+  echo "husky - pre-push script failed (code 254)" >&2
+  echo "error: failed to push some refs to origin" >&2
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 1, r.stderr
+    assert "pre-push" in r.stderr
+    assert "--no-verify" in r.stderr
+    assert "husky - pre-push script failed (code 254)" in r.stderr
+
+
+def test_does_not_diagnose_ordinary_push_failure(tmp_path):
+    """An ordinary network/auth push failure gets no hook-failure hint."""
+    run_dir = _make_run(tmp_path, "feat-n-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-n-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
+  echo "fatal: Authentication failed for '"'"'https://github.com/o/r.git/'"'"'" >&2
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 1, r.stderr
+    assert "--no-verify" not in r.stderr
+    assert "pre-push" not in r.stderr
+
+
 def test_records_pushed_at_on_success(tmp_path):
     """Successful push writes pushed_at and clears push_error."""
     run_dir = _make_run(
