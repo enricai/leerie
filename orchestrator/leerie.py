@@ -25131,6 +25131,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     + " (fix + resume)")
                 log(f"  {sid}: {blocker}")
                 st.data.setdefault("subtask_status", {})[sid] = "blocked"
+                log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
+                    f"{st.run_id} {sid}` once addressed, then `leerie "
+                    "resume` to continue without re-running it")
                 st.save()
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocker, "summary": blocker}
