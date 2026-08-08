@@ -253,7 +253,8 @@ defeating judge independence.
 before host preflight. It globs `"$USER_REPO"/leerie-*.log`, and for each
 match logs a warning naming the file plus the bind-mount risk. **Detection
 and warning only** — it never blocks the run; relocating the default log
-destination (`--log-file`) is separate work.
+destination and teeing the launcher's own output there is `--log-file`
+(N5b), documented below.
 
 Mirrors `_warn_if_leerie_stale()`'s detection-and-warn shape and is tested
 the same way (`tests/test_log_in_repo_warning.py`, extracting the function
@@ -2225,6 +2226,69 @@ never obliterated by a transport blip. The probe rc is captured via
 launcher's `set -e`. (DESIGN §6 *Shallow seeding for heavy repos*,
 resume corollary.)
 
+### `--log-file` / `LEERIE_LOG_FILE` (N5b)
+
+Resolved **in the `leerie` launcher** (bash — the Python orchestrator never
+reads it), mirroring the `--state-dir` resolution block: CLI flag > env var
+> `leerie.toml` flat key > default.
+
+- **`LEERIE_LOG_FILE_RESOLVED`** — the resolved log file path, exported for
+  the teeing wiring below. Resolution: `--log-file <path>` CLI >
+  `LEERIE_LOG_FILE` env > `leerie.toml` `log_file = "..."` > default
+  `$LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log`.
+
+Operators commonly run `leerie task | tee leerie-<task>.log`, and a log left
+inside `$USER_REPO` is bind-mounted whole into every worker's container —
+letting a worker read its own orchestration log, including gate/judge
+vocabulary, and defeat judge independence (the failure mode the N5 startup
+warning at `_warn_if_log_in_repo` detects). The default therefore lands
+under `LEERIE_STATE_HOST_DIR` — never under `$USER_REPO` — settling N5's
+own stated residual (whether "outside the repo" should specifically mean
+the state dir) in favor of the state dir: it already exists, is never
+bind-mounted into a worker container, and is the convention every other
+per-run artifact (`state.json`, per-worker logs) already uses.
+
+`--log-file` is registered in the launcher's `_value_flags` list (so the
+task-argument-extraction walk does not mistake its value for the task
+string) and is stripped (flag + value) from `REWRITTEN_ARGS` before
+forwarding to the orchestrator's `parse_args()`, the same way
+`--seed-depth` / `--seed-shallow-threshold-mb` are — the orchestrator
+declares no argument for it and would otherwise error `unrecognized
+arguments`.
+
+**Teeing (local runtime).** The launcher itself now writes its combined
+stdout+stderr to `LEERIE_LOG_FILE_RESOLVED`, so the operator no longer
+needs to run the manual `| tee` that created the N5 leak in the first
+place. Wired into the existing decoupled-streaming mechanism (DESIGN §6
+*Launcher hang on abnormal container exit*): in the piped/non-TTY local
+case (`TTY_FLAGS=-i` and stdout is not a TTY), `nerdctl run` already
+redirects into a launcher-owned `$_run_log` file that a `tail -f` WE own
+streams to our own stdout, so the SSH mux (Colima) never holds our stdout
+pipe. That `tail` is now piped through `tee -a "$LEERIE_LOG_FILE_RESOLVED"`
+when the target is writable (probed with a throwaway `: >> ...` append,
+after a best-effort `mkdir -p` of its parent directory) — `$_run_log`
+itself is a scratch file removed at exit; `LEERIE_LOG_FILE_RESOLVED` is
+the durable copy. No enclosing subshell around the pipeline: `$!` names
+tee (the pipeline's last process) when teeing, or tail itself when not —
+identical to the pre-teeing behavior in the non-teeing case. When teeing,
+`$_tail_pid` names only `tee`; `tail` itself is a distinct process in the
+pipeline that does not reliably exit on its own — a `tail -f` on a
+since-deleted file never gets the write that would trigger a `SIGPIPE`
+once its stdout pipe is broken, so it would otherwise survive `_reap_tail`
+and orphan under init. `_reap_tail` therefore also recovers `tail`'s PID
+from the job table (`jobs -l %%`) at reap time and kills it alongside
+`$_tail_pid`.
+
+Deliberately **not** wired for the `-it` interactive/`--clarify` path: it
+uses a real pty with no intermediate `tail`/`tee` process (piping its
+output would defeat `-t`, the same reason the launcher itself drops to
+`-i` when the operator's own stdout is piped — see the TTY_FLAGS comment
+above the local execution branch), so `$_run_log` and the teeing wiring
+never activate there and the documented piped-mode/TTY-flag hazards at
+`leerie:7580-7702` are unaffected. Remote runtimes (Fly, EC2) are also out
+of scope for this teeing wiring — the `$USER_REPO` bind-mount leak N5
+targets is a local-runtime-only condition.
+
 ### Verbosity
 
 Controls how much of the per-worker activity surfaces to the
@@ -3543,8 +3607,15 @@ schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical
 `input_schema`) in `_unhardenable`, so the doomed attempt is paid once per run
 rather than once per worker call, and increments `fell_back` — reported in the
 end-of-run summary and logged at *every* verbosity with the API's own reason via
-`_api_error_head`. Only **400** retries; 401/403/429/5xx are not schema problems
-and the original would fail identically.
+`_api_error_head`. The log line also names the rejected worker TYPE
+(`worker=<type>`, or `worker=unknown` when the fingerprint matches no known
+schema): `_fingerprint_to_worker_type()` builds a fingerprint→worker-type map
+once from `SCHEMAS`, using the same canonicalization
+`_structured_output_fingerprint` applies to a request's `input_schema`, and
+`_worker_type_for_fingerprint()` looks up the request's already-computed
+fingerprint at the log call site — so a future grammar-compile timeout is
+self-attributing from the log alone. Only **400** retries; 401/403/429/5xx are
+not schema problems and the original would fail identically.
 
 Measured live across all 23 schemas (2026-08-04, `claude-sonnet-4-5-20250929`):
 **21 compile, 2 do not** — `planner` ("Schema is too complex.") and `reconciler`
@@ -4459,7 +4530,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
 | Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` is snapshotted **once before the round loop** (a per-round HEAD would fold in prior conformer commits and miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; for each owned file, a clobber is a deletion at HEAD or a blob reverted to the base version (three-way blob compare via `_blob_sha`, which uses `git rev-parse --verify -q` to avoid the bare-`rev-parse` missing-path footgun) while a legit conformer edit leaves a distinct third blob and is not flagged. Warns **always**; under `--strict-conformer` also `_rollback_conformer_commits()` to the implementer HEAD **and blocks** — a `clobbered_files` flag threaded to the post-loop `blocked_reason` (per-subtask) / `final_blocked` (final) sets a block even when `_conformance_clean(last_res)` is True, so a clobber is never silently completed. Not auto-rolled-back in advisory mode — a legitimate revert-to-base is git-indistinguishable from a clobber. The final-tree pass applies the same guard with `base=run_branch`, `impl_head=staging HEAD snapshotted before that pass`. |
 | Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `_run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/bun/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn/bun build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn/bun lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
+| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types, both feedback-injected: (1) **multi-invocation** (Pattern A) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is a common cause, but a worker that keeps re-running the same axis on a provably unchanged tree wastes an expensive install/lint/build/test cycle, so this class is fed back too. (2) **retry-after-backgrounded** (Pattern B) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. Both classes are collected after each round (matched via `"auto-backgrounded" in w or "times in one round" in w`) and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `_run_conformer()` call (or inlined into the next round's prompt for the final-conformer call site) so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/bun/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn/bun build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn/bun lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
 | Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
 
 The phase is advisory: **no path through the conformance phase produces a

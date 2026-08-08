@@ -843,6 +843,78 @@ esac
 
 export LEERIE_STATE_HOST_DIR
 
+# --- --log-file / LEERIE_LOG_FILE / leerie.toml log_file (N5b) -----------
+# Resolves LEERIE_LOG_FILE_RESOLVED: where a `leerie task | tee <path>`
+# operator should point their tee (or, once bugfix-002 wires teeing itself,
+# where the launcher writes its own copy). N5 (PR #188) added a startup
+# warning for a tee log left inside $USER_REPO — bind-mounted whole into
+# every worker container, letting a worker read its own orchestration log
+# and defeat judge independence. This resolver is the promised follow-up:
+# a --log-file knob whose default lands OUTSIDE the repo. N5's own stated
+# residual — whether "outside the repo" should specifically mean the state
+# dir — is settled here in favor of the state dir: it already exists, is
+# never bind-mounted into a worker container, and is the convention every
+# other per-run artifact (state.json, per-worker logs) already uses.
+#
+# Resolution-only in this subtask (bugfix-001) — the actual tee/write
+# wiring is separate work (bugfix-002). Placed after LEERIE_STATE_HOST_DIR
+# is resolved above since the default depends on it.
+#
+# Precedence (lowest → highest), mirroring the --state-dir block above:
+#   default ($LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log)
+#   → leerie.toml `log_file = ...`
+#   → LEERIE_LOG_FILE env var
+#   → --log-file CLI flag
+_cli_log_file=""
+_prev_was_log_file=false
+for arg in "$@"; do
+  if $_prev_was_log_file; then
+    _cli_log_file="$arg"
+    _prev_was_log_file=false
+    continue
+  fi
+  case "$arg" in
+    --log-file=*) _cli_log_file="${arg#--log-file=}" ;;
+    --log-file)   _prev_was_log_file=true ;;
+  esac
+done
+
+if [ -n "$_cli_log_file" ]; then
+  LEERIE_LOG_FILE_RESOLVED="$_cli_log_file"
+elif [ -n "${LEERIE_LOG_FILE:-}" ]; then
+  LEERIE_LOG_FILE_RESOLVED="$LEERIE_LOG_FILE"
+else
+  _toml_log_file="$( { grep -E '^[[:space:]]*log_file[[:space:]]*=' \
+                            "$USER_REPO/leerie.toml" 2>/dev/null \
+                        || true; } \
+                      | head -1 \
+                      | sed -E 's/^[[:space:]]*log_file[[:space:]]*=[[:space:]]*//;
+                                s/[[:space:]]*$//;
+                                s/^"(.*)"$/\1/;
+                                s/^'"'"'(.*)'"'"'$/\1/')"
+  if [ -n "$_toml_log_file" ]; then
+    LEERIE_LOG_FILE_RESOLVED="$_toml_log_file"
+  else
+    LEERIE_LOG_FILE_RESOLVED="$LEERIE_STATE_HOST_DIR/logs/leerie-$$.log"
+  fi
+  unset _toml_log_file
+fi
+unset _cli_log_file _prev_was_log_file
+
+# Expand leading ~ in the final resolved value.
+case "$LEERIE_LOG_FILE_RESOLVED" in
+  "~")   LEERIE_LOG_FILE_RESOLVED="$HOME" ;;
+  "~/"*) LEERIE_LOG_FILE_RESOLVED="$HOME/${LEERIE_LOG_FILE_RESOLVED#"~/"}" ;;
+esac
+
+export LEERIE_LOG_FILE_RESOLVED
+
+# Ensure the resolved log file's parent directory exists so the local-runtime
+# teeing wired below (bugfix-002) can append to it without a manual mkdir —
+# best-effort: an unwritable/uncreatable parent just leaves teeing disabled
+# further down, mirroring the existing "$_run_log unwritable" fallback.
+mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true
+
 # .owner sidecar: claims this state dir for USER_REPO so two different
 # repos sharing a basename cannot silently write into the same tree.
 # Also catches the case where the resolved path is the leerie install
@@ -3869,7 +3941,7 @@ _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --judge-dir \
 --heal-dir --phase --host-no-push --status --report --chain-id \
---seed-depth --seed-shallow-threshold-mb --group-id "
+--seed-depth --seed-shallow-threshold-mb --group-id --log-file "
 for arg in "$@"; do
   _argi=$((_argi + 1))
   # Skip if this arg is the value of a previous value-taking flag.
@@ -5582,6 +5654,7 @@ _prev_was_fly_app_rewrite=false
 _prev_was_state_dir_rewrite=false
 _prev_was_seed_knob=false
 _prev_was_ec2_knob=false
+_prev_was_log_file_rewrite=false
 _rw_argi=0
 for arg in "$@"; do
   _rw_argi=$((_rw_argi + 1))
@@ -5615,6 +5688,11 @@ for arg in "$@"; do
     # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
     # --ec2-security-group / --ec2-subnet-id.
     _prev_was_ec2_knob=false
+    continue
+  fi
+  if [ "$_prev_was_log_file_rewrite" = "true" ]; then
+    # Consume the value of --log-file.
+    _prev_was_log_file_rewrite=false
     continue
   fi
   if $prev_was_inspect; then
@@ -5690,6 +5768,16 @@ for arg in "$@"; do
       _prev_was_ec2_knob=true
       ;;
     --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*)
+      # =form; consumed above.
+      ;;
+    --log-file)
+      # Launcher-only flag (N5b); resolved into LEERIE_LOG_FILE_RESOLVED
+      # above. The orchestrator's argparse doesn't know it — strip both
+      # the flag and its value so they don't leak to parse_args() (which
+      # is strict, not parse_known_args).
+      _prev_was_log_file_rewrite=true
+      ;;
+    --log-file=*)
       # =form; consumed above.
       ;;
     --no-re-seed)
@@ -7706,6 +7794,20 @@ else
     _run_log="$LEERIE_STATE_HOST_DIR/.runlog-$$"
     : > "$_run_log" 2>/dev/null || _run_log=""   # fall back to direct if unwritable
   fi
+  # N5b/bugfix-002: tee the decoupled stream into the resolved --log-file
+  # path so the launcher itself replaces the operator's manual
+  # `leerie task | tee <path>` habit (N5's leak vector — a tee target left
+  # inside $USER_REPO gets bind-mounted whole into every worker container).
+  # Only wired for the piped/non-TTY case above: that's the only shape the
+  # decoupled run-log mechanism exists for, and it's the shape the manual
+  # `| tee` habit itself replaces. Best-effort: an unwritable/uncreatable
+  # log file silently disables teeing rather than failing the run.
+  _log_tee_target=""
+  if [ -n "$_run_log" ] && [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then
+    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then
+      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"
+    fi
+  fi
   _reap_tail() {
     if [ -n "${_tail_pid:-}" ]; then
       # Let tail drain the final write before we kill it — otherwise a
@@ -7714,8 +7816,21 @@ else
       # Do NOT cat the file afterward: tail already streamed it, and a cat would
       # duplicate the entire log on every clean run.
       sleep 0.3
-      kill "$_tail_pid" 2>/dev/null || true
+      # When teeing, $_tail_pid names only `tee` (the pipeline's last
+      # process, per $!) — `tail` itself is a distinct process that would
+      # otherwise survive the kill, orphan under init, and sit blocked on
+      # its now-pipe-broken stdout forever (a `tail -f` on a since-deleted
+      # file never gets the write that would trigger its SIGPIPE exit).
+      # Recover its PID from the job table right here, rather than at
+      # backgrounding time — a `jobs`/command-substitution fork issued
+      # immediately after starting the pipeline measurably delays the
+      # pipe's first bytes reaching our stdout, which is exactly what
+      # the sleep above exists to avoid.
+      _tail_writer_pid="$(jobs -l %% 2>/dev/null \
+        | awk '/tail -n/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit} }')"
+      kill "$_tail_pid" ${_tail_writer_pid:+"$_tail_writer_pid"} 2>/dev/null || true
       _tail_pid=""
+      _tail_writer_pid=""
     fi
     # Clear _run_log after removing it so a later trap-driven _reap_tail is a
     # true no-op rather than re-rm'ing an already-deleted path (single-shot).
@@ -7811,7 +7926,15 @@ else
   if [ -n "$_run_log" ]; then
     # Decoupled: nerdctl → run-log file; a tail WE own streams the file to our
     # own stdout so the SSH mux never holds our stdout pipe (see above).
-    ( tail -n +1 -f "$_run_log" 2>/dev/null ) &
+    # When a --log-file target is writable, tee that same stream into it —
+    # no enclosing subshell, so $! names the pipeline's last process (tee
+    # when teeing, tail otherwise, matching the pre-teeing behavior exactly).
+    _tail_writer_pid=""
+    if [ -n "$_log_tee_target" ]; then
+      tail -n +1 -f "$_run_log" 2>/dev/null | tee -a "$_log_tee_target" &
+    else
+      tail -n +1 -f "$_run_log" 2>/dev/null &
+    fi
     _tail_pid=$!
     nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 || container_rc=$?
     # Stop the tail and flush any trailing bytes it hasn't printed yet.
