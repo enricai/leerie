@@ -129,6 +129,12 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # strips them from REWRITTEN_ARGS; the orchestrator never reads them.
     "--seed-depth",
     "--seed-shallow-threshold-mb",
+    # --log-file is value-taking but launcher-only (N5b): it resolves into
+    # LEERIE_LOG_FILE_RESOLVED in the launcher, settling N5's "outside the
+    # repo" default in favor of the state dir. The launcher strips it from
+    # REWRITTEN_ARGS; the orchestrator never reads it (resolution-only in
+    # this subtask — the tee/write wiring is separate work).
+    "--log-file",
 })
 
 
