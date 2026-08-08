@@ -12701,12 +12701,17 @@ def _cgroup_enroll(sid: str, pid: int) -> str | None:
 
 def _cgroup_destroy(sid: str | None) -> None:
     """Ask the broker to tear down the worker cgroup (kill any survivors,
-    rmdir). Best-effort — broker/socket errors are swallowed. Called from
-    `_invoke`'s cleanup path on every exit (success, timeout, abort)."""
+    rmdir). Best-effort — broker/socket errors are swallowed and a broker-
+    reported ERR (e.g. a lingering process kept the dir busy) is logged
+    rather than silently discarded, so a failed teardown is distinguishable
+    from a successful one. Called from `_invoke`'s cleanup path on every
+    exit (success, timeout, abort)."""
     if sid is None:
         return
     with contextlib.suppress(OSError):
-        _cgroup_request(f"destroy {sid}")
+        resp = _cgroup_request(f"destroy {sid}")
+        if resp != "OK":
+            log(f"  [{sid}] cgroup destroy failed ({resp}); dir may be leaked")
 
 
 def _cgroup_stat(sid: str | None) -> tuple[int, int, int, int] | None:

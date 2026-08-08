@@ -207,13 +207,16 @@ def _v2_enroll(sid: str, pid: int) -> None:
     _write(f"{_v2_dir(sid)}/cgroup.procs", str(pid))
 
 
-def _v2_destroy(sid: str) -> None:
+def _v2_destroy(sid: str) -> str | None:
+    """rmdir the worker's v2 cgroup dir. Returns None on success, or the
+    OSError message on failure (e.g. a lingering process kept it busy)."""
     d = _v2_dir(sid)
     _write(f"{d}/cgroup.kill", "1", swallow=True)
     try:
         os.rmdir(d)
-    except OSError:
-        pass
+    except OSError as e:
+        return str(e.strerror or e)
+    return None
 
 
 def _v2_stat(sid: str) -> tuple[int, int, int, int]:
@@ -248,16 +251,22 @@ def _v1_enroll(sid: str, pid: int) -> None:
     _write(f"{mdir}/cgroup.procs", str(pid))
 
 
-def _v1_destroy(sid: str) -> None:
+def _v1_destroy(sid: str) -> str | None:
+    """rmdir both v1 controller dirs. Returns None on success, or the
+    first OSError message encountered (pids dir checked before memory
+    dir, matching _v1_dirs' ordering)."""
     pdir, mdir = _v1_dirs(sid)
     # v1 has no cgroup.kill; move survivors to the parent then rmdir.
+    err = None
     for d in (pdir, mdir):
         for pid in _read(f"{d}/cgroup.procs").split():
             _write(f"{os.path.dirname(d)}/cgroup.procs", pid, swallow=True)
         try:
             os.rmdir(d)
-        except OSError:
-            pass
+        except OSError as e:
+            if err is None:
+                err = str(e.strerror or e)
+    return err
 
 
 def _v1_stat(sid: str) -> tuple[int, int, int, int]:
@@ -352,7 +361,9 @@ def _do(verb: str, args: list[str]) -> str:
         sid = args[0]
         if not _valid_sid(sid):
             return "ERR bad sid"
-        destroy(sid)
+        err = destroy(sid)
+        if err is not None:
+            return f"ERR {err}"
         return "OK"
     if verb == "stat":
         sid = args[0]
