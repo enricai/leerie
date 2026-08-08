@@ -2225,6 +2225,37 @@ never obliterated by a transport blip. The probe rc is captured via
 launcher's `set -e`. (DESIGN §6 *Shallow seeding for heavy repos*,
 resume corollary.)
 
+### `--log-file` / `LEERIE_LOG_FILE` (N5b)
+
+Resolved **in the `leerie` launcher** (bash — the Python orchestrator never
+reads it), mirroring the `--state-dir` resolution block: CLI flag > env var
+> `leerie.toml` flat key > default. Resolution-only — the actual tee/write
+wiring is separate work.
+
+- **`LEERIE_LOG_FILE_RESOLVED`** — the resolved log file path, exported for
+  future consumers. Resolution: `--log-file <path>` CLI >
+  `LEERIE_LOG_FILE` env > `leerie.toml` `log_file = "..."` > default
+  `$LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log`.
+
+Operators commonly run `leerie task | tee leerie-<task>.log`, and a log left
+inside `$USER_REPO` is bind-mounted whole into every worker's container —
+letting a worker read its own orchestration log, including gate/judge
+vocabulary, and defeat judge independence (the failure mode the N5 startup
+warning at `_warn_if_log_in_repo` detects). The default therefore lands
+under `LEERIE_STATE_HOST_DIR` — never under `$USER_REPO` — settling N5's
+own stated residual (whether "outside the repo" should specifically mean
+the state dir) in favor of the state dir: it already exists, is never
+bind-mounted into a worker container, and is the convention every other
+per-run artifact (`state.json`, per-worker logs) already uses.
+
+`--log-file` is registered in the launcher's `_value_flags` list (so the
+task-argument-extraction walk does not mistake its value for the task
+string) and is stripped (flag + value) from `REWRITTEN_ARGS` before
+forwarding to the orchestrator's `parse_args()`, the same way
+`--seed-depth` / `--seed-shallow-threshold-mb` are — the orchestrator
+declares no argument for it and would otherwise error `unrecognized
+arguments`.
+
 ### Verbosity
 
 Controls how much of the per-worker activity surfaces to the
