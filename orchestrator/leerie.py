@@ -10740,6 +10740,29 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     return (None, False)
 
 
+def _find_antml_markup(value: object) -> str | None:
+    """Recursively scan a JSON-shaped value for a string containing
+    literal `antml:` markup. Returns the offending string on the first
+    hit, None if clean. Structured recursion (dict/list), not a
+    top-level-only check — the incident showed corruption landing in
+    arbitrary nested fields (e.g. inside `clarification_question`)."""
+    if isinstance(value, str):
+        return value if "antml:" in value else None
+    if isinstance(value, dict):
+        for v in value.values():
+            hit = _find_antml_markup(v)
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(value, list):
+        for v in value:
+            hit = _find_antml_markup(v)
+            if hit is not None:
+                return hit
+        return None
+    return None
+
+
 # --- result cross-field validation -------------------------------------------
 
 def _validate_result(result: dict) -> tuple[str, str] | None:
@@ -10757,7 +10780,23 @@ def _validate_result(result: dict) -> tuple[str, str] | None:
     and surface as conformance warnings, but do not affect terminal
     status. The other branches (handoff, blocked, failed, clarification)
     still enforce the mechanical-precondition fields their next-step
-    consumers require."""
+    consumers require.
+
+    Checked before anything else: literal `antml:`-shaped markup inside
+    any string field value. Upstream anthropics/claude-code#64690 is a
+    model-side token-generation bug that can leak tool-call markup
+    (`antml:parameter`, `antml:invoke`, …) into a structured-output
+    field's own string value. No legitimate worker output contains this
+    substring, so its presence is an unambiguous corruption signal — the
+    underlying work may well have succeeded, so this is retryable rather
+    than the terminal `"broken"` the status dispatch below would
+    otherwise assign it via a coincidentally-matching shape (e.g. a
+    corrupted `checkpoint_path`)."""
+    if _find_antml_markup(result) is not None:
+        return ("corrupted_envelope",
+                "result contains literal 'antml:' markup in a string field "
+                "— upstream anthropics/claude-code#64690 token-generation "
+                "corruption")
     status = result.get("status")
     if status == "incomplete-handoff":
         cp = result.get("checkpoint_path")
@@ -23257,6 +23296,17 @@ _WORKER_RETRYABLE_KINDS = frozenset({
                        # envelope by _run_implementer's WorkerError /
                        # TimeoutExpired catches. Both are corrective-note
                        # cases — a fresh worker can plausibly do better.
+    "corrupted_envelope",  # _validate_result — literal `antml:`-shaped
+                       # markup found inside a string field value.
+                       # Upstream anthropics/claude-code#64690:
+                       # model-side token-generation corruption can leak
+                       # tool-call markup into a structured-output
+                       # field's own string value. The underlying work
+                       # can plausibly have succeeded, so a fresh worker
+                       # retry — not the terminal "broken" the status
+                       # dispatch would otherwise assign via a
+                       # coincidentally-matching field shape — is the
+                       # right response.
 })
 
 
