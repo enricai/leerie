@@ -24571,7 +24571,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"conformer round {c_round}:")
-            and "auto-backgrounded" in w]
+            and ("auto-backgrounded" in w or "times in one round" in w)]
         blt_feedback = (
             _format_check_feedback(bg_retry_warnings, c_round,
                                    caps["conformance_rounds"])
@@ -25063,7 +25063,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"final conformer round {c_round}:")
-            and "auto-backgrounded" in w]
+            and ("auto-backgrounded" in w or "times in one round" in w)]
         blt_feedback = (
             _format_check_feedback(bg_retry_warnings, c_round,
                                    caps["conformance_rounds"])

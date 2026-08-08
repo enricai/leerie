@@ -672,8 +672,11 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
 
 
 def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
-    """When the conformer runs the same axis multiple times (Pattern A:
-    legitimate progressive testing), no feedback should be injected."""
+    """When the conformer runs the same axis multiple times in one round
+    (Pattern A: repetition), that warning is now threaded into the next
+    round's feedback too, exactly like the auto-backgrounded (Pattern B)
+    class — closing the gap where leerie detected the repetition but
+    never told the worker."""
     c = env["leerie"]
     dirty = _clean_result(
         build={"ran": True, "passed": False, "command": "npm run build",
@@ -696,8 +699,9 @@ def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
 
     assert state["i"] == 2, "expected 2 conformer rounds"
     assert state["feedbacks"][0] is None
-    assert state["feedbacks"][1] is None, \
-        "Pattern A (progressive testing) should NOT inject feedback"
+    assert state["feedbacks"][1] is not None, \
+        "Pattern A (within-round repetition) should now inject feedback"
+    assert "times in one round" in state["feedbacks"][1]
 
 
 # --- strict-conformer mode -------------------------------------------------
