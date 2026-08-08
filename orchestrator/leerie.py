@@ -8600,6 +8600,81 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
     return issues
 
 
+_TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
+
+
+def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
+    """Deterministic floor beneath `TEST_OWNERSHIP_RISK`
+    (`check_classifier_output`, leerie.py:5798) and `phase_overlap_judge`
+    (DESIGN §5 *Cross-domain surface overlap*). Returns a list of
+    `TEST_OWNERSHIP_OVERLAP` messages ([] when clean). Pure function, no
+    state, no LLM — mirrors `check_duplicate_providers` above.
+
+    `TEST_OWNERSHIP_RISK` correctly identifies that a code category
+    (bug-fixing / feature-implementation / refactoring) and `testing`
+    running blind to each other can both author the same test file — but
+    that check only nudges the classifier at classify time; nothing
+    mechanically catches the case where the classifier proceeds anyway (or
+    a re-plan reintroduces the overlap downstream, the same "bypassed a
+    passed gate" shape `check_duplicate_providers`'s own docstring
+    documents). This is that mechanical catch, applied to
+    `files_likely_touched` instead of `provides` tags, since the collision
+    here is on file OWNERSHIP, not on a declared capability: a testing-
+    domain subtask and a code-domain subtask both listing the same file is
+    exactly the shape that made the plan-overlap judge refuse as
+    unresolvable in the barnacle fake-timer incident this check exists for.
+
+    Domain is read off the `CATEGORY_ABBREV` id prefix (`test-` for
+    `testing`; `bugfix-`/`feat-`/`refactor-` for the three
+    `_TEST_OWNERSHIP_RISK_CODE_CATS` categories), the same convention
+    `_warn_test_subtask_missing_producer_edge` already relies on for the
+    testing side. Paths are compared via `_normalize_artifact_path`, per
+    that function's own docstring recommendation and matching the sibling
+    `check_duplicate_providers`/`NO_FILE_OVERLAP` checks.
+
+    Advisory as shipped — logged, never gating, matching this repo's
+    disposition for `check_duplicate_providers` (DESIGN §5)."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+
+    def _files(s: dict) -> set[str]:
+        return {
+            _normalize_artifact_path(f)
+            for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and f.strip()
+        }
+
+    test_sids = sorted(sid for sid in subtasks if sid.startswith("test-"))
+    code_sids = sorted(
+        sid for sid in subtasks
+        if sid.startswith(_TEST_OWNERSHIP_CODE_PREFIXES))
+
+    issues: list[str] = []
+    for test_sid in test_sids:
+        test_files = _files(subtasks[test_sid])
+        if not test_files:
+            continue
+        for code_sid in code_sids:
+            shared = test_files & _files(subtasks[code_sid])
+            if not shared:
+                continue
+            issues.append(
+                f"TEST_OWNERSHIP_OVERLAP: {test_sid} (testing) and "
+                f"{code_sid} (code) both touch "
+                f"{', '.join(sorted(shared))} — running blind to each "
+                "other, both can author or rewrite the same test file with "
+                "incompatible contracts (DESIGN §5 *Cross-domain surface "
+                f"overlap*). {code_sid} should own the file unless the "
+                f"plan gives {test_sid} an explicit depends_on/requires "
+                "edge on it."
+            )
+    return issues
+
+
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
@@ -21928,6 +22003,8 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # switch off is not a floor (DESIGN §5 *A deterministic floor underneath
     # the judge*). Advisory as shipped — logged, never gating.
     for issue in check_duplicate_providers(plans):
+        log(f"⚠  {issue}")
+    for issue in check_test_ownership_overlap(plans):
         log(f"⚠  {issue}")
 
     # Cheap-skip conditions, in order of cost.
