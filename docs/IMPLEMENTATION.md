@@ -253,7 +253,8 @@ defeating judge independence.
 before host preflight. It globs `"$USER_REPO"/leerie-*.log`, and for each
 match logs a warning naming the file plus the bind-mount risk. **Detection
 and warning only** — it never blocks the run; relocating the default log
-destination (`--log-file`) is separate work.
+destination and teeing the launcher's own output there is `--log-file`
+(N5b), documented below.
 
 Mirrors `_warn_if_leerie_stale()`'s detection-and-warn shape and is tested
 the same way (`tests/test_log_in_repo_warning.py`, extracting the function
@@ -2229,11 +2230,10 @@ resume corollary.)
 
 Resolved **in the `leerie` launcher** (bash — the Python orchestrator never
 reads it), mirroring the `--state-dir` resolution block: CLI flag > env var
-> `leerie.toml` flat key > default. Resolution-only — the actual tee/write
-wiring is separate work.
+> `leerie.toml` flat key > default.
 
 - **`LEERIE_LOG_FILE_RESOLVED`** — the resolved log file path, exported for
-  future consumers. Resolution: `--log-file <path>` CLI >
+  the teeing wiring below. Resolution: `--log-file <path>` CLI >
   `LEERIE_LOG_FILE` env > `leerie.toml` `log_file = "..."` > default
   `$LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log`.
 
@@ -2255,6 +2255,35 @@ forwarding to the orchestrator's `parse_args()`, the same way
 `--seed-depth` / `--seed-shallow-threshold-mb` are — the orchestrator
 declares no argument for it and would otherwise error `unrecognized
 arguments`.
+
+**Teeing (local runtime).** The launcher itself now writes its combined
+stdout+stderr to `LEERIE_LOG_FILE_RESOLVED`, so the operator no longer
+needs to run the manual `| tee` that created the N5 leak in the first
+place. Wired into the existing decoupled-streaming mechanism (DESIGN §6
+*Launcher hang on abnormal container exit*): in the piped/non-TTY local
+case (`TTY_FLAGS=-i` and stdout is not a TTY), `nerdctl run` already
+redirects into a launcher-owned `$_run_log` file that a `tail -f` WE own
+streams to our own stdout, so the SSH mux (Colima) never holds our stdout
+pipe. That `tail` is now piped through `tee -a "$LEERIE_LOG_FILE_RESOLVED"`
+when the target is writable (probed with a throwaway `: >> ...` append,
+after a best-effort `mkdir -p` of its parent directory) — `$_run_log`
+itself is a scratch file removed at exit; `LEERIE_LOG_FILE_RESOLVED` is
+the durable copy. No enclosing subshell around the pipeline: `$!` names
+tee (the pipeline's last process) when teeing, or tail itself when not —
+identical to the pre-teeing behavior in the non-teeing case — so
+`_reap_tail`'s existing single `kill "$_tail_pid"` still tears the whole
+chain down (killing tee closes the pipe tail writes into; tail exits on
+its own next write via `SIGPIPE`).
+
+Deliberately **not** wired for the `-it` interactive/`--clarify` path: it
+uses a real pty with no intermediate `tail`/`tee` process (piping its
+output would defeat `-t`, the same reason the launcher itself drops to
+`-i` when the operator's own stdout is piped — see the TTY_FLAGS comment
+above the local execution branch), so `$_run_log` and the teeing wiring
+never activate there and the documented piped-mode/TTY-flag hazards at
+`leerie:7580-7702` are unaffected. Remote runtimes (Fly, EC2) are also out
+of scope for this teeing wiring — the `$USER_REPO` bind-mount leak N5
+targets is a local-runtime-only condition.
 
 ### Verbosity
 
