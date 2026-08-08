@@ -1239,6 +1239,61 @@ def test_fallback_is_logged_at_every_verbosity(leerie, rejecting_upstream,
     assert p.fell_back == 1
 
 
+def test_fallback_log_names_the_rejected_worker(leerie, rejecting_upstream,
+                                                 monkeypatch):
+    """The fallback line must be self-attributing: which worker's schema was
+    rejected, not just that some schema was. Drives a request carrying a real
+    SCHEMAS[worker] input_schema through the fallback path."""
+    url, _ = rejecting_upstream
+    monkeypatch.setattr(leerie._StrictOutputProxy, "_UPSTREAM", url)
+    lines: list[str] = []
+    monkeypatch.setattr(leerie, "log", lambda m: lines.append(m))
+
+    async def go():
+        p = leerie._StrictOutputProxy(max_parallel=5)
+        port = await p.start()
+        try:
+            body = _wrap(copy.deepcopy(leerie.SCHEMAS["planner"]))
+            await _post(port, body)
+        finally:
+            await p.stop()
+        return p
+    asyncio.run(go())
+    hits = [l for l in lines if "retrying WITHOUT" in l]
+    assert len(hits) == 1, "the fallback was not surfaced"
+    assert "worker=planner" in hits[0], (
+        f"the log line did not name the rejected worker: {hits[0]!r}")
+
+
+def test_fallback_log_names_unknown_worker_for_foreign_schema(
+        leerie, rejecting_upstream, monkeypatch):
+    """A schema that matches no known worker (e.g. the CLI wraps/normalizes it
+    differently than SCHEMAS[w] itself) must degrade to an explicit
+    'worker=unknown' rather than crashing or silently omitting attribution."""
+    url, _ = rejecting_upstream
+    p, lines = _run_against(leerie, url, monkeypatch, 1, "quiet")
+    hits = [l for l in lines if "retrying WITHOUT" in l]
+    assert len(hits) == 1, "the fallback was not surfaced"
+    assert "worker=unknown" in hits[0], (
+        f"an unrecognized schema must not be silently omitted: {hits[0]!r}")
+    assert p.fell_back == 1
+
+
+def test_worker_type_for_fingerprint_resolves_a_real_worker(leerie):
+    """The map must resolve a real worker type from its own SCHEMAS-derived
+    fingerprint — 'planner' is the worker N10 names as the one that actually
+    timed out."""
+    fp = leerie._structured_output_fingerprint(
+        _wrap(copy.deepcopy(leerie.SCHEMAS["planner"])))
+    assert fp is not None
+    assert leerie._worker_type_for_fingerprint(fp) == "planner"
+
+
+def test_worker_type_for_fingerprint_unknown_schema_and_none(leerie):
+    assert leerie._worker_type_for_fingerprint(None) is None
+    assert leerie._worker_type_for_fingerprint("not-a-real-fingerprint") is None
+
+
 def test_api_error_head_reads_the_message_and_survives_junk(leerie):
     """Operates on the API's machine-generated envelope, so it must not explode
     on a body that is not the shape it expects."""

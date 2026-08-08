@@ -28,6 +28,7 @@ import copy
 import ctypes
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -11882,6 +11883,30 @@ def _structured_output_fingerprint(body: bytes) -> str | None:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+@functools.lru_cache(maxsize=1)
+def _fingerprint_to_worker_type() -> dict[str, str]:
+    """Maps a schema fingerprint back to the worker type it belongs to.
+
+    Built once from `SCHEMAS` using the exact same canonicalization
+    `_structured_output_fingerprint` applies to a request's `input_schema`
+    (`scripts/verify-strict-schemas.py`'s `tool_for()` confirms the CLI
+    hardens `SCHEMAS[worker]` itself, unmodified) so a fallback log line can
+    name which worker's schema was rejected instead of leaving it anonymous.
+    """
+    return {
+        hashlib.sha256(json.dumps(schema, sort_keys=True).encode())
+        .hexdigest()[:16]: worker
+        for worker, schema in SCHEMAS.items()
+    }
+
+
+def _worker_type_for_fingerprint(fingerprint: str | None) -> str | None:
+    """Resolves a request's schema fingerprint to its worker type, or None."""
+    if fingerprint is None:
+        return None
+    return _fingerprint_to_worker_type().get(fingerprint)
+
+
 class _StrictOutputProxy:
     """One loopback proxy per run, forcing constrained decoding.
 
@@ -12173,8 +12198,10 @@ class _StrictOutputProxy:
                 self.fell_back += 1
                 self.rewritten -= 1
                 self.passed_through += 1
+                worker_type = _worker_type_for_fingerprint(fingerprint) or "unknown"
                 log(f"  strict-output proxy: upstream rejected the hardened "
-                    f"schema ({_api_error_head(payload)}) — retrying WITHOUT "
+                    f"schema for worker={worker_type} "
+                    f"({_api_error_head(payload)}) — retrying WITHOUT "
                     f"constrained decoding; this worker keeps ordinary "
                     f"post-hoc validation for the rest of the run")
                 status, up_headers, payload = await loop.run_in_executor(
