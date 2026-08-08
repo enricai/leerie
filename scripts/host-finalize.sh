@@ -330,7 +330,21 @@ $_diagnosis"
           echo "[leerie] finalize: rebase not applied ($_rebaser_status); pushing $run_branch as-is" >&2
           ;;
         *)
+          # The one artifact that would identify why the rebase degraded is
+          # $_rebaser_json — don't discard it. Truncate to keep the sidecar
+          # and stderr bounded (the payload can carry a full worker
+          # transcript on a crash) and record the jq parse status alongside
+          # it, since a non-zero jq rc here means the JSON itself was
+          # unparseable rather than merely missing `.status`.
+          local _rebaser_json_trunc _rebaser_jq_rc=0
+          printf '%s' "$_rebaser_json" | jq -e '.status // ""' >/dev/null 2>&1 || _rebaser_jq_rc=$?
+          _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | head -c 2000)"
           echo "[leerie] finalize: rebaser returned no usable status; pushing $run_branch as-is" >&2
+          echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $_rebaser_json_trunc" >&2
+          _host_finalize_update_run_json "$run_json" \
+            "rebase_disposition_status=unusable" \
+            "rebase_disposition_jq_rc=$_rebaser_jq_rc" \
+            "rebase_disposition_raw_json=$_rebaser_json_trunc"
           ;;
       esac
       git -C "$USER_REPO" update-ref -d "$_rebase_scratch_ref" \
@@ -372,6 +386,14 @@ $_diagnosis"
     echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
     echo "  Push stderr was:" >&2
     printf '    %s\n' "$push_stderr" >&2
+    if printf '%s' "$push_stderr" | grep -qiE 'husky|pre-push script failed|exit code 254'; then
+      local _hook_name
+      _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1)"
+      echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
+      echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
+      echo "    git push -u origin $run_branch --no-verify" >&2
+      echo "  (or set NO_VERIFY_PUSH=true before invoking finalize)." >&2
+    fi
     return 1
   fi
   local pushed_at

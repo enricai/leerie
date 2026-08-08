@@ -4665,25 +4665,82 @@ def _is_node_repo(cwd: str) -> bool:
     return any((Path(cwd) / name).exists() for name in _NODE_MANIFEST_NAMES)
 
 
-def _auto_worker_memory_max(max_parallel: int) -> int:
-    """Auto-derive a per-worker memory cap from /proc/meminfo.
+# N9 (PENDING_ISSUES.md): every concurrent leerie run shares ONE
+# `leerie.slice` cgroup with a single enforced `memory.max` — measured live,
+# `_auto_worker_memory_max`'s /proc/meminfo basis sized each worker as if its
+# run owned the whole host, so N concurrent runs' workers could jointly
+# demand 2.3x the shared slice's actual budget (individual workers get
+# SIGKILLed by the kernel OOM killer inside their own cgroup when the shared
+# slice hits its cap, even though the slice-wide backstop itself holds).
+# `_WORKER_BUILD_PEAK_BYTES` is the measured combined build+resident-claude
+# peak (_auto_worker_memory_max's docstring, below) that admission is gated
+# against: below this, a build-running worker is at real risk of an in-cgroup
+# OOM kill rather than merely "tight".
+_WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
+_WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
+_WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
 
-    The goal: distribute the VM's RAM across `max_parallel + 1` slots
-    so one slot remains for the orchestrator + system processes
-    (sshd, lima-guestagent, etc.) outside any worker cgroup. Floored
-    at 8 GiB per worker — the worker cgroup holds the build/test
+
+def _cgroup_slice_info() -> tuple[int, int] | None:
+    """Read-only query of the shared `leerie.slice` budget and live worker
+    concurrency, via the broker's `slice` verb (N9). Returns
+    `(memory_max_bytes, live_sibling_count)`, or None when the broker is
+    unreachable/errors/has no usable hierarchy (containment off) or reports
+    no configured slice ceiling (`memory_max_bytes == -1`) — callers must
+    treat None as "no slice-wide budget known" and fall back to a basis that
+    does not need it, never assume unlimited."""
+    try:
+        resp = _cgroup_request("slice")
+    except OSError:
+        return None
+    parts = resp.split()
+    if len(parts) != 3 or parts[0] != "OK":
+        return None
+    try:
+        mem_max, siblings = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    if mem_max <= 0:
+        return None
+    return (mem_max, siblings)
+
+
+def _slice_worker_memory_max(slice_max_bytes: int, live_siblings: int,
+                             max_parallel: int) -> int:
+    """Pure divisor (N9's chosen formula): split the shared slice budget
+    across live sibling workers PLUS this run's own worst-case concurrency
+    (`max_parallel`) PLUS one slot for the orchestrator/system processes
+    outside any worker cgroup — mirroring `_auto_worker_memory_max`'s prior
+    `total // (max_parallel + 1)` shape, but against the shared slice ceiling
+    and live cross-run concurrency instead of host RAM and this run alone.
+    Shrinks automatically as sibling runs start and grows back as they
+    finish, because the shared slice IS the shared state (no lockfile/
+    registry needed — PENDING_ISSUES.md N9). Floored at 256 MiB purely to
+    keep the result sane (positive, non-degenerate) when the slice is
+    already saturated; whether that number is actually enough for a build is
+    the admission gate's job (`_await_worker_memory_admission`), not this
+    function's."""
+    per_worker = slice_max_bytes // (live_siblings + max_parallel + 1)
+    return max(per_worker, 256 * 1024**2)
+
+
+def _auto_worker_memory_max_legacy(max_parallel: int) -> int:
+    """The pre-N9 basis: distribute /proc/meminfo MemTotal across
+    `max_parallel + 1` slots, floored at 8 GiB. Used as `_auto_worker_memory_max`'s
+    fallback when the shared-slice basis is unavailable (no broker / no
+    cgroup containment / `--dangerously-allow-uncapped`) — in that
+    situation there is no shared-slice enforcement to rely on either, so
+    sizing as if this run owns the host is the closest approximation left.
+
+    Floored at 8 GiB per worker — the worker cgroup holds the build/test
     subprocess tree AND the resident `claude -p` process at the same
     time (claude stays alive running the build via Bash and streaming
     its output), and live in-container measurement showed a Next.js/
     Turbopack build alone peaking at 4.16 GiB, build + resident claude
-    at ~6.3 GiB. The prior 4 GiB clamp was below that combined peak, so
-    no VM size could auto-derive enough for a build-running worker; an
-    8 GiB floor gives margin over the measured 6.3 GiB peak. The
-    aggregate `leerie.slice` memory.max (scripts/container-entry.sh) is
-    the real VM-OOM backstop, so this per-worker floor can be generous
-    — multi-worker waves stay bounded by that slice cap, not by this
-    per-worker number; build-heavy waves should pair a generous
-    per-worker cap with a lower --max-parallel.
+    at ~6.3 GiB (`_WORKER_BUILD_PEAK_BYTES`). The prior 4 GiB clamp was
+    below that combined peak, so no VM size could auto-derive enough for
+    a build-running worker; an 8 GiB floor gives margin over the
+    measured 6.3 GiB peak.
 
     Falls back to 2 GiB if /proc/meminfo is unreadable (non-Linux,
     sandboxed test, etc.). The cgroup write itself will detect a
@@ -4701,6 +4758,68 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
         return 2 * 1024**3
     per_worker = total // (max_parallel + 1)
     return max(per_worker, 8 * 1024**3)
+
+
+def _auto_worker_memory_max(max_parallel: int) -> int:
+    """Auto-derive a per-worker memory cap.
+
+    N9-corrected basis: the aggregate `leerie.slice` memory.max
+    (scripts/container-entry.sh) is shared by every concurrent leerie run on
+    the host, not owned exclusively by this one — so the per-worker cap is
+    now derived from that shared budget (`_slice_worker_memory_max`, divided
+    across live sibling workers + this run's own `max_parallel` + one
+    orchestrator/system slot) rather than /proc/meminfo, which sized each
+    worker as if this run owned the whole host and let concurrent runs
+    jointly overcommit the shared slice (measured 2.3x — PENDING_ISSUES.md
+    N9). Falls back to the legacy /proc/meminfo basis
+    (`_auto_worker_memory_max_legacy`) when the shared-slice budget can't be
+    read (no broker, no cgroup containment, `--dangerously-allow-uncapped`)
+    — there the shared-slice enforcement this basis depends on is absent
+    anyway."""
+    info = _cgroup_slice_info()
+    if info is None:
+        return _auto_worker_memory_max_legacy(max_parallel)
+    slice_max_bytes, live_siblings = info
+    return _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
+
+
+async def _await_worker_memory_admission(
+        max_parallel: int,
+        build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES,
+        poll_interval_sec: float = _WORKER_MEMORY_ADMISSION_POLL_SEC,
+        max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> None:
+    """Admission gate (N9 DECISION 2026-08-06): before spawning a new
+    worker, block while admitting it would drive the shared per-worker
+    allocation below the measured build peak — rather than admitting it
+    regardless and letting the kernel OOM-kill it mid-build. Returns
+    (admits) immediately when no shared-slice budget is readable (no
+    broker / containment off — nothing to gate against) or once the
+    computed per-worker share is >= `build_peak_bytes`.
+
+    Bounded at `max_wait_sec` (default 10 min) rather than blocking
+    forever: a long-running sibling worker that never releases its slot
+    would otherwise wedge this run's admission indefinitely. On timeout,
+    admits anyway and logs — a late-admitted worker risking an in-cgroup
+    OOM kill is the pre-N9 status quo, not a new failure mode, and is
+    strictly better than a run that never makes progress."""
+    waited = 0.0
+    while True:
+        info = _cgroup_slice_info()
+        if info is None:
+            return
+        slice_max_bytes, live_siblings = info
+        cap = _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
+        if cap >= build_peak_bytes:
+            return
+        if waited >= max_wait_sec:
+            log(f"  worker memory admission wait exceeded "
+                f"{max_wait_sec:.0f}s (shared slice would allocate "
+                f"{cap / 1024**3:.1f} GiB/worker, below the "
+                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor); "
+                f"admitting anyway")
+            return
+        await asyncio.sleep(poll_interval_sec)
+        waited += poll_interval_sec
 
 
 def resolve_worker_memory_max(repo_root: Path,
@@ -8481,6 +8600,81 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
     return issues
 
 
+_TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
+
+
+def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
+    """Deterministic floor beneath `TEST_OWNERSHIP_RISK`
+    (`check_classifier_output`, leerie.py:5798) and `phase_overlap_judge`
+    (DESIGN §5 *Cross-domain surface overlap*). Returns a list of
+    `TEST_OWNERSHIP_OVERLAP` messages ([] when clean). Pure function, no
+    state, no LLM — mirrors `check_duplicate_providers` above.
+
+    `TEST_OWNERSHIP_RISK` correctly identifies that a code category
+    (bug-fixing / feature-implementation / refactoring) and `testing`
+    running blind to each other can both author the same test file — but
+    that check only nudges the classifier at classify time; nothing
+    mechanically catches the case where the classifier proceeds anyway (or
+    a re-plan reintroduces the overlap downstream, the same "bypassed a
+    passed gate" shape `check_duplicate_providers`'s own docstring
+    documents). This is that mechanical catch, applied to
+    `files_likely_touched` instead of `provides` tags, since the collision
+    here is on file OWNERSHIP, not on a declared capability: a testing-
+    domain subtask and a code-domain subtask both listing the same file is
+    exactly the shape that made the plan-overlap judge refuse as
+    unresolvable in the barnacle fake-timer incident this check exists for.
+
+    Domain is read off the `CATEGORY_ABBREV` id prefix (`test-` for
+    `testing`; `bugfix-`/`feat-`/`refactor-` for the three
+    `_TEST_OWNERSHIP_RISK_CODE_CATS` categories), the same convention
+    `_warn_test_subtask_missing_producer_edge` already relies on for the
+    testing side. Paths are compared via `_normalize_artifact_path`, per
+    that function's own docstring recommendation and matching the sibling
+    `check_duplicate_providers`/`NO_FILE_OVERLAP` checks.
+
+    Advisory as shipped — logged, never gating, matching this repo's
+    disposition for `check_duplicate_providers` (DESIGN §5)."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+
+    def _files(s: dict) -> set[str]:
+        return {
+            _normalize_artifact_path(f)
+            for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and f.strip()
+        }
+
+    test_sids = sorted(sid for sid in subtasks if sid.startswith("test-"))
+    code_sids = sorted(
+        sid for sid in subtasks
+        if sid.startswith(_TEST_OWNERSHIP_CODE_PREFIXES))
+
+    issues: list[str] = []
+    for test_sid in test_sids:
+        test_files = _files(subtasks[test_sid])
+        if not test_files:
+            continue
+        for code_sid in code_sids:
+            shared = test_files & _files(subtasks[code_sid])
+            if not shared:
+                continue
+            issues.append(
+                f"TEST_OWNERSHIP_OVERLAP: {test_sid} (testing) and "
+                f"{code_sid} (code) both touch "
+                f"{', '.join(sorted(shared))} — running blind to each "
+                "other, both can author or rewrite the same test file with "
+                "incompatible contracts (DESIGN §5 *Cross-domain surface "
+                f"overlap*). {code_sid} should own the file unless the "
+                f"plan gives {test_sid} an explicit depends_on/requires "
+                "edge on it."
+            )
+    return issues
+
+
 _ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
                                "credential"})
 
@@ -9130,6 +9324,59 @@ def _normalize_pip_installs(recipe: list[dict]) -> list[dict]:
             i = cmd.index("install")
             new_cmd = cmd[:i + 1] + ["--break-system-packages"] + cmd[i + 1:]
             out.append({**entry, "command": new_cmd})
+        else:
+            out.append(entry)
+    return out
+
+
+# N22: Next.js/Turbopack's Rust/Tokio build tooling sizes its thread pool to
+# the host's full core count — nothing in the worker cgroup constrains
+# *detected* parallelism (only pids.max bounds how many of those threads/forks
+# the cgroup will actually admit). A build that spawns one worker thread per
+# host core can exhaust the per-worker `pids.max` cap (measured spiking to
+# 972/2048), and the resulting EAGAIN surfaces as a `build-failed` defect of
+# the diff rather than what it actually is: a resource-limit collision.
+# UV_THREADPOOL_SIZE caps libuv's pool (Node's fs/crypto/zlib workers, which
+# Next's build pipeline uses); RAYON_NUM_THREADS caps the rayon-based
+# parallelism SWC (Next's Rust compiler, which underlies Turbopack) uses for
+# its transform passes. Both are inert (fall back to their own default) when
+# a given command doesn't use that runtime, so setting both unconditionally
+# on every Node install/build command is safe.
+_NODE_THREADPOOL_CAP_ENV: dict[str, str] = {
+    "UV_THREADPOOL_SIZE": "4",
+    "RAYON_NUM_THREADS": "4",
+}
+
+_NODE_PACKAGE_MANAGERS = frozenset({"pnpm", "npm", "yarn"})
+
+
+def _normalize_node_threadpool(recipe: list[dict]) -> list[dict]:
+    """Inject `_NODE_THREADPOOL_CAP_ENV` into every Node/pnpm/npm/yarn
+    install-or-build entry's `env` dict, unless the entry already sets that
+    var (an entry-supplied value wins — this only fills gaps). Returns a new
+    recipe list (entries are shallow-copied only when rewritten).
+
+    Why this is code, not a prompt rule: nothing in the worker cgroup caps
+    a build tool's *detected* core count (§12: prompts advisory, code
+    enforces) — a Rust/Tokio or libuv thread pool sized to `nproc` will size
+    itself the same way whether or not a prompt asks it not to. Normalizing
+    here, at the single point every consumer reads the recipe as data, means
+    every execution path (the base-tree baseline's direct `_run_streaming`
+    call, and the advisory PROVISION_RECIPE text handed to implementer/
+    conformer workers) gets the cap.
+    """
+    out: list[dict] = []
+    for entry in recipe:
+        cmd = entry.get("command") or []
+        if (entry.get("kind") in ("install", "build")
+                and cmd and cmd[0] in _NODE_PACKAGE_MANAGERS):
+            env = dict(entry.get("env") or {})
+            changed = False
+            for k, v in _NODE_THREADPOOL_CAP_ENV.items():
+                if k not in env:
+                    env[k] = v
+                    changed = True
+            out.append({**entry, "env": env} if changed else entry)
         else:
             out.append(entry)
     return out
@@ -10493,6 +10740,29 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     return (None, False)
 
 
+def _find_antml_markup(value: object) -> str | None:
+    """Recursively scan a JSON-shaped value for a string containing
+    literal `antml:` markup. Returns the offending string on the first
+    hit, None if clean. Structured recursion (dict/list), not a
+    top-level-only check — the incident showed corruption landing in
+    arbitrary nested fields (e.g. inside `clarification_question`)."""
+    if isinstance(value, str):
+        return value if "antml:" in value else None
+    if isinstance(value, dict):
+        for v in value.values():
+            hit = _find_antml_markup(v)
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(value, list):
+        for v in value:
+            hit = _find_antml_markup(v)
+            if hit is not None:
+                return hit
+        return None
+    return None
+
+
 # --- result cross-field validation -------------------------------------------
 
 def _validate_result(result: dict) -> tuple[str, str] | None:
@@ -10510,7 +10780,23 @@ def _validate_result(result: dict) -> tuple[str, str] | None:
     and surface as conformance warnings, but do not affect terminal
     status. The other branches (handoff, blocked, failed, clarification)
     still enforce the mechanical-precondition fields their next-step
-    consumers require."""
+    consumers require.
+
+    Checked before anything else: literal `antml:`-shaped markup inside
+    any string field value. Upstream anthropics/claude-code#64690 is a
+    model-side token-generation bug that can leak tool-call markup
+    (`antml:parameter`, `antml:invoke`, …) into a structured-output
+    field's own string value. No legitimate worker output contains this
+    substring, so its presence is an unambiguous corruption signal — the
+    underlying work may well have succeeded, so this is retryable rather
+    than the terminal `"broken"` the status dispatch below would
+    otherwise assign it via a coincidentally-matching shape (e.g. a
+    corrupted `checkpoint_path`)."""
+    if _find_antml_markup(result) is not None:
+        return ("corrupted_envelope",
+                "result contains literal 'antml:' markup in a string field "
+                "— upstream anthropics/claude-code#64690 token-generation "
+                "corruption")
     status = result.get("status")
     if status == "incomplete-handoff":
         cp = result.get("checkpoint_path")
@@ -12454,12 +12740,17 @@ def _cgroup_enroll(sid: str, pid: int) -> str | None:
 
 def _cgroup_destroy(sid: str | None) -> None:
     """Ask the broker to tear down the worker cgroup (kill any survivors,
-    rmdir). Best-effort — broker/socket errors are swallowed. Called from
-    `_invoke`'s cleanup path on every exit (success, timeout, abort)."""
+    rmdir). Best-effort — broker/socket errors are swallowed and a broker-
+    reported ERR (e.g. a lingering process kept the dir busy) is logged
+    rather than silently discarded, so a failed teardown is distinguishable
+    from a successful one. Called from `_invoke`'s cleanup path on every
+    exit (success, timeout, abort)."""
     if sid is None:
         return
     with contextlib.suppress(OSError):
-        _cgroup_request(f"destroy {sid}")
+        resp = _cgroup_request(f"destroy {sid}")
+        if resp != "OK":
+            log(f"  [{sid}] cgroup destroy failed ({resp}); dir may be leaked")
 
 
 def _cgroup_stat(sid: str | None) -> tuple[int, int, int, int] | None:
@@ -12918,7 +13209,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
-                  active_token: str | None = None) -> dict:
+                  active_token: str | None = None,
+                  max_parallel: int | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -12952,7 +13244,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     with per-invocation, with no container restart. Passed explicitly
     rather than mutated via ambient `os.environ` because the orchestrator
     runs many `claude -p` workers concurrently (`asyncio.gather` under
-    `Semaphore(max_parallel)`); mutating process-global env would race."""
+    `Semaphore(max_parallel)`); mutating process-global env would race.
+
+    `max_parallel`, when given, arms the N9 slice-aware admission gate
+    (`_await_worker_memory_admission`): before spawning, block while
+    admitting this worker would drive the shared `leerie.slice`
+    per-worker allocation below the measured build-peak floor. None
+    (the default) skips the gate — used by callers with no run-level
+    `max_parallel` context, e.g. the startup smoke test."""
+    if max_parallel is not None:
+        await _await_worker_memory_admission(max_parallel)
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -14089,7 +14390,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          DEFAULT_CAPS["worker_pids_max"]),
                                      run_id=st.run_id,
                                      active_token=st.data.get(
-                                         "active_oauth_token"))
+                                         "active_oauth_token"),
+                                     max_parallel=caps.get("max_parallel"))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
@@ -16500,6 +16802,10 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # the Debian-13 externally-managed system Python. See
     # _normalize_pip_installs.
     recipe = _normalize_pip_installs(recipe)
+    # Cap Node/pnpm build tooling's thread pool so it doesn't size to the
+    # host's full core count and exhaust the worker's pids.max cgroup cap
+    # (N22). See _normalize_node_threadpool.
+    recipe = _normalize_node_threadpool(recipe)
 
     prov["recipe"] = recipe
     st.save()
@@ -21742,6 +22048,8 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # the judge*). Advisory as shipped — logged, never gating.
     for issue in check_duplicate_providers(plans):
         log(f"⚠  {issue}")
+    for issue in check_test_ownership_overlap(plans):
+        log(f"⚠  {issue}")
 
     # Cheap-skip conditions, in order of cost.
     if st.data.get("skip_overlap_judge"):
@@ -22305,6 +22613,12 @@ def check_budget_feasibility(st: State, caps: dict,
             f"still fire if the estimate was correct).",
             code=EXIT_BUDGET_INFEASIBLE,
         )
+    log(
+        f"budget feasibility: cap {cap} ok for total estimate "
+        f"{total_estimate:g} ({already_spent} spent + "
+        f"{remaining_estimate:g} remaining, × margin {margin} = "
+        f"{total_estimate * margin:g})"
+    )
 
 
 def _repair_prescribed_commands(plans: list[dict],
@@ -22773,7 +23087,13 @@ def _format_provision_recipe_section(recipe: list[dict],
     else:
         raise ValueError(f"unknown audience {audience!r}")
     for i, e in enumerate(filtered_entries, 1):
-        cmd_str = " ".join(e["command"])
+        # An `env` entry (e.g. _normalize_node_threadpool's thread-pool
+        # caps) is rendered as a shell-style `VAR=val` prefix so a worker
+        # copying this line into its own Bash call still gets the cap —
+        # the worker executes via a real shell, so this is inert text here
+        # and a real env-var assignment there.
+        env_prefix = "".join(f"{k}={v} " for k, v in (e.get("env") or {}).items())
+        cmd_str = env_prefix + " ".join(e["command"])
         wd = e.get("working_dir", ".")
         timeout = _recipe_timeout_s(e)
         lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout:g}s)")
@@ -22976,6 +23296,17 @@ _WORKER_RETRYABLE_KINDS = frozenset({
                        # envelope by _run_implementer's WorkerError /
                        # TimeoutExpired catches. Both are corrective-note
                        # cases — a fresh worker can plausibly do better.
+    "corrupted_envelope",  # _validate_result — literal `antml:`-shaped
+                       # markup found inside a string field value.
+                       # Upstream anthropics/claude-code#64690:
+                       # model-side token-generation corruption can leak
+                       # tool-call markup into a structured-output
+                       # field's own string value. The underlying work
+                       # can plausibly have succeeded, so a fresh worker
+                       # retry — not the terminal "broken" the status
+                       # dispatch would otherwise assign via a
+                       # coincidentally-matching field shape — is the
+                       # right response.
 })
 
 
@@ -23482,7 +23813,10 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
     """Spawn one conformer for one subtask in its existing worktree.
     Returns the worker's structured output, or None on WorkerError (which
     is recorded as a warning by the caller — DESIGN §9: the phase is
-    advisory)."""
+    advisory). Raises `PidExhaustedError` (a WorkerError subclass) rather
+    than swallowing it, so the caller can attach its cgroup pids
+    diagnostic to the recorded warnings instead of a generic crash
+    message (N22)."""
     sys_prompt = _load_prompt("conformer")
     repo_root = st.repo_root
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
@@ -23528,6 +23862,14 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                               model=models["conformer"],
                               effort=efforts["conformer"],
                               sid=f"{sid}-conformer")
+    except PidExhaustedError:
+        # Re-raised rather than swallowed like the generic WorkerError
+        # below (of which this is a subclass): the caller
+        # (_run_conformance_phase) attaches the cgroup pids.current/
+        # pids.max this exception already carries (N22) to its recorded
+        # warnings, instead of losing that diagnostic behind a generic
+        # "conformer crashed" message.
+        raise
     except WorkerError as e:
         log(f"  {sid}: conformer crashed: {e}")
         return None
@@ -23667,6 +24009,7 @@ async def _run_checked_loop(
     name: str,
     max_rounds: int,
     make_feedback_prompt: Callable[[str], Awaitable[dict]] | None = None,
+    log_path: Path | None = None,
 ) -> tuple[dict | None, list[str]]:
     """Generic mechanical-feedback retry loop (CRITIC pattern).
 
@@ -23734,7 +24077,16 @@ async def _run_checked_loop(
     on legitimate, still-improving retries. Equality is the correct
     signal for "this is not new information"; a strict subset is new
     information (fewer open issues) and must be allowed to keep
-    retrying, bounded as always by ``max_rounds``."""
+    retrying, bounded as always by ``max_rounds``.
+
+    *log_path* is optional. When given, each round's per-worker JSONL log
+    is scanned via `_detect_malformed_tool_envelope` (N6) after `invoke()`
+    returns; a hit is appended to that round's issue list as a gating
+    `MALFORMED_TOOL_ENVELOPE` finding, forcing one additional round through
+    the same `make_feedback_prompt` mechanism as any other found issue —
+    a malformed tool-call envelope (e.g. `{"Bash": {...}}` instead of
+    `{...}`) is otherwise dropped by the CLI with no retry and no other
+    signal that the call never happened."""
     warnings: list[str] = []
     last_res: dict | None = None
     seen_issue_sets: list[frozenset[str]] = []
@@ -23773,6 +24125,14 @@ async def _run_checked_loop(
             break
 
         all_issues = check(last_res)
+        if log_path is not None and _detect_malformed_tool_envelope(log_path):
+            all_issues = [
+                *all_issues,
+                "MALFORMED_TOOL_ENVELOPE: worker submitted a malformed "
+                "tool-call envelope (e.g. `{\"Bash\": {...}}` instead of "
+                "`{...}`) — the CLI rejected it with an 'unexpected "
+                "parameter' error and the call was lost; retry with the "
+                "tool's plain input shape (no extra wrapper key)."]
         # Advisory findings are surfaced but never re-invoke (DESIGN
         # §"Findings carry a severity; only gating findings re-invoke").
         # Everything below this line reasons about `issues` — the gating
@@ -23998,6 +24358,48 @@ def _count_orphaned_bg_axis(log_path: Path,
     return orphans
 
 
+# Exact wording the Claude Code CLI returns when a worker submits a tool
+# call whose top-level input is wrapped in an extra envelope layer (e.g.
+# `{"Bash": {"command": ...}}` instead of the plain `{"command": ...}` the
+# tool schema expects) — an `InputValidationError` naming the bogus
+# top-level key as an "unexpected parameter". The call is simply lost with
+# no retry when this happens (N6). Deliberately narrow: this matches only
+# this specific wording, never the generic `tool-fail` tag — ~81% of
+# tool-fails are benign deliberate absence probes (e.g. `ls` on a path that
+# may not exist) and must not force a retry round.
+_MALFORMED_TOOL_ENVELOPE_MARKER = "unexpected parameter"
+
+
+def _detect_malformed_tool_envelope(log_path: Path) -> bool:
+    """True when this worker's per-worker JSONL log contains at least one
+    tool-result error matching the malformed-envelope shape above.
+
+    Reuses the same `_iter_log_tool_use`-style tolerant JSONL scan as
+    `_emit_bash_axis_warnings` / `_count_orphaned_bg_axis`: any line that
+    isn't valid JSON, or any event that doesn't carry the expected
+    message/content shape, is skipped silently rather than raising — a
+    single malformed log line must not break detection for the whole
+    worker."""
+    if not log_path.is_file():
+        return False
+    for line in log_path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "user":
+            continue
+        for b in (event.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") != "tool_result" or not b.get("is_error"):
+                continue
+            text = _extract_tool_result_text(b).lower()
+            if _MALFORMED_TOOL_ENVELOPE_MARKER in text:
+                return True
+    return False
+
+
 def _emit_bash_axis_warnings(log_path: Path, round_label: str,
                              warnings: list[str]) -> None:
     """Helper called once per conformer round: append advisory warnings
@@ -24062,10 +24464,25 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
-        last_res = await _run_conformer(
-            sid, leerie_dir, worktree, caps, st, models, efforts,
-            rules_files=rules_files, blt_commands=blt,
-            diff_base=run_branch, extra_feedback=blt_feedback)
+        try:
+            last_res = await _run_conformer(
+                sid, leerie_dir, worktree, caps, st, models, efforts,
+                rules_files=rules_files, blt_commands=blt,
+                diff_base=run_branch, extra_feedback=blt_feedback)
+        except PidExhaustedError as e:
+            # N22: the build/lint/test the conformer ran spawned enough
+            # worker threads/processes to hit the cgroup's pids.max — a
+            # resource-limit collision, not a defect in the diff. `str(e)`
+            # already carries pids.current/pids.max (set at the raise
+            # site in _read_stream); recorded here rather than discarded
+            # behind a generic crash message so the operator can tell the
+            # two apart.
+            warnings.append(f"conformer round {c_round}: PID cgroup "
+                            f"exhausted (build/lint/test spawned too many "
+                            f"worker threads); phase surfaced as "
+                            f"advisory: {e}")
+            last_res = None
+            break
 
         if last_res is None:
             warnings.append(f"conformer round {c_round}: worker crashed; "
@@ -24358,9 +24775,15 @@ async def _capture_conformance_baseline(
         if e.get("kind") not in ("install", "build") or not e.get("command"):
             continue
         wd = staging / (e.get("working_dir") or ".")
+        # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
+        # layers on top of the orchestrator's own environment rather than
+        # replacing it — `_run_streaming(env=None)` would otherwise mean
+        # "inherit everything," so an explicit dict here must still carry
+        # PATH etc.
+        entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
         try:
             await _run_streaming(
-                e["command"], cwd=str(wd),
+                e["command"], cwd=str(wd), env=entry_env,
                 timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
@@ -25131,6 +25554,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     + " (fix + resume)")
                 log(f"  {sid}: {blocker}")
                 st.data.setdefault("subtask_status", {})[sid] = "blocked"
+                log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
+                    f"{st.run_id} {sid}` once addressed, then `leerie "
+                    "resume` to continue without re-running it")
                 st.save()
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocker, "summary": blocker}
@@ -25383,6 +25809,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             name=f"integrator-{sid}",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_integrator_fb,
+            log_path=leerie_dir / "logs" / f"integrator-{sid}.log",
         )
         if ires is None:
             # The integrator crashed every round (infrastructure: PID

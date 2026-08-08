@@ -216,9 +216,9 @@ def test_base_copied_into_buildkit_namespace_before_build(tmp_path):
 
     log_content = (tmp_path / "nerdctl.log").read_text()
     lines = log_content.splitlines()
-    # The copy path: `save leerie:1.2.3` and a `--namespace buildkit load`.
-    assert any(l.startswith("save leerie:1.2.3") for l in lines), log_content
-    assert any("--namespace buildkit load" in l for l in lines), log_content
+    # The copy path: `save -o <tmpfile> leerie:1.2.3` and a `--namespace buildkit load -i <tmpfile>`.
+    assert any(l.startswith("save ") and l.endswith(" leerie:1.2.3") for l in lines), log_content
+    assert any("--namespace buildkit load -i " in l for l in lines), log_content
     # The buildkit-ns probe is `--namespace buildkit image inspect leerie:1.2.3`.
     assert any("--namespace buildkit image inspect leerie:1.2.3" in l
                for l in lines), log_content
@@ -254,7 +254,7 @@ def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
     assert result.returncode == 0, result.stderr
     log_content = (tmp_path / "nerdctl.log").read_text()
     # Base present in buildkit ns → no save|load copy.
-    assert "save leerie:1.2.3" not in log_content, log_content
+    assert not any(l.startswith("save ") for l in log_content.splitlines()), log_content
     assert "buildkit load" not in log_content, log_content
     # But the build still happens.
     assert any(l.startswith("build ") for l in log_content.splitlines()), log_content
@@ -730,7 +730,95 @@ def test_lockfile_bump_still_changes_hash_against_opt_target(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Runtime BUNDLE_PATH env reconciliation (leerie:~6042 CACHE_MOUNTS):
+# N1: the language-dep probe build tag must be a valid OCI reference (no
+# leading underscore), and ensure_base_in_buildkit_ns must use a file-based
+# save+load with captured stderr logged on failure, not a bare silenced pipe.
+# ---------------------------------------------------------------------------
+
+def test_lang_probe_build_tag_is_a_valid_oci_reference(tmp_path):
+    """The language-dep probe build (and its cleanup `image rm`) must never
+    use a tag with a leading underscore — OCI/nerdctl rejects that reference
+    outright, so the probe always failed and the bake silently degraded to
+    apt-only. Falsify by reverting to `__leerie_lang_probe_$$`."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    _write_config_toml(leerie_dir)
+    (user_repo / "uv.lock").write_text("")
+    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
+    assert result.returncode == 0, result.stderr
+
+    log_content = (tmp_path / "nerdctl.log").read_text()
+    build_lines = [l for l in log_content.splitlines() if l.startswith("build ")]
+    # Two builds fire: the language-dep probe, then the real per-repo build.
+    probe_lines = [l for l in build_lines if " -t leerie-repo/" not in l]
+    assert probe_lines, f"no probe build call found:\n{log_content}"
+    assert not any("__leerie_lang_probe_" in l for l in probe_lines), log_content
+    assert not any(" -t _" in l for l in probe_lines), log_content
+
+    rm_lines = [l for l in log_content.splitlines() if l.startswith("image rm ")]
+    assert rm_lines, f"no `image rm` cleanup call found:\n{log_content}"
+    assert not any("__leerie_lang_probe_" in l for l in rm_lines), log_content
+    assert not any(l.split()[-1].startswith("_") for l in rm_lines), log_content
+
+
+def test_save_load_uses_tempfile_and_logs_stderr_on_failure(tmp_path):
+    """ensure_base_in_buildkit_ns must save/load through temp files (not a
+    bare `nerdctl save | nerdctl load` pipe) so a failure's stderr survives,
+    and must log that captured stderr via remote_log on failure. Falsify by
+    reverting to the piped, stderr-discarding form."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    # A nerdctl stub whose `save` subcommand prints a diagnostic to stderr
+    # and fails, simulating a real save failure.
+    body = r"""
+nerdctl() {
+  echo "$*" >> "$NERDCTL_LOG"
+  local ns=""
+  if [ "${1:-}" = "--namespace" ]; then ns="${2:-}"; shift 2 || true; fi
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    image) [ "$ns" = "buildkit" ] && return 1; return "${NERDCTL_INSPECT_RC:-0}" ;;
+    save) echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1 ;;
+    build) return "${NERDCTL_BUILD_RC:-0}" ;;
+    *) return 0 ;;
+  esac
+}
+ensure_base_in_buildkit_ns
+"""
+    result = _run_harness(
+        tmp_path,
+        body,
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+            "IMAGE_TAG": "leerie:1.2.3",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+    log_content = (tmp_path / "nerdctl.log").read_text()
+    # A file-based save is used (an `-o <path>` output flag), not a bare pipe.
+    save_lines = [l for l in log_content.splitlines() if l.startswith("save ")]
+    assert save_lines, f"no save call found:\n{log_content}"
+    assert " -o " in save_lines[0], save_lines[0]
+    # load must never be reached — save failed, so the `&&` guard short-circuits.
+    assert not any(l.startswith("--namespace buildkit load") or "load -i" in l
+                    for l in log_content.splitlines()), log_content
+
+    # The captured stderr diagnostic must be surfaced via remote_log.
+    assert "nerdctl-save-failure: disk quota exceeded" in result.stderr, result.stderr
 # must point at /opt/bundle only when the Dockerfile actually baked there,
 # else keep the pre-existing cache-mount fallback path.
 # ---------------------------------------------------------------------------

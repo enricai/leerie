@@ -64,6 +64,26 @@ class TestSettleSubtaskWiring:
         i_blocked = src.index("if blocked_reason:")
         assert i_gate < i_blocked
 
+    def test_logs_actionable_warning_at_blocked_detection(self, leerie):
+        """N21: the moment `subtask_status[sid]` is set to 'blocked', a
+        log() call fires immediately naming the sid and the exact
+        `leerie accept-blocked <run-id> <sid>` remedy — not only surfaced
+        later at wave close."""
+        src = inspect.getsource(leerie._settle_subtask)
+        i_assign = src.index('[sid] = "blocked"')
+        # The very next statement after the assignment must be a log()
+        # call carrying the sid and the remedy command (before st.save()).
+        after = src[i_assign:i_assign + 400]
+        i_log = after.index("log(")
+        i_save = after.index("st.save()")
+        assert i_log < i_save, (
+            "log() must fire immediately at blocked-detection, not after "
+            "the state write is saved and the loop moves on")
+        log_call = after[i_log:i_save]
+        assert "{sid}" in log_call
+        assert "accept-blocked" in log_call
+        assert "{st.run_id}" in log_call or "st.run_id" in log_call
+
 
 class TestFinalConformanceWiring:
     def test_final_uses_actionable_solution_defects(self, leerie):

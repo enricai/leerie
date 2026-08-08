@@ -4469,6 +4469,33 @@ _warn_if_leerie_stale() {
 }
 _warn_if_leerie_stale || true
 
+# --- in-repo tee-log warning ---------------------------------------------
+# Operators commonly run `leerie task | tee leerie-<task>.log`, and the log
+# lands in $USER_REPO by default — which is bind-mounted whole into every
+# worker's container at /work (DESIGN §2). A worker can then `cat`/`grep`
+# its own orchestration log, including gate vocabulary and internal check
+# names, defeating judge independence (e.g. an adherence/wiring judge
+# reading the very log that would tell it what verdict is expected).
+#
+# Detection-and-warn only (N5). The correct-default fix — writing the log
+# outside the repo via --log-file — is separate work; this check never
+# blocks the run, only alerts before it proceeds.
+_warn_if_log_in_repo() {
+  local _f
+  for _f in "$USER_REPO"/leerie-*.log; do
+    [ -e "$_f" ] || continue
+    remote_log "warning: found $(basename "$_f") inside the repo root" \
+               "($USER_REPO)."
+    echo "  This directory is bind-mounted whole into every worker" >&2
+    echo "  container. If this file is your \`tee\` target for this" >&2
+    echo "  run's output, workers can read their own orchestration log —" >&2
+    echo "  including judge/gate names — undermining judge independence." >&2
+    echo "  Move the log outside the repo (e.g. \`leerie task | tee" >&2
+    echo "  /tmp/leerie-task.log\`)." >&2
+  done
+}
+_warn_if_log_in_repo || true
+
 # --- host preflight: git repo + gh + jq ---------------------------------
 # These checks moved out of the orchestrator (DESIGN §6 *Finalization*).
 # The launcher does the host-side push + PR after the container exits,
@@ -4736,9 +4763,15 @@ ensure_base_in_buildkit_ns() {
     return 0
   fi
   remote_log "copying base image into buildkit namespace (one-time; ~15-20s)..."
-  if ! nerdctl save "$IMAGE_TAG" | nerdctl --namespace buildkit load >/dev/null 2>&1; then
+  local _save_load_tar _save_load_err
+  _save_load_tar="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image.XXXXXX.tar")"
+  _save_load_err="$(mktemp "${TMPDIR:-/tmp}/leerie-base-image-copy.XXXXXX.log")"
+  if ! { nerdctl save -o "$_save_load_tar" "$IMAGE_TAG" && \
+         nerdctl --namespace buildkit load -i "$_save_load_tar"; } >"$_save_load_err" 2>&1; then
     remote_log "warning: could not copy base image into buildkit namespace — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+    remote_log "warning: save/load error output: $(cat "$_save_load_err")"
   fi
+  rm -f "$_save_load_tar" "$_save_load_err"
 }
 
 # Build the per-repo derived image. Caller has already verified the build
@@ -5359,7 +5392,7 @@ PY
            --build-arg BASE_IMAGE="$IMAGE_TAG" \
            --build-arg HOST_UID="$(id -u)" \
            --build-arg HOST_GID="$(id -g)" \
-           -t "__leerie_lang_probe_$$" \
+           -t "leerie-lang-probe:$$" \
            -f "$_leerie_dockerfile" \
            "$USER_REPO" \
            >/dev/null 2>&1; then
@@ -5384,7 +5417,7 @@ PY
         mv "$_gen_df_tmp2" "$_leerie_dockerfile"
         unset _gen_df_tmp2 _pkg2
       else
-        nerdctl image rm "__leerie_lang_probe_$$" >/dev/null 2>&1 || true
+        nerdctl image rm "leerie-lang-probe:$$" >/dev/null 2>&1 || true
       fi
     fi
   fi

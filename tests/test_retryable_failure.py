@@ -43,13 +43,13 @@ def test_terminal_kinds_return_false(leerie, kind):
 
 
 def test_retryable_kinds_constant_matches_documented_set(leerie):
-    """The retryable enum must be exactly the six documented kinds.
+    """The retryable enum must be exactly the seven documented kinds.
     Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
     assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
         {"no_commits", "dirty_worktree", "empty_handoff", "worktree_setup",
-         "pid_exhausted", "oom_killed"}
+         "pid_exhausted", "oom_killed", "corrupted_envelope"}
     )
 
 
@@ -121,6 +121,8 @@ _PRODUCER_RETRYABLE_KINDS = {
     "pid_exhausted",
     # _settle_subtask's `except OomKilledError` arm → "oom_killed"
     "oom_killed",
+    # _validate_result's top-of-function antml: markup scan → "corrupted_envelope"
+    "corrupted_envelope",
 }
 
 
@@ -361,4 +363,111 @@ class TestCategoryIsTheSingleSourceOfTruth:
         assert (code.index("_INFRASTRUCTURE_FAILURE_KINDS")
                 < code.index("infrastructure failure")), (
             "the log must sit inside the category branch")
+
+
+# --- antml: markup corruption detection (N20) -------------------------------
+# Upstream anthropics/claude-code#64690: a model-side token-generation bug
+# can leak tool-call markup into a structured-output field's own string
+# value. `_validate_result` must catch this at the TOP of the function,
+# before the status dispatch, and classify it as retryable rather than
+# falling through to "broken".
+
+_ANTML_SNIPPET = "some text antml:parameter leaked in here"
+
+
+def test_validate_result_detects_antml_markup_and_is_retryable(leerie):
+    """The incident shape: status='incomplete-handoff', checkpoint_path=null,
+    with 'antml:parameter' leaked into another string field. Must classify
+    as the new corruption kind, not 'broken', and that kind must be
+    retryable."""
+    res = {
+        "subtask_id": "bugfix-014",
+        "status": "incomplete-handoff",
+        "checkpoint_path": None,
+        "summary": _ANTML_SNIPPET,
+    }
+    err = leerie._validate_result(res)
+    assert err is not None
+    kind, _msg = err
+    assert kind == "corrupted_envelope"
+    assert leerie._retryable_failure(kind) is True
+
+
+def test_validate_result_checks_corruption_before_status_dispatch(leerie, tmp_path):
+    """A corruption-shaped payload with an OTHERWISE-VALID status (real,
+    existing checkpoint_path) must still classify as corruption, not fall
+    through the status dispatch and return None."""
+    cp = tmp_path / "checkpoint.md"
+    cp.write_text("in progress")
+    res = {
+        "subtask_id": "bugfix-014",
+        "status": "incomplete-handoff",
+        "checkpoint_path": str(cp),
+        "summary": _ANTML_SNIPPET,
+    }
+    err = leerie._validate_result(res)
+    assert err is not None
+    kind, _msg = err
+    assert kind == "corrupted_envelope"
+
+
+def test_validate_result_falsification_without_the_check(leerie):
+    """FALSIFIER: removing the top-of-function check would make this exact
+    corrupted-but-status-dispatchable-shaped payload return 'broken' via the
+    existing incomplete-handoff missing-checkpoint arm. This test documents
+    that the pre-fix behavior IS 'broken' (non-retryable) by directly
+    invoking the pre-check dispatch shape — i.e. this is the same payload
+    minus the corruption marker."""
+    res = {
+        "subtask_id": "bugfix-014",
+        "status": "incomplete-handoff",
+        "checkpoint_path": None,
+    }
+    err = leerie._validate_result(res)
+    assert err is not None
+    kind, _msg = err
+    assert kind == "broken"
+    assert leerie._retryable_failure(kind) is False
+
+
+def test_validate_result_scans_nested_fields(leerie):
+    """The detector must recurse into nested structures (e.g.
+    clarification_question), since the incident showed corruption landing
+    in arbitrary fields, not just top-level ones."""
+    res = {
+        "subtask_id": "bugfix-014",
+        "status": "needs-clarification",
+        "checkpoint_path": None,
+        "clarification_question": {
+            "id": "q1",
+            "question": _ANTML_SNIPPET,
+            "why_underivable": "n/a",
+        },
+    }
+    err = leerie._validate_result(res)
+    assert err is not None
+    kind, _msg = err
+    assert kind == "corrupted_envelope"
+
+
+def test_validate_result_clean_result_unaffected(leerie):
+    """A clean result with no antml: markup anywhere must be unaffected by
+    the new check — a well-formed complete result stays None."""
+    res = {
+        "subtask_id": "bugfix-014",
+        "status": "complete",
+        "summary": "Added the widget and wired it up.",
+    }
+    assert leerie._validate_result(res) is None
+
+
+def test_find_antml_markup_recurses_lists_and_dicts(leerie):
+    """Unit coverage for the detector helper itself: hits inside a list,
+    inside a nested dict, and a clean structure returning None."""
+    assert leerie._find_antml_markup("clean string") is None
+    assert leerie._find_antml_markup(_ANTML_SNIPPET) == _ANTML_SNIPPET
+    assert leerie._find_antml_markup({"a": {"b": [1, 2, _ANTML_SNIPPET]}}) == _ANTML_SNIPPET
+    assert leerie._find_antml_markup({"a": "clean", "b": ["also clean"]}) is None
+    assert leerie._find_antml_markup(None) is None
+    assert leerie._find_antml_markup(42) is None
 

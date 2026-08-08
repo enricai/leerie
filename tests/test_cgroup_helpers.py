@@ -177,6 +177,25 @@ def test_destroy_swallows_unreachable(leerie, monkeypatch):
     leerie._cgroup_destroy("sid-d")  # must not raise
 
 
+def test_destroy_logs_broker_err_reply(leerie, monkeypatch):
+    """N17: an `ERR ...` destroy reply (e.g. rmdir failed) must be logged,
+    not silently discarded — a failed teardown was previously
+    indistinguishable from a successful one."""
+    _stub_broker(leerie, monkeypatch, "ERR Directory not empty")
+    logged = []
+    monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
+    leerie._cgroup_destroy("sid-e")
+    assert any("sid-e" in m and "Directory not empty" in m for m in logged)
+
+
+def test_destroy_ok_reply_does_not_log(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "OK")
+    logged = []
+    monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
+    leerie._cgroup_destroy("sid-f")
+    assert logged == []
+
+
 # ---- fail-closed gate + recording (unified) -------------------------------
 
 class _FakeState:

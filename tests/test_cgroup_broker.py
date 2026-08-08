@@ -111,13 +111,53 @@ def test_enroll_writes_cgroup_procs(broker):
     assert "4321" in (d / "cgroup.procs").read_text()
 
 
-def test_destroy_removes_dir(broker):
+def test_destroy_removes_dir(broker, monkeypatch):
+    # On a real kernel cgroupfs, cgroup.kill is a pre-existing pseudo-file
+    # that writing to it does not turn into a dentry blocking rmdir; on
+    # this fake (plain-directory) cgroupfs it would, so stub the
+    # cgroup.kill write out to isolate the success path.
+    broker._handle("create wsid 0 0")
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    assert d.is_dir()
+    orig_write = broker._write
+    monkeypatch.setattr(
+        broker, "_write",
+        lambda path, *a, **kw: None if path.endswith("cgroup.kill") else orig_write(path, *a, **kw))
+    assert broker._handle("destroy wsid") == "OK"
+    assert not d.exists()
+
+
+def test_destroy_reports_err_on_rmdir_failure(broker):
+    """N17: a failed rmdir (e.g. ENOTEMPTY because a controller left a
+    stray file behind) must surface as `ERR ...`, not a silently-discarded
+    `OK` — see the 70-stale-vs-12-live cgroup leak this closes."""
     broker._handle("create wsid 0 64")
     d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
     assert d.is_dir()
-    assert broker._handle("destroy wsid") == "OK"
-    # cgroup.kill is a stray file on a regular fs, so rmdir may be blocked;
-    # the contract is that destroy returns OK and does not raise.
+    assert (d / "pids.max").exists()  # non-empty dir -> rmdir fails
+    resp = broker._handle("destroy wsid")
+    assert resp.startswith("ERR ")
+    assert d.exists()
+
+
+def test_v2_destroy_returns_none_on_success(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid2"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    assert broker._v2_destroy("wsid2") is None
+    assert not d.exists()
+
+
+def test_v2_destroy_returns_error_message_on_failure(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid3"
+    d.mkdir(parents=True)
+
+    def _raise(path):
+        raise OSError(39, "Directory not empty")
+
+    monkeypatch.setattr(broker.os, "rmdir", _raise)
+    err = broker._v2_destroy("wsid3")
+    assert err == "Directory not empty"
 
 
 def test_no_hierarchy_errors(broker, monkeypatch):
@@ -376,4 +416,10 @@ def test_rootless_create_enroll_destroy_round_trip(rootless_broker):
     assert rootless_broker._handle("enroll wsid 4321") == "OK"
     assert "4321" in (d / "cgroup.procs").read_text()
 
-    assert rootless_broker._handle("destroy wsid") == "OK"
+    # On this fake (plain-directory) cgroupfs the limit files created
+    # above are real dentries a real kernel cgroupfs would not have, so
+    # rmdir genuinely fails here (ENOTEMPTY) — this is the N17 contract:
+    # a failed teardown surfaces as ERR rather than a silently-swallowed
+    # OK. Real cgroupfs directories contain no such stray files.
+    resp = rootless_broker._handle("destroy wsid")
+    assert resp.startswith("ERR ")
