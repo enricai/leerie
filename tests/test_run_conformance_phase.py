@@ -216,6 +216,56 @@ def test_worker_crash_surfaces_as_warning(env):
     assert any("crashed" in w for w in warnings)
 
 
+# --- PID cgroup exhaustion (N22): the diagnostic must survive into the
+# recorded warnings, not collapse into the generic "worker crashed" text ---
+
+def test_pid_exhaustion_attaches_pids_stat_to_warnings(env):
+    c = env["leerie"]
+
+    async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
+                    *, rules_files, blt_commands, diff_base,
+                    extra_feedback=None):
+        raise c.PidExhaustedError(
+            "worker t1-conformer exhausted its PID cgroup "
+            "(pids.current=2048/2048, fork denials=7); every "
+            "shell-spawning tool call fails with EAGAIN")
+
+    c._run_conformer = _stub
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert res is None
+    assert any("pids.current=2048/2048" in w for w in warnings)
+    assert any("PID cgroup" in w for w in warnings)
+    # Not swallowed as a generic crash — the diagnostic must be visible.
+    assert not any(w == "conformer round 0: worker crashed; phase "
+                        "surfaced as advisory" for w in warnings)
+
+
+def test_run_conformer_reraises_pid_exhausted_error(env, monkeypatch):
+    """`_run_conformer` itself must re-raise `PidExhaustedError` — not
+    swallow it under the generic `except WorkerError` (of which it is a
+    subclass) the way an ordinary crashed worker is swallowed."""
+    c = env["leerie"]
+
+    async def _fake_claude_p(*args, **kwargs):
+        raise c.PidExhaustedError(
+            "worker t1-conformer exhausted its PID cgroup "
+            "(pids.current=2048/2048, fork denials=7); every "
+            "shell-spawning tool call fails with EAGAIN")
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    with pytest.raises(c.PidExhaustedError, match="pids.current=2048/2048"):
+        asyncio.run(c._run_conformer(
+            env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+            env["st"], env["models"], {"conformer": None}, rules_files=[],
+            blt_commands={"build": "", "lint": "", "test": ""},
+            diff_base=env["run_branch"]))
+
+
 # --- protected path: conformer commits get rolled back --------------------
 
 def test_protected_path_commit_is_rolled_back(env):

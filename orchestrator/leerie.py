@@ -9254,6 +9254,59 @@ def _normalize_pip_installs(recipe: list[dict]) -> list[dict]:
     return out
 
 
+# N22: Next.js/Turbopack's Rust/Tokio build tooling sizes its thread pool to
+# the host's full core count — nothing in the worker cgroup constrains
+# *detected* parallelism (only pids.max bounds how many of those threads/forks
+# the cgroup will actually admit). A build that spawns one worker thread per
+# host core can exhaust the per-worker `pids.max` cap (measured spiking to
+# 972/2048), and the resulting EAGAIN surfaces as a `build-failed` defect of
+# the diff rather than what it actually is: a resource-limit collision.
+# UV_THREADPOOL_SIZE caps libuv's pool (Node's fs/crypto/zlib workers, which
+# Next's build pipeline uses); RAYON_NUM_THREADS caps the rayon-based
+# parallelism SWC (Next's Rust compiler, which underlies Turbopack) uses for
+# its transform passes. Both are inert (fall back to their own default) when
+# a given command doesn't use that runtime, so setting both unconditionally
+# on every Node install/build command is safe.
+_NODE_THREADPOOL_CAP_ENV: dict[str, str] = {
+    "UV_THREADPOOL_SIZE": "4",
+    "RAYON_NUM_THREADS": "4",
+}
+
+_NODE_PACKAGE_MANAGERS = frozenset({"pnpm", "npm", "yarn"})
+
+
+def _normalize_node_threadpool(recipe: list[dict]) -> list[dict]:
+    """Inject `_NODE_THREADPOOL_CAP_ENV` into every Node/pnpm/npm/yarn
+    install-or-build entry's `env` dict, unless the entry already sets that
+    var (an entry-supplied value wins — this only fills gaps). Returns a new
+    recipe list (entries are shallow-copied only when rewritten).
+
+    Why this is code, not a prompt rule: nothing in the worker cgroup caps
+    a build tool's *detected* core count (§12: prompts advisory, code
+    enforces) — a Rust/Tokio or libuv thread pool sized to `nproc` will size
+    itself the same way whether or not a prompt asks it not to. Normalizing
+    here, at the single point every consumer reads the recipe as data, means
+    every execution path (the base-tree baseline's direct `_run_streaming`
+    call, and the advisory PROVISION_RECIPE text handed to implementer/
+    conformer workers) gets the cap.
+    """
+    out: list[dict] = []
+    for entry in recipe:
+        cmd = entry.get("command") or []
+        if (entry.get("kind") in ("install", "build")
+                and cmd and cmd[0] in _NODE_PACKAGE_MANAGERS):
+            env = dict(entry.get("env") or {})
+            changed = False
+            for k, v in _NODE_THREADPOOL_CAP_ENV.items():
+                if k not in env:
+                    env[k] = v
+                    changed = True
+            out.append({**entry, "env": env} if changed else entry)
+        else:
+            out.append(entry)
+    return out
+
+
 def _is_pip_install(cmd: list[str]) -> bool:
     """True iff `cmd` (an argv list) is a pip *install* invocation — bare
     `pip`/`pip3 …` or `python[3] -m pip …` — where the pip subcommand is
@@ -16630,6 +16683,10 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # the Debian-13 externally-managed system Python. See
     # _normalize_pip_installs.
     recipe = _normalize_pip_installs(recipe)
+    # Cap Node/pnpm build tooling's thread pool so it doesn't size to the
+    # host's full core count and exhaust the worker's pids.max cgroup cap
+    # (N22). See _normalize_node_threadpool.
+    recipe = _normalize_node_threadpool(recipe)
 
     prov["recipe"] = recipe
     st.save()
@@ -22909,7 +22966,13 @@ def _format_provision_recipe_section(recipe: list[dict],
     else:
         raise ValueError(f"unknown audience {audience!r}")
     for i, e in enumerate(filtered_entries, 1):
-        cmd_str = " ".join(e["command"])
+        # An `env` entry (e.g. _normalize_node_threadpool's thread-pool
+        # caps) is rendered as a shell-style `VAR=val` prefix so a worker
+        # copying this line into its own Bash call still gets the cap —
+        # the worker executes via a real shell, so this is inert text here
+        # and a real env-var assignment there.
+        env_prefix = "".join(f"{k}={v} " for k, v in (e.get("env") or {}).items())
+        cmd_str = env_prefix + " ".join(e["command"])
         wd = e.get("working_dir", ".")
         timeout = _recipe_timeout_s(e)
         lines.append(f"  {i}. {cmd_str}   (cwd: {wd}, timeout: {timeout:g}s)")
@@ -23618,7 +23681,10 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
     """Spawn one conformer for one subtask in its existing worktree.
     Returns the worker's structured output, or None on WorkerError (which
     is recorded as a warning by the caller — DESIGN §9: the phase is
-    advisory)."""
+    advisory). Raises `PidExhaustedError` (a WorkerError subclass) rather
+    than swallowing it, so the caller can attach its cgroup pids
+    diagnostic to the recorded warnings instead of a generic crash
+    message (N22)."""
     sys_prompt = _load_prompt("conformer")
     repo_root = st.repo_root
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
@@ -23664,6 +23730,14 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                               model=models["conformer"],
                               effort=efforts["conformer"],
                               sid=f"{sid}-conformer")
+    except PidExhaustedError:
+        # Re-raised rather than swallowed like the generic WorkerError
+        # below (of which this is a subclass): the caller
+        # (_run_conformance_phase) attaches the cgroup pids.current/
+        # pids.max this exception already carries (N22) to its recorded
+        # warnings, instead of losing that diagnostic behind a generic
+        # "conformer crashed" message.
+        raise
     except WorkerError as e:
         log(f"  {sid}: conformer crashed: {e}")
         return None
@@ -24198,10 +24272,25 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
-        last_res = await _run_conformer(
-            sid, leerie_dir, worktree, caps, st, models, efforts,
-            rules_files=rules_files, blt_commands=blt,
-            diff_base=run_branch, extra_feedback=blt_feedback)
+        try:
+            last_res = await _run_conformer(
+                sid, leerie_dir, worktree, caps, st, models, efforts,
+                rules_files=rules_files, blt_commands=blt,
+                diff_base=run_branch, extra_feedback=blt_feedback)
+        except PidExhaustedError as e:
+            # N22: the build/lint/test the conformer ran spawned enough
+            # worker threads/processes to hit the cgroup's pids.max — a
+            # resource-limit collision, not a defect in the diff. `str(e)`
+            # already carries pids.current/pids.max (set at the raise
+            # site in _read_stream); recorded here rather than discarded
+            # behind a generic crash message so the operator can tell the
+            # two apart.
+            warnings.append(f"conformer round {c_round}: PID cgroup "
+                            f"exhausted (build/lint/test spawned too many "
+                            f"worker threads); phase surfaced as "
+                            f"advisory: {e}")
+            last_res = None
+            break
 
         if last_res is None:
             warnings.append(f"conformer round {c_round}: worker crashed; "
@@ -24494,9 +24583,15 @@ async def _capture_conformance_baseline(
         if e.get("kind") not in ("install", "build") or not e.get("command"):
             continue
         wd = staging / (e.get("working_dir") or ".")
+        # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
+        # layers on top of the orchestrator's own environment rather than
+        # replacing it — `_run_streaming(env=None)` would otherwise mean
+        # "inherit everything," so an explicit dict here must still carry
+        # PATH etc.
+        entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
         try:
             await _run_streaming(
-                e["command"], cwd=str(wd),
+                e["command"], cwd=str(wd), env=entry_env,
                 timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
