@@ -281,6 +281,65 @@ def test_protected_path_commit_is_rolled_back(env):
     assert state["i"] == 1  # loop broke after rollback
 
 
+# --- BLT-repetition feedback threading (mirrors the per-subtask phase) ----
+
+def _bash_event(tid, cmd):
+    return {"message": {"content": [
+        {"type": "tool_use", "id": tid, "name": "Bash",
+         "input": {"command": cmd}}]}}
+
+
+def _result_event(tid, text):
+    return {"message": {"content": [
+        {"type": "tool_result", "tool_use_id": tid, "content": text}]}}
+
+
+def _write_log(path, events):
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+def test_within_round_repetition_injects_feedback_into_next_round(env):
+    """When _emit_bash_axis_warnings detects a within-round repetition
+    (e.g. TEST_CMD run twice in one round — Pattern A) at the final,
+    whole-tree conformer call site, that warning must be threaded into
+    the next round's prompt, exactly like the auto-backgrounded
+    (Pattern B) class already is."""
+    c = env["leerie"]
+    dirty = _clean_result(
+        build={"ran": True, "passed": False, "command": "npm run build",
+               "summary": "fail"})
+
+    prompts: list[str] = []
+
+    async def _stub(**kwargs):
+        i = len(prompts)
+        prompts.append(kwargs["user_prompt"])
+        if i == 0:
+            # Round 0's own transcript, discovered by
+            # _emit_bash_axis_warnings after this round completes.
+            _write_log(
+                env["run_dir"] / "logs" / "final-conformer-r0.log",
+                [_bash_event("a1", "npm test"),
+                 _result_event("a1", "1 test passed"),
+                 _bash_event("a2", "npm test"),
+                 _result_event("a2", "42 tests passed")])
+            return dirty
+        return _clean_result()
+
+    c.claude_p = _stub
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    assert len(prompts) >= 2, "expected at least 2 final-conformer rounds"
+    assert not any("times in one round" in p for p in prompts[:1]), \
+        "round 0's own prompt should carry no prior-round feedback"
+    assert any("times in one round" in p for p in prompts[1:]), \
+        f"round 1's prompt should carry the repetition feedback; " \
+        f"prompts={prompts!r}"
+
+
 # --- residuals get summarized into warnings -------------------------------
 
 def test_failing_axis_summarized_into_warnings(env):
