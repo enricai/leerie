@@ -372,6 +372,14 @@ $_diagnosis"
     echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
     echo "  Push stderr was:" >&2
     printf '    %s\n' "$push_stderr" >&2
+    if printf '%s' "$push_stderr" | grep -qiE 'husky|pre-push script failed|exit code 254'; then
+      local _hook_name
+      _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1)"
+      echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
+      echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
+      echo "    git push -u origin $run_branch --no-verify" >&2
+      echo "  (or set NO_VERIFY_PUSH=true before invoking finalize)." >&2
+    fi
     return 1
   fi
   local pushed_at
