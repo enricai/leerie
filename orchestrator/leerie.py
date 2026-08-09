@@ -4690,6 +4690,27 @@ _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
 # enough slack above 6.3 GiB that an ordinary heavier-than-measured build
 # is not killed, while a genuine runaway (tens of GiB) still is.
 _WORKER_MEMORY_CEILING_MULTIPLIER = 1.5
+# How long an admitted worker's memory demand is assumed NOT to be visible
+# in the slice's unreclaimable usage yet. `_await_worker_memory_admission`
+# reserves one build peak per worker admitted inside this window, because
+# the gate is otherwise stateless: `_invoke` runs under
+# `Semaphore(max_parallel)` and the gate sits inside it, so up to
+# `max_parallel` workers evaluate identical pre-allocation headroom in the
+# same event-loop instant and all admit. (The superseded divisor did not
+# have this gap: it read `live_siblings`, which counts *enrolled* cgroups,
+# and enrollment happens microseconds after spawn.)
+#
+# This is a heuristic for the ramp-up gap only, not a guarantee. A worker
+# that starts a build twenty minutes in is outside any window — that case
+# is covered by the unreclaimable reading itself, which by then reflects
+# the worker's real usage. The window covers exactly the interval where
+# that reading is still blind.
+_WORKER_ADMISSION_RAMP_SEC = 180.0
+# Monotonic stamps of recent admissions. The orchestrator runs on a single
+# asyncio event loop and this list is only touched between `await` points,
+# so no lock is needed (same reasoning as `State`'s `st.data[k] = v;
+# st.save()` pairs).
+_recent_admissions: list[float] = []
 
 
 def _cgroup_slice_info() -> tuple[int, int, int] | None:
@@ -4832,10 +4853,18 @@ async def _await_worker_memory_admission(
     have under-reported headroom by half and stalled a fleet with ample
     room.
 
+    The headroom required scales with how many workers were admitted
+    within `_WORKER_ADMISSION_RAMP_SEC` — one build peak each, plus one for
+    this worker. The gate is otherwise stateless and a whole wave clears it
+    on a single reading, since `_invoke` runs under
+    `Semaphore(max_parallel)` with this call inside it.
+
     Admits immediately when no shared-slice budget is readable (no broker /
     containment off — nothing to gate against) or when the broker could not
     read unreclaimable usage (`-1`): unknown fails open, matching
-    `_cgroup_slice_info`'s whole-tuple None contract.
+    `_cgroup_slice_info`'s whole-tuple None contract. Neither fail-open path
+    records a reservation — with no budget known there is no accounting to
+    do, and recording one would throttle the next worker for nothing.
 
     Bounded at `max_wait_sec` (default 10 min) rather than blocking
     forever: a long-running sibling worker that never releases its memory
@@ -4853,7 +4882,16 @@ async def _await_worker_memory_admission(
         if unreclaimable < 0:
             return
         headroom = slice_max_bytes - unreclaimable
-        if headroom >= build_peak_bytes:
+        # Reserve a build peak for every worker admitted recently enough
+        # that its own demand cannot have shown up in `unreclaimable` yet,
+        # plus one for the worker being admitted now. Without this the gate
+        # is stateless and a whole wave clears it on the same reading.
+        now = time.monotonic()
+        _recent_admissions[:] = [t for t in _recent_admissions
+                                 if now - t < _WORKER_ADMISSION_RAMP_SEC]
+        needed = build_peak_bytes * (1 + len(_recent_admissions))
+        if headroom >= needed:
+            _recent_admissions.append(now)
             return
         if waited >= max_wait_sec:
             # `live_siblings` is not an input to the decision (that is the
@@ -4863,9 +4901,13 @@ async def _await_worker_memory_admission(
             log(f"  worker memory admission wait exceeded "
                 f"{max_wait_sec:.0f}s (shared slice headroom "
                 f"{headroom / 1024**3:.1f} GiB, below the "
-                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor; "
+                f"{needed / 1024**3:.1f} GiB needed for this worker plus "
+                f"{len(_recent_admissions)} still ramping up; "
                 f"{live_siblings} live worker cgroups slice-wide); "
                 f"admitting anyway")
+            # Still an admission: this worker will allocate like any other,
+            # so it must count against the next one's reservation.
+            _recent_admissions.append(now)
             return
         await asyncio.sleep(poll_interval_sec)
         waited += poll_interval_sec
@@ -4876,7 +4918,13 @@ def resolve_worker_memory_max(repo_root: Path,
                               cli_value: str | None = None) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
     --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
-    leerie.toml `worker_memory_max` → auto-derive from /proc/meminfo.
+    leerie.toml `worker_memory_max` → auto-derive (`_auto_worker_memory_max`:
+    a fixed isolation ceiling from the shared `leerie.slice` budget, falling
+    back to /proc/meminfo only when no broker/slice budget is readable).
+
+    An explicit value bypasses the derivation only. The admission gate still
+    runs — it reads shared slice headroom, which is orthogonal to any one
+    worker's cap.
 
     All sources accept the same format ("4G", "512M", "1024") and are
     validated by _parse_memory_size, which die()s on bad input — bad

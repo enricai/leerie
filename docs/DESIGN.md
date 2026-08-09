@@ -2957,6 +2957,23 @@ which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
 was reclaimable file cache**, so gating on `memory.current` would
 under-report headroom by half and stall a fleet that had ample room.
 
+The gate also **reserves** one build peak per worker admitted within
+`_WORKER_ADMISSION_RAMP_SEC`, plus one for the worker being admitted. It
+is otherwise stateless, and `_invoke` runs under
+`Semaphore(max_parallel)` with the gate *inside* it — so a whole wave
+would evaluate identical pre-allocation headroom and all of it would
+admit. (The superseded divisor had no such gap: it read `live_siblings`,
+which counts enrolled cgroups, and enrollment happens microseconds after
+spawn.) On a slice already at 40 GiB of 54.9, the first two workers of a
+wave admit and the third waits, where a stateless gate would have let all
+five through against 14.9 GiB of headroom.
+
+The window is a heuristic for the ramp-up gap only. A worker that starts
+a build twenty minutes in is outside any window — by then its demand is
+in the `unreclaimable` reading itself, which is what covers that case.
+The reservation covers exactly the interval where that reading is still
+blind.
+
 The wait is bounded (10 min) and then admits anyway: a run that never
 progresses is worse than a tight one, and because the ceiling is now
 always ≥ the build peak, a late-admitted worker is no longer doomed by

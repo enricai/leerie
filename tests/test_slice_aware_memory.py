@@ -47,6 +47,18 @@ async def _async_noop(_s):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _reset_admissions(leerie):
+    """`_recent_admissions` is module-level mutable state and conftest's
+    `leerie` fixture is **session-scoped** — the module is loaded once for
+    the whole suite, so entries survive across tests AND across files.
+    Clear on both sides: before, so these tests are order-independent;
+    after, so they cannot perturb any other file that exercises the gate."""
+    leerie._recent_admissions.clear()
+    yield
+    leerie._recent_admissions.clear()
+
+
 # ---- _cgroup_slice_info: broker client -------------------------------------
 
 def test_slice_info_parses_ok_triple(leerie, monkeypatch):
@@ -323,6 +335,119 @@ def test_admission_gives_up_after_max_wait_and_admits_anyway(
         leerie._await_worker_memory_admission(
             poll_interval_sec=1.0, max_wait_sec=3.0),
         timeout=5.0))
+
+
+# ---- burst accounting: reservations for workers still ramping up ----------
+# The gate is otherwise stateless, and `_invoke` runs under
+# Semaphore(max_parallel) with the gate INSIDE it — so a whole wave
+# evaluates identical pre-allocation headroom and all of it admits. The
+# superseded divisor did not have this gap (it read `live_siblings`, and
+# enrollment happens microseconds after spawn), so this is a real regression
+# the reservation closes.
+
+def _admit(leerie, monkeypatch, slice_max, unreclaimable, live=1):
+    """Run one admission against a fixed slice reading; return the sleeps
+    it took (empty == admitted without blocking)."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                        lambda: (slice_max, live, unreclaimable))
+    slept = []
+
+    async def rec(s):
+        slept.append(s)
+
+    monkeypatch.setattr(asyncio, "sleep", rec)
+    asyncio.run(leerie._await_worker_memory_admission(
+        poll_interval_sec=1.0, max_wait_sec=3.0))
+    return slept
+
+
+def test_burst_on_an_idle_slice_admits_every_worker(leerie, monkeypatch):
+    """The reservation must not reintroduce the stall this whole change
+    exists to remove: a full wave on a roomy slice admits with no waiting.
+    On 54.9 GiB the five need 6.3/12.6/18.9/25.2/31.5 GiB — all fit."""
+    for i in range(5):
+        slept = _admit(leerie, monkeypatch, _SLICE_54_9_GIB, 2 * 1024**3)
+        assert slept == [], f"worker {i + 1} of an idle-slice wave blocked"
+    assert len(leerie._recent_admissions) == 5
+
+
+def test_burst_on_a_busy_slice_blocks_once_reservations_exceed_headroom(
+        leerie, monkeypatch):
+    """The measured-shape case: slice at 40 GiB unreclaimable leaves
+    14.9 GiB. First worker needs 6.3, second 12.6 — both fit. The third
+    needs 18.9 and must block, where the stateless gate admitted it."""
+    busy = 40 * 1024**3
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
+    assert len(leerie._recent_admissions) == 2
+    third = _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy)
+    assert third, "third worker must block: 18.9 GiB needed, 14.9 available"
+
+
+def test_admissions_age_out_of_the_ramp_window(leerie, monkeypatch):
+    """Reservations are for the ramp-up gap only. Once a worker's demand
+    has had time to show up in `unreclaimable`, reserving for it again
+    would double-count — which is exactly how the divisor over-blocked."""
+    busy = 40 * 1024**3
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(leerie.time, "monotonic", lambda: clock["t"])
+
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy), "third blocks"
+
+    # Past the window: the earlier admissions no longer hold reservations.
+    clock["t"] += leerie._WORKER_ADMISSION_RAMP_SEC + 1
+    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == [], (
+        "a stale reservation must not keep throttling forever")
+    assert len(leerie._recent_admissions) == 1
+
+
+def test_failopen_paths_record_no_reservation(leerie, monkeypatch):
+    """No budget known -> no accounting to do. Recording here would
+    throttle the next worker on the strength of a reading we never got."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
+    asyncio.run(leerie._await_worker_memory_admission())
+    assert leerie._recent_admissions == []
+
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                        lambda: (_SLICE_54_9_GIB, 3, -1))
+    asyncio.run(leerie._await_worker_memory_admission())
+    assert leerie._recent_admissions == []
+
+
+def test_timeout_path_records_a_reservation(leerie, monkeypatch):
+    """A worker admitted past the wait cap still allocates, so it must
+    count against the next one — otherwise a saturated slice admits an
+    unbounded stream of them, each one 'the first'."""
+    monkeypatch.setattr(
+        leerie, "_cgroup_slice_info",
+        lambda: (_SLICE_54_9_GIB, 1, _SLICE_54_9_GIB - 1024**3))
+    monkeypatch.setattr(asyncio, "sleep", _async_noop)
+    asyncio.run(leerie._await_worker_memory_admission(
+        poll_interval_sec=1.0, max_wait_sec=2.0))
+    assert len(leerie._recent_admissions) == 1
+
+
+def test_reservation_state_needs_explicit_reset(leerie):
+    """Guard-the-guard for `_reset_admissions`. conftest's `leerie` fixture
+    is session-scoped, so `_recent_admissions` is one list shared by the
+    entire suite — the isolation these tests need comes from the autouse
+    fixture, not from module reloading. Pinned because assuming otherwise
+    is exactly the mistake this test caught: without the reset the burst
+    tests are order-dependent and leak reservations into other files."""
+    # Source-coupled rather than reading a pytest-internal attribute, whose
+    # name varies across pytest versions.
+    from pathlib import Path
+    conftest_src = (Path(__file__).resolve().parent / "conftest.py").read_text()
+    i = conftest_src.index("def leerie(")
+    decorator = conftest_src[:i].rsplit("@pytest.fixture", 1)[1]
+    assert 'scope="session"' in decorator, (
+        "the leerie fixture is no longer session-scoped; re-check whether "
+        "_reset_admissions is still required (and whether other module-level "
+        "state in leerie.py now behaves differently under test)")
+    # Which is why the autouse reset fixture is what makes this hold.
+    assert leerie._recent_admissions == []
 
 
 def test_admission_signature_takes_no_max_parallel(leerie):
