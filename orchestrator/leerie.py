@@ -21666,7 +21666,9 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             cur_plans[0], prescribed_procedure)
         if repaired:
             log(f"  adherence-gate: synthesised {repaired} to run the task's "
-                f"prescribed commands (mechanical repair — no re-plan)")
+                f"prescribed commands (mechanical repair only — this does "
+                f"not by itself decide whether a re-plan follows; the "
+                f"adherence score is still evaluated separately below)")
         floor_issues = check_prescribed_command_coverage(
             prescribed_procedure,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
@@ -21701,6 +21703,11 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # `_run_checked_loop`'s existing retry semantics exactly like the
         # reconciler and overlap-judge do.
         replan_round[0] += 1
+        adherence_score = (last_judge_result[0] or {}).get("instruction_adherence")
+        log(f"  adherence-gate: triggering re-plan round {replan_round[0]} "
+            f"(instruction_adherence={adherence_score} < "
+            f"{_ADHERENCE_GATE_THRESHOLD} and/or unresolved floor "
+            f"violations — see feedback below)")
         # A re-plan is the largest budget event in a run and was previously
         # authorised with no budget check at all (DESIGN §13).
         check_replan_affordable(st, caps, "adherence gate", cur_plans[0])

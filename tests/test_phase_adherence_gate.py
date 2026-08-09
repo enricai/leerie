@@ -372,6 +372,64 @@ def test_low_adherence_triggers_replan_then_converges(
     assert result == good_plans
 
 
+def test_repair_log_is_scoped_and_replan_log_names_the_score(
+    leerie, monkeypatch, tmp_path, capsys
+):
+    """bugfix-006: the mechanical-repair log must not claim 'no re-plan'
+    unscoped, since a low judge score two lines later can still trigger a
+    full re-plan. A separate log line must name the adherence score that
+    drove that re-plan decision."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["prescribed_procedure"] = _prescribed(["recon generate"])
+    bad_plans = [_plan("feature-implementation", _subtask("feat-001"))]
+    good_plans = [_plan(
+        "feature-implementation",
+        _subtask("feat-001", runs_commands=["recon generate"]),
+    )]
+
+    judge_calls = []
+
+    async def fake_claude_p(**kwargs):
+        judge_calls.append(kwargs)
+        if len(judge_calls) == 1:
+            # The mechanical repair fires (floor is violated on round 1),
+            # but the judge still scores adherence below the gate threshold
+            # — the repair and the re-plan decision are independent.
+            return {
+                "user_prescribed_a_procedure": True,
+                "instruction_adherence": 2.5,
+                "violations": ["plan substitutes manual steps"],
+                "rationale": "still substitutes manual work",
+            }
+        return {
+            "user_prescribed_a_procedure": True,
+            "instruction_adherence": 9.0,
+            "violations": [],
+            "rationale": "now honors the prescribed command",
+        }
+
+    replan_calls = []
+
+    async def fake_phase_plan(task, st_, caps, models, efforts, replan_round=0):
+        replan_calls.append(task)
+        return good_plans
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_plan", fake_phase_plan)
+
+    result = asyncio.run(leerie.phase_adherence_gate(
+        bad_plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+    assert len(replan_calls) == 1
+    assert result == good_plans
+
+    captured = capsys.readouterr()
+    assert "no re-plan" not in captured.out
+    assert "mechanical repair only" in captured.out
+    assert "triggering re-plan" in captured.out
+    assert "instruction_adherence=2.5" in captured.out
+
+
 def test_exhaustion_dies(leerie, monkeypatch, tmp_path, capsys):
     """Every round stays low-adherence — the loop exhausts
     judgment_check_rounds and the gate must die(), not silently proceed
