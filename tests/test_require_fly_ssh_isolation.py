@@ -189,6 +189,104 @@ def test_require_fly_ssh_isolates_from_user_agent(short_home):
     )
 
 
+def test_agent_ensure_reuses_keyless_but_reachable_agent(short_home):
+    """A live agent with no keys yet (ssh-add -l exit code 1) must be
+    reused, not respawned. Respawning on rc 1 unlinks the live socket
+    (rm -f) out from under the still-running agent process, orphaning
+    it permanently — the exact defect this subtask fixes.
+    """
+    sock = short_home / ".cache" / "leerie" / "agent" / "ssh-agent.sock"
+    script = f"""
+        source {LIB_SH}
+        _leerie_fly_agent_ensure
+        # No identities added: `ssh-add -l` against this agent returns
+        # exit code 1 (reachable, no keys) — not exit code 2.
+        SSH_AUTH_SOCK="{sock}" ssh-add -l >/dev/null 2>&1
+        echo "add_rc=$?"
+        before=$(pgrep -x ssh-agent | sort | tr '\\n' ',')
+        _leerie_fly_agent_ensure
+        after=$(pgrep -x ssh-agent | sort | tr '\\n' ',')
+        echo "before=$before"
+        echo "after=$after"
+    """
+    result = _run_bash(script, tmp_home=short_home)
+    assert result.returncode == 0, result.stderr
+    assert "add_rc=1" in result.stdout, (
+        f"expected ssh-add -l to return rc 1 (keyless, reachable) against a "
+        f"freshly-spawned agent with no keys added; got: {result.stdout}"
+    )
+    before_line = [l for l in result.stdout.splitlines() if l.startswith("before=")][0]
+    after_line = [l for l in result.stdout.splitlines() if l.startswith("after=")][0]
+    before = before_line.replace("before=", "")
+    after = after_line.replace("after=", "")
+    # The exact same process set must still be alive, and no additional
+    # ssh-agent process may have been spawned alongside it (a leaked
+    # orphan would show up here as an extra pid).
+    assert before and before == after, (
+        f"agent was respawned/orphaned on a keyless-but-reachable agent: "
+        f"before={before!r} after={after!r}"
+    )
+
+
+def test_agent_ensure_respawns_on_unreachable_agent(short_home):
+    """A dead/unreachable agent (ssh-add -l exit code 2 — stale socket,
+    no listener) must still trigger rm -f + respawn.
+    """
+    agent_dir = short_home / ".cache" / "leerie" / "agent"
+    sock = agent_dir / "ssh-agent.sock"
+    agent_dir.mkdir(parents=True)
+    # Fabricate a stale socket inode with nothing listening on it, which
+    # is exactly what ssh-add -l reports as exit code 2.
+    subprocess.run(
+        ["python3", "-c", f"""
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind({str(sock)!r})
+s.close()
+"""],
+        check=True,
+    )
+    script = f"""
+        source {LIB_SH}
+        SSH_AUTH_SOCK="{sock}" ssh-add -l >/dev/null 2>&1
+        echo "add_rc=$?"
+        _leerie_fly_agent_ensure
+        pid=$(pgrep -x ssh-agent | head -1)
+        echo "pid=$pid"
+    """
+    result = _run_bash(script, tmp_home=short_home)
+    assert result.returncode == 0, result.stderr
+    assert "add_rc=2" in result.stdout, (
+        f"expected ssh-add -l to return rc 2 against an unreachable/stale "
+        f"socket; got: {result.stdout}"
+    )
+    pid_line = [l for l in result.stdout.splitlines() if l.startswith("pid=")][0]
+    assert pid_line != "pid=", (
+        f"expected a fresh agent to be spawned on rc 2 (stale socket); "
+        f"got no pid: {result.stdout}"
+    )
+
+
+def test_agent_ensure_spawns_new_agent_with_idle_timeout(short_home):
+    """A newly-spawned agent must carry a `-t` idle timeout, so an
+    orphan that does still occur (e.g. a future regression) expires
+    rather than leaking indefinitely.
+    """
+    sock = short_home / ".cache" / "leerie" / "agent" / "ssh-agent.sock"
+    script = f"""
+        source {LIB_SH}
+        _leerie_fly_agent_ensure
+        ps -eo args= | grep '^ssh-agent -a'
+    """
+    result = _run_bash(script, tmp_home=short_home)
+    assert result.returncode == 0, result.stderr
+    cmdline = result.stdout.strip()
+    assert " -t " in f" {cmdline} ", (
+        f"expected the spawned ssh-agent to carry a -t idle-timeout flag; "
+        f"got argv: {cmdline!r}"
+    )
+
+
 def test_require_fly_ssh_is_idempotent(short_home):
     """Calling require_fly_ssh twice in a row issues only one cert.
     Spans a single bash process so the private agent persists.
