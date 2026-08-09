@@ -49,11 +49,12 @@ def _extract_mkdir_line() -> str:
 
 
 def _extract_setup_block() -> str:
-    """The `_run_log=...` / `_log_tee_target=...` resolution block."""
+    """The `_run_log=...` / `_log_tee_target=...` resolution block. Computed
+    independent of `$_run_log` (bugfix-005) so the interactive/-it branch
+    can wire it too."""
     return _extract(
         '  _run_log=""\n',
-        '  _log_tee_target=""\n  if [ -n "$_run_log" ] && '
-        '[ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
+        '  _log_tee_target=""\n  if [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
         '    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then\n'
         '      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"\n'
         "    fi\n"
@@ -69,7 +70,9 @@ def _extract_reap_tail() -> str:
 
 
 def _extract_invocation() -> str:
-    """The `if [ -n "$_run_log" ]; then ... fi` tail/tee/nerdctl-run block."""
+    """The full `if [ -n "$_run_log" ]; then ... fi` block: the piped
+    tail/tee branch, the `script`-wrapped interactive/-it branch
+    (bugfix-005), and the unwrapped fallback."""
     return _extract(
         '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
         '    nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi\n',
@@ -78,6 +81,7 @@ def _extract_invocation() -> str:
 
 assert "_log_tee_target=" in _extract_setup_block()
 assert "tee -a" in _extract_invocation()
+assert "script -qe -c" in _extract_invocation()
 assert "sleep 0.3" in _extract_reap_tail()
 
 
@@ -114,7 +118,26 @@ printf 'RUN_LOG_GONE=%s\n' "$([ -z "$_run_log" ] && echo yes || echo no)"
 """
 
 
-def _run(state_dir: Path, log_file: Path, tty_flags: str = "-i", stdout_is_tty: bool = False):
+def _write_nerdctl_stub(bin_dir: Path) -> None:
+    """A real executable `nerdctl` on PATH -- required for the interactive
+    branch, which invokes it through `script -c "nerdctl run ..."` (a
+    fresh $SHELL -c subprocess that cannot see the harness's own bash
+    function)."""
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "nerdctl"
+    stub.write_text(
+        "#!/usr/bin/env bash\nprintf 'hello from container\\nsecond line\\n'\n"
+    )
+    stub.chmod(0o755)
+
+
+def _run(
+    state_dir: Path,
+    log_file: Path,
+    tty_flags: str = "-i",
+    stdout_is_tty: bool = False,
+    with_path_stub: bool = False,
+):
     script = state_dir / "harness.sh"
     script.write_text(
         _HARNESS
@@ -126,13 +149,18 @@ def _run(state_dir: Path, log_file: Path, tty_flags: str = "-i", stdout_is_tty: 
         .replace("__INVOCATION__", _extract_invocation())
         .replace("__REAP__", _extract_reap_tail())
     )
+    env = os.environ.copy()
+    if with_path_stub:
+        bin_dir = state_dir / "bin"
+        _write_nerdctl_stub(bin_dir)
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
     # Run with stdout/stderr piped (never a TTY) to match how this suite's
     # other piped-mode tests exercise the operator's own `| tee` pattern,
     # and how subprocess.run always invokes children.
     return subprocess.run(
         ["bash", str(script)],
         capture_output=True, text=True, timeout=30,
-        env=os.environ.copy(),
+        env=env,
     )
 
 
@@ -220,13 +248,84 @@ def test_interactive_tty_path_is_never_gated_into_run_log(tmp_path):
     """Regression guard for the scope_note: the -it interactive/--clarify
     path (TTY_FLAGS=-it) never enters the decoupled/_run_log branch at all
     -- `_run_log` stays empty -- so teeing wiring added here cannot affect
-    the documented interactive stdin/pty contract at leerie:7580-7702."""
+    the documented interactive stdin/pty contract at leerie:7580-7702. It
+    is teed via `script`(1) instead (see
+    test_interactive_tty_path_is_teed_via_script below), not via
+    `$_run_log`/`tail`/`tee`."""
     state_dir = _setup(tmp_path)
     log_file = tmp_path / "logs" / "leerie-run.log"
-    result = _run(state_dir, log_file, tty_flags="-it")
+    result = _run(state_dir, log_file, tty_flags="-it", with_path_stub=True)
     assert result.returncode == 0, result.stderr
     assert "RUN_LOG_GONE=yes" in result.stdout
-    assert not log_file.exists()
+
+
+def test_interactive_tty_path_is_teed_via_script(tmp_path):
+    """bugfix-005: --log-file must no longer be a silent no-op in the -it
+    interactive/--clarify path. Requires `script`(1) on PATH and a real
+    `nerdctl` executable (not a bash function -- `script -c` runs the
+    command in a fresh `$SHELL -c` subprocess that cannot see the
+    harness's shell functions)."""
+    state_dir = _setup(tmp_path)
+    log_file = tmp_path / "logs" / "leerie-run.log"
+    result = _run(state_dir, log_file, tty_flags="-it", with_path_stub=True)
+    assert result.returncode == 0, result.stderr
+    assert log_file.exists(), "resolved --log-file target was never created"
+    logged = log_file.read_text()
+    assert "hello from container" in logged
+    assert "second line" in logged
+
+
+def test_interactive_tty_path_falls_back_when_script_unavailable(tmp_path, monkeypatch):
+    """When `script`(1) is not on PATH, the interactive branch must fall
+    back to nerdctl inheriting stdout directly (the pre-fix behavior) --
+    never fail the run, and never attempt to pipe nerdctl's own stdout
+    (which would defeat `-t`)."""
+    state_dir = _setup(tmp_path)
+    log_file = tmp_path / "logs" / "leerie-run.log"
+    # A minimal PATH with only the nerdctl stub and no `script` binary.
+    bin_dir = state_dir / "bin"
+    _write_nerdctl_stub(bin_dir)
+    script_path = state_dir / "harness.sh"
+    script_path.write_text(
+        _HARNESS
+        .replace("__STATE__", str(state_dir))
+        .replace("__LOGFILE__", str(log_file))
+        .replace("__TTYFLAGS__", "-it")
+        .replace("__MKDIR__", _extract_mkdir_line())
+        .replace("__SETUP__", _extract_setup_block())
+        .replace("__INVOCATION__", _extract_invocation())
+        .replace("__REAP__", _extract_reap_tail())
+    )
+    # A curated PATH: symlinks to just the externals this -it scenario
+    # actually invokes (mkdir, sleep -- `_tail_pid` stays empty here, so
+    # `_reap_tail`'s jobs/awk/kill branch never runs), the nerdctl stub,
+    # and NOT `script` -- deliberately excluded to prove the fallback,
+    # even though the real `script` binary lives in the same system
+    # directory as bash/mkdir/sleep on this host.
+    import shutil
+    bash_path = shutil.which("bash")
+    for _tool in ("mkdir", "sleep"):
+        (bin_dir / _tool).symlink_to(shutil.which(_tool))
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir)
+    result = subprocess.run(
+        [bash_path, str(script_path)],
+        capture_output=True, text=True, timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "hello from container" in result.stdout   # nerdctl still ran, direct
+
+
+def test_interactive_script_command_is_a_single_quoted_string(tmp_path):
+    """The Linux `script -c` branch must pass the whole `nerdctl run ...`
+    invocation as one shell-quoted string, never a raw, unquoted argv
+    concatenation that would break on paths/values containing spaces or
+    shell metacharacters."""
+    invocation = _extract_invocation()
+    assert '_nerdctl_run_quoted="nerdctl run"' in invocation
+    assert "printf -v _rarg_q '%q' \"$_rarg\"" in invocation
+    assert 'script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"' in invocation
 
 
 def test_unwritable_log_file_disables_teeing_without_failing(tmp_path):
