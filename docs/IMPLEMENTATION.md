@@ -6742,11 +6742,20 @@ no keys yet — a freshly-spawned agent before its first cert lands)
 both mean the agent is alive; only rc 2 (cannot connect) means the
 socket is stale. Treating rc 1 the same as rc 2 unlinks a live
 agent's socket (`rm -f`) out from under the still-running process,
-orphaning it permanently. Any newly-spawned agent also carries a
-`-t 24h` idle timeout on the identities it holds, matching the Fly
-cert lifetime, so an orphan that does still occur (e.g. a future
-regression in the reuse predicate) self-limits rather than leaking
-indefinitely.
+orphaning it permanently. That predicate is the leak fix.
+
+Any newly-spawned agent also carries `-t 24h`, which sets the default
+maximum lifetime of the **identities** it holds — matching the 24h Fly
+cert (`flyctl ssh issue --agent`) this agent is kept alive to hold, so
+it expires nothing early. It does **not** bound the agent process:
+`man ssh-agent` defines `-t life` as "a default value for the maximum
+lifetime of identities added to the agent", and killing the agent is a
+separate operation (`ssh-agent -k`). Verified empirically — an agent
+started with `-t 2` outlives its identity's expiry. **An orphaned agent
+therefore still leaks indefinitely, holding an empty keyring**; reaping
+one would need a real reaper, which does not exist. Earlier revisions of
+this paragraph and of `lib.sh`'s comment claimed `-t` made an orphan
+"self-limit", which is false.
 
 #### Worker auth + config seeding (`scripts/remote/seed-auth.sh`)
 
