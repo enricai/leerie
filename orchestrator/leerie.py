@@ -13816,6 +13816,21 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # broker errors, same "cannot tell" contract as every other
         # _cgroup_stat call site.
         final_stat = _cgroup_stat(cgroup_sid)
+        # Reap any backgrounded subprocesses the worker left behind BEFORE
+        # destroying the cgroup. `claude -p` workers use Claude Code's Bash
+        # tool with `run_in_background: true` for long-running tasks (test
+        # runners, builds, dev servers — DESIGN §6). Those subprocesses are
+        # spawned in detached POSIX sessions, exit-reparent to PID 1, and can
+        # still be alive (and thus still cgroup members) at this point on the
+        # success path — the timeout/abort paths above already reap before
+        # terminating, but this success-path finally previously destroyed the
+        # cgroup first. A non-empty cgroup makes the broker's rmdir fail with
+        # EBUSY (measured 68-104 lingering PIDs on crash-path workers, M10),
+        # so stop_and_reap must run before _cgroup_destroy here too.
+        leaked = await descendant_tracker.stop_and_reap()
+        if leaked:
+            log(f"  [{sid}] reaped {leaked} backgrounded subprocess(es) "
+                f"that survived `claude -p` exit")
         # cgroup teardown via the broker. The broker's destroy atomically
         # reaps any worker-tree process that survived _terminate_proc_tree /
         # descendant_tracker.stop_and_reap above (cgroup.kill on v2, move-to-
@@ -13824,18 +13839,6 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # across a long-running orchestrator. Best-effort: socket errors are
         # swallowed inside _cgroup_destroy.
         _cgroup_destroy(cgroup_sid)
-    # Success path: reap any backgrounded subprocesses the worker left
-    # behind. `claude -p` workers use Claude Code's Bash tool with
-    # `run_in_background: true` for long-running tasks (test runners,
-    # builds, dev servers — DESIGN §6). Those subprocesses
-    # are spawned in detached POSIX sessions, exit-reparent to PID 1, and
-    # would otherwise outlive `claude -p`'s clean exit. The tracker has
-    # accumulated their PIDs throughout the worker's life; stop_and_reap
-    # SIGKILLs the union.
-    leaked = await descendant_tracker.stop_and_reap()
-    if leaked:
-        log(f"  [{sid}] reaped {leaked} backgrounded subprocess(es) "
-            f"that survived `claude -p` exit")
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()

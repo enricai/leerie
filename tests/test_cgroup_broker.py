@@ -160,6 +160,62 @@ def test_v2_destroy_returns_error_message_on_failure(broker, monkeypatch):
     assert err == "Directory not empty"
 
 
+def test_v2_destroy_drains_lingering_procs_before_rmdir(broker, monkeypatch):
+    """M10: cgroup.kill is asynchronous, so cgroup.procs can briefly still
+    list survivors right after the write. `_v2_destroy` must poll until it
+    drains (or a short deadline elapses) rather than rmdir'ing immediately
+    and failing EBUSY on a cgroup that is merely still emptying."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid4"
+    d.mkdir(parents=True)
+    (d / "cgroup.procs").write_text("4242\n")
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker.time, "sleep", lambda *_a: None)
+
+    reads = {"n": 0}
+    orig_read = broker._read
+
+    def _fake_read(path):
+        if path == str(d / "cgroup.procs"):
+            reads["n"] += 1
+            # Drain after a couple of polls, simulating the kernel reaping
+            # the killed process asynchronously. Also remove the stray file
+            # on this fake (plain-directory) cgroupfs once "drained" so the
+            # subsequent rmdir isn't blocked by it (real cgroupfs's
+            # cgroup.procs is a pseudo-file that never blocks rmdir — see
+            # test_destroy_removes_dir's comment).
+            if reads["n"] < 3:
+                return "4242\n"
+            (d / "cgroup.procs").unlink(missing_ok=True)
+            return ""
+        return orig_read(path)
+
+    monkeypatch.setattr(broker, "_read", _fake_read)
+
+    assert broker._v2_destroy("wsid4") is None
+    assert not d.exists()
+    assert reads["n"] >= 3
+
+
+def test_v2_destroy_gives_up_after_deadline(broker, monkeypatch):
+    """A cgroup that never drains within the deadline still gets an rmdir
+    attempt (and surfaces the resulting error) rather than polling forever."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid5"
+    d.mkdir(parents=True)
+    (d / "cgroup.procs").write_text("4242\n")
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker.time, "sleep", lambda *_a: None)
+
+    # Never-draining cgroup.procs; a fake monotonic clock that jumps straight
+    # past the deadline on the first check so the test doesn't need to spin
+    # through real wall-clock polls.
+    times = iter([0.0, 100.0, 100.0])
+    monkeypatch.setattr(broker.time, "monotonic", lambda: next(times))
+
+    err = broker._v2_destroy("wsid5")
+    assert err is not None
+    assert d.exists()
+
+
 def test_no_hierarchy_errors(broker, monkeypatch):
     """When no usable hierarchy is detected, ops report ERR rather than
     silently pretending to enforce."""
