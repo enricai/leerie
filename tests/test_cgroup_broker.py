@@ -50,6 +50,7 @@ def broker(tmp_path, monkeypatch):
     # spin for 10s, so shrink it. The shipped value is pinned separately by
     # test_destroy_drain_budget_is_ten_seconds.
     monkeypatch.setattr(mod, "_DESTROY_DRAIN_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(mod, "_V1_DRAIN_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(mod, "_DESTROY_DRAIN_POLL_SEC", 0.005)
     mod._HIER = mod._detect()
     return mod
@@ -263,6 +264,60 @@ def test_destroy_v1_on_missing_dirs_is_fast(broker, monkeypatch):
     assert _time.monotonic() - t0 < 0.5
 
 
+def test_destroy_returns_success_when_dir_vanishes_mid_loop(broker, monkeypatch):
+    """The other half of the missing-dir guard. The guard covers "gone
+    before we start"; a concurrent reap can also remove it *during* the
+    loop, and FileNotFoundError is an OSError like any other — so without
+    a dedicated arm it is retried for the whole budget and then reported
+    as a leak, for a dir that is in fact gone. Asserts elapsed time,
+    because the wrong version eventually returns an error, not None."""
+    import time as _time
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-toctou"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_read", lambda p: "")  # reads as drained
+    monkeypatch.setattr(broker, "_DESTROY_DRAIN_TIMEOUT_SEC", 2.0)
+
+    real_rmdir = broker.os.rmdir
+    calls = {"n": 0}
+
+    def racing_rmdir(p):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            real_rmdir(p)  # someone else reaped it first
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(broker.os, "rmdir", racing_rmdir)
+    t0 = _time.monotonic()
+    assert broker._v2_destroy("toctou") is None
+    assert _time.monotonic() - t0 < 0.5
+
+
+def test_v1_drain_budget_is_short(broker, monkeypatch):
+    """v1 has no `cgroup.kill`: _v1_destroy migrates survivors first, so by
+    the time the drain runs the outcome is already settled — a long wait
+    cannot change it, and v1 pays it twice (one dir per controller). A
+    never-draining v1 cgroup must therefore fail fast, unlike v2."""
+    import time as _time
+    pdir, mdir = broker._v1_dirs("stuckv1")
+    for d in (pdir, mdir):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    # Never drains: migration "failed", processes still enrolled.
+    monkeypatch.setattr(broker, "_read",
+                        lambda p: "777\n" if p.endswith("cgroup.procs") else "")
+    # Shipped v1 budget, not the fixture's shrunken v2 one.
+    monkeypatch.setattr(broker, "_V1_DRAIN_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(broker, "_DESTROY_DRAIN_TIMEOUT_SEC", 10.0)
+    t0 = _time.monotonic()
+    err = broker._v1_destroy("stuckv1")
+    elapsed = _time.monotonic() - t0
+    assert err is not None, "a never-draining cgroup must still report"
+    # Two dirs x 0.5s budget, with generous slack — and far below the two
+    # x 10s the shared v2 budget would have cost.
+    assert elapsed < 3.0, f"v1 drain took {elapsed:.1f}s; must not use the v2 budget"
+
+
 def test_destroy_drain_budget_is_ten_seconds(broker):
     """Pins the shipped constants (the fixture shrinks them for speed).
     10s because the leaking workers were conformers whose trees reached
@@ -274,6 +329,11 @@ def test_destroy_drain_budget_is_ten_seconds(broker):
     spec.loader.exec_module(pristine)
     assert pristine._DESTROY_DRAIN_TIMEOUT_SEC == 10.0
     assert 0 < pristine._DESTROY_DRAIN_POLL_SEC <= 0.5
+    # v1 waits on an already-settled migration, not an in-flight async
+    # kill, and pays the budget once per controller dir — so it must stay
+    # far below the v2 budget.
+    assert pristine._V1_DRAIN_TIMEOUT_SEC == 0.5
+    assert pristine._V1_DRAIN_TIMEOUT_SEC < pristine._DESTROY_DRAIN_TIMEOUT_SEC
 
 
 # ---- slice verb: budget, live count, unreclaimable -------------------------
@@ -562,6 +622,7 @@ def rootless_broker(tmp_path, monkeypatch):
     # so the deliberate ENOTEMPTY failure path below returns promptly
     # instead of spending the shipped 10s.
     monkeypatch.setattr(mod, "_DESTROY_DRAIN_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(mod, "_V1_DRAIN_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(mod, "_DESTROY_DRAIN_POLL_SEC", 0.005)
     mod._HIER = mod._detect()
     return mod

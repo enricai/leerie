@@ -97,6 +97,12 @@ _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # wait is off the critical path.
 _DESTROY_DRAIN_TIMEOUT_SEC = 10.0
 _DESTROY_DRAIN_POLL_SEC = 0.05
+# v1 waits for a migration that has already either succeeded or failed, not
+# for an in-flight async kill (v1 has no `cgroup.kill`) — so a long wait
+# cannot change the outcome, and _v1_destroy pays it twice, once per
+# controller dir. Short enough to stay off the critical path, long enough to
+# cover a pid dying between the procs read and its migration write.
+_V1_DRAIN_TIMEOUT_SEC = 0.5
 
 # Hierarchy is one of: "v2", "v1", "none". Decided at startup by _detect().
 _HIER = "none"
@@ -220,9 +226,20 @@ def _v2_enroll(sid: str, pid: int) -> None:
     _write(f"{_v2_dir(sid)}/cgroup.procs", str(pid))
 
 
-def _drain_then_rmdir(d: str) -> str | None:
+def _drain_then_rmdir(d: str, budget_sec: float) -> str | None:
     """Wait for `d/cgroup.procs` to drain, then rmdir it. Returns None on
-    success or the OSError message once the budget is exhausted.
+    success or the OSError message once `budget_sec` is exhausted.
+
+    The budget is a parameter rather than a constant because the two
+    hierarchies are waiting for different things. On v2 the wait is for an
+    ASYNCHRONOUS `cgroup.kill` the kernel is already carrying out, so it
+    should be generous. On v1 there is no `cgroup.kill` at all: `_v1_destroy`
+    migrates survivors to the parent first, and that either worked or did
+    not before we get here — if it failed the processes are still alive and
+    unmigrated, so `cgroup.procs` will never drain and a long wait buys
+    nothing (twice over, since v1 loops two controller dirs). A short v1
+    budget still covers the one race that matters there: a pid dying between
+    the read of `cgroup.procs` and the write that migrates it.
 
     `cgroup.kill` is ASYNCHRONOUS: it delivers SIGKILL and returns, while
     the kernel tears the processes down over the following moments. An
@@ -243,12 +260,19 @@ def _drain_then_rmdir(d: str) -> str | None:
     # in a cleanup path that runs for every worker.
     if not os.path.isdir(d):
         return None
-    deadline = time.monotonic() + _DESTROY_DRAIN_TIMEOUT_SEC
+    deadline = time.monotonic() + budget_sec
     err: str | None = None
     while True:
         if not _read(f"{d}/cgroup.procs").strip():
             try:
                 os.rmdir(d)
+                return None
+            except FileNotFoundError:
+                # Reaped concurrently between the isdir() guard above and
+                # here. Same disposition as the guard: already-gone is
+                # success. Without this arm the retry loop would spend the
+                # whole budget and then report a leak for a dir that is in
+                # fact gone.
                 return None
             except OSError as e:
                 # Drained but still busy (e.g. a child cgroup, or a PID
@@ -268,7 +292,7 @@ def _v2_destroy(sid: str) -> str | None:
     process kept it busy for the whole drain budget)."""
     d = _v2_dir(sid)
     _write(f"{d}/cgroup.kill", "1", swallow=True)
-    return _drain_then_rmdir(d)
+    return _drain_then_rmdir(d, _DESTROY_DRAIN_TIMEOUT_SEC)
 
 
 def _v2_stat(sid: str) -> tuple[int, int, int, int]:
@@ -315,7 +339,7 @@ def _v1_destroy(sid: str) -> str | None:
     for d in (pdir, mdir):
         for pid in _read(f"{d}/cgroup.procs").split():
             _write(f"{os.path.dirname(d)}/cgroup.procs", pid, swallow=True)
-        e = _drain_then_rmdir(d)
+        e = _drain_then_rmdir(d, _V1_DRAIN_TIMEOUT_SEC)
         if e is not None and err is None:
             err = e
     return err
