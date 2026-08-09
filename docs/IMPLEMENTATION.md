@@ -6720,6 +6720,18 @@ via `mkdir`-as-mutex (portable across darwin/linux without the
 non-stdlib `flock` binary that macOS lacks); only the first spawn
 wins, the rest see a live socket and reuse it.
 
+The reuse check probes the socket with `ssh-add -l` and reuses it on
+any exit code **other than 2** — rc 0 (has keys) and rc 1 (reachable,
+no keys yet — a freshly-spawned agent before its first cert lands)
+both mean the agent is alive; only rc 2 (cannot connect) means the
+socket is stale. Treating rc 1 the same as rc 2 unlinks a live
+agent's socket (`rm -f`) out from under the still-running process,
+orphaning it permanently. Any newly-spawned agent also carries a
+`-t 24h` idle timeout on the identities it holds, matching the Fly
+cert lifetime, so an orphan that does still occur (e.g. a future
+regression in the reuse predicate) self-limits rather than leaking
+indefinitely.
+
 #### Worker auth + config seeding (`scripts/remote/seed-auth.sh`)
 
 After `provision_machine()` returns successfully, the launcher sources
