@@ -4680,49 +4680,75 @@ def _is_node_repo(cwd: str) -> bool:
 _WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
 _WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
 _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
+# Headroom over the measured build peak for the per-worker isolation
+# ceiling. Not a share of anything (see `_worker_memory_ceiling`) — just
+# enough slack above 6.3 GiB that an ordinary heavier-than-measured build
+# is not killed, while a genuine runaway (tens of GiB) still is.
+_WORKER_MEMORY_CEILING_MULTIPLIER = 1.5
 
 
-def _cgroup_slice_info() -> tuple[int, int] | None:
-    """Read-only query of the shared `leerie.slice` budget and live worker
-    concurrency, via the broker's `slice` verb (N9). Returns
-    `(memory_max_bytes, live_sibling_count)`, or None when the broker is
-    unreachable/errors/has no usable hierarchy (containment off) or reports
-    no configured slice ceiling (`memory_max_bytes == -1`) — callers must
-    treat None as "no slice-wide budget known" and fall back to a basis that
-    does not need it, never assume unlimited."""
+def _cgroup_slice_info() -> tuple[int, int, int] | None:
+    """Read-only query of the shared `leerie.slice` budget, live worker
+    concurrency, and unreclaimable usage, via the broker's `slice` verb.
+    Returns `(memory_max_bytes, live_sibling_count, unreclaimable_bytes)`,
+    or None when the broker is unreachable/errors/has no usable hierarchy
+    (containment off) or reports no configured slice ceiling
+    (`memory_max_bytes == -1`) — callers must treat None as "no slice-wide
+    budget known" and fall back to a basis that does not need it, never
+    assume unlimited.
+
+    `unreclaimable_bytes` is -1 when the broker could not read it; callers
+    must treat that as "unknown" and admit (fail-open), matching the
+    whole-tuple None contract rather than inventing a blocking default."""
     try:
         resp = _cgroup_request("slice")
     except OSError:
         return None
     parts = resp.split()
-    if len(parts) != 3 or parts[0] != "OK":
+    if len(parts) != 4 or parts[0] != "OK":
         return None
     try:
-        mem_max, siblings = int(parts[1]), int(parts[2])
+        mem_max, siblings, unreclaimable = (int(parts[1]), int(parts[2]),
+                                            int(parts[3]))
     except ValueError:
         return None
     if mem_max <= 0:
         return None
-    return (mem_max, siblings)
+    return (mem_max, siblings, unreclaimable)
 
 
-def _slice_worker_memory_max(slice_max_bytes: int, live_siblings: int,
-                             max_parallel: int) -> int:
-    """Pure divisor (N9's chosen formula): split the shared slice budget
-    across live sibling workers PLUS this run's own worst-case concurrency
-    (`max_parallel`) PLUS one slot for the orchestrator/system processes
-    outside any worker cgroup — mirroring `_auto_worker_memory_max`'s prior
-    `total // (max_parallel + 1)` shape, but against the shared slice ceiling
-    and live cross-run concurrency instead of host RAM and this run alone.
-    Shrinks automatically as sibling runs start and grows back as they
-    finish, because the shared slice IS the shared state (no lockfile/
-    registry needed — PENDING_ISSUES.md N9). Floored at 256 MiB purely to
-    keep the result sane (positive, non-degenerate) when the slice is
-    already saturated; whether that number is actually enough for a build is
-    the admission gate's job (`_await_worker_memory_admission`), not this
-    function's."""
-    per_worker = slice_max_bytes // (live_siblings + max_parallel + 1)
-    return max(per_worker, 256 * 1024**2)
+def _worker_memory_ceiling(slice_max_bytes: int) -> int:
+    """Per-worker `memory.max`: a fixed isolation ceiling, NOT a share of
+    the slice (DESIGN §6 *A per-worker cap is a ceiling, not a
+    reservation*).
+
+    Writing `memory.max` allocates nothing — it only bounds — and the
+    aggregate `leerie.slice/memory.max` is the real backstop against host
+    exhaustion. So per-worker ceilings may safely sum past the slice budget,
+    and this value depends only on the host's slice size: NOT on
+    `live_siblings`, NOT on `max_parallel`.
+
+    The superseded divisor (`slice_max // (live_siblings + max_parallel +
+    1)`) treated the ceiling as a reservation, which issued caps *below*
+    `_WORKER_BUILD_PEAK_BYTES` and so guaranteed the in-cgroup OOM the cap
+    exists to prevent — measured live at 4.58 GiB/worker. It also counted
+    this run twice (`live_siblings` is slice-wide and already includes this
+    run's own workers), so a single run blocked its own third concurrent
+    worker with no other run on the host.
+
+    Bounded above by half the slice, so one worker is never licensed to
+    consume the whole fleet's budget — but never at the cost of dropping
+    below the build peak, which is the failure this ceiling exists to
+    prevent. On a slice too small to honour both, the build peak wins: a
+    `memory.max` above the slice budget is harmless (the aggregate slice
+    cap binds first anyway), whereas one below the build peak guarantees
+    the in-cgroup OOM. That ordering is why there is no separate small
+    floor here — `_WORKER_BUILD_PEAK_BYTES` is itself the floor.
+
+    Load-independence is what makes resolving this once, at startup,
+    correct."""
+    want = int(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER)
+    return max(_WORKER_BUILD_PEAK_BYTES, min(want, slice_max_bytes // 2))
 
 
 def _auto_worker_memory_max_legacy(max_parallel: int) -> int:
@@ -4764,58 +4790,70 @@ def _auto_worker_memory_max_legacy(max_parallel: int) -> int:
 def _auto_worker_memory_max(max_parallel: int) -> int:
     """Auto-derive a per-worker memory cap.
 
-    N9-corrected basis: the aggregate `leerie.slice` memory.max
-    (scripts/container-entry.sh) is shared by every concurrent leerie run on
-    the host, not owned exclusively by this one — so the per-worker cap is
-    now derived from that shared budget (`_slice_worker_memory_max`, divided
-    across live sibling workers + this run's own `max_parallel` + one
-    orchestrator/system slot) rather than /proc/meminfo, which sized each
-    worker as if this run owned the whole host and let concurrent runs
-    jointly overcommit the shared slice (measured 2.3x — PENDING_ISSUES.md
-    N9). Falls back to the legacy /proc/meminfo basis
+    Derived from the aggregate `leerie.slice` memory.max
+    (scripts/container-entry.sh) via `_worker_memory_ceiling` — a fixed
+    isolation ceiling, not a share. Cross-run contention is handled by
+    `_await_worker_memory_admission` (which measures real slice headroom),
+    NOT by shrinking this number: a cap is a ceiling, and shrinking it below
+    the build peak causes the exact OOM it is meant to prevent.
+
+    Falls back to the legacy /proc/meminfo basis
     (`_auto_worker_memory_max_legacy`) when the shared-slice budget can't be
     read (no broker, no cgroup containment, `--dangerously-allow-uncapped`)
     — there the shared-slice enforcement this basis depends on is absent
-    anyway."""
+    anyway. `max_parallel` is used only on that fallback path."""
     info = _cgroup_slice_info()
     if info is None:
         return _auto_worker_memory_max_legacy(max_parallel)
-    slice_max_bytes, live_siblings = info
-    return _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
+    slice_max_bytes, _live_siblings, _unreclaimable = info
+    return _worker_memory_ceiling(slice_max_bytes)
 
 
 async def _await_worker_memory_admission(
-        max_parallel: int,
         build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES,
         poll_interval_sec: float = _WORKER_MEMORY_ADMISSION_POLL_SEC,
         max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> None:
-    """Admission gate (N9 DECISION 2026-08-06): before spawning a new
-    worker, block while admitting it would drive the shared per-worker
-    allocation below the measured build peak — rather than admitting it
-    regardless and letting the kernel OOM-kill it mid-build. Returns
-    (admits) immediately when no shared-slice budget is readable (no
-    broker / containment off — nothing to gate against) or once the
-    computed per-worker share is >= `build_peak_bytes`.
+    """Admission gate: before spawning a new worker, block while the shared
+    `leerie.slice` lacks the measured headroom for another build — rather
+    than admitting it regardless and letting the kernel OOM-kill it
+    mid-build. This is where cross-run contention is handled; the per-worker
+    cap itself is a fixed ceiling (`_worker_memory_ceiling`) and is never
+    shrunk to make room.
+
+    The signal is `slice_max - unreclaimable`, deliberately NOT
+    `slice_max - memory.current`: `memory.current` counts reclaimable page
+    cache, which the kernel frees under pressure. Measured live, 10.4 GiB of
+    20.5 GiB in use was `inactive_file` — gating on `memory.current` would
+    have under-reported headroom by half and stalled a fleet with ample
+    room.
+
+    Admits immediately when no shared-slice budget is readable (no broker /
+    containment off — nothing to gate against) or when the broker could not
+    read unreclaimable usage (`-1`): unknown fails open, matching
+    `_cgroup_slice_info`'s whole-tuple None contract.
 
     Bounded at `max_wait_sec` (default 10 min) rather than blocking
-    forever: a long-running sibling worker that never releases its slot
+    forever: a long-running sibling worker that never releases its memory
     would otherwise wedge this run's admission indefinitely. On timeout,
-    admits anyway and logs — a late-admitted worker risking an in-cgroup
-    OOM kill is the pre-N9 status quo, not a new failure mode, and is
-    strictly better than a run that never makes progress."""
+    admits anyway and logs. That is safe now in a way it was not under the
+    superseded divisor: the ceiling is always >= `build_peak_bytes`, so a
+    late-admitted worker is no longer handed a cap that guarantees its own
+    OOM."""
     waited = 0.0
     while True:
         info = _cgroup_slice_info()
         if info is None:
             return
-        slice_max_bytes, live_siblings = info
-        cap = _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
-        if cap >= build_peak_bytes:
+        slice_max_bytes, _live_siblings, unreclaimable = info
+        if unreclaimable < 0:
+            return
+        headroom = slice_max_bytes - unreclaimable
+        if headroom >= build_peak_bytes:
             return
         if waited >= max_wait_sec:
             log(f"  worker memory admission wait exceeded "
-                f"{max_wait_sec:.0f}s (shared slice would allocate "
-                f"{cap / 1024**3:.1f} GiB/worker, below the "
+                f"{max_wait_sec:.0f}s (shared slice headroom "
+                f"{headroom / 1024**3:.1f} GiB, below the "
                 f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor); "
                 f"admitting anyway")
             return
@@ -13273,14 +13311,15 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     runs many `claude -p` workers concurrently (`asyncio.gather` under
     `Semaphore(max_parallel)`); mutating process-global env would race.
 
-    `max_parallel`, when given, arms the N9 slice-aware admission gate
-    (`_await_worker_memory_admission`): before spawning, block while
-    admitting this worker would drive the shared `leerie.slice`
-    per-worker allocation below the measured build-peak floor. None
-    (the default) skips the gate — used by callers with no run-level
-    `max_parallel` context, e.g. the startup smoke test."""
+    `max_parallel`, when given, arms the slice-aware admission gate
+    (`_await_worker_memory_admission`): before spawning, block while the
+    shared `leerie.slice` lacks the measured headroom for another build.
+    It is an arming signal only — "this caller has run-level context" —
+    not an input to the gate's arithmetic, which reads real slice
+    headroom. None (the default) skips the gate, used by callers with no
+    run-level context, e.g. the startup smoke test."""
     if max_parallel is not None:
-        await _await_worker_memory_admission(max_parallel)
+        await _await_worker_memory_admission()
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -28037,13 +28076,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # helper was renamed private and thus came under that guard's scope.
     caps["token_probe_cache_sec"] = resolve_token_probe_cache_sec(
         cwd, getattr(args, "token_probe_cache_sec", None))
-    # Resolve per-worker cgroup memory cap. Auto-derives from
-    # /proc/meminfo when unset; resolver die()s on a bad size string.
-    # Reads `caps["max_parallel"]` already resolved above so the auto-
-    # derived value is "VM ram split N+1 ways, floored at 8 GiB" (a
-    # build-running worker's cgroup holds the build subprocess tree AND
-    # the resident claude -p process at once; measured build+claude peak
-    # is ~6.3 GiB — see _auto_worker_memory_max).
+    # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
+    # string. Auto-derives a fixed isolation CEILING from the shared
+    # leerie.slice budget (_worker_memory_ceiling) — a build-running
+    # worker's cgroup holds the build subprocess tree AND the resident
+    # claude -p process at once, measured peak ~6.3 GiB. Resolving once
+    # here is correct precisely because the ceiling is load-independent;
+    # contention is handled at spawn time by the admission gate, not by
+    # shrinking this value. `caps["max_parallel"]` is read only for the
+    # legacy /proc/meminfo fallback (no broker / containment off).
     caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
         Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max)
     # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the

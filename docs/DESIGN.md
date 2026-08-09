@@ -2861,8 +2861,9 @@ Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` (where `<sid>` is the
 run-scoped composed sid — see *The per-worker cgroup name is
 run-scoped* below) with `memory.max` set to
-`caps["worker_memory_max_bytes"]` (default: VM RAM split across
-`max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
+`caps["worker_memory_max_bytes"]` (default: a fixed isolation ceiling
+derived from the measured build peak — see *A per-worker cap is a
+ceiling, not a reservation* below) and `pids.max` set
 to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
@@ -2917,21 +2918,58 @@ and build + resident claude peaks at 5.6–6.3 GiB. An earlier `4 GiB`
 clamp on the auto-derived value was *below* that combined peak, so no
 VM size could auto-derive a cap sufficient for a build-running
 worker — every such worker was cgroup-OOM-killed regardless of host
-RAM. The fix floors the auto-derive at 8 GiB (`max(even_split, 8
-GiB)`), giving margin over the measured 6.3 GiB peak, and drops the
-upper clamp entirely: the real backstop against a runaway per-worker
-cap is the *aggregate* `leerie.slice/memory.max` cap set by
-`scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
-bounds the whole worker fleet regardless of any individual worker's
-`memory.max`. Because that aggregate cap is the real VM-OOM backstop,
-the per-worker floor can be generous without risking host-level
-memory exhaustion — but it does mean **build-heavy waves need a lower
-`--max-parallel`**: five concurrent 8 GiB-capped workers (40 GiB
-aggregate) will not all fit under a ~13.6 GiB slice cap on a 16 GiB
-VM, so the slice cap will itself OOM-kill one of them first. Pair a
-generous per-worker cap with a reduced `--max-parallel` for waves
-expected to run builds, rather than relying on the per-worker cap
-alone to bound concurrency.
+RAM. Any cap below that combined peak guarantees the very OOM the cap
+exists to contain.
+
+**A per-worker cap is a ceiling, not a reservation.** Writing
+`memory.max` allocates nothing; it only bounds. The real backstop
+against host-level exhaustion is the *aggregate*
+`leerie.slice/memory.max` set by `scripts/container-entry.sh`
+(`MemTotal - max(1 GiB, 12.5%)`), which bounds the whole worker fleet
+regardless of any individual worker's `memory.max`. Two consequences
+follow, and they are the load-bearing part of this design:
+
+1. Per-worker ceilings **may safely sum past the slice budget**. Eight
+   workers capped at 9.4 GiB do not reserve 75 GiB; they each promise
+   only "kill me before I exceed 9.4". The slice cap still binds.
+2. Therefore the per-worker cap must **never** be derived by dividing
+   the slice budget across a projected worker count. Doing so treats a
+   ceiling as a reservation and manufactures caps *below* the measured
+   build peak — the failure above, reintroduced. A run whose workers
+   were sized during a busy moment stays handicapped for its whole
+   life, since the cap is resolved once at startup.
+
+The cap is therefore a fixed isolation ceiling —
+`max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
+the host's slice budget alone, not of load. The half-slice bound stops
+one worker being licensed to eat the fleet's headroom, but the build
+peak outranks it: on a slice too small to honour both, a `memory.max`
+above the slice is harmless (the aggregate cap binds first) while one
+below the build peak guarantees the OOM. Its job is to stop one runaway
+worker from eating the fleet's headroom, not to apportion shares. Being
+load-independent is what makes resolving it once, at startup, correct.
+
+**Contention is handled by admission, not by shrinking caps.** Before
+spawning a worker, leerie blocks while the slice lacks room for another
+build (`_await_worker_memory_admission`). The signal is measured
+headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable
++ unreclaimable slab, read from `memory.stat`), never `memory.current`,
+which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
+was reclaimable file cache**, so gating on `memory.current` would
+under-report headroom by half and stall a fleet that had ample room.
+
+The wait is bounded (10 min) and then admits anyway: a run that never
+progresses is worse than a tight one, and because the ceiling is now
+always ≥ the build peak, a late-admitted worker is no longer doomed by
+construction. When no slice budget is readable at all (containment off,
+`--dangerously-allow-uncapped`, no broker), admission is a no-op and
+sizing falls back to the legacy `/proc/meminfo` basis — there is no
+shared enforcement to gate against either way.
+
+This replaces the older advice to hand-tune `--max-parallel` down for
+build-heavy waves. That advice was sound under a divide-the-slice cap,
+but it asked the operator to predict contention that the orchestrator
+can now simply measure.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the

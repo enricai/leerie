@@ -44,6 +44,13 @@ def broker(tmp_path, monkeypatch):
     # below still exercises the split-hierarchy helpers against this same
     # fake cgroupfs, so point both at the tmp root.
     monkeypatch.setattr(mod, "V1_ROOT", str(root))
+    # `destroy` waits for the killed subtree to drain before rmdir'ing
+    # (see _drain_then_rmdir). The shipped 10s budget is right for a real
+    # conformer's process tree but would make every failure-path test here
+    # spin for 10s, so shrink it. The shipped value is pinned separately by
+    # test_destroy_drain_budget_is_ten_seconds.
+    monkeypatch.setattr(mod, "_DESTROY_DRAIN_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(mod, "_DESTROY_DRAIN_POLL_SEC", 0.005)
     mod._HIER = mod._detect()
     return mod
 
@@ -158,6 +165,148 @@ def test_v2_destroy_returns_error_message_on_failure(broker, monkeypatch):
     monkeypatch.setattr(broker.os, "rmdir", _raise)
     err = broker._v2_destroy("wsid3")
     assert err == "Directory not empty"
+
+
+# ---- destroy: drain before rmdir ------------------------------------------
+# `cgroup.kill` is asynchronous — it delivers SIGKILL and returns while the
+# kernel tears the tree down. An immediate rmdir races that and loses with
+# EBUSY, leaking the dir: measured, 116 stale leerie-w-* dirs of which 88
+# were -conformer (test-suite trees reaching hundreds of PIDs). The
+# orchestrator had been logging the cause verbatim: "cgroup destroy failed
+# (ERR Device or resource busy); dir may be leaked".
+
+def test_destroy_waits_for_procs_to_drain(broker, monkeypatch):
+    """A subtree that is still dying must be waited for, not abandoned.
+    Zero-retry code fails this; so does any fixed sleep shorter than the
+    drain."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-drain"
+    d.mkdir(parents=True)
+    # Deliberately no real cgroup.procs file: on a real cgroupfs the
+    # pseudo-files do not block rmdir, but on this plain-directory fake
+    # they would, masking what this test is about. The stubbed _read below
+    # supplies the contents instead.
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+
+    reads = {"n": 0}
+    orig_read = broker._read
+
+    def draining(path):
+        if path.endswith("cgroup.procs"):
+            reads["n"] += 1
+            # Still dying for the first few polls, then drained.
+            return "" if reads["n"] > 3 else "111\n222\n"
+        return orig_read(path)
+
+    monkeypatch.setattr(broker, "_read", draining)
+    assert broker._v2_destroy("drain") is None
+    assert not d.exists()
+    assert reads["n"] > 3, "must have polled while the tree was draining"
+
+
+def test_destroy_does_not_rmdir_while_procs_remain(broker, monkeypatch):
+    """Anti-vacuity for the above: while cgroup.procs is non-empty the
+    rmdir must not even be attempted, so a 'drain' that just retries a
+    doomed rmdir cannot pass."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-busy"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_read",
+                        lambda p: "999\n" if p.endswith("cgroup.procs") else "")
+    attempted = []
+    monkeypatch.setattr(broker.os, "rmdir",
+                        lambda p: attempted.append(p))
+    err = broker._v2_destroy("busy")
+    assert attempted == []
+    assert err is not None
+
+
+def test_destroy_still_reports_error_when_budget_exhausted(broker, monkeypatch):
+    """The retry must not swallow a genuine leak — the orchestrator's
+    'dir may be leaked' warning depends on this error surfacing."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-stuck"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_read",
+                        lambda p: "" if p.endswith("cgroup.procs") else "")
+
+    def _raise(path):
+        raise OSError(16, "Device or resource busy")
+
+    monkeypatch.setattr(broker.os, "rmdir", _raise)
+    assert broker._v2_destroy("stuck") == "Device or resource busy"
+
+
+def test_destroy_drain_budget_is_ten_seconds(broker):
+    """Pins the shipped constants (the fixture shrinks them for speed).
+    10s because the leaking workers were conformers whose trees reached
+    the hundreds; a sub-second budget does not cover their teardown."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cgroup_broker_pristine",
+                                                  _BROKER_PATH)
+    pristine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pristine)
+    assert pristine._DESTROY_DRAIN_TIMEOUT_SEC == 10.0
+    assert 0 < pristine._DESTROY_DRAIN_POLL_SEC <= 0.5
+
+
+# ---- slice verb: budget, live count, unreclaimable -------------------------
+
+def test_slice_verb_reports_max_live_and_unreclaimable(broker):
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.max").write_text("58986594304\n")
+    (slice_dir / "memory.stat").write_text(
+        "anon 8589934592\nfile 11072506368\ninactive_file 11072506368\n"
+        "slab_unreclaimable 33554432\nunevictable 0\n")
+    live = slice_dir / "leerie-w-alive"
+    live.mkdir()
+    (live / "cgroup.procs").write_text("4242\n")
+    dead = slice_dir / "leerie-w-dead"
+    dead.mkdir()
+    (dead / "cgroup.procs").write_text("")
+
+    resp = broker._handle("slice")
+    parts = resp.split()
+    assert parts[0] == "OK"
+    assert int(parts[1]) == 58986594304
+    assert int(parts[2]) == 1, "empty cgroup.procs is not a live sibling"
+    assert int(parts[3]) == 8589934592 + 33554432
+
+
+def test_slice_unreclaimable_excludes_page_cache(broker):
+    """THE calibration pin. Measured live, 10.4 GiB of 20.5 GiB in use was
+    reclaimable `inactive_file`. Counting it (i.e. using memory.current)
+    under-reports headroom by half and stalls a fleet with ample room."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.max").write_text("58986594304\n")
+    (slice_dir / "memory.current").write_text("22011707392")  # 20.5 GiB
+    (slice_dir / "memory.stat").write_text(
+        "anon 8181121024\nfile 12320309248\ninactive_file 11136925696\n"
+        "active_file 1181116416\nslab_unreclaimable 33554432\n"
+        "unevictable 0\n")
+    got = broker._slice_unreclaimable()
+    assert got == 8181121024 + 33554432
+    assert got < 22011707392, "must not equal/exceed memory.current"
+
+
+def test_slice_unreclaimable_minus_one_when_unreadable(broker):
+    """No memory.stat at all -> -1 ("unknown"), which the orchestrator
+    treats as fail-open rather than as a full slice."""
+    assert broker._slice_unreclaimable() == -1
+
+
+def test_slice_unreclaimable_tolerates_missing_optional_keys(broker):
+    """Some kernels omit unevictable/slab_unreclaimable. Only the primary
+    anon/rss key is required — treating an optional absence as a read
+    failure would fail open far more often than necessary."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.stat").write_text("anon 1234\nfile 99\n")
+    assert broker._slice_unreclaimable() == 1234
+
+
+def test_slice_unreclaimable_minus_one_when_primary_key_absent(broker):
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.stat").write_text("file 99\ninactive_file 99\n")
+    assert broker._slice_unreclaimable() == -1
 
 
 def test_no_hierarchy_errors(broker, monkeypatch):
@@ -382,6 +531,11 @@ def rootless_broker(tmp_path, monkeypatch):
                                                   _BROKER_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # Same reason as the `broker` fixture: shrink the destroy drain budget
+    # so the deliberate ENOTEMPTY failure path below returns promptly
+    # instead of spending the shipped 10s.
+    monkeypatch.setattr(mod, "_DESTROY_DRAIN_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(mod, "_DESTROY_DRAIN_POLL_SEC", 0.005)
     mod._HIER = mod._detect()
     return mod
 
