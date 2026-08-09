@@ -4720,7 +4720,7 @@ def _slice_worker_memory_max(slice_max_bytes: int, live_siblings: int,
     registry needed — PENDING_ISSUES.md N9). Floored at 256 MiB purely to
     keep the result sane (positive, non-degenerate) when the slice is
     already saturated; whether that number is actually enough for a build is
-    the admission gate's job (`_await_worker_memory_admission`), not this
+    the admission gate's job (`_degrade_max_parallel_for_wave`), not this
     function's."""
     per_worker = slice_max_bytes // (live_siblings + max_parallel + 1)
     return max(per_worker, 256 * 1024**2)
