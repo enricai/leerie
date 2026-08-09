@@ -46,9 +46,12 @@ Protocol (newline-terminated, one request per connection):
   destroy <sid>                 -> OK | ERR <msg>
   stat <sid>                    -> OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill> | ERR <msg>
   slice                         -> OK <leerie.slice memory.max, -1 if unset> <live sibling worker cgroups> <unreclaimable bytes, -1 if unreadable>
-                                    (N9: read-only, used to size a new worker's
-                                    memory cap against the shared slice budget
-                                    rather than /proc/meminfo)
+                                    (read-only. Used to gate worker admission on
+                                    measured slice headroom: slice memory.max
+                                    minus UNRECLAIMABLE usage — page cache is
+                                    excluded, so this is not memory.current.
+                                    Per-worker sizing is load-independent and
+                                    does NOT consume the live-sibling count.)
 
 `<sid>` is validated against `^[A-Za-z0-9._-]+$` and only ever composed
 into `leerie-w-<sid>` under the fixed slice — no path traversal. `<pid>`,
@@ -234,6 +237,12 @@ def _drain_then_rmdir(d: str) -> str | None:
     a fixed interval, because how long teardown takes scales with the tree
     the worker built. Still returns the error when the budget runs out, so
     a genuine leak is reported rather than silently swallowed by retrying."""
+    # Already gone: destroy is idempotent, and there is nothing to drain.
+    # Without this, FileNotFoundError (an OSError like any other) would be
+    # retried for the whole budget — 10s per call, 20s on v1's two dirs —
+    # in a cleanup path that runs for every worker.
+    if not os.path.isdir(d):
+        return None
     deadline = time.monotonic() + _DESTROY_DRAIN_TIMEOUT_SEC
     err: str | None = None
     while True:

@@ -235,15 +235,24 @@ def test_admission_gates_on_headroom_not_worker_count(leerie, monkeypatch):
     asyncio.run(leerie._await_worker_memory_admission())
     assert slept == [], "many workers + free memory must not block"
 
-    # Uncrowded but full -> must block until the budget is spent.
+    # Uncrowded but full -> must block until the budget is spent. The sleep
+    # stub must RECORD: a non-recording stub makes this half pass whether
+    # or not the gate blocked, which is precisely the half that proves the
+    # fix.
     slept.clear()
     monkeypatch.setattr(
         leerie, "_cgroup_slice_info",
         lambda: (_SLICE_54_9_GIB, 1, _SLICE_54_9_GIB - 1024**3))
-    monkeypatch.setattr(asyncio, "sleep", _async_noop)
+
+    async def recording_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
     asyncio.run(leerie._await_worker_memory_admission(
         poll_interval_sec=10.0, max_wait_sec=25.0))
-    # Reached the timeout arm rather than admitting straight through.
+    assert slept, "one worker + a full slice must block, not admit"
+    assert sum(slept) >= 20.0, (
+        f"must have waited out the budget before admitting: {slept}")
 
 
 def test_admission_admits_when_unreclaimable_unknown(leerie, monkeypatch):

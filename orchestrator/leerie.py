@@ -4666,17 +4666,22 @@ def _is_node_repo(cwd: str) -> bool:
     return any((Path(cwd) / name).exists() for name in _NODE_MANIFEST_NAMES)
 
 
-# N9 (PENDING_ISSUES.md): every concurrent leerie run shares ONE
-# `leerie.slice` cgroup with a single enforced `memory.max` — measured live,
-# `_auto_worker_memory_max`'s /proc/meminfo basis sized each worker as if its
-# run owned the whole host, so N concurrent runs' workers could jointly
-# demand 2.3x the shared slice's actual budget (individual workers get
-# SIGKILLed by the kernel OOM killer inside their own cgroup when the shared
-# slice hits its cap, even though the slice-wide backstop itself holds).
-# `_WORKER_BUILD_PEAK_BYTES` is the measured combined build+resident-claude
-# peak (_auto_worker_memory_max's docstring, below) that admission is gated
-# against: below this, a build-running worker is at real risk of an in-cgroup
-# OOM kill rather than merely "tight".
+# Every concurrent leerie run shares ONE `leerie.slice` cgroup with a single
+# enforced `memory.max`. `_WORKER_BUILD_PEAK_BYTES` is the measured combined
+# build+resident-claude peak (see `_auto_worker_memory_max_legacy`'s
+# docstring), and it does double duty: it is the floor the per-worker
+# ceiling can never drop below (`_worker_memory_ceiling`) AND the headroom
+# admission waits for (`_await_worker_memory_admission`). Below it, a
+# build-running worker is at real risk of an in-cgroup OOM kill rather than
+# merely "tight".
+#
+# Note what is deliberately NOT a defect here: per-worker ceilings summing
+# past the shared slice budget. `memory.max` is a bound, not a reservation,
+# and the aggregate slice cap is the real backstop — so overcommitting
+# ceilings is intended (DESIGN §6 *A per-worker cap is a ceiling, not a
+# reservation*). An earlier revision read that overcommit as the bug and
+# divided the slice across a projected worker count to prevent it, which
+# issued caps BELOW this peak and caused the OOMs it meant to avoid.
 _WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
 _WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
 _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
@@ -4844,17 +4849,22 @@ async def _await_worker_memory_admission(
         info = _cgroup_slice_info()
         if info is None:
             return
-        slice_max_bytes, _live_siblings, unreclaimable = info
+        slice_max_bytes, live_siblings, unreclaimable = info
         if unreclaimable < 0:
             return
         headroom = slice_max_bytes - unreclaimable
         if headroom >= build_peak_bytes:
             return
         if waited >= max_wait_sec:
+            # `live_siblings` is not an input to the decision (that is the
+            # whole point — see `_worker_memory_ceiling`), but it is the
+            # first thing you want when diagnosing a stall: it separates
+            # "the fleet is genuinely busy" from "one worker is leaking".
             log(f"  worker memory admission wait exceeded "
                 f"{max_wait_sec:.0f}s (shared slice headroom "
                 f"{headroom / 1024**3:.1f} GiB, below the "
-                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor); "
+                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor; "
+                f"{live_siblings} live worker cgroups slice-wide); "
                 f"admitting anyway")
             return
         await asyncio.sleep(poll_interval_sec)

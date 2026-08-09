@@ -236,6 +236,33 @@ def test_destroy_still_reports_error_when_budget_exhausted(broker, monkeypatch):
     assert broker._v2_destroy("stuck") == "Device or resource busy"
 
 
+def test_destroy_on_a_missing_dir_is_fast_and_succeeds(broker, monkeypatch):
+    """An already-gone cgroup is success, not failure — and must not spend
+    the drain budget: FileNotFoundError is an OSError like any other, so an
+    unguarded retry loop burns the whole 10s (20s on v1's two dirs) in a
+    cleanup path that runs for every worker. Asserts elapsed time, because
+    the return value alone passes against the unguarded version too."""
+    import time as _time
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    # Deliberately larger than any plausible fast path, so the assertion
+    # below is about the early return and not about the fixture's budget.
+    monkeypatch.setattr(broker, "_DESTROY_DRAIN_TIMEOUT_SEC", 2.0)
+    t0 = _time.monotonic()
+    assert broker._v2_destroy("never-created") is None
+    assert _time.monotonic() - t0 < 0.5
+
+
+def test_destroy_v1_on_missing_dirs_is_fast(broker, monkeypatch):
+    """Same guard on the v1 path, which loops two controller dirs and so
+    doubled the stall."""
+    import time as _time
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_DESTROY_DRAIN_TIMEOUT_SEC", 2.0)
+    t0 = _time.monotonic()
+    assert broker._v1_destroy("never-created") is None
+    assert _time.monotonic() - t0 < 0.5
+
+
 def test_destroy_drain_budget_is_ten_seconds(broker):
     """Pins the shipped constants (the fixture shrinks them for speed).
     10s because the leaking workers were conformers whose trees reached

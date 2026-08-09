@@ -2945,9 +2945,8 @@ the host's slice budget alone, not of load. The half-slice bound stops
 one worker being licensed to eat the fleet's headroom, but the build
 peak outranks it: on a slice too small to honour both, a `memory.max`
 above the slice is harmless (the aggregate cap binds first) while one
-below the build peak guarantees the OOM. Its job is to stop one runaway
-worker from eating the fleet's headroom, not to apportion shares. Being
-load-independent is what makes resolving it once, at startup, correct.
+below the build peak guarantees the OOM. Being load-independent is what
+makes resolving it once, at startup, correct.
 
 **Contention is handled by admission, not by shrinking caps.** Before
 spawning a worker, leerie blocks while the slice lacks room for another
