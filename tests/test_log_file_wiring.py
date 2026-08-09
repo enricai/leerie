@@ -115,6 +115,7 @@ __REAP__
 _reap_tail
 
 printf 'RUN_LOG_GONE=%s\n' "$([ -z "$_run_log" ] && echo yes || echo no)"
+printf 'CONTAINER_RC=%s\n' "$container_rc"
 """
 
 
@@ -326,6 +327,119 @@ def test_interactive_script_command_is_a_single_quoted_string(tmp_path):
     assert '_nerdctl_run_quoted="nerdctl run"' in invocation
     assert "printf -v _rarg_q '%q' \"$_rarg\"" in invocation
     assert 'script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"' in invocation
+
+
+def _write_bsd_script_stub(bin_dir: Path) -> None:
+    """A `script`(1) stand-in that reproduces the one BSD-script property
+    this branch depends on and none of the others: it ALWAYS exits 0,
+    regardless of the wrapped command's real exit status (there is no
+    util-linux -e/--return equivalent on BSD/macOS script(1) -- confirmed
+    via `script --help`). It still execs its trailing positional args
+    directly (no shell), matching real BSD script's argv contract, and
+    still appends to the `-a <file>` target so the existing teeing
+    assertions keep working."""
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "script"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "# BSD-style: script -q -a <file> <command...>\n"
+        "_out=\"$3\"\n"
+        "shift 3\n"
+        '"$@" >>"$_out" 2>&1\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+
+
+def _write_darwin_uname_stub(bin_dir: Path) -> None:
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "uname"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-s" ]; then echo Darwin; else /usr/bin/uname "$@"; fi\n'
+    )
+    stub.chmod(0o755)
+
+
+def test_darwin_script_path_reports_real_container_exit_code(tmp_path):
+    """bugfix-005 completeness gap: on macOS, BSD script(1) always exits 0,
+    so `script -q -a ... nerdctl run ...` alone can never surface a real
+    container failure -- `container_rc` must come from the sentinel-file
+    mechanism, not from script(1)'s own exit status."""
+    state_dir = _setup(tmp_path)
+    log_file = tmp_path / "logs" / "leerie-run.log"
+    bin_dir = state_dir / "bin"
+    bin_dir.mkdir()
+    # nerdctl stub that fails, mirroring a real containerized-run failure.
+    nerdctl_stub = bin_dir / "nerdctl"
+    nerdctl_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'hello from container\\nsecond line\\n'\n"
+        "exit 3\n"
+    )
+    nerdctl_stub.chmod(0o755)
+    _write_bsd_script_stub(bin_dir)
+    _write_darwin_uname_stub(bin_dir)
+    script_path = state_dir / "harness.sh"
+    script_path.write_text(
+        _HARNESS
+        .replace("__STATE__", str(state_dir))
+        .replace("__LOGFILE__", str(log_file))
+        .replace("__TTYFLAGS__", "-it")
+        .replace("__MKDIR__", _extract_mkdir_line())
+        .replace("__SETUP__", _extract_setup_block())
+        .replace("__INVOCATION__", _extract_invocation())
+        .replace("__REAP__", _extract_reap_tail())
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True, text=True, timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CONTAINER_RC=3" in result.stdout, (
+        "the Darwin branch must recover nerdctl's real exit code via the "
+        "sentinel file, not rely on BSD script(1)'s own (always-0) status: "
+        f"{result.stdout!r}"
+    )
+    assert log_file.exists()
+    logged = log_file.read_text()
+    assert "hello from container" in logged
+    assert "second line" in logged
+
+
+def test_darwin_script_path_reports_success_exit_code(tmp_path):
+    """Positive control for the sentinel mechanism: a successful nerdctl
+    run still reports CONTAINER_RC=0 through the same Darwin path (proving
+    the sentinel isn't just always non-zero)."""
+    state_dir = _setup(tmp_path)
+    log_file = tmp_path / "logs" / "leerie-run.log"
+    bin_dir = state_dir / "bin"
+    _write_nerdctl_stub(bin_dir)
+    _write_bsd_script_stub(bin_dir)
+    _write_darwin_uname_stub(bin_dir)
+    script_path = state_dir / "harness.sh"
+    script_path.write_text(
+        _HARNESS
+        .replace("__STATE__", str(state_dir))
+        .replace("__LOGFILE__", str(log_file))
+        .replace("__TTYFLAGS__", "-it")
+        .replace("__MKDIR__", _extract_mkdir_line())
+        .replace("__SETUP__", _extract_setup_block())
+        .replace("__INVOCATION__", _extract_invocation())
+        .replace("__REAP__", _extract_reap_tail())
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True, text=True, timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CONTAINER_RC=0" in result.stdout
 
 
 def test_unwritable_log_file_disables_teeing_without_failing(tmp_path):

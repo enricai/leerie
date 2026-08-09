@@ -7957,8 +7957,40 @@ else
     # BSD `script` (macOS) instead takes the command as trailing positional
     # args and execs it directly, no shell involved.
     if [ "$(uname -s)" = "Darwin" ]; then
-      script -q -a "$_log_tee_target" nerdctl run "${_run_argv[@]}" \
-        || container_rc=$?
+      # BSD script(1) has no util-linux -e/--return equivalent (confirmed
+      # via `script --help`: -e/--return is util-linux-only, BSD script has
+      # no analogous flag) — it always exits 0 regardless of the wrapped
+      # command's real exit status, so `|| container_rc=$?` never fires.
+      # Route nerdctl's real exit code through a sentinel file written by a
+      # /bin/sh -c wrapper that script(1) execs directly (BSD script takes
+      # the command as trailing positional args, no shell involved unless
+      # we supply one) — the same technique the util-linux branch below
+      # already uses %q-quoting for, just wrapped in `; echo $? > file`.
+      _darwin_rc_file="$(mktemp 2>/dev/null || echo "/tmp/.leerie-rc-$$")"
+      _nerdctl_run_quoted="nerdctl run"
+      for _rarg in "${_run_argv[@]}"; do
+        printf -v _rarg_q '%q' "$_rarg"
+        _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
+      done
+      printf -v _darwin_rc_file_q '%q' "$_darwin_rc_file"
+      script -q -a "$_log_tee_target" /bin/sh -c \
+        "$_nerdctl_run_quoted; echo \$? > $_darwin_rc_file_q"
+      _darwin_rc_read="$(cat "$_darwin_rc_file" 2>/dev/null)"
+      case "$_darwin_rc_read" in
+        ''|*[!0-9]*)
+          # Sentinel missing/non-numeric (script(1) itself failed to
+          # launch, or the wrapped command was killed by a signal before
+          # the echo ran) — fail closed rather than silently reporting
+          # success.
+          container_rc=1
+          ;;
+        *)
+          container_rc="$_darwin_rc_read"
+          ;;
+      esac
+      unset _darwin_rc_read
+      rm -f "$_darwin_rc_file" 2>/dev/null || true
+      unset _nerdctl_run_quoted _rarg _rarg_q _darwin_rc_file _darwin_rc_file_q
     else
       _nerdctl_run_quoted="nerdctl run"
       for _rarg in "${_run_argv[@]}"; do
