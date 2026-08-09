@@ -196,6 +196,34 @@ def test_destroy_ok_reply_does_not_log(leerie, monkeypatch):
     assert logged == []
 
 
+def test_invoke_finally_reaps_before_destroying_cgroup(leerie):
+    """M10: `_invoke`'s (the worker-spawning helper `claude_p` calls)
+    success-path `finally:` block must call
+    `descendant_tracker.stop_and_reap()` BEFORE `_cgroup_destroy(cgroup_sid)`
+    — a backgrounded subprocess the tracker hasn't reaped yet is still a
+    cgroup member, and destroying (rmdir) a non-empty cgroup fails EBUSY.
+    Source-coupled rather than behavioral: driving `_invoke` end-to-end
+    requires a real/stubbed subprocess and cgroup, which is exercised by the
+    in-container reproduction, not this unit suite."""
+    import inspect
+    import re
+
+    src = inspect.getsource(leerie._invoke)
+    # `stop_and_reap()` is also called on the timeout/abort exception paths
+    # above the success-path `finally:` block — scope the search to the text
+    # from `final_stat`'s read onward so this pins the finally-block instance
+    # specifically, not an earlier one.
+    finally_idx = src.index("\n    finally:")
+    final_stat_idx = src.index("final_stat = _cgroup_stat(cgroup_sid)")
+    tail = src[final_stat_idx:]
+    reap_match = re.search(r"await descendant_tracker\.stop_and_reap\(\)", tail)
+    destroy_match = re.search(r"_cgroup_destroy\(cgroup_sid\)", tail)
+    assert reap_match is not None, "stop_and_reap() call not found after final_stat read in _invoke"
+    assert destroy_match is not None, "_cgroup_destroy(cgroup_sid) call not found after final_stat read in _invoke"
+    assert finally_idx < final_stat_idx
+    assert reap_match.start() < destroy_match.start()
+
+
 # ---- fail-closed gate + recording (unified) -------------------------------
 
 class _FakeState:

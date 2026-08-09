@@ -72,6 +72,7 @@ import re
 import signal
 import socket
 import sys
+import time
 
 SOCK_PATH = "/run/leerie-cgroup.sock"
 SLICE = "leerie.slice"
@@ -207,11 +208,25 @@ def _v2_enroll(sid: str, pid: int) -> None:
     _write(f"{_v2_dir(sid)}/cgroup.procs", str(pid))
 
 
+_V2_DESTROY_DRAIN_DEADLINE_SEC = 2.0
+_V2_DESTROY_DRAIN_POLL_SEC = 0.05
+
+
 def _v2_destroy(sid: str) -> str | None:
     """rmdir the worker's v2 cgroup dir. Returns None on success, or the
-    OSError message on failure (e.g. a lingering process kept it busy)."""
+    OSError message on failure (e.g. a lingering process kept it busy).
+
+    `cgroup.kill` (SIGKILL to every member) is asynchronous — the kernel
+    schedules the signals and reaps zombies out-of-band, so `cgroup.procs`
+    can still list survivors for a brief window right after the write. An
+    immediate `rmdir` in that window fails EBUSY. Poll `cgroup.procs` until
+    it drains (or a short deadline elapses) before rmdir so a still-emptying
+    cgroup doesn't spuriously fail teardown."""
     d = _v2_dir(sid)
     _write(f"{d}/cgroup.kill", "1", swallow=True)
+    deadline = time.monotonic() + _V2_DESTROY_DRAIN_DEADLINE_SEC
+    while _read(f"{d}/cgroup.procs").strip() and time.monotonic() < deadline:
+        time.sleep(_V2_DESTROY_DRAIN_POLL_SEC)
     try:
         os.rmdir(d)
     except OSError as e:
