@@ -2279,15 +2279,30 @@ and orphan under init. `_reap_tail` therefore also recovers `tail`'s PID
 from the job table (`jobs -l %%`) at reap time and kills it alongside
 `$_tail_pid`.
 
-Deliberately **not** wired for the `-it` interactive/`--clarify` path: it
-uses a real pty with no intermediate `tail`/`tee` process (piping its
-output would defeat `-t`, the same reason the launcher itself drops to
-`-i` when the operator's own stdout is piped — see the TTY_FLAGS comment
-above the local execution branch), so `$_run_log` and the teeing wiring
-never activate there and the documented piped-mode/TTY-flag hazards at
-`leerie:7580-7702` are unaffected. Remote runtimes (Fly, EC2) are also out
-of scope for this teeing wiring — the `$USER_REPO` bind-mount leak N5
-targets is a local-runtime-only condition.
+**Interactive/-it path (bugfix-005).** `$_run_log`/`tail`+`tee` is still
+gated to the piped case only — piping nerdctl's own stdout there would
+defeat `-t`, the same reason the launcher itself drops to `-i` when the
+operator's own stdout is piped (see the TTY_FLAGS comment above the local
+execution branch). But leaving `--log-file` a silent no-op whenever
+stdout is a real tty (the common interactive case) defeated the whole
+point of the flag, so the `-it` branch is instead wrapped in `script`(1)
+when a `--log-file` target is writable and `script` is on `PATH`:
+`script` allocates its own pty for the `nerdctl run` child, so nerdctl
+still gets a real console for `--clarify`'s interactive prompt — TTY_FLAGS
+and nerdctl's own argv/redirection are untouched — while `script` itself
+duplicates that pty's bytes into the log file on the side. util-linux
+`script` (Linux) only accepts a command via `-c <string>` run through
+`$SHELL -c`, so the `nerdctl run` argv is `%q`-quoted into one string;
+BSD `script` (macOS) takes the command as trailing positional args and
+execs it directly. Candidate (1) — reusing the piped-mode run-log
+mechanism here — was explicitly falsified: it requires nerdctl's own
+stdout to be a non-tty file, which cannot coexist with `-t`. Falls back
+to nerdctl inheriting stdout directly, unchanged, when no `--log-file`
+target is writable or `script` is unavailable. The documented piped-mode/
+TTY-flag hazards at `leerie:7580-7702` are unaffected either way. Remote
+runtimes (Fly, EC2) are also out of scope for this teeing wiring — the
+`$USER_REPO` bind-mount leak N5 targets is a local-runtime-only
+condition.
 
 ### Verbosity
 

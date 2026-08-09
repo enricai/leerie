@@ -7794,16 +7794,18 @@ else
     _run_log="$LEERIE_STATE_HOST_DIR/.runlog-$$"
     : > "$_run_log" 2>/dev/null || _run_log=""   # fall back to direct if unwritable
   fi
-  # N5b/bugfix-002: tee the decoupled stream into the resolved --log-file
-  # path so the launcher itself replaces the operator's manual
+  # N5b/bugfix-002: tee the launcher's own stdout into the resolved
+  # --log-file path so the launcher itself replaces the operator's manual
   # `leerie task | tee <path>` habit (N5's leak vector — a tee target left
   # inside $USER_REPO gets bind-mounted whole into every worker container).
-  # Only wired for the piped/non-TTY case above: that's the only shape the
-  # decoupled run-log mechanism exists for, and it's the shape the manual
-  # `| tee` habit itself replaces. Best-effort: an unwritable/uncreatable
-  # log file silently disables teeing rather than failing the run.
+  # Computed independent of TTY_FLAGS/$_run_log (bugfix-005): the piped/
+  # non-TTY branch below wires this target into the existing
+  # tail-owned-by-us pipeline, while the interactive/-it branch wires it
+  # via `script` (see below) rather than leaving it a no-op. Best-effort:
+  # an unwritable/uncreatable log file silently disables teeing rather
+  # than failing the run.
   _log_tee_target=""
-  if [ -n "$_run_log" ] && [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then
+  if [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then
     if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then
       _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"
     fi
@@ -7939,8 +7941,69 @@ else
     nerdctl run "${_run_argv[@]}" >"$_run_log" 2>&1 || container_rc=$?
     # Stop the tail and flush any trailing bytes it hasn't printed yet.
     _reap_tail
+  elif [ -n "$_log_tee_target" ] && command -v script >/dev/null 2>&1; then
+    # Interactive/-it (or run-log uncreatable), with a writable --log-file
+    # target: tee via `script`(1) rather than piping nerdctl's own stdout —
+    # a pipe would defeat `-t` (the same hazard the TTY_FLAGS comment above
+    # documents). `script` allocates its own pty for the child, so nerdctl
+    # still sees a real console for --clarify's interactive prompt; it only
+    # duplicates that pty's bytes into the log file on the side. Never
+    # touches TTY_FLAGS or nerdctl's own argv/I/O redirection (bugfix-005 —
+    # candidate (1), reusing the piped-mode run-log mechanism here, was
+    # falsified: it requires nerdctl's stdout to be a non-tty file).
+    #
+    # util-linux `script` (Linux) only accepts a command via `-c <string>`,
+    # run through $SHELL -c — so the argv is shell-quoted into one string.
+    # BSD `script` (macOS) instead takes the command as trailing positional
+    # args and execs it directly, no shell involved.
+    if [ "$(uname -s)" = "Darwin" ]; then
+      # BSD script(1) has no util-linux -e/--return equivalent (confirmed
+      # via `script --help`: -e/--return is util-linux-only, BSD script has
+      # no analogous flag) — it always exits 0 regardless of the wrapped
+      # command's real exit status, so `|| container_rc=$?` never fires.
+      # Route nerdctl's real exit code through a sentinel file written by a
+      # /bin/sh -c wrapper that script(1) execs directly (BSD script takes
+      # the command as trailing positional args, no shell involved unless
+      # we supply one) — the same technique the util-linux branch below
+      # already uses %q-quoting for, just wrapped in `; echo $? > file`.
+      _darwin_rc_file="$(mktemp 2>/dev/null || echo "/tmp/.leerie-rc-$$")"
+      _nerdctl_run_quoted="nerdctl run"
+      for _rarg in "${_run_argv[@]}"; do
+        printf -v _rarg_q '%q' "$_rarg"
+        _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
+      done
+      printf -v _darwin_rc_file_q '%q' "$_darwin_rc_file"
+      script -q -a "$_log_tee_target" /bin/sh -c \
+        "$_nerdctl_run_quoted; echo \$? > $_darwin_rc_file_q"
+      _darwin_rc_read="$(cat "$_darwin_rc_file" 2>/dev/null)"
+      case "$_darwin_rc_read" in
+        ''|*[!0-9]*)
+          # Sentinel missing/non-numeric (script(1) itself failed to
+          # launch, or the wrapped command was killed by a signal before
+          # the echo ran) — fail closed rather than silently reporting
+          # success.
+          container_rc=1
+          ;;
+        *)
+          container_rc="$_darwin_rc_read"
+          ;;
+      esac
+      unset _darwin_rc_read
+      rm -f "$_darwin_rc_file" 2>/dev/null || true
+      unset _nerdctl_run_quoted _rarg _rarg_q _darwin_rc_file _darwin_rc_file_q
+    else
+      _nerdctl_run_quoted="nerdctl run"
+      for _rarg in "${_run_argv[@]}"; do
+        printf -v _rarg_q '%q' "$_rarg"
+        _nerdctl_run_quoted="$_nerdctl_run_quoted $_rarg_q"
+      done
+      script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target" \
+        || container_rc=$?
+      unset _nerdctl_run_quoted _rarg _rarg_q
+    fi
   else
-    # Interactive/-it (or run-log uncreatable): nerdctl inherits stdout directly.
+    # Interactive/-it (or run-log uncreatable), no --log-file target or no
+    # `script`(1) available: nerdctl inherits stdout directly, unchanged.
     nerdctl run "${_run_argv[@]}" || container_rc=$?
   fi
 fi
