@@ -403,6 +403,14 @@ STATE_FIELDS = (
     # judge returned `{collisions: []}`.
     "plan_overlap_judge",
     "plan_overlap_applied",
+    # duplicate_provider_merge_applied: set by phase_overlap_judge (M11
+    # DECISION — DESIGN §5 *A deterministic floor underneath the judge*).
+    # The post-apply mutation summary (same shape as plan_overlap_applied)
+    # for merges the deterministic `check_duplicate_providers` floor
+    # synthesized and applied via `_apply_overlap_collisions`, independent
+    # of whether the `plan_overlap_judge` worker itself ran. Absent when
+    # the floor found nothing to merge.
+    "duplicate_provider_merge_applied",
     # adherence_gate: audit record from the phase 2⅞ instruction-adherence
     # gate (phase_adherence_gate) — {judge: <adherence_judge output>,
     # floor_issues: list[str]}. Written once the gate clears (immediately
@@ -8599,6 +8607,77 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
                     "an explicit depends_on and given distinct surfaces "
                     "(DESIGN §5 *Cross-domain surface overlap*)")
     return issues
+
+
+def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
+    """Synthesize `merge` collisions for every pair `check_duplicate_providers`
+    would flag, shaped for `_apply_overlap_collisions` (M11 DECISION: the
+    duplicate-provider floor's detections are routed into a merge resolution
+    rather than left purely advisory).
+
+    Deliberately a standalone mirror of `check_duplicate_providers`'s
+    detection logic — same `_cofile_cluster` exclusion, same
+    `_normalize_artifact_path` file-overlap test, same tag/sid iteration
+    order — rather than a refactor of that function, per this subtask's
+    scope (`check_duplicate_providers` itself is unchanged and keeps
+    returning its own advisory `list[str]`).
+
+    Every returned collision has `resolution: "merge"`, so the N-way case
+    (three or more subtasks sharing one tag, pairwise) is not a separate
+    code path: `_apply_overlap_collisions` already folds a connected
+    cluster of merges into one survivor via its anchor + transitive
+    `survivor_of` resolution — safe specifically because a merge's intent
+    assembly carries the absorbed subtask's full intent forward (unlike a
+    `drop`, where the analogous transitive chase silently discards a live
+    subtask — see `_apply_multidrop`'s docstring). The closing edge of such
+    a cluster (e.g. pair (B, C) once A↔B and A↔C have already collapsed
+    both to the same survivor) is recorded as `skipped_redundant` by that
+    helper rather than double-applied."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+
+    providers: dict[str, list[str]] = {}
+    for sid, s in subtasks.items():
+        for tag in s.get("provides", []) or []:
+            if isinstance(tag, str) and tag.strip():
+                providers.setdefault(tag, []).append(sid)
+
+    def _files(s: dict) -> set[str]:
+        return {
+            _normalize_artifact_path(f)
+            for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and f.strip()
+        }
+
+    collisions: list[dict] = []
+    for tag in sorted(providers):
+        sids = sorted(providers[tag])
+        for i in range(len(sids)):
+            for j in range(i + 1, len(sids)):
+                a, b = subtasks[sids[i]], subtasks[sids[j]]
+                cluster = a.get("_cofile_cluster")
+                if cluster and cluster == b.get("_cofile_cluster"):
+                    continue  # deliberate sub-file split of one file
+                shared = _files(a) & _files(b)
+                if not shared:
+                    continue
+                collisions.append({
+                    "a_sid": sids[i], "b_sid": sids[j],
+                    "resolution": "merge",
+                    "artifact": tag,
+                    "merge_feasibility": (
+                        f"deterministic duplicate-provider floor: both "
+                        f"subtasks declare provides={tag!r} and both touch "
+                        f"{', '.join(sorted(shared))} — merged rather than "
+                        "left as duplicate work (DESIGN §5 *A deterministic "
+                        "floor underneath the judge*, M11 DECISION)"),
+                    "reason": "DUPLICATE_PROVIDER",
+                })
+    return collisions
 
 
 _TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
@@ -22075,6 +22154,24 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # the judge*). Advisory as shipped — logged, never gating.
     for issue in check_duplicate_providers(plans):
         log(f"⚠  {issue}")
+    # M11 DECISION: route the floor's detections into a merge resolution
+    # rather than leaving them advisory-only (DESIGN §5 *A deterministic
+    # floor underneath the judge*). Sits above every skip below, same as
+    # the advisory logging above it, so it runs on single-planner plans
+    # and `--skip-overlap-judge` runs too — the floor exists precisely
+    # because those are the paths where the judge itself never gets a
+    # chance to resolve the collision.
+    dup_collisions = _duplicate_provider_merge_collisions(plans)
+    if dup_collisions:
+        dup_applied = _apply_overlap_collisions(plans, dup_collisions)
+        st.data["duplicate_provider_merge_applied"] = dup_applied
+        st.save()
+        n_merged = sum(1 for a in dup_applied if a.get("action") == "merge")
+        n_other = len(dup_applied) - n_merged
+        log(f"phase 2¾: duplicate-provider floor merged {n_merged} "
+            f"collision(s)" +
+            (f", {n_other} skipped (redundant or would cycle)"
+             if n_other else "") + " (M11 DECISION)")
     for issue in check_test_ownership_overlap(plans):
         log(f"⚠  {issue}")
 
