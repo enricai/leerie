@@ -4676,10 +4676,11 @@ def _is_node_repo(cwd: str) -> bool:
 # `_WORKER_BUILD_PEAK_BYTES` is the measured combined build+resident-claude
 # peak (_auto_worker_memory_max's docstring, below) that admission is gated
 # against: below this, a build-running worker is at real risk of an in-cgroup
-# OOM kill rather than merely "tight".
-_WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
-_WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
-_WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
+# OOM kill rather than merely "tight". M9 DECISION 2026-08-09: gate at the
+# same 8 GiB floor `_auto_worker_memory_max_legacy` already derives from this
+# identical 6.3 GiB measurement — 6.3 GiB left the admission gate 46% below
+# the codebase's own documented safety margin for the same peak.
+_WORKER_BUILD_PEAK_BYTES = 8 * 1024**3
 
 
 def _cgroup_slice_info() -> tuple[int, int] | None:
@@ -4784,43 +4785,52 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
     return _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
 
 
-async def _await_worker_memory_admission(
+def _degrade_max_parallel_for_wave(
         max_parallel: int,
-        build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES,
-        poll_interval_sec: float = _WORKER_MEMORY_ADMISSION_POLL_SEC,
-        max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> None:
-    """Admission gate (N9 DECISION 2026-08-06): before spawning a new
-    worker, block while admitting it would drive the shared per-worker
-    allocation below the measured build peak — rather than admitting it
-    regardless and letting the kernel OOM-kill it mid-build. Returns
-    (admits) immediately when no shared-slice budget is readable (no
-    broker / containment off — nothing to gate against) or once the
-    computed per-worker share is >= `build_peak_bytes`.
+        build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES) -> int:
+    """Wave-scoped memory-admission gate (M9+M3 DECISION 2026-08-09):
+    replaces the retired `_await_worker_memory_admission`, which blocked a
+    spawn for up to 600s polling for a per-worker share that provably can
+    never rise while a live sibling run holds its slot, then admitted
+    anyway — measured 43x/18x slowdowns and 100% stall rates at higher
+    --max-parallel. This is a single, non-blocking check run once per wave
+    (by `phase_execute`, at wave entry) rather than once per spawn: it
+    computes the largest concurrency this wave can run at without driving
+    the shared `leerie.slice` per-worker allocation below
+    `build_peak_bytes`, logs a warning naming the degraded value when it
+    had to shrink, and returns immediately either way — no poll loop, no
+    `await`.
 
-    Bounded at `max_wait_sec` (default 10 min) rather than blocking
-    forever: a long-running sibling worker that never releases its slot
-    would otherwise wedge this run's admission indefinitely. On timeout,
-    admits anyway and logs — a late-admitted worker risking an in-cgroup
-    OOM kill is the pre-N9 status quo, not a new failure mode, and is
-    strictly better than a run that never makes progress."""
-    waited = 0.0
-    while True:
-        info = _cgroup_slice_info()
-        if info is None:
-            return
-        slice_max_bytes, live_siblings = info
-        cap = _slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel)
-        if cap >= build_peak_bytes:
-            return
-        if waited >= max_wait_sec:
-            log(f"  worker memory admission wait exceeded "
-                f"{max_wait_sec:.0f}s (shared slice would allocate "
-                f"{cap / 1024**3:.1f} GiB/worker, below the "
-                f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor); "
-                f"admitting anyway")
-            return
-        await asyncio.sleep(poll_interval_sec)
-        waited += poll_interval_sec
+    Returns `max_parallel` unchanged when no shared-slice budget is known
+    (no broker / containment off — nothing to gate against) or when the
+    configured `max_parallel` already fits. Otherwise returns the largest
+    N in [1, max_parallel] such that `_slice_worker_memory_max(
+    slice_max_bytes, live_siblings, N) >= build_peak_bytes` — shrinking
+    this wave's OWN concurrency (the only knob this run controls; it
+    cannot shrink a sibling run's live worker count) rather than admitting
+    into a doomed spawn.
+
+    Called exactly once at wave entry and handed straight to
+    `asyncio.Semaphore()` as a plain int — the result is never fed back
+    into a later `_slice_worker_memory_max` call, so it cannot itself
+    oscillate a subsequent divisor (M3's residual-risk note)."""
+    info = _cgroup_slice_info()
+    if info is None:
+        return max_parallel
+    slice_max_bytes, live_siblings = info
+    degraded = max_parallel
+    while degraded > 1 and _slice_worker_memory_max(
+            slice_max_bytes, live_siblings, degraded) < build_peak_bytes:
+        degraded -= 1
+    if degraded < max_parallel:
+        cap = _slice_worker_memory_max(slice_max_bytes, live_siblings, degraded)
+        log(f"  memory admission: shared slice would allocate "
+            f"{_slice_worker_memory_max(slice_max_bytes, live_siblings, max_parallel) / 1024**3:.1f} "
+            f"GiB/worker at max_parallel={max_parallel}, below the "
+            f"{build_peak_bytes / 1024**3:.1f} GiB build-peak floor; "
+            f"degrading this wave to max_parallel={degraded} "
+            f"({cap / 1024**3:.1f} GiB/worker)")
+    return degraded
 
 
 def resolve_worker_memory_max(repo_root: Path,
@@ -13236,8 +13246,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
-                  active_token: str | None = None,
-                  max_parallel: int | None = None) -> dict:
+                  active_token: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -13273,14 +13282,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     runs many `claude -p` workers concurrently (`asyncio.gather` under
     `Semaphore(max_parallel)`); mutating process-global env would race.
 
-    `max_parallel`, when given, arms the N9 slice-aware admission gate
-    (`_await_worker_memory_admission`): before spawning, block while
-    admitting this worker would drive the shared `leerie.slice`
-    per-worker allocation below the measured build-peak floor. None
-    (the default) skips the gate — used by callers with no run-level
-    `max_parallel` context, e.g. the startup smoke test."""
-    if max_parallel is not None:
-        await _await_worker_memory_admission(max_parallel)
+    The N9 slice-aware memory-admission gate is no longer applied per
+    spawn here (M9+M3 DECISION 2026-08-09): it degrades a wave's
+    concurrency once at wave entry instead (`_degrade_max_parallel_for_wave`,
+    called by `phase_execute` before constructing that wave's
+    `asyncio.Semaphore`) rather than blocking each individual spawn."""
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -14417,8 +14423,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          DEFAULT_CAPS["worker_pids_max"]),
                                      run_id=st.run_id,
                                      active_token=st.data.get(
-                                         "active_oauth_token"),
-                                     max_parallel=caps.get("max_parallel"))
+                                         "active_oauth_token"))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
@@ -26054,18 +26059,25 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             log(f"phase 4: base-health baseline errored "
                 f"({type(e).__name__}: {e}); proceeding with no baseline")
 
-    sem = asyncio.Semaphore(caps["max_parallel"])
-
-    async def settle_one(sid: str) -> tuple[str, dict]:
-        async with sem:
-            r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
-            log(f"  {sid}: {r.get('status')}")
-            return sid, r
-
     waves = st.data["waves"]
     start = st.data.get("completed_waves", 0)
     for wi in range(start, len(waves)):
         wave = waves[wi]
+
+        # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
+        # wave's concurrency once, at wave entry, rather than blocking each
+        # individual spawn (the retired _await_worker_memory_admission poll
+        # loop). Computed fresh per wave so a sibling run finishing between
+        # waves is reflected without an in-wave feedback loop.
+        wave_max_parallel = _degrade_max_parallel_for_wave(caps["max_parallel"])
+        sem = asyncio.Semaphore(wave_max_parallel)
+
+        async def settle_one(sid: str) -> tuple[str, dict]:
+            async with sem:
+                r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
+                log(f"  {sid}: {r.get('status')}")
+                return sid, r
+
         # On resume, skip subtasks already completed in a prior
         # invocation.  Failed/blocked subtasks are retried — that is
         # the point of resume.

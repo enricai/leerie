@@ -125,95 +125,90 @@ def test_auto_memory_max_reverting_to_proc_meminfo_basis_fails(
     assert result != legacy_value
 
 
-# ---- _await_worker_memory_admission: admission gate ------------------------
+# ---- _degrade_max_parallel_for_wave: wave-scoped admission gate -----------
+# (M9+M3 DECISION 2026-08-09: replaces the retired blocking
+# _await_worker_memory_admission poll-then-admit-anyway loop with a single,
+# non-blocking check computed once at wave entry.)
 
-def test_admission_returns_immediately_when_no_slice_info(leerie, monkeypatch):
-    """Containment off / no broker: nothing to gate against, admit
-    immediately (no sleep)."""
+def test_degrade_returns_max_parallel_unchanged_when_no_slice_info(
+        leerie, monkeypatch):
+    """Containment off / no broker: nothing to gate against."""
     monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
-    slept = []
-    monkeypatch.setattr(asyncio, "sleep",
-                        lambda s: slept.append(s) or _immediate())
-    asyncio.run(leerie._await_worker_memory_admission(max_parallel=5))
-    assert slept == []
+    assert leerie._degrade_max_parallel_for_wave(5) == 5
 
 
-def test_admission_returns_immediately_when_cap_above_build_peak(
+def test_degrade_returns_max_parallel_unchanged_when_cap_above_build_peak(
         leerie, monkeypatch):
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
                          lambda: (200 * 1024**3, 2))  # plenty of room
-    slept = []
-    monkeypatch.setattr(asyncio, "sleep",
-                        lambda s: slept.append(s) or _immediate())
-    asyncio.run(leerie._await_worker_memory_admission(
-        max_parallel=5, build_peak_bytes=leerie._WORKER_BUILD_PEAK_BYTES))
-    assert slept == []
+    assert leerie._degrade_max_parallel_for_wave(
+        5, build_peak_bytes=leerie._WORKER_BUILD_PEAK_BYTES) == 5
 
 
-def test_admission_blocks_then_admits_once_siblings_free_up(leerie, monkeypatch):
-    """The core admission-queue contract: a cap below the build-peak floor
-    makes the gate wait (sleep), re-polling until conditions improve."""
-    calls = {"n": 0}
-
-    def fake_slice_info():
-        calls["n"] += 1
-        # First two polls: saturated (12 live siblings -> well under peak).
-        # Third poll: a sibling finished -> plenty of room.
-        if calls["n"] < 3:
-            return (60 * 1024**3, 12)
-        return (60 * 1024**3, 0)
-
-    monkeypatch.setattr(leerie, "_cgroup_slice_info", fake_slice_info)
-    slept = []
-
-    async def fake_sleep(s):
-        slept.append(s)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    asyncio.run(leerie._await_worker_memory_admission(
-        max_parallel=5, poll_interval_sec=1.0, max_wait_sec=100.0))
-    assert len(slept) == 2  # blocked for exactly the two saturated polls
-    assert calls["n"] == 3
-
-
-def test_admission_blocks_rather_than_admitting_a_doomed_worker(
+def test_degrade_shrinks_max_parallel_when_share_is_below_floor(
         leerie, monkeypatch):
-    """Falsification: with a permanently saturated slice, the gate must
-    keep waiting (not admit) until max_wait_sec is exhausted — proving
-    admission is genuinely gated, not a no-op that always returns."""
-    monkeypatch.setattr(leerie, "_cgroup_slice_info",
-                         lambda: (60 * 1024**3, 12))  # never improves
-    slept = []
-
-    async def fake_sleep(s):
-        slept.append(s)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    asyncio.run(leerie._await_worker_memory_admission(
-        max_parallel=5, poll_interval_sec=10.0, max_wait_sec=25.0))
-    # Waited until the budget was exhausted (3 polls: 10, 20, 30 >= 25) then
-    # admitted anyway rather than hanging forever.
-    assert len(slept) >= 2
-    assert sum(slept) >= 20.0
-
-
-def test_admission_gives_up_after_max_wait_and_admits_anyway(
-        leerie, monkeypatch):
-    """Bounded wait: never hang indefinitely even if the slice never frees
-    up (a long-running sibling that never releases its slot)."""
+    """The core M3 contract: a live sibling holding its slot means the
+    per-worker share at the configured max_parallel can never rise on its
+    own — the fix must shrink this wave's own concurrency, not poll and
+    hope."""
+    # 60 GiB slice, 12 live siblings, max_parallel=5: 60/(12+5+1) ~= 3.3 GiB
+    # per worker, below an 8 GiB floor at max_parallel=5 but not at 1.
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
                          lambda: (60 * 1024**3, 12))
-    monkeypatch.setattr(asyncio, "sleep", _async_noop)
-    # Must return (not hang) within a bounded number of event-loop turns.
-    asyncio.run(asyncio.wait_for(
-        leerie._await_worker_memory_admission(
-            max_parallel=5, poll_interval_sec=1.0, max_wait_sec=3.0),
-        timeout=5.0))
+    result = leerie._degrade_max_parallel_for_wave(5)
+    assert 1 <= result < 5
+    # Sanity: the returned concurrency actually fits the floor (or is the
+    # unavoidable floor of 1 when even solo can't fit).
+    cap = leerie._slice_worker_memory_max(60 * 1024**3, 12, result)
+    assert cap >= leerie._WORKER_BUILD_PEAK_BYTES or result == 1
 
 
-async def _async_noop(_s):
-    return None
+def test_degrade_never_returns_less_than_one(leerie, monkeypatch):
+    """A permanently saturated slice must not degrade below a usable
+    minimum concurrency — better to run one worker at real OOM risk than
+    to admit zero and make no progress."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                         lambda: (1024, 1000))  # tiny, saturated
+    assert leerie._degrade_max_parallel_for_wave(5) == 1
 
 
-async def _immediate():
-    return None
+def test_degrade_does_not_sleep_or_block(leerie, monkeypatch):
+    """Bounded/near-immediate: no poll loop, no await — a plain sync call
+    that returns on its first pass regardless of how saturated the slice
+    is (replacing the old up-to-600s block-then-admit-anyway wait)."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                         lambda: (60 * 1024**3, 12))  # never improves
+    calls = {"n": 0}
+
+    def fail_if_slept(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("_degrade_max_parallel_for_wave must not sleep")
+
+    monkeypatch.setattr("time.sleep", fail_if_slept)
+    monkeypatch.setattr(asyncio, "sleep", fail_if_slept)
+    result = leerie._degrade_max_parallel_for_wave(5)
+    assert calls["n"] == 0
+    assert result == 1
+
+
+def test_degrade_logs_warning_naming_the_degraded_value(leerie, monkeypatch, capsys):
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                         lambda: (60 * 1024**3, 12))
+    result = leerie._degrade_max_parallel_for_wave(5)
+    out = capsys.readouterr().out
+    assert "degrading this wave to max_parallel=" in out
+    assert f"max_parallel={result}" in out
+
+
+def test_degrade_computed_once_does_not_feed_back_into_slice_divisor(
+        leerie, monkeypatch):
+    """M3's residual-risk note: the degraded value is a plain int handed to
+    asyncio.Semaphore(), never re-fed into _slice_worker_memory_max's own
+    divisor by _degrade_max_parallel_for_wave itself — calling it twice in
+    a row with the same (unchanged) slice info is idempotent rather than
+    ratcheting the concurrency down further each call."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                         lambda: (60 * 1024**3, 12))
+    first = leerie._degrade_max_parallel_for_wave(5)
+    second = leerie._degrade_max_parallel_for_wave(first)
+    assert second == first
