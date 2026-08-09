@@ -2874,10 +2874,9 @@ Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` (where `<sid>` is the
 run-scoped composed sid — see *The per-worker cgroup name is
 run-scoped* below) with `memory.max` set to
-`caps["worker_memory_max_bytes"]` (default: derived from the shared
-`leerie.slice` budget, see below — falling back to VM RAM split across
-`max_parallel + 1` slots, floored at 8 GiB, only when no slice budget
-is readable) and `pids.max` set
+`caps["worker_memory_max_bytes"]` (default: a fixed isolation ceiling
+derived from the measured build peak — see *A per-worker cap is a
+ceiling, not a reservation* below) and `pids.max` set
 to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
@@ -2935,48 +2934,110 @@ worker — every such worker was cgroup-OOM-killed regardless of host
 RAM. Any cap below that combined peak guarantees the very OOM the cap
 exists to contain.
 
-**N9 DECISION — the per-worker cap is sized against the shared slice
-budget, not against this run's own host view.** Every concurrent
-leerie run on a host shares ONE `leerie.slice` cgroup with a single
-enforced `memory.max` (`scripts/container-entry.sh`,
-`MemTotal - max(1 GiB, 12.5%)`). The pre-N9 basis derived each
-worker's cap from `/proc/meminfo` as if this run owned the whole
-host, so N concurrent runs' workers could jointly demand well past the
-shared slice's actual budget — individual workers got SIGKILLed by the
-kernel OOM killer inside their own cgroup even though the slice-wide
-backstop itself held (measured 2.3x overcommit). The default cap is
-now `_auto_worker_memory_max`: read the shared slice's `memory.max`
-and live sibling `leerie-w-*` worker count via the broker's `slice`
-verb, then divide across `live_siblings + max_parallel + 1` (the `+1`
-for the orchestrator/system processes outside any worker cgroup),
-floored at 256 MiB (`_slice_worker_memory_max`). It shrinks
-automatically as sibling runs start and grows back as they finish,
-because the shared slice IS the shared state — no lockfile or cross-run
-registry needed. Falls back to the legacy `/proc/meminfo`-derived basis
-(`max(even_split, 8 GiB)`, `_auto_worker_memory_max_legacy`) only when
-no broker/slice budget is readable (containment off,
-`--dangerously-allow-uncapped`) — there the shared-slice enforcement
-the new basis depends on is absent anyway.
+**Reap the worker's own subprocesses before destroying its cgroup.** The
+`finally` that tears a worker down must call
+`descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`. Those
+backgrounded subprocesses (Claude Code's Bash tool with
+`run_in_background: true` — test runners, builds, dev servers) are still
+cgroup members while alive, so destroying first hands the broker a cgroup
+this orchestrator deliberately left populated, and its `rmdir` fails
+`EBUSY`. The timeout and abort paths always reaped first; the success path
+did not, and that asymmetry was the dominant source of leaked
+`leerie-w-*` directories.
 
-**M9+M3 DECISION 2026-08-09 — a wave-scoped degrade gate, not a
-per-spawn admission block.** An intermediate design blocked each
-individual spawn (`_await_worker_memory_admission`) while polling for a
-per-worker share that could never rise while a live sibling run held
-its slot, then admitted anyway past a 10-minute wait cap — measured
-43x/18x slowdowns and 100% stall rates at higher `--max-parallel`.
-`_degrade_max_parallel_for_wave`, called once at the start of each wave
-by `phase_execute` before constructing that wave's `asyncio.Semaphore`,
-replaces it: a single, non-blocking check that computes the largest
-concurrency the wave can run at without driving the shared-slice
-per-worker allocation below the measured ~6.3 GiB build+resident-claude
-peak (gated at an 8 GiB floor, `_WORKER_BUILD_PEAK_BYTES`, matching the
-legacy basis's own floor for the same peak), shrinking that wave's own
-semaphore size and logging a warning naming the degraded value when it
-doesn't fit — rather than admitting a worker the kernel is likely to
-OOM-kill mid-build. It is recomputed fresh per wave, so a sibling run
-finishing between waves is reflected without an in-wave feedback loop,
-and the degraded value is never fed back into a later divisor call, so
-it cannot oscillate.
+Measured over 1801 workers: conformers are **8%** of all workers but
+**88%** of destroy failures, and their median backgrounded-subprocess
+count is **984 against 12** for everything else. The failures land exactly
+where the unreaped population is largest, which is the signature of this
+ordering rather than of an unlucky kill race.
+
+The broker's drain (below) remains as the backstop for the residual race —
+a tree still dying when destroy runs — but the ordering is what removes
+the cause. It is pinned by a source-coupled test, since an ordering is
+invisible to a behavioural one.
+
+**A per-worker cap is a ceiling, not a reservation.** Writing
+`memory.max` allocates nothing; it only bounds. The real backstop
+against host-level exhaustion is the *aggregate*
+`leerie.slice/memory.max` set by `scripts/container-entry.sh`
+(`MemTotal - max(1 GiB, 12.5%)`), which bounds the whole worker fleet
+regardless of any individual worker's `memory.max`. Two consequences
+follow, and they are the load-bearing part of this design:
+
+1. Per-worker ceilings **may safely sum past the slice budget**. Eight
+   workers capped at 9.4 GiB do not reserve 75 GiB; they each promise
+   only "kill me before I exceed 9.4". The slice cap still binds.
+2. Therefore the per-worker cap must **never** be derived by dividing
+   the slice budget across a projected worker count. Doing so treats a
+   ceiling as a reservation and manufactures caps *below* the measured
+   build peak — the failure above, reintroduced. A run whose workers
+   were sized during a busy moment stays handicapped for its whole
+   life, since the cap is resolved once at startup.
+
+The cap is therefore a fixed isolation ceiling —
+`max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
+the host's slice budget alone, not of load. The half-slice bound stops
+one worker being licensed to eat the fleet's headroom, but the build
+peak outranks it: on a slice too small to honour both, a `memory.max`
+above the slice is harmless (the aggregate cap binds first) while one
+below the build peak guarantees the OOM. Being load-independent is what
+makes resolving it once, at startup, correct.
+
+**Contention is handled by admission, not by shrinking caps.** Before
+spawning a worker, leerie blocks while the slice lacks room for another
+build (`_await_worker_memory_admission`). The signal is measured
+headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable
++ unreclaimable slab, read from `memory.stat`), never `memory.current`,
+which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
+was reclaimable file cache**, so gating on `memory.current` would
+under-report headroom by half and stall a fleet that had ample room.
+
+The gate also **reserves** one build peak per worker still in flight —
+admitted and not yet exited — plus one for the worker being admitted. It
+is otherwise stateless, and `_invoke` runs under
+`Semaphore(max_parallel)` with the gate *inside* it — so a whole wave
+would evaluate identical pre-allocation headroom and all of it would
+admit. (The superseded divisor had no such gap: it read `live_siblings`,
+which counts enrolled cgroups, and enrollment happens microseconds after
+spawn.) On a slice already at 40 GiB of 54.9, the first two workers of a
+wave admit and the third waits, where a stateless gate would have let all
+five through against 14.9 GiB of headroom.
+
+**A reservation is bounded by the worker's lifetime, not by elapsed
+time**, and that distinction is the whole correctness argument. Most
+workers are short-lived — classifier, fit_judge, splitter and
+satisfied_probe finish in seconds — so an interval-based reservation
+outlives its worker by orders of magnitude and they accumulate. Measured
+against real runs, 13–15 workers start within any 180 s window, which
+under an interval model demands 88–101 GiB on a 54.9 GiB slice:
+unsatisfiable at *any* load, so every worker stalls the full wait and
+admits anyway. That is the same stall this mechanism exists to remove,
+reintroduced by the mechanism itself.
+
+Bounding by lifetime makes the ceiling provable rather than a guess about
+timing: in-flight workers are capped by the semaphore the spawn path
+already runs under, so reservations cannot exceed
+`build_peak × (max_parallel + 1)` — about 38 GiB at the default, which
+fits an idle slice and still blocks a busy one.
+
+`_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
+window between the gate and the spawn path's `try`/`finally`. It is also
+the right bound on its own terms: past that long, a still-running
+worker's demand is already in the `unreclaimable` reading, and reserving
+for it again would double-count.
+
+The wait is bounded (10 min) and then admits anyway: a run that never
+progresses is worse than a tight one, and because the ceiling is now
+always ≥ the build peak, a late-admitted worker is no longer doomed by
+construction. When no slice budget is readable at all (containment off,
+`--dangerously-allow-uncapped`, no broker), admission is a no-op and
+sizing falls back to the legacy `/proc/meminfo` basis — there is no
+shared enforcement to gate against either way.
+
+This replaces the older advice to hand-tune `--max-parallel` down for
+build-heavy waves. That advice was sound under a divide-the-slice cap,
+but it asked the operator to predict contention that the orchestrator
+can now simply measure.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the

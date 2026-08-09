@@ -1,116 +1,139 @@
-"""Tests for the M9+M3 memory-admission-gate fix (artifact tag
-`memory-admission-degrade-fix`): raise the build-peak admission floor to
-8 GiB (matching `_auto_worker_memory_max_legacy`'s own floor for the
-identical 6.3 GiB measurement) and replace the blocking
-poll-then-admit-anyway `_await_worker_memory_admission` with a wave-scoped
-`_degrade_max_parallel_for_wave` computed once at wave entry.
+"""Wave-entry concurrency degrade (`_degrade_max_parallel_for_wave`).
 
-Mirrors tests/test_slice_aware_memory.py's stubbed-`_cgroup_slice_info`
-pattern.
+Merged design: main's per-worker **ceiling** and cache-aware headroom signal,
+with the self-run branch's **degrade-instead-of-block** response. The branch's
+insight was that blocking a spawn for up to 10 minutes is the wrong answer to
+"the slice is busy" — shrinking the wave's own concurrency is. Main's
+contribution is the signal: `slice_max - unreclaimable`, which excludes
+reclaimable page cache.
+
+The original branch version of this file pinned a divisor-based
+`_slice_worker_memory_max`, which the merge dropped in favour of main's
+ceiling. Rewritten against the merged function.
+
+Note the degrade and `_await_worker_memory_admission` must read the SAME
+signal, or they can disagree about whether memory is available — one
+admitting while the other blocks.
 """
 from __future__ import annotations
 
-import asyncio
+import ast
+import inspect
+import textwrap
 
 import pytest
 
 
-# ---- (1) the admission floor is 8 GiB, not 6.3 GiB -------------------------
-
-def test_build_peak_floor_is_8_gib(leerie):
-    assert leerie._WORKER_BUILD_PEAK_BYTES == int(8 * 1024**3)
+_SLICE_54_9_GIB = 58986594304          # the measured host
+_PEAK = None                            # filled from the module in fixtures
 
 
-def test_build_peak_floor_matches_legacy_floor(leerie):
-    """The floor this gate uses must match `_auto_worker_memory_max_legacy`'s
-    own documented floor for the SAME 6.3 GiB measurement — the
-    self-inconsistency M9's finding names (6.3 GiB was 46% below the
-    codebase's own 8 GiB legacy floor for the identical peak). A huge
-    `max_parallel` forces the legacy per-worker split well below its
-    8 GiB floor, so what's returned is the floor itself, not an unfloored
-    split."""
-    legacy_floor = leerie._auto_worker_memory_max_legacy(max_parallel=100000)
-    assert leerie._WORKER_BUILD_PEAK_BYTES == legacy_floor
+@pytest.fixture(autouse=True)
+def _reset_admissions(leerie):
+    """`_active_admissions` is module-level and conftest's `leerie` fixture is
+    session-scoped — see tests/test_slice_aware_memory.py."""
+    leerie._active_admissions.clear()
+    yield
+    leerie._active_admissions.clear()
 
 
-# ---- (2) a permanently-below-floor share degrades, without a 600s wait ----
-
-def test_degrade_fires_on_a_permanently_saturated_share(leerie, monkeypatch, capsys):
-    """A live sibling run holding its slot means the per-worker share can
-    never rise on its own — the fix must degrade max_parallel for the wave
-    and log a warning, not block waiting for a condition that provably
-    cannot change."""
+def _slice(leerie, monkeypatch, unreclaimable, slice_max=_SLICE_54_9_GIB):
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
-                         lambda: (60 * 1024**3, 12))  # never improves
-    result = leerie._degrade_max_parallel_for_wave(5)
-    assert result < 5
-    out = capsys.readouterr().out
-    assert "degrading this wave" in out
-    assert f"max_parallel={result}" in out
+                        lambda: (slice_max, 3, unreclaimable))
 
 
-def test_degrade_proceeds_without_waiting_the_600s_poll_budget(leerie, monkeypatch):
-    """The retired _await_worker_memory_admission polled up to 600s before
-    admitting anyway. The replacement must return near-immediately —
-    proven here by a hard wall-clock bound well under that budget, with no
-    sleep/await involved at all (this is a plain sync function)."""
-    monkeypatch.setattr(leerie, "_cgroup_slice_info",
-                         lambda: (60 * 1024**3, 12))
-    import time
-    t0 = time.monotonic()
-    leerie._degrade_max_parallel_for_wave(5)
-    elapsed = time.monotonic() - t0
-    assert elapsed < 1.0  # nowhere near the retired 600s poll budget
+def test_roomy_slice_does_not_degrade(leerie, monkeypatch):
+    """The common case must be untouched — a degrade that fires when memory
+    is plentiful would be the stall this whole mechanism removes, wearing a
+    different hat."""
+    _slice(leerie, monkeypatch, 2 * 1024**3)          # 52.9 GiB free
+    assert leerie._degrade_max_parallel_for_wave(5) == 5
 
 
-def test_await_worker_memory_admission_no_longer_exists(leerie):
-    """The blocking poll-then-admit-anyway gate is retired, not merely
-    dormant — its replacement is a synchronous, wave-scoped function."""
-    assert not hasattr(leerie, "_await_worker_memory_admission")
+def test_busy_slice_degrades_to_what_fits(leerie, monkeypatch):
+    """The branch's core idea: shrink concurrency rather than block a spawn.
+    With 14.9 GiB free and a 6.3 GiB floor, two workers fit, not five."""
+    _slice(leerie, monkeypatch, 40 * 1024**3)         # 14.9 GiB free
+    got = leerie._degrade_max_parallel_for_wave(5)
+    assert got == 2, f"14.9 GiB / 6.3 GiB should fit 2 workers, got {got}"
 
 
-# ---- (3) computed once at wave entry, not re-derived per spawn / oscillating ---
-
-def test_degrade_is_a_plain_sync_function_not_a_per_spawn_gate(leerie):
-    """`_invoke` (the per-spawn call site) must no longer carry a
-    `max_parallel` admission-gating parameter — the gate moved to
-    `phase_execute`'s wave loop, computed once per wave."""
-    import inspect
-    sig = inspect.signature(leerie._invoke)
-    assert "max_parallel" not in sig.parameters
-    assert not asyncio.iscoroutinefunction(leerie._degrade_max_parallel_for_wave)
+def test_never_degrades_below_one(leerie, monkeypatch):
+    """A wave of zero workers makes no progress at all — strictly worse than
+    an over-subscribed one, which the per-spawn gate still backstops."""
+    _slice(leerie, monkeypatch, _SLICE_54_9_GIB - 1024**3)   # 1 GiB free
+    assert leerie._degrade_max_parallel_for_wave(5) == 1
 
 
-def test_phase_execute_computes_degrade_once_per_wave_not_per_spawn(leerie):
-    """Source-coupling guard (driving the real phase_execute end-to-end
-    spawns real workers): `_degrade_max_parallel_for_wave` must be called
-    inside phase_execute's `for wi in range(...)` wave loop, and the
-    resulting Semaphore must be constructed from it — never inside
-    `settle_one` (which would re-derive it per spawn) and never inside
-    `_invoke`/`claude_p` (the retired per-spawn gate)."""
-    import inspect
+def test_fail_open_when_no_slice_budget(leerie, monkeypatch):
+    """Containment off / no broker: nothing to size against."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
+    assert leerie._degrade_max_parallel_for_wave(5) == 5
+
+
+def test_fail_open_when_unreclaimable_unknown(leerie, monkeypatch):
+    """-1 means the broker could not read memory.stat. Unknown must not be
+    read as 'full' — that would degrade every wave to 1 on a read error."""
+    _slice(leerie, monkeypatch, -1)
+    assert leerie._degrade_max_parallel_for_wave(5) == 5
+
+
+def test_uses_the_same_signal_as_the_blocking_gate(leerie, monkeypatch):
+    """The load-bearing consistency property. If the degrade sized against
+    `memory.current` while the gate reads unreclaimable, a slice holding
+    30 GiB of reclaimable page cache would degrade the wave to 1 while the
+    gate cheerfully admitted — the two disagreeing about the same slice.
+
+    Pinned behaviourally: page cache is invisible to both. `memory.current`
+    is not even readable through `_cgroup_slice_info`, so a regression here
+    means someone added a second signal."""
+    # 8 GiB unreclaimable, but a slice whose memory.current would be ~40 GiB
+    # once page cache is counted. Only the unreclaimable part may matter.
+    _slice(leerie, monkeypatch, 8 * 1024**3)          # 46.9 GiB real headroom
+    assert leerie._degrade_max_parallel_for_wave(5) == 5
+
+    src = inspect.getsource(leerie._degrade_max_parallel_for_wave)
+    assert "memory.current" not in src or "not" in src.lower()
+    assert "unreclaimable" in src
+
+
+def test_is_synchronous_not_a_per_spawn_gate(leerie):
+    """The whole point of the branch's design: one cheap check at wave entry,
+    not an await per spawn. A coroutine here would reintroduce the shape it
+    replaced."""
+    assert not inspect.iscoroutinefunction(
+        leerie._degrade_max_parallel_for_wave)
+    # Strip the docstring before scanning the body — it names
+    # `_await_worker_memory_admission` on purpose, and a naive substring
+    # check matches the prose describing the thing it forbids. Same trap
+    # CLAUDE.md records for the zombie-reaper guard.
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(leerie._degrade_max_parallel_for_wave)))
+    fn = tree.body[0]
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)
+            and isinstance(fn.body[0].value.value, str)):
+        fn.body = fn.body[1:]
+    body = ast.unparse(fn)
+    assert "await" not in body
+    assert "sleep" not in body
+
+
+def test_result_does_not_oscillate_when_reapplied(leerie, monkeypatch):
+    """The degraded value goes to `asyncio.Semaphore` and must never be fed
+    back into a later headroom computation. Applying the function to its own
+    output must be a fixed point, or successive waves could ratchet down."""
+    _slice(leerie, monkeypatch, 40 * 1024**3)
+    once = leerie._degrade_max_parallel_for_wave(5)
+    assert leerie._degrade_max_parallel_for_wave(once) == once
+
+
+def test_wired_at_wave_entry(leerie):
+    """Source-coupled: the function is inert unless `phase_execute` actually
+    calls it and hands the result to the wave's Semaphore. An unwired fix is
+    the failure mode CLAUDE.md records for the coverage gate."""
     src = inspect.getsource(leerie.phase_execute)
-    assert "_degrade_max_parallel_for_wave(" in src
-    # The call sits inside the wave loop, before the per-wave semaphore.
-    wave_loop_idx = src.index("for wi in range(")
-    degrade_idx = src.index("_degrade_max_parallel_for_wave(")
-    sem_idx = src.index("asyncio.Semaphore(")
-    assert wave_loop_idx < degrade_idx < sem_idx
-
-    invoke_src = inspect.getsource(leerie._invoke)
-    assert "_degrade_max_parallel_for_wave(" not in invoke_src
-    claude_p_src = inspect.getsource(leerie.claude_p)
-    assert "_degrade_max_parallel_for_wave(" not in claude_p_src
-
-
-def test_degrade_result_does_not_oscillate_when_reapplied(leerie, monkeypatch):
-    """A degraded max_parallel must not, by construction, feed back into
-    `_slice_worker_memory_max`'s own divisor in a way that keeps shrinking
-    on repeated evaluation against the same (unchanged) slice state —
-    idempotent re-application is the falsifier for "oscillates"."""
-    monkeypatch.setattr(leerie, "_cgroup_slice_info",
-                         lambda: (60 * 1024**3, 12))
-    a = leerie._degrade_max_parallel_for_wave(5)
-    b = leerie._degrade_max_parallel_for_wave(a)
-    c = leerie._degrade_max_parallel_for_wave(b)
-    assert a == b == c
+    assert "_degrade_max_parallel_for_wave(caps[\"max_parallel\"])" in src
+    i_call = src.index("_degrade_max_parallel_for_wave")
+    i_sem = src.index("asyncio.Semaphore(wave_max_parallel)")
+    assert i_call < i_sem, "the degrade must precede the Semaphore it sizes"
