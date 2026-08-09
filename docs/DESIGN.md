@@ -727,6 +727,19 @@ Like every floor in this system, it is evaluated even when the judgment
 layer crashes — a worker-infrastructure failure must never become a way
 to waive a mechanical check.
 
+**M11 DECISION — the floor's detections are resolved, not merely
+logged.** Shipped purely advisory, the floor left every flagged pair as
+duplicate work for the integrator to discover on its own. Each flagged
+pair is now synthesized into a `merge` collision and applied through the
+same `_apply_overlap_collisions` machinery the judge's own output uses —
+including its anchor + transitive `survivor_of` cluster resolution, so a
+3-or-more-participant collision (several subtasks sharing one `provides`
+tag and file) collapses to a single survivor rather than leaving any
+participant both dropped and referenced as a dangling dependency target.
+This runs above every skip in the same phase, so it fires on the exact
+paths the floor exists for: single-planner plans and `--skip-overlap-judge`
+runs, where the judge itself never gets a chance to resolve the collision.
+
 A single subtask can legitimately overlap with several siblings on
 different artifacts — e.g. one subtask creates a new config file
 *and* wires an existing config to it, each half colliding with a
