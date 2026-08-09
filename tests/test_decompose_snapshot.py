@@ -423,20 +423,29 @@ class TestSnapshotSourceCoupling:
         )
 
     def test_snapshot_written_inside_the_expansion_loop(self, leerie):
-        """The assignment must sit inside the per-subtask loop (before
-        plan['subtasks'] = leaves finalizes the whole plan), not after —
-        otherwise a crash on a later subtask loses everything, which is
-        exactly the bug this subtask fixes."""
+        """The assignment must sit inside the per-subtask expansion work
+        (before plan['subtasks'] = leaves finalizes the whole plan), not
+        after — otherwise a crash on a later subtask loses everything,
+        which is exactly the bug this subtask fixes. The expansion loop is
+        bounded-concurrent (asyncio.Semaphore + _gather_or_cancel, mirroring
+        _filter_satisfied_subtasks's accumulate-as-they-complete shape at
+        :8886 — M2 perf fix) rather than a bare sequential for loop, so this
+        checks the snapshot-before-finalize invariant directly instead of
+        relying on the old strictly-sequential loop's exact text."""
         src = inspect.getsource(leerie.phase_plan)
-        loop_pos = src.find("for subtask in first_pass:")
         snap_pos = src.find('st.data["decompose_snapshot"]')
         assign_pos = src.find('plan["subtasks"] = leaves')
-        assert loop_pos != -1 and snap_pos != -1 and assign_pos != -1
-        assert loop_pos < snap_pos < assign_pos, (
-            "decompose_snapshot must be written inside the per-subtask "
-            "expansion loop, before plan['subtasks'] is finalized — "
-            "otherwise a WorkerError on a later top-level subtask discards "
-            "the snapshot of subtasks that already finished."
+        assert snap_pos != -1 and assign_pos != -1
+        assert snap_pos < assign_pos, (
+            "decompose_snapshot must be written per top-level subtask, "
+            "before plan['subtasks'] is finalized — otherwise a "
+            "WorkerError on a later top-level subtask discards the "
+            "snapshot of subtasks that already finished."
+        )
+        assert "Semaphore" in src and "_gather_or_cancel" in src, (
+            "the expansion loop must run under bounded concurrency "
+            "(asyncio.Semaphore + _gather_or_cancel), not a strictly "
+            "sequential for loop (M2 perf fix)."
         )
 
     def test_fit_judge_call_is_wrapped_in_try_except_workererror(self, leerie):
