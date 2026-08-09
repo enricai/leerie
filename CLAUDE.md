@@ -760,7 +760,41 @@ orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 the fail-closed `_enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
 sid validation, and v1/v2 path selection — against
-a fake cgroupfs. Memory-OOM naming (DESIGN §6 *Detecting memory OOM*) —
+a fake cgroupfs. Neither can catch **wire-protocol drift between the two**,
+which `tests/test_broker_wire_contract.py` exists for: the broker composes
+`slice` (4 tokens) and `stat` (5) while the orchestrator parses them, the
+field count is hand-written on both sides, and until that file nothing
+compared them. Drift is silent in the worst way — both parsers return
+`None` on a mismatch and `None` legitimately means "containment is off", so
+a drifted `slice` makes worker sizing fall back to `/proc/meminfo` **and**
+turns the admission gate into a no-op, while a drifted `stat` disables
+PID-exhaustion detection and memory-OOM naming, with nothing logged and no
+test failing. The existing two cannot see it by construction:
+`test_cgroup_helpers.py` feeds leerie's parser hand-written fixture strings
+(parser vs. fixture, not parser vs. broker) and `test_cgroup_broker.py`
+never touches leerie's parsers. The contract file is the only place the two
+meet — the **real** broker's emitted string fed to the **real** leerie
+parser, with the socket the only thing stubbed — and it carries an
+anti-vacuity test proving the guard fires on an added/removed field, plus a
+transposition check (right arity, wrong order) driving the parsed values
+into `_worker_memory_ceiling` and the headroom comparison. Same class as the
+`collect-subtrees.sh` schema duplication above, which had already drifted in
+production before its guard existed. Note the burst-reservation state
+`_active_admissions` (token → monotonic stamp, mutated by
+`_await_worker_memory_admission` and `_release_worker_memory_admission`) is
+**module-level** and conftest's `leerie` fixture is **session-scoped**, so
+`tests/test_slice_aware_memory.py` clears it in an autouse fixture on both
+sides — without that its burst tests are order-dependent and leak
+reservations into every other file that exercises the gate; a
+guard-the-guard test source-couples to the fixture's `scope="session"` so a
+scope change forces that reasoning to be re-examined. Those burst tests use
+the **measured** production density (15 worker starts per 180 s, from real
+runs' `calls.ndjson`) rather than a number that looks representative: an
+earlier revision bounded reservations by elapsed time instead of by worker
+lifetime, which stalls every real run — its tests used 5, under
+`max_parallel`, and passed against the defect, which first bites at 9.
+Memory-OOM naming
+(DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending
 command + `memory.max`) over `_validate_result`'s generic "checkpoint ...
 does not exist" text — is pinned end-to-end through `_settle_subtask` in

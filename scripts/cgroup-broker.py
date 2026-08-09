@@ -45,10 +45,13 @@ Protocol (newline-terminated, one request per connection):
   enroll <sid> <pid>            -> OK | ERR <msg>
   destroy <sid>                 -> OK | ERR <msg>
   stat <sid>                    -> OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill> | ERR <msg>
-  slice                         -> OK <leerie.slice memory.max, -1 if unset> <live sibling worker cgroups>
-                                    (N9: read-only, used to size a new worker's
-                                    memory cap against the shared slice budget
-                                    rather than /proc/meminfo)
+  slice                         -> OK <leerie.slice memory.max, -1 if unset> <live sibling worker cgroups> <unreclaimable bytes, -1 if unreadable>
+                                    (read-only. Used to gate worker admission on
+                                    measured slice headroom: slice memory.max
+                                    minus UNRECLAIMABLE usage — page cache is
+                                    excluded, so this is not memory.current.
+                                    Per-worker sizing is load-independent and
+                                    does NOT consume the live-sibling count.)
 
 `<sid>` is validated against `^[A-Za-z0-9._-]+$` and only ever composed
 into `leerie-w-<sid>` under the fixed slice — no path traversal. `<pid>`,
@@ -72,6 +75,7 @@ import re
 import signal
 import socket
 import sys
+import time
 
 SOCK_PATH = "/run/leerie-cgroup.sock"
 SLICE = "leerie.slice"
@@ -84,6 +88,21 @@ V1_ROOT = "/sys/fs/cgroup"
 # since we have no privilege over the true top level there.
 V2_ROOT = os.environ.get("LEERIE_CGROUP_V2_ROOT", "/sys/fs/cgroup")
 _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# `destroy` waits for the killed subtree to actually drain before rmdir'ing
+# (see _drain_then_rmdir). 10s because the workers that leaked were
+# conformers running full test suites, whose process trees reached the
+# hundreds; a sub-second budget is not enough for those to die. The
+# orchestrator's destroy is fire-and-forget on a finished worker, so this
+# wait is off the critical path.
+_DESTROY_DRAIN_TIMEOUT_SEC = 10.0
+_DESTROY_DRAIN_POLL_SEC = 0.05
+# v1 waits for a migration that has already either succeeded or failed, not
+# for an in-flight async kill (v1 has no `cgroup.kill`) — so a long wait
+# cannot change the outcome, and _v1_destroy pays it twice, once per
+# controller dir. Short enough to stay off the critical path, long enough to
+# cover a pid dying between the procs read and its migration write.
+_V1_DRAIN_TIMEOUT_SEC = 0.5
 
 # Hierarchy is one of: "v2", "v1", "none". Decided at startup by _detect().
 _HIER = "none"
@@ -207,16 +226,73 @@ def _v2_enroll(sid: str, pid: int) -> None:
     _write(f"{_v2_dir(sid)}/cgroup.procs", str(pid))
 
 
+def _drain_then_rmdir(d: str, budget_sec: float) -> str | None:
+    """Wait for `d/cgroup.procs` to drain, then rmdir it. Returns None on
+    success or the OSError message once `budget_sec` is exhausted.
+
+    The budget is a parameter rather than a constant because the two
+    hierarchies are waiting for different things. On v2 the wait is for an
+    ASYNCHRONOUS `cgroup.kill` the kernel is already carrying out, so it
+    should be generous. On v1 there is no `cgroup.kill` at all: `_v1_destroy`
+    migrates survivors to the parent first, and that either worked or did
+    not before we get here — if it failed the processes are still alive and
+    unmigrated, so `cgroup.procs` will never drain and a long wait buys
+    nothing (twice over, since v1 loops two controller dirs). A short v1
+    budget still covers the one race that matters there: a pid dying between
+    the read of `cgroup.procs` and the write that migrates it.
+
+    `cgroup.kill` is ASYNCHRONOUS: it delivers SIGKILL and returns, while
+    the kernel tears the processes down over the following moments. An
+    immediate `os.rmdir` therefore races that teardown and loses with
+    EBUSY, leaking the directory — measured, 116 stale `leerie-w-*` dirs of
+    which 88 were `-conformer`, whose test-suite subprocess trees reach
+    hundreds of PIDs and take correspondingly longer to die. The
+    orchestrator had been naming the cause all along: `cgroup destroy
+    failed (ERR Device or resource busy); dir may be leaked`.
+
+    Polls the real completion signal (procs draining) rather than sleeping
+    a fixed interval, because how long teardown takes scales with the tree
+    the worker built. Still returns the error when the budget runs out, so
+    a genuine leak is reported rather than silently swallowed by retrying."""
+    # Already gone: destroy is idempotent, and there is nothing to drain.
+    # Without this, FileNotFoundError (an OSError like any other) would be
+    # retried for the whole budget — 10s per call, 20s on v1's two dirs —
+    # in a cleanup path that runs for every worker.
+    if not os.path.isdir(d):
+        return None
+    deadline = time.monotonic() + budget_sec
+    err: str | None = None
+    while True:
+        if not _read(f"{d}/cgroup.procs").strip():
+            try:
+                os.rmdir(d)
+                return None
+            except FileNotFoundError:
+                # Reaped concurrently between the isdir() guard above and
+                # here. Same disposition as the guard: already-gone is
+                # success. Without this arm the retry loop would spend the
+                # whole budget and then report a leak for a dir that is in
+                # fact gone.
+                return None
+            except OSError as e:
+                # Drained but still busy (e.g. a child cgroup, or a PID
+                # reaped between the read and the rmdir) — keep retrying
+                # within the same budget.
+                err = str(e.strerror or e)
+        if time.monotonic() >= deadline:
+            if err is None:
+                err = "Device or resource busy"
+            return err
+        time.sleep(_DESTROY_DRAIN_POLL_SEC)
+
+
 def _v2_destroy(sid: str) -> str | None:
-    """rmdir the worker's v2 cgroup dir. Returns None on success, or the
-    OSError message on failure (e.g. a lingering process kept it busy)."""
+    """SIGKILL the worker subtree, wait for it to drain, then rmdir. Returns
+    None on success, or the OSError message on failure (e.g. a lingering
+    process kept it busy for the whole drain budget)."""
     d = _v2_dir(sid)
     _write(f"{d}/cgroup.kill", "1", swallow=True)
-    try:
-        os.rmdir(d)
-    except OSError as e:
-        return str(e.strerror or e)
-    return None
+    return _drain_then_rmdir(d, _DESTROY_DRAIN_TIMEOUT_SEC)
 
 
 def _v2_stat(sid: str) -> tuple[int, int, int, int]:
@@ -257,15 +333,15 @@ def _v1_destroy(sid: str) -> str | None:
     dir, matching _v1_dirs' ordering)."""
     pdir, mdir = _v1_dirs(sid)
     # v1 has no cgroup.kill; move survivors to the parent then rmdir.
+    # Migration is likewise not instantaneous, so the same drain-then-rmdir
+    # discipline applies here as on v2 (see _drain_then_rmdir).
     err = None
     for d in (pdir, mdir):
         for pid in _read(f"{d}/cgroup.procs").split():
             _write(f"{os.path.dirname(d)}/cgroup.procs", pid, swallow=True)
-        try:
-            os.rmdir(d)
-        except OSError as e:
-            if err is None:
-                err = str(e.strerror or e)
+        e = _drain_then_rmdir(d, _V1_DRAIN_TIMEOUT_SEC)
+        if e is not None and err is None:
+            err = e
     return err
 
 
@@ -307,6 +383,41 @@ def _slice_memory_max() -> int:
         return int(raw)
     except ValueError:
         return -1
+
+
+def _slice_unreclaimable() -> int:
+    """Bytes in the slice the kernel CANNOT free under pressure. Returns -1
+    when unreadable, which the caller treats as "unknown" and fails open.
+
+    Deliberately not `memory.current`: that counts page cache, which is
+    reclaimable, and on a live host 10.4 GiB of the 20.5 GiB in use was
+    `inactive_file`. Gating admission on `memory.current` would therefore
+    under-report headroom by half and stall a fleet with ample room.
+
+    v2 counts anon + unevictable + unreclaimable slab. Anon is included
+    because worker cgroups run with `memory.swap.max=0`, so it cannot be
+    paged out. v1's memory controller spells the same quantities
+    `total_rss` / `total_unevictable`."""
+    raw = _read(f"{_slice_dir()}/memory.stat")
+    if not raw:
+        return -1
+    fields = ("anon", "unevictable", "slab_unreclaimable") if _HIER == "v2" \
+        else ("total_rss", "total_unevictable")
+    vals: dict[str, int] = {}
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in fields:
+            try:
+                vals[parts[0]] = int(parts[1])
+            except ValueError:
+                return -1
+    # Require the primary anon/rss key; the others are best-effort extras
+    # that some kernels omit, and treating their absence as a read failure
+    # would fail open far more often than necessary.
+    primary = fields[0]
+    if primary not in vals:
+        return -1
+    return sum(vals.values())
 
 
 def _live_sibling_count() -> int:
@@ -372,7 +483,8 @@ def _do(verb: str, args: list[str]) -> str:
         cur, mx, ev, oom = stat(sid)
         return f"OK {cur} {mx} {ev} {oom}"
     if verb == "slice":
-        return f"OK {_slice_memory_max()} {_live_sibling_count()}"
+        return (f"OK {_slice_memory_max()} {_live_sibling_count()} "
+                f"{_slice_unreclaimable()}")
     return f"ERR unknown verb {verb}"
 
 
