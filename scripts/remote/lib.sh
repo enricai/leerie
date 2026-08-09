@@ -559,14 +559,26 @@ _leerie_fly_agent_ensure() {
   # bash RETURN traps persist in the caller's scope (they fire on every
   # subsequent function return up the call chain). Instead, we rmdir
   # explicitly at each return path below.
-  if [ -S "$sock" ] && SSH_AUTH_SOCK="$sock" ssh-add -l \
-       >/dev/null 2>&1; then
-    export SSH_AUTH_SOCK="$sock"
-    rmdir "$lockdir" 2>/dev/null || true
-    return 0
+  if [ -S "$sock" ]; then
+    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1
+    # ssh-add -l exit codes: 0 = has keys, 1 = agent reachable but has no
+    # keys yet, 2 = cannot connect to the agent at all. Only rc 2 means
+    # the socket is stale; rc 1 is a perfectly healthy, just-spawned or
+    # freshly-cert-expired agent and must be reused, not respawned —
+    # respawning on rc 1 unlinks a live agent's socket out from under it
+    # (rm -f below) while the agent process keeps running, orphaning it.
+    if [ "$?" -ne 2 ]; then
+      export SSH_AUTH_SOCK="$sock"
+      rmdir "$lockdir" 2>/dev/null || true
+      return 0
+    fi
   fi
   rm -f "$sock"
-  ssh-agent -a "$sock" >/dev/null 2>&1
+  # -t 24h: idle timeout for identities added to this agent, matching the
+  # Fly cert lifetime. If this agent is ever orphaned (e.g. a future
+  # reuse-predicate regression), it self-limits rather than leaking
+  # indefinitely.
+  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1
   export SSH_AUTH_SOCK="$sock"
   rmdir "$lockdir" 2>/dev/null || true
 }
