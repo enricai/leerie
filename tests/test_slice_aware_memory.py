@@ -49,14 +49,14 @@ async def _async_noop(_s):
 
 @pytest.fixture(autouse=True)
 def _reset_admissions(leerie):
-    """`_recent_admissions` is module-level mutable state and conftest's
+    """`_active_admissions` is module-level mutable state and conftest's
     `leerie` fixture is **session-scoped** — the module is loaded once for
     the whole suite, so entries survive across tests AND across files.
     Clear on both sides: before, so these tests are order-independent;
     after, so they cannot perturb any other file that exercises the gate."""
-    leerie._recent_admissions.clear()
+    leerie._active_admissions.clear()
     yield
-    leerie._recent_admissions.clear()
+    leerie._active_admissions.clear()
 
 
 # ---- _cgroup_slice_info: broker client -------------------------------------
@@ -337,86 +337,137 @@ def test_admission_gives_up_after_max_wait_and_admits_anyway(
         timeout=5.0))
 
 
-# ---- burst accounting: reservations for workers still ramping up ----------
-# The gate is otherwise stateless, and `_invoke` runs under
-# Semaphore(max_parallel) with the gate INSIDE it — so a whole wave
-# evaluates identical pre-allocation headroom and all of it admits. The
-# superseded divisor did not have this gap (it read `live_siblings`, and
-# enrollment happens microseconds after spawn), so this is a real regression
-# the reservation closes.
+# ---- burst accounting: reservations bounded by WORKER LIFETIME -------------
+# The gate is otherwise stateless: `_invoke` runs under
+# Semaphore(max_parallel) with the gate INSIDE it, so a whole wave evaluates
+# identical pre-allocation headroom and all of it admits.
+#
+# A reservation is held until the worker EXITS, not for a fixed interval.
+# An earlier revision used an interval and shipped a far worse bug than the
+# gap it closed: most workers are short-lived (classifier, fit_judge,
+# splitter, satisfied_probe finish in seconds), so interval reservations
+# outlive their workers and pile up. Measured against real runs'
+# calls.ndjson, 13-15 workers start within any 180s window, demanding
+# 88-101 GiB on a 54.9 GiB slice — unsatisfiable at ANY load, so every
+# worker stalled the full wait. Hence the density used below is the
+# MEASURED one, not a number that felt representative: the pass-3 tests
+# used 5 (under max_parallel) and passed against that defect.
 
-def _admit(leerie, monkeypatch, slice_max, unreclaimable, live=1):
-    """Run one admission against a fixed slice reading; return the sleeps
-    it took (empty == admitted without blocking)."""
+_MEASURED_BURST = 15          # max starts within 180s, self-run 18e39ef3
+_IDLE = 2 * 1024**3           # 52.9 GiB free of 54.9
+_BUSY = 40 * 1024**3          # 14.9 GiB free
+
+
+def _admit(leerie, monkeypatch, unreclaimable, live=1):
+    """One admission attempt. Returns (token, sleeps); sleeps empty means
+    it admitted without blocking."""
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
-                        lambda: (slice_max, live, unreclaimable))
+                        lambda: (_SLICE_54_9_GIB, live, unreclaimable))
     slept = []
 
     async def rec(s):
         slept.append(s)
 
     monkeypatch.setattr(asyncio, "sleep", rec)
-    asyncio.run(leerie._await_worker_memory_admission(
+    tok = asyncio.run(leerie._await_worker_memory_admission(
         poll_interval_sec=1.0, max_wait_sec=3.0))
-    return slept
+    return tok, slept
 
 
-def test_burst_on_an_idle_slice_admits_every_worker(leerie, monkeypatch):
-    """The reservation must not reintroduce the stall this whole change
-    exists to remove: a full wave on a roomy slice admits with no waiting.
-    On 54.9 GiB the five need 6.3/12.6/18.9/25.2/31.5 GiB — all fit."""
-    for i in range(5):
-        slept = _admit(leerie, monkeypatch, _SLICE_54_9_GIB, 2 * 1024**3)
-        assert slept == [], f"worker {i + 1} of an idle-slice wave blocked"
-    assert len(leerie._recent_admissions) == 5
-
-
-def test_burst_on_a_busy_slice_blocks_once_reservations_exceed_headroom(
+def test_realistic_burst_of_short_lived_workers_never_stalls(
         leerie, monkeypatch):
-    """The measured-shape case: slice at 40 GiB unreclaimable leaves
-    14.9 GiB. First worker needs 6.3, second 12.6 — both fit. The third
-    needs 18.9 and must block, where the stateless gate admitted it."""
-    busy = 40 * 1024**3
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
-    assert len(leerie._recent_admissions) == 2
-    third = _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy)
-    assert third, "third worker must block: 18.9 GiB needed, 14.9 available"
+    """THE regression pin. 15 short-lived workers — the measured production
+    density — each admitted then exiting. Not one may stall on a slice with
+    52.9 GiB free. The interval-based revision failed this at worker #9 and
+    by #15 demanded 101 GiB, more than the entire slice."""
+    for i in range(1, _MEASURED_BURST + 1):
+        tok, slept = _admit(leerie, monkeypatch, _IDLE)
+        assert slept == [], (
+            f"worker #{i} of {_MEASURED_BURST} stalled on an idle slice")
+        leerie._release_worker_memory_admission(tok)
+    assert leerie._active_admissions == {}
 
 
-def test_admissions_age_out_of_the_ramp_window(leerie, monkeypatch):
-    """Reservations are for the ramp-up gap only. Once a worker's demand
-    has had time to show up in `unreclaimable`, reserving for it again
-    would double-count — which is exactly how the divisor over-blocked."""
-    busy = 40 * 1024**3
+def test_concurrent_workers_hold_reservations_until_they_exit(
+        leerie, monkeypatch):
+    """The mechanism still does its job: workers that have NOT exited hold
+    their reservations, so a busy slice blocks once they exceed headroom.
+    14.9 GiB free admits two (6.3, 12.6) and blocks the third (18.9)."""
+    t1, s1 = _admit(leerie, monkeypatch, _BUSY)
+    t2, s2 = _admit(leerie, monkeypatch, _BUSY)
+    assert s1 == [] and s2 == []
+    assert len(leerie._active_admissions) == 2
+    _t3, s3 = _admit(leerie, monkeypatch, _BUSY)
+    assert s3, "third worker must block: 18.9 GiB needed, 14.9 available"
+    assert t1 != t2, "tokens must be distinct or release frees the wrong one"
+
+
+def test_release_frees_the_reservation(leerie, monkeypatch):
+    """Exiting workers stop counting — the property the interval model
+    lacked, and the whole reason the burst above does not stall."""
+    tok, _ = _admit(leerie, monkeypatch, _BUSY)
+    assert len(leerie._active_admissions) == 1
+    leerie._release_worker_memory_admission(tok)
+    assert leerie._active_admissions == {}
+    # Idempotent: a double release must not corrupt anything.
+    leerie._release_worker_memory_admission(tok)
+    assert leerie._active_admissions == {}
+
+
+def test_reservation_bound_is_the_semaphore_not_a_time_guess(
+        leerie, monkeypatch):
+    """The correctness argument: in-flight is capped by the
+    Semaphore(max_parallel) `_invoke` already runs under, so the total
+    demand cannot exceed build_peak * (max_parallel + 1) — about 38 GiB at
+    the default 5, which fits an idle 54.9 GiB slice. Pinned as a property,
+    since it is what makes the bound provable rather than heuristic."""
+    max_parallel = 5
+    toks = []
+    for _ in range(max_parallel):
+        tok, slept = _admit(leerie, monkeypatch, _IDLE)
+        assert slept == []
+        toks.append(tok)
+    worst_case = leerie._WORKER_BUILD_PEAK_BYTES * (max_parallel + 1)
+    assert worst_case < _SLICE_54_9_GIB, (
+        "a full wave's reservations must fit the slice, or the gate "
+        "deadlocks itself the way the interval model did")
+    for t in toks:
+        leerie._release_worker_memory_admission(t)
+
+
+def test_leaked_token_ages_out(leerie, monkeypatch):
+    """Backstop for the window between the gate and `_invoke`'s
+    try/finally: a token never released is pruned after the ramp window, so
+    a setup failure cannot throttle the run forever."""
     clock = {"t": 1000.0}
     monkeypatch.setattr(leerie.time, "monotonic", lambda: clock["t"])
+    _admit(leerie, monkeypatch, _BUSY)          # never released
+    _admit(leerie, monkeypatch, _BUSY)          # never released
+    assert len(leerie._active_admissions) == 2
+    _tok, slept = _admit(leerie, monkeypatch, _BUSY)
+    assert slept, "still in flight -> third blocks"
 
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == []
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy), "third blocks"
-
-    # Past the window: the earlier admissions no longer hold reservations.
     clock["t"] += leerie._WORKER_ADMISSION_RAMP_SEC + 1
-    assert _admit(leerie, monkeypatch, _SLICE_54_9_GIB, busy) == [], (
-        "a stale reservation must not keep throttling forever")
-    assert len(leerie._recent_admissions) == 1
+    _tok, slept = _admit(leerie, monkeypatch, _BUSY)
+    assert slept == [], "leaked reservations must not throttle forever"
 
 
-def test_failopen_paths_record_no_reservation(leerie, monkeypatch):
-    """No budget known -> no accounting to do. Recording here would
+def test_failopen_paths_return_no_token(leerie, monkeypatch):
+    """No budget known -> nothing to account for. Reserving here would
     throttle the next worker on the strength of a reading we never got."""
     monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
-    asyncio.run(leerie._await_worker_memory_admission())
-    assert leerie._recent_admissions == []
+    assert asyncio.run(leerie._await_worker_memory_admission()) is None
+    assert leerie._active_admissions == {}
 
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
                         lambda: (_SLICE_54_9_GIB, 3, -1))
-    asyncio.run(leerie._await_worker_memory_admission())
-    assert leerie._recent_admissions == []
+    assert asyncio.run(leerie._await_worker_memory_admission()) is None
+    assert leerie._active_admissions == {}
+    # And releasing a None token is a no-op, so callers need no branch.
+    leerie._release_worker_memory_admission(None)
 
 
-def test_timeout_path_records_a_reservation(leerie, monkeypatch):
+def test_timeout_path_reserves(leerie, monkeypatch):
     """A worker admitted past the wait cap still allocates, so it must
     count against the next one — otherwise a saturated slice admits an
     unbounded stream of them, each one 'the first'."""
@@ -424,30 +475,62 @@ def test_timeout_path_records_a_reservation(leerie, monkeypatch):
         leerie, "_cgroup_slice_info",
         lambda: (_SLICE_54_9_GIB, 1, _SLICE_54_9_GIB - 1024**3))
     monkeypatch.setattr(asyncio, "sleep", _async_noop)
-    asyncio.run(leerie._await_worker_memory_admission(
+    tok = asyncio.run(leerie._await_worker_memory_admission(
         poll_interval_sec=1.0, max_wait_sec=2.0))
-    assert len(leerie._recent_admissions) == 1
+    assert tok is not None
+    assert len(leerie._active_admissions) == 1
+
+
+def test_invoke_admitted_releases_the_reservation_on_every_exit_path(leerie):
+    """Source-coupled wiring pin: the fix is inert without the release, and
+    an inert-but-present fix is the failure mode that let the coverage-gate
+    bug ship a whole release (CLAUDE.md).
+
+    The release cannot live in `_invoke`'s own finally: that does not begin
+    until ~570 lines in, after `asyncio.create_subprocess_exec` (which this
+    repo has seen raise), so a setup failure would strand the token."""
+    src = inspect.getsource(leerie._invoke_admitted)
+    assert "_await_worker_memory_admission()" in src
+    assert "try:" in src and "finally:" in src
+    assert "_release_worker_memory_admission(" in src, (
+        "the wrapper no longer releases the reservation — every admitted "
+        "worker would hold one until the ramp backstop expires, and enough "
+        "of them stall the run outright")
+    i_try = src.index("try:")
+    i_release = src.index("_release_worker_memory_admission(")
+    assert i_try < i_release, "release must be in the finally, not before it"
+    assert "await _invoke(" in src, "wrapper must delegate to the real body"
+    # The body itself must not re-acquire the concern.
+    body = inspect.getsource(leerie._invoke)
+    assert "_await_worker_memory_admission" not in body
+
+
+def test_claude_p_spawns_through_the_admitted_wrapper(leerie):
+    """The gate is only reached if `claude_p` calls the wrapper. Pinned
+    separately from the wrapper's own contract because a correct wrapper
+    nothing calls is exactly as inert as a missing one.
+
+    `_invoke` keeps its name deliberately: five test files
+    `inspect.getsource(leerie._invoke)` and 23 monkeypatch it, and the
+    wrapper delegating through the module global preserves both."""
+    src = inspect.getsource(leerie.claude_p)
+    assert "_invoke_admitted(" in src
+    assert "max_parallel=" in src
 
 
 def test_reservation_state_needs_explicit_reset(leerie):
     """Guard-the-guard for `_reset_admissions`. conftest's `leerie` fixture
-    is session-scoped, so `_recent_admissions` is one list shared by the
+    is session-scoped, so `_active_admissions` is one dict shared by the
     entire suite — the isolation these tests need comes from the autouse
-    fixture, not from module reloading. Pinned because assuming otherwise
-    is exactly the mistake this test caught: without the reset the burst
-    tests are order-dependent and leak reservations into other files."""
-    # Source-coupled rather than reading a pytest-internal attribute, whose
-    # name varies across pytest versions.
+    fixture, not from module reloading."""
     from pathlib import Path
     conftest_src = (Path(__file__).resolve().parent / "conftest.py").read_text()
     i = conftest_src.index("def leerie(")
     decorator = conftest_src[:i].rsplit("@pytest.fixture", 1)[1]
     assert 'scope="session"' in decorator, (
         "the leerie fixture is no longer session-scoped; re-check whether "
-        "_reset_admissions is still required (and whether other module-level "
-        "state in leerie.py now behaves differently under test)")
-    # Which is why the autouse reset fixture is what makes this hold.
-    assert leerie._recent_admissions == []
+        "_reset_admissions is still required")
+    assert leerie._active_admissions == {}
 
 
 def test_admission_signature_takes_no_max_parallel(leerie):

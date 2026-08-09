@@ -2957,8 +2957,8 @@ which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
 was reclaimable file cache**, so gating on `memory.current` would
 under-report headroom by half and stall a fleet that had ample room.
 
-The gate also **reserves** one build peak per worker admitted within
-`_WORKER_ADMISSION_RAMP_SEC`, plus one for the worker being admitted. It
+The gate also **reserves** one build peak per worker still in flight —
+admitted and not yet exited — plus one for the worker being admitted. It
 is otherwise stateless, and `_invoke` runs under
 `Semaphore(max_parallel)` with the gate *inside* it — so a whole wave
 would evaluate identical pre-allocation headroom and all of it would
@@ -2968,11 +2968,28 @@ spawn.) On a slice already at 40 GiB of 54.9, the first two workers of a
 wave admit and the third waits, where a stateless gate would have let all
 five through against 14.9 GiB of headroom.
 
-The window is a heuristic for the ramp-up gap only. A worker that starts
-a build twenty minutes in is outside any window — by then its demand is
-in the `unreclaimable` reading itself, which is what covers that case.
-The reservation covers exactly the interval where that reading is still
-blind.
+**A reservation is bounded by the worker's lifetime, not by elapsed
+time**, and that distinction is the whole correctness argument. Most
+workers are short-lived — classifier, fit_judge, splitter and
+satisfied_probe finish in seconds — so an interval-based reservation
+outlives its worker by orders of magnitude and they accumulate. Measured
+against real runs, 13–15 workers start within any 180 s window, which
+under an interval model demands 88–101 GiB on a 54.9 GiB slice:
+unsatisfiable at *any* load, so every worker stalls the full wait and
+admits anyway. That is the same stall this mechanism exists to remove,
+reintroduced by the mechanism itself.
+
+Bounding by lifetime makes the ceiling provable rather than a guess about
+timing: in-flight workers are capped by the semaphore the spawn path
+already runs under, so reservations cannot exceed
+`build_peak × (max_parallel + 1)` — about 38 GiB at the default, which
+fits an idle slice and still blocks a busy one.
+
+`_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
+window between the gate and the spawn path's `try`/`finally`. It is also
+the right bound on its own terms: past that long, a still-running
+worker's demand is already in the `unreclaimable` reading, and reserving
+for it again would double-count.
 
 The wait is bounded (10 min) and then admits anyway: a run that never
 progresses is worse than a tight one, and because the ceiling is now

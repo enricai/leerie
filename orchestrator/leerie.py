@@ -4690,27 +4690,41 @@ _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
 # enough slack above 6.3 GiB that an ordinary heavier-than-measured build
 # is not killed, while a genuine runaway (tens of GiB) still is.
 _WORKER_MEMORY_CEILING_MULTIPLIER = 1.5
-# How long an admitted worker's memory demand is assumed NOT to be visible
-# in the slice's unreclaimable usage yet. `_await_worker_memory_admission`
-# reserves one build peak per worker admitted inside this window, because
-# the gate is otherwise stateless: `_invoke` runs under
-# `Semaphore(max_parallel)` and the gate sits inside it, so up to
-# `max_parallel` workers evaluate identical pre-allocation headroom in the
-# same event-loop instant and all admit. (The superseded divisor did not
-# have this gap: it read `live_siblings`, which counts *enrolled* cgroups,
-# and enrollment happens microseconds after spawn.)
+# `_await_worker_memory_admission` reserves one build peak per worker that
+# has been admitted but whose demand cannot yet be visible in the slice's
+# unreclaimable reading. Without that the gate is stateless: `_invoke` runs
+# under `Semaphore(max_parallel)` and the gate sits inside it, so a whole
+# wave evaluates identical pre-allocation headroom and all of it admits.
+# (The superseded divisor had no such gap — it read `live_siblings`, which
+# counts *enrolled* cgroups, and enrollment happens microseconds after
+# spawn.)
 #
-# This is a heuristic for the ramp-up gap only, not a guarantee. A worker
-# that starts a build twenty minutes in is outside any window — that case
-# is covered by the unreclaimable reading itself, which by then reflects
-# the worker's real usage. The window covers exactly the interval where
-# that reading is still blind.
+# A reservation is held until the worker EXITS, not for a fixed interval.
+# That distinction is the whole correctness argument: most workers are
+# short-lived (classifier, fit_judge, splitter, satisfied_probe finish in
+# seconds), so an interval-based reservation outlives its worker by orders
+# of magnitude and they pile up. Measured against real runs' calls.ndjson,
+# 13-15 workers start within any 180s window, which under an interval model
+# demands 88-101 GiB on a 54.9 GiB slice — unsatisfiable at ANY load, so
+# every worker stalls the full wait and admits anyway. That is the exact
+# stall this whole mechanism exists to remove.
+#
+# Bounding by lifetime instead makes the ceiling provable rather than a
+# guess about timing: in-flight workers are capped by the semaphore
+# `_invoke` already runs under, so the reservation total cannot exceed
+# `_WORKER_BUILD_PEAK_BYTES * (max_parallel + 1)`.
+#
+# The age-out below is a leak backstop, NOT the primary mechanism. The gate
+# runs before `_invoke`'s try/finally begins, so a failure in that window
+# would otherwise strand a token forever. It is also the correct upper
+# bound on its own terms: past this long, a still-running worker's demand
+# is in the unreclaimable reading, and reserving for it again double-counts.
 _WORKER_ADMISSION_RAMP_SEC = 180.0
-# Monotonic stamps of recent admissions. The orchestrator runs on a single
-# asyncio event loop and this list is only touched between `await` points,
-# so no lock is needed (same reasoning as `State`'s `st.data[k] = v;
-# st.save()` pairs).
-_recent_admissions: list[float] = []
+# token -> monotonic stamp. The orchestrator runs on a single asyncio event
+# loop and this dict is only touched between `await` points, so no lock is
+# needed (same reasoning as `State`'s `st.data[k] = v; st.save()` pairs).
+_active_admissions: dict[int, float] = {}
+_admission_seq = 0
 
 
 def _cgroup_slice_info() -> tuple[int, int, int] | None:
@@ -4835,10 +4849,30 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
     return _worker_memory_ceiling(slice_max_bytes)
 
 
+def _reserve_worker_memory_admission() -> int:
+    """Record an admission and return its release token."""
+    global _admission_seq
+    _admission_seq += 1
+    _active_admissions[_admission_seq] = time.monotonic()
+    return _admission_seq
+
+
+def _release_worker_memory_admission(token: int | None) -> None:
+    """Drop a worker's memory reservation once it has exited.
+
+    Idempotent, and a no-op on None so the fail-open admission paths (no
+    slice budget readable, unreclaimable unknown) need no special-casing at
+    the call site. Must run on EVERY exit path — a reservation that outlives
+    its worker throttles the next one for nothing, and enough of them stall
+    the run outright."""
+    if token is not None:
+        _active_admissions.pop(token, None)
+
+
 async def _await_worker_memory_admission(
         build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES,
         poll_interval_sec: float = _WORKER_MEMORY_ADMISSION_POLL_SEC,
-        max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> None:
+        max_wait_sec: float = _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC) -> int | None:
     """Admission gate: before spawning a new worker, block while the shared
     `leerie.slice` lacks the measured headroom for another build — rather
     than admitting it regardless and letting the kernel OOM-kill it
@@ -4853,18 +4887,28 @@ async def _await_worker_memory_admission(
     have under-reported headroom by half and stalled a fleet with ample
     room.
 
-    The headroom required scales with how many workers were admitted
-    within `_WORKER_ADMISSION_RAMP_SEC` — one build peak each, plus one for
-    this worker. The gate is otherwise stateless and a whole wave clears it
-    on a single reading, since `_invoke` runs under
-    `Semaphore(max_parallel)` with this call inside it.
+    The headroom required scales with the number of workers **in flight** —
+    admitted and not yet exited — one build peak each, plus one for this
+    worker. The gate is otherwise stateless and a whole wave clears it on a
+    single reading, since `_invoke` runs under `Semaphore(max_parallel)`
+    with this call inside it.
+
+    Returns a release token, or None when it admitted without reserving.
+    **The caller MUST pass it to `_release_worker_memory_admission` on every
+    exit path.** Bounding a reservation by the worker's lifetime rather than
+    by elapsed time is what keeps the total bounded by the semaphore
+    (`build_peak * (max_parallel + 1)`); an interval-based reservation
+    outlives the many short-lived workers by orders of magnitude and piles
+    up until the requirement exceeds the whole slice — measured at 88-101
+    GiB against a 54.9 GiB slice, which stalls every worker.
 
     Admits immediately when no shared-slice budget is readable (no broker /
     containment off — nothing to gate against) or when the broker could not
     read unreclaimable usage (`-1`): unknown fails open, matching
     `_cgroup_slice_info`'s whole-tuple None contract. Neither fail-open path
-    records a reservation — with no budget known there is no accounting to
-    do, and recording one would throttle the next worker for nothing.
+    reserves (both return None) — with no budget known there is no
+    accounting to do, and reserving would throttle the next worker for
+    nothing.
 
     Bounded at `max_wait_sec` (default 10 min) rather than blocking
     forever: a long-running sibling worker that never releases its memory
@@ -4877,22 +4921,23 @@ async def _await_worker_memory_admission(
     while True:
         info = _cgroup_slice_info()
         if info is None:
-            return
+            return None
         slice_max_bytes, live_siblings, unreclaimable = info
         if unreclaimable < 0:
-            return
+            return None
         headroom = slice_max_bytes - unreclaimable
-        # Reserve a build peak for every worker admitted recently enough
-        # that its own demand cannot have shown up in `unreclaimable` yet,
-        # plus one for the worker being admitted now. Without this the gate
-        # is stateless and a whole wave clears it on the same reading.
+        # Reserve a build peak for every worker still in flight — admitted
+        # and not yet exited — plus one for the worker being admitted now.
+        # Without this the gate is stateless and a whole wave clears it on
+        # the same reading. Stale entries are pruned as a leak backstop for
+        # the window between here and `_invoke`'s try/finally.
         now = time.monotonic()
-        _recent_admissions[:] = [t for t in _recent_admissions
-                                 if now - t < _WORKER_ADMISSION_RAMP_SEC]
-        needed = build_peak_bytes * (1 + len(_recent_admissions))
+        for tok in [t for t, stamp in _active_admissions.items()
+                    if now - stamp >= _WORKER_ADMISSION_RAMP_SEC]:
+            del _active_admissions[tok]
+        needed = build_peak_bytes * (1 + len(_active_admissions))
         if headroom >= needed:
-            _recent_admissions.append(now)
-            return
+            return _reserve_worker_memory_admission()
         if waited >= max_wait_sec:
             # `live_siblings` is not an input to the decision (that is the
             # whole point — see `_worker_memory_ceiling`), but it is the
@@ -4902,13 +4947,12 @@ async def _await_worker_memory_admission(
                 f"{max_wait_sec:.0f}s (shared slice headroom "
                 f"{headroom / 1024**3:.1f} GiB, below the "
                 f"{needed / 1024**3:.1f} GiB needed for this worker plus "
-                f"{len(_recent_admissions)} still ramping up; "
+                f"{len(_active_admissions)} in flight; "
                 f"{live_siblings} live worker cgroups slice-wide); "
                 f"admitting anyway")
             # Still an admission: this worker will allocate like any other,
             # so it must count against the next one's reservation.
-            _recent_admissions.append(now)
-            return
+            return _reserve_worker_memory_admission()
         await asyncio.sleep(poll_interval_sec)
         waited += poll_interval_sec
 
@@ -13323,6 +13367,52 @@ async def _select_active_oauth_token(st: "State", caps: dict) -> None:
     st.save()
 
 
+async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
+                           sid: str, leerie_dir: Path, verbosity: str,
+                           progress: Callable[[],
+                                              tuple[int, int, int, int]
+                                              | None] | None = None,
+                           idle_warn_sec: float | None = None,
+                           worker_memory_max_bytes: int | None = None,
+                           worker_pids_max: int | None = None,
+                           stdin_data: str | None = None,
+                           run_id: str | None = None,
+                           active_token: str | None = None,
+                           max_parallel: int | None = None) -> dict:
+    """Admission-gated wrapper around `_invoke`.
+
+    This exists as a separate function purely so the memory reservation is
+    released on **every** exit path. `_invoke`'s own try/finally does not
+    start until ~570 lines in — after `asyncio.create_subprocess_exec`,
+    which this repo has seen raise (the argv E2BIG incident) — so releasing
+    there alone would strand a token whenever setup failed.
+
+    The wrapper is the NEW name rather than `_invoke` being renamed, so that
+    the five test files which `inspect.getsource(leerie._invoke)` keep
+    seeing the real body, and the 23 that monkeypatch `leerie._invoke` keep
+    intercepting it (the delegation below resolves through the module
+    global).
+
+    `max_parallel`, when given, arms the gate: block while the shared
+    `leerie.slice` lacks measured headroom for another build. It is an
+    arming signal only — "this caller has run-level context" — not an input
+    to the gate's arithmetic, which reads real slice headroom. None (the
+    default) skips the gate, used by callers with no run-level context,
+    e.g. the startup smoke test."""
+    admission_token: int | None = None
+    if max_parallel is not None:
+        admission_token = await _await_worker_memory_admission()
+    try:
+        return await _invoke(
+            cmd, cwd, timeout, sid, leerie_dir, verbosity,
+            progress=progress, idle_warn_sec=idle_warn_sec,
+            worker_memory_max_bytes=worker_memory_max_bytes,
+            worker_pids_max=worker_pids_max, stdin_data=stdin_data,
+            run_id=run_id, active_token=active_token)
+    finally:
+        _release_worker_memory_admission(admission_token)
+
+
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   sid: str, leerie_dir: Path, verbosity: str,
                   progress: Callable[[], tuple[int, int, int, int] | None]
@@ -13332,8 +13422,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
-                  active_token: str | None = None,
-                  max_parallel: int | None = None) -> dict:
+                  active_token: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is fed to the child's stdin by a concurrent
@@ -13369,15 +13458,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     runs many `claude -p` workers concurrently (`asyncio.gather` under
     `Semaphore(max_parallel)`); mutating process-global env would race.
 
-    `max_parallel`, when given, arms the slice-aware admission gate
-    (`_await_worker_memory_admission`): before spawning, block while the
-    shared `leerie.slice` lacks the measured headroom for another build.
-    It is an arming signal only — "this caller has run-level context" —
-    not an input to the gate's arithmetic, which reads real slice
-    headroom. None (the default) skips the gate, used by callers with no
-    run-level context, e.g. the startup smoke test."""
-    if max_parallel is not None:
-        await _await_worker_memory_admission()
+    Memory admission is handled by `_invoke_admitted` above, which owns the
+    reservation's lifetime; nothing here needs to know about it."""
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
@@ -14500,7 +14582,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # once at claude_p entry) so a mid-run rotation (below) takes
             # effect on the very next _invoke call, including a retry
             # inside this same claude_p invocation.
-            envelope = await _invoke(build(retry_note), cwd, timeout,
+            envelope = await _invoke_admitted(build(retry_note), cwd, timeout,
                                      sid, leerie_dir, verbosity,
                                      stdin_data=user_prompt + retry_note,
                                      progress=lambda: _get_progress(st),
