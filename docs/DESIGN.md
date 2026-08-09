@@ -2874,8 +2874,10 @@ Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` (where `<sid>` is the
 run-scoped composed sid — see *The per-worker cgroup name is
 run-scoped* below) with `memory.max` set to
-`caps["worker_memory_max_bytes"]` (default: VM RAM split across
-`max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
+`caps["worker_memory_max_bytes"]` (default: derived from the shared
+`leerie.slice` budget, see below — falling back to VM RAM split across
+`max_parallel + 1` slots, floored at 8 GiB, only when no slice budget
+is readable) and `pids.max` set
 to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
@@ -2930,21 +2932,51 @@ and build + resident claude peaks at 5.6–6.3 GiB. An earlier `4 GiB`
 clamp on the auto-derived value was *below* that combined peak, so no
 VM size could auto-derive a cap sufficient for a build-running
 worker — every such worker was cgroup-OOM-killed regardless of host
-RAM. The fix floors the auto-derive at 8 GiB (`max(even_split, 8
-GiB)`), giving margin over the measured 6.3 GiB peak, and drops the
-upper clamp entirely: the real backstop against a runaway per-worker
-cap is the *aggregate* `leerie.slice/memory.max` cap set by
-`scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
-bounds the whole worker fleet regardless of any individual worker's
-`memory.max`. Because that aggregate cap is the real VM-OOM backstop,
-the per-worker floor can be generous without risking host-level
-memory exhaustion — but it does mean **build-heavy waves need a lower
-`--max-parallel`**: five concurrent 8 GiB-capped workers (40 GiB
-aggregate) will not all fit under a ~13.6 GiB slice cap on a 16 GiB
-VM, so the slice cap will itself OOM-kill one of them first. Pair a
-generous per-worker cap with a reduced `--max-parallel` for waves
-expected to run builds, rather than relying on the per-worker cap
-alone to bound concurrency.
+RAM. Any cap below that combined peak guarantees the very OOM the cap
+exists to contain.
+
+**N9 DECISION — the per-worker cap is sized against the shared slice
+budget, not against this run's own host view.** Every concurrent
+leerie run on a host shares ONE `leerie.slice` cgroup with a single
+enforced `memory.max` (`scripts/container-entry.sh`,
+`MemTotal - max(1 GiB, 12.5%)`). The pre-N9 basis derived each
+worker's cap from `/proc/meminfo` as if this run owned the whole
+host, so N concurrent runs' workers could jointly demand well past the
+shared slice's actual budget — individual workers got SIGKILLed by the
+kernel OOM killer inside their own cgroup even though the slice-wide
+backstop itself held (measured 2.3x overcommit). The default cap is
+now `_auto_worker_memory_max`: read the shared slice's `memory.max`
+and live sibling `leerie-w-*` worker count via the broker's `slice`
+verb, then divide across `live_siblings + max_parallel + 1` (the `+1`
+for the orchestrator/system processes outside any worker cgroup),
+floored at 256 MiB (`_slice_worker_memory_max`). It shrinks
+automatically as sibling runs start and grows back as they finish,
+because the shared slice IS the shared state — no lockfile or cross-run
+registry needed. Falls back to the legacy `/proc/meminfo`-derived basis
+(`max(even_split, 8 GiB)`, `_auto_worker_memory_max_legacy`) only when
+no broker/slice budget is readable (containment off,
+`--dangerously-allow-uncapped`) — there the shared-slice enforcement
+the new basis depends on is absent anyway.
+
+**M9+M3 DECISION 2026-08-09 — a wave-scoped degrade gate, not a
+per-spawn admission block.** An intermediate design blocked each
+individual spawn (`_await_worker_memory_admission`) while polling for a
+per-worker share that could never rise while a live sibling run held
+its slot, then admitted anyway past a 10-minute wait cap — measured
+43x/18x slowdowns and 100% stall rates at higher `--max-parallel`.
+`_degrade_max_parallel_for_wave`, called once at the start of each wave
+by `phase_execute` before constructing that wave's `asyncio.Semaphore`,
+replaces it: a single, non-blocking check that computes the largest
+concurrency the wave can run at without driving the shared-slice
+per-worker allocation below the measured ~6.3 GiB build+resident-claude
+peak (gated at an 8 GiB floor, `_WORKER_BUILD_PEAK_BYTES`, matching the
+legacy basis's own floor for the same peak), shrinking that wave's own
+semaphore size and logging a warning naming the degraded value when it
+doesn't fit — rather than admitting a worker the kernel is likely to
+OOM-kill mid-build. It is recomputed fresh per wave, so a sibling run
+finishing between waves is reflected without an in-wave feedback loop,
+and the degraded value is never fed back into a later divisor call, so
+it cannot oscillate.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the

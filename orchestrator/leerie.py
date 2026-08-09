@@ -4846,7 +4846,9 @@ def resolve_worker_memory_max(repo_root: Path,
                               cli_value: str | None = None) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
     --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
-    leerie.toml `worker_memory_max` → auto-derive from /proc/meminfo.
+    leerie.toml `worker_memory_max` → auto-derive (`_auto_worker_memory_max`:
+    the shared `leerie.slice` budget, N9, falling back to /proc/meminfo only
+    when no broker/slice budget is readable).
 
     All sources accept the same format ("4G", "512M", "1024") and are
     validated by _parse_memory_size, which die()s on bad input — bad
@@ -28174,13 +28176,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # helper was renamed private and thus came under that guard's scope.
     caps["token_probe_cache_sec"] = resolve_token_probe_cache_sec(
         cwd, getattr(args, "token_probe_cache_sec", None))
-    # Resolve per-worker cgroup memory cap. Auto-derives from
-    # /proc/meminfo when unset; resolver die()s on a bad size string.
-    # Reads `caps["max_parallel"]` already resolved above so the auto-
-    # derived value is "VM ram split N+1 ways, floored at 8 GiB" (a
-    # build-running worker's cgroup holds the build subprocess tree AND
-    # the resident claude -p process at once; measured build+claude peak
-    # is ~6.3 GiB — see _auto_worker_memory_max).
+    # Resolve per-worker cgroup memory cap. Auto-derives from the shared
+    # leerie.slice budget (N9), falling back to /proc/meminfo only when no
+    # broker/slice budget is readable; resolver die()s on a bad size
+    # string. Reads `caps["max_parallel"]` already resolved above — both
+    # the slice-aware basis and its /proc/meminfo fallback use it as one
+    # of the divisor's terms (a build-running worker's cgroup holds the
+    # build subprocess tree AND the resident claude -p process at once;
+    # measured build+claude peak is ~6.3 GiB — see _auto_worker_memory_max).
     caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
         Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max)
     # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the
