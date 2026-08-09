@@ -17462,16 +17462,29 @@ async def phase_plan(task: str, st: State, caps: dict,
     # the parent became (DESIGN §5 *Id-vanishing operations*). Accumulated
     # across every plan and applied once below: the dependent may live in a
     # different category's plan than the parent it names.
+    # Bounded concurrency (M2 perf fix): the sequential for-loop below used
+    # to await _recursive_decompose one top-level subtask at a time —
+    # measured on navegando aa15a9ca as 143 fit_judge/splitter calls at
+    # ~0.7x parallelism (fully serialized) versus the planner stage's own
+    # 4-8.5x in the same run. Mirrors the accumulate-as-they-complete shape
+    # of _filter_satisfied_subtasks's `sem = asyncio.Semaphore(...)` +
+    # `_gather_or_cancel` (:8886) — leaves/expansion/snapshot are shared,
+    # mutated only in the non-await tail of each task, which is safe under
+    # the single-event-loop invariant (CLAUDE.md: coroutines only interleave
+    # at await points).
     expansion: dict[str, list[str]] = {}
+    sem = asyncio.Semaphore(caps["max_parallel"])
     for plan in plans:
         first_pass = plan.get("subtasks", [])
         if not first_pass:
             continue
         leaves: list[dict] = []
-        for subtask in first_pass:
-            expanded = await _recursive_decompose(
-                subtask, 0, st, caps, models, efforts, repo_root,
-                repo_map=repo_map)
+
+        async def expand_one(subtask: dict) -> None:
+            async with sem:
+                expanded = await _recursive_decompose(
+                    subtask, 0, st, caps, models, efforts, repo_root,
+                    repo_map=repo_map)
             pid = subtask.get("id")
             leaf_ids = [c.get("id") for c in expanded if c.get("id")]
             if pid and pid not in leaf_ids:
@@ -17482,8 +17495,13 @@ async def phase_plan(task: str, st: State, caps: dict,
             # §6 *Credential strategy*). A WorkerError from a later subtask's
             # fit_judge/splitter call no longer discards the fit/split
             # decisions already paid for on subtasks that finished first.
-            st.data["decompose_snapshot"] = {"leaves": leaves}
+            # Completion (and therefore snapshot-write) order across
+            # subtasks is now nondeterministic — nothing depends on it; each
+            # write still captures every subtask finished so far.
+            st.data["decompose_snapshot"] = {"leaves": list(leaves)}
             st.save()
+
+        await _gather_or_cancel(*(expand_one(subtask) for subtask in first_pass))
         plan["subtasks"] = leaves
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), expansion)
