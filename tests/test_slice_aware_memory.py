@@ -17,6 +17,7 @@ Mirrors tests/test_cgroup_helpers.py's stubbed-socket-broker pattern: stub
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 
@@ -503,6 +504,69 @@ def test_invoke_admitted_releases_the_reservation_on_every_exit_path(leerie):
     # The body itself must not re-acquire the concern.
     body = inspect.getsource(leerie._invoke)
     assert "_await_worker_memory_admission" not in body
+
+
+def test_wrapper_forwards_every_invoke_parameter(leerie):
+    """`_invoke_admitted` exists only to forward to `_invoke`, and a
+    parameter added to `_invoke` later would be **silently dropped** — the
+    callee would quietly take its default and no test would fail.
+
+    This is the class CLAUDE.md documents for
+    `tests/test_claude_p_call_sites.py`: a call-site signature mismatch once
+    shipped for a whole release, logged as a clean advisory degrade, and
+    "no stub-based test can catch this class" because every stub accepts
+    any signature. So this is a static AST check, and it DERIVES the
+    parameter list rather than enumerating it — a future parameter is
+    covered automatically."""
+    params = list(inspect.signature(leerie._invoke).parameters)
+    assert params, "could not read _invoke's signature"
+
+    src = inspect.getsource(leerie._invoke_admitted)
+    tree = ast.parse(src.replace("async def", "def", 1))
+    call = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_invoke":
+            call = node
+    assert call is not None, "wrapper no longer calls _invoke"
+
+    forwarded = set(params[:len(call.args)]) | {
+        kw.arg for kw in call.keywords if kw.arg}
+    # **kwargs would forward everything; accept it explicitly rather than
+    # letting the derived check pass by accident.
+    splat = any(kw.arg is None for kw in call.keywords)
+    dropped = [p for p in params if p not in forwarded]
+    assert splat or not dropped, (
+        f"_invoke_admitted does not forward {dropped} — those would "
+        f"silently fall back to their defaults on every gated worker spawn")
+
+
+def test_wrapper_accepts_everything_invoke_does(leerie):
+    """The mirror of the above: a parameter the wrapper cannot even accept
+    is one `claude_p` cannot pass, which fails loudly at the call site
+    rather than silently — but only if someone runs that path. Pinned so
+    the two signatures cannot drift in either direction."""
+    inv = set(inspect.signature(leerie._invoke).parameters)
+    adm = set(inspect.signature(leerie._invoke_admitted).parameters)
+    assert inv <= adm, f"wrapper cannot accept: {sorted(inv - adm)}"
+    # The wrapper's only surplus is the arming signal.
+    assert adm - inv == {"max_parallel"}
+
+
+def test_claude_p_call_site_binds_against_the_wrapper(leerie):
+    """Bind `claude_p`'s actual call against the real signature — the same
+    technique test_claude_p_call_sites.py uses, for the one call site that
+    file does not cover."""
+    tree = ast.parse(inspect.getsource(leerie.claude_p))
+    site = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(
+                node.func, "id", None) == "_invoke_admitted":
+            site = node
+    assert site is not None, "claude_p no longer calls _invoke_admitted"
+    names = [kw.arg for kw in site.keywords if kw.arg]
+    # Binds positionally-by-count plus the keywords actually written.
+    inspect.signature(leerie._invoke_admitted).bind(
+        *[None] * len(site.args), **{n: None for n in names})
 
 
 def test_claude_p_spawns_through_the_admitted_wrapper(leerie):

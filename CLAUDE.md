@@ -779,14 +779,21 @@ anti-vacuity test proving the guard fires on an added/removed field, plus a
 transposition check (right arity, wrong order) driving the parsed values
 into `_worker_memory_ceiling` and the headroom comparison. Same class as the
 `collect-subtrees.sh` schema duplication above, which had already drifted in
-production before its guard existed. Note the burst-reservation state in
-`_await_worker_memory_admission` (`_recent_admissions`) is **module-level**
-and conftest's `leerie` fixture is **session-scoped**, so
+production before its guard existed. Note the burst-reservation state
+`_active_admissions` (token → monotonic stamp, mutated by
+`_await_worker_memory_admission` and `_release_worker_memory_admission`) is
+**module-level** and conftest's `leerie` fixture is **session-scoped**, so
 `tests/test_slice_aware_memory.py` clears it in an autouse fixture on both
 sides — without that its burst tests are order-dependent and leak
 reservations into every other file that exercises the gate; a
 guard-the-guard test source-couples to the fixture's `scope="session"` so a
-scope change forces that reasoning to be re-examined. Memory-OOM naming
+scope change forces that reasoning to be re-examined. Those burst tests use
+the **measured** production density (15 worker starts per 180 s, from real
+runs' `calls.ndjson`) rather than a number that looks representative: an
+earlier revision bounded reservations by elapsed time instead of by worker
+lifetime, which stalls every real run — its tests used 5, under
+`max_parallel`, and passed against the defect, which first bites at 9.
+Memory-OOM naming
 (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending
 command + `memory.max`) over `_validate_result`'s generic "checkpoint ...

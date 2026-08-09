@@ -13458,8 +13458,13 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     runs many `claude -p` workers concurrently (`asyncio.gather` under
     `Semaphore(max_parallel)`); mutating process-global env would race.
 
-    Memory admission is handled by `_invoke_admitted` above, which owns the
-    reservation's lifetime; nothing here needs to know about it."""
+    **This entry point BYPASSES memory admission.** `_invoke_admitted`
+    above is the gated one, and it owns the reservation's lifetime, so
+    nothing in this body needs to know about it. Spawning a run worker
+    through here instead would silently skip the gate — invisible, since
+    the only symptom is memory pressure attributable to nothing. The one
+    legitimate caller is `preflight`'s smoke test, which has no run-level
+    `max_parallel` context to gate against."""
     log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
