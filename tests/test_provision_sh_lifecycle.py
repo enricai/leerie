@@ -15,12 +15,20 @@ PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 
 
 def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    # Exclude LEERIE_STATE_DIR, LEERIE_STATE_HOST_DIR, and XDG_CACHE_HOME from
-    # the base environment so tests run in isolation. XDG_CACHE_HOME points to
-    # /tmp/.cache which may not be writable in all test contexts, causing mkdir
-    # failures in lib.sh's _leerie_fly_agent_ensure function.
+    # Exclude LEERIE_STATE_DIR, LEERIE_STATE_HOST_DIR, XDG_CACHE_HOME, and
+    # USER_REPO from the base environment so tests run in isolation.
+    # XDG_CACHE_HOME points to /tmp/.cache which may not be writable in all
+    # test contexts, causing mkdir failures in lib.sh's
+    # _leerie_fly_agent_ensure function. USER_REPO is set by the leerie
+    # harness itself (when these tests run inside a leerie-managed worker
+    # container) to a bare marker value rather than a real repo path — left
+    # in place, decide_teardown's "$USER_REPO/.leerie/runs" state-sync
+    # fallback resolves to a cwd-relative "leerie/.leerie/runs", and `mkdir
+    # -p` on that path collides with the `leerie` launcher script file that
+    # sits at this repo's own root, failing with "Not a directory".
     base_env = {k: v for k, v in os.environ.items()
-                if k not in ("LEERIE_STATE_DIR", "LEERIE_STATE_HOST_DIR", "XDG_CACHE_HOME")}
+                if k not in ("LEERIE_STATE_DIR", "LEERIE_STATE_HOST_DIR",
+                             "XDG_CACHE_HOME", "USER_REPO")}
     if env:
         base_env.update(env)
     return subprocess.run(
