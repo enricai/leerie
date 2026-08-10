@@ -102,7 +102,28 @@ MIN_CLAUDE_CLI = (2, 1, 22)
 
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
-    "max_total_workers": 200,       # hard ceiling on claude -p invocations
+    # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
+    # 2026-08-09): the 8 per-subtask retry caps already catch looping
+    # runaways locally; this global ceiling only needs to stay above the
+    # cost of a legitimate large plan. Measured worst case 27.0 calls/
+    # completed-subtask, median ~17.5 -- 2000 covers ~74 subtasks at the
+    # worst observed rate and ~115 at the median while remaining a genuine
+    # backstop for a run that has actually gone wrong.
+    "max_total_workers": 2000,      # hard ceiling on claude -p invocations
+    # Share of max_total_workers that recursive decomposition (fit_judge +
+    # splitter, DESIGN §5½ (P1)) may spend before it is forced to stop
+    # splitting and accept remaining nodes as leaves (N3+N4). Derived from
+    # a 118-run corpus sweep: decomposition share of budget was p90 22.7%
+    # for healthy (pushed) runs vs. p50 34.1% for runs that never pushed
+    # any code -- a 40% cap fires on 1/48 healthy runs (2%) and 31/70
+    # unhealthy runs (44%), the cleanest separation measured. This partitions
+    # the shared worker budget (State.bump_workers) so decomposition cannot
+    # starve execution of every call before a single line of code is
+    # written; it does NOT gate on fit_judge score (that option -- stopping
+    # early on projected cost -- was investigated and rejected: it would
+    # ship exactly the low-scoring nodes decompose_fit_threshold exists to
+    # keep splitting).
+    "decompose_budget_share": 0.40,
     # Concurrent workers within a wave. Per-worker cgroup containment
     # (DESIGN §6 *Memory containment*) keeps an OOM inside one worker's
     # cgroup, so wave-level parallelism can be high without cascading to
@@ -312,7 +333,7 @@ STATE_FIELDS = (
     "plan_snapshot",
     "decompose_snapshot",
     "blocked",
-    "worker_count", "telemetry",
+    "worker_count", "decompose_worker_count", "telemetry",
     "categories", "classifier_questions", "prescribed_procedure",
     "required_items", "answers",
     # likely_already_satisfied / likely_already_satisfied_evidence:
@@ -6607,7 +6628,20 @@ async def _label_migration_chunks(
 
     chunk_spec = [{"id": cid, "files_likely_touched": chunk}
                   for cid, chunk in zip(ids, chunks)]
-    st.bump_workers(caps)
+    try:
+        _bump_decompose_workers(st, caps)
+    except DecompositionBudgetExceeded:
+        # Decomposition's share of the worker budget is spent (N3+N4) --
+        # skip the label-only call entirely and keep the deterministic
+        # labels (already guaranteed-distinct; the worker only upgrades
+        # them). Not a WorkerError degrade: no call was ever spawned.
+        log(f"_recursive_decompose: decomposition budget exceeded before "
+            f"label-only splitter for {base_id}; using deterministic "
+            "chunk labels")
+        return [
+            _migration_child(subtask, chunk, cid, *labels[cid])
+            for cid, chunk in zip(ids, chunks)
+        ]
     sys_prompt = _load_prompt("splitter")
     user_prompt = wrap_repo_map(
         "LABEL PRE-PARTITIONED MIGRATION CHUNKS (label-only mode).\n"
@@ -6787,6 +6821,42 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
     return [dense_child, rest_child]
 
 
+def _bump_decompose_workers(st: "State", caps: dict) -> None:
+    """Reserve one decomposition call against `decompose_budget_share *
+    max_total_workers` and bump the shared worker budget (N3+N4 --
+    partition the budget so recursive decomposition cannot starve
+    execution).
+
+    Checks the decomposition-specific ceiling BEFORE bumping anything: a
+    refused call must not touch `worker_count` or `decompose_worker_count`
+    -- every recursion node still visits this function once even after the
+    share is exhausted (each sibling/child in the tree independently
+    reaches its own fit_judge/splitter spawn site), and if refusal still
+    incremented the counters, those phantom bumps would themselves eat
+    into the execution budget the partition exists to protect, and
+    `decompose_worker_count` would grow unbounded past the share instead
+    of holding at it.
+
+    Called instead of a bare `st.bump_workers(caps)` at every fit_judge /
+    splitter spawn site in `_recursive_decompose`. Once the share is
+    available, `st.bump_workers` still runs and can still raise the
+    pre-existing global-budget WorkerError -- this only adds an earlier,
+    decomposition-specific ceiling in front of it."""
+    share = caps.get("decompose_budget_share",
+                     DEFAULT_CAPS["decompose_budget_share"])
+    cap = caps["max_total_workers"]
+    spent = st.data.get("decompose_worker_count", 0)
+    if spent >= share * cap:
+        raise DecompositionBudgetExceeded(
+            f"decomposition budget exceeded ({spent} calls, "
+            f"{share:.0%} share of {cap} reached); accepting as leaf to "
+            "preserve execution budget."
+        )
+    st.bump_workers(caps)
+    st.data["decompose_worker_count"] = spent + 1
+    st.save()
+
+
 async def _recursive_decompose(
     subtask: dict,
     depth: int,
@@ -6871,7 +6941,16 @@ async def _recursive_decompose(
         )
 
     # --- judge step ----------------------------------------------------------
-    st.bump_workers(caps)
+    try:
+        _bump_decompose_workers(st, caps)
+    except DecompositionBudgetExceeded as exc:
+        # Decomposition's share of the worker budget is spent (N3+N4) --
+        # accept as a leaf without spawning the fit_judge call, the same
+        # disposition a WorkerError degrade below reaches. Logged
+        # separately from the crash message so the budget cap is visible
+        # in run logs rather than reading as a worker failure.
+        log(f"_recursive_decompose: {exc}")
+        return [subtask]
     sys_prompt = _load_prompt("fit_judge")
     user_prompt = _with_repo_map(
         "SUBTASK TO JUDGE:\n"
@@ -6980,7 +7059,14 @@ async def _recursive_decompose(
         # Coupled minority: LLM splitter decides the partition using
         # structural seams from the repo-map; backstopped by
         # _check_migration_surface at the plan level.
-        st.bump_workers(caps)
+        try:
+            _bump_decompose_workers(st, caps)
+        except DecompositionBudgetExceeded as exc:
+            # Decomposition's share of the worker budget is spent (N3+N4)
+            # -- accept as a leaf without spawning the splitter call, the
+            # same disposition a WorkerError degrade below reaches.
+            log(f"_recursive_decompose: {exc}")
+            return [subtask]
         sys_prompt_s = _load_prompt("splitter")
         user_prompt_s = _with_repo_map(
             "SUBTASK TO SPLIT:\n"
@@ -11451,6 +11537,18 @@ def _validate_resume_state(data: dict) -> None:
 # =========================================================================
 class WorkerError(RuntimeError):
     pass
+
+
+class DecompositionBudgetExceeded(WorkerError):
+    """Recursive decomposition (fit_judge/splitter) has spent its share of
+    the worker budget (N3+N4, DEFAULT_CAPS["decompose_budget_share"]).
+
+    Subclasses WorkerError so every existing `except WorkerError:` call site
+    in `_recursive_decompose` already degrades the node to a leaf without
+    any new control-flow -- the distinct type exists only so callers can
+    log an accurate "budget" message instead of the generic "crashed"
+    message.
+    """
 
 
 class WorktreeSetupError(WorkerError):

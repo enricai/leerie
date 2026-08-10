@@ -1691,6 +1691,60 @@ launch, not resuming the same (now-destroyed) machine. This routing
 keeps the user from paying for a Fly volume indefinitely once the
 budget check has already fired.
 
+### Decomposition budget partition (N3+N4)
+
+Recursive decomposition (`_recursive_decompose`, DESIGN §5½ (P1) — every
+`fit_judge`/`splitter` call it spawns) shares the same `worker_count`
+budget as execution, and was observed to exhaust `max_total_workers`
+entirely during planning, leaving zero calls for implementers/conformers
+(a 118-run corpus sweep found decomposition consumed p50 34.1% / p90
+67.5% / max 90.7% of the total budget on runs that never pushed any
+code, vs. p50 14.1% / p90 22.7% on healthy runs). Two changes address
+this together (they are one coupled fix; landing either alone leaves the
+failure intact):
+
+1. **`DEFAULT_CAPS["decompose_budget_share"] = 0.40`** — the fraction of
+   `max_total_workers` recursive decomposition may spend. Enforced by
+   `_bump_decompose_workers(st, caps)`, which every fit_judge/splitter
+   spawn site in `_recursive_decompose` (including the label-only
+   migration-chunk splitter) calls instead of a bare `st.bump_workers`.
+   It bumps `st.data["worker_count"]` (via `st.bump_workers`, so the
+   pre-existing global-cap `WorkerError` still fires first and
+   unchanged) and `st.data["decompose_worker_count"]`, then raises
+   `DecompositionBudgetExceeded` (a `WorkerError` subclass) once
+   `decompose_worker_count > decompose_budget_share * max_total_workers`.
+   Callers catch it and accept the node as a leaf (fit_judge/splitter
+   sites) or fall back to the pre-existing deterministic chunk labels
+   (label-only migration site) without spawning the call — the same
+   degrade path already used for a genuine `WorkerError` (worker crash),
+   so no new terminal state is introduced. The 40% threshold is
+   corpus-derived, not chosen: it fires on 1/48 healthy (pushed) runs
+   (2%) and 31/70 unhealthy (never-pushed) runs (44%) — the cleanest
+   separation measured. This does **not** gate on the fit_judge score;
+   stopping early on projected cost was investigated and rejected, since
+   it would ship exactly the low-scoring nodes `decompose_fit_threshold`
+   exists to keep splitting.
+2. **`DEFAULT_CAPS["max_total_workers"]` raised `200 → 2000`** — per the
+   corpus measurement above, 200 is below the cost of a typical
+   *completed* run (worst observed 27.0 calls/completed-subtask, median
+   ~17.5), so it was firing as a routine capacity limit rather than the
+   runaway backstop it is documented as. Runaway detection already lives
+   at the per-subtask level (8 separate retry-round caps —
+   `failed_retries`, `conformance_rounds`, `completeness_retry_rounds`,
+   `judgment_check_rounds`, `planner_check_rounds`,
+   `implementer_confidence_retries`, `confidence_rounds`,
+   `decompose_noprogress_rounds`), which demonstrably catch a looping
+   subtask; the global ceiling only needs to stay above legitimate large
+   plans. 2000 covers ~74 subtasks at the worst observed rate and ~115
+   at the median.
+
+Both defaults remain overridable via the existing `--max-workers` /
+`LEERIE_MAX_WORKERS` / `leerie.toml` resolution chain
+(`decompose_budget_share` has no CLI/env/TOML override — it is not
+exposed as a user-facing knob, matching the module-constant-vs-cap
+split documented above for values with no operational reason to be
+tuned per run).
+
 ### Single-owner-per-run-dir enforcement
 
 DESIGN §6 *Single owner per run dir*. The orchestrator refuses to
@@ -8119,6 +8173,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
 | `worker_count` | int | running total of `claude -p` invocations against `max_total_workers` |
+| `decompose_worker_count` | int | running total of `claude -p` invocations spent inside `_recursive_decompose` (fit_judge + splitter, including the label-only migration splitter), against `decompose_budget_share * max_total_workers`. Bumped by `_bump_decompose_workers` alongside `worker_count` (which it also bumps). N3+N4: decomposition is a subset of the total worker budget, so this field never exceeds `worker_count` |
 | `current_phase` | str | the orchestrator's active phase string (e.g. `"phase 2: planning"`, `"phase 4-5: implementing"`); written at each phase entry and read by `_memory_sampler` so each `memory.ndjson` sample can be correlated with the phase that produced it. Empty string before phase 1 fires |
 | `telemetry` | dict | calls, cost_usd, input_tokens, output_tokens — printed at run end |
 | `categories` | list[str] | classifier output, post-whitelist filtering |
