@@ -909,6 +909,71 @@ esac
 
 export LEERIE_LOG_FILE_RESOLVED
 
+# --- _resolve_ec2_knob ----------------------------------------------------
+# CLI > env var > leerie.toml > (empty). Shared by the AWS region/profile
+# block immediately below and by the five --ec2-* instance-shape knobs far
+# below; defined HERE, before the top-level verb dispatch, because the AWS
+# block must run ahead of the accept-blocked/stop/kill/finalize arms that
+# consume LEERIE_AWS_* (see that block's comment). Depends only on
+# $USER_REPO, resolved at the top of this script.
+_resolve_ec2_knob() {
+  local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval
+  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
+  eval "_envval=\"\${$_envname:-}\""
+  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
+  if [ -f "$USER_REPO/leerie.toml" ]; then
+    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
+                        "$USER_REPO/leerie.toml" 2>/dev/null \
+                      | head -1 \
+                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
+    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
+  fi
+}
+
+# --- AWS region/profile prefs (leerie's own knobs, launcher-owned) --------
+# Resolve CLI > env > leerie.toml into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE,
+# the vars every consumer already reads (ec2-lib.sh's require_aws,
+# ec2-ssm.sh, ec2-provision.sh's _aws_region_profile_args, and the
+# accept-blocked/stop/kill/finalize arms). Same-name assignment + export,
+# matching the --ec2-* knobs below rather than --log-file's _RESOLVED
+# suffix: that suffix exists because log_file has a computed default, and
+# these have none -- unset means "let the AWS CLI's own credential chain
+# resolve", which require_aws depends on.
+#
+# MUST stay above the top-level verb dispatch. accept-blocked, stop, kill
+# and finalize all read LEERIE_AWS_* inside their arms, so resolving at the
+# --ec2-* block far below would fix only the main dispatch and leave those
+# four honouring the env tier alone -- which is the defect this closes.
+#
+# These are launcher-owned: the orchestrator runs inside the container,
+# where an AWS region for host-side EC2 provisioning is meaningless. It
+# declares no --aws-region/--aws-profile flags, so both are stripped from
+# REWRITTEN_ARGS below (and allowlisted in
+# tests/test_launcher_value_flags_coupling.py, like --log-file).
+_cli_aws_region=""
+_cli_aws_profile=""
+_prev_aws_knob=""
+for arg in "$@"; do
+  if [ -n "$_prev_aws_knob" ]; then
+    case "$_prev_aws_knob" in
+      region)  _cli_aws_region="$arg" ;;
+      profile) _cli_aws_profile="$arg" ;;
+    esac
+    _prev_aws_knob=""
+    continue
+  fi
+  case "$arg" in
+    --aws-region=*)  _cli_aws_region="${arg#--aws-region=}" ;;
+    --aws-region)    _prev_aws_knob="region" ;;
+    --aws-profile=*) _cli_aws_profile="${arg#--aws-profile=}" ;;
+    --aws-profile)   _prev_aws_knob="profile" ;;
+  esac
+done
+LEERIE_AWS_REGION="$(_resolve_ec2_knob "$_cli_aws_region" LEERIE_AWS_REGION aws_region)"
+LEERIE_AWS_PROFILE="$(_resolve_ec2_knob "$_cli_aws_profile" LEERIE_AWS_PROFILE aws_profile)"
+unset _cli_aws_region _cli_aws_profile _prev_aws_knob
+export LEERIE_AWS_REGION LEERIE_AWS_PROFILE
+
 # Ensure the resolved log file's parent directory exists so the local-runtime
 # teeing wired below (bugfix-002) can append to it without a manual mkdir —
 # best-effort: an unwritable/uncreatable parent just leaves teeing disabled
@@ -4279,20 +4344,9 @@ export LEERIE_SEED_DEPTH LEERIE_SEED_SHALLOW_THRESHOLD_MB
 # existing actionable "not set — required for --runtime ec2" error.
 #
 # _resolve_ec2_knob <cli-value> <env-var-name> <toml-key> — prints the
-# resolved value, or nothing if none of the three tiers has one.
-_resolve_ec2_knob() {
-  local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval
-  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
-  eval "_envval=\"\${$_envname:-}\""
-  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
-  if [ -f "$USER_REPO/leerie.toml" ]; then
-    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
-                        "$USER_REPO/leerie.toml" 2>/dev/null \
-                      | head -1 \
-                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
-    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
-  fi
-}
+# resolved value, or nothing if none of the three tiers has one. Defined
+# far above (beside the AWS region/profile block), because that block must
+# run ahead of the top-level verb dispatch; this call site is unaffected.
 _cli_ec2_ami=""
 _cli_ec2_instance_type=""
 _cli_ec2_key_name=""
@@ -5654,6 +5708,7 @@ _prev_was_fly_app_rewrite=false
 _prev_was_state_dir_rewrite=false
 _prev_was_seed_knob=false
 _prev_was_ec2_knob=false
+_prev_was_aws_knob=false
 _prev_was_log_file_rewrite=false
 _rw_argi=0
 for arg in "$@"; do
@@ -5688,6 +5743,11 @@ for arg in "$@"; do
     # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
     # --ec2-security-group / --ec2-subnet-id.
     _prev_was_ec2_knob=false
+    continue
+  fi
+  if [ "$_prev_was_aws_knob" = "true" ]; then
+    # Consume the value of --aws-region / --aws-profile.
+    _prev_was_aws_knob=false
     continue
   fi
   if [ "$_prev_was_log_file_rewrite" = "true" ]; then
@@ -5768,6 +5828,19 @@ for arg in "$@"; do
       _prev_was_ec2_knob=true
       ;;
     --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*)
+      # =form; consumed above.
+      ;;
+    --aws-region|--aws-profile)
+      # Launcher-only flags (leerie's own AWS region/profile knobs);
+      # resolved into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE far above --
+      # above the verb dispatch, since accept-blocked/stop/kill/finalize
+      # consume them -- and read by ec2-lib.sh / ec2-ssm.sh /
+      # ec2-provision.sh host-side. The orchestrator runs inside the
+      # container and declares no such flags, so strip both the flag and
+      # its value; parse_args() is strict, not parse_known_args.
+      _prev_was_aws_knob=true
+      ;;
+    --aws-region=*|--aws-profile=*)
       # =form; consumed above.
       ;;
     --log-file)
@@ -7880,7 +7953,8 @@ else
     LEERIE_REMOTE_EXIT_RC LEERIE_REMOTE_RUN_ID LEERIE_CHAIN_ID \
     LEERIE_WAVE_IDX LEERIE_TAIL_RUN_ID LEERIE_LIST_FLY_JSON \
     LEERIE_EC2_INSTANCE_ID LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE \
-    LEERIE_EC2_KEY_NAME LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID "
+    LEERIE_EC2_KEY_NAME LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID \
+    LEERIE_AWS_REGION LEERIE_AWS_PROFILE "
   _leerie_env_args=()
   # `compgen -v` lists shell + env variable names; filter to LEERIE_* and skip
   # the deny-list and empty values. Bare `-e NAME` passes the host value.

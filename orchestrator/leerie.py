@@ -701,16 +701,15 @@ RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 
-# AWS region/profile prefs for the ec2 runtime — leerie-level knobs (which
-# region/profile leerie itself uses when provisioning EC2 machines),
-# distinct from the AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain
-# env vars resolved by scripts/remote/aws-credentials.sh. Resolution order:
-# CLI flag → env var → per-repo leerie.toml → None (free-form strings, no
-# enum check — mirrors PR_TEMPLATE_ENV).
-AWS_REGION_ENV = "LEERIE_AWS_REGION"
-AWS_REGION_FILE = SOURCE_OF_TRUTH_FILE
-AWS_PROFILE_ENV = "LEERIE_AWS_PROFILE"
-AWS_PROFILE_FILE = SOURCE_OF_TRUTH_FILE
+# NOTE: leerie's own AWS region/profile knobs (LEERIE_AWS_REGION /
+# LEERIE_AWS_PROFILE, and the aws_region / aws_profile leerie.toml keys)
+# are deliberately NOT resolved here. They are consumed only host-side,
+# when the launcher provisions --runtime ec2 machines, so the launcher
+# owns their full CLI > env > leerie.toml resolution; the orchestrator
+# runs inside the container where the value is meaningless and declares
+# no --aws-region/--aws-profile flags. See `leerie`'s "AWS region/profile
+# prefs" block. Resolving them here previously produced a value nothing
+# read, which is what left the CLI and leerie.toml tiers silently inert.
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -4469,32 +4468,6 @@ def resolve_pr_base_branch(repo_root: Path,
         repo_root, cli_value,
         env_var=PR_BASE_BRANCH_ENV, file_key="pr_base_branch",
         file_name=PR_BASE_BRANCH_FILE, default=None)
-
-
-def resolve_aws_region(repo_root: Path,
-                       cli_value: str | None = None) -> str | None:
-    """Resolve the AWS region leerie uses to provision ec2 runtime
-    machines. Order: --aws-region CLI flag →
-    LEERIE_AWS_REGION env → leerie.toml → None. Free-form string, no enum
-    validation — distinct from the AWS SDK's own AWS_REGION credential-chain
-    env var, which scripts/remote/aws-credentials.sh resolves independently."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=AWS_REGION_ENV, file_key="aws_region",
-        file_name=AWS_REGION_FILE, default=None)
-
-
-def resolve_aws_profile(repo_root: Path,
-                        cli_value: str | None = None) -> str | None:
-    """Resolve the AWS profile leerie uses to provision ec2 runtime
-    machines. Order: --aws-profile CLI flag →
-    LEERIE_AWS_PROFILE env → leerie.toml → None. Free-form string, no enum
-    validation — distinct from the AWS SDK's own AWS_PROFILE credential-chain
-    env var, which scripts/remote/aws-credentials.sh resolves independently."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=AWS_PROFILE_ENV, file_key="aws_profile",
-        file_name=AWS_PROFILE_FILE, default=None)
 
 
 def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
@@ -28203,22 +28176,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help=f"execution runtime "
                          f"({'|'.join(RUNTIME_VALUES)}, default local); "
                          f"overrides {RUNTIME_ENV} and leerie.toml")
-    ap.add_argument("--aws-region", metavar="REGION",
-                    help="AWS region leerie itself uses when provisioning "
-                         "--runtime ec2 machines. Free-form string, no "
-                         "validation. Distinct from the AWS SDK's own "
-                         "AWS_REGION credential-chain env var, which "
-                         "scripts/remote/aws-credentials.sh resolves "
-                         f"independently. Default: None. Also {AWS_REGION_ENV} "
-                         "env var or aws_region in leerie.toml.")
-    ap.add_argument("--aws-profile", metavar="PROFILE",
-                    help="AWS profile leerie itself uses when provisioning "
-                         "--runtime ec2 machines. Free-form string, no "
-                         "validation. Distinct from the AWS SDK's own "
-                         "AWS_PROFILE credential-chain env var, which "
-                         "scripts/remote/aws-credentials.sh resolves "
-                         f"independently. Default: None. Also {AWS_PROFILE_ENV} "
-                         "env var or aws_profile in leerie.toml.")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
@@ -28487,10 +28444,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # --source-of-truth / --model[-*] before we got here.
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
     args.runtime = resolve_runtime(repo_root, args.runtime)
-    args.aws_region = resolve_aws_region(
-        repo_root, getattr(args, "aws_region", None))
-    args.aws_profile = resolve_aws_profile(
-        repo_root, getattr(args, "aws_profile", None))
     models = resolve_models(repo_root, args)
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
     efforts = resolve_efforts(repo_root, args)

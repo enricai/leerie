@@ -187,16 +187,52 @@ def test_worker_pids_max_forwarded():
     assert "LEERIE_WORKER_PIDS_MAX" in names
 
 
-def test_aws_region_profile_prefs_forwarded():
-    """LEERIE_AWS_REGION/LEERIE_AWS_PROFILE are orchestrator-read prefs
-    (mirroring LEERIE_PR_TEMPLATE) that boto3's credential chain inside the
-    container needs — unlike the EC2 instance-lifecycle vars, these must NOT
-    be deny-listed."""
+def test_aws_region_profile_prefs_are_deny_listed():
+    """LEERIE_AWS_REGION/LEERIE_AWS_PROFILE are host-only, like the EC2
+    instance-lifecycle vars beside them on the deny-list.
+
+    This test previously asserted the opposite, on two rationales that were
+    both false (corrected 2026-08-10):
+
+      - *"orchestrator-read prefs"* — the orchestrator resolved them into
+        `args.aws_region` / `args.aws_profile`, which nothing ever read.
+        That discarded resolution is exactly why the documented `--aws-region`
+        CLI flag and the `leerie.toml` keys were silently inert while only
+        the env var worked. Resolution now lives in the launcher, beside the
+        consumers, and the orchestrator declares no such flags at all.
+      - *"boto3's credential chain inside the container needs"* them — boto3
+        reads `AWS_REGION` / `AWS_PROFILE`, never a `LEERIE_`-prefixed name,
+        so forwarding these could not have reached it. Nothing in the repo
+        imports boto3 either (it is in requirements.txt, unused).
+
+    Every real consumer is host-side: `ec2-lib.sh`'s `require_aws`,
+    `ec2-ssm.sh`, `ec2-provision.sh`'s `_aws_region_profile_args`, and the
+    accept-blocked/stop/kill/finalize arms.
+    """
     names = _forwarded_names(_run({
         "LEERIE_AWS_REGION": "us-east-1",
         "LEERIE_AWS_PROFILE": "leerie-ci",
     }))
-    assert {"LEERIE_AWS_REGION", "LEERIE_AWS_PROFILE"} <= names
+    assert not ({"LEERIE_AWS_REGION", "LEERIE_AWS_PROFILE"} & names), (
+        "LEERIE_AWS_* are host-only knobs consumed by the launcher when "
+        "provisioning --runtime ec2 machines; forwarding them into the "
+        "container ships an env var nothing reads")
+
+
+def test_aws_denylist_did_not_disable_forwarding_generally():
+    """ANTI-VACUITY control for the test above.
+
+    `_forwarded_names` returning an empty set would satisfy a `not (... & ...)`
+    assertion trivially. A sibling LEERIE_* var set in the same invocation
+    must still forward, proving the deny-list is selective rather than the
+    harness being broken.
+    """
+    names = _forwarded_names(_run({
+        "LEERIE_AWS_REGION": "us-east-1",
+        "LEERIE_MAX_WORKERS": "80",
+    }))
+    assert "LEERIE_MAX_WORKERS" in names
+    assert "LEERIE_AWS_REGION" not in names
 
 
 def test_dynamic_per_worker_var_forwarded():
