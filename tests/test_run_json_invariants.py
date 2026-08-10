@@ -9,11 +9,14 @@ Invariants (mirrors orchestrator/leerie.py:_validate_run_json):
    (a run is at most one terminal-or-paused state).
 5. If `paused_at` is set, `fly_machine_id` must also be set
    (cannot pause without knowing where to resume).
-6. If `killed_at` is set on a run showing Fly/EC2 evidence
-   (`fly_machine_id`, `ec2_instance_id`, `volume_id`, or `image_tag`),
-   at least one of `fly_machine_id`/`ec2_instance_id` must also be set
-   (cannot have destroyed a machine you don't have a pointer to). A
-   local (nerdctl) kill shows none of that evidence, so it is exempt.
+6. If `killed_at` is set on a Fly/EC2-shaped sidecar, at least one of
+   `fly_machine_id`/`ec2_instance_id` must also be set (cannot have
+   destroyed a machine you don't have a pointer to). "Fly/EC2-shaped"
+   means either (a) it shows remote evidence — `fly_machine_id`,
+   `ec2_instance_id`, `volume_id`, or `image_tag` non-null — or (b) it
+   carries a `fly_machine_id`/`ec2_instance_id` key at all, even null
+   (the shape `_ensure_run_json` writes from a `fly-machine.json` that
+   lacks the id). A local (nerdctl) kill has neither, so it is exempt.
 7. `sync_failed_at` is mutex-checked against `pushed_at` (a pushed run
    can't be sync-failed) and `killed_at` (a destroyed machine can't be
    sync-failed). When set, `fly_machine_id` must also be set.
@@ -203,6 +206,42 @@ def test_rejects_killed_without_any_machine_id_but_with_fly_evidence(leerie):
         leerie._validate_run_json(_minimal_run_json(
             killed_at="2026-05-29T16:00:00+00:00",
             image_tag="registry.fly.io/leerie:0.6.7",
+        ))
+
+
+def test_rejects_killed_fly_shaped_without_fly_machine_id(leerie):
+    """The key-presence half of rule 6, disjoint from the evidence half
+    above: a sidecar that CARRIES `fly_machine_id` but has it null, with
+    no other remote evidence at all. This is exactly what the launcher's
+    `_ensure_run_json` writes when it bootstraps a missing sidecar from a
+    `fly-machine.json` that lacks the id or fails to parse — a corrupt
+    remote kill the evidence test alone cannot see.
+
+    `_minimal_run_json` passes overrides through `**`, so `fly_machine_id
+    =None` injects the KEY with a None value; omitting the argument
+    entirely leaves the key absent (see `test_accepts_killed_local`).
+    That difference is the whole point of this test."""
+    with pytest.raises(
+        ValueError,
+        match="killed_at is set but neither fly_machine_id nor ec2_instance_id",
+    ):
+        leerie._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+            fly_machine_id=None,
+        ))
+
+
+def test_rejects_killed_ec2_shaped_without_ec2_instance_id(leerie):
+    """Same as above on the EC2 side: the key is present but null, which
+    is what `_ensure_run_json` writes from an `ec2-instance.json` missing
+    the instance id."""
+    with pytest.raises(
+        ValueError,
+        match="killed_at is set but neither fly_machine_id nor ec2_instance_id",
+    ):
+        leerie._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+            ec2_instance_id=None,
         ))
 
 

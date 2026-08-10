@@ -3438,16 +3438,20 @@ def _validate_run_json(data: dict) -> None:
        (a run cannot be in more than one terminal-or-paused state).
     5. If `paused_at` is set, `fly_machine_id` must also be set — you
        cannot pause a run without knowing where to resume it.
-    6. If `killed_at` is set on a run that shows evidence of being a
-       Fly/EC2 run (`fly_machine_id`, `ec2_instance_id`, `volume_id`, or
-       `image_tag` — the last two are Fly-only fields the docs describe
-       as "null for local-runtime runs" — any one of them non-null at
-       some point), then at least one of `fly_machine_id`/`ec2_instance_id`
-       must still be set — you cannot have destroyed a machine you don't
-       have a pointer to. A run with NONE of those markers ever set is a
+    6. If `killed_at` is set on a Fly/EC2-shaped sidecar, at least one of
+       `fly_machine_id`/`ec2_instance_id` must still be set — you cannot
+       have destroyed a machine you don't have a pointer to. A sidecar
+       counts as Fly/EC2-shaped on *either* of two independent signals:
+       (a) it shows remote evidence — `fly_machine_id`, `ec2_instance_id`,
+       `volume_id`, or `image_tag` non-null, the last two being Fly-only
+       fields the docs describe as "null for local-runtime runs"; or
+       (b) it *carries* a `fly_machine_id`/`ec2_instance_id` key at all,
+       even null, which is how `_ensure_run_json` (the launcher, `leerie`)
+       bootstraps a Fly/EC2 sidecar from a `fly-machine.json` that is
+       missing the id or unparseable. A run with neither signal is a
        local (nerdctl) kill: there is no "machine" to point to, so the
        invariant does not apply (a local `leerie kill` writes `killed_at`
-       alone, with no machine id of any kind).
+       alone, with no machine id key of any kind).
     7. If `volume_id` is set, `fly_machine_id` must also be set — a Fly
        volume without a machine to attach it to is a corrupt sidecar
        (provision.sh writes the two together; the only way to violate
@@ -3497,17 +3501,29 @@ def _validate_run_json(data: dict) -> None:
     _shows_remote_evidence = any(
         v is not None for v in (fly_machine_id, ec2_instance_id, volume_id, image_tag)
     )
+    # Key PRESENCE, independent of the non-null evidence above: the
+    # launcher's `_ensure_run_json` bootstraps a missing sidecar from
+    # `fly-machine.json`/`ec2-instance.json` as a single-key skeleton, and
+    # writes that key as *null* when the source file lacks the id or fails
+    # to parse. Such a sidecar then gets `killed_at` merged in with no
+    # non-null evidence anywhere -- a genuinely corrupt remote kill that
+    # the evidence test alone cannot see. A local run never carries either
+    # key: `_write_run_json` is merge-only with no skeleton and no call
+    # site passes them, and `_ensure_run_json` writes nothing at all when
+    # neither sidecar source exists. So this clause cannot catch a local
+    # kill (verified against the full on-disk run corpus).
+    _is_remote_shaped = "fly_machine_id" in data or "ec2_instance_id" in data
     if (
         killed_at is not None
         and fly_machine_id is None
         and ec2_instance_id is None
-        and _shows_remote_evidence
+        and (_shows_remote_evidence or _is_remote_shaped)
     ):
         raise ValueError(
             "run.json invariant: killed_at is set but neither fly_machine_id "
-            "nor ec2_instance_id is set, though this sidecar shows other "
-            "remote-runtime evidence; you cannot have destroyed a machine "
-            "you don't have a pointer to"
+            "nor ec2_instance_id is set, though this sidecar is Fly/EC2-shaped "
+            "(it carries a machine-id key or other remote-runtime evidence); "
+            "you cannot have destroyed a machine you don't have a pointer to"
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
