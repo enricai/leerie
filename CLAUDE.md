@@ -787,7 +787,20 @@ production before its guard existed. Note the burst-reservation state
 sides — without that its burst tests are order-dependent and leak
 reservations into every other file that exercises the gate; a
 guard-the-guard test source-couples to the fixture's `scope="session"` so a
-scope change forces that reasoning to be re-examined. Those burst tests use
+scope change forces that reasoning to be re-examined.
+`tests/test_memory_admission_degrade.py` covers the **first** admission stage,
+`_degrade_max_parallel_for_wave` — the synchronous wave-entry shrink that sizes
+a wave's `asyncio.Semaphore` to real headroom so the blocking gate rarely has
+to act. It carries the same autouse `_active_admissions` reset for the same
+reason, and its load-bearing test is
+`test_uses_the_same_signal_as_the_blocking_gate`: the degrade and the gate must
+both read `slice_max - unreclaimable`, because two signals could disagree about
+one slice — sizing a wave down against page-cache pressure the gate then admits
+into. Note `test_is_synchronous_not_a_per_spawn_gate` strips the docstring via
+`ast` before scanning for `await`: the docstring names
+`_await_worker_memory_admission` on purpose, and a naive substring check
+matches the prose describing the thing it forbids (the same trap the
+zombie-reaper guard documents above). Those burst tests use
 the **measured** production density (15 worker starts per 180 s, from real
 runs' `calls.ndjson`) rather than a number that looks representative: an
 earlier revision bounded reservations by elapsed time instead of by worker
@@ -859,7 +872,30 @@ without the wiring), and `_mark_reapable` never admits an
 `_ASYNCIO_MANAGED_PIDS` member; plus a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
 that `main()` calls `_become_subreaper()` and `_orchestrate()` spawns+cancels
-`_zombie_reaper`. The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
+`_zombie_reaper`. Three further surfaces arrived with the `PENDING_ISSUES.md` work order and are
+catalogued here because their traps are not obvious from the test names.
+`tests/test_duplicate_provider_merge_routing.py` (7 tests) pins that
+`check_duplicate_providers`' detections are routed into a **merge** resolution
+and never a drop — the transitive `survivor_of` chase is safe for a merge
+(intent carries forward) and silently destroys a live subtask for a drop, which
+is the hazard `_apply_multidrop` documents above. The floor had been advisory
+only: measured across the run corpus, **4 of 5 runs where it fired applied zero
+resolutions**, one of them with 35 detections and no action.
+`tests/test_recursive_decompose_parallel.py` (4 tests) pins that `phase_plan`'s
+expansion loop — previously a plain sequential `await`, measured at ~0.7x
+parallelism — now bounds concurrency with the **existing** `_gather_or_cancel`
+while preserving `decompose_snapshot`'s per-completion write, including the
+`list(leaves)` copy that keeps a later crash from mutating an already-taken
+snapshot (the aliasing class `test_checkpoint_aliasing.py` exists for).
+`tests/test_require_fly_ssh_isolation.py` (8 tests) pins
+`_leerie_fly_agent_ensure`'s reuse predicate, whose exit codes are the whole
+point: `ssh-add -l` returns **1** for a reachable-but-keyless agent, **0** with
+a key, **2** for a dead socket (verified live). Treating rc 1 like rc 2 `rm -f`s
+a live agent's socket out from under it, orphaning the process — which is the
+leak. The `-t 24h` on spawn bounds the **identities**, not the agent process,
+so it is not an orphan mitigation; see `scripts/remote/lib.sh`'s comment.
+
+The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
 stream-back (both files streamed when host has neither, never clobbers an

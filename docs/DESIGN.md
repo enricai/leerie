@@ -2983,9 +2983,30 @@ above the slice is harmless (the aggregate cap binds first) while one
 below the build peak guarantees the OOM. Being load-independent is what
 makes resolving it once, at startup, correct.
 
-**Contention is handled by admission, not by shrinking caps.** Before
-spawning a worker, leerie blocks while the slice lacks room for another
-build (`_await_worker_memory_admission`). The signal is measured
+**Contention is handled by admission in two stages, not by shrinking
+caps.** The cheap stage runs once at wave entry
+(`_degrade_max_parallel_for_wave`, called by `phase_execute`): it shrinks
+the wave's own concurrency to the largest N whose workers fit the headroom
+that actually exists, and hands N straight to the wave's
+`asyncio.Semaphore`. The expensive stage is the per-spawn gate below, which
+can block for minutes.
+
+The order matters. A wave that enters over-subscribed pays the blocking
+gate *per worker*, so sizing the wave to real headroom first means the gate
+is a backstop for what changes **during** the wave — a sibling run's
+workers arriving — rather than the routine path. Shrinking concurrency is
+also the only lever this run actually controls: it cannot shrink a sibling
+run's live worker count, and it must not shrink its own per-worker cap
+(that is the reservation error above).
+
+Both stages read the **same** signal, `slice_max - unreclaimable`. That is
+not incidental: two signals could disagree about one slice, with the
+degrade sizing a wave down against page-cache pressure the gate then
+cheerfully admits into. The degrade never feeds its own output back into a
+later headroom computation, so successive waves cannot ratchet down.
+
+Before spawning a worker, leerie blocks while the slice lacks room for
+another build (`_await_worker_memory_admission`). The signal is measured
 headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable
 + unreclaimable slab, read from `memory.stat`), never `memory.current`,
 which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
