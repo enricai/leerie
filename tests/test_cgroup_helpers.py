@@ -54,15 +54,22 @@ def reset_probe_memo(leerie):
     leerie._CGROUP_HIERARCHY = None
 
 
-def _stub_broker(leerie, monkeypatch, responses):
+def _stub_broker(leerie, monkeypatch, responses, calls=None):
     """Replace `_cgroup_request` with a stub that records every payload it
     was sent and returns queued responses. `responses` is either a single
     string (returned for every call) or a callable(payload) -> str. A
-    string starting with 'RAISE' makes the stub raise OSError."""
+    string starting with 'RAISE' makes the stub raise OSError.
+
+    When `calls` (a list) is passed, each invocation's full `(payload,
+    timeout)` pair is appended to it — used by the N18 timeout-parity
+    tests below, which need to see what timeout `_cgroup_destroy` actually
+    requested, not just the payload."""
     sent = []
 
     def fake(payload, timeout=5.0):
         sent.append(payload)
+        if calls is not None:
+            calls.append((payload, timeout))
         resp = responses(payload) if callable(responses) else responses
         if resp.startswith("RAISE"):
             raise OSError(resp[len("RAISE"):].strip() or "connection refused")
@@ -194,6 +201,44 @@ def test_destroy_ok_reply_does_not_log(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
     leerie._cgroup_destroy("sid-f")
     assert logged == []
+
+
+# ---- N18: destroy's client timeout must not undercut the broker's drain
+# budget (scripts/cgroup-broker.py's `_DESTROY_DRAIN_TIMEOUT_SEC`), or the
+# client abandons a still-legitimately-draining destroy before the broker
+# finishes rmdir'ing it -- and since workers run with --cgroupns=host, the
+# leerie-w-<sid> directory lives on the HOST cgroupfs and outlives the
+# container, so a broker killed mid-drain (run/container teardown proceeding
+# because nothing was left waiting) permanently orphans it. --------------
+
+def test_destroy_uses_a_timeout_that_covers_the_broker_drain_budget(leerie, monkeypatch):
+    """`_cgroup_destroy` must request a timeout >= the broker's own
+    `_DESTROY_DRAIN_TIMEOUT_SEC` (10.0s) -- the old bare 5.0s
+    `_cgroup_request` default undercut it. Loads the real broker module
+    (not a hand-copied constant) so this can never silently drift from the
+    broker's actual budget, mirroring the SCHEMAS["integrator"] /
+    collect-subtrees.sh drift-guard discipline documented in CLAUDE.md."""
+    broker_mod = _load_broker()
+    calls = []
+    _stub_broker(leerie, monkeypatch, "OK", calls=calls)
+    leerie._cgroup_destroy("sid-g")
+    assert len(calls) == 1
+    payload, timeout = calls[0]
+    assert payload == "destroy sid-g"
+    assert timeout >= broker_mod._DESTROY_DRAIN_TIMEOUT_SEC, (
+        f"client destroy timeout {timeout}s is shorter than the broker's "
+        f"own drain budget {broker_mod._DESTROY_DRAIN_TIMEOUT_SEC}s -- a "
+        f"still-legitimately-draining destroy would be abandoned early "
+        f"(N18)")
+
+
+def test_cgroup_destroy_timeout_constant_matches_the_documented_margin(leerie):
+    """Regression pin for the constant itself, independent of how
+    `_cgroup_destroy` happens to use it -- a future refactor that keeps the
+    call site correct but shrinks the constant back toward (or below) 5.0s
+    would defeat the fix silently."""
+    broker_mod = _load_broker()
+    assert leerie._CGROUP_DESTROY_TIMEOUT_SEC >= broker_mod._DESTROY_DRAIN_TIMEOUT_SEC
 
 
 def test_invoke_finally_reaps_before_destroying_cgroup(leerie):

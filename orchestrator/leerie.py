@@ -12952,6 +12952,26 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 _CGROUP_BROKER_SOCK = "/run/leerie-cgroup.sock"
 _CGROUP_PROBE_RESULT: bool | None = None
 _CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
+# N18: must stay >= scripts/cgroup-broker.py's own `_DESTROY_DRAIN_TIMEOUT_SEC`
+# (10.0s) -- a `destroy` request's own drain-then-rmdir loop can legitimately
+# run for the broker's full budget on a large worker subtree (a conformer's
+# test-suite process tree), and the broker keeps working toward that rmdir
+# for the whole budget regardless of whether this client is still listening.
+# `_cgroup_request`'s prior 5.0s default timeout was BELOW that budget, so a
+# still-legitimately-draining destroy made the client give up and swallow a
+# bare socket timeout (contextlib.suppress(OSError) in `_cgroup_destroy`,
+# with no log line -- unlike a broker-reported `ERR ...`, which is logged).
+# The broker itself still finishes the rmdir moments later off in its own
+# single-threaded accept loop -- but nothing in the orchestrator was waiting
+# for that any more, so run/container teardown was free to proceed and tear
+# down the broker (PID 1) mid-drain. Because workers run with
+# `--cgroupns=host`, the cgroup directory lives on the HOST cgroupfs and
+# outlives the container, so a broker killed mid-drain permanently orphans
+# the `leerie-w-<sid>` directory instead of merely delaying its removal --
+# this is the N18 leak. Keep this in sync with cgroup-broker.py's constant;
+# the margin covers scheduling/socket overhead beyond the broker's own
+# monotonic deadline.
+_CGROUP_DESTROY_TIMEOUT_SEC = 15.0
 
 
 def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
@@ -13086,11 +13106,16 @@ def _cgroup_destroy(sid: str | None) -> None:
     reported ERR (e.g. a lingering process kept the dir busy) is logged
     rather than silently discarded, so a failed teardown is distinguishable
     from a successful one. Called from `_invoke`'s cleanup path on every
-    exit (success, timeout, abort)."""
+    exit (success, timeout, abort).
+
+    Uses `_CGROUP_DESTROY_TIMEOUT_SEC` (not the 5.0s client default) so this
+    call blocks at least as long as the broker's own drain-then-rmdir budget
+    — see that constant's comment (N18) for why a shorter client timeout
+    orphans the cgroup directory rather than merely delaying its removal."""
     if sid is None:
         return
     with contextlib.suppress(OSError):
-        resp = _cgroup_request(f"destroy {sid}")
+        resp = _cgroup_request(f"destroy {sid}", timeout=_CGROUP_DESTROY_TIMEOUT_SEC)
         if resp != "OK":
             log(f"  [{sid}] cgroup destroy failed ({resp}); dir may be leaked")
 
