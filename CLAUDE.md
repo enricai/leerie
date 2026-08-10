@@ -735,8 +735,26 @@ EC2 instance-shape vars (`LEERIE_EC2_AMI`/`_INSTANCE_TYPE`/`_KEY_NAME`/
 `_SECURITY_GROUP`/`_SUBNET_ID` — the five `RunInstances` params, distinct
 from the region/profile prefs above) are covered in
 `tests/test_resolve_ec2_vars.py`: the bash `_resolve_ec2_knob` CLI > env >
-`leerie.toml` > (no default) ladder reproduced and pinned against the real
-launcher source (`test_block_present_in_launcher`), per-var isolation,
+`leerie.toml` > (no default) ladder — **extracted** from the launcher at
+test time by `_extract_resolve_ec2_knob()`, not reproduced. It was a
+hand-written copy until 2026-08-10, which was body-blind *by construction*:
+the tests executed a string literal defined in the test file, so no change
+to the launcher could reach them, while `test_block_present_in_launcher`
+pinned only the helper's name plus the flag/toml-key strings and never its
+logic. `tests/test_no_duplicate_ec2_knob.py` keeps it the only
+implementation — the third guard of this shape after
+`tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py` —
+with its marker anchored to the **start of a line**, since a reproduction
+opens the body at column 0 while a legitimate reference
+(`src.index("_resolve_ec2_knob() {")` inside an extractor) is always quoted
+mid-line; matching the bare token would flag the very extractors the guard
+exists to encourage. **A falsification trap worth remembering:** the first
+attempt to prove the old copy was blind deleted the helper's `[ -f ]`
+guard, and that passes either way — removing it is behaviourally inert,
+since grep on a missing file already fails silently. Inverting the CLI/env
+precedence is the sabotage that discriminates (5 failures with the
+extraction, 0 with the copy). A falsification that changes no observable
+proves nothing. Also covered: per-var isolation,
 `=`-form CLI flags, the env-forwarding denylist guard (these vars must
 never leak into the container), and `ec2-lib.sh`'s `_resolve_ec2_var`
 required-var-read contract (prints on success, actionable
