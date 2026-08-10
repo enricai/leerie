@@ -2446,7 +2446,25 @@ def log(msg: str) -> None:
     print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
 
 
+# Module-level run id, set once `State.__init__` has assigned a run
+# directory (N8: "emit run id on every terminal exit path"). `die()` runs
+# at module scope with no `st` in hand at most call sites, so this is the
+# only channel available to it. `_set_current_run_id` is the sole writer;
+# `State.__init__` is the sole caller, so every `State` instance created
+# for this process (fresh run, resume, or a nested `State(...)` for a
+# different run_id, e.g. accept-blocked's `target_st`) keeps this pointed
+# at the most recently constructed run.
+_CURRENT_RUN_ID: str | None = None
+
+
+def _set_current_run_id(run_id: str) -> None:
+    global _CURRENT_RUN_ID
+    _CURRENT_RUN_ID = run_id
+
+
 def die(msg: str, code: int = 1):
+    if _CURRENT_RUN_ID:
+        msg = f"{msg} (run {_CURRENT_RUN_ID})"
     print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
@@ -15247,6 +15265,7 @@ class State:
     ):
         self.leerie_root = leerie_root
         self.run_id = run_id
+        _set_current_run_id(run_id)
         # leerie_root may now live outside the repo (LEERIE_STATE_DIR), so
         # repo_root cannot be derived from it as leerie_root.parent in general.
         self.repo_root: Path = repo_root if repo_root is not None else leerie_root.parent
@@ -27622,8 +27641,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # logged and ignored.
             await _backstop_capture_prior_runs(
                 leerie_dir, Path(os.getcwd()), caps, models, efforts)
+            # Unconditional (not gated behind `if not args.resume`): a
+            # resumed run previously never announced its id at all, which
+            # made it impossible to tell which run a given log stream
+            # belonged to from stdout alone (N8).
+            log(f"run id: {st.run_id}")
             if not args.resume:
-                log(f"run id: {st.run_id}")
                 # Initialize run.json with the immutable run-identity
                 # fields (run_id, branch, working_branch, pr_base_branch,
                 # started_at, task) so `leerie list` can enumerate this

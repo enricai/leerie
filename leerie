@@ -8106,7 +8106,21 @@ fi
 #     plugin re-runs leerie with --answers after the user responds.
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   if [ "$container_rc" -ne 0 ]; then
-    echo "[leerie] finalize: skipped — container exited with code $container_rc" >&2
+    # Prefer the explicit/positional run id (--run-id / `resume <id>`)
+    # when known; fall back to the local container id (the run id for a
+    # fresh local run — DESIGN §6) read from the cidfile this launcher
+    # invocation wrote. Neither is set on the Fly/EC2 paths, where this
+    # message is unreachable in practice (see the comment above).
+    _finalize_skip_run_id="${LEERIE_RUN_ID:-}"
+    if [ -z "$_finalize_skip_run_id" ] && [ -f "${_cidfile:-}" ]; then
+      _finalize_skip_run_id="$(cat "$_cidfile" 2>/dev/null)"
+    fi
+    if [ -n "$_finalize_skip_run_id" ]; then
+      remote_log "finalize: skipped — container exited with code $container_rc (run $_finalize_skip_run_id)"
+    else
+      remote_log "finalize: skipped — container exited with code $container_rc"
+    fi
+    unset _finalize_skip_run_id
   fi
   exit "$container_rc"
 fi
