@@ -697,20 +697,40 @@ totals exactly; what breaks is *two suites at once*, not parallelism itself.
 
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
-`resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,
+`resolve_runtime`,
 `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `_validate_result`, `_validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
 `resolve_blt`)
 including a coupling test that the
 retry-policy markers match the live check-function strings.
-`resolve_aws_region`/`resolve_aws_profile` (the `LEERIE_AWS_REGION`/
-`LEERIE_AWS_PROFILE`/`leerie.toml` knobs for which region/profile leerie
+The `--aws-region`/`--aws-profile` knobs (which region/profile leerie
 itself uses when provisioning `--runtime ec2` machines, distinct from the
-AWS SDK's own credential-chain env vars) are covered in
-`tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
-CLI/env/file precedence structure but for the unvalidated free-form-string
-`_resolve_str_pref` machinery (no enum, no `die()` path). The launcher-side
+AWS SDK's own credential-chain env vars) are **launcher-owned** and covered
+in `tests/test_resolve_aws_launcher.py`. They were orchestrator-resolved
+until 2026-08-10, into `args.aws_region`/`args.aws_profile` — which nothing
+read, since the orchestrator runs inside the container where a host-side
+provisioning region is meaningless. The launcher, the only real consumer,
+honoured `LEERIE_AWS_*` alone, so **the documented CLI flag and
+`leerie.toml` keys were both silently inert while the env var worked.**
+Resolution now runs in the launcher via `_resolve_ec2_knob`, deliberately
+**above the top-level verb dispatch** — `accept-blocked`/`stop`/`kill`/
+`finalize` each read `LEERIE_AWS_*` inside their own arms, so resolving
+beside the `--ec2-*` knobs would have fixed only the main dispatch. The
+block is *extracted* from the real launcher by the test rather than
+reproduced (see `test_no_duplicate_state_walks.py` for why), and its
+load-bearing case asserts the resolved value **reaches the consumer's
+argv** (`_aws_region_profile_args`) — the deleted
+`tests/test_resolve_aws_prefs.py` pinned the argparse flag and the
+resolver and passed for months while the value reached nothing.
+`tests/test_no_dead_resolutions.py` generalises that: no
+`args.X = resolve_Y(...)` may go unread. It is the sibling
+`tests/test_no_dead_functions.py` cannot be — that one scans for
+unreferenced *functions*, and these resolvers **were** referenced, by the
+dead assignments themselves. Its reader count must exclude each
+assignment's own RHS (every resolution passes its current value in as the
+CLI tier); without that exclusion the sweep reports zero dead resolutions
+on the tree that had two. The launcher-side
 EC2 instance-shape vars (`LEERIE_EC2_AMI`/`_INSTANCE_TYPE`/`_KEY_NAME`/
 `_SECURITY_GROUP`/`_SUBNET_ID` — the five `RunInstances` params, distinct
 from the region/profile prefs above) are covered in

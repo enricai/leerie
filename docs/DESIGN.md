@@ -4238,7 +4238,7 @@ trust model matches the spec: the user picks the moment (by typing
 
 `--runtime ec2` provisions and runs the orchestrator on an AWS EC2
 instance (`scripts/remote/aws-credentials.sh`,
-`resolve_aws_region`/`resolve_aws_profile`, the `boto3`/`botocore` pin,
+the launcher's AWS region/profile resolution, the `boto3`/`botocore` pin,
 and the launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md
 "Runtime mode" / "AWS region/profile prefs"). This section is the
 canonical architecture the shipped dispatch implements against — the
@@ -4419,7 +4419,8 @@ Session Manager over SSH and states why:
   hallpass + WireGuard (line 2509-2511). Authentication and authorization
   flow through the same AWS credential chain and IAM already established
   for the rest of the EC2 runtime (`aws-credentials.sh`,
-  `resolve_aws_region`/`resolve_aws_profile`) rather than a
+  the launcher's `LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` resolution)
+  rather than a
   parallel key-pair-management surface — one credential model for the
   whole EC2 runtime, matching the "reuses Fly's ... dispositions
   everywhere the two platforms agree" framing above.

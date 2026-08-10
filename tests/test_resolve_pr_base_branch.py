@@ -145,8 +145,15 @@ def test_write_run_json_pr_base_branch_survives_merge(leerie, tmp_path):
 #
 # main()'s argparse setup is inline (no standalone build_arg_parser()), so
 # behaviorally invoking argument parsing means invoking main() itself, which
-# performs full orchestration. Source-coupling is the correct tier here,
-# mirroring tests/test_resolve_aws_prefs.py's TestArgparseFlagsWired.
+# performs full orchestration. Source-coupling is the correct tier here.
+#
+# It used to mirror tests/test_resolve_aws_prefs.py's TestArgparseFlagsWired,
+# which was deleted 2026-08-10: pinning "the flag is wired to the resolver"
+# proves the value is COMPUTED, never that anything consumes it, and those
+# AWS flags turned out to resolve into a variable nothing read. Unlike them,
+# `args.pr_base_branch` is genuinely consumed (see
+# tests/test_no_dead_resolutions.py, which now enforces that for every
+# `args.X = resolve_Y(...)`), so this pin sits on top of a live circuit.
 
 class TestArgparseFlagWired:
     """--pr-base-branch must exist as a real argparse flag and its parsed
