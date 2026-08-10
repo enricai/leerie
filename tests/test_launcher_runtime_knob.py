@@ -8,6 +8,8 @@ never fail.
 from __future__ import annotations
 
 import subprocess
+
+import pytest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +29,7 @@ def _extract_runtime_block() -> str:
     made it body-blind BY CONSTRUCTION: it never read or executed `leerie`,
     so no change to the launcher could fail any of its tests. The copy had
     already drifted twice over — it was missing `_RUNTIME_EXPLICIT`
-    entirely (set at five sites and consumed by the resume auto-detect and
+    entirely (set at six sites and consumed by the resume auto-detect and
     the "resuming a Fly run with --runtime local" warning, so nothing in
     the suite covered that flag at all), and it emitted errors with a bare
     `echo "leerie: ..."` where the launcher uses `remote_log`. The one
@@ -241,8 +243,15 @@ def test_runtime_explicit_false_by_default(tmp_path):
     assert _run_explicit(tmp_path, {}, []) == "false"
 
 
-def test_runtime_explicit_true_for_cli_equals_form(tmp_path):
-    assert _run_explicit(tmp_path, {}, ["--runtime=fly"]) == "true"
+@pytest.mark.parametrize("value", ["local", "fly", "ec2"])
+def test_runtime_explicit_true_for_cli_equals_form(tmp_path, value):
+    """All THREE `--runtime=<v>` arms, not just `=fly`.
+
+    They are separate case branches in the launcher (`leerie:4087-4089`),
+    so covering one covers none of the others: deleting
+    `_RUNTIME_EXPLICIT=true` from the `=local` or `=ec2` arm previously
+    left the whole suite green."""
+    assert _run_explicit(tmp_path, {}, [f"--runtime={value}"]) == "true"
 
 
 def test_runtime_explicit_true_for_cli_two_arg_form(tmp_path):

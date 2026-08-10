@@ -13,10 +13,10 @@ found afterwards outside the original list, and two had already drifted:
   auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`, and inlining one of
   three `CGROUP_MOUNT_ARG` branches as a literal.
 - `tests/test_launcher_runtime_knob.py` reproduced the RUNTIME block with
-  `_RUNTIME_EXPLICIT` missing entirely — a flag set at five sites and read
+  `_RUNTIME_EXPLICIT` missing entirely — a flag set at six sites and read
   by the resume auto-detect, with zero coverage anywhere in the suite.
 - `tests/test_group_state_dir_guard.py` reproduced `_state_dir_default`
-  with six stale launcher line citations in its own docstring.
+  with nine stale launcher line citations in its own docstring.
 
 None of those produced a WRONG answer. They were blind — they would have
 passed identically if the launcher deleted the behaviour under test, which
@@ -31,6 +31,7 @@ in `tests/test_no_duplicate_ec2_knob.py` and CLAUDE.md.
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -109,7 +110,12 @@ def test_the_scan_can_find_a_reproduction():
 def test_converted_files_actually_extract():
     """The counterpart to the absence checks: absence of a reproduction is
     also satisfied by a file that tests nothing at all. Each converted
-    harness must read the launcher."""
+    harness must read the launcher AND use what it read.
+
+    Reading alone is too weak — a file could call `LAUNCHER.read_text()`
+    and discard the result. So walk the AST and require the extraction to
+    reach the harness the tests actually execute, which is the property
+    that makes the file coupled rather than merely adjacent."""
     for name in ("test_launcher_state_mount.py",
                  "test_launcher_runtime_knob.py",
                  "test_group_state_dir_guard.py",
@@ -119,3 +125,40 @@ def test_converted_files_actually_extract():
                 or "_extract_state_dir_block" in src), (
             f"{name} no longer reads the launcher — it cannot be coupled "
             f"to it")
+        tree = ast.parse(src)
+        # An extraction is "used" when its result is concatenated into a
+        # harness string or assigned to a module-level name the tests run.
+        used = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                if any(isinstance(n, ast.Call) and _extract_name(n)
+                       for n in ast.walk(node)):
+                    used = True
+            if isinstance(node, ast.Assign):
+                for n in ast.walk(node.value):
+                    if isinstance(n, ast.Call) and _extract_name(n):
+                        used = True
+        assert used, (
+            f"{name} reads the launcher but never feeds the result into a "
+            f"harness — the extraction is decorative")
+
+
+def _extract_name(call: ast.Call) -> bool:
+    """True when `call` is one of the extraction helpers.
+
+    A bare `read_text` is deliberately NOT enough. Every one of these files
+    calls `(TESTS_DIR / name).read_text()`, `path.read_text()` or similar
+    for reasons unrelated to the launcher, so accepting the method by name
+    let any assignment anywhere in the file satisfy the "extraction is
+    used" check — which is most of the strength the caller's docstring
+    claims. Only `LAUNCHER.read_text()` counts: that is the receiver that
+    makes the read an extraction of the file under guard.
+    """
+    fn = call.func
+    name = getattr(fn, "id", None) or getattr(fn, "attr", None) or ""
+    if name.startswith("_extract"):
+        return True
+    if name == "read_text":
+        recv = getattr(fn, "value", None)
+        return isinstance(recv, ast.Name) and recv.id == "LAUNCHER"
+    return False

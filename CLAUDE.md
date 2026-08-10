@@ -743,10 +743,11 @@ the tests executed a string literal defined in the test file, so no change
 to the launcher could reach them, while `test_block_present_in_launcher`
 pinned only the helper's name plus the flag/toml-key strings and never its
 logic. `tests/test_no_duplicate_ec2_knob.py` keeps it the only
-implementation — the third guard of this shape after
-`tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py`,
-and now generalised by a fourth, `tests/test_no_duplicate_launcher_blocks.py`
-(below) —
+implementation — one of a family of guards of this shape, alongside
+`tests/test_no_duplicate_state_walks.py` and
+`tests/test_no_duplicate_launcher_splitters.py` (which guards the shared
+derivation in `tests/launcher_blocks.py`), and now generalised over eight
+bash blocks by `tests/test_no_duplicate_launcher_blocks.py` (below) —
 with its marker anchored to the **start of a line**, since a reproduction
 opens the body at column 0 while a legitimate reference
 (`src.index("_resolve_ec2_knob() {")` inside an extractor) is always quoted
@@ -969,8 +970,10 @@ basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
 `--state-dir`) is in `tests/test_group_state_dir_guard.py`. That file's class-A harness
 **extracted** `_state_dir_default` from the launcher rather than reproducing
 it as of the N13 follow-up — it had been a hand-copy whose own docstring
-cited six launcher line numbers, every one already stale (the block moved
-from ~`:502-561` to `:785-844`), so no change to the launcher could fail it.
+cited nine launcher line numbers, every one stale (the block had moved to
+`:785-844`), so no change to the launcher could fail it. Those citations
+are now corrected in place rather than deleted — they are what makes the
+extraction's target legible.
 It now imports `_extract_state_dir_block` from
 `tests/test_resolve_state_dir.py`, which is the single owner of that
 extraction and has two importers (this file and
@@ -2924,23 +2927,27 @@ discipline for **bash** blocks: a table of eight start-of-line markers
 (`_resolve_ec2_knob`, `_state_dir_default`, `_resolve_seed_knob`,
 `ensure_image`, `resolve_repo_image_tag`, the `config)` case arm, the
 `# --- runtime-mode knob ---` block, and the `_run_argv=(` array), each
-asserted to appear exactly once in the launcher and never at column 0 in any
-test file. It exists because converting N13's five named files fixed those
+asserted to appear exactly once in the launcher and never at the start of a
+line in any test file (two of the eight — the `config)` arm and the
+`_run_argv=(` array — are matched at their own two-space indent). It exists because converting N13's five named files fixed those
 instances but not the rule: **three more reproductions were found afterwards
 outside that list, and two had already drifted** —
 `tests/test_launcher_state_mount.py` reproduced the `nerdctl run` argv
 missing `--cidfile`, `--cgroupns=host`, `ROOTLESS_SECOPT`, the `LEERIE_*`
 auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`, and
 `tests/test_launcher_runtime_knob.py` omitted `_RUNTIME_EXPLICIT` entirely —
-a flag set at five sites and read by the resume auto-detect
+a flag set at six sites and read by the resume auto-detect
 (`leerie:4127`, `:4152`) that had **zero coverage suite-wide**; deleting
 every assignment left the whole suite green, and now fails five tests. None
 of those copies produced a *wrong* answer, which is the point: they were
 blind, and would have passed identically if the launcher deleted the
 behaviour under test. The `config)` row needs an explicit marker rather than
-a derived `name() {` shape, and the anti-vacuity controls are the same pair
-`test_no_duplicate_ec2_knob.py` carries plus a "converted files actually
-read the launcher" check.
+a derived `name() {` shape, and its anti-vacuity controls are ec2_knob's pair
+(the launcher really defines each marker; consumers extract rather than
+reproduce) plus one that file does NOT have —
+`test_the_scan_can_find_a_reproduction`, which plants a copy and proves the
+scan fires on it while still ignoring a legitimately quoted reference. A
+scan that matched nothing would otherwise certify "no duplicates" forever.
 
 `tests/test_no_duplicate_launcher_splitters.py` enforces the single owner
 and carries two anti-vacuity controls, since a scan that matches nothing would

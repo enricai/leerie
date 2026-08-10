@@ -174,7 +174,7 @@ def test_v2_destroy_returns_error_message_on_failure(broker, monkeypatch):
 # ---- destroy: drain before rmdir ------------------------------------------
 # `cgroup.kill` is asynchronous — it delivers SIGKILL and returns while the
 # kernel tears the tree down. An immediate rmdir races that and loses with
-# EBUSY, leaking the dir: measured, 116 stale leerie-w-* dirs of which 88
+# EBUSY, leaking the dir: measured, 115 stale leerie-w-* dirs of which 88
 # were -conformer (test-suite trees reaching hundreds of PIDs). The
 # orchestrator had been logging the cause verbatim: "cgroup destroy failed
 # (ERR Device or resource busy); dir may be leaked".
@@ -844,3 +844,150 @@ def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch):
         "the sweep's failure arm re-raises; a housekeeping failure would "
         "then stop the broker, and the broker is the only thing that can "
         "enforce containment")
+
+
+def test_sweep_on_v1_walks_both_controller_dirs(broker, monkeypatch):
+    """D1: the v1 arm had no coverage at all — the fixture forces v2, so
+    `roots` could have been `[]` and every sweep test still passed.
+
+    v1 splits one worker across a pids/ and a memory/ dir, and both must be
+    reclaimed or `create` later reuses a half-removed cgroup."""
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    root = Path(broker.V1_ROOT)
+    old = time.time() - broker._ORPHAN_MIN_AGE_SEC * 3
+    orphan, live = [], []
+    for ctrl in ("pids", "memory"):
+        d = root / ctrl / broker.SLICE / "leerie-w-abc-conformer"
+        d.mkdir(parents=True)
+        os.utime(d, (old, old))
+        orphan.append(d)
+        l = root / ctrl / broker.SLICE / "leerie-w-xyz-live"
+        l.mkdir(parents=True)
+        (l / "cgroup.procs").write_text("4242\n")
+        os.utime(l, (old, old))
+        live.append(l)
+
+    reclaimed = broker._sweep_orphaned_worker_cgroups()
+
+    assert all(not d.exists() for d in orphan), "v1 orphan not fully reclaimed"
+    assert all(d.exists() for d in live), "v1 sweep removed a live cgroup"
+    # ONE worker, not two. The count is per worker; a per-directory tally
+    # double-reports every v1 orphan.
+    assert reclaimed == 1, f"v1 double-counted: {reclaimed}"
+
+
+def test_sweep_skips_when_no_usable_hierarchy(broker, monkeypatch):
+    """`_slice_dir()` falls back to the v1 memory path when `_HIER` is
+    "none", so without this guard the sweep would walk a host the broker
+    has just declared unusable.
+
+    The orphan below is what makes this falsifiable. Without it the test
+    passed with the guard DELETED: `_slice_dir()` returned
+    `{V1_ROOT}/memory/leerie.slice`, a path the fixture never creates, so
+    `os.listdir` raised, the walk's own `except` hit `continue`, and both
+    assertions held for a reason unrelated to the guard. The fake
+    filesystem was doing the guard's job. Seeding a sweepable orphan on
+    exactly that fallback path means removing the guard now reclaims it.
+    """
+    monkeypatch.setattr(broker, "_HIER", "none")
+    v1_slice = Path(broker.V1_ROOT) / "memory" / broker.SLICE
+    v1_slice.mkdir(parents=True)
+    _seed_worker_dir(v1_slice, "leerie-w-orphan-abc",
+                     age_sec=broker._ORPHAN_MIN_AGE_SEC * 2)
+
+    called = []
+    monkeypatch.setattr(broker, "_drain_then_rmdir",
+                        lambda d, b: called.append(d))
+    assert broker._sweep_orphaned_worker_cgroups() == 0
+    assert not called, (
+        f"the sweep walked a hierarchy it declared unusable: {called}")
+
+
+def test_sweep_does_not_retry_a_failing_rmdir(broker, monkeypatch):
+    """B1: the budget is 0.0, not a retry window.
+
+    A candidate is already drained, so a retry buys nothing — and an
+    `rmdir` failing here usually fails PERMANENTLY (a worker whose tests
+    shelled out to a container runtime leaves child cgroups, so the
+    parent's own `cgroup.procs` is empty while `rmdir` returns ENOTEMPTY
+    forever). With a per-dir window each such orphan would tax every future
+    broker start, and this runs before the socket binds."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    _seed_worker_dir(slice_dir, "leerie-w-stuck-conformer",
+                     procs="", age_sec=broker._ORPHAN_MIN_AGE_SEC * 3)
+    budgets = []
+    monkeypatch.setattr(broker, "_drain_then_rmdir",
+                        lambda d, b: budgets.append(b) or "Device or resource busy")
+    broker._sweep_orphaned_worker_cgroups()
+    assert budgets == [0.0], (
+        f"sweep must not grant a retry window, got {budgets}")
+
+
+def test_sweep_has_an_aggregate_budget(broker):
+    """A partial sweep beats a delayed socket bind: whatever is missed is
+    reclaimed next start, but time spent here is time the orchestrator's
+    first broker request races (and that request fails open, silently
+    degrading worker sizing)."""
+    assert broker._SWEEP_TOTAL_BUDGET_SEC == 5.0
+    src = inspect.getsource(broker._sweep_orphaned_worker_cgroups)
+    assert "_SWEEP_TOTAL_BUDGET_SEC" in src
+
+
+def test_sweep_does_not_count_a_half_removed_v1_worker(broker, monkeypatch):
+    """On v1 one worker owns two dirs. Removing one is not a reclaim.
+
+    `test_sweep_on_v1_walks_both_controller_dirs` asserts both must go "or
+    `create` later reuses a half-removed cgroup", but only exercises the
+    both-succeed path — the code had no mechanism enforcing the claim, and
+    the failure it misses is the COMMON one: a worker whose tests shelled
+    out to a container runtime leaves child cgroups, so `memory/` returns
+    ENOTEMPTY permanently while `pids/` rmdirs cleanly. The sweep then
+    reported a reclaim for a worker still occupying the slice.
+    """
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    for controller in ("pids", "memory"):
+        d = Path(broker.V1_ROOT) / controller / broker.SLICE
+        d.mkdir(parents=True, exist_ok=True)
+        _seed_worker_dir(d, "leerie-w-half",
+                         age_sec=broker._ORPHAN_MIN_AGE_SEC * 2)
+
+    def _fake(d, budget):
+        return "Device or resource busy" if "/memory/" in d else None
+
+    monkeypatch.setattr(broker, "_drain_then_rmdir", _fake)
+    assert broker._sweep_orphaned_worker_cgroups() == 0, (
+        "a worker whose memory/ dir survived was counted as reclaimed")
+
+
+def test_sweep_budget_bounds_the_walk_not_just_the_removals(broker,
+                                                            monkeypatch):
+    """The ceiling must bound the SCAN, not only the `rmdir`s.
+
+    The constant-plus-substring assertion above cannot tell where the check
+    sits, and its original placement — after the live/young/unstattable
+    `continue`s — meant an entry that was skipped never reached it. Since
+    each `_drain_then_rmdir(d, 0.0)` is microseconds, the budget was
+    effectively unreachable while the unbounded half (a `_read` and an
+    `os.stat` per entry) ran unchecked on every start.
+
+    Every entry here is LIVE, so all of them take a `continue` and none is
+    ever removed. With the check at the top the walk still stops; with it
+    below the `continue`s the sweep scans all 50 regardless.
+    """
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    for i in range(50):
+        _seed_worker_dir(slice_dir, f"leerie-w-live-{i:03d}", procs="123\n")
+
+    seen = []
+    real_read = broker._read
+    monkeypatch.setattr(broker, "_read",
+                        lambda p: (seen.append(p), real_read(p))[1])
+
+    # Budget exhausted after the first entry is examined.
+    ticks = iter([0.0] + [broker._SWEEP_TOTAL_BUDGET_SEC + 1.0] * 200)
+    monkeypatch.setattr(broker.time, "monotonic", lambda: next(ticks))
+
+    assert broker._sweep_orphaned_worker_cgroups() == 0
+    assert len(seen) <= 1, (
+        f"the budget did not stop the walk: {len(seen)} entries were still "
+        "stat'd/read after it was exhausted")

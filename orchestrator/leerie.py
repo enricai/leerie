@@ -5001,7 +5001,8 @@ def _degrade_max_parallel_for_wave(
         log(f"  memory admission: shared slice headroom "
             f"{headroom / 1024**3:.1f} GiB fits {degraded} concurrent "
             f"worker(s) at the {build_peak_bytes / 1024**3:.1f} GiB "
-            f"build-peak floor, not {max_parallel}; degrading this wave to "
+            f"per-worker demand estimate, not {max_parallel}; degrading "
+            f"this wave to "
             f"max_parallel={degraded}")
     return degraded
 
@@ -5117,12 +5118,18 @@ async def _await_worker_memory_admission(
 #                             ---------
 #                             ~2.40 GiB
 #
-# Rounded up to 2432 MiB. This deliberately DIVERGES from P9's inline 2048
-# literal, which it previously reused: that figure was sized for the
-# resident claude process alone (see `_invoke`'s comment, "reserves headroom
-# for the resident claude -p process"), later measured at 0.32 GiB, and
-# reusing it here silently spent the whole budget on claude while charging
-# it for Node's non-heap RSS as well. PENDING_ISSUES' N14-16 records the
+# Rounded up to 2432 MiB, replacing the 2048 this and P9's injection used
+# to share. That figure was sized for the resident claude process alone
+# ("reserves headroom for the resident claude -p process"), later measured
+# at 0.32 GiB, so it silently spent the whole budget on claude while being
+# charged for Node's non-heap RSS as well.
+#
+# **`_invoke`'s P9 injection reads this same constant** — it computes the
+# mirror image (cap -> heap, where this computes heap -> cap) and subtracts
+# the identical quantity. They were briefly out of step, with the injection
+# still on 2048 while this said 2432, which handed Node a heap 384 MiB
+# larger than fits the cage. Keep them referencing one constant so that
+# cannot recur. PENDING_ISSUES' N14-16 records the
 # residual this closes: "the split between declared heap and Node's
 # non-heap RSS is not decomposed, so the exact headroom multiplier is
 # unset."
@@ -5182,7 +5189,9 @@ def resolve_worker_memory_max(repo_root: Path,
     subprocess, so a ceiling smaller than heap + headroom guarantees an
     in-cgroup OOM regardless of source. When the resolved value (from any
     source) undershoots that floor: an auto-derived value is raised to it
-    (bounded by the shared slice budget, when known); an explicit
+    (unclamped — the shared slice budget is a refusal condition, not a
+    ceiling on the raise: a value exceeding it die()s rather than being
+    silently trimmed); an explicit
     CLI/env/file value is left as the operator's decision but refused with
     an actionable die() naming --worker-memory-max, since silently
     overriding an explicit cap would be a different kind of surprise."""
@@ -5255,7 +5264,12 @@ def resolve_worker_memory_max(repo_root: Path,
     # the wave at entry using the same demand figure — so this is a
     # forecast of degradation, not a fatal configuration.
     if slice_max_bytes is not None and needed * max_parallel > slice_max_bytes:
-        fits = max(1, slice_max_bytes // needed)
+        # Same signal as `_degrade_max_parallel_for_wave`: slice budget
+        # MINUS unreclaimable, never the raw budget. Forecasting against
+        # the raw figure over-reports how many workers will actually be
+        # admitted, in a message whose only job is to predict that degrade.
+        _unrecl = info[2] if info is not None and info[2] >= 0 else 0
+        fits = max(1, (slice_max_bytes - _unrecl) // needed)
         log(f"worker memory: a {heap_mib:.0f} MiB declared heap needs "
             f"{needed_mib:.0f} MiB per worker, so the "
             f"{slice_max_bytes / 1024**2:.0f} MiB leerie.slice budget fits "
@@ -10559,6 +10573,25 @@ async def _backstop_capture_prior_runs(
         log_dir = run_dir / "logs"
         if not log_dir.is_dir():
             continue
+        # An EMPTY logs/ is a skeleton, not a run: `main()` mkdirs the run
+        # subtree before several startup resolvers that can die() (a bad
+        # --worker-memory-max, a declared heap that cannot fit the slice),
+        # so a rejected launch leaves a dir with logs/ and no sentinel.
+        # Without this it draws a dep_capture worker on every later run,
+        # forever, over a directory that never produced a single log line.
+        # `iterdir()` scandirs lazily inside `any()`, so unlike the `is_dir`
+        # guards above — which swallow OSError and return False — this line
+        # RAISES. A concurrent `cleanup.sh` removing a run dir in the window
+        # since `log_dir.is_dir()`, or a dir that is simply unreadable,
+        # would then propagate out of a function its call site documents as
+        # "Non-fatal: any error is logged and ignored" and abort the run at
+        # startup. Treat an unreadable logs/ as an empty one: both mean
+        # there is nothing here to capture.
+        try:
+            if not any(log_dir.iterdir()):
+                continue
+        except OSError:
+            continue
         sentinel = run_dir / "dep_capture.done"
         if sentinel.is_file():
             continue
@@ -13982,18 +14015,34 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # Node/V8 derives its default heap ceiling (~4.2 GiB) from *host* memory,
     # not the worker's cgroup memory.max — so on a Node repo, a build can
     # abort with a V8 heap OOM while most of leerie's (larger) per-worker
-    # allowance sits unused (P9). `- 2048` reserves headroom for the
-    # resident `claude -p` process sharing the same cgroup (see
-    # _auto_worker_memory_max's docstring: build + resident claude peaks
-    # around 6.3 GiB, measured against an 8 GiB floor). Auto-derivation
-    # floors at 8 GiB so this is normally >= 6144, but --worker-memory-max /
-    # LEERIE_WORKER_MEMORY_MAX / leerie.toml let an operator set the cap
-    # below 2 GiB explicitly — clamp so V8 is never handed a non-positive
-    # or degenerately small ceiling.
+    # allowance sits unused (P9).
+    #
+    # This is the mirror image of `resolve_worker_memory_max`'s
+    # reconciliation: that one asks "given a declared heap, how big must the
+    # cap be", this one asks "given a cap, how big a heap may Node have".
+    # **Both subtract the same quantity** — everything else that shares the
+    # cgroup, i.e. Node's non-heap RSS plus the resident `claude -p`
+    # process — so both must use `_NODE_HEAP_HEADROOM_BYTES` rather than
+    # re-typing a literal.
+    #
+    # They did not, and that was a real defect: this site kept `- 2048`
+    # when the constant was re-derived to 2432, so leerie was granting a
+    # heap 384 MiB larger than its own measurement says fits. Worked
+    # example on the common auto path (ceiling 9677 MiB): 7629 injected +
+    # ~2130 non-heap + ~328 claude = 10087 against a 9677 cap — an
+    # in-cgroup OOM produced by leerie's own injection, which is the exact
+    # failure class N14-16 exists to close. Referencing the shared constant
+    # makes the two halves move together or not at all.
+    #
+    # Auto-derivation floors at 8 GiB so this is normally >= 5760, but
+    # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX / leerie.toml let an
+    # operator set the cap below the reserve explicitly — clamp so V8 is
+    # never handed a non-positive or degenerately small ceiling.
     if worker_memory_max_bytes is not None and _is_node_repo(cwd):
         if worker_env is None:
             worker_env = os.environ.copy()
-        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        reserve_mb = _NODE_HEAP_HEADROOM_BYTES // (1024 * 1024)
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - reserve_mb, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
     proc = await asyncio.create_subprocess_exec(
@@ -18241,12 +18290,16 @@ def _warn_decomposition_share(st: State, caps: dict) -> float | None:
     st.save()
     threshold = caps.get("decompose_budget_share",
                          DEFAULT_CAPS["decompose_budget_share"])
+    # Same defensive access as `threshold` above: this branch only runs when
+    # the warning fires, so a bracket lookup here would KeyError on exactly
+    # the partial-caps callers the .get() was written to tolerate.
+    _cap_total = caps.get("max_total_workers",
+                          DEFAULT_CAPS["max_total_workers"])
     if share >= threshold:
         log(f"  decomposition used {dec}/{total} calls ({share:.0%}) of this "
             f"run's spend so far, at or above the {threshold:.0%} advisory "
             f"share; healthy runs measured p50 13%. Execution has "
-            f"{caps['max_total_workers'] - total} of "
-            f"{caps['max_total_workers']} calls left")
+            f"{_cap_total - total} of {_cap_total} calls left")
     return share
 
 
@@ -24394,10 +24447,53 @@ def resolve_blt(repo_root: Path) -> dict[str, str]:
 # an LLM.
 _NODE_HEAP_FLAG_RE = re.compile(r"--max[-_]old[-_]space[-_]size(?:=|\s+)(\d+)")
 
-# `<pm> run <script>` — the shape `_infer_build_lint_test` emits for every
-# Node repo. The heap flag is almost never in this string; it is in the
-# package.json script body this indirects to.
-_PM_RUN_RE = re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9:_.-]+)")
+# A package-manager invocation, and every candidate token that follows it.
+# `_infer_build_lint_test` emits `<pm> run <script>`, but a `.leerie/
+# config.toml` may declare any of the idiomatic shorthands, and the heap
+# flag is almost never in this string — it is in the package.json script
+# body the command indirects to.
+#
+# Matching only the literal `run` missed `yarn test`, `npm test`,
+# `npm run-script test`, and every workspace form (`pnpm -r run build`,
+# `pnpm --filter web run build`). Rather than enumerate those, take the PM
+# token and treat each following non-flag token as a candidate script name.
+#
+# The two error directions are NOT symmetric, and the asymmetry is what
+# licenses the over-inclusion. The resolved heap RAISES the worker's memory
+# cage (`needed = declared_heap_bytes + _NODE_HEAP_HEADROOM_BYTES`), so:
+# over-detecting inflates the cage — wasteful, and it throttles the
+# admission gate, but it cannot OOM; MISSING a script under-sizes the cage
+# and the worker OOMs, which is the whole failure this reconciliation
+# exists to prevent. When in doubt, offer the candidate.
+_PM_TOKEN_RE = re.compile(r"\b(?:npm|pnpm|yarn|bun)\b")
+# Split on shell separators BEFORE tokenising: tokens past one belong to a
+# different command. Testing `tok in {"&&", ...}` per whitespace-split token
+# cannot see a separator written without surrounding spaces —
+# `"build&&node".split()` yields one token that equals no separator — so
+# `pnpm run build&&node x.js` lost `build` (the real script) and offered
+# `x.js` instead. That is a miss, the dangerous direction.
+_SEG_RE = re.compile(r"&&|\|\||[;|&\n]")
+
+
+def _pm_script_candidates(cmd: str) -> list[str]:
+    """Script names a package-manager invocation in `cmd` might be running.
+
+    Over-inclusive on purpose (see `_PM_TOKEN_RE` for why that direction is
+    the safe one): callers look each name up in `package.json`'s `scripts`,
+    so a token that is not a script resolves to nothing. `run` /
+    `run-script` are skipped as the subcommands they are, flags are skipped,
+    and a flag's *value* may survive as a spurious candidate — accepted,
+    because narrowing it away costs misses. `pnpm exec turbo run build`
+    resolves `build` only because trailing tokens are still considered."""
+    out: list[str] = []
+    for seg in _SEG_RE.split(cmd):
+        for m in _PM_TOKEN_RE.finditer(seg):
+            for tok in seg[m.end():].split():
+                if tok.startswith("-") or tok in ("run", "run-script"):
+                    continue
+                if re.fullmatch(r"[A-Za-z0-9:_.-]+", tok):
+                    out.append(tok)
+    return out
 
 
 def _package_json_scripts(repo_root: Path) -> dict[str, str]:
@@ -24467,8 +24563,7 @@ def _declared_node_heap_bytes(repo_root: Path) -> int | None:
             mb = _heap_in(cmd)
             if mb is not None and (max_mb is None or mb > max_mb):
                 max_mb = mb
-            for m in _PM_RUN_RE.finditer(cmd):
-                name = m.group(1)
+            for name in _pm_script_candidates(cmd):
                 if name in seen:
                     continue
                 seen.add(name)
@@ -28975,17 +29070,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # helper was renamed private and thus came under that guard's scope.
     caps["token_probe_cache_sec"] = resolve_token_probe_cache_sec(
         cwd, getattr(args, "token_probe_cache_sec", None))
-    # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
-    # string. Auto-derives a fixed isolation CEILING from the shared
-    # leerie.slice budget (_worker_memory_ceiling) — a build-running
-    # worker's cgroup holds the build subprocess tree AND the resident
-    # claude -p process at once, measured peak ~6.3 GiB. Resolving once
-    # here is correct precisely because the ceiling is load-independent;
-    # contention is handled at spawn time by the admission gate, not by
-    # shrinking this value. `caps["max_parallel"]` feeds the legacy
-    # /proc/meminfo fallback (no broker / containment off) and the
-    # fleet-fit forecast, which asks whether max_parallel workers of
-    # this repo's declared demand fit the slice at once.
     # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the
     # resolver die()s on a non-positive-integer value. Threaded into
     # _cgroup_create via the caps.get("worker_pids_max", …) site so the
@@ -29042,7 +29126,19 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # a diagnosable trail (the gap that made run 26fd0fa5 undiagnosable).
     _install_run_log_tee(st.run_dir)
 
-    # Per-worker memory sizing. Deliberately AFTER the log tee: this block
+    # Resolve per-worker cgroup memory cap; resolver die()s on a bad size
+    # string. Auto-derives a fixed isolation CEILING from the shared
+    # leerie.slice budget (_worker_memory_ceiling) — a build-running
+    # worker's cgroup holds the build subprocess tree AND the resident
+    # claude -p process at once, measured peak ~6.3 GiB. Resolving once
+    # here is correct precisely because the ceiling is load-independent;
+    # contention is handled at spawn time by the admission gate, not by
+    # shrinking this value. `caps["max_parallel"]` feeds the legacy
+    # /proc/meminfo fallback (no broker / containment off) and the
+    # fleet-fit forecast, which asks whether max_parallel workers of
+    # this repo's declared demand fit the slice at once.
+    #
+    # Deliberately AFTER the log tee: this block
     # is the only startup step that logs a *diagnosis* rather than a
     # setting — the repo's declared Node heap, or its absence, and the
     # fleet-fit forecast. Resolving it before the tee sent exactly those

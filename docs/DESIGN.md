@@ -2991,8 +2991,8 @@ regardless of any individual worker's `memory.max`. Two consequences
 follow, and they are the load-bearing part of this design:
 
 1. Per-worker ceilings **may safely sum past the slice budget**. Eight
-   workers capped at 9.4 GiB do not reserve 75 GiB; they each promise
-   only "kill me before I exceed 9.4". The slice cap still binds.
+   workers capped at 9.45 GiB do not reserve 75.6 GiB; they each promise
+   only "kill me before I exceed 9.45". The slice cap still binds.
 2. Therefore the per-worker cap must **never** be derived by dividing
    the slice budget across a projected worker count. Doing so treats a
    ceiling as a reservation and manufactures caps *below* the measured
@@ -3002,23 +3002,57 @@ follow, and they are the load-bearing part of this design:
 
 The cap is therefore a fixed isolation ceiling —
 `max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
-the host's slice budget alone, not of load. The half-slice bound stops
+the host's slice budget and the repo's own declared needs, never of
+*load*. (The declared-needs half is the reconciliation below; the point
+here is that nothing about how busy the slice is right now may enter.) The half-slice bound stops
 one worker being licensed to eat the fleet's headroom, but the build
 peak outranks it: on a slice too small to honour both, a `memory.max`
 above the slice is harmless (the aggregate cap binds first) while one
 below the build peak guarantees the OOM. Being load-independent is what
 makes resolving it once, at startup, correct.
 
+**A repo can declare its own memory needs, and the ceiling must honour
+them.** Node 20+ sizes its heap from the container it finds itself in —
+but an explicit `--max-old-space-size` overrides that entirely, and the
+heap then throws OOM at its declared limit regardless of how much room the
+cgroup has. So a repo whose own build or test command declares a heap
+(most often not in the command leerie resolves, but inside the
+`package.json` script that command runs — which is why the resolver
+follows the indirection rather than scanning the literal string) has
+told leerie exactly what one of its workers needs, and a ceiling derived
+without reading that is derived from the wrong evidence: the repo's own
+number outranks any measurement leerie inherited from elsewhere.
+
+The ceiling is therefore raised to `declared heap + headroom` when the
+repo declares one, where the headroom covers everything else sharing the
+cgroup — Node's non-heap memory and the resident worker process. Two
+refusals bound it. An operator who pins a smaller cap explicitly is
+refused rather than silently overridden, because issuing a cap below a
+declared heap guarantees the OOM the cap exists to prevent. And a declared
+heap that cannot fit the shared slice even alone is refused outright,
+since no per-worker arithmetic can rescue it.
+
+The same headroom figure runs in reverse elsewhere: leerie also tells Node
+how big a heap it may take given a cap. Those are one quantity viewed from
+two directions, and they must move together — they were once out of step,
+which had leerie granting a heap larger than the cage it had to live in.
+
 **The ceiling is not the only per-worker figure: admission needs a
 *demand* estimate, and the two are different quantities.** The ceiling
 answers "how big before *this* worker is killed" and reserves nothing.
 Admission answers a different question — "is there room for another
 build right now" — and that one genuinely does reserve, so it needs a
-prediction of what a worker will actually *use*. Conflating the two in
-either direction is a mistake: reserving against the ceiling throttles
-every run to fit a bound nobody is expected to reach, and sizing the
-ceiling from the estimate reintroduces the divide-the-slice failure
-above.
+prediction of what a worker will actually *use*. Conflating the two is a mistake in one
+direction: reserving against the *ceiling* would throttle every run to fit
+a bound nobody is expected to reach.
+
+The other direction is subtler, because the two figures legitimately
+coincide. When a repo declares a heap, the ceiling is raised to exactly
+`declared heap + headroom` — the same value the demand estimate takes —
+and that is not the divide-the-slice failure above: it is a *floor* driven
+by what the repo says it needs, not a *share* of the slice divided by a
+worker count. The rule that matters is the narrow one: never derive a
+per-worker cap by dividing the slice budget across projected workers.
 
 The estimate defaults to the same measured build peak, which is why the
 distinction stayed invisible for so long. It stops being invisible when
@@ -3036,8 +3070,20 @@ section used to quote:
 1. The provable reservation ceiling is `demand × (max_parallel + 1)`,
    not `build_peak × (max_parallel + 1)`. For a repo that declares a
    large heap this can exceed the slice budget, and that is expected:
-   wave-entry degradation shrinks concurrency until it fits, which is
-   the mechanism doing its job rather than a violation of the bound.
+   wave-entry degradation shrinks concurrency toward what fits, which is
+   the mechanism doing its job rather than a violation of the bound. It
+   floors at one worker: a wave of zero makes no progress at all.
+
+   That floor is not what handles a heap larger than the whole slice,
+   though — startup refuses first, so the wave never runs. Degradation
+   floors at one worker because a wave of zero is useless, not because
+   one oversized worker is an acceptable outcome. The refusal is also
+   narrower than "always": it is reached only when the resolved ceiling
+   is *below* `declared heap + headroom`, so a repo whose auto-derived
+   ceiling already clears that floor is admitted without the slice ever
+   being consulted. What is genuinely relied on there is the per-worker
+   cap — the slice check asks whether ONE such worker fits, never
+   `max_parallel` of them.
 2. Because degradation is the designed response, a declared heap large
    relative to the slice buys fewer concurrent workers. The operator is
    told so at startup rather than discovering it as unexplained
@@ -3104,8 +3150,8 @@ already runs under, so reservations cannot exceed
 38 GiB, which fits an idle 54.9 GiB slice and still blocks a busy one.
 A repo declaring a large heap raises the estimate and can push that
 product past the slice; wave-entry degradation then shrinks concurrency
-until it fits, which is the designed response rather than a broken
-bound.
+toward what fits (flooring at one), which is the designed response rather
+than a broken bound.
 
 `_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
 window between the gate and the spawn path's `try`/`finally`. It is also
