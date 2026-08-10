@@ -312,3 +312,150 @@ def test_config_toml_still_wins_when_it_declares_blt(leerie, repo_root):
         test_cmd="NODE_OPTIONS=--max-old-space-size=2048 vitest run",
     )
     assert leerie._declared_node_heap_bytes(repo_root) == 2048 * 1024 * 1024
+
+
+# ---- package-manager shorthands (B7) ---------------------------------------
+#
+# `_infer_build_lint_test` emits `<pm> run <script>`, but a repo's own
+# `.leerie/config.toml` may declare any idiomatic shorthand. Matching only
+# the literal `run` silently disabled the whole reconciliation for those —
+# and since the heap lives in the script body, a missed indirection means
+# no heap found at all.
+
+@pytest.mark.parametrize("cmd", [
+    "yarn test",                     # yarn's `run` is optional
+    "npm test",                      # npm lifecycle shorthand
+    "npm run-script test",           # documented npm alias
+    "pnpm run test",                 # the inferred form (control)
+])
+def test_pm_shorthands_reach_the_script(leerie, repo_root, cmd):
+    _write_node_repo(repo_root, {
+        "test": "NODE_OPTIONS=--max-old-space-size=8192 vitest run"})
+    _write_config(repo_root, test_cmd=cmd)
+    assert leerie._declared_node_heap_bytes(repo_root) == 8192 * 1024 * 1024
+
+
+@pytest.mark.parametrize("cmd", [
+    "pnpm -r run build",
+    "pnpm --filter web run build",
+    "yarn --cwd app build",
+])
+def test_workspace_flag_forms_reach_the_script(leerie, repo_root, cmd):
+    """A flag's VALUE may survive as a spurious candidate (`web`, `app`) —
+    harmless, because a candidate that is not a script name is only a
+    `scripts.get()` miss. What matters is that `build` is still reached."""
+    _write_node_repo(repo_root, {
+        "build": "NODE_OPTIONS=--max-old-space-size=8192 next build"})
+    _write_config(repo_root, typecheck_cmd=cmd)   # typecheck_cmd writes `build`
+    assert leerie._declared_node_heap_bytes(repo_root) == 8192 * 1024 * 1024
+
+
+@pytest.mark.parametrize("cmd", [
+    "pnpm run build&&node x.js start",     # no spaces around &&
+    "pnpm run build;node x.js start",      # no spaces around ;
+    "pnpm run build|tee log start",        # no spaces around |
+    "pnpm run build && node x.js start",   # spaced (already worked)
+])
+def test_separator_without_spaces_still_finds_the_real_script(
+        leerie, repo_root, cmd):
+    """The script the command actually runs must be found whichever way the
+    chain is punctuated — and the *other* command's argument must not be.
+
+    This is one control for two failures, because the pre-fix code produced
+    both at once. `_SHELL_SEP` was tested per whitespace-split token, so a
+    separator written without surrounding spaces was invisible:
+    `"build&&node".split()` is a single token that equals no separator. On
+    `pnpm run build&&node x.js start` the shipped matcher therefore returned
+    `['x.js', 'start']` — it LOST `build`, the script being run, and offered
+    `start`, an argument to a different command.
+
+    The miss is the dangerous half. A resolved heap raises the worker's
+    memory cage, so losing `build`'s declared 8192 under-sizes the cage and
+    the worker OOMs — the exact failure this reconciliation exists to
+    prevent. Asserting 8192 (not 16384, not None) pins both halves: `build`
+    was found, and `start` was not.
+    """
+    _write_node_repo(repo_root, {
+        "build": "NODE_OPTIONS=--max-old-space-size=8192 next build",
+        "start": "NODE_OPTIONS=--max-old-space-size=16384 next start",
+    })
+    _write_config(repo_root, test_cmd=cmd)
+    assert leerie._declared_node_heap_bytes(repo_root) == 8192 * 1024**2
+
+
+@pytest.mark.parametrize("cmd,expected", [
+    # A PM subcommand that is not a script resolves to nothing...
+    ("pnpm install --frozen-lockfile", ["install"]),
+    # ...but trailing tokens are still offered, and that is deliberate:
+    # `pnpm exec turbo run build` finds `build` ONLY because of it.
+    ("pnpm exec turbo run build", ["exec", "turbo", "build"]),
+    ("pnpm --filter web run build", ["web", "build"]),
+    ("yarn --cwd app build", ["app", "build"]),
+    ("npm run-script test", ["test"]),
+    ("yarn test", ["test"]),
+    # A newline is a separator too. Covered here rather than end-to-end
+    # because it cannot survive the trip: `_write_config` interpolates into
+    # a TOML basic string, and a literal newline makes that invalid TOML, so
+    # the whole config is dropped and the assertion would be answered by the
+    # inference fallback instead. That is how the newline case in the
+    # end-to-end parametrization above came to pass pre-fix while proving
+    # nothing — it never tested a newline at all.
+    ("pnpm run build\nnode x.js start", ["build"]),
+])
+def test_candidate_extraction_stays_over_inclusive(leerie, cmd, expected):
+    """Asserted at the unit, because the end-to-end form cannot fail.
+
+    Its predecessor (`test_pm_subcommands_are_not_treated_as_scripts`) wrote
+    a fixture with no `--max-old-space-size` anywhere and asserted `None` —
+    which every possible implementation returns, including one that scans
+    every script in the file. It could not distinguish correct behaviour
+    from any other.
+
+    Over-inclusion is the intended design, not a tolerated flaw: narrowing
+    to `exec`/`dlx`-abandon or stop-at-`--` was prototyped and rejected,
+    because `pnpm exec turbo run build` and `pnpm exec turbo -- run build`
+    both become misses under those rules.
+    """
+    assert leerie._pm_script_candidates(cmd) == expected
+
+
+# ---- the fleet-fit forecast (B4/B5) ----------------------------------------
+
+def test_fleet_fit_forecast_uses_the_same_signal_as_the_degrade(
+        leerie, repo_root, monkeypatch, capsys):
+    """The forecast predicts `_degrade_max_parallel_for_wave`, so it must
+    read the same signal — `slice_max MINUS unreclaimable`, never the raw
+    budget.
+
+    Dividing the raw budget over-reports how many workers will actually be
+    admitted, in a message whose only purpose is to tell the operator what
+    the degrade is about to do. Numbers chosen so the two disagree: a
+    40 GiB slice with 20 GiB unreclaimable fits 3 workers raw and 1 after
+    the subtraction."""
+    _write_node_repo(repo_root, {
+        "test": "NODE_OPTIONS=--max-old-space-size=8192 vitest run"})
+    monkeypatch.setattr(leerie, "_auto_worker_memory_max",
+                        lambda *_a, **_k: 6 * 1024**3)
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                        lambda: (40 * 1024**3, 0, 20 * 1024**3))
+
+    leerie.resolve_worker_memory_max(repo_root, max_parallel=5)
+    out = capsys.readouterr()
+    msg = out.out + out.err
+
+    assert "fits ~1 concurrent workers" in msg, (
+        f"forecast must divide headroom, not the raw slice budget: {msg}")
+    assert "fits ~3" not in msg
+
+
+def test_degrade_log_names_the_demand_estimate_not_the_build_peak(
+        leerie, monkeypatch, capsys):
+    """`build_peak_bytes` is injectable now, so labelling it the
+    "build-peak floor" is wrong precisely on the runs N14-16 targets — it
+    prints a repo's declared-heap demand under the build-peak name."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info",
+                        lambda: (40 * 1024**3, 0, 30 * 1024**3))
+    leerie._degrade_max_parallel_for_wave(5, 8 * 1024**3)
+    msg = "".join(capsys.readouterr())
+    assert "per-worker demand estimate" in msg
+    assert "build-peak floor" not in msg

@@ -96,7 +96,14 @@ def test_invoke_sets_node_options_for_node_repo(leerie, tmp_path, monkeypatch):
         monkeypatch, leerie, str(tmp_path),
         worker_memory_max_bytes=8 * 1024**3))
     assert env is not None
-    assert env["NODE_OPTIONS"] == "--max-old-space-size=6144"
+    # Derived from the constant, not retyped: `_invoke` reserves
+    # `_NODE_HEAP_HEADROOM_BYTES` for Node's own non-heap footprint plus the
+    # resident `claude` process. A literal here silently goes stale the next
+    # time that reserve is re-derived — which is exactly what happened to
+    # this line when it still read 6144 (= 8192 - 2048).
+    reserve_mb = leerie._NODE_HEAP_HEADROOM_BYTES // (1024 * 1024)
+    expected = 8 * 1024 - reserve_mb
+    assert env["NODE_OPTIONS"] == f"--max-old-space-size={expected}"
 
 
 def test_invoke_omits_node_options_for_non_node_repo(leerie, tmp_path, monkeypatch):
@@ -119,8 +126,14 @@ def test_invoke_omits_node_options_when_memory_max_is_none(leerie, tmp_path, mon
 def test_invoke_clamps_node_options_for_small_explicit_memory_max(leerie, tmp_path, monkeypatch):
     # --worker-memory-max / LEERIE_WORKER_MEMORY_MAX can be set below 2 GiB
     # explicitly (resolve_worker_memory_max has no minimum, unlike the
-    # auto-derive path's 8 GiB floor) — the naive `cap_mb - 2048` derivation
+    # auto-derive path's 8 GiB floor) — subtracting the reserve outright
     # would go negative and hand V8 an invalid --max-old-space-size.
+    # This asserts the 256 floor literally rather than deriving it: the
+    # floor IS the constant under test here, and it only engages while the
+    # reserve exceeds the cap (1024 MiB). That makes this test sensitive to
+    # the reserve shrinking below ~768 MiB, which is intentional — a reserve
+    # that small is itself the bug `test_node_heap_headroom_is_2432_mib`
+    # exists to catch.
     import asyncio
     (tmp_path / "package.json").write_text("{}")
     env = asyncio.run(_capture_env_and_run(

@@ -206,43 +206,87 @@ def test_is_node_repo_false_for_empty_dir(leerie, tmp_path):
 
 # ---- NODE_OPTIONS derivation (P9) ------------------------------------------
 #
-# The derivation itself (leerie.py ~12707-12711, inside `_invoke`) is:
-#     cap_mb = max(worker_memory_max_bytes // (1024*1024) - 2048, 256)
+# The derivation itself (inside `_invoke`) is:
+#     reserve_mb = _NODE_HEAP_HEADROOM_BYTES // (1024*1024)
+#     cap_mb = max(worker_memory_max_bytes // (1024*1024) - reserve_mb, 256)
 #     worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 # gated on `worker_memory_max_bytes is not None and _is_node_repo(cwd)`.
+#
+# The reserve is READ FROM THE MODULE here, never re-typed. It is the same
+# quantity `resolve_worker_memory_max` adds to a declared heap — Node's
+# non-heap RSS plus the resident claude process — and the two sites were
+# once out of step (injection on 2048 while the constant said 2432), which
+# handed Node a heap 384 MiB larger than its cgroup could hold. Hard-coding
+# it in these tests is what would let that recur silently.
 # `_invoke` builds the whole subprocess environment inline rather than
 # through a standalone helper, so these tests pin the arithmetic and the
 # gating condition directly (mirroring the derivation's own inline
 # formula) rather than invoking the full async subprocess-spawning
 # function, which the rest of this file's tests never do either.
 
-def _node_options_value(cap_bytes: int) -> str:
-    cap_mb = max(cap_bytes // (1024 * 1024) - 2048, 256)
+def _reserve_mb(leerie) -> int:
+    return leerie._NODE_HEAP_HEADROOM_BYTES // (1024 * 1024)
+
+
+def test_node_heap_headroom_is_2432_mib(leerie):
+    """Pin the VALUE, not just that everything derives from it.
+
+    Every other assertion about the reserve in this suite is now expressed
+    as `_reserve_mb(leerie)`, and `_invoke`'s injection reads the same
+    constant — which is the coupling we want, but it means all of them move
+    together. Setting the constant to `243 * 1024 * 1024` left the ENTIRE
+    suite green: the derivations agreed with each other about a reserve an
+    order of magnitude too small, and nothing said where they should agree.
+
+    The two anchors that used to hold the number down — a literal
+    `--max-old-space-size=6144` assertion and a `"- 2048"` source pin — were
+    both removed when those sites were converted to derive from the
+    constant, so this replaces them. Same reasoning as
+    `test_orphan_min_age_is_one_hour` and
+    `test_destroy_drain_budget_is_ten_seconds` in the broker suite.
+
+    The decomposition (docs/DESIGN.md, and the comment at the definition):
+
+        Node's own non-heap RSS   ~2.08 GiB   derived
+        the resident `claude -p`  ~0.32 GiB   measured live
+                                  ---------
+                                  ~2.40 GiB   -> rounded up to 2432 MiB
+
+    Under-sizing it hands Node a heap larger than fits the cage and the
+    worker OOMs; over-sizing it wastes the difference on every worker.
+    """
+    assert leerie._NODE_HEAP_HEADROOM_BYTES == 2432 * 1024 * 1024
+
+
+def _node_options_value(leerie, cap_bytes: int) -> str:
+    cap_mb = max(cap_bytes // (1024 * 1024) - _reserve_mb(leerie), 256)
     return f"--max-old-space-size={cap_mb}"
 
 
 def test_node_options_arithmetic_8gib_floor(leerie):
-    """8 GiB floor (the common auto-derived case) minus the 2048 MiB
-    reserve for the resident claude process."""
+    """8 GiB floor (the common auto-derived case) minus the reserve."""
     cap_bytes = 8 * 1024**3
-    assert _node_options_value(cap_bytes) == "--max-old-space-size=6144"
+    expected = 8192 - _reserve_mb(leerie)
+    assert _node_options_value(leerie, cap_bytes) == \
+        f"--max-old-space-size={expected}"
 
 
 def test_node_options_arithmetic_larger_auto_derived_cap(leerie):
     """A larger auto-derived cap (e.g. 25.6 GiB from a well-resourced
-    host splitting across max_parallel=4) still subtracts exactly
-    2048 MiB, not a percentage or other scaling."""
+    host splitting across max_parallel=4) still subtracts exactly the
+    reserve, not a percentage or other scaling."""
     cap_bytes = (128 * 1024**3) // 5  # matches test_auto_splits_meminfo_across_slots
     cap_mb = cap_bytes // (1024 * 1024)
-    assert _node_options_value(cap_bytes) == f"--max-old-space-size={cap_mb - 2048}"
+    assert _node_options_value(leerie, cap_bytes) == \
+        f"--max-old-space-size={cap_mb - _reserve_mb(leerie)}"
 
 
 def test_node_options_clamped_when_cap_below_reserve(leerie):
-    """An operator-set cap below the 2048 MiB reserve (e.g. via
+    """An operator-set cap below the reserve (e.g. via
     --worker-memory-max/LEERIE_WORKER_MEMORY_MAX/leerie.toml) must not
     produce a non-positive or degenerately small V8 heap ceiling."""
-    cap_bytes = 512 * 1024**2  # 512 MiB, well under the 2048 MiB reserve
-    assert _node_options_value(cap_bytes) == "--max-old-space-size=256"
+    cap_bytes = 512 * 1024**2  # 512 MiB, well under the reserve
+    assert _node_options_value(leerie, cap_bytes) == "--max-old-space-size=256"
 
 
 def test_node_options_present_for_node_repo(leerie, tmp_path):
@@ -254,10 +298,12 @@ def test_node_options_present_for_node_repo(leerie, tmp_path):
     if worker_memory_max_bytes is not None and leerie._is_node_repo(str(tmp_path)):
         import os as _os
         worker_env = _os.environ.copy()
-        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024)
+                     - _reserve_mb(leerie), 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
     assert worker_env is not None
-    assert worker_env["NODE_OPTIONS"] == "--max-old-space-size=6144"
+    assert worker_env["NODE_OPTIONS"] == \
+        f"--max-old-space-size={8192 - _reserve_mb(leerie)}"
 
 
 def test_node_options_absent_for_non_node_repo(leerie, tmp_path):
@@ -269,7 +315,8 @@ def test_node_options_absent_for_non_node_repo(leerie, tmp_path):
     if worker_memory_max_bytes is not None and leerie._is_node_repo(str(tmp_path)):
         import os as _os
         worker_env = _os.environ.copy()
-        cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - 2048, 256)
+        cap_mb = max(worker_memory_max_bytes // (1024 * 1024)
+                     - _reserve_mb(leerie), 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
     assert worker_env is None
 
@@ -314,13 +361,25 @@ def test_invoke_node_options_gate_condition_unchanged(leerie):
 
 
 def test_invoke_node_options_reserve_constant_unchanged(leerie):
-    """The 2048 MiB reserve is what the tests above hard-code; a change to
-    this constant in `_invoke` must be reflected in the arithmetic tests
-    too, not silently diverge from what they assert."""
+    """The reserve must be READ from `_NODE_HEAP_HEADROOM_BYTES`, not
+    re-typed as a literal.
+
+    This pin used to assert the literal `- 2048`, which is a weaker
+    property: it kept the injection frozen while
+    `resolve_worker_memory_max` moved its own copy of the same quantity to
+    2432, and the two silently disagreed — leerie granting Node a heap
+    384 MiB bigger than the cgroup it had to live in. Coupling to the
+    shared constant makes that state unrepresentable: change the constant
+    and both the reconciliation floor and the injected heap move together,
+    or neither does."""
     block = _invoke_node_options_source(leerie)
-    assert "- 2048" in block, (
-        "The 2048 MiB reserve constant in _invoke's NODE_OPTIONS derivation "
-        "changed — update test_node_options_arithmetic_* to match."
+    assert "_NODE_HEAP_HEADROOM_BYTES" in block, (
+        "_invoke's NODE_OPTIONS derivation must reference "
+        "_NODE_HEAP_HEADROOM_BYTES, not a re-typed literal — that is how "
+        "it drifted out of step with resolve_worker_memory_max before."
+    )
+    assert "- 2048" not in block, (
+        "a literal reserve reappeared in _invoke's NODE_OPTIONS derivation"
     )
 
 
@@ -345,7 +404,7 @@ def test_invoke_node_options_env_key_and_format_unchanged(leerie):
 
 def test_invoke_node_options_formula_ast_matches_helper(leerie):
     """Parse `_invoke`'s real NODE_OPTIONS assignment as an AST and confirm
-    it computes `max(worker_memory_max_bytes // (1024*1024) - 2048, 256)` —
+    it computes `max(worker_memory_max_bytes // (1024*1024) - reserve_mb, 256)` —
     structurally, not by substring — so a reformulation that keeps the
     substrings above (e.g. reordering the max() args, or changing the
     divisor) still gets caught."""
@@ -374,7 +433,42 @@ def test_invoke_node_options_formula_ast_matches_helper(leerie):
 
     sub_expr = call.args[0]
     assert isinstance(sub_expr, ast.BinOp) and isinstance(sub_expr.op, ast.Sub)
-    assert isinstance(sub_expr.right, ast.Constant) and sub_expr.right.value == 2048
+    # The subtrahend must be a NAME (the reserve derived from
+    # `_NODE_HEAP_HEADROOM_BYTES`), never an `ast.Constant`. A constant here
+    # is exactly the drift that let the injection and the reconciliation
+    # disagree about the same quantity.
+    assert not isinstance(sub_expr.right, ast.Constant), (
+        "the reserve is a hard-coded literal again; it must derive from "
+        "_NODE_HEAP_HEADROOM_BYTES"
+    )
+    assert isinstance(sub_expr.right, ast.Name), (
+        f"expected a name for the reserve, got {ast.dump(sub_expr.right)}"
+    )
+    # ...and that name must actually BE derived from the constant. Asserting
+    # only "it is a Name" accepts any local, so
+    #     reserve_mb = 2432          # _NODE_HEAP_HEADROOM_BYTES
+    #     cap_mb = max(... - reserve_mb, 256)
+    # passes every check above — the literal is back, the coupling is gone,
+    # and the accompanying comment makes the `"_NODE_HEAP_HEADROOM_BYTES" in
+    # block` substring check pass too. Resolve the binding instead.
+    reserve_name = sub_expr.right.id
+    bindings = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == reserve_name
+    ]
+    assert bindings, f"`{reserve_name}` is used but never assigned in _invoke"
+    assert any(
+        isinstance(sub, ast.Name)
+        and sub.id == "_NODE_HEAP_HEADROOM_BYTES"
+        for b in bindings for sub in ast.walk(b.value)
+    ), (
+        f"`{reserve_name}` is not derived from _NODE_HEAP_HEADROOM_BYTES; "
+        f"got {[ast.unparse(b.value) for b in bindings]} — the reserve is a "
+        f"literal wearing a name"
+    )
 
     floordiv_expr = sub_expr.left
     assert isinstance(floordiv_expr, ast.BinOp) and isinstance(floordiv_expr.op, ast.FloorDiv)

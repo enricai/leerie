@@ -94,6 +94,27 @@ def test_threshold_comes_from_caps_not_a_literal(leerie, capsys):
     assert "decomposition used 20/100" in "".join(capsys.readouterr())
 
 
+def test_tolerates_a_caps_dict_missing_max_total_workers(leerie, capsys):
+    """The whole point of the `.get()` — and the one case no other test in
+    this file constructs.
+
+    Every other test here passes a caps dict carrying `max_total_workers`,
+    so the bracket lookup this replaced would have passed all of them. It
+    KeyErrors only on a partial-caps caller, and only on the branch that
+    runs when the warning fires — the two conditions have to coincide, so
+    the fix was shipped untested. `run_recapture_deps`, `run_rebaser` and
+    `_replay_capture` each build their own minimal caps.
+    """
+    st = _St({"worker_count": 100, "decompose_worker_count": 60})  # 60%
+    share = leerie._warn_decomposition_share(st, {})
+    assert share == 0.6
+    out = "".join(capsys.readouterr())
+    assert "decomposition used 60/100" in out
+    # The fallback figure came from DEFAULT_CAPS, not from a KeyError path.
+    left = leerie.DEFAULT_CAPS["max_total_workers"] - 100
+    assert f"{left} of {leerie.DEFAULT_CAPS['max_total_workers']}" in out
+
+
 def test_declared_in_state_fields(leerie):
     """Guard-the-guard for the generic parity sweep: this key must be
     declared, or `resume` carries an undeclared field."""

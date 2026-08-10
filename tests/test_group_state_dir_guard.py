@@ -3,20 +3,20 @@ per-basename state dirs even when the parent env carries LEERIE_STATE_HOST_DIR,
 and a shared LEERIE_STATE_DIR / --state-dir is rejected before any child spawns.
 
 Background (from the plan's finding #1):
-  The launcher exports LEERIE_STATE_HOST_DIR after resolution (leerie:561), so
+  The launcher exports LEERIE_STATE_HOST_DIR after resolution (leerie:844), so
   every child process inherits the *parent's* already-resolved state dir. This
-  is safe because children re-resolve from cwd basename (leerie:502-508) and
+  is safe because children re-resolve from cwd basename (leerie:785-789) and
   LEERIE_STATE_HOST_DIR is the *output* var — it does NOT feed back into
-  resolution (the *input* var is LEERIE_STATE_DIR, leerie:531-534). So two
+  resolution (the *input* var is LEERIE_STATE_DIR, leerie:814-816). So two
   members cd-ing into grp-api and grp-web each get their own
   ~/.leerie/<basename> regardless of the inherited output var.
 
   The trap: if LEERIE_STATE_DIR (input) or --state-dir (CLI) is forwarded into
   the child's env, all members resolve to the same shared dir and the .owner
   sidecar refuses the second member. The group arm therefore rejects both
-  before fan-out (leerie:2808-2813, leerie:2790-2793).
+  before fan-out (leerie:3564-3567, leerie:3546-3548).
 
-The harness below mirrors _state_dir_default (leerie:502-506) — the exact
+The harness below runs _state_dir_default (leerie:785-789) — the exact
 resolution that each group-member subshell runs after cd-ing into its repo.
 We test:
   A) With LEERIE_STATE_HOST_DIR inherited from the "parent", two members in
@@ -42,8 +42,8 @@ LAUNCHER = REPO_ROOT / "leerie"
 #
 # Each member receives USER_REPO (its repo path), HOME, and optionally
 # inherits LEERIE_STATE_HOST_DIR (the parent's already-resolved output var)
-# and/or LEERIE_STATE_DIR (the dangerous input var).  The harness reproduces
-# leerie:502-561 — the block that runs in the child subshell after `cd <repo>`.
+# and/or LEERIE_STATE_DIR (the dangerous input var).  The harness EXTRACTS
+# leerie:785-844 — the block that runs in the child subshell after `cd <repo>`.
 #
 # Args: <user_repo> <fake_home>; remaining args are treated as CLI flags.
 # Env: set LEERIE_STATE_HOST_DIR and/or LEERIE_STATE_DIR as needed.
@@ -52,9 +52,10 @@ LAUNCHER = REPO_ROOT / "leerie"
 # Extracted verbatim from the launcher rather than reproduced. The copy this
 # replaced was logic-identical to `leerie`'s block, but body-blind by
 # construction — nothing here read or executed the launcher, so no change to
-# it could fail these tests. Its own docstring cited SIX launcher line
-# numbers, every one of which had already drifted (the block moved from
-# ~:502-561 to :785-844), which is the drift this shape exists to prevent.
+# it could fail these tests. Its own docstring carried NINE launcher line
+# citations, every one drifted (the block had moved to :785-844); they are
+# corrected above rather than deleted, since they are what makes the
+# extraction's target legible, which is the drift this shape exists to prevent.
 #
 # Imported from test_resolve_state_dir rather than re-derived: that module
 # owns the extraction, and a second copy of a RULE drifts exactly the way a
@@ -143,9 +144,9 @@ class TestDistinctStateDirsUnderInheritedOutputVar:
         parent's already-resolved output var), the second member (grp-web) must
         still resolve to ~/.leerie/grp-web — NOT to ~/.leerie/grp-api.
 
-        LEERIE_STATE_HOST_DIR is the *output* var (leerie:561 `export`), not
+        LEERIE_STATE_HOST_DIR is the *output* var (leerie:844 `export`), not
         the *input* var (LEERIE_STATE_DIR).  The resolution block re-derives
-        from basename unconditionally (leerie:502-508), so the inherited output
+        from basename unconditionally (leerie:785-789), so the inherited output
         var is immediately overwritten and has no effect.
         """
         fake_home = tmp_path / "home"

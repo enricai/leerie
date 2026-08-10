@@ -255,7 +255,7 @@ def _drain_then_rmdir(d: str, budget_sec: float) -> str | None:
     `cgroup.kill` is ASYNCHRONOUS: it delivers SIGKILL and returns, while
     the kernel tears the processes down over the following moments. An
     immediate `os.rmdir` therefore races that teardown and loses with
-    EBUSY, leaking the directory — measured, 116 stale `leerie-w-*` dirs of
+    EBUSY, leaking the directory — measured, 115 stale `leerie-w-*` dirs of
     which 88 were `-conformer`, whose test-suite subprocess trees reach
     hundreds of PIDs and take correspondingly longer to die. The
     orchestrator had been naming the cause all along: `cgroup destroy
@@ -463,6 +463,13 @@ def _live_sibling_count() -> int:
 # spanned 14 days while every live worker's directory was minutes old.
 _ORPHAN_MIN_AGE_SEC = 3600.0
 
+# Hard ceiling on the whole sweep. It runs before the socket binds, so any
+# time spent here is time the orchestrator's first broker request races —
+# and that request fails open, degrading worker sizing silently. A partial
+# sweep is strictly better than a delayed bind: whatever is missed is
+# reclaimed on the next start.
+_SWEEP_TOTAL_BUDGET_SEC = 5.0
+
 
 def _sweep_orphaned_worker_cgroups() -> int:
     """Remove empty, old `leerie-w-*` directories left by earlier runs.
@@ -492,8 +499,19 @@ def _sweep_orphaned_worker_cgroups() -> int:
 
     Runs before the socket exists (see `main`), so no client of THIS broker
     can be mid-create while it walks."""
+    _started = time.monotonic()
+    if _HIER not in ("v1", "v2"):
+        # No usable hierarchy: `_slice_dir()` would fall back to the v1
+        # memory path on a host the broker has just declared unusable, and
+        # walking it is meaningless.
+        return 0
     now = time.time()
-    reclaimed = 0
+    # Count WORKERS, not directories: v1 splits one worker across two
+    # controller dirs, so a per-dir tally double-reports it.
+    reclaimed: set[str] = set()
+    # Names whose removal failed in AT LEAST ONE controller dir. Subtracted
+    # at the end so a worker is counted only when every dir it owns is gone.
+    failed: set[str] = set()
     # v1 splits a worker across two controller dirs; v2 has one. Walk
     # whatever the detected hierarchy actually uses rather than assuming.
     roots = ([f"{V1_ROOT}/pids/{SLICE}", f"{V1_ROOT}/memory/{SLICE}"]
@@ -504,6 +522,20 @@ def _sweep_orphaned_worker_cgroups() -> int:
         except OSError:
             continue
         for name in entries:
+            # Checked at the TOP of the loop, before the four `continue`s
+            # below. Sitting after them, the budget bounded only removals —
+            # and since each `_drain_then_rmdir(d, 0.0)` is microseconds,
+            # that made it effectively unreachable, while the genuinely
+            # unbounded part (one `_read` plus one `os.stat` per entry, on
+            # every broker start) was never checked at all. A slice holding
+            # tens of thousands of live-or-young entries is exactly the case
+            # the ceiling exists for, and it is the case the old placement
+            # could not see.
+            if time.monotonic() - _started >= _SWEEP_TOTAL_BUDGET_SEC:
+                _log(f"orphan sweep hit its {_SWEEP_TOTAL_BUDGET_SEC:.0f}s "
+                     f"budget; {len(reclaimed - failed)} reclaimed, "
+                     f"stopping early")
+                return len(reclaimed - failed)
             if not name.startswith("leerie-w-"):
                 continue
             d = f"{root}/{name}"
@@ -516,11 +548,29 @@ def _sweep_orphaned_worker_cgroups() -> int:
             if age < _ORPHAN_MIN_AGE_SEC:
                 continue
             # Reuse the real teardown rather than a bare os.rmdir: it
-            # already handles already-gone and retries a transient EBUSY.
-            # The dir is empty, so the budget is never actually spent.
-            if _drain_then_rmdir(d, 0.5) is None:
-                reclaimed += 1
-    return reclaimed
+            # already handles already-gone.
+            #
+            # Budget 0.0, NOT a retry window. A sweep candidate is by
+            # construction already drained, so retrying buys nothing — and
+            # an `rmdir` that fails here usually fails *permanently*: a
+            # worker whose tests shelled out to a container runtime leaves
+            # CHILD cgroups, so the parent's own `cgroup.procs` is empty
+            # while `rmdir` returns ENOTEMPTY forever. With a per-dir retry
+            # window each such orphan would tax every future broker start,
+            # and this runs before the socket binds, so the orchestrator's
+            # first `slice` request races that delay and silently degrades
+            # to /proc/meminfo sizing.
+            if _drain_then_rmdir(d, 0.0) is None:
+                reclaimed.add(name)
+            else:
+                # v1 splits one worker across pids/ and memory/. If either
+                # dir survives, the worker is half-removed, not reclaimed —
+                # and the ENOTEMPTY case above is exactly the one that
+                # persists. Counting the name from the successful half
+                # would report a reclaim the next `create` still has to
+                # clean up after.
+                failed.add(name)
+    return len(reclaimed - failed)
 
 
 # --- dispatch --------------------------------------------------------------

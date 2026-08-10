@@ -1136,6 +1136,41 @@ class TestBackstopCapturePriorRuns:
 
         assert len(called) == 1 and called[0] == run_dir
 
+    def test_skips_run_with_an_empty_logs_dir(self, leerie, tmp_path,
+                                               monkeypatch):
+        """A SKELETON run dir — logs/ present but empty — must not draw a
+        worker.
+
+        `main()` mkdirs the run subtree before several startup resolvers
+        that can die() (a `--worker-memory-max` below the repo's declared
+        Node heap, a heap that cannot fit the slice), so a rejected launch
+        leaves exactly this shape: `logs/` created, nothing written, no
+        sentinel. Keying only on "logs/ exists" spends a dep_capture
+        `claude -p` worker on it — on every later run, forever, over a
+        directory that never produced a single log line. An operator
+        iterating on that flag accumulates one per attempt."""
+        leerie_root = tmp_path / "state"
+        run_dir = leerie_root / "runs" / "run-skeleton"
+        (run_dir / "logs").mkdir(parents=True)   # deliberately empty
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        called = []
+
+        async def _fake_capture(repo_root, st, **kwargs):
+            called.append(getattr(st, "run_dir", None))
+
+        with patch.object(leerie, "capture_repo_deps", new=_fake_capture):
+            asyncio.run(leerie._backstop_capture_prior_runs(
+                leerie_root, repo,
+                caps=_FAKE_CAPS, models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+            ))
+
+        assert called == [], (
+            "a skeleton run dir (empty logs/) must not trigger capture")
+
     def test_skips_run_without_logs_dir(self, leerie, tmp_path, monkeypatch):
         """A run dir without a logs/ subdirectory is not eligible for capture."""
         leerie_root = tmp_path / "state"
