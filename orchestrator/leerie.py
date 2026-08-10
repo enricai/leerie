@@ -6877,7 +6877,9 @@ async def _recursive_decompose(
       2. If score >= decompose_fit_threshold or depth >= decompose_max_depth:
          return [subtask] (leaf).
       3. Split using _partition_files (migration) or the splitter worker
-         (coupled minority). Every judge/split call goes through st.bump_workers.
+         (coupled minority). Every judge/split call goes through
+         _bump_decompose_workers, which enforces decompose_budget_share
+         (N3+N4) on top of the shared st.bump_workers budget.
       4. No-progress guard: if decompose_noprogress_rounds consecutive rounds
          produce no child whose score exceeds the parent's, accept as leaf with
          a warning.
