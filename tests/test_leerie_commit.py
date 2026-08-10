@@ -14,11 +14,15 @@ orchestrator records it beside the version. Absence is a normal state (a tarball
 install has no checkout to read), so it must degrade to `None` rather than fail
 a run or write a misleading empty string.
 """
+import ast
+import inspect
 import json
 import re
 import sys
 import textwrap
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestrator"))
 import leerie  # noqa: E402
@@ -30,8 +34,38 @@ from tests.launcher_blocks import launch_env_blocks  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = (REPO / "leerie").read_text()
 
+# Keys that must be initialised in BOTH of `_run_phases`' state-init
+# branches. Parametrised over a list rather than written once per key: a
+# per-field guard is precisely why `dangerously_force_strict_output`
+# shipped absent from the fresh-run branch — i.e. from every non-resume
+# run, the only path that can set the flag at all — while `leerie_commit`,
+# the one field that had this guard, survived in both. This module's own
+# docstring cites that field as the exemplar of the attribution gap, which
+# is how the omission hid in plain sight.
+#
+# Add a key here whenever a new `st.data` field must be seeded on both
+# paths; do NOT copy the walk below for it.
+_BOTH_BRANCH_KEYS = ("leerie_commit", "dangerously_force_strict_output")
 
 
+def _resume_split() -> tuple[list, list]:
+    """`_run_phases`' `if args.resume:` node, as `(resume_body, fresh_body)`.
+
+    The resume path seeds state with subscript assignments and the fresh
+    path with a dict literal, so a source-order check cannot tell which
+    branch it covered — see `test_written_in_BOTH_state_init_branches`.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
+    nodes = [n for n in ast.walk(tree)
+             if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)]
+    assert nodes, "could not locate the `if args.resume:` split"
+    node = nodes[0]
+    assert node.orelse, "the fresh-run `else:` branch was not found"
+    return node.body, node.orelse
+
+
+def _mentions(body: list, key: str) -> bool:
+    return any(key in ast.unparse(s) for s in body)
 
 
 class TestStateSurface:
@@ -74,7 +108,8 @@ class TestWriteSite:
         assert 'os.environ.get("LEERIE_COMMIT") or None' in src, (
             "an unset LEERIE_COMMIT must record None, not an empty string")
 
-    def test_written_in_BOTH_state_init_branches(self):
+    @pytest.mark.parametrize("key", _BOTH_BRANCH_KEYS)
+    def test_written_in_BOTH_state_init_branches(self, key):
         """The resume path and the fresh path are separate initialisations.
 
         `_run_phases` sets state under `if args.resume:` with subscript
@@ -85,47 +120,38 @@ class TestWriteSite:
         and the one the field exists for. A source-order check across a
         two-branch function cannot tell you which branch it covered.
 
-        This walks the AST instead and requires the key in each branch.
+        This walks the AST instead and requires the key in each branch, over
+        every key in `_BOTH_BRANCH_KEYS` — see that constant for why this is
+        parametrised rather than duplicated per field.
         """
-        import ast
-        import inspect
-        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
-        resume_ifs = [
-            n for n in ast.walk(tree)
-            if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)
-        ]
-        assert resume_ifs, "could not locate the `if args.resume:` split"
-        node = resume_ifs[0]
-        assert node.orelse, "the fresh-run `else:` branch was not found"
-
-        def mentions(body) -> bool:
-            return any("leerie_commit" in ast.unparse(s) for s in body)
-
-        assert mentions(node.body), "resume branch does not record leerie_commit"
-        assert mentions(node.orelse), (
-            "FRESH-RUN branch does not record leerie_commit — the field would "
-            "be null for every non-resume run")
+        resume, fresh = _resume_split()
+        assert _mentions(resume, key), f"resume branch does not record {key}"
+        assert _mentions(fresh, key), (
+            f"FRESH-RUN branch does not record {key} — the field would be "
+            f"absent for every non-resume run")
 
     def test_both_branches_also_record_the_version(self):
         """Anti-vacuity control for the test above.
 
         If the branch-finding logic were wrong (wrong node, empty bodies), the
-        `leerie_commit` assertions could pass or fail for reasons unrelated to
-        the key. `leerie_version` is known to be in both branches, so it must
-        be found by the same walk — if it is not, the walk is broken, not the
-        code.
+        per-key assertions could pass or fail for reasons unrelated to the
+        key. `leerie_version` is known to be in both branches and is
+        deliberately NOT in `_BOTH_BRANCH_KEYS`, so it must be found by the
+        same walk — if it is not, the walk is broken, not the code.
         """
-        import ast
-        import inspect
-        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
-        node = [n for n in ast.walk(tree)
-                if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)][0]
-
-        def mentions(body) -> bool:
-            return any("leerie_version" in ast.unparse(s) for s in body)
-
-        assert mentions(node.body) and mentions(node.orelse), (
+        resume, fresh = _resume_split()
+        assert _mentions(resume, "leerie_version"), (
             "the branch walk is broken — leerie_version is known to be in both")
+        assert _mentions(fresh, "leerie_version"), (
+            "the branch walk is broken — leerie_version is known to be in both")
+
+    @pytest.mark.parametrize("key", _BOTH_BRANCH_KEYS)
+    def test_both_branch_keys_are_declared_state_fields(self, key):
+        """A key seeded on both paths but absent from `STATE_FIELDS` fails
+        `test_state_fields.py`'s write sweep with a generic diff. Naming them
+        here means a dropped declaration fails against the field, not the
+        sweep."""
+        assert key in leerie.STATE_FIELDS
 
 
 class TestRoundTrip:

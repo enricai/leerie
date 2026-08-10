@@ -27435,6 +27435,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "clarify": bool(args.clarify),
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
+                   # Same both-branches requirement as leerie_commit below,
+                   # for the same reason: this flag lowers the CLI's context
+                   # ceiling invisibly (see `_model_arg`), so a run that dies
+                   # of it is unattributable without the field. It shipped
+                   # absent from THIS branch — i.e. from every fresh run,
+                   # which is the only path that can hit the flag at all,
+                   # since `resume` re-reads it from the state it was missing
+                   # from.
+                   "dangerously_force_strict_output": bool(
+                       caps.get("force_strict_output")),
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
                    "skip_adherence_check": bool(
                        getattr(args, "skip_adherence_check", False)),
