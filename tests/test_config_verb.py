@@ -16,21 +16,31 @@ Sub-behaviours under test:
       keys (build/lint/test/setup_packages) and the ARG BASE_IMAGE / USER
       leerie Dockerfile guidance.
 
-Strategy: the per-mode tests (a)-(d) use a self-contained bash harness that
-implements the spec and records observable side-effects (argv log for
-claude, nerdctl call log for the no-container assertion) — this keeps those
-tests fast and independent of the exact launcher wiring. A separate parity
-guard (`test_config_inference_matches_infer_build_lint_test` and friends,
-below) extracts and runs the REAL `config)` case arm out of the launcher
-(following the extract-from-launcher pattern in
-test_launcher_per_repo_image.py) and diffs its inference output against
-orchestrator/leerie.py::_infer_build_lint_test() across a fixture matrix, so
-the launcher's inline inferrer can never silently diverge from the Python
-table again without a red test.
+Strategy: ALL tests in this file — the per-mode tests (a)-(d) as well as the
+inference parity guard further down — extract and run the REAL `config)`
+case arm out of the launcher (`_extract_config_arm`, following the
+extract-from-launcher pattern in `tests/test_resolve_ec2_vars.py`'s
+`_extract_resolve_ec2_knob`), rather than hand-reproducing the arm's logic
+in a standalone bash string. A hand-copied reproduction is body-blind by
+construction — the tests would run a string literal defined in this file, so
+no change to the launcher's actual `config)` arm could affect them. This
+previously left the per-mode (a)-(d) tests running a stale, narrower copy of
+the inferrer (the `--recapture` sub-mode and the `_user_repo` local-variable
+refactor were absent from the hand copy) while only the inference-parity
+tests below exercised the real arm.
+
+Verified live per N13's documented trap: an inert sabotage is not a valid
+falsification. The discriminating falsification used here is inverting the
+`--init` already-exists guard (writing the config file even when it already
+exists, instead of refusing): with the extraction,
+`test_init_fails_if_config_already_exists` fails; against the old
+hand-copied harness it could not have, since that harness never read the
+launcher's source at all.
 
 Precedent for this pattern: test_launcher_runtime_knob.py (standalone
 harness for a launcher case arm), test_ensure_image.py (function harness),
-test_launcher_per_repo_image.py (extract-real-block-from-launcher harness).
+test_resolve_ec2_vars.py / test_resolve_repo_image_tag.py
+(extract-real-block-from-launcher harness).
 """
 from __future__ import annotations
 
@@ -49,267 +59,26 @@ _PYBIN = str(Path(sys.executable).parent)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# ---------------------------------------------------------------------------
-# Shared harness
-# ---------------------------------------------------------------------------
-# The harness mirrors the `config` case arm in the launcher's case dispatch
-# at leerie line ~558.  Key invariants the harness encodes:
-#
-#  1. `config` is listed in the ownership-short-circuit guard (alongside
-#     version) so it never claims a state directory.
-#  2. After the case arm runs, `exit 0` fires before any container path.
-#  3. Bare mode shells out to python3 inline (no subprocess to leerie.py).
-#  4. --init writes .leerie/config.toml via python3 inline snippet.
-#  5. --chat execs interactive `claude` (NOT `claude -p`).
-#
-# The harness exposes two externally observable channels:
-#   $NERDCTL_LOG  — each `nerdctl` invocation appends "nerdctl <args>" here
-#   $CLAUDE_LOG   — each `claude` invocation appends JSON-encoded argv here
-#
-# Stubs for nerdctl and claude are injected on PATH via a temp bin dir.
 
-_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Inputs via env (all optional with sensible defaults):
-#   USER_REPO      — path to the simulated user repo
-#   LEERIE_REPO    — path to the leerie repo (defaults to repo root)
-#   NERDCTL_LOG    — file to append nerdctl invocations to (touch before run)
-#   CLAUDE_LOG     — file to append claude invocations to (touch before run)
-#
-# argv:  config [--init|--chat]
-
-remote_log() { echo "[leerie] $*" >&2; }
-
-# Stub nerdctl: log every invocation; never actually run a container.
-nerdctl() {
-  echo "nerdctl $*" >> "${NERDCTL_LOG:-/dev/null}"
-  return 0
-}
-
-# Stub claude: log argv as a space-joined string; fake an interactive session.
-claude() {
-  printf '%s\n' "$*" >> "${CLAUDE_LOG:-/dev/null}"
-  return 0
-}
-
-# Make stubs visible to exec inside --chat arm.
-export -f nerdctl claude
-
-USER_REPO="${USER_REPO:-$(pwd)}"
-LEERIE_REPO="${LEERIE_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
-
-# Inline BLT inferrer: returns declared values from .leerie/config.toml,
-# else falls through to pattern-based inference. This mirrors the REAL
-# launcher's `config)` arm inferrer (leerie:565-658), which in turn mirrors
-# orchestrator/leerie.py::_infer_build_lint_test() by hand (DESIGN §6½).
-# Kept in sync manually for the unit-level (per-mode) tests below; the
-# parity guard further down in this file drives the REAL launcher block
-# directly and compares it against _infer_build_lint_test() in-process, so
-# any future divergence between this copy and the launcher/orchestrator is
-# caught even if this copy is not updated.
-_config_read_key() {
-  local key="$1" file="$USER_REPO/.leerie/config.toml"
-  [ -f "$file" ] || return 0
-  { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null \
-    | head -1 \
-    | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//;
-              s/[[:space:]]*$//;
-              s/^\"(.*)\"$/\1/;
-              s/^'(.*)'$/\1/"; } || true
-}
-
-_is_rails_repo() {
-  local repo="$1"
-  [ -f "$repo/Gemfile.lock" ] && [ -f "$repo/bin/rails" ]
-}
-
-_infer_axis() {
-  local axis="$1"
-  # Declared value wins.
-  local declared
-  declared="$(_config_read_key "$axis")"
-  if [ -n "${declared+x}" ] && { [ -n "$declared" ] || \
-      grep -qE "^[[:space:]]*${axis}[[:space:]]*=" "$USER_REPO/.leerie/config.toml" 2>/dev/null; }; then
-    echo "$declared"
-    return
-  fi
-  local build="" lint="" test=""
-  if [ -f "$USER_REPO/Makefile" ]; then
-    build="make"
-  fi
-  if [ -f "$USER_REPO/package.json" ]; then
-    local _pm="npm"
-    if [ -f "$USER_REPO/pnpm-lock.yaml" ]; then
-      _pm="pnpm"
-    elif [ -f "$USER_REPO/yarn.lock" ]; then
-      _pm="yarn"
-    elif [ -f "$USER_REPO/bun.lockb" ] || [ -f "$USER_REPO/bun.lock" ]; then
-      _pm="bun"
-    fi
-    [ -n "$build" ] || build="$_pm run build"
-    [ -n "$test" ] || test="$_pm run test"
-  fi
-  if [ -f "$USER_REPO/pyproject.toml" ] || [ -f "$USER_REPO/pytest.ini" ] || \
-     [ -f "$USER_REPO/setup.cfg" ]; then
-    [ -n "$test" ] || test="pytest"
-  fi
-  if [ -f "$USER_REPO/Cargo.toml" ]; then
-    [ -n "$build" ] || build="cargo build"
-    [ -n "$test" ] || test="cargo test"
-  fi
-  if [ -f "$USER_REPO/go.mod" ]; then
-    [ -n "$build" ] || build="go build ./..."
-    [ -n "$test" ] || test="go test ./..."
-  fi
-  if [ -f "$USER_REPO/pom.xml" ]; then
-    [ -n "$build" ] || build="mvn package"
-    [ -n "$test" ] || test="mvn test"
-  fi
-  if [ -f "$USER_REPO/build.gradle" ] || [ -f "$USER_REPO/build.gradle.kts" ]; then
-    if [ -f "$USER_REPO/gradlew" ]; then
-      [ -n "$build" ] || build="./gradlew build"
-      [ -n "$test" ] || test="./gradlew test"
-    else
-      [ -n "$build" ] || build="gradle build"
-      [ -n "$test" ] || test="gradle test"
-    fi
-  fi
-  if [ -f "$USER_REPO/.eslintrc" ] || [ -f "$USER_REPO/.eslintrc.json" ] || \
-     [ -f "$USER_REPO/.eslintrc.js" ] || [ -f "$USER_REPO/.eslintrc.cjs" ] || \
-     [ -f "$USER_REPO/.eslintrc.yaml" ] || [ -f "$USER_REPO/.eslintrc.yml" ]; then
-    [ -n "$lint" ] || lint="npx eslint ."
-  fi
-  if [ -f "$USER_REPO/.ruff.toml" ] || [ -f "$USER_REPO/ruff.toml" ]; then
-    [ -n "$lint" ] || lint="ruff check ."
-  fi
-  if [ -f "$USER_REPO/.rubocop.yml" ] || [ -f "$USER_REPO/.rubocop.yaml" ]; then
-    [ -n "$lint" ] || lint="bundle exec rubocop"
-  fi
-  if [ -f "$USER_REPO/detekt.yml" ] || [ -f "$USER_REPO/detekt.yaml" ]; then
-    [ -n "$lint" ] || lint="detekt"
-  fi
-  if [ -n "$(find "$USER_REPO" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
-    [ -n "$build" ] || build="dotnet build"
-    [ -n "$test" ] || test="dotnet test"
-  elif [ -n "$(find "$USER_REPO" -maxdepth 1 -name '*.csproj' -print -quit 2>/dev/null)" ]; then
-    [ -n "$build" ] || build="dotnet build"
-    [ -n "$test" ] || test="dotnet test"
-  fi
-  if [ -f "$USER_REPO/phpunit.xml" ] || [ -f "$USER_REPO/phpunit.xml.dist" ]; then
-    [ -n "$test" ] || test="vendor/bin/phpunit"
-  fi
-  if [ -f "$USER_REPO/phpstan.neon" ] || [ -f "$USER_REPO/phpstan.neon.dist" ]; then
-    [ -n "$lint" ] || lint="vendor/bin/phpstan analyse"
-  fi
-  if _is_rails_repo "$USER_REPO"; then
-    [ -n "$test" ] || test="bin/rails test"
-  fi
-  case "$axis" in
-    build) echo "$build" ;;
-    lint) echo "$lint" ;;
-    test) echo "$test" ;;
-  esac
-}
-
-_axis_source() {
-  local axis="$1"
-  local config_file="$USER_REPO/.leerie/config.toml"
-  if [ -f "$config_file" ] && \
-     grep -qE "^[[:space:]]*${axis}[[:space:]]*=" "$config_file" 2>/dev/null; then
-    echo "config"
-  else
-    echo "inference"
-  fi
-}
-
-case "${1:-}" in
-  --init)
-    shift
-    # Create .leerie/ directory and write config.toml with auto-detected values.
-    mkdir -p "$USER_REPO/.leerie"
-    config_path="$USER_REPO/.leerie/config.toml"
-    if [ -f "$config_path" ]; then
-      remote_log "error: $config_path already exists; delete it first to re-init"
-      exit 1
-    fi
-    _build_val="$(_infer_axis build)"
-    _lint_val="$(_infer_axis lint)"
-    _test_val="$(_infer_axis test)"
-    cat > "$config_path" <<TOML
-# leerie per-repo configuration — commit this file to version-control.
-# Generated by: leerie config --init
-# See: https://leerie.enric.ai/docs/config
-
-# Shell command leerie runs to build the project.
-build = "$_build_val"
-
-# Shell command leerie runs as the lint check.
-lint = "$_lint_val"
-
-# Shell command leerie runs to execute the test suite.
-test = "$_test_val"
-
-# Space- or comma-separated apt package names to install at the system level.
-# Uncomment and fill in if your project needs system libraries.
-# setup_packages = "libvips-dev fonts-noto"
-TOML
-    echo "Created $config_path"
-    echo "  Suggested next step: git add .leerie/ && git commit -m 'chore: add leerie config'"
-    exit 0
-    ;;
-
-  --chat)
-    shift
-    system_prompt="$LEERIE_REPO/prompts/config_chat.md"
-    if [ ! -f "$system_prompt" ]; then
-      remote_log "error: $system_prompt not found (leerie installation may be incomplete)"
-      exit 1
-    fi
-    # Interactive claude session — NOT claude -p.
-    # claude records its argv to CLAUDE_LOG for test inspection.
-    claude \
-      --system-prompt-file "$system_prompt" \
-      --add-dir "$USER_REPO" \
-      "Help me configure leerie for this repo."
-    exit 0
-    ;;
-
-  "")
-    # Bare: print effective config with provenance.
-    echo "Effective leerie config for: $USER_REPO"
-    echo ""
-    for axis in build lint test; do
-      val="$(_infer_axis "$axis")"
-      src="$(_axis_source "$axis")"
-      printf '  %-8s = %-40s  [%s]\n' "$axis" "${val:-(not set)}" "$src"
-    done
-    # Also show leerie.toml keys if present.
-    leerie_toml="$USER_REPO/leerie.toml"
-    if [ -f "$leerie_toml" ]; then
-      echo ""
-      echo "leerie.toml (operational knobs):"
-      grep -v '^[[:space:]]*#' "$leerie_toml" 2>/dev/null \
-        | grep '=' \
-        | while IFS= read -r line; do
-          printf '  %s\n' "$line"
-        done
-    fi
-    exit 0
-    ;;
-
-  *)
-    echo "leerie config: unknown sub-command '$1'" >&2
-    echo "Usage: leerie config [--init | --chat]" >&2
-    exit 1
-    ;;
-esac
-"""
+def _extract_config_arm() -> str:
+    """Return the real `config)` case-arm body (including the `config)`
+    pattern and trailing `;;`) verbatim from the shipped launcher. See
+    module docstring for the body-blindness rationale and the live
+    falsification result."""
+    launcher_text = (REPO_ROOT / "leerie").read_text()
+    start_marker = "  config)\n"
+    end_marker = "\n  list)"
+    s = launcher_text.index(start_marker)
+    e = launcher_text.index(end_marker, s)
+    return launcher_text[s:e]
 
 
 def _make_stub_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Create a bin dir with stub nerdctl + git binaries; return (bin_dir, nerdctl_log, claude_log)."""
+    """Create a bin dir with stub nerdctl + claude binaries; return
+    (bin_dir, nerdctl_log, claude_log). nerdctl is stubbed only to detect
+    whether the real config) arm ever invokes it (it shouldn't — the arm
+    exits before any container path); claude is stubbed to record its argv
+    for the --chat assertions."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     nerdctl_log = tmp_path / "nerdctl.log"
@@ -317,7 +86,6 @@ def _make_stub_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
     claude_log = tmp_path / "claude.log"
     claude_log.touch()
 
-    # nerdctl stub: log every invocation
     nerdctl_stub = bin_dir / "nerdctl"
     nerdctl_stub.write_text(
         "#!/bin/sh\n"
@@ -326,7 +94,6 @@ def _make_stub_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     nerdctl_stub.chmod(0o755)
 
-    # claude stub: log argv joined by space
     claude_stub = bin_dir / "claude"
     claude_stub.write_text(
         "#!/bin/sh\n"
@@ -334,19 +101,6 @@ def _make_stub_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
         "exit 0\n"
     )
     claude_stub.chmod(0o755)
-
-    # git stub: minimal — only `git -C <path> remote get-url origin` needed
-    git_stub = bin_dir / "git"
-    git_stub.write_text(
-        "#!/bin/sh\n"
-        'if [ "${1:-}" = "-C" ]; then shift 2; fi\n'
-        'if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then\n'
-        '  echo "${FAKE_GIT_REMOTE:-}"\n'
-        '  exit 0\n'
-        "fi\n"
-        'command git "$@"\n'
-    )
-    git_stub.chmod(0o755)
 
     return bin_dir, nerdctl_log, claude_log
 
@@ -359,8 +113,22 @@ def _run_config(
     extra_env: dict | None = None,
     expect_fail: bool = False,
 ) -> tuple[str, str, Path, Path]:
-    """Run the config verb harness; return (stdout, stderr, nerdctl_log, claude_log)."""
+    """Run the REAL launcher's `config)` arm (extracted verbatim via
+    `_extract_config_arm`), wrapped in a minimal dispatcher that supplies
+    the `remote_log` helper the arm expects from its enclosing launcher
+    scope, plus stubbed `nerdctl`/`claude` on PATH.
+
+    Returns (stdout, stderr, nerdctl_log, claude_log)."""
     bin_dir, nerdctl_log, claude_log = _make_stub_bin(tmp_path)
+    block = _extract_config_arm()
+    script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'remote_log() { echo "[leerie] $*" >&2; }\n'
+        'case "${1:-}" in\n'
+        f"{block}\n"
+        "esac\n"
+    )
     env = {
         "PATH": str(bin_dir) + ":/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path / "home"),
@@ -368,25 +136,23 @@ def _run_config(
         "LEERIE_REPO": str(REPO_ROOT),
         "NERDCTL_LOG": str(nerdctl_log),
         "CLAUDE_LOG": str(claude_log),
-        "FAKE_GIT_REMOTE": "",
     }
     if extra_env:
         env.update(extra_env)
 
     result = subprocess.run(
-        ["bash", "-c", _HARNESS, "--"] + args,
+        ["bash", "-c", script, "--", "config"] + args,
         env=env,
         capture_output=True,
         text=True,
     )
     if not expect_fail:
         assert result.returncode == 0, (
-            f"config harness exited {result.returncode}\n"
+            f"config arm exited {result.returncode}\n"
             f"stdout: {result.stdout}\n"
             f"stderr: {result.stderr}"
         )
     return result.stdout, result.stderr, nerdctl_log, claude_log
-
 
 # ---------------------------------------------------------------------------
 # (a) leerie config --init
@@ -842,31 +608,20 @@ def test_config_arm_exits_before_nerdctl_run():
 # Parity guard: the REAL launcher `config)` arm's inference must match
 # orchestrator/leerie.py::_infer_build_lint_test() exactly.
 #
-# Unlike the per-mode tests above (which run against the harness's own copy
-# of the inferrer for speed/isolation), these tests extract the actual
+# `_extract_config_arm` is defined near the top of this file (shared with
+# the per-mode tests (a)-(d) above). These tests extract the actual
 # `config)` case-arm body out of the shipped `leerie` launcher — the same
-# extract-from-launcher pattern test_launcher_per_repo_image.py uses for the
-# per-repo-image block — wrap it in a minimal dispatcher, run
-# `config --init` against a fixture repo, and diff the written build/lint/
-# test values against _infer_build_lint_test()'s output for that same
-# fixture (obtained in-process via the `leerie` fixture from conftest.py).
+# extract-from-launcher pattern test_resolve_repo_image_tag.py uses — wrap
+# it in a minimal dispatcher, run `config --init` against a fixture repo,
+# and diff the written build/lint/test values against
+# _infer_build_lint_test()'s output for that same fixture (obtained
+# in-process via the `leerie` fixture from conftest.py).
 #
 # If the launcher's `_infer_axis` is ever reverted to the old thin table
 # (Makefile/package.json/pyproject+pytest only), these tests fail on every
 # fixture outside that thin table's coverage (Rails, Cargo, go.mod, gradle,
 # dotnet, php, eslint, ruff) — the drift can no longer land silently.
 # ---------------------------------------------------------------------------
-
-
-def _extract_config_arm() -> str:
-    """Return the real `config)` case-arm body (including the `config)`
-    pattern and trailing `;;`) verbatim from the shipped launcher."""
-    launcher_text = (REPO_ROOT / "leerie").read_text()
-    start_marker = "  config)\n"
-    end_marker = "\n  list)"
-    s = launcher_text.index(start_marker)
-    e = launcher_text.index(end_marker, s)
-    return launcher_text[s:e]
 
 
 def _run_real_config_arm(

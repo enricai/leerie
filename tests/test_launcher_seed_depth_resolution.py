@@ -12,9 +12,24 @@ Resolution precedence mirrors FLY_VM_DISK_GB: CLI flag > env var >
 NOT read by the Python orchestrator — they live entirely in bash — so
 the resolution is tested at the launcher layer.
 
-These tests reproduce the launcher's `_resolve_seed_knob` helper +
-validation byte-for-byte (see `test_block_present_in_launcher`), so a
-refactor that changes parsing surfaces a coupling failure.
+The block under test is extracted verbatim from the launcher (mirroring
+`tests/test_resolve_ec2_vars.py`'s `_extract_resolve_ec2_knob`), not
+hand-copied. A hand-copied reproduction is body-blind by construction —
+the tests would run a string literal defined in this file, and no change
+to the launcher's actual logic could affect them. `_log.sh` is sourced
+for real so `remote_log` (the validation-failure emitter the extracted
+block calls) is the genuine implementation, not a stand-in.
+
+Verified live per N13's documented trap: an inert sabotage (e.g.
+removing the `[ -f "$USER_REPO/leerie.toml" ]` guard) is not a valid
+falsification, since a missing toml file already makes the subsequent
+`grep` fail silently either way — it passes both with and without the
+guard and proves nothing. The discriminating falsification used here is
+inverting the CLI/env precedence inside `_resolve_seed_knob` (swapping
+which branch returns first): with the extraction,
+`test_cli_wins_over_env_and_toml` and `test_env_wins_over_toml` fail;
+against the old hand-copied block they could not have, since that block
+never read the launcher's source at all.
 """
 from __future__ import annotations
 
@@ -26,70 +41,32 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
+LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
 
 
-# The launcher's seed-knob resolution helper + CLI-scan + validation,
-# reproduced so the tests exercise the launcher's logic and a refactor
-# that changes parsing makes the coupling test fail.
-_LAUNCHER_SEED_BLOCK = r"""
-_resolve_seed_knob() {
-  local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _envval _tomlval
-  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
-  eval "_envval=\"\${$_envname:-}\""
-  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
-  if [ -f "$USER_REPO/leerie.toml" ]; then
-    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
-                        "$USER_REPO/leerie.toml" 2>/dev/null \
-                      | head -1 \
-                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
-    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
-  fi
-  printf '%s' "$_default"
-}
-_cli_seed_depth=""
-_cli_seed_threshold=""
-_prev_seed_arg=""
-for arg in "$@"; do
-  if [ -n "$_prev_seed_arg" ]; then
-    case "$_prev_seed_arg" in
-      depth)     _cli_seed_depth="$arg" ;;
-      threshold) _cli_seed_threshold="$arg" ;;
-    esac
-    _prev_seed_arg=""
-    continue
-  fi
-  case "$arg" in
-    --seed-depth=*)                  _cli_seed_depth="${arg#--seed-depth=}" ;;
-    --seed-depth)                    _prev_seed_arg="depth" ;;
-    --seed-shallow-threshold-mb=*)   _cli_seed_threshold="${arg#--seed-shallow-threshold-mb=}" ;;
-    --seed-shallow-threshold-mb)     _prev_seed_arg="threshold" ;;
-  esac
-done
-LEERIE_SEED_DEPTH="$(_resolve_seed_knob "$_cli_seed_depth" LEERIE_SEED_DEPTH seed_depth 50)"
-LEERIE_SEED_SHALLOW_THRESHOLD_MB="$(_resolve_seed_knob "$_cli_seed_threshold" LEERIE_SEED_SHALLOW_THRESHOLD_MB seed_shallow_threshold_mb 200)"
-case "$LEERIE_SEED_DEPTH" in
-  ''|*[!0-9]*)
-    echo "LEERIE_SEED_DEPTH='$LEERIE_SEED_DEPTH' is not a non-negative integer (0 = full history)" >&2
-    exit 1
-    ;;
-esac
-case "$LEERIE_SEED_SHALLOW_THRESHOLD_MB" in
-  ''|*[!0-9]*|0)
-    echo "LEERIE_SEED_SHALLOW_THRESHOLD_MB='$LEERIE_SEED_SHALLOW_THRESHOLD_MB' is not a positive integer (MB)" >&2
-    exit 1
-    ;;
-esac
-"""
+def _extract_seed_knob_block() -> str:
+    """The REAL shallow-seed resolution block, lifted out of the launcher:
+    `_resolve_seed_knob()`, its CLI-arg scan, and the depth/threshold
+    validation, ending at the `export` line. See module docstring for the
+    body-blindness rationale and the live falsification result."""
+    src = LAUNCHER.read_text()
+    start = src.index("_resolve_seed_knob() {")
+    end_marker = "export LEERIE_SEED_DEPTH LEERIE_SEED_SHALLOW_THRESHOLD_MB\n"
+    end = src.index(end_marker, start) + len(end_marker)
+    return src[start:end]
 
 
 def _run(user_repo: Path, *args: str, env_extra: dict | None = None,
          ) -> subprocess.CompletedProcess:
-    """Source the launcher's seed-knob block in a subshell with the given
-    CLI args and USER_REPO. Prints the two resolved values on success."""
+    """Source the launcher's REAL seed-knob block in a subshell with the
+    given CLI args and USER_REPO. Prints the two resolved values on
+    success. `_log.sh` is sourced first so `remote_log` (called on
+    validation failure) is the genuine implementation."""
     script = (
         "set -euo pipefail\n"
         f"USER_REPO={user_repo!s}\n"
-        f"{_LAUNCHER_SEED_BLOCK}\n"
+        f"source {LOG_SH}\n"
+        f"{_extract_seed_knob_block()}\n"
         'printf "%s %s\\n" "$LEERIE_SEED_DEPTH" "$LEERIE_SEED_SHALLOW_THRESHOLD_MB"\n'
     )
     env = {**os.environ}
@@ -176,29 +153,11 @@ def test_garbage_threshold_rejected(tmp_path, bad):
     assert "LEERIE_SEED_SHALLOW_THRESHOLD_MB" in result.stderr
 
 
-def test_block_present_in_launcher():
-    """Coupling test: the reproduced block must stay in lockstep with the
-    launcher. Pin the key helper name, flag names, defaults, and the two
-    validation vocabularies so a drift surfaces here."""
+def test_block_stripped_from_rewritten_args():
+    """Coupling test: the two flags must be stripped from REWRITTEN_ARGS
+    (launcher-only), so they never reach the orchestrator's strict
+    parse_args()."""
     src = LAUNCHER.read_text()
-    assert "_resolve_seed_knob()" in src, (
-        "Launcher's _resolve_seed_knob helper is missing or renamed — "
-        "update this test in lockstep."
-    )
-    assert 'LEERIE_SEED_DEPTH seed_depth 50' in src, (
-        "Launcher's LEERIE_SEED_DEPTH resolution (env var, toml key "
-        "'seed_depth', default 50) has drifted."
-    )
-    assert 'LEERIE_SEED_SHALLOW_THRESHOLD_MB seed_shallow_threshold_mb 200' in src, (
-        "Launcher's threshold resolution (toml key "
-        "'seed_shallow_threshold_mb', default 200) has drifted."
-    )
-    assert "--seed-depth" in src and "--seed-shallow-threshold-mb" in src, (
-        "Launcher must scan the --seed-depth / --seed-shallow-threshold-mb "
-        "CLI flags."
-    )
-    # The two flags must be stripped from REWRITTEN_ARGS (launcher-only),
-    # so they never reach the orchestrator's strict parse_args().
     assert "--seed-depth|--seed-shallow-threshold-mb)" in src, (
         "Launcher must strip --seed-depth / --seed-shallow-threshold-mb "
         "from REWRITTEN_ARGS (they are host-only; the orchestrator uses "
