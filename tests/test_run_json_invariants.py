@@ -9,8 +9,11 @@ Invariants (mirrors orchestrator/leerie.py:_validate_run_json):
    (a run is at most one terminal-or-paused state).
 5. If `paused_at` is set, `fly_machine_id` must also be set
    (cannot pause without knowing where to resume).
-6. If `killed_at` is set, `fly_machine_id` must also be set
-   (cannot have destroyed a machine you don't have a pointer to).
+6. If `killed_at` is set on a run showing Fly/EC2 evidence
+   (`fly_machine_id`, `ec2_instance_id`, `volume_id`, or `image_tag`),
+   at least one of `fly_machine_id`/`ec2_instance_id` must also be set
+   (cannot have destroyed a machine you don't have a pointer to). A
+   local (nerdctl) kill shows none of that evidence, so it is exempt.
 7. `sync_failed_at` is mutex-checked against `pushed_at` (a pushed run
    can't be sync-failed) and `killed_at` (a destroyed machine can't be
    sync-failed). When set, `fly_machine_id` must also be set.
@@ -191,12 +194,44 @@ def test_accepts_killed_remote(leerie):
     ))
 
 
-def test_rejects_killed_without_fly_machine_id(leerie):
-    """Cannot have killed a machine you don't have a pointer to."""
-    with pytest.raises(ValueError, match="killed_at is set but fly_machine_id"):
+def test_rejects_killed_without_any_machine_id_but_with_fly_evidence(leerie):
+    """Cannot have killed a machine you don't have a pointer to, when the
+    sidecar shows other Fly-only evidence (image_tag: 'null for
+    local-runtime runs' per IMPLEMENTATION.md §8) — a corrupt Fly sidecar,
+    not a local kill."""
+    with pytest.raises(ValueError, match="killed_at is set but neither"):
         leerie._validate_run_json(_minimal_run_json(
             killed_at="2026-05-29T16:00:00+00:00",
+            image_tag="registry.fly.io/leerie:0.6.7",
         ))
+
+
+def test_rejects_killed_without_any_machine_id_but_with_volume_evidence(leerie):
+    """Same as above, using volume_id (also Fly-only) as the evidence."""
+    with pytest.raises(ValueError, match="killed_at is set but neither"):
+        leerie._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+            volume_id="vol_abc123",
+        ))
+
+
+def test_accepts_killed_local(leerie):
+    """N7 regression: a local (nerdctl) `leerie kill` writes killed_at
+    alone — no fly_machine_id, no ec2_instance_id, no other remote
+    evidence. A nerdctl container has no machine id, so the invariant
+    does not apply; this must not be rejected as invariant-violating."""
+    leerie._validate_run_json(_minimal_run_json(
+        killed_at="2026-05-29T16:00:00+00:00",
+    ))
+
+
+def test_accepts_killed_ec2(leerie):
+    """Valid killed EC2 run: killed_at + ec2_instance_id, no
+    fly_machine_id."""
+    leerie._validate_run_json(_minimal_run_json(
+        killed_at="2026-05-29T16:00:00+00:00",
+        ec2_instance_id="i-0123456789abcdef0",
+    ))
 
 
 def test_rejects_killed_and_paused_both_set(leerie):

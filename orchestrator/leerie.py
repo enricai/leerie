@@ -3399,8 +3399,16 @@ def _validate_run_json(data: dict) -> None:
        (a run cannot be in more than one terminal-or-paused state).
     5. If `paused_at` is set, `fly_machine_id` must also be set — you
        cannot pause a run without knowing where to resume it.
-    6. If `killed_at` is set, `fly_machine_id` must also be set — you
-       cannot have destroyed a machine you don't have a pointer to.
+    6. If `killed_at` is set on a run that shows evidence of being a
+       Fly/EC2 run (`fly_machine_id`, `ec2_instance_id`, `volume_id`, or
+       `image_tag` — the last two are Fly-only fields the docs describe
+       as "null for local-runtime runs" — any one of them non-null at
+       some point), then at least one of `fly_machine_id`/`ec2_instance_id`
+       must still be set — you cannot have destroyed a machine you don't
+       have a pointer to. A run with NONE of those markers ever set is a
+       local (nerdctl) kill: there is no "machine" to point to, so the
+       invariant does not apply (a local `leerie kill` writes `killed_at`
+       alone, with no machine id of any kind).
     7. If `volume_id` is set, `fly_machine_id` must also be set — a Fly
        volume without a machine to attach it to is a corrupt sidecar
        (provision.sh writes the two together; the only way to violate
@@ -3417,6 +3425,9 @@ def _validate_run_json(data: dict) -> None:
     paused_at = data.get("paused_at")
     killed_at = data.get("killed_at")
     fly_machine_id = data.get("fly_machine_id")
+    ec2_instance_id = data.get("ec2_instance_id")
+    volume_id = data.get("volume_id")
+    image_tag = data.get("image_tag")
     if pushed_at is not None and push_error is not None:
         raise ValueError(
             "run.json invariant: pushed_at and push_error are both set; "
@@ -3444,10 +3455,20 @@ def _validate_run_json(data: dict) -> None:
             "run.json invariant: paused_at is set but fly_machine_id is null; "
             "you cannot pause a run without knowing where to resume it"
         )
-    if killed_at is not None and fly_machine_id is None:
+    _shows_remote_evidence = any(
+        v is not None for v in (fly_machine_id, ec2_instance_id, volume_id, image_tag)
+    )
+    if (
+        killed_at is not None
+        and fly_machine_id is None
+        and ec2_instance_id is None
+        and _shows_remote_evidence
+    ):
         raise ValueError(
-            "run.json invariant: killed_at is set but fly_machine_id is null; "
-            "you cannot have destroyed a machine you don't have a pointer to"
+            "run.json invariant: killed_at is set but neither fly_machine_id "
+            "nor ec2_instance_id is set, though this sidecar shows other "
+            "remote-runtime evidence; you cannot have destroyed a machine "
+            "you don't have a pointer to"
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
