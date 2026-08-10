@@ -401,6 +401,23 @@ def test_separator_without_spaces_still_finds_the_real_script(
     # end-to-end parametrization above came to pass pre-fix while proving
     # nothing — it never tested a newline at all.
     ("pnpm run build\nnode x.js start", ["build"]),
+    # ---- the shapes `_SEG_RE` must NOT break -----------------------------
+    # It splits on a bare `&` as well as `&&`, so these are the commands
+    # where segmenting could plausibly cut a real script off. Each must
+    # still yield `build`. They pass under BOTH the current implementation
+    # and the per-token predecessor, so they are not a second proof of the
+    # separator fix — they are a guard against the NEXT edit to that regex,
+    # in the direction that costs a miss (lost script -> under-sized cage
+    # -> OOM). Do not delete them as redundant coverage.
+    ("pnpm run build 2>&1 | tee log", ["build"]),   # `&` inside a redirect
+    ("pnpm run build --url \"a&b\"", ["build"]),    # `&` inside an argument
+    ("echo hi && pnpm run build", ["build"]),       # PM after the separator
+    ("NODE_ENV=production pnpm run build", ["build"]),   # env-var prefix
+    # `>` is deliberately NOT a separator: the redirect target survives as a
+    # candidate. Harmless (it resolves to no script) and left that way, since
+    # adding `>` to `_SEG_RE` buys nothing and every addition to that regex
+    # risks a miss.
+    ("pnpm run build > out.log", ["build", "out.log"]),
 ])
 def test_candidate_extraction_stays_over_inclusive(leerie, cmd, expected):
     """Asserted at the unit, because the end-to-end form cannot fail.

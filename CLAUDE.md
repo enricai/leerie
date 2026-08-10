@@ -848,6 +848,53 @@ runs' `calls.ndjson`) rather than a number that looks representative: an
 earlier revision bounded reservations by elapsed time instead of by worker
 lifetime, which stalls every real run — its tests used 5, under
 `max_parallel`, and passed against the defect, which first bites at 9.
+The **repo-declared-heap reconciliation** (N14-16, DESIGN §6 — a repo's own
+`--max-old-space-size` overrides whatever heap Node would infer from the
+cgroup, so the per-worker ceiling must be reconciled against it) is covered by
+`tests/test_worker_heap_ceiling_reconcile.py` and
+`tests/test_worker_memory_heap_reconcile.py`, with the P9 `NODE_OPTIONS`
+injection in `tests/test_node_options_injection.py` and the resolver chain in
+`tests/test_resolve_worker_memory_max.py`. Four traps here are not obvious
+from the test names. **(1) The two error directions are not symmetric, and
+the asymmetry sets which tests matter.** The declared heap RAISES the cage
+(`needed = declared_heap + _NODE_HEAP_HEADROOM_BYTES`), so over-detecting a
+script name only inflates the cage and throttles admission, while MISSING one
+under-sizes it and the worker OOMs — the failure the whole reconciliation
+exists to prevent. `_pm_script_candidates` is therefore deliberately
+over-inclusive, and three narrowings (abandon on `exec`/`dlx`, stop at `--`,
+drop `npx`) were prototyped and rejected because each introduced misses;
+`test_candidate_extraction_stays_over_inclusive` pins that intent at the unit,
+including a block of rows guarding the shapes `_SEG_RE` must not break
+(`2>&1`, `&` inside an argument, a PM after the separator) — those pass under
+both the current and the superseded implementation on purpose, so they are a
+guard against the next edit to that regex, not a second proof of the fix.
+**(2) `_SEG_RE` splits before tokenising** because testing each
+whitespace-split token against a separator set cannot see `build&&node`, which
+is one token; the old form lost the real script on every space-free separator.
+**(3) A config.toml fixture cannot reach the real code path** — measured
+across the five repos leerie manages, 2 of 5 declare a heap in `package.json`
+and **0 of 5** in `.leerie/config.toml`, so the original config.toml-only
+suite reported full coverage while the reconciliation fired on none of them.
+The second half of the file builds package.json fixtures for that reason.
+A related trap: `_write_config` interpolates into a TOML **basic string**, so a
+command containing a literal newline produces invalid TOML, the whole config is
+silently dropped, and the assertion is answered by BLT inference instead — one
+parametrization passed that way while testing nothing, which is why the newline
+case is asserted at the unit rather than end-to-end.
+**(4) `_NODE_HEAP_HEADROOM_BYTES` needs its own value pin.** Both P9's
+injection and the reconciliation now derive from it (they compute mirror
+images of one quantity and briefly disagreed, handing Node a heap 384 MiB
+larger than fits the cage), which is the coupling we want — but it means every
+assertion moves with the constant: setting it to `243 * 1024 * 1024` once left
+the entire suite green. `test_node_heap_headroom_is_2432_mib` anchors the
+value, and the AST pin resolves the reserve **name's binding** rather than
+merely requiring an `ast.Name`, so `reserve_mb = 2432  # <const>` fails.
+`tests/test_decompose_share_advisory.py` covers `_warn_decomposition_share`,
+whose one non-obvious test is the partial-caps case: every other test supplies
+`max_total_workers`, so the `.get()` fallback is only exercised by a caller
+that omits it (`run_recapture_deps`, `run_rebaser`, `_replay_capture` each
+build their own minimal caps) AND only on the branch that runs when the
+warning fires.
 Memory-OOM naming
 (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending
