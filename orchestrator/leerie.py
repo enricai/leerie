@@ -5132,6 +5132,13 @@ async def _await_worker_memory_admission(
 _NODE_HEAP_HEADROOM_BYTES = 2432 * 1024 * 1024
 
 
+# Distinguishes "caller supplied nothing" from a legitimate `None` result.
+# Needed because `_declared_node_heap_bytes` returns None to mean "scanned,
+# nothing declared" — the majority case — so None cannot also mean "not
+# supplied" without re-scanning every ordinary run.
+_UNSET = object()
+
+
 def resolve_worker_demand_estimate(declared_heap_bytes: int | None) -> int:
     """The per-worker memory DEMAND estimate the admission surfaces size on.
 
@@ -5153,7 +5160,8 @@ def resolve_worker_demand_estimate(declared_heap_bytes: int | None) -> int:
 def resolve_worker_memory_max(repo_root: Path,
                               max_parallel: int,
                               cli_value: str | None = None,
-                              declared_heap_bytes: int | None = None) -> int:
+                              declared_heap_bytes: int | None | object = _UNSET
+                              ) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
     --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
     leerie.toml `worker_memory_max` → auto-derive (`_auto_worker_memory_max`:
@@ -5198,9 +5206,15 @@ def resolve_worker_memory_max(repo_root: Path,
 
     # `declared_heap_bytes` is a parameter so `main()` can resolve it once
     # and reuse it for `resolve_worker_demand_estimate` without a second
-    # scan (and a second log line). Falls back to scanning when not passed,
-    # keeping every existing direct caller working unchanged.
-    if declared_heap_bytes is None:
+    # scan (and a second log line).
+    #
+    # The sentinel is `_UNSET`, not None, because None is a legitimate
+    # RESULT — "scanned, found no declared heap" — and that is the majority
+    # case. Using None for both meanings re-scanned on every ordinary repo,
+    # which is exactly the duplication this parameter exists to avoid:
+    # measured, two `BLT:` lines and two "no --max-old-space-size" lines per
+    # run, plus a second `package.json` parse.
+    if declared_heap_bytes is _UNSET:
         declared_heap_bytes = _declared_node_heap_bytes(repo_root)
     if declared_heap_bytes is None:
         return val
@@ -5217,7 +5231,8 @@ def resolve_worker_memory_max(repo_root: Path,
             f"sets the per-worker memory ceiling to only {val_mib:.0f} MiB -- "
             f"raise --worker-memory-max to at least {needed_mib:.0f} MiB "
             f"(declared heap + {_NODE_HEAP_HEADROOM_BYTES / 1024**2:.0f} MiB "
-            f"headroom for the resident claude process)")
+            f"headroom for Node's non-heap RSS and the resident claude "
+            f"process)")
 
     info = _cgroup_slice_info()
     slice_max_bytes = info[0] if info is not None else None
@@ -13346,10 +13361,11 @@ def _cgroup_enroll(sid: str, pid: int) -> str | None:
 
 def _cgroup_destroy(sid: str | None) -> None:
     """Ask the broker to tear down the worker cgroup (kill any survivors,
-    rmdir). Best-effort — broker/socket errors are swallowed and a broker-
-    reported ERR (e.g. a lingering process kept the dir busy) is logged
-    rather than silently discarded, so a failed teardown is distinguishable
-    from a successful one. Called from `_invoke`'s cleanup path on every
+    rmdir). Best-effort — nothing here raises — but every failure is logged:
+    a broker-reported ERR (e.g. a lingering process kept the dir busy) and,
+    since N18, a socket error or client timeout too. Both were previously
+    indistinguishable from success on the socket path, which is what made
+    the directory leak hard to attribute. Called from `_invoke`'s cleanup path on every
     exit (success, timeout, abort).
 
     Uses `_CGROUP_DESTROY_TIMEOUT_SEC` (not the 5.0s client default) so this
@@ -18200,12 +18216,22 @@ def _warn_decomposition_share(st: State, caps: dict) -> float | None:
     denominator is still tiny, so the ratio starts near 1.0 and would refuse
     healthy runs at ~7 calls.
 
-    Measuring it here — once, after expansion completes, when the
-    denominator is at its most meaningful pre-execution value — is what
-    turns "no data" into data. Runs that die during planning never write a
-    `plan.json`, so the corpus of unhealthy runs is survivor-biased and no
-    honest threshold can be derived from it today; `decompose_share` in
-    state.json is how that gets fixed."""
+    Measuring it after expansion completes, when the denominator is at its
+    most meaningful pre-execution value, is what turns "no data" into data.
+    Runs that die during planning never write a `plan.json`, so the corpus
+    of unhealthy runs is survivor-biased and no honest threshold can be
+    derived from it today; `decompose_share` in state.json is how that gets
+    fixed.
+
+    **Not once per run.** `phase_plan` is re-entered by the re-plan paths
+    (`phase_adherence_gate`'s feedback loop, and the wiring gate's), and
+    each re-entry overwrites the value — deliberately, since the last
+    planning pass is the one whose spend the run actually carries. It is
+    also skipped entirely on a resume that already checkpointed past
+    `plans_after_plan`, so an interrupted run keeps whatever its last
+    completed planning pass recorded. Neither matters for an advisory
+    whose consumer is a future calibration sweep, but both make "recorded
+    once" false, so do not build anything on that assumption."""
     total = st.data.get("worker_count", 0)
     if not total:
         return None
@@ -18218,7 +18244,7 @@ def _warn_decomposition_share(st: State, caps: dict) -> float | None:
     if share >= threshold:
         log(f"  decomposition used {dec}/{total} calls ({share:.0%}) of this "
             f"run's spend so far, at or above the {threshold:.0%} advisory "
-            f"share; healthy runs measured p50 15%. Execution has "
+            f"share; healthy runs measured p50 13%. Execution has "
             f"{caps['max_total_workers'] - total} of "
             f"{caps['max_total_workers']} calls left")
     return share
@@ -23732,8 +23758,11 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     # Sits alongside the existing plain sidecars (`working-branch`,
     # `criteria/<id>.md`, `checkpoints/<id>.md`).
     task_path = leerie_dir / "task.md"
-    task_path.write_text(task)
-    task_bytes = len(task.encode())
+    # Explicit utf-8 on both: `_task_ref_bytes` is consumed by the worker
+    # to decide whether to page the file, so the count and the write must
+    # agree regardless of the host locale.
+    task_path.write_text(task, encoding="utf-8")
+    task_bytes = len(task.encode("utf-8"))
     sub_dir = leerie_dir / "subtasks"
     for sid, s in subtasks.items():
         spec = dict(s)
@@ -28953,18 +28982,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # claude -p process at once, measured peak ~6.3 GiB. Resolving once
     # here is correct precisely because the ceiling is load-independent;
     # contention is handled at spawn time by the admission gate, not by
-    # shrinking this value. `caps["max_parallel"]` is read only for the
-    # legacy /proc/meminfo fallback (no broker / containment off).
-    # Resolved once here, not inside the resolver, so the ceiling and the
-    # admission demand estimate share one scan (and one log line).
-    _declared_heap = _declared_node_heap_bytes(Path(os.getcwd()))
-    caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
-        Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max,
-        declared_heap_bytes=_declared_heap)
-    # What a worker of THIS repo is expected to actually use — distinct from
-    # the ceiling above, and what both admission surfaces size on (N14-16).
-    caps["worker_demand_estimate_bytes"] = resolve_worker_demand_estimate(
-        _declared_heap)
+    # shrinking this value. `caps["max_parallel"]` feeds the legacy
+    # /proc/meminfo fallback (no broker / containment off) and the
+    # fleet-fit forecast, which asks whether max_parallel workers of
+    # this repo's declared demand fit the slice at once.
     # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the
     # resolver die()s on a non-positive-integer value. Threaded into
     # _cgroup_create via the caps.get("worker_pids_max", …) site so the
@@ -29020,6 +29041,25 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # so an abnormal exit or a client that loses the piped stream still leaves
     # a diagnosable trail (the gap that made run 26fd0fa5 undiagnosable).
     _install_run_log_tee(st.run_dir)
+
+    # Per-worker memory sizing. Deliberately AFTER the log tee: this block
+    # is the only startup step that logs a *diagnosis* rather than a
+    # setting — the repo's declared Node heap, or its absence, and the
+    # fleet-fit forecast. Resolving it before the tee sent exactly those
+    # lines to bare stdout on the local runtime, so the post-hoc
+    # attribution they exist for was missing from orchestrator.log — the
+    # one place a finished run can still be diagnosed from.
+    #
+    # Resolved once here, not inside the resolver, so the ceiling and the
+    # admission demand estimate share one scan (and one log line).
+    _declared_heap = _declared_node_heap_bytes(Path(os.getcwd()))
+    caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
+        Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max,
+        declared_heap_bytes=_declared_heap)
+    # What a worker of THIS repo is expected to actually use — distinct from
+    # the ceiling above, and what both admission surfaces size on (N14-16).
+    caps["worker_demand_estimate_bytes"] = resolve_worker_demand_estimate(
+        _declared_heap)
 
     # Resolve source-of-truth and per-worker model preferences once per run.
     # Both die() on a bad value so typos in leerie.toml or env vars are

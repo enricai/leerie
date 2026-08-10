@@ -114,7 +114,9 @@ the flag exists. The full rationale for the wave model is in
 [`DESIGN.md`](DESIGN.md) §5.
 
 The merged plan lives at `<state-root>/plan.json`; per-subtask spec
-files appear at `<state-root>/subtasks/<id>.json`. `<state-root>`
+files appear at `<state-root>/subtasks/<id>.json`; the task document
+itself is written verbatim to `<state-root>/task.md`, which is what
+each spec's `_task_ref` points at. `<state-root>`
 defaults to `$HOME/.leerie/<basename>/`; override with
 `LEERIE_STATE_DIR`, `--state-dir`, or `state_dir =` in `leerie.toml`.
 

@@ -744,7 +744,9 @@ to the launcher could reach them, while `test_block_present_in_launcher`
 pinned only the helper's name plus the flag/toml-key strings and never its
 logic. `tests/test_no_duplicate_ec2_knob.py` keeps it the only
 implementation — the third guard of this shape after
-`tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py` —
+`tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py`,
+and now generalised by a fourth, `tests/test_no_duplicate_launcher_blocks.py`
+(below) —
 with its marker anchored to the **start of a line**, since a reproduction
 opens the body at column 0 while a legitimate reference
 (`src.index("_resolve_ec2_knob() {")` inside an extractor) is always quoted
@@ -798,7 +800,7 @@ orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
 `_cgroup_enroll`/`_cgroup_destroy` via a stubbed socket round-trip) and
 the fail-closed `_enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
 covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
-sid validation, and v1/v2 path selection — against
+sid validation, v1/v2 path selection, and the startup **orphan sweep** — against
 a fake cgroupfs. Neither can catch **wire-protocol drift between the two**,
 which `tests/test_broker_wire_contract.py` exists for: the broker composes
 `slice` (4 tokens) and `stat` (5) while the orchestrator parses them, the
@@ -964,7 +966,15 @@ Python-layer `group_id` in `run.json` (`_validate_run_json`,
 `_write_run_json`, `_derive_run_status`) is in
 `tests/test_group_run_json.py`. State-dir isolation (distinct
 basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
-`--state-dir`) is in `tests/test_group_state_dir_guard.py`. The
+`--state-dir`) is in `tests/test_group_state_dir_guard.py`. That file's class-A harness
+**extracted** `_state_dir_default` from the launcher rather than reproducing
+it as of the N13 follow-up — it had been a hand-copy whose own docstring
+cited six launcher line numbers, every one already stale (the block moved
+from ~`:502-561` to `:785-844`), so no change to the launcher could fail it.
+It now imports `_extract_state_dir_block` from
+`tests/test_resolve_state_dir.py`, which is the single owner of that
+extraction and has two importers (this file and
+`tests/test_launcher_state_mount.py`). The
 capture engine (DESIGN §6½) — `_gather_dep_manifests` (the manifests-first
 PRIMARY corpus), `_extract_depcap_commands` (the install-filtered SECONDARY
 command hint), `_is_install_command` (the install-verb filter),
@@ -2909,7 +2919,30 @@ hard-coded enumeration with a derivation after a missed instance shipped —
 state-init branches, then 1 of 2 launch blocks (that last one caught by a
 reviewer, not the suite). The derivation was then written twice, once per
 consumer. Two copies of a *rule* drift exactly the way two copies of a *list*
-do. `tests/test_no_duplicate_launcher_splitters.py` enforces the single owner
+do. `tests/test_no_duplicate_launcher_blocks.py` is the general form of that
+discipline for **bash** blocks: a table of eight start-of-line markers
+(`_resolve_ec2_knob`, `_state_dir_default`, `_resolve_seed_knob`,
+`ensure_image`, `resolve_repo_image_tag`, the `config)` case arm, the
+`# --- runtime-mode knob ---` block, and the `_run_argv=(` array), each
+asserted to appear exactly once in the launcher and never at column 0 in any
+test file. It exists because converting N13's five named files fixed those
+instances but not the rule: **three more reproductions were found afterwards
+outside that list, and two had already drifted** —
+`tests/test_launcher_state_mount.py` reproduced the `nerdctl run` argv
+missing `--cidfile`, `--cgroupns=host`, `ROOTLESS_SECOPT`, the `LEERIE_*`
+auto-forward and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`, and
+`tests/test_launcher_runtime_knob.py` omitted `_RUNTIME_EXPLICIT` entirely —
+a flag set at five sites and read by the resume auto-detect
+(`leerie:4127`, `:4152`) that had **zero coverage suite-wide**; deleting
+every assignment left the whole suite green, and now fails five tests. None
+of those copies produced a *wrong* answer, which is the point: they were
+blind, and would have passed identically if the launcher deleted the
+behaviour under test. The `config)` row needs an explicit marker rather than
+a derived `name() {` shape, and the anti-vacuity controls are the same pair
+`test_no_duplicate_ec2_knob.py` carries plus a "converted files actually
+read the launcher" check.
+
+`tests/test_no_duplicate_launcher_splitters.py` enforces the single owner
 and carries two anti-vacuity controls, since a scan that matches nothing would
 certify 'no duplicates' forever: the marker must be found *inside* the owner,
 and at least two other files must actually import `launch_env_blocks`. The

@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import re
 
 import pytest
 
@@ -496,7 +497,17 @@ def test_invoke_admitted_releases_the_reservation_on_every_exit_path(leerie):
     # the bare build-peak fallback: N14-16 showed that constant understates
     # a repo declaring its own Node heap, and an un-threaded estimate makes
     # the correction inert at the gate even though the resolver computed it.
-    assert "worker_demand_estimate_bytes" in src
+    #
+    # Match the CALL, not the bare token. `worker_demand_estimate_bytes` is
+    # also the name of this function's own parameter, so a substring check
+    # is satisfied by the signature line and passes even when the argument
+    # is dropped from the call — i.e. it pins nothing, which is exactly the
+    # regression it is supposed to catch.
+    assert re.search(
+        r"_await_worker_memory_admission\(\s*worker_demand_estimate_bytes",
+        src), (
+        "the demand estimate must be PASSED to the gate, not merely accepted "
+        "as a parameter")
     assert "try:" in src and "finally:" in src
     assert "_release_worker_memory_admission(" in src, (
         "the wrapper no longer releases the reservation — every admitted "

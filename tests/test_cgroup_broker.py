@@ -683,9 +683,10 @@ def test_rootless_create_enroll_destroy_round_trip(rootless_broker):
 def _seed_worker_dir(slice_dir, name, *, procs="", age_sec=0.0):
     """Seed a worker cgroup dir on the fake cgroupfs.
 
-    An EMPTY `cgroup.procs` is modelled by omitting the file, matching what
-    the broker's own `create` leaves behind on this fake and what `_read`
-    reads back (`""` either way). Writing a real empty file instead would
+    An EMPTY `cgroup.procs` is modelled by omitting the file, which is what
+    `_read` reads back anyway (`""` either way). Note this is NOT the shape
+    the broker's own `create` leaves on this fake — that writes `pids.max`
+    and `memory.max`, so a created dir here is non-empty. Writing a real empty file instead would
     make the plain directory non-empty and `os.rmdir` fail ENOTEMPTY — a
     fake-filesystem artifact, since real cgroupfs is kernfs and its control
     files never block rmdir. See `test_destroy_removes_dir` for the same
@@ -698,6 +699,20 @@ def _seed_worker_dir(slice_dir, name, *, procs="", age_sec=0.0):
         past = time.time() - age_sec
         os.utime(d, (past, past))
     return d
+
+
+def test_orphan_min_age_is_one_hour(broker):
+    """Pin the VALUE, not just the guard's existence.
+
+    Every other age assertion in this file is expressed relative to
+    `_ORPHAN_MIN_AGE_SEC`, and the "young" fixture has age ~0 — so setting
+    the constant to 0.001 leaves the whole file green while removing the
+    only protection against sweeping a live worker's cgroup during the
+    create/enroll window (including a *concurrent run's*, which this broker
+    cannot serialise against). That is the mutation that would actually
+    delete a running worker's cgroup, so the number needs its own pin —
+    same reasoning as `test_destroy_drain_budget_is_ten_seconds`."""
+    assert broker._ORPHAN_MIN_AGE_SEC == 3600.0
 
 
 def test_sweep_reclaims_an_old_empty_worker_dir(broker):
@@ -766,7 +781,7 @@ def test_sweep_ignores_non_worker_directories(broker):
     assert other.exists()
 
 
-def test_sweep_is_selective_across_a_mixed_slice(broker):
+def test_sweep_is_selective_across_a_mixed_slice(broker, monkeypatch):
     """End to end on the shape the real host had: a pile of old empties
     alongside live workers. Anti-vacuity — a sweep that reclaimed nothing,
     or everything, would pass one of the tests above but not this."""
@@ -780,10 +795,24 @@ def test_sweep_is_selective_across_a_mixed_slice(broker):
             for i in range(2)]
     young = _seed_worker_dir(slice_dir, "leerie-w-young-feat", procs="")
 
+    # Intercept the removal and assert on what was ATTEMPTED. Asserting
+    # `live` still exists is not enough and was verified unable to fail:
+    # `_drain_then_rmdir` re-reads `cgroup.procs` itself, so deleting the
+    # sweep's own guard still leaves `reclaimed == 4` and every directory in
+    # the state this test expects. The count and the exists-checks are all
+    # satisfied by the downstream re-check rather than by the guard.
+    attempted: list[str] = []
+
+    def _record(d, budget):
+        attempted.append(d)
+        return None
+
+    monkeypatch.setattr(broker, "_drain_then_rmdir", _record)
     assert broker._sweep_orphaned_worker_cgroups() == 4
-    assert all(not d.exists() for d in old)
-    assert all(d.exists() for d in live)
-    assert young.exists()
+    assert sorted(attempted) == sorted(str(d) for d in old)
+    for d in live:
+        assert str(d) not in attempted, "tried to remove a live worker cgroup"
+    assert str(young) not in attempted
 
 
 def test_sweep_runs_before_the_socket_is_bound(broker):
@@ -806,3 +835,12 @@ def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch):
     assert "try:" in src[:i_sweep], "the sweep call is not wrapped in try/"
     assert "non-fatal" in src, (
         "the sweep's failure arm should say plainly that it is non-fatal")
+    # ...and must not re-raise. Without this, adding `raise` to the except
+    # arm — the exact behaviour this test forbids — keeps both assertions
+    # above green, since the log line still says "non-fatal".
+    except_arm = src[src.index("except Exception"):]
+    except_arm = except_arm[:except_arm.index("\n    if ")]
+    assert "raise" not in except_arm, (
+        "the sweep's failure arm re-raises; a housekeeping failure would "
+        "then stop the broker, and the broker is the only thing that can "
+        "enforce containment")

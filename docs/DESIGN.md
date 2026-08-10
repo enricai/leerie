@@ -2956,6 +2956,32 @@ a tree still dying when destroy runs — but the ordering is what removes
 the cause. It is pinned by a source-coupled test, since an ordering is
 invisible to a behavioural one.
 
+**Prevention is not reclamation, so the broker also sweeps.** Worker
+cgroups live on the *host* hierarchy — workers run with
+`--cgroupns=host` — so they outlive the container that made them.
+Everything above stops new leaks; nothing removes the ones already on
+disk, and an orchestrator killed outright still skips its own cleanup
+entirely. The broker therefore sweeps abandoned worker cgroups once at
+startup, before it binds its socket, so no client of its own run can be
+mid-create while it walks.
+
+The sweep is **deliberately cross-run**: the pile it exists to clear
+belongs to runs that are long gone, and a run cannot clean up after a
+predecessor it never knew about. That makes its predicate a safety
+question rather than a housekeeping one, and two conditions must hold
+together — the cgroup has no processes in it, *and* it is older than a
+generous age floor. Neither alone is sufficient. Creating a cgroup and
+enrolling a process into it are separate steps, so a live cgroup is
+briefly empty, and a *concurrent* run's broker is a different process
+this one cannot serialise against; only age covers that window.
+
+Identity cannot substitute for age here, which is worth recording
+because the obvious approach is wrong: the cgroup name carries its
+owning run id, but a resumed run keeps its original id while getting a
+new container, so "is a container with this id still alive" reports
+*dead* for every resumed run — a predicate that would have deleted the
+live runs on the host where this was measured.
+
 **A per-worker cap is a ceiling, not a reservation.** Writing
 `memory.max` allocates nothing; it only bounds. The real backstop
 against host-level exhaustion is the *aggregate*
@@ -2982,6 +3008,40 @@ peak outranks it: on a slice too small to honour both, a `memory.max`
 above the slice is harmless (the aggregate cap binds first) while one
 below the build peak guarantees the OOM. Being load-independent is what
 makes resolving it once, at startup, correct.
+
+**The ceiling is not the only per-worker figure: admission needs a
+*demand* estimate, and the two are different quantities.** The ceiling
+answers "how big before *this* worker is killed" and reserves nothing.
+Admission answers a different question — "is there room for another
+build right now" — and that one genuinely does reserve, so it needs a
+prediction of what a worker will actually *use*. Conflating the two in
+either direction is a mistake: reserving against the ceiling throttles
+every run to fit a bound nobody is expected to reach, and sizing the
+ceiling from the estimate reintroduces the divide-the-slice failure
+above.
+
+The estimate defaults to the same measured build peak, which is why the
+distinction stayed invisible for so long. It stops being invisible when
+a repo *declares* its own memory demand: an explicit
+`--max-old-space-size` in the build/lint/test command a repo runs
+overrides Node's container-aware default, so such a worker's real
+demand is the declared heap plus non-heap headroom, well above the
+historical peak. Admission then sizes on that instead. Deliberately
+only then — raising the estimate fleet-wide would throttle every repo
+to fix a case most do not have.
+
+Two consequences follow, and they replace the fixed arithmetic this
+section used to quote:
+
+1. The provable reservation ceiling is `demand × (max_parallel + 1)`,
+   not `build_peak × (max_parallel + 1)`. For a repo that declares a
+   large heap this can exceed the slice budget, and that is expected:
+   wave-entry degradation shrinks concurrency until it fits, which is
+   the mechanism doing its job rather than a violation of the bound.
+2. Because degradation is the designed response, a declared heap large
+   relative to the slice buys fewer concurrent workers. The operator is
+   told so at startup rather than discovering it as unexplained
+   slowness.
 
 **Contention is handled by admission in two stages, not by shrinking
 caps.** The cheap stage runs once at wave entry
@@ -3013,8 +3073,10 @@ which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
 was reclaimable file cache**, so gating on `memory.current` would
 under-report headroom by half and stall a fleet that had ample room.
 
-The gate also **reserves** one build peak per worker still in flight —
-admitted and not yet exited — plus one for the worker being admitted. It
+The gate also **reserves** one per-worker *demand estimate* (above:
+normally the build peak, or the repo's declared heap plus headroom when
+it declares one) per worker still in flight — admitted and not yet
+exited — plus one for the worker being admitted. It
 is otherwise stateless, and `_invoke` runs under
 `Semaphore(max_parallel)` with the gate *inside* it — so a whole wave
 would evaluate identical pre-allocation headroom and all of it would
@@ -3038,8 +3100,12 @@ reintroduced by the mechanism itself.
 Bounding by lifetime makes the ceiling provable rather than a guess about
 timing: in-flight workers are capped by the semaphore the spawn path
 already runs under, so reservations cannot exceed
-`build_peak × (max_parallel + 1)` — about 38 GiB at the default, which
-fits an idle slice and still blocks a busy one.
+`demand × (max_parallel + 1)`. At the default estimate that is about
+38 GiB, which fits an idle 54.9 GiB slice and still blocks a busy one.
+A repo declaring a large heap raises the estimate and can push that
+product past the slice; wave-entry degradation then shrinks concurrency
+until it fits, which is the designed response rather than a broken
+bound.
 
 `_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
 window between the gate and the spawn path's `try`/`finally`. It is also
@@ -6415,9 +6481,10 @@ collisions (two different abs_paths sharing a basename) are caught at
 use time via an `.owner` sidecar inside the dir that records the
 abs_path of the repo that owns it — the launcher refuses to write into
 a dir owned by a different repo and prints the override knobs. State,
-plan, criteria, checkpoints, logs, the worktrees themselves, the
-PR-result sidecar, and the per-subtask `artifacts/` directory (§5
-*Artifact passing between subtasks*) all live under the per-run subtree.
+plan, the task document, criteria, checkpoints, logs, the worktrees
+themselves, the PR-result sidecar, and the per-subtask `artifacts/`
+directory (§5 *Artifact passing between subtasks*) all live under the
+per-run subtree.
 Two runs in the same repository share no coordination state — each has
 its own `runs/<run-id>/` subtree, and neither can clobber the other's
 `state.json`, log files, or worktrees by collision.
