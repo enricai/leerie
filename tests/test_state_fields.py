@@ -47,25 +47,57 @@ def _spec_fields() -> set[str]:
     return fields
 
 
+def _is_st_data(node: ast.AST) -> bool:
+    """`st.data` exactly — not `bst.data`, not `other.data`.
+
+    A text match on `st\\.data` also matches `bst.data`, the
+    `_BackstopState` stub in `_backstop_capture_prior_runs`. That is not a
+    hypothetical: it is what silently disabled the dict-literal half of
+    `_runtime_field_writes` (see that function's note).
+    """
+    return (isinstance(node, ast.Attribute) and node.attr == "data"
+            and isinstance(node.value, ast.Name) and node.value.id == "st")
+
+
 def _runtime_field_writes() -> set[str]:
     """Every name used as a key on `st.data` in leerie.py — whether via
     `st.data["x"] = ...`, `st.data.setdefault("x", ...)`, or as a key in
-    the run-init dict literal in `_run_phases()`."""
-    source = LEERIE_PY.read_text()
+    the run-init dict literal in `_run_phases()`.
 
-    direct = set(re.findall(r'st\.data\["([a-z_]+)"\]\s*=', source))
-    setdefault = set(re.findall(r'st\.data\.setdefault\("([a-z_]+)"', source))
-
-    # The init in `_run_phases()` writes several keys in one dict literal:
-    #   st.data = {"task": task, "started_at": now(), ...}
-    init_match = re.search(
-        r"st\.data\s*=\s*\{(.*?)\}", source, re.DOTALL,
-    )
-    init = set()
-    if init_match:
-        init = set(re.findall(r'"([a-z_]+)"\s*:', init_match.group(1)))
-
-    return direct | setdefault | init
+    AST rather than regex, because the regex version silently covered only
+    two of those three forms for its whole life. It matched the literal
+    with `re.search(r"st\\.data\\s*=\\s*\\{(.*?)\\}", ...)`, and two bugs
+    compounded: `bst.data = {}` (a stub, `orchestrator/leerie.py`) matched
+    `st\\.data` for want of a word boundary, and `re.search` returns that
+    FIRST match, whose non-greedy body captured zero characters. Measured:
+    an undeclared key injected into the run-init literal was not detected,
+    while the same key in a subscript write was — so the guarantee
+    CLAUDE.md records for this test held for one write form only.
+    """
+    tree = ast.parse(LEERIE_PY.read_text())
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        # st.data["x"] = ...
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if (isinstance(tgt, ast.Subscript) and _is_st_data(tgt.value)
+                        and isinstance(tgt.slice, ast.Constant)
+                        and isinstance(tgt.slice.value, str)):
+                    found.add(tgt.slice.value)
+                # st.data = {"x": ..., ...}
+                if _is_st_data(tgt) and isinstance(node.value, ast.Dict):
+                    found |= {k.value for k in node.value.keys
+                              if isinstance(k, ast.Constant)
+                              and isinstance(k.value, str)}
+        # st.data.setdefault("x", ...)
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault"
+                and _is_st_data(node.func.value)
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            found.add(node.args[0].value)
+    return found
 
 
 def _state_init_branch_keys(leerie) -> tuple[set[str], set[str]]:
@@ -76,14 +108,28 @@ def _state_init_branch_keys(leerie) -> tuple[set[str], set[str]]:
     dict literal, so this walks the AST rather than matching text — a
     source-order or whole-file regex cannot tell which arm it covered, which
     is the exact trap documented in `tests/test_leerie_commit.py`.
+
+    THIS IS THE SINGLE OWNER of the branch-split derivation.
+    `tests/test_leerie_commit.py` and
+    `tests/test_phase_planning_coverage_gate.py` import it;
+    `tests/test_no_duplicate_state_walks.py` enforces that nothing
+    re-implements it. Two copies of a rule drift exactly the way two copies
+    of a list do — see `tests/launcher_blocks.py` for the same lesson.
     """
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
+    # Match the test EXACTLY. `"args.resume" in ast.unparse(...)` also
+    # matches the later `if not args.resume:` guard, and `ast.walk` yields
+    # breadth-first — not source order — so picking `[0]` from a substring
+    # match selected the right node by luck, not by construction.
     nodes = [n for n in ast.walk(tree)
-             if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)]
-    assert nodes, "could not locate the `if args.resume:` split"
+             if isinstance(n, ast.If) and ast.unparse(n.test) == "args.resume"]
+    assert len(nodes) == 1, (
+        f"expected exactly one `if args.resume:` node in _run_phases, found "
+        f"{len(nodes)} — a second one makes `nodes[0]` ambiguous, which is "
+        f"how this walk would silently start analysing the wrong branch")
     node = nodes[0]
     assert node.orelse, "the fresh-run `else:` branch was not found"
 
@@ -91,19 +137,37 @@ def _state_init_branch_keys(leerie) -> tuple[set[str], set[str]]:
         found: set[str] = set()
         for stmt in body:
             for n in ast.walk(stmt):
+                # Fail loudly on a write form this walk cannot see, rather
+                # than under-reporting. An unseen `st.data.update({...})`
+                # would shrink `resume_keys` and make the guard below pass
+                # vacuously — the failure mode it exists to prevent.
+                if (isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and _is_st_data(n.func.value)
+                        and n.func.attr in ("update", "setdefault")):
+                    raise AssertionError(
+                        f"`st.data.{n.func.attr}()` in a state-init branch is "
+                        f"a write form this walk does not collect. Teach "
+                        f"`_state_init_branch_keys` about it — leaving it "
+                        f"unseen makes the symmetry guard pass vacuously.")
+                if isinstance(n, ast.AugAssign) and _is_st_data(n.target):
+                    raise AssertionError(
+                        "augmented assignment to st.data in a state-init "
+                        "branch is not collected by this walk")
                 if not isinstance(n, ast.Assign):
                     continue
                 for tgt in n.targets:
                     # st.data["x"] = ...
                     if (isinstance(tgt, ast.Subscript)
-                            and "st.data" in ast.unparse(tgt.value)
-                            and isinstance(tgt.slice, ast.Constant)):
+                            and _is_st_data(tgt.value)
+                            and isinstance(tgt.slice, ast.Constant)
+                            and isinstance(tgt.slice.value, str)):
                         found.add(tgt.slice.value)
                     # st.data = {"x": ..., ...}
-                    if (ast.unparse(tgt) == "st.data"
-                            and isinstance(n.value, ast.Dict)):
+                    if _is_st_data(tgt) and isinstance(n.value, ast.Dict):
                         found |= {k.value for k in n.value.keys
-                                  if isinstance(k, ast.Constant)}
+                                  if isinstance(k, ast.Constant)
+                                  and isinstance(k.value, str)}
         return found
 
     return keys(node.body), keys(node.orelse)
@@ -129,6 +193,12 @@ def test_no_resume_only_state_keys(leerie):
     The reverse direction is deliberately NOT asserted: `task`,
     `started_at` and `worker_count` are legitimately fresh-only, since a
     resumed run already has them.
+
+    This is also what makes hand-seeded flag tests safe everywhere else.
+    Several files set `st.data["skip_*"] = True` directly and assert on the
+    consumer — a shape that verifies a reader, not a feature, and is
+    structurally blind to whether anything ever writes the key. This guard
+    is the producer half for all of them at once.
     """
     resume_keys, fresh_keys = _state_init_branch_keys(leerie)
     resume_only = resume_keys - fresh_keys

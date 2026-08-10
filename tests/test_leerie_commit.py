@@ -14,12 +14,10 @@ orchestrator records it beside the version. Absence is a normal state (a tarball
 install has no checkout to read), so it must degrade to `None` rather than fail
 a run or write a misleading empty string.
 """
-import ast
 import inspect
 import json
 import re
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -60,24 +58,11 @@ _BOTH_BRANCH_KEYS = (
 )
 
 
-def _resume_split() -> tuple[list, list]:
-    """`_run_phases`' `if args.resume:` node, as `(resume_body, fresh_body)`.
-
-    The resume path seeds state with subscript assignments and the fresh
-    path with a dict literal, so a source-order check cannot tell which
-    branch it covered — see `test_written_in_BOTH_state_init_branches`.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(leerie._run_phases)))
-    nodes = [n for n in ast.walk(tree)
-             if isinstance(n, ast.If) and "args.resume" in ast.unparse(n.test)]
-    assert nodes, "could not locate the `if args.resume:` split"
-    node = nodes[0]
-    assert node.orelse, "the fresh-run `else:` branch was not found"
-    return node.body, node.orelse
-
-
-def _mentions(body: list, key: str) -> bool:
-    return any(key in ast.unparse(s) for s in body)
+# The branch-split walk has ONE owner. This file previously carried its own
+# copy, which is the duplicated-derivation defect `tests/launcher_blocks.py`
+# was created to end — "two copies of a rule drift exactly the way two copies
+# of a list do." Enforced by tests/test_no_duplicate_state_walks.py.
+from tests.test_state_fields import _state_init_branch_keys  # noqa: E402
 
 
 class TestStateSurface:
@@ -136,9 +121,9 @@ class TestWriteSite:
         every key in `_BOTH_BRANCH_KEYS` — see that constant for why this is
         parametrised rather than duplicated per field.
         """
-        resume, fresh = _resume_split()
-        assert _mentions(resume, key), f"resume branch does not record {key}"
-        assert _mentions(fresh, key), (
+        resume, fresh = _state_init_branch_keys(leerie)
+        assert key in resume, f"resume branch does not record {key}"
+        assert key in fresh, (
             f"FRESH-RUN branch does not record {key} — the field would be "
             f"absent for every non-resume run")
 
@@ -151,10 +136,10 @@ class TestWriteSite:
         deliberately NOT in `_BOTH_BRANCH_KEYS`, so it must be found by the
         same walk — if it is not, the walk is broken, not the code.
         """
-        resume, fresh = _resume_split()
-        assert _mentions(resume, "leerie_version"), (
+        resume, fresh = _state_init_branch_keys(leerie)
+        assert "leerie_version" in resume, (
             "the branch walk is broken — leerie_version is known to be in both")
-        assert _mentions(fresh, "leerie_version"), (
+        assert "leerie_version" in fresh, (
             "the branch walk is broken — leerie_version is known to be in both")
 
     @pytest.mark.parametrize("key", _BOTH_BRANCH_KEYS)

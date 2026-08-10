@@ -1420,7 +1420,19 @@ checked by `tests/test_state_fields.py`, not a runtime filter —
 an undeclared key is not silently dropped on `resume`. What actually
 happens is louder: `test_state_fields.py::test_every_st_data_write_is_declared`
 fails the moment a new `st.data["x"] = ...` write lands without a
-matching `STATE_FIELDS` entry, and `test_state_fields_matches_spec_table`
+matching `STATE_FIELDS` entry — though note that guarantee held for the
+**subscript form only** until 2026-08-10. `_runtime_field_writes` matched the
+run-init dict literal with `re.search(r"st\.data\s*=\s*\{(.*?)\}", ...)`, and
+two bugs compounded: the pattern has no word boundary so `bst.data = {}` (the
+`_BackstopState` stub) matched, and `re.search` returns that **first** match,
+whose non-greedy body captured **zero characters**. Measured before the fix: an
+undeclared key injected into the run-init literal was not detected, while the
+same key in a subscript write was; the matcher saw 67 keys where a correct one
+sees 70, blind to exactly the three literal-only keys (`task`, `started_at`,
+`worker_count`). It is now an AST walk, which also kills the `bst` false match
+by construction — the general lesson being that a text match on `st\.data`
+cannot distinguish a real `State` from a stub whose attribute merely ends the
+same way. `test_state_fields_matches_spec_table`
 fails if the IMPLEMENTATION.md §8 field table and `STATE_FIELDS` drift
 out of sync in either direction. The resumable-planning checkpoint keys
 above additionally get their own named guard-the-guard pins in
@@ -2902,7 +2914,18 @@ not here** — it is `tests/test_state_fields.py::test_no_resume_only_state_keys
 which *derives* the rule (`resume_keys - fresh_keys == set()`, walked over the
 `if args.resume:` node) for every key, with **no list to maintain and no
 allowlist**: the reverse direction is deliberately unasserted, since `task`,
-`started_at` and `worker_count` are legitimately fresh-only. `_BOTH_BRANCH_KEYS`
+`started_at` and `worker_count` are legitimately fresh-only. That walk
+(`_state_init_branch_keys`) has **one owner**, imported by its consumers and
+enforced by `tests/test_no_duplicate_state_walks.py` — the same single-owner
+discipline `tests/launcher_blocks.py` carries, and for a sharper reason: a
+drifted second copy under-reports `resume_keys`, which makes the symmetry guard
+pass **vacuously** rather than fail. Two traps are pinned inside the walk
+itself: it matches `ast.unparse(n.test) == "args.resume"` **exactly** and
+asserts exactly one node (a substring match also catches the later
+`if not args.resume:` guard, and `ast.walk` is breadth-first rather than source
+order, so `nodes[0]` was selecting the right branch by luck), and it **raises**
+on an `st.data.update()` / `setdefault()` / augmented write inside either arm
+instead of silently not collecting it. `_BOTH_BRANCH_KEYS`
 in `test_leerie_commit.py` is a frozen set of *named pins* for the three fields
 that have actually shipped broken on this seam, kept for the same reason the
 resumable-planning keys keep theirs — a generic sweep fails with a diff, a named
