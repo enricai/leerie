@@ -137,8 +137,8 @@ def test_status_killed_remote(leerie):
 
 
 def test_status_killed_without_machine_id_is_local_kill_not_corrupt(leerie):
-    """N7: killed_at with no machine id and no other Fly/EC2 evidence is
-    a valid local (nerdctl) kill, not a corrupt sidecar."""
+    """N7: killed_at with no machine id KEY at all and no other Fly/EC2
+    evidence is a valid local (nerdctl) kill, not a corrupt sidecar."""
     rj = {"killed_at": "2026-05-29T16:00:00+00:00"}
     assert leerie._derive_run_status(rj, {}) == "killed"
 
@@ -149,6 +149,19 @@ def test_status_killed_without_machine_id_but_fly_evidence_is_corrupt(leerie):
     rj = {
         "killed_at": "2026-05-29T16:00:00+00:00",
         "image_tag": "registry.fly.io/leerie:0.6.7",
+    }
+    assert leerie._derive_run_status(rj, {}) == "corrupt-sidecar"
+
+
+def test_status_killed_fly_shaped_without_machine_id_is_corrupt(leerie):
+    """Invariant: a sidecar that CARRIES the fly_machine_id key but has it
+    null — the shape `_ensure_run_json` writes when `fly-machine.json` is
+    missing the id — is corrupt even with no other Fly evidence. This is
+    the key-presence half of rule 6, disjoint from the image_tag case
+    above."""
+    rj = {
+        "killed_at": "2026-05-29T16:00:00+00:00",
+        "fly_machine_id": None,
     }
     assert leerie._derive_run_status(rj, {}) == "corrupt-sidecar"
 
