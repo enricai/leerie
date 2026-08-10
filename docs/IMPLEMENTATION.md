@@ -1110,6 +1110,15 @@ Common to both modes:
   proceeds with terminal-only output; a mid-run write failure is swallowed so
   the terminal stream never breaks. Per-worker `<state-root>/logs/<sid>.log`
   files (the raw event streams) are unaffected and orthogonal.
+- **`die()` announces the run id on every terminal exit path (N8).**
+  `State.__init__` calls `_set_current_run_id(run_id)`, which stashes the id
+  in the module-level `_CURRENT_RUN_ID` — the only channel available to
+  `die()`, since most call sites run at module scope with no `State` in
+  hand. Once a `State` has been constructed, every subsequent `die("...")`
+  appends `(run <id>)` to its message; a `die()` before any `State` exists
+  (e.g. an early preflight failure) is unaffected and prints its plain
+  message. This closes the gap where a mid-run `die()` gave the operator no
+  id to pass to `resume`. Pinned in `tests/test_run_id_terminal_emit.py`.
 - `--rm` removes the stopped container automatically so they don't
   accumulate. Worktrees and state on the bind-mounted host
   filesystem survive for `resume`.
