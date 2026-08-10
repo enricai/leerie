@@ -2897,16 +2897,32 @@ replacement walks `_run_phases`'s AST, locates the `args.resume` `If` node, and
 requires the key in `body` **and** `orelse`, with an anti-vacuity control
 asserting the same walk finds `leerie_version` (known to be in both, and
 deliberately excluded from the parametrised list below) so a broken walk fails
-as a broken walk rather than a missing key. That walk is **parametrised over
-`_BOTH_BRANCH_KEYS`**, not written per field, because a per-field guard is
-itself the defect this pins: `leerie_commit` had the guard and survived in both
-branches, while `dangerously_force_strict_output` had none and shipped absent
-from the fresh-run branch — i.e. from every non-resume run, the only path that
-can set the flag at all, since `resume` re-reads it from the state it was
-missing from (this file's own module docstring cites that field as the
-exemplar of the attribution gap, which is how the omission hid in plain sight).
-**Any new `st.data` field that must be seeded on both paths goes in that tuple;
-do not copy the walk.** (2) The local `-e`
+as a broken walk rather than a missing key. **The enforcement for this seam is
+not here** — it is `tests/test_state_fields.py::test_no_resume_only_state_keys`,
+which *derives* the rule (`resume_keys - fresh_keys == set()`, walked over the
+`if args.resume:` node) for every key, with **no list to maintain and no
+allowlist**: the reverse direction is deliberately unasserted, since `task`,
+`started_at` and `worker_count` are legitimately fresh-only. `_BOTH_BRANCH_KEYS`
+in `test_leerie_commit.py` is a frozen set of *named pins* for the three fields
+that have actually shipped broken on this seam, kept for the same reason the
+resumable-planning keys keep theirs — a generic sweep fails with a diff, a named
+pin fails naming the field. A new field does not go in it. **This is the fourth
+time an enumeration here was replaced by a derivation after a missed instance
+shipped** (PRs #180–#183 are the others): the first fix parametrised the walk
+over a two-entry tuple, and the derived rule immediately found a third defect
+the tuple could not have caught — `skip_coverage_check`, seeded only under
+`if args.resume:` since PR #162 (*"add --skip-coverage-check, the escape hatch
+this gate lacked"*). That one was **behavioural, not attribution**:
+`phase_planning_coverage_gate` reads it straight off `st.data`, so `.get()`
+returned `None` and the flag was silently inert on every fresh run — while
+`tests/test_phase_planning_coverage_gate.py`'s `TestSkipCoverageCheck` reported
+full coverage, because every test in it sets the key **by hand** and so pins the
+consumer while proving nothing about the producer. That file now carries a named
+producer pin importing the shared walk. By contrast
+`dangerously_force_strict_output` (M7) is a **record only** — the flag's
+behaviour comes from `caps["force_strict_output"]` in `_orchestrate`, ahead of
+the split and independent of `st.data`, so both paths always honoured it and
+what was lost was attribution. (2) The local `-e`
 forward covers only `--runtime local`, and there are **two** further launch
 blocks — Fly and EC2 each build their own `child_env = dict(os.environ)` inside
 their own unquoted `<<PY` heredoc. Both must forward the value, JSON-encoded

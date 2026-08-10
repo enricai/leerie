@@ -27435,19 +27435,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "clarify": bool(args.clarify),
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
-                   # Same both-branches requirement as leerie_commit below,
-                   # for the same reason: this flag lowers the CLI's context
-                   # ceiling invisibly (see `_model_arg`), so a run that dies
-                   # of it is unattributable without the field. It shipped
-                   # absent from THIS branch — i.e. from every fresh run,
-                   # which is the only path that can hit the flag at all,
-                   # since `resume` re-reads it from the state it was missing
-                   # from.
+                   # Same both-branches requirement as leerie_commit below.
+                   # This one is purely a RECORD: the flag's behaviour comes
+                   # from `caps["force_strict_output"]` in `_orchestrate`,
+                   # ahead of this split and independent of st.data, so both
+                   # paths always honoured it. What was missing on the fresh
+                   # path — i.e. the common one — was the field that makes a
+                   # failure attributable to the flag afterwards, the flag
+                   # having lowered the CLI's context ceiling invisibly (see
+                   # `_model_arg`).
                    "dangerously_force_strict_output": bool(
                        caps.get("force_strict_output")),
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
                    "skip_adherence_check": bool(
                        getattr(args, "skip_adherence_check", False)),
+                   # Unlike the record above this one is BEHAVIOURAL:
+                   # `phase_planning_coverage_gate` reads it straight off
+                   # st.data, so omitting it here made `.get()` return None
+                   # and the gate run anyway — the flag was inert on every
+                   # fresh run from the commit that introduced it.
+                   "skip_coverage_check": bool(
+                       getattr(args, "skip_coverage_check", False)),
                    "skip_completeness_check": bool(
                        getattr(args, "skip_completeness_check", False)),
                    "skip_satisfied_check": bool(

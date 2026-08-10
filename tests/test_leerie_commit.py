@@ -34,18 +34,30 @@ from tests.launcher_blocks import launch_env_blocks  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = (REPO / "leerie").read_text()
 
-# Keys that must be initialised in BOTH of `_run_phases`' state-init
-# branches. Parametrised over a list rather than written once per key: a
-# per-field guard is precisely why `dangerously_force_strict_output`
-# shipped absent from the fresh-run branch — i.e. from every non-resume
-# run, the only path that can set the flag at all — while `leerie_commit`,
-# the one field that had this guard, survived in both. This module's own
-# docstring cites that field as the exemplar of the attribution gap, which
-# is how the omission hid in plain sight.
+# Named pins for the fields that have actually shipped broken on this
+# seam. These are NOT the enforcement — `tests/test_state_fields.py`'s
+# `test_no_resume_only_state_keys` derives the rule for every key, with no
+# list to maintain. A new field does not belong here; it is already
+# covered.
 #
-# Add a key here whenever a new `st.data` field must be seeded on both
-# paths; do NOT copy the walk below for it.
-_BOTH_BRANCH_KEYS = ("leerie_commit", "dangerously_force_strict_output")
+# This list exists for the reason CLAUDE.md gives for the
+# resumable-planning keys: a generic sweep fails with a diff, while a named
+# pin fails naming the field and the incident. Keeping both is the
+# convention, and the enumeration is deliberately frozen to the historical
+# cases so it cannot rot back into a maintenance burden — which is what it
+# was when it had two entries and missed `skip_coverage_check` entirely.
+_BOTH_BRANCH_KEYS = (
+    # v0.11.x: shipped absent from the fresh path, making every non-resume
+    # run's version ambiguous — the gap this whole module exists for.
+    "leerie_commit",
+    # M7: same seam. A record rather than behaviour (the flag itself comes
+    # from `caps` in `_orchestrate`), so the cost was an unattributable run.
+    "dangerously_force_strict_output",
+    # PR #162: same seam, but read straight off `st.data` by
+    # `phase_planning_coverage_gate` — so `--skip-coverage-check` was
+    # silently inert on every fresh run from the commit that introduced it.
+    "skip_coverage_check",
+)
 
 
 def _resume_split() -> tuple[list, list]:
