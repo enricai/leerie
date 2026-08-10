@@ -5038,7 +5038,7 @@ def resolve_worker_memory_max(repo_root: Path,
                 val = _auto_worker_memory_max(max_parallel)
 
     declared_heap_bytes = _declared_node_heap_bytes(repo_root)
-    if not declared_heap_bytes:
+    if declared_heap_bytes is None:
         return val
     needed = declared_heap_bytes + _NODE_HEAP_HEADROOM_BYTES
     if val >= needed:

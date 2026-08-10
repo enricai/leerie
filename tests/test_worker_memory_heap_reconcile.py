@@ -63,6 +63,16 @@ def test_empty_declared_axis_tolerated(leerie, tmp_path):
     assert leerie._declared_node_heap_bytes(tmp_path) is None
 
 
+def test_declared_heap_of_zero_is_a_real_value_not_none(leerie, tmp_path):
+    """--max-old-space-size=0 is a syntactically valid (if unusual) Node
+    flag. It must parse to 0, distinct from "no flag declared" (None) --
+    0 is falsy in Python, so a caller checking truthiness rather than
+    identity-with-None would silently treat this the same as "nothing
+    declared"."""
+    _write_config(tmp_path, test="NODE_OPTIONS=--max-old-space-size=0 next test")
+    assert leerie._declared_node_heap_bytes(tmp_path) == 0
+
+
 # ---- resolve_worker_memory_max: regression (no declared heap) -------------
 
 def test_no_declared_heap_behavior_unchanged(leerie, tmp_path, monkeypatch):
@@ -130,6 +140,25 @@ def test_declared_heap_raise_bounded_when_slice_unknown(
     result = leerie.resolve_worker_memory_max(tmp_path, max_parallel=4)
     heap_bytes = 8192 * 1024 * 1024
     assert result >= heap_bytes + leerie._NODE_HEAP_HEADROOM_BYTES
+
+
+def test_declared_heap_of_zero_still_reconciled_not_skipped(
+        leerie, tmp_path, monkeypatch):
+    """--max-old-space-size=0 must not be mistaken for "no declared heap".
+    0 is Python-falsy, so a truthiness check (`if not declared_heap_bytes`)
+    rather than an identity check (`is None`) would silently bypass the
+    reconciliation for exactly this value. Force the auto-derived ceiling
+    below headroom alone so the raise is only observable if reconciliation
+    actually ran."""
+    monkeypatch.delenv("LEERIE_WORKER_MEMORY_MAX", raising=False)
+    _write_config(tmp_path, test="NODE_OPTIONS=--max-old-space-size=0 jest")
+    auto_val = leerie._NODE_HEAP_HEADROOM_BYTES // 2
+    monkeypatch.setattr(leerie, "_auto_worker_memory_max",
+                        lambda max_parallel: auto_val)
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
+    result = leerie.resolve_worker_memory_max(tmp_path, max_parallel=4)
+    assert result >= leerie._NODE_HEAP_HEADROOM_BYTES
+    assert result != auto_val
 
 
 # ---- resolve_worker_memory_max: die() paths --------------------------------
