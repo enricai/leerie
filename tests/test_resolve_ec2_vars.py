@@ -45,23 +45,40 @@ _EC2_VARS = [
     ("--ec2-subnet-id", "LEERIE_EC2_SUBNET_ID", "ec2_subnet_id"),
 ]
 
-# The launcher's EC2-knob resolution helper + CLI-scan, reproduced so the
-# tests exercise the launcher's logic and a refactor that changes parsing
-# makes the coupling test (test_block_present_in_launcher) fail.
-_LAUNCHER_EC2_BLOCK = r"""
-_resolve_ec2_knob() {
-  local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval
-  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
-  eval "_envval=\"\${$_envname:-}\""
-  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
-  if [ -f "$USER_REPO/leerie.toml" ]; then
-    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
-                        "$USER_REPO/leerie.toml" 2>/dev/null \
-                      | head -1 \
-                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
-    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
-  fi
-}
+def _extract_resolve_ec2_knob() -> str:
+    """The REAL `_resolve_ec2_knob` body, lifted out of the launcher.
+
+    This used to be a hand-written copy of the helper, and that copy was
+    body-blind by construction: the tests ran a string literal defined in
+    this file, so NO change to the launcher could affect them, while
+    `test_block_present_in_launcher` pins only the helper's *name* plus the
+    flag and toml-key strings, never its logic.
+
+    Verified by inverting the real helper's CLI/env precedence: with the
+    extraction, `test_cli_wins_over_env_and_toml` fails for all five vars;
+    against the old copy it could not have. (A first attempt used the
+    `[ -f ]` guard for this, which passes either way -- removing it is
+    behaviourally inert, since grep on a missing file already fails
+    silently. Pick a sabotage that changes an observable, or the
+    falsification proves nothing.)
+
+    Two copies of a rule drift exactly the way two copies of a list do; see
+    `tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py`
+    for the same lesson, and `tests/test_no_duplicate_ec2_knob.py` for the
+    guard that keeps this the only source.
+
+    The CLI-scan below stays reproduced on purpose: it is a fixture driving
+    specific argv, not a second copy of a shared rule.
+    """
+    src = LAUNCHER.read_text()
+    start = src.index("_resolve_ec2_knob() {")
+    end = src.index("\n}\n", start) + len("\n}\n")
+    return src[start:end]
+
+
+# The launcher's EC2-knob CLI-scan and assignments. The helper itself is
+# extracted above; this part is reproduced so the tests can drive argv.
+_LAUNCHER_EC2_CLI_SCAN = r"""
 _cli_ec2_ami=""
 _cli_ec2_instance_type=""
 _cli_ec2_key_name=""
@@ -110,7 +127,8 @@ def _run(user_repo: Path, *args: str, env_extra: dict | None = None,
     script = (
         "set -euo pipefail\n"
         f"USER_REPO={user_repo!s}\n"
-        f"{_LAUNCHER_EC2_BLOCK}\n"
+        f"{_extract_resolve_ec2_knob()}\n"
+        f"{_LAUNCHER_EC2_CLI_SCAN}\n"
         'printf "%s|%s|%s|%s|%s\\n" '
         '"$LEERIE_EC2_AMI" "$LEERIE_EC2_INSTANCE_TYPE" "$LEERIE_EC2_KEY_NAME" '
         '"$LEERIE_EC2_SECURITY_GROUP" "$LEERIE_EC2_SUBNET_ID"\n'

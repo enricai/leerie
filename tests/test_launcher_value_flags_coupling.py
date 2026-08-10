@@ -135,6 +135,22 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # REWRITTEN_ARGS; the orchestrator never reads it (resolution-only in
     # this subtask — the tee/write wiring is separate work).
     "--log-file",
+    # --aws-region / --aws-profile are value-taking but launcher-only:
+    # they resolve into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE above the
+    # top-level verb dispatch (accept-blocked/stop/kill/finalize all read
+    # them inside their arms) and are consumed host-side by ec2-lib.sh,
+    # ec2-ssm.sh and ec2-provision.sh when provisioning --runtime ec2
+    # machines. The launcher strips them from REWRITTEN_ARGS.
+    #
+    # The orchestrator declared both flags until 2026-08-10 and resolved
+    # them into `args.aws_region` / `args.aws_profile` — which nothing
+    # read, because the orchestrator runs INSIDE the container where a
+    # host-side provisioning region is meaningless. The launcher, the only
+    # real consumer, honoured the env var alone, so the documented CLI and
+    # leerie.toml tiers were both silently inert. Ownership now sits where
+    # the consumers are.
+    "--aws-region",
+    "--aws-profile",
 })
 
 

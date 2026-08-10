@@ -727,6 +727,19 @@ Like every floor in this system, it is evaluated even when the judgment
 layer crashes — a worker-infrastructure failure must never become a way
 to waive a mechanical check.
 
+**M11 DECISION — the floor's detections are resolved, not merely
+logged.** Shipped purely advisory, the floor left every flagged pair as
+duplicate work for the integrator to discover on its own. Each flagged
+pair is now synthesized into a `merge` collision and applied through the
+same `_apply_overlap_collisions` machinery the judge's own output uses —
+including its anchor + transitive `survivor_of` cluster resolution, so a
+3-or-more-participant collision (several subtasks sharing one `provides`
+tag and file) collapses to a single survivor rather than leaving any
+participant both dropped and referenced as a dangling dependency target.
+This runs above every skip in the same phase, so it fires on the exact
+paths the floor exists for: single-planner plans and `--skip-overlap-judge`
+runs, where the judge itself never gets a chance to resolve the collision.
+
 A single subtask can legitimately overlap with several siblings on
 different artifacts — e.g. one subtask creates a new config file
 *and* wires an existing config to it, each half colliding with a
@@ -2921,6 +2934,28 @@ worker — every such worker was cgroup-OOM-killed regardless of host
 RAM. Any cap below that combined peak guarantees the very OOM the cap
 exists to contain.
 
+**Reap the worker's own subprocesses before destroying its cgroup.** The
+`finally` that tears a worker down must call
+`descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`. Those
+backgrounded subprocesses (Claude Code's Bash tool with
+`run_in_background: true` — test runners, builds, dev servers) are still
+cgroup members while alive, so destroying first hands the broker a cgroup
+this orchestrator deliberately left populated, and its `rmdir` fails
+`EBUSY`. The timeout and abort paths always reaped first; the success path
+did not, and that asymmetry was the dominant source of leaked
+`leerie-w-*` directories.
+
+Measured over 1801 workers: conformers are **8%** of all workers but
+**88%** of destroy failures, and their median backgrounded-subprocess
+count is **984 against 12** for everything else. The failures land exactly
+where the unreaped population is largest, which is the signature of this
+ordering rather than of an unlucky kill race.
+
+The broker's drain (below) remains as the backstop for the residual race —
+a tree still dying when destroy runs — but the ordering is what removes
+the cause. It is pinned by a source-coupled test, since an ordering is
+invisible to a behavioural one.
+
 **A per-worker cap is a ceiling, not a reservation.** Writing
 `memory.max` allocates nothing; it only bounds. The real backstop
 against host-level exhaustion is the *aggregate*
@@ -2948,9 +2983,30 @@ above the slice is harmless (the aggregate cap binds first) while one
 below the build peak guarantees the OOM. Being load-independent is what
 makes resolving it once, at startup, correct.
 
-**Contention is handled by admission, not by shrinking caps.** Before
-spawning a worker, leerie blocks while the slice lacks room for another
-build (`_await_worker_memory_admission`). The signal is measured
+**Contention is handled by admission in two stages, not by shrinking
+caps.** The cheap stage runs once at wave entry
+(`_degrade_max_parallel_for_wave`, called by `phase_execute`): it shrinks
+the wave's own concurrency to the largest N whose workers fit the headroom
+that actually exists, and hands N straight to the wave's
+`asyncio.Semaphore`. The expensive stage is the per-spawn gate below, which
+can block for minutes.
+
+The order matters. A wave that enters over-subscribed pays the blocking
+gate *per worker*, so sizing the wave to real headroom first means the gate
+is a backstop for what changes **during** the wave — a sibling run's
+workers arriving — rather than the routine path. Shrinking concurrency is
+also the only lever this run actually controls: it cannot shrink a sibling
+run's live worker count, and it must not shrink its own per-worker cap
+(that is the reservation error above).
+
+Both stages read the **same** signal, `slice_max - unreclaimable`. That is
+not incidental: two signals could disagree about one slice, with the
+degrade sizing a wave down against page-cache pressure the gate then
+cheerfully admits into. The degrade never feeds its own output back into a
+later headroom computation, so successive waves cannot ratchet down.
+
+Before spawning a worker, leerie blocks while the slice lacks room for
+another build (`_await_worker_memory_admission`). The signal is measured
 headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable
 + unreclaimable slab, read from `memory.stat`), never `memory.current`,
 which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
@@ -4182,7 +4238,7 @@ trust model matches the spec: the user picks the moment (by typing
 
 `--runtime ec2` provisions and runs the orchestrator on an AWS EC2
 instance (`scripts/remote/aws-credentials.sh`,
-`resolve_aws_region`/`resolve_aws_profile`, the `boto3`/`botocore` pin,
+the launcher's AWS region/profile resolution, the `boto3`/`botocore` pin,
 and the launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md
 "Runtime mode" / "AWS region/profile prefs"). This section is the
 canonical architecture the shipped dispatch implements against — the
@@ -4363,7 +4419,8 @@ Session Manager over SSH and states why:
   hallpass + WireGuard (line 2509-2511). Authentication and authorization
   flow through the same AWS credential chain and IAM already established
   for the rest of the EC2 runtime (`aws-credentials.sh`,
-  `resolve_aws_region`/`resolve_aws_profile`) rather than a
+  the launcher's `LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` resolution)
+  rather than a
   parallel key-pair-management surface — one credential model for the
   whole EC2 runtime, matching the "reuses Fly's ... dispositions
   everywhere the two platforms agree" framing above.

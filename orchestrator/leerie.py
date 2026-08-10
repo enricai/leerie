@@ -403,6 +403,14 @@ STATE_FIELDS = (
     # judge returned `{collisions: []}`.
     "plan_overlap_judge",
     "plan_overlap_applied",
+    # duplicate_provider_merge_applied: set by phase_overlap_judge (M11
+    # DECISION — DESIGN §5 *A deterministic floor underneath the judge*).
+    # The post-apply mutation summary (same shape as plan_overlap_applied)
+    # for merges the deterministic `check_duplicate_providers` floor
+    # synthesized and applied via `_apply_overlap_collisions`, independent
+    # of whether the `plan_overlap_judge` worker itself ran. Absent when
+    # the floor found nothing to merge.
+    "duplicate_provider_merge_applied",
     # adherence_gate: audit record from the phase 2⅞ instruction-adherence
     # gate (phase_adherence_gate) — {judge: <adherence_judge output>,
     # floor_issues: list[str]}. Written once the gate clears (immediately
@@ -693,16 +701,15 @@ RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 
-# AWS region/profile prefs for the ec2 runtime — leerie-level knobs (which
-# region/profile leerie itself uses when provisioning EC2 machines),
-# distinct from the AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain
-# env vars resolved by scripts/remote/aws-credentials.sh. Resolution order:
-# CLI flag → env var → per-repo leerie.toml → None (free-form strings, no
-# enum check — mirrors PR_TEMPLATE_ENV).
-AWS_REGION_ENV = "LEERIE_AWS_REGION"
-AWS_REGION_FILE = SOURCE_OF_TRUTH_FILE
-AWS_PROFILE_ENV = "LEERIE_AWS_PROFILE"
-AWS_PROFILE_FILE = SOURCE_OF_TRUTH_FILE
+# NOTE: leerie's own AWS region/profile knobs (LEERIE_AWS_REGION /
+# LEERIE_AWS_PROFILE, and the aws_region / aws_profile leerie.toml keys)
+# are deliberately NOT resolved here. They are consumed only host-side,
+# when the launcher provisions --runtime ec2 machines, so the launcher
+# owns their full CLI > env > leerie.toml resolution; the orchestrator
+# runs inside the container where the value is meaningless and declares
+# no --aws-region/--aws-profile flags. See `leerie`'s "AWS region/profile
+# prefs" block. Resolving them here previously produced a value nothing
+# read, which is what left the CLI and leerie.toml tiers silently inert.
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -4463,32 +4470,6 @@ def resolve_pr_base_branch(repo_root: Path,
         file_name=PR_BASE_BRANCH_FILE, default=None)
 
 
-def resolve_aws_region(repo_root: Path,
-                       cli_value: str | None = None) -> str | None:
-    """Resolve the AWS region leerie uses to provision ec2 runtime
-    machines. Order: --aws-region CLI flag →
-    LEERIE_AWS_REGION env → leerie.toml → None. Free-form string, no enum
-    validation — distinct from the AWS SDK's own AWS_REGION credential-chain
-    env var, which scripts/remote/aws-credentials.sh resolves independently."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=AWS_REGION_ENV, file_key="aws_region",
-        file_name=AWS_REGION_FILE, default=None)
-
-
-def resolve_aws_profile(repo_root: Path,
-                        cli_value: str | None = None) -> str | None:
-    """Resolve the AWS profile leerie uses to provision ec2 runtime
-    machines. Order: --aws-profile CLI flag →
-    LEERIE_AWS_PROFILE env → leerie.toml → None. Free-form string, no enum
-    validation — distinct from the AWS SDK's own AWS_PROFILE credential-chain
-    env var, which scripts/remote/aws-credentials.sh resolves independently."""
-    return _resolve_str_pref(
-        repo_root, cli_value,
-        env_var=AWS_PROFILE_ENV, file_key="aws_profile",
-        file_name=AWS_PROFILE_FILE, default=None)
-
-
 def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
                                env_var: str, file_key: str, file_name: str,
                                default: int) -> int:
@@ -4867,6 +4848,49 @@ def _release_worker_memory_admission(token: int | None) -> None:
     the run outright."""
     if token is not None:
         _active_admissions.pop(token, None)
+
+
+def _degrade_max_parallel_for_wave(
+        max_parallel: int,
+        build_peak_bytes: int = _WORKER_BUILD_PEAK_BYTES) -> int:
+    """Shrink a wave's concurrency to what the shared slice can currently
+    feed, once at wave entry. Returns the largest N in [1, max_parallel]
+    with `headroom >= build_peak_bytes * N`.
+
+    This is the cheap half of admission control, and it exists so the
+    expensive half rarely has to act: `_await_worker_memory_admission`
+    below can block a spawn for up to 10 minutes, and a wave that enters
+    over-subscribed pays that per worker. Sizing the wave to the headroom
+    that actually exists means the gate is a backstop for what changes
+    *during* the wave (a sibling run's workers arriving), not the routine
+    path.
+
+    Reads the same signal as the gate — `slice_max - unreclaimable`, which
+    excludes reclaimable page cache — so the two cannot disagree about
+    whether memory is available. Returns `max_parallel` unchanged when no
+    slice budget is readable or unreclaimable is unknown, matching the
+    gate's fail-open contract.
+
+    Synchronous and computed once: the result is handed straight to
+    `asyncio.Semaphore` and never fed back into a later headroom
+    computation, so it cannot oscillate."""
+    info = _cgroup_slice_info()
+    if info is None:
+        return max_parallel
+    slice_max_bytes, _live_siblings, unreclaimable = info
+    if unreclaimable < 0:
+        return max_parallel
+    headroom = slice_max_bytes - unreclaimable
+    degraded = max_parallel
+    while degraded > 1 and headroom < build_peak_bytes * degraded:
+        degraded -= 1
+    if degraded < max_parallel:
+        log(f"  memory admission: shared slice headroom "
+            f"{headroom / 1024**3:.1f} GiB fits {degraded} concurrent "
+            f"worker(s) at the {build_peak_bytes / 1024**3:.1f} GiB "
+            f"build-peak floor, not {max_parallel}; degrading this wave to "
+            f"max_parallel={degraded}")
+    return degraded
 
 
 async def _await_worker_memory_admission(
@@ -8739,6 +8763,77 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
                     "an explicit depends_on and given distinct surfaces "
                     "(DESIGN §5 *Cross-domain surface overlap*)")
     return issues
+
+
+def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
+    """Synthesize `merge` collisions for every pair `check_duplicate_providers`
+    would flag, shaped for `_apply_overlap_collisions` (M11 DECISION: the
+    duplicate-provider floor's detections are routed into a merge resolution
+    rather than left purely advisory).
+
+    Deliberately a standalone mirror of `check_duplicate_providers`'s
+    detection logic — same `_cofile_cluster` exclusion, same
+    `_normalize_artifact_path` file-overlap test, same tag/sid iteration
+    order — rather than a refactor of that function, per this subtask's
+    scope (`check_duplicate_providers` itself is unchanged and keeps
+    returning its own advisory `list[str]`).
+
+    Every returned collision has `resolution: "merge"`, so the N-way case
+    (three or more subtasks sharing one tag, pairwise) is not a separate
+    code path: `_apply_overlap_collisions` already folds a connected
+    cluster of merges into one survivor via its anchor + transitive
+    `survivor_of` resolution — safe specifically because a merge's intent
+    assembly carries the absorbed subtask's full intent forward (unlike a
+    `drop`, where the analogous transitive chase silently discards a live
+    subtask — see `_apply_multidrop`'s docstring). The closing edge of such
+    a cluster (e.g. pair (B, C) once A↔B and A↔C have already collapsed
+    both to the same survivor) is recorded as `skipped_redundant` by that
+    helper rather than double-applied."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+
+    providers: dict[str, list[str]] = {}
+    for sid, s in subtasks.items():
+        for tag in s.get("provides", []) or []:
+            if isinstance(tag, str) and tag.strip():
+                providers.setdefault(tag, []).append(sid)
+
+    def _files(s: dict) -> set[str]:
+        return {
+            _normalize_artifact_path(f)
+            for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and f.strip()
+        }
+
+    collisions: list[dict] = []
+    for tag in sorted(providers):
+        sids = sorted(providers[tag])
+        for i in range(len(sids)):
+            for j in range(i + 1, len(sids)):
+                a, b = subtasks[sids[i]], subtasks[sids[j]]
+                cluster = a.get("_cofile_cluster")
+                if cluster and cluster == b.get("_cofile_cluster"):
+                    continue  # deliberate sub-file split of one file
+                shared = _files(a) & _files(b)
+                if not shared:
+                    continue
+                collisions.append({
+                    "a_sid": sids[i], "b_sid": sids[j],
+                    "resolution": "merge",
+                    "artifact": tag,
+                    "merge_feasibility": (
+                        f"deterministic duplicate-provider floor: both "
+                        f"subtasks declare provides={tag!r} and both touch "
+                        f"{', '.join(sorted(shared))} — merged rather than "
+                        "left as duplicate work (DESIGN §5 *A deterministic "
+                        "floor underneath the judge*, M11 DECISION)"),
+                    "reason": "DUPLICATE_PROVIDER",
+                })
+    return collisions
 
 
 _TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
@@ -14000,6 +14095,21 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # broker errors, same "cannot tell" contract as every other
         # _cgroup_stat call site.
         final_stat = _cgroup_stat(cgroup_sid)
+        # Reap any backgrounded subprocesses the worker left behind BEFORE
+        # destroying the cgroup. `claude -p` workers use Claude Code's Bash
+        # tool with `run_in_background: true` for long-running tasks (test
+        # runners, builds, dev servers — DESIGN §6). Those subprocesses are
+        # spawned in detached POSIX sessions, exit-reparent to PID 1, and can
+        # still be alive (and thus still cgroup members) at this point on the
+        # success path — the timeout/abort paths above already reap before
+        # terminating, but this success-path finally previously destroyed the
+        # cgroup first. A non-empty cgroup makes the broker's rmdir fail with
+        # EBUSY (measured 68-104 lingering PIDs on crash-path workers, M10),
+        # so stop_and_reap must run before _cgroup_destroy here too.
+        leaked = await descendant_tracker.stop_and_reap()
+        if leaked:
+            log(f"  [{sid}] reaped {leaked} backgrounded subprocess(es) "
+                f"that survived `claude -p` exit")
         # cgroup teardown via the broker. The broker's destroy atomically
         # reaps any worker-tree process that survived _terminate_proc_tree /
         # descendant_tracker.stop_and_reap above (cgroup.kill on v2, move-to-
@@ -14008,18 +14118,6 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # across a long-running orchestrator. Best-effort: socket errors are
         # swallowed inside _cgroup_destroy.
         _cgroup_destroy(cgroup_sid)
-    # Success path: reap any backgrounded subprocesses the worker left
-    # behind. `claude -p` workers use Claude Code's Bash tool with
-    # `run_in_background: true` for long-running tasks (test runners,
-    # builds, dev servers — DESIGN §6). Those subprocesses
-    # are spawned in detached POSIX sessions, exit-reparent to PID 1, and
-    # would otherwise outlive `claude -p`'s clean exit. The tracker has
-    # accumulated their PIDs throughout the worker's life; stop_and_reap
-    # SIGKILLs the union.
-    leaked = await descendant_tracker.stop_and_reap()
-    if leaked:
-        log(f"  [{sid}] reaped {leaked} backgrounded subprocess(es) "
-            f"that survived `claude -p` exit")
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
@@ -17646,16 +17744,29 @@ async def phase_plan(task: str, st: State, caps: dict,
     # the parent became (DESIGN §5 *Id-vanishing operations*). Accumulated
     # across every plan and applied once below: the dependent may live in a
     # different category's plan than the parent it names.
+    # Bounded concurrency (M2 perf fix): the sequential for-loop below used
+    # to await _recursive_decompose one top-level subtask at a time —
+    # measured on navegando aa15a9ca as 143 fit_judge/splitter calls at
+    # ~0.7x parallelism (fully serialized) versus the planner stage's own
+    # 4-8.5x in the same run. Mirrors the accumulate-as-they-complete shape
+    # of _filter_satisfied_subtasks's `sem = asyncio.Semaphore(...)` +
+    # `_gather_or_cancel` (:8886) — leaves/expansion/snapshot are shared,
+    # mutated only in the non-await tail of each task, which is safe under
+    # the single-event-loop invariant (CLAUDE.md: coroutines only interleave
+    # at await points).
     expansion: dict[str, list[str]] = {}
+    sem = asyncio.Semaphore(caps["max_parallel"])
     for plan in plans:
         first_pass = plan.get("subtasks", [])
         if not first_pass:
             continue
         leaves: list[dict] = []
-        for subtask in first_pass:
-            expanded = await _recursive_decompose(
-                subtask, 0, st, caps, models, efforts, repo_root,
-                repo_map=repo_map)
+
+        async def expand_one(subtask: dict) -> None:
+            async with sem:
+                expanded = await _recursive_decompose(
+                    subtask, 0, st, caps, models, efforts, repo_root,
+                    repo_map=repo_map)
             pid = subtask.get("id")
             leaf_ids = [c.get("id") for c in expanded if c.get("id")]
             if pid and pid not in leaf_ids:
@@ -17666,8 +17777,13 @@ async def phase_plan(task: str, st: State, caps: dict,
             # §6 *Credential strategy*). A WorkerError from a later subtask's
             # fit_judge/splitter call no longer discards the fit/split
             # decisions already paid for on subtasks that finished first.
-            st.data["decompose_snapshot"] = {"leaves": leaves}
+            # Completion (and therefore snapshot-write) order across
+            # subtasks is now nondeterministic — nothing depends on it; each
+            # write still captures every subtask finished so far.
+            st.data["decompose_snapshot"] = {"leaves": list(leaves)}
             st.save()
+
+        await _gather_or_cancel(*(expand_one(subtask) for subtask in first_pass))
         plan["subtasks"] = leaves
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), expansion)
@@ -21763,7 +21879,9 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
             cur_plans[0], prescribed_procedure)
         if repaired:
             log(f"  adherence-gate: synthesised {repaired} to run the task's "
-                f"prescribed commands (mechanical repair — no re-plan)")
+                f"prescribed commands (mechanical repair only — this does "
+                f"not by itself decide whether a re-plan follows; the "
+                f"adherence score is still evaluated separately below)")
         floor_issues = check_prescribed_command_coverage(
             prescribed_procedure,
             [s for plan in cur_plans[0] for s in plan.get("subtasks", []) or []],
@@ -21798,6 +21916,11 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         # `_run_checked_loop`'s existing retry semantics exactly like the
         # reconciler and overlap-judge do.
         replan_round[0] += 1
+        adherence_score = (last_judge_result[0] or {}).get("instruction_adherence")
+        log(f"  adherence-gate: triggering re-plan round {replan_round[0]} "
+            f"(instruction_adherence={adherence_score} < "
+            f"{_ADHERENCE_GATE_THRESHOLD} and/or unresolved floor "
+            f"violations — see feedback below)")
         # A re-plan is the largest budget event in a run and was previously
         # authorised with no budget check at all (DESIGN §13).
         check_replan_affordable(st, caps, "adherence gate", cur_plans[0])
@@ -22259,6 +22382,24 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # the judge*). Advisory as shipped — logged, never gating.
     for issue in check_duplicate_providers(plans):
         log(f"⚠  {issue}")
+    # M11 DECISION: route the floor's detections into a merge resolution
+    # rather than leaving them advisory-only (DESIGN §5 *A deterministic
+    # floor underneath the judge*). Sits above every skip below, same as
+    # the advisory logging above it, so it runs on single-planner plans
+    # and `--skip-overlap-judge` runs too — the floor exists precisely
+    # because those are the paths where the judge itself never gets a
+    # chance to resolve the collision.
+    dup_collisions = _duplicate_provider_merge_collisions(plans)
+    if dup_collisions:
+        dup_applied = _apply_overlap_collisions(plans, dup_collisions)
+        st.data["duplicate_provider_merge_applied"] = dup_applied
+        st.save()
+        n_merged = sum(1 for a in dup_applied if a.get("action") == "merge")
+        n_other = len(dup_applied) - n_merged
+        log(f"phase 2¾: duplicate-provider floor merged {n_merged} "
+            f"collision(s)" +
+            (f", {n_other} skipped (redundant or would cycle)"
+             if n_other else "") + " (M11 DECISION)")
     for issue in check_test_ownership_overlap(plans):
         log(f"⚠  {issue}")
 
@@ -26238,18 +26379,25 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             log(f"phase 4: base-health baseline errored "
                 f"({type(e).__name__}: {e}); proceeding with no baseline")
 
-    sem = asyncio.Semaphore(caps["max_parallel"])
-
-    async def settle_one(sid: str) -> tuple[str, dict]:
-        async with sem:
-            r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
-            log(f"  {sid}: {r.get('status')}")
-            return sid, r
-
     waves = st.data["waves"]
     start = st.data.get("completed_waves", 0)
     for wi in range(start, len(waves)):
         wave = waves[wi]
+
+        # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
+        # wave's concurrency once, at wave entry, rather than blocking each
+        # individual spawn (the retired _await_worker_memory_admission poll
+        # loop). Computed fresh per wave so a sibling run finishing between
+        # waves is reflected without an in-wave feedback loop.
+        wave_max_parallel = _degrade_max_parallel_for_wave(caps["max_parallel"])
+        sem = asyncio.Semaphore(wave_max_parallel)
+
+        async def settle_one(sid: str) -> tuple[str, dict]:
+            async with sem:
+                r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
+                log(f"  {sid}: {r.get('status')}")
+                return sid, r
+
         # On resume, skip subtasks already completed in a prior
         # invocation.  Failed/blocked subtasks are retried — that is
         # the point of resume.
@@ -27260,9 +27408,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "clarify": bool(args.clarify),
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
+                   # Same both-branches requirement as leerie_commit below.
+                   # This one is purely a RECORD: the flag's behaviour comes
+                   # from `caps["force_strict_output"]` in `_orchestrate`,
+                   # ahead of this split and independent of st.data, so both
+                   # paths always honoured it. What was missing on the fresh
+                   # path — i.e. the common one — was the field that makes a
+                   # failure attributable to the flag afterwards, the flag
+                   # having lowered the CLI's context ceiling invisibly (see
+                   # `_model_arg`).
+                   "dangerously_force_strict_output": bool(
+                       caps.get("force_strict_output")),
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
                    "skip_adherence_check": bool(
                        getattr(args, "skip_adherence_check", False)),
+                   # Unlike the record above this one is BEHAVIOURAL:
+                   # `phase_planning_coverage_gate` reads it straight off
+                   # st.data, so omitting it here made `.get()` return None
+                   # and the gate run anyway — the flag was inert on every
+                   # fresh run from the commit that introduced it.
+                   "skip_coverage_check": bool(
+                       getattr(args, "skip_coverage_check", False)),
                    "skip_completeness_check": bool(
                        getattr(args, "skip_completeness_check", False)),
                    "skip_satisfied_check": bool(
@@ -28010,22 +28176,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help=f"execution runtime "
                          f"({'|'.join(RUNTIME_VALUES)}, default local); "
                          f"overrides {RUNTIME_ENV} and leerie.toml")
-    ap.add_argument("--aws-region", metavar="REGION",
-                    help="AWS region leerie itself uses when provisioning "
-                         "--runtime ec2 machines. Free-form string, no "
-                         "validation. Distinct from the AWS SDK's own "
-                         "AWS_REGION credential-chain env var, which "
-                         "scripts/remote/aws-credentials.sh resolves "
-                         f"independently. Default: None. Also {AWS_REGION_ENV} "
-                         "env var or aws_region in leerie.toml.")
-    ap.add_argument("--aws-profile", metavar="PROFILE",
-                    help="AWS profile leerie itself uses when provisioning "
-                         "--runtime ec2 machines. Free-form string, no "
-                         "validation. Distinct from the AWS SDK's own "
-                         "AWS_PROFILE credential-chain env var, which "
-                         "scripts/remote/aws-credentials.sh resolves "
-                         f"independently. Default: None. Also {AWS_PROFILE_ENV} "
-                         "env var or aws_profile in leerie.toml.")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
@@ -28294,10 +28444,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # --source-of-truth / --model[-*] before we got here.
     sot_pref = resolve_source_of_truth(repo_root, args.source_of_truth)
     args.runtime = resolve_runtime(repo_root, args.runtime)
-    args.aws_region = resolve_aws_region(
-        repo_root, getattr(args, "aws_region", None))
-    args.aws_profile = resolve_aws_profile(
-        repo_root, getattr(args, "aws_profile", None))
     models = resolve_models(repo_root, args)
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
     efforts = resolve_efforts(repo_root, args)

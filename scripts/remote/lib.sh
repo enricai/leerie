@@ -559,14 +559,36 @@ _leerie_fly_agent_ensure() {
   # bash RETURN traps persist in the caller's scope (they fire on every
   # subsequent function return up the call chain). Instead, we rmdir
   # explicitly at each return path below.
-  if [ -S "$sock" ] && SSH_AUTH_SOCK="$sock" ssh-add -l \
-       >/dev/null 2>&1; then
-    export SSH_AUTH_SOCK="$sock"
-    rmdir "$lockdir" 2>/dev/null || true
-    return 0
+  if [ -S "$sock" ]; then
+    SSH_AUTH_SOCK="$sock" ssh-add -l >/dev/null 2>&1
+    # ssh-add -l exit codes: 0 = has keys, 1 = agent reachable but has no
+    # keys yet, 2 = cannot connect to the agent at all. Only rc 2 means
+    # the socket is stale; rc 1 is a perfectly healthy, just-spawned or
+    # freshly-cert-expired agent and must be reused, not respawned —
+    # respawning on rc 1 unlinks a live agent's socket out from under it
+    # (rm -f below) while the agent process keeps running, orphaning it.
+    if [ "$?" -ne 2 ]; then
+      export SSH_AUTH_SOCK="$sock"
+      rmdir "$lockdir" 2>/dev/null || true
+      return 0
+    fi
   fi
   rm -f "$sock"
-  ssh-agent -a "$sock" >/dev/null 2>&1
+  # -t 24h: default max lifetime for IDENTITIES added to this agent,
+  # matching the Fly cert lifetime (`flyctl ssh issue --agent` issues a 24h
+  # cert, and this agent is reused across runs to hold it — see the header
+  # comment). It costs nothing: the cert already expires at 24h either way.
+  #
+  # What it does NOT do is bound the agent PROCESS. `man ssh-agent`: "-t
+  # life — Set a default value for the maximum lifetime of identities added
+  # to the agent." Verified empirically: an agent started with `-t 2` is
+  # still alive well past its identity's expiry. So this is not a mitigation
+  # for orphaned agents — an orphan still leaks forever, holding only an
+  # empty keyring. The rc-1-vs-rc-2 predicate above is the actual leak fix
+  # (it stops us orphaning a live agent in the first place); reaping an
+  # agent orphaned some other way would need a real reaper, which does not
+  # exist yet.
+  ssh-agent -a "$sock" -t 24h >/dev/null 2>&1
   export SSH_AUTH_SOCK="$sock"
   rmdir "$lockdir" 2>/dev/null || true
 }

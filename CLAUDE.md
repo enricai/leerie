@@ -697,26 +697,64 @@ totals exactly; what breaks is *two suites at once*, not parallelism itself.
 
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
-`resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,
+`resolve_runtime`,
 `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `_validate_result`, `_validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
 `resolve_blt`)
 including a coupling test that the
 retry-policy markers match the live check-function strings.
-`resolve_aws_region`/`resolve_aws_profile` (the `LEERIE_AWS_REGION`/
-`LEERIE_AWS_PROFILE`/`leerie.toml` knobs for which region/profile leerie
+The `--aws-region`/`--aws-profile` knobs (which region/profile leerie
 itself uses when provisioning `--runtime ec2` machines, distinct from the
-AWS SDK's own credential-chain env vars) are covered in
-`tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
-CLI/env/file precedence structure but for the unvalidated free-form-string
-`_resolve_str_pref` machinery (no enum, no `die()` path). The launcher-side
+AWS SDK's own credential-chain env vars) are **launcher-owned** and covered
+in `tests/test_resolve_aws_launcher.py`. They were orchestrator-resolved
+until 2026-08-10, into `args.aws_region`/`args.aws_profile` — which nothing
+read, since the orchestrator runs inside the container where a host-side
+provisioning region is meaningless. The launcher, the only real consumer,
+honoured `LEERIE_AWS_*` alone, so **the documented CLI flag and
+`leerie.toml` keys were both silently inert while the env var worked.**
+Resolution now runs in the launcher via `_resolve_ec2_knob`, deliberately
+**above the top-level verb dispatch** — `accept-blocked`/`stop`/`kill`/
+`finalize` each read `LEERIE_AWS_*` inside their own arms, so resolving
+beside the `--ec2-*` knobs would have fixed only the main dispatch. The
+block is *extracted* from the real launcher by the test rather than
+reproduced (see `test_no_duplicate_state_walks.py` for why), and its
+load-bearing case asserts the resolved value **reaches the consumer's
+argv** (`_aws_region_profile_args`) — the deleted
+`tests/test_resolve_aws_prefs.py` pinned the argparse flag and the
+resolver and passed for months while the value reached nothing.
+`tests/test_no_dead_resolutions.py` generalises that: no
+`args.X = resolve_Y(...)` may go unread. It is the sibling
+`tests/test_no_dead_functions.py` cannot be — that one scans for
+unreferenced *functions*, and these resolvers **were** referenced, by the
+dead assignments themselves. Its reader count must exclude each
+assignment's own RHS (every resolution passes its current value in as the
+CLI tier); without that exclusion the sweep reports zero dead resolutions
+on the tree that had two. The launcher-side
 EC2 instance-shape vars (`LEERIE_EC2_AMI`/`_INSTANCE_TYPE`/`_KEY_NAME`/
 `_SECURITY_GROUP`/`_SUBNET_ID` — the five `RunInstances` params, distinct
 from the region/profile prefs above) are covered in
 `tests/test_resolve_ec2_vars.py`: the bash `_resolve_ec2_knob` CLI > env >
-`leerie.toml` > (no default) ladder reproduced and pinned against the real
-launcher source (`test_block_present_in_launcher`), per-var isolation,
+`leerie.toml` > (no default) ladder — **extracted** from the launcher at
+test time by `_extract_resolve_ec2_knob()`, not reproduced. It was a
+hand-written copy until 2026-08-10, which was body-blind *by construction*:
+the tests executed a string literal defined in the test file, so no change
+to the launcher could reach them, while `test_block_present_in_launcher`
+pinned only the helper's name plus the flag/toml-key strings and never its
+logic. `tests/test_no_duplicate_ec2_knob.py` keeps it the only
+implementation — the third guard of this shape after
+`tests/launcher_blocks.py` and `tests/test_no_duplicate_state_walks.py` —
+with its marker anchored to the **start of a line**, since a reproduction
+opens the body at column 0 while a legitimate reference
+(`src.index("_resolve_ec2_knob() {")` inside an extractor) is always quoted
+mid-line; matching the bare token would flag the very extractors the guard
+exists to encourage. **A falsification trap worth remembering:** the first
+attempt to prove the old copy was blind deleted the helper's `[ -f ]`
+guard, and that passes either way — removing it is behaviourally inert,
+since grep on a missing file already fails silently. Inverting the CLI/env
+precedence is the sabotage that discriminates (5 failures with the
+extraction, 0 with the copy). A falsification that changes no observable
+proves nothing. Also covered: per-var isolation,
 `=`-form CLI flags, the env-forwarding denylist guard (these vars must
 never leak into the container), and `ec2-lib.sh`'s `_resolve_ec2_var`
 required-var-read contract (prints on success, actionable
@@ -787,7 +825,20 @@ production before its guard existed. Note the burst-reservation state
 sides — without that its burst tests are order-dependent and leak
 reservations into every other file that exercises the gate; a
 guard-the-guard test source-couples to the fixture's `scope="session"` so a
-scope change forces that reasoning to be re-examined. Those burst tests use
+scope change forces that reasoning to be re-examined.
+`tests/test_memory_admission_degrade.py` covers the **first** admission stage,
+`_degrade_max_parallel_for_wave` — the synchronous wave-entry shrink that sizes
+a wave's `asyncio.Semaphore` to real headroom so the blocking gate rarely has
+to act. It carries the same autouse `_active_admissions` reset for the same
+reason, and its load-bearing test is
+`test_uses_the_same_signal_as_the_blocking_gate`: the degrade and the gate must
+both read `slice_max - unreclaimable`, because two signals could disagree about
+one slice — sizing a wave down against page-cache pressure the gate then admits
+into. Note `test_is_synchronous_not_a_per_spawn_gate` strips the docstring via
+`ast` before scanning for `await`: the docstring names
+`_await_worker_memory_admission` on purpose, and a naive substring check
+matches the prose describing the thing it forbids (the same trap the
+zombie-reaper guard documents above). Those burst tests use
 the **measured** production density (15 worker starts per 180 s, from real
 runs' `calls.ndjson`) rather than a number that looks representative: an
 earlier revision bounded reservations by elapsed time instead of by worker
@@ -859,7 +910,30 @@ without the wiring), and `_mark_reapable` never admits an
 `_ASYNCIO_MANAGED_PIDS` member; plus a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
 that `main()` calls `_become_subreaper()` and `_orchestrate()` spawns+cancels
-`_zombie_reaper`. The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
+`_zombie_reaper`. Three further surfaces arrived with the `PENDING_ISSUES.md` work order and are
+catalogued here because their traps are not obvious from the test names.
+`tests/test_duplicate_provider_merge_routing.py` (7 tests) pins that
+`check_duplicate_providers`' detections are routed into a **merge** resolution
+and never a drop — the transitive `survivor_of` chase is safe for a merge
+(intent carries forward) and silently destroys a live subtask for a drop, which
+is the hazard `_apply_multidrop` documents above. The floor had been advisory
+only: measured across the run corpus, **4 of 5 runs where it fired applied zero
+resolutions**, one of them with 35 detections and no action.
+`tests/test_recursive_decompose_parallel.py` (4 tests) pins that `phase_plan`'s
+expansion loop — previously a plain sequential `await`, measured at ~0.7x
+parallelism — now bounds concurrency with the **existing** `_gather_or_cancel`
+while preserving `decompose_snapshot`'s per-completion write, including the
+`list(leaves)` copy that keeps a later crash from mutating an already-taken
+snapshot (the aliasing class `test_checkpoint_aliasing.py` exists for).
+`tests/test_require_fly_ssh_isolation.py` (8 tests) pins
+`_leerie_fly_agent_ensure`'s reuse predicate, whose exit codes are the whole
+point: `ssh-add -l` returns **1** for a reachable-but-keyless agent, **0** with
+a key, **2** for a dead socket (verified live). Treating rc 1 like rc 2 `rm -f`s
+a live agent's socket out from under it, orphaning the process — which is the
+leak. The `-t 24h` on spawn bounds the **identities**, not the agent process,
+so it is not an orphan mitigation; see `scripts/remote/lib.sh`'s comment.
+
+The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
 is tested across two files. `tests/test_fetch_branch_sh.py` covers run
 discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
 stream-back (both files streamed when host has neither, never clobbers an
@@ -1384,7 +1458,19 @@ checked by `tests/test_state_fields.py`, not a runtime filter —
 an undeclared key is not silently dropped on `resume`. What actually
 happens is louder: `test_state_fields.py::test_every_st_data_write_is_declared`
 fails the moment a new `st.data["x"] = ...` write lands without a
-matching `STATE_FIELDS` entry, and `test_state_fields_matches_spec_table`
+matching `STATE_FIELDS` entry — though note that guarantee held for the
+**subscript form only** until 2026-08-10. `_runtime_field_writes` matched the
+run-init dict literal with `re.search(r"st\.data\s*=\s*\{(.*?)\}", ...)`, and
+two bugs compounded: the pattern has no word boundary so `bst.data = {}` (the
+`_BackstopState` stub) matched, and `re.search` returns that **first** match,
+whose non-greedy body captured **zero characters**. Measured before the fix: an
+undeclared key injected into the run-init literal was not detected, while the
+same key in a subscript write was; the matcher saw 67 keys where a correct one
+sees 70, blind to exactly the three literal-only keys (`task`, `started_at`,
+`worker_count`). It is now an AST walk, which also kills the `bst` false match
+by construction — the general lesson being that a text match on `st\.data`
+cannot distinguish a real `State` from a stub whose attribute merely ends the
+same way. `test_state_fields_matches_spec_table`
 fails if the IMPLEMENTATION.md §8 field table and `STATE_FIELDS` drift
 out of sync in either direction. The resumable-planning checkpoint keys
 above additionally get their own named guard-the-guard pins in
@@ -2859,8 +2945,45 @@ both live in the resume branch, so it passed while the field was absent from
 every fresh run, i.e. the common case and the whole point of the field. The
 replacement walks `_run_phases`'s AST, locates the `args.resume` `If` node, and
 requires the key in `body` **and** `orelse`, with an anti-vacuity control
-asserting the same walk finds `leerie_version` (known to be in both) so a broken
-walk fails as a broken walk rather than a missing key. (2) The local `-e`
+asserting the same walk finds `leerie_version` (known to be in both, and
+deliberately excluded from the parametrised list below) so a broken walk fails
+as a broken walk rather than a missing key. **The enforcement for this seam is
+not here** — it is `tests/test_state_fields.py::test_no_resume_only_state_keys`,
+which *derives* the rule (`resume_keys - fresh_keys == set()`, walked over the
+`if args.resume:` node) for every key, with **no list to maintain and no
+allowlist**: the reverse direction is deliberately unasserted, since `task`,
+`started_at` and `worker_count` are legitimately fresh-only. That walk
+(`_state_init_branch_keys`) has **one owner**, imported by its consumers and
+enforced by `tests/test_no_duplicate_state_walks.py` — the same single-owner
+discipline `tests/launcher_blocks.py` carries, and for a sharper reason: a
+drifted second copy under-reports `resume_keys`, which makes the symmetry guard
+pass **vacuously** rather than fail. Two traps are pinned inside the walk
+itself: it matches `ast.unparse(n.test) == "args.resume"` **exactly** and
+asserts exactly one node (a substring match also catches the later
+`if not args.resume:` guard, and `ast.walk` is breadth-first rather than source
+order, so `nodes[0]` was selecting the right branch by luck), and it **raises**
+on an `st.data.update()` / `setdefault()` / augmented write inside either arm
+instead of silently not collecting it. `_BOTH_BRANCH_KEYS`
+in `test_leerie_commit.py` is a frozen set of *named pins* for the three fields
+that have actually shipped broken on this seam, kept for the same reason the
+resumable-planning keys keep theirs — a generic sweep fails with a diff, a named
+pin fails naming the field. A new field does not go in it. **This is the fourth
+time an enumeration here was replaced by a derivation after a missed instance
+shipped** (PRs #180–#183 are the others): the first fix parametrised the walk
+over a two-entry tuple, and the derived rule immediately found a third defect
+the tuple could not have caught — `skip_coverage_check`, seeded only under
+`if args.resume:` since PR #162 (*"add --skip-coverage-check, the escape hatch
+this gate lacked"*). That one was **behavioural, not attribution**:
+`phase_planning_coverage_gate` reads it straight off `st.data`, so `.get()`
+returned `None` and the flag was silently inert on every fresh run — while
+`tests/test_phase_planning_coverage_gate.py`'s `TestSkipCoverageCheck` reported
+full coverage, because every test in it sets the key **by hand** and so pins the
+consumer while proving nothing about the producer. That file now carries a named
+producer pin importing the shared walk. By contrast
+`dangerously_force_strict_output` (M7) is a **record only** — the flag's
+behaviour comes from `caps["force_strict_output"]` in `_orchestrate`, ahead of
+the split and independent of `st.data`, so both paths always honoured it and
+what was lost was attribution. (2) The local `-e`
 forward covers only `--runtime local`, and there are **two** further launch
 blocks — Fly and EC2 each build their own `child_env = dict(os.environ)` inside
 their own unquoted `<<PY` heredoc. Both must forward the value, JSON-encoded

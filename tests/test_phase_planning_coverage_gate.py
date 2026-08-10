@@ -211,6 +211,33 @@ class TestSkipCoverageCheck:
         assert (src.index('st.data.get("skip_coverage_check")')
                 < src.index("_load_prompt("))
 
+    def test_the_flag_is_actually_seeded_on_a_fresh_run(self, leerie):
+        """The producer half — which every test above is blind to.
+
+        They all set `st.data["skip_coverage_check"]` by hand, so they pin
+        the CONSUMER and pass no matter what `_run_phases` writes. And what
+        it wrote, from the commit that introduced the flag (PR #162, *"add
+        --skip-coverage-check, the escape hatch this gate lacked"*) until
+        this one, was nothing on the fresh-run path: the key was seeded only
+        under `if args.resume:`. So `.get()` returned None on every fresh
+        run, the short-circuit above never fired, and the flag was silently
+        inert on the path operators actually use — while this class reported
+        full coverage of it.
+
+        The general rule is derived in `test_state_fields.py`; this is the
+        named pin, which fails naming this flag in the file about this gate.
+        The walk is imported rather than re-implemented — see
+        `tests/launcher_blocks.py` for why a shared derivation gets one
+        owner.
+        """
+        from tests.test_state_fields import _state_init_branch_keys
+
+        resume_keys, fresh_keys = _state_init_branch_keys(leerie)
+        assert "skip_coverage_check" in resume_keys
+        assert "skip_coverage_check" in fresh_keys, (
+            "--skip-coverage-check is inert on every fresh run: the key is "
+            "never seeded, so the short-circuit above reads None")
+
 
 # --- the guard that would have caught the 0.10.0 bug ---------------------- #
 

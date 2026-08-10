@@ -90,10 +90,21 @@ V2_ROOT = os.environ.get("LEERIE_CGROUP_V2_ROOT", "/sys/fs/cgroup")
 _SID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # `destroy` waits for the killed subtree to actually drain before rmdir'ing
-# (see _drain_then_rmdir). 10s because the workers that leaked were
-# conformers running full test suites, whose process trees reached the
-# hundreds; a sub-second budget is not enough for those to die. The
-# orchestrator's destroy is fire-and-forget on a finished worker, so this
+# (see _drain_then_rmdir). 10s is derived from measurement, not intuition:
+# SIGKILL -> fully-reaped, worst of 3 on a loaded host (loadavg 66/32 cores,
+# the regime drains actually happen in), was 37ms at 10 procs, 40ms at 100,
+# 531ms at 500 and 1667ms at 1200 — roughly linear above 500 at ~1.62ms/proc.
+# The largest tree observed in real logs is 3385, which extrapolates to ~5.2s.
+# A 2s budget therefore covers the median conformer (984 procs, ~1.3s) but
+# NOT that tail; 10s covers ~6300 with margin. The figures were measured with
+# `sleep`, the cheapest possible process — real subprocesses (node, pytest)
+# unmap more memory and hold more fds, so these are a lower bound.
+#
+# Note the drain is now a backstop rather than the primary fix: the
+# orchestrator reaps its own tracked subprocesses before calling destroy
+# (DESIGN §6 *Reap the worker's own subprocesses before destroying its
+# cgroup*), so what remains here is the residual race of a tree still dying.
+# The orchestrator's destroy is fire-and-forget on a finished worker, so this
 # wait is off the critical path.
 _DESTROY_DRAIN_TIMEOUT_SEC = 10.0
 _DESTROY_DRAIN_POLL_SEC = 0.05

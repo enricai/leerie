@@ -57,11 +57,11 @@ def _extract_resolver() -> str:
 
 def _extract_setup_block() -> str:
     """The `_run_log=...` / `_log_tee_target=...` decoupled-streaming
-    resolution block."""
+    resolution block. `_log_tee_target` is computed independent of
+    `$_run_log` (bugfix-005) so the interactive/-it branch can wire it too."""
     return _extract(
         '  _run_log=""\n',
-        '  _log_tee_target=""\n  if [ -n "$_run_log" ] && '
-        '[ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
+        '  _log_tee_target=""\n  if [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
         '    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then\n'
         '      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"\n'
         "    fi\n"
