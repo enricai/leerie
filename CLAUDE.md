@@ -2895,8 +2895,18 @@ both live in the resume branch, so it passed while the field was absent from
 every fresh run, i.e. the common case and the whole point of the field. The
 replacement walks `_run_phases`'s AST, locates the `args.resume` `If` node, and
 requires the key in `body` **and** `orelse`, with an anti-vacuity control
-asserting the same walk finds `leerie_version` (known to be in both) so a broken
-walk fails as a broken walk rather than a missing key. (2) The local `-e`
+asserting the same walk finds `leerie_version` (known to be in both, and
+deliberately excluded from the parametrised list below) so a broken walk fails
+as a broken walk rather than a missing key. That walk is **parametrised over
+`_BOTH_BRANCH_KEYS`**, not written per field, because a per-field guard is
+itself the defect this pins: `leerie_commit` had the guard and survived in both
+branches, while `dangerously_force_strict_output` had none and shipped absent
+from the fresh-run branch — i.e. from every non-resume run, the only path that
+can set the flag at all, since `resume` re-reads it from the state it was
+missing from (this file's own module docstring cites that field as the
+exemplar of the attribution gap, which is how the omission hid in plain sight).
+**Any new `st.data` field that must be seeded on both paths goes in that tuple;
+do not copy the walk.** (2) The local `-e`
 forward covers only `--runtime local`, and there are **two** further launch
 blocks — Fly and EC2 each build their own `child_env = dict(os.environ)` inside
 their own unquoted `<<PY` heredoc. Both must forward the value, JSON-encoded
