@@ -491,7 +491,12 @@ def test_invoke_admitted_releases_the_reservation_on_every_exit_path(leerie):
     until ~570 lines in, after `asyncio.create_subprocess_exec` (which this
     repo has seen raise), so a setup failure would strand the token."""
     src = inspect.getsource(leerie._invoke_admitted)
-    assert "_await_worker_memory_admission()" in src
+    assert "_await_worker_memory_admission(" in src
+    # It must be handed the per-worker demand estimate rather than left to
+    # the bare build-peak fallback: N14-16 showed that constant understates
+    # a repo declaring its own Node heap, and an un-threaded estimate makes
+    # the correction inert at the gate even though the resolver computed it.
+    assert "worker_demand_estimate_bytes" in src
     assert "try:" in src and "finally:" in src
     assert "_release_worker_memory_admission(" in src, (
         "the wrapper no longer releases the reservation — every admitted "
@@ -548,8 +553,10 @@ def test_wrapper_accepts_everything_invoke_does(leerie):
     inv = set(inspect.signature(leerie._invoke).parameters)
     adm = set(inspect.signature(leerie._invoke_admitted).parameters)
     assert inv <= adm, f"wrapper cannot accept: {sorted(inv - adm)}"
-    # The wrapper's only surplus is the arming signal.
-    assert adm - inv == {"max_parallel"}
+    # The wrapper's surplus is exactly the admission-control inputs, which
+    # `_invoke` itself has no business knowing about: the arming signal, and
+    # the per-worker demand estimate the gate sizes on (N14-16).
+    assert adm - inv == {"max_parallel", "worker_demand_estimate_bytes"}
 
 
 def test_claude_p_call_site_binds_against_the_wrapper(leerie):

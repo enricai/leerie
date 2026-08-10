@@ -39,12 +39,64 @@ def test_subtask_spec_does_not_inline_the_task_text(leerie, tmp_path):
     raw = spec_path.read_text()
     assert task not in raw, (
         "subtask spec must not embed the full task text verbatim; "
-        "it should reference plan.json instead"
+        "it should reference the task sidecar instead"
     )
     spec = json.loads(raw)
     assert "_task" not in spec
     assert "_task_ref" in spec
-    assert spec["_task_ref"] == str(st.run_dir / "plan.json")
+    assert spec["_task_ref"] == str(st.run_dir / "task.md")
+
+
+def test_task_sidecar_holds_the_task_verbatim(leerie, tmp_path):
+    """`_task_ref` must resolve to a file whose bytes ARE the task — a ref
+    to a file that does not exist, or holds something else, is worse than
+    the inlined copy it replaced."""
+    st = _minimal_state(leerie, tmp_path, "test-write-plan-sidecar")
+    task = "# Heading\n\nthe real task text\n"
+    subtasks = {
+        "feat-001": {"id": "feat-001", "title": "x",
+                     "success_criteria_seed": "y", "size": "small",
+                     "provides": [], "requires": [], "depends_on": []},
+    }
+    leerie._write_plan(st.run_dir, task, st, subtasks, [["feat-001"]])
+    spec = json.loads(
+        (st.run_dir / "subtasks" / "feat-001.json").read_text())
+    ref = Path(spec["_task_ref"])
+    assert ref.exists(), "_task_ref points at a file that was never written"
+    assert ref.read_text() == task
+    assert spec["_task_ref_bytes"] == len(task.encode())
+
+
+def test_deref_target_is_smaller_than_plan_json(leerie, tmp_path):
+    """The target the worker is told to read must be SMALLER than
+    plan.json, not larger.
+
+    This is the invariant the first version of the N6 fix violated:
+    `_task_ref` pointed at plan.json, which is the task text PLUS every
+    subtask body, so it was strictly bigger than any single brief it
+    replaced — 125,047 B against a 110,400 B brief on the run that
+    reproduced N6. That relocates the Read-cap failure instead of removing
+    it, and no test caught it because the only size assertion bounded the
+    BRIEF, one level too shallow."""
+    st = _minimal_state(leerie, tmp_path, "test-write-plan-deref-size")
+    task = "T" * 70_000
+    subtasks = {
+        f"feat-{i:03d}": {"id": f"feat-{i:03d}", "title": "x",
+                          "success_criteria_seed": "y", "size": "small",
+                          "provides": [], "requires": [], "depends_on": []}
+        for i in range(1, 12)
+    }
+    leerie._write_plan(st.run_dir, task, st, subtasks,
+                       [[sid] for sid in subtasks])
+    spec = json.loads(
+        (st.run_dir / "subtasks" / "feat-001.json").read_text())
+    deref = Path(spec["_task_ref"]).stat().st_size
+    plan_json = (st.run_dir / "plan.json").stat().st_size
+    assert deref < plan_json, (
+        f"the deref target ({deref} B) is not smaller than plan.json "
+        f"({plan_json} B) — pointing there relocates the Read-cap failure")
+    # And it is the task itself plus nothing: no JSON envelope, no escaping.
+    assert deref == len(task.encode())
 
 
 def test_plan_json_still_carries_the_full_task_text(leerie, tmp_path):

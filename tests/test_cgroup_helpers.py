@@ -262,7 +262,13 @@ def test_invoke_finally_reaps_before_destroying_cgroup(leerie):
     final_stat_idx = src.index("final_stat = _cgroup_stat(cgroup_sid)")
     tail = src[final_stat_idx:]
     reap_match = re.search(r"await descendant_tracker\.stop_and_reap\(\)", tail)
-    destroy_match = re.search(r"_cgroup_destroy\(cgroup_sid\)", tail)
+    # Matches both the direct call and the `asyncio.to_thread(...)` dispatch
+    # it is made through (N18: destroy blocks for the broker's whole drain —
+    # seconds — so it must not sit on the event loop). The ordering
+    # invariant this test exists for is unchanged by that.
+    destroy_match = re.search(
+        r"_cgroup_destroy\(cgroup_sid\)|to_thread\(\s*_cgroup_destroy,\s*cgroup_sid\s*\)",
+        tail)
     assert reap_match is not None, "stop_and_reap() call not found after final_stat read in _invoke"
     assert destroy_match is not None, "_cgroup_destroy(cgroup_sid) call not found after final_stat read in _invoke"
     assert finally_idx < final_stat_idx

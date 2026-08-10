@@ -12,104 +12,64 @@ real container, and sources the relevant block from the launcher verbatim.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+LAUNCHER = REPO_ROOT / "leerie"
 
-_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
+# Both halves are EXTRACTED from the launcher, not reproduced. The copy this
+# replaced was materially stale against `leerie`'s real `_run_argv` array —
+# it inlined one of three `CGROUP_MOUNT_ARG` branches as a literal and was
+# missing `--cidfile` and its bind, `--label`, `-e USER_REPO=`,
+# `-e LEERIE_COMMIT=`, the `LEERIE_*` auto-forward, `--cgroupns=host`,
+# `ROOTLESS_SECOPT`, `REWRITTEN_ARGS`, and `${REPO_IMAGE_TAG:-$IMAGE_TAG}`.
+# None of that flipped an assertion, which is the point: the tests were
+# blind, not wrong. They would pass identically if the launcher dropped the
+# state mount tomorrow — the exact regression this file exists to catch.
+from tests.test_resolve_state_dir import _extract_state_dir_block
 
-USER_REPO="$1"
-HOME="$2"
-LEERIE_REPO="$3"
-IMAGE_TAG="$4"
-export HOME
-shift 4   # remaining args are simulated CLI (unused in this harness)
 
-# ---- state-dir resolution (mirrors launcher) ----------------------------
-_state_dir_default() {
-  local basename
-  basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
-  echo "$HOME/.leerie/$basename"
-}
+def _extract_run_argv() -> str:
+    """The real `nerdctl run` argv array, lifted verbatim. Same marker pair
+    `tests/test_launcher_env_forwarding.py` already uses."""
+    src = LAUNCHER.read_text()
+    m = re.search(r"(  _run_argv=\(\n.*?\n  \)\n)", src, re.DOTALL)
+    assert m, "could not locate the _run_argv array in the launcher"
+    return m.group(1)
 
-LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
 
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | head -1 \
-                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_state_dir" ]; then
-    case "$_toml_state_dir" in
-      "~")   _toml_state_dir="$HOME" ;;
-      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
-    esac
-    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
-  fi
-  unset _toml_state_dir
-fi
-
-if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
-fi
-
-_cli_state_dir=""
-_prev_was_state_dir=false
-for arg in "$@"; do
-  if $_prev_was_state_dir; then
-    _cli_state_dir="$arg"
-    _prev_was_state_dir=false
-    continue
-  fi
-  case "$arg" in
-    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
-    --state-dir)   _prev_was_state_dir=true ;;
-  esac
-done
-if [ -n "$_cli_state_dir" ]; then
-  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
-fi
-unset _cli_state_dir _prev_was_state_dir
-
-case "$LEERIE_STATE_HOST_DIR" in
-  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
-  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
-esac
-
-# ---- stub nerdctl: print argv one-per-line, then exit 0 -----------------
-nerdctl() {
-  for a in "$@"; do printf '%s\n' "$a"; done
-}
-
-# ---- reproduce the nerdctl run invocation from the launcher -------------
+# The extracted argv references many launcher-scope variables; stub the ones
+# this test does not vary, and let the real ones (USER_REPO, LEERIE_REPO,
+# LEERIE_STATE_HOST_DIR) flow through from the resolution block above.
+_HARNESS = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    'USER_REPO="$1"\n'
+    'HOME="$2"\n'
+    'LEERIE_REPO="$3"\n'
+    'IMAGE_TAG="$4"\n'
+    "export HOME\n"
+    "shift 4\n"
+    + _extract_state_dir_block()
+    + """
+nerdctl() { for a in "$@"; do printf '%s\\n' "$a"; done; }
 TTY_FLAGS="-i"
+_cidfile="/dev/null"
+REPO_IMAGE_TAG=""
+LEERIE_COMMIT=""
 AUTH_MOUNTS=()
 CACHE_MOUNTS=()
 INSPECT_MOUNTS=()
-container_rc=0
-
-nerdctl run \
-  --rm $TTY_FLAGS \
-  --name "leerie-stub-$$" \
-  -e LEERIE_INSPECT_DIRS= \
-  -e LEERIE_STATE_DIR=/leerie-state \
-  --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
-  -v "$USER_REPO:/work" \
-  -v "$LEERIE_REPO:/opt/leerie-image:ro" \
-  -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
-  ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
-  ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
-  ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
-  -w /work \
-  "$IMAGE_TAG" || container_rc=$?
+CGROUP_MOUNT_ARG=()
+ROOTLESS_SECOPT=()
+REWRITTEN_ARGS=()
+_leerie_env_args=()
 """
+    + _extract_run_argv()
+    + '\nnerdctl run "${_run_argv[@]}"\n'
+)
 
 
 def _run(

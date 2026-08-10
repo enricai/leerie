@@ -13,6 +13,9 @@ in-container reproduction, not this unit test.
 from __future__ import annotations
 
 import importlib.util
+import inspect
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -665,3 +668,141 @@ def test_rootless_create_enroll_destroy_round_trip(rootless_broker):
     # OK. Real cgroupfs directories contain no such stray files.
     resp = rootless_broker._handle("destroy wsid")
     assert resp.startswith("ERR ")
+
+
+# --- orphan sweep (N18 reclaim half) ---------------------------------------
+#
+# The leak itself is fixed: `cgroup.kill` is asynchronous, so an immediate
+# rmdir raced kernel teardown and lost with EBUSY, which `_drain_then_rmdir`
+# now waits out. Nothing reclaims what leaked BEFORE that, though — measured
+# 115 empty `leerie-w-*` dirs spanning 14 days on one host, none of which any
+# code path would ever remove — and a SIGKILLed orchestrator still skips its
+# own cleanup. These pin the reclaim half and, more importantly, the two
+# guards that keep it from deleting a live worker's cgroup.
+
+def _seed_worker_dir(slice_dir, name, *, procs="", age_sec=0.0):
+    """Seed a worker cgroup dir on the fake cgroupfs.
+
+    An EMPTY `cgroup.procs` is modelled by omitting the file, matching what
+    the broker's own `create` leaves behind on this fake and what `_read`
+    reads back (`""` either way). Writing a real empty file instead would
+    make the plain directory non-empty and `os.rmdir` fail ENOTEMPTY — a
+    fake-filesystem artifact, since real cgroupfs is kernfs and its control
+    files never block rmdir. See `test_destroy_removes_dir` for the same
+    accommodation on the destroy path."""
+    d = slice_dir / name
+    d.mkdir()
+    if procs:
+        (d / "cgroup.procs").write_text(procs)
+    if age_sec:
+        past = time.time() - age_sec
+        os.utime(d, (past, past))
+    return d
+
+
+def test_sweep_reclaims_an_old_empty_worker_dir(broker):
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    d = _seed_worker_dir(slice_dir, "leerie-w-abc123-bugfix-001-conformer",
+                         procs="", age_sec=broker._ORPHAN_MIN_AGE_SEC + 60)
+    assert broker._sweep_orphaned_worker_cgroups() == 1
+    assert not d.exists()
+
+
+def test_sweep_never_touches_a_live_worker_dir(broker, monkeypatch):
+    """The load-bearing guard: a directory with enrolled processes belongs
+    to a running worker — possibly a *concurrent run's*, since worker
+    cgroups live on the host cgroupfs and two brokers were observed live on
+    one host. Age alone must not be enough to delete it.
+
+    **Asserting only that the directory still exists is not enough**, and
+    that version of this test was verified unable to fail: on this fake
+    cgroupfs a live dir holds a real `cgroup.procs` FILE, so `os.rmdir`
+    returns ENOTEMPTY and the directory survives whether or not the guard
+    exists — the filesystem does the protecting, not the code. Deleting the
+    guard passed all seven sweep tests. So intercept the removal itself and
+    assert on what the sweep *attempted*, which is the actual contract."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    live = _seed_worker_dir(slice_dir, "leerie-w-def456-test-002",
+                            procs="4242\n",
+                            age_sec=broker._ORPHAN_MIN_AGE_SEC * 24)
+    old = _seed_worker_dir(slice_dir, "leerie-w-def456-test-003",
+                           procs="",
+                           age_sec=broker._ORPHAN_MIN_AGE_SEC * 24)
+
+    attempted: list[str] = []
+
+    def _record(d, budget):
+        attempted.append(d)
+        return None  # pretend removal always succeeds
+
+    monkeypatch.setattr(broker, "_drain_then_rmdir", _record)
+    broker._sweep_orphaned_worker_cgroups()
+
+    assert str(old) in attempted, (
+        "control: the abandoned dir must still be swept, else this test "
+        "proves nothing about the live one")
+    assert str(live) not in attempted, (
+        "the sweep tried to remove a cgroup that still had processes in it")
+
+
+def test_sweep_never_touches_a_young_empty_dir(broker):
+    """The other guard: `create` and `enroll` are two separate client
+    round-trips, so a cgroup legitimately has an empty `cgroup.procs` in
+    between. A concurrent run's broker does not serialize against this one,
+    so only age can cover that window."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    d = _seed_worker_dir(slice_dir, "leerie-w-fed321-feat-003", procs="")
+    assert broker._sweep_orphaned_worker_cgroups() == 0
+    assert d.exists(), "swept a cgroup inside the create/enroll window"
+
+
+def test_sweep_ignores_non_worker_directories(broker):
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    other = slice_dir / "some-other-thing"
+    other.mkdir()
+    past = time.time() - broker._ORPHAN_MIN_AGE_SEC * 10
+    os.utime(other, (past, past))
+    assert broker._sweep_orphaned_worker_cgroups() == 0
+    assert other.exists()
+
+
+def test_sweep_is_selective_across_a_mixed_slice(broker):
+    """End to end on the shape the real host had: a pile of old empties
+    alongside live workers. Anti-vacuity — a sweep that reclaimed nothing,
+    or everything, would pass one of the tests above but not this."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    old = [_seed_worker_dir(slice_dir, f"leerie-w-old{i}-conformer",
+                            procs="", age_sec=broker._ORPHAN_MIN_AGE_SEC * 5)
+           for i in range(4)]
+    live = [_seed_worker_dir(slice_dir, f"leerie-w-live{i}-conformer",
+                             procs=f"{1000 + i}\n",
+                             age_sec=broker._ORPHAN_MIN_AGE_SEC * 5)
+            for i in range(2)]
+    young = _seed_worker_dir(slice_dir, "leerie-w-young-feat", procs="")
+
+    assert broker._sweep_orphaned_worker_cgroups() == 4
+    assert all(not d.exists() for d in old)
+    assert all(d.exists() for d in live)
+    assert young.exists()
+
+
+def test_sweep_runs_before_the_socket_is_bound(broker):
+    """Source-coupled: ordering IS the safety argument. Sweeping after
+    `listen()` would race a client of this very broker through its
+    create/enroll window, which no age floor is meant to cover."""
+    src = inspect.getsource(broker.main)
+    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
+    i_bind = src.index("srv.bind(")
+    assert i_sweep < i_bind, (
+        "the orphan sweep must run before the socket is bound")
+
+
+def test_sweep_failure_does_not_stop_the_broker(broker, monkeypatch):
+    """The broker is the only thing that can enforce containment; a sweep
+    is housekeeping. If housekeeping can abort startup, a cosmetic bug
+    becomes a fail-closed die() for the whole run."""
+    src = inspect.getsource(broker.main)
+    i_sweep = src.index("_sweep_orphaned_worker_cgroups")
+    assert "try:" in src[:i_sweep], "the sweep call is not wrapped in try/"
+    assert "non-fatal" in src, (
+        "the sweep's failure arm should say plainly that it is non-fatal")

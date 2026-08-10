@@ -451,6 +451,78 @@ def _live_sibling_count() -> int:
     return count
 
 
+# Minimum age before an empty worker cgroup is considered abandoned rather
+# than in-flight. The hazard is narrow but real: `create` and `enroll` are
+# two separate client round-trips, so a freshly created cgroup legitimately
+# has an empty `cgroup.procs` for the moment between them — and a
+# *concurrently running second run* has its own broker, which this one does
+# not serialize against (two brokers were observed live on one host).
+#
+# An hour is far beyond that window and far below the age of a real orphan:
+# measured on the host that motivated this, the 115 abandoned directories
+# spanned 14 days while every live worker's directory was minutes old.
+_ORPHAN_MIN_AGE_SEC = 3600.0
+
+
+def _sweep_orphaned_worker_cgroups() -> int:
+    """Remove empty, old `leerie-w-*` directories left by earlier runs.
+    Returns how many were reclaimed.
+
+    Worker cgroups live on the HOST cgroupfs (workers run with
+    `--cgroupns=host`), so they outlive the container that made them. Before
+    the drain-then-rmdir fix they accumulated without bound — `cgroup.kill`
+    is asynchronous, so an immediate `rmdir` raced kernel teardown and lost
+    with EBUSY, worst for conformers whose process trees reach hundreds of
+    PIDs. That is fixed, and nothing has leaked since; but nothing reclaims
+    what already leaked either, and a SIGKILLed orchestrator still skips its
+    own cleanup. This is the reclaim half.
+
+    **Deliberately cross-run.** It removes other runs' abandoned
+    directories, not just this run's: that is the point — the accumulated
+    pile belongs to runs that are long gone. The two guards that make it
+    safe are `cgroup.procs` being empty (never true of a live worker with
+    processes in it) and `_ORPHAN_MIN_AGE_SEC` (covers the create/enroll
+    window, including a concurrent run's, which no cross-broker lock could).
+
+    Scoping by "is a container with this run id still around" was
+    considered and rejected: a resumed run keeps its original `--run-id`
+    while getting a NEW container, so that predicate reports false-dead on
+    every resumed run — checked against the live host, where it would have
+    deleted both running runs' cgroups.
+
+    Runs before the socket exists (see `main`), so no client of THIS broker
+    can be mid-create while it walks."""
+    now = time.time()
+    reclaimed = 0
+    # v1 splits a worker across two controller dirs; v2 has one. Walk
+    # whatever the detected hierarchy actually uses rather than assuming.
+    roots = ([f"{V1_ROOT}/pids/{SLICE}", f"{V1_ROOT}/memory/{SLICE}"]
+             if _HIER == "v1" else [_slice_dir()])
+    for root in roots:
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            if not name.startswith("leerie-w-"):
+                continue
+            d = f"{root}/{name}"
+            if _read(f"{d}/cgroup.procs").strip():
+                continue
+            try:
+                age = now - os.stat(d).st_mtime
+            except OSError:
+                continue
+            if age < _ORPHAN_MIN_AGE_SEC:
+                continue
+            # Reuse the real teardown rather than a bare os.rmdir: it
+            # already handles already-gone and retries a transient EBUSY.
+            # The dir is empty, so the budget is never actually spent.
+            if _drain_then_rmdir(d, 0.5) is None:
+                reclaimed += 1
+    return reclaimed
+
+
 # --- dispatch --------------------------------------------------------------
 
 def _valid_sid(sid: str) -> bool:
@@ -553,6 +625,16 @@ def main() -> int:
     # the whole rootless path is best-effort, so this is the only positive
     # signal of which root the broker actually operated under.
     _log(f"hierarchy={_HIER} v2_root={V2_ROOT}")
+
+    # Before the socket exists, so no client of this broker can be mid-create
+    # while the walk runs. Best-effort: a sweep failure must never stop the
+    # broker from starting, since nothing else can enforce containment.
+    try:
+        _reclaimed = _sweep_orphaned_worker_cgroups()
+        if _reclaimed:
+            _log(f"swept {_reclaimed} orphaned leerie-w-* cgroup dir(s)")
+    except Exception as e:  # noqa: BLE001 - startup must not be fatal
+        _log(f"orphan sweep failed (non-fatal): {e}")
 
     if os.path.exists(SOCK_PATH):
         os.unlink(SOCK_PATH)

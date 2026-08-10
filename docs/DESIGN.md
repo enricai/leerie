@@ -6888,8 +6888,9 @@ invocations a single run may spawn. The cheap, late check is
 `State.bump_workers()` — it raises `WorkerError` the moment the
 counter would exceed the cap. That check is necessary as a backstop,
 but it fires *during execution*, after some — sometimes most — of the
-run's compute has already been spent. A 63-subtask run with the
-default cap of 200 cannot finish; the late check discovers this around
+run's compute has already been spent. A 63-subtask run against a cap of
+200 (the default before N4 raised it to 2000) cannot finish; the late
+check discovers this around
 subtask 38, leaving the run branch with the first few waves' worth of
 integrated commits and the rest unrunnable.
 
@@ -6926,7 +6927,7 @@ So `check_replan_affordable` runs before each re-plan, projecting the
 re-plan's cost from the domain count and the *already-known* subtask count
 (the decomposition term dominates, so subtask count is what it scales on) and
 `die()`ing early when it cannot fit. Dying at the gate costs nothing and names
-the real cause; dying at worker 200 costs the whole run. It honours the same
+the real cause; dying at the worker cap costs the whole run. It honours the same
 `skip_budget_check` opt-out, and `State.bump_workers()` remains the
 load-bearing backstop either way.
 
