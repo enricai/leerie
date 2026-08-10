@@ -23349,7 +23349,14 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     sub_dir = leerie_dir / "subtasks"
     for sid, s in subtasks.items():
         spec = dict(s)
-        spec["_task"] = task
+        # N6: the full task text is already persisted once in plan.json's
+        # top-level "task" field (written just above) — no prompt reads
+        # `_task` (verbatim grep across prompts/ and commands/), so
+        # duplicating it into every subtask spec only bloats the brief
+        # each implementer reads (measured 90.8-97.8% of brief bytes on
+        # large task docs, causing CLI spill-to-Read-cap failures). Point
+        # at the shared plan.json instead of copying the bytes.
+        spec["_task_ref"] = str(leerie_dir / "plan.json")
         spec["_source_of_truth"] = sot
         spec["_clarification_answers"] = answers
         (sub_dir / f"{sid}.json").write_text(json.dumps(spec, indent=2))

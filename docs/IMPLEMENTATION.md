@@ -4199,8 +4199,13 @@ Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 on the classification.
 
 Between Phase 3 and Phase 4, `_write_plan()` persists the merged plan
-(`<state-root>/runs/<run-id>/plan.json`) and per-subtask spec files
-(`<state-root>/runs/<run-id>/subtasks/<id>.json`). The conformance
+(`<state-root>/runs/<run-id>/plan.json`, which carries the full task text
+under its top-level `"task"` key) and per-subtask spec files
+(`<state-root>/runs/<run-id>/subtasks/<id>.json`). Each spec file carries
+`_task_ref` — the path to `plan.json` — rather than a second copy of the
+task text: no prompt reads a `_task` field, and inlining the full task
+into every subtask spec was measured to bloat briefs by 90.8-97.8% on
+large task documents, spilling past the CLI's Read cap. The conformance
 phase derives its advisory build/lint/test commands separately via
 `_infer_build_lint_test(repo_root)`, which performs best-effort
 discovery by checking for configuration files and lockfiles. Supported
