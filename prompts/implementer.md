@@ -69,9 +69,12 @@ cp -r /opt/venv .venv-private
 No `pyvenv.cfg` editing or shebang relocation is needed — `python3 -m pip`
 resolves correctly against the clone's own path regardless of where it lives.
 
-The subtask spec includes the overall task, the `source_of_truth`, the
-clarification answers, and this subtask's `success_criteria_seed`,
-`depends_on`, `investigation_notes`, and `files_likely_touched`.
+The subtask spec includes the `source_of_truth`, the clarification
+answers, and this subtask's `success_criteria_seed`, `depends_on`,
+`investigation_notes`, and `files_likely_touched`. It does not inline
+the overall task text — `_task_ref` names the path to `plan.json`,
+whose top-level `"task"` field carries it; read that file if you need
+the full task context beyond your `success_criteria_seed`.
 
 ## Artifacts from upstream subtasks
 

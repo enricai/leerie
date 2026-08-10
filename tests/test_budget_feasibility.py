@@ -84,12 +84,17 @@ def test_medium_plan_fits_default_cap(leerie):
 
 def test_summarizer_scenario_dies(leerie, capsys):
     """63 subtasks, 10 waves, worker_count=8 (the upstream phases on a
-    multi-domain run). With default cap 200 and the default 2.5
-    multiplier, the estimate exceeds the cap.
+    multi-domain run). Pinned against a cap of 200 (the pre-N3+N4
+    default; the production default is now 2000 -- see
+    test_resolve_max_workers.py -- so this test fixes its own cap
+    rather than relying on the default, since the estimate below no
+    longer exceeds 2000) and the default 2.5 multiplier, the estimate
+    exceeds the cap.
     Estimate: 8 + (63*2.5 + 10 + 2 + 1) = 8 + 170.5 = 178.5. ×1.15 = 205.3 > 200.
     Inspired by run `feat-migrate-the-application-code-c65cbe`, 2026-06-03."""
     st = _FakeState(worker_count=8)  # classifier + provision + 4 planners + reconciler + overlap_judge
     caps = _default_caps(leerie)
+    caps["max_total_workers"] = 200
     with pytest.raises(SystemExit) as exc:
         leerie.check_budget_feasibility(st, caps,
                                         _make_subtasks(63), _make_waves(10))
@@ -119,6 +124,7 @@ def test_die_message_names_the_per_subtask_upstream_phases(leerie, capsys):
     """
     st = _FakeState(worker_count=8)
     caps = _default_caps(leerie)
+    caps["max_total_workers"] = 200
     with pytest.raises(SystemExit):
         leerie.check_budget_feasibility(st, caps,
                                         _make_subtasks(63), _make_waves(10))
@@ -199,6 +205,7 @@ def test_recommended_cap_passes_when_applied(leerie, capsys):
     clears its own preflight."""
     st = _FakeState(worker_count=8)
     caps = _default_caps(leerie)
+    caps["max_total_workers"] = 200
     with pytest.raises(SystemExit):
         leerie.check_budget_feasibility(st, caps,
                                         _make_subtasks(63), _make_waves(10))

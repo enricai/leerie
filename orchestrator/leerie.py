@@ -102,7 +102,28 @@ MIN_CLAUDE_CLI = (2, 1, 22)
 
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
-    "max_total_workers": 200,       # hard ceiling on claude -p invocations
+    # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
+    # 2026-08-09): the 8 per-subtask retry caps already catch looping
+    # runaways locally; this global ceiling only needs to stay above the
+    # cost of a legitimate large plan. Measured worst case 27.0 calls/
+    # completed-subtask, median ~17.5 -- 2000 covers ~74 subtasks at the
+    # worst observed rate and ~115 at the median while remaining a genuine
+    # backstop for a run that has actually gone wrong.
+    "max_total_workers": 2000,      # hard ceiling on claude -p invocations
+    # Share of max_total_workers that recursive decomposition (fit_judge +
+    # splitter, DESIGN §5½ (P1)) may spend before it is forced to stop
+    # splitting and accept remaining nodes as leaves (N3+N4). Derived from
+    # a 118-run corpus sweep: decomposition share of budget was p90 22.7%
+    # for healthy (pushed) runs vs. p50 34.1% for runs that never pushed
+    # any code -- a 40% cap fires on 1/48 healthy runs (2%) and 31/70
+    # unhealthy runs (44%), the cleanest separation measured. This partitions
+    # the shared worker budget (State.bump_workers) so decomposition cannot
+    # starve execution of every call before a single line of code is
+    # written; it does NOT gate on fit_judge score (that option -- stopping
+    # early on projected cost -- was investigated and rejected: it would
+    # ship exactly the low-scoring nodes decompose_fit_threshold exists to
+    # keep splitting).
+    "decompose_budget_share": 0.40,
     # Concurrent workers within a wave. Per-worker cgroup containment
     # (DESIGN §6 *Memory containment*) keeps an OOM inside one worker's
     # cgroup, so wave-level parallelism can be high without cascading to
@@ -312,7 +333,7 @@ STATE_FIELDS = (
     "plan_snapshot",
     "decompose_snapshot",
     "blocked",
-    "worker_count", "telemetry",
+    "worker_count", "decompose_worker_count", "telemetry",
     "categories", "classifier_questions", "prescribed_procedure",
     "required_items", "answers",
     # likely_already_satisfied / likely_already_satisfied_evidence:
@@ -2446,7 +2467,25 @@ def log(msg: str) -> None:
     print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
 
 
+# Module-level run id, set once `State.__init__` has assigned a run
+# directory (N8: "emit run id on every terminal exit path"). `die()` runs
+# at module scope with no `st` in hand at most call sites, so this is the
+# only channel available to it. `_set_current_run_id` is the sole writer;
+# `State.__init__` is the sole caller, so every `State` instance created
+# for this process (fresh run, resume, or a nested `State(...)` for a
+# different run_id, e.g. accept-blocked's `target_st`) keeps this pointed
+# at the most recently constructed run.
+_CURRENT_RUN_ID: str | None = None
+
+
+def _set_current_run_id(run_id: str) -> None:
+    global _CURRENT_RUN_ID
+    _CURRENT_RUN_ID = run_id
+
+
 def die(msg: str, code: int = 1):
+    if _CURRENT_RUN_ID:
+        msg = f"{msg} (run {_CURRENT_RUN_ID})"
     print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
@@ -3399,8 +3438,16 @@ def _validate_run_json(data: dict) -> None:
        (a run cannot be in more than one terminal-or-paused state).
     5. If `paused_at` is set, `fly_machine_id` must also be set — you
        cannot pause a run without knowing where to resume it.
-    6. If `killed_at` is set, `fly_machine_id` must also be set — you
-       cannot have destroyed a machine you don't have a pointer to.
+    6. If `killed_at` is set on a run that shows evidence of being a
+       Fly/EC2 run (`fly_machine_id`, `ec2_instance_id`, `volume_id`, or
+       `image_tag` — the last two are Fly-only fields the docs describe
+       as "null for local-runtime runs" — any one of them non-null at
+       some point), then at least one of `fly_machine_id`/`ec2_instance_id`
+       must still be set — you cannot have destroyed a machine you don't
+       have a pointer to. A run with NONE of those markers ever set is a
+       local (nerdctl) kill: there is no "machine" to point to, so the
+       invariant does not apply (a local `leerie kill` writes `killed_at`
+       alone, with no machine id of any kind).
     7. If `volume_id` is set, `fly_machine_id` must also be set — a Fly
        volume without a machine to attach it to is a corrupt sidecar
        (provision.sh writes the two together; the only way to violate
@@ -3417,6 +3464,9 @@ def _validate_run_json(data: dict) -> None:
     paused_at = data.get("paused_at")
     killed_at = data.get("killed_at")
     fly_machine_id = data.get("fly_machine_id")
+    ec2_instance_id = data.get("ec2_instance_id")
+    volume_id = data.get("volume_id")
+    image_tag = data.get("image_tag")
     if pushed_at is not None and push_error is not None:
         raise ValueError(
             "run.json invariant: pushed_at and push_error are both set; "
@@ -3444,10 +3494,20 @@ def _validate_run_json(data: dict) -> None:
             "run.json invariant: paused_at is set but fly_machine_id is null; "
             "you cannot pause a run without knowing where to resume it"
         )
-    if killed_at is not None and fly_machine_id is None:
+    _shows_remote_evidence = any(
+        v is not None for v in (fly_machine_id, ec2_instance_id, volume_id, image_tag)
+    )
+    if (
+        killed_at is not None
+        and fly_machine_id is None
+        and ec2_instance_id is None
+        and _shows_remote_evidence
+    ):
         raise ValueError(
-            "run.json invariant: killed_at is set but fly_machine_id is null; "
-            "you cannot have destroyed a machine you don't have a pointer to"
+            "run.json invariant: killed_at is set but neither fly_machine_id "
+            "nor ec2_instance_id is set, though this sidecar shows other "
+            "remote-runtime evidence; you cannot have destroyed a machine "
+            "you don't have a pointer to"
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
@@ -4981,6 +5041,17 @@ async def _await_worker_memory_admission(
         waited += poll_interval_sec
 
 
+# Headroom reserved above a repo-declared Node heap when reconciling the
+# per-worker ceiling with it (see _declared_node_heap_bytes) — the resident
+# `claude -p` process shares the worker's cgroup with the build/test
+# subprocess tree, same 2048 MiB figure P9's NODE_OPTIONS injection uses for
+# the mirror-image calculation (cap -> heap, here heap -> cap). Kept as its
+# own constant rather than importing _invoke's inline literal, since that
+# literal is source-coupled to tests/test_resolve_worker_memory_max.py's AST
+# checks and must not be touched by unrelated work.
+_NODE_HEAP_HEADROOM_BYTES = 2048 * 1024 * 1024
+
+
 def resolve_worker_memory_max(repo_root: Path,
                               max_parallel: int,
                               cli_value: str | None = None) -> int:
@@ -4996,18 +5067,66 @@ def resolve_worker_memory_max(repo_root: Path,
 
     All sources accept the same format ("4G", "512M", "1024") and are
     validated by _parse_memory_size, which die()s on bad input — bad
-    config is caught at startup, not during a worker spawn."""
+    config is caught at startup, not during a worker spawn.
+
+    Reconciled against any `--max-old-space-size` the repo's own BLT
+    commands declare (N14-16 — `_declared_node_heap_bytes`): Node's declared
+    heap overrides whatever NODE_OPTIONS leerie injects for that one
+    subprocess, so a ceiling smaller than heap + headroom guarantees an
+    in-cgroup OOM regardless of source. When the resolved value (from any
+    source) undershoots that floor: an auto-derived value is raised to it
+    (bounded by the shared slice budget, when known); an explicit
+    CLI/env/file value is left as the operator's decision but refused with
+    an actionable die() naming --worker-memory-max, since silently
+    overriding an explicit cap would be a different kind of surprise."""
+    explicit_source: str | None = None
     if cli_value is not None:
-        return _parse_memory_size(cli_value, "--worker-memory-max")
-    env = os.environ.get(WORKER_MEMORY_MAX_ENV, "").strip()
-    if env:
-        return _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
-    cfg = repo_root / WORKER_MEMORY_MAX_FILE
-    file_val = _read_toml_key(cfg, "worker_memory_max")
-    if file_val is not None:
-        return _parse_memory_size(file_val,
-                                  f"{cfg}: worker_memory_max")
-    return _auto_worker_memory_max(max_parallel)
+        val = _parse_memory_size(cli_value, "--worker-memory-max")
+        explicit_source = "--worker-memory-max"
+    else:
+        env = os.environ.get(WORKER_MEMORY_MAX_ENV, "").strip()
+        if env:
+            val = _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
+            explicit_source = WORKER_MEMORY_MAX_ENV
+        else:
+            cfg = repo_root / WORKER_MEMORY_MAX_FILE
+            file_val = _read_toml_key(cfg, "worker_memory_max")
+            if file_val is not None:
+                val = _parse_memory_size(file_val, f"{cfg}: worker_memory_max")
+                explicit_source = f"{cfg}: worker_memory_max"
+            else:
+                val = _auto_worker_memory_max(max_parallel)
+
+    declared_heap_bytes = _declared_node_heap_bytes(repo_root)
+    if declared_heap_bytes is None:
+        return val
+    needed = declared_heap_bytes + _NODE_HEAP_HEADROOM_BYTES
+    if val >= needed:
+        return val
+
+    heap_mib = declared_heap_bytes / 1024**2
+    needed_mib = needed / 1024**2
+    val_mib = val / 1024**2
+    if explicit_source is not None:
+        die(f"the repo's build/lint/test commands declare a Node heap of "
+            f"{heap_mib:.0f} MiB (--max-old-space-size), but {explicit_source} "
+            f"sets the per-worker memory ceiling to only {val_mib:.0f} MiB -- "
+            f"raise --worker-memory-max to at least {needed_mib:.0f} MiB "
+            f"(declared heap + {_NODE_HEAP_HEADROOM_BYTES / 1024**2:.0f} MiB "
+            f"headroom for the resident claude process)")
+
+    info = _cgroup_slice_info()
+    slice_max_bytes = info[0] if info is not None else None
+    if slice_max_bytes is not None and needed > slice_max_bytes:
+        die(f"the repo's build/lint/test commands declare a Node heap of "
+            f"{heap_mib:.0f} MiB (--max-old-space-size), which needs "
+            f"{needed_mib:.0f} MiB of per-worker memory headroom -- that "
+            f"does not fit within the shared leerie.slice budget of "
+            f"{slice_max_bytes / 1024**2:.0f} MiB even alone. Raise the "
+            f"slice's memory.max, or lower the repo's declared heap, or "
+            f"pin a smaller --worker-memory-max deliberately if you accept "
+            f"the OOM risk")
+    return needed
 
 
 def resolve_worker_pids_max(repo_root: Path,
@@ -6509,7 +6628,20 @@ async def _label_migration_chunks(
 
     chunk_spec = [{"id": cid, "files_likely_touched": chunk}
                   for cid, chunk in zip(ids, chunks)]
-    st.bump_workers(caps)
+    try:
+        _bump_decompose_workers(st, caps)
+    except DecompositionBudgetExceeded:
+        # Decomposition's share of the worker budget is spent (N3+N4) --
+        # skip the label-only call entirely and keep the deterministic
+        # labels (already guaranteed-distinct; the worker only upgrades
+        # them). Not a WorkerError degrade: no call was ever spawned.
+        log(f"_recursive_decompose: decomposition budget exceeded before "
+            f"label-only splitter for {base_id}; using deterministic "
+            "chunk labels")
+        return [
+            _migration_child(subtask, chunk, cid, *labels[cid])
+            for cid, chunk in zip(ids, chunks)
+        ]
     sys_prompt = _load_prompt("splitter")
     user_prompt = wrap_repo_map(
         "LABEL PRE-PARTITIONED MIGRATION CHUNKS (label-only mode).\n"
@@ -6689,6 +6821,42 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
     return [dense_child, rest_child]
 
 
+def _bump_decompose_workers(st: "State", caps: dict) -> None:
+    """Reserve one decomposition call against `decompose_budget_share *
+    max_total_workers` and bump the shared worker budget (N3+N4 --
+    partition the budget so recursive decomposition cannot starve
+    execution).
+
+    Checks the decomposition-specific ceiling BEFORE bumping anything: a
+    refused call must not touch `worker_count` or `decompose_worker_count`
+    -- every recursion node still visits this function once even after the
+    share is exhausted (each sibling/child in the tree independently
+    reaches its own fit_judge/splitter spawn site), and if refusal still
+    incremented the counters, those phantom bumps would themselves eat
+    into the execution budget the partition exists to protect, and
+    `decompose_worker_count` would grow unbounded past the share instead
+    of holding at it.
+
+    Called instead of a bare `st.bump_workers(caps)` at every fit_judge /
+    splitter spawn site in `_recursive_decompose`. Once the share is
+    available, `st.bump_workers` still runs and can still raise the
+    pre-existing global-budget WorkerError -- this only adds an earlier,
+    decomposition-specific ceiling in front of it."""
+    share = caps.get("decompose_budget_share",
+                     DEFAULT_CAPS["decompose_budget_share"])
+    cap = caps["max_total_workers"]
+    spent = st.data.get("decompose_worker_count", 0)
+    if spent >= share * cap:
+        raise DecompositionBudgetExceeded(
+            f"decomposition budget exceeded ({spent} calls, "
+            f"{share:.0%} share of {cap} reached); accepting as leaf to "
+            "preserve execution budget."
+        )
+    st.bump_workers(caps)
+    st.data["decompose_worker_count"] = spent + 1
+    st.save()
+
+
 async def _recursive_decompose(
     subtask: dict,
     depth: int,
@@ -6709,7 +6877,9 @@ async def _recursive_decompose(
       2. If score >= decompose_fit_threshold or depth >= decompose_max_depth:
          return [subtask] (leaf).
       3. Split using _partition_files (migration) or the splitter worker
-         (coupled minority). Every judge/split call goes through st.bump_workers.
+         (coupled minority). Every judge/split call goes through
+         _bump_decompose_workers, which enforces decompose_budget_share
+         (N3+N4) on top of the shared st.bump_workers budget.
       4. No-progress guard: if decompose_noprogress_rounds consecutive rounds
          produce no child whose score exceeds the parent's, accept as leaf with
          a warning.
@@ -6773,7 +6943,16 @@ async def _recursive_decompose(
         )
 
     # --- judge step ----------------------------------------------------------
-    st.bump_workers(caps)
+    try:
+        _bump_decompose_workers(st, caps)
+    except DecompositionBudgetExceeded as exc:
+        # Decomposition's share of the worker budget is spent (N3+N4) --
+        # accept as a leaf without spawning the fit_judge call, the same
+        # disposition a WorkerError degrade below reaches. Logged
+        # separately from the crash message so the budget cap is visible
+        # in run logs rather than reading as a worker failure.
+        log(f"_recursive_decompose: {exc}")
+        return [subtask]
     sys_prompt = _load_prompt("fit_judge")
     user_prompt = _with_repo_map(
         "SUBTASK TO JUDGE:\n"
@@ -6882,7 +7061,14 @@ async def _recursive_decompose(
         # Coupled minority: LLM splitter decides the partition using
         # structural seams from the repo-map; backstopped by
         # _check_migration_surface at the plan level.
-        st.bump_workers(caps)
+        try:
+            _bump_decompose_workers(st, caps)
+        except DecompositionBudgetExceeded as exc:
+            # Decomposition's share of the worker budget is spent (N3+N4)
+            # -- accept as a leaf without spawning the splitter call, the
+            # same disposition a WorkerError degrade below reaches.
+            log(f"_recursive_decompose: {exc}")
+            return [subtask]
         sys_prompt_s = _load_prompt("splitter")
         user_prompt_s = _with_repo_map(
             "SUBTASK TO SPLIT:\n"
@@ -11355,6 +11541,18 @@ class WorkerError(RuntimeError):
     pass
 
 
+class DecompositionBudgetExceeded(WorkerError):
+    """Recursive decomposition (fit_judge/splitter) has spent its share of
+    the worker budget (N3+N4, DEFAULT_CAPS["decompose_budget_share"]).
+
+    Subclasses WorkerError so every existing `except WorkerError:` call site
+    in `_recursive_decompose` already degrades the node to a leaf without
+    any new control-flow -- the distinct type exists only so callers can
+    log an accurate "budget" message instead of the generic "crashed"
+    message.
+    """
+
+
 class WorktreeSetupError(WorkerError):
     """`new-worktree.sh` could not produce the subtask's worktree.
 
@@ -12872,6 +13070,26 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 _CGROUP_BROKER_SOCK = "/run/leerie-cgroup.sock"
 _CGROUP_PROBE_RESULT: bool | None = None
 _CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
+# N18: must stay >= scripts/cgroup-broker.py's own `_DESTROY_DRAIN_TIMEOUT_SEC`
+# (10.0s) -- a `destroy` request's own drain-then-rmdir loop can legitimately
+# run for the broker's full budget on a large worker subtree (a conformer's
+# test-suite process tree), and the broker keeps working toward that rmdir
+# for the whole budget regardless of whether this client is still listening.
+# `_cgroup_request`'s prior 5.0s default timeout was BELOW that budget, so a
+# still-legitimately-draining destroy made the client give up and swallow a
+# bare socket timeout (contextlib.suppress(OSError) in `_cgroup_destroy`,
+# with no log line -- unlike a broker-reported `ERR ...`, which is logged).
+# The broker itself still finishes the rmdir moments later off in its own
+# single-threaded accept loop -- but nothing in the orchestrator was waiting
+# for that any more, so run/container teardown was free to proceed and tear
+# down the broker (PID 1) mid-drain. Because workers run with
+# `--cgroupns=host`, the cgroup directory lives on the HOST cgroupfs and
+# outlives the container, so a broker killed mid-drain permanently orphans
+# the `leerie-w-<sid>` directory instead of merely delaying its removal --
+# this is the N18 leak. Keep this in sync with cgroup-broker.py's constant;
+# the margin covers scheduling/socket overhead beyond the broker's own
+# monotonic deadline.
+_CGROUP_DESTROY_TIMEOUT_SEC = 15.0
 
 
 def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
@@ -13006,11 +13224,16 @@ def _cgroup_destroy(sid: str | None) -> None:
     reported ERR (e.g. a lingering process kept the dir busy) is logged
     rather than silently discarded, so a failed teardown is distinguishable
     from a successful one. Called from `_invoke`'s cleanup path on every
-    exit (success, timeout, abort)."""
+    exit (success, timeout, abort).
+
+    Uses `_CGROUP_DESTROY_TIMEOUT_SEC` (not the 5.0s client default) so this
+    call blocks at least as long as the broker's own drain-then-rmdir budget
+    — see that constant's comment (N18) for why a shorter client timeout
+    orphans the cgroup directory rather than merely delaying its removal."""
     if sid is None:
         return
     with contextlib.suppress(OSError):
-        resp = _cgroup_request(f"destroy {sid}")
+        resp = _cgroup_request(f"destroy {sid}", timeout=_CGROUP_DESTROY_TIMEOUT_SEC)
         if resp != "OK":
             log(f"  [{sid}] cgroup destroy failed ({resp}); dir may be leaked")
 
@@ -15142,6 +15365,7 @@ class State:
     ):
         self.leerie_root = leerie_root
         self.run_id = run_id
+        _set_current_run_id(run_id)
         # leerie_root may now live outside the repo (LEERIE_STATE_DIR), so
         # repo_root cannot be derived from it as leerie_root.parent in general.
         self.repo_root: Path = repo_root if repo_root is not None else leerie_root.parent
@@ -23290,7 +23514,14 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     sub_dir = leerie_dir / "subtasks"
     for sid, s in subtasks.items():
         spec = dict(s)
-        spec["_task"] = task
+        # N6: the full task text is already persisted once in plan.json's
+        # top-level "task" field (written just above) — no prompt reads
+        # `_task` (verbatim grep across prompts/ and commands/), so
+        # duplicating it into every subtask spec only bloats the brief
+        # each implementer reads (measured 90.8-97.8% of brief bytes on
+        # large task docs, causing CLI spill-to-Read-cap failures). Point
+        # at the shared plan.json instead of copying the bytes.
+        spec["_task_ref"] = str(leerie_dir / "plan.json")
         spec["_source_of_truth"] = sot
         spec["_clarification_answers"] = answers
         (sub_dir / f"{sid}.json").write_text(json.dumps(spec, indent=2))
@@ -23897,6 +24128,39 @@ def resolve_blt(repo_root: Path) -> dict[str, str]:
         else:
             out[ax] = inferred[ax]
     return out
+
+
+_NODE_HEAP_FLAG_RE = re.compile(r"--max-old-space-size=(\d+)")
+
+
+def _declared_node_heap_bytes(repo_root: Path) -> int | None:
+    """Max `--max-old-space-size` (MiB, converted to bytes) declared across
+    the repo's effective build/lint/test commands (`resolve_blt`), or None
+    if no BLT command declares the flag.
+
+    Node 20+ derives its default V8 heap ceiling from the *host*, but an
+    explicit `--max-old-space-size` overrides that entirely — the heap
+    adjusts to that limit and Node throws OOM if it is crossed, regardless
+    of container size (see N14-16 in PENDING_ISSUES). A repo's own test/
+    build/lint command commonly sets this (directly, or via
+    `NODE_OPTIONS=--max-old-space-size=N <cmd>`), and that inline
+    assignment overrides whatever `NODE_OPTIONS` leerie itself injects for
+    that one subprocess (P9, `_invoke`) — so a declared heap bigger than
+    the per-worker cgroup ceiling guarantees an in-cgroup OOM leerie's own
+    injection cannot prevent. `resolve_worker_memory_max` uses this to
+    reconcile the ceiling with what the repo actually needs."""
+    blt = resolve_blt(repo_root)
+    max_mb: int | None = None
+    for cmd in blt.values():
+        if not cmd:
+            continue
+        for m in _NODE_HEAP_FLAG_RE.finditer(cmd):
+            mb = int(m.group(1))
+            if max_mb is None or mb > max_mb:
+                max_mb = mb
+    if max_mb is None:
+        return None
+    return max_mb * 1024 * 1024
 
 
 def _validate_conformance_result(result: dict, worktree: str) -> str | None:
@@ -27477,8 +27741,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # logged and ignored.
             await _backstop_capture_prior_runs(
                 leerie_dir, Path(os.getcwd()), caps, models, efforts)
+            # Unconditional (not gated behind `if not args.resume`): a
+            # resumed run previously never announced its id at all, which
+            # made it impossible to tell which run a given log stream
+            # belonged to from stdout alone (N8).
+            log(f"run id: {st.run_id}")
             if not args.resume:
-                log(f"run id: {st.run_id}")
                 # Initialize run.json with the immutable run-identity
                 # fields (run_id, branch, working_branch, pr_base_branch,
                 # started_at, task) so `leerie list` can enumerate this

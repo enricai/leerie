@@ -16,12 +16,16 @@ def repo_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_default_cap_is_two_hundred(leerie):
-    assert leerie.DEFAULT_CAPS["max_total_workers"] == 200
+def test_default_cap_is_two_thousand(leerie):
+    """N3+N4 (2026-08-10): raised 200 -> 2000 so the backstop no longer
+    catches legitimate large plans; runaway detection lives at the
+    per-subtask retry-cap level instead (docs/IMPLEMENTATION.md
+    "Decomposition budget partition (N3+N4)")."""
+    assert leerie.DEFAULT_CAPS["max_total_workers"] == 2000
 
 
 def test_default_when_nothing_set(leerie, repo_root):
-    assert leerie.resolve_max_workers(repo_root) == 200
+    assert leerie.resolve_max_workers(repo_root) == 2000
 
 
 def test_file_value(leerie, repo_root):
@@ -94,9 +98,9 @@ def test_zero_file_value_dies(leerie, repo_root, capsys):
 
 def test_empty_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_WORKERS", "")
-    assert leerie.resolve_max_workers(repo_root) == 200
+    assert leerie.resolve_max_workers(repo_root) == 2000
 
 
 def test_whitespace_only_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_WORKERS", "   ")
-    assert leerie.resolve_max_workers(repo_root) == 200
+    assert leerie.resolve_max_workers(repo_root) == 2000

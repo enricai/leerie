@@ -9,8 +9,24 @@ miss, invoke build-push.sh --push (which is idempotent at the registry).
 
 ensure_image() lives in the bash launcher, so the tests use the same
 isolated-harness pattern as test_launcher_runtime_knob.py / source the
-launcher's function block into a minimal bash script with build-push.sh
-stubbed.
+launcher's REAL function verbatim (mirroring
+`tests/test_resolve_ec2_vars.py`'s `_extract_resolve_ec2_knob`) into a
+minimal bash script with build-push.sh/flyctl stubbed, rather than
+hand-reproducing the function. A hand-copied reproduction is body-blind by
+construction — the tests would run a string literal defined in this file,
+so no change to the launcher's actual logic could affect them. This
+mattered in practice: the previous hand-copied harness predated the
+function's per-repo-Dockerfile branch (`_FLY_PER_REPO_DOCKERFILE`) and its
+switch from bare `echo ... >&2` to `remote_log`, so it was silently testing
+an old shape of the function.
+
+Verified live per N13's documented trap: an inert sabotage is not a valid
+falsification. The discriminating falsification used here is inverting the
+cache-hit/cache-miss branch (returning success on a cache MISS instead of a
+cache HIT): with the extraction, `test_cache_hit_skips_build_push` and
+`test_cache_miss_invokes_build_push_and_records_tag` both fail; against the
+old hand-copied harness they could not have, since that harness never read
+the launcher's source at all.
 """
 from __future__ import annotations
 
@@ -19,15 +35,21 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+LAUNCHER = REPO_ROOT / "leerie"
 
-# Bash harness that mirrors ensure_image() from the launcher. We don't
-# source `leerie` directly because it runs preflight + dispatch on source;
-# the function block is small enough to keep in sync via the
-# coupling test below.
-_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
 
+def _extract_ensure_image() -> str:
+    """The REAL `ensure_image()` function, lifted out of the launcher
+    verbatim. See module docstring for the body-blindness rationale and
+    the live falsification result."""
+    src = LAUNCHER.read_text()
+    start = src.index("ensure_image() {")
+    end = src.index("\n}\n", start) + len("\n}\n")
+    return src[start:end]
+
+
+# Bash harness wrapping the REAL ensure_image() extracted above.
+#
 # Test inputs:
 #   $XDG_CACHE_HOME → forced to a temp dir so the test never touches
 #                     the real user cache.
@@ -37,61 +59,16 @@ set -euo pipefail
 #   PATH            → must include a stub `flyctl` that handles
 #                     `apps list --json` and `apps create`.
 #   $1              → image tag to ensure.
-
-ensure_image() {
-  local tag="$1" cache_dir cache_file
-  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie"
-  cache_file="$cache_dir/published-tags.txt"
-  if [ -f "$cache_file" ] && grep -Fxq "$tag" "$cache_file" 2>/dev/null; then
-    return 0
-  fi
-  local build_push="$LEERIE_REPO/scripts/remote/build-push.sh"
-  if [ ! -x "$build_push" ]; then
-    echo "leerie: error: $build_push not found or not executable" >&2
-    return 1
-  fi
-  local fly_app="$LEERIE_FLY_APP"
-
-  # Auto-create the Fly app if missing. flyctl apps list returns a JSON
-  # array; check for a Name match. The remote builder and registry push
-  # both require the app to exist. Idempotent on existing apps.
-  if ! flyctl apps list --json 2>/dev/null \
-       | python3 -c '
-import json, sys
-try:
-    apps = json.load(sys.stdin)
-    names = [a.get("Name") or a.get("name") for a in apps]
-    sys.exit(0 if sys.argv[1] in names else 1)
-except Exception:
-    sys.exit(1)
-' "$fly_app"; then
-    echo "[leerie] remote: Fly app '$fly_app' does not exist — creating it" >&2
-    if ! flyctl apps create "$fly_app" 2>&1; then
-      echo "leerie: error: flyctl apps create $fly_app failed" >&2
-      echo "  Create it manually: flyctl apps create $fly_app" >&2
-      return 1
-    fi
-  fi
-
-  # Forward --local-build to build-push.sh when the launcher was invoked
-  # with --local-build or LEERIE_LOCAL_BUILD=1.
-  local build_args=(--app "$fly_app" --push)
-  if [ "${LOCAL_BUILD:-false}" = "true" ]; then
-    build_args+=(--local-build)
-  fi
-
-  echo "[leerie] remote: ensuring image $tag is published (cache miss)" >&2
-  if ! "$build_push" "${build_args[@]}"; then
-    echo "leerie: error: build-push.sh failed; remote run cannot proceed" >&2
-    return 1
-  fi
-  mkdir -p "$cache_dir"
-  printf '%s\n' "$tag" >> "$cache_file"
-  return 0
-}
-
-ensure_image "$1"
-"""
+def _harness() -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        # remote_log matches the real _log.sh format closely enough for
+        # these tests' substring assertions ("[leerie] ..." on stderr).
+        'remote_log() { echo "[leerie] $*" >&2; }\n'
+        f"{_extract_ensure_image()}\n"
+        'ensure_image "$1"\n'
+    )
 
 
 def _stub_flyctl(tmp_path: Path, existing_apps: list[str] | None = None,
@@ -130,7 +107,7 @@ def _run(tag: str, *, env: dict, cwd: Path,
         base_env["PATH"] = f"{flyctl_dir}:{base_env.get('PATH', '')}"
     base_env.update(env)
     return subprocess.run(
-        ["bash", "-c", _HARNESS, "harness", tag],
+        ["bash", "-c", _harness(), "harness", tag],
         env=base_env,
         cwd=str(cwd),
         capture_output=True,
@@ -313,20 +290,17 @@ def test_no_auto_publish_flag_consumed_by_launcher():
     assert "--no-auto-publish)" in text
 
 
-def test_ensure_image_harness_matches_launcher():
-    """Coupling test: the harness used in this file must match the live launcher.
-
-    If you edit ensure_image() in the launcher, update the _HARNESS in this
-    file accordingly. This test catches drift by checking that key tokens
-    co-occur in both places.
-    """
-    leerie_launcher = REPO_ROOT / "leerie"
-    launcher_text = leerie_launcher.read_text()
-    # The function body's load-bearing lines must appear in both.
+def test_ensure_image_extraction_contains_load_bearing_lines():
+    """Sanity check on the extraction itself: the load-bearing lines this
+    file's tests rely on must actually be present in the extracted
+    function body. Guards against a marker-string change in the launcher
+    silently truncating `_extract_ensure_image()`'s extraction (e.g. a
+    renamed function, or the `\\n}\\n` end-marker matching too early)."""
+    extracted = _extract_ensure_image()
     sentinels = [
         'cache_file="$cache_dir/published-tags.txt"',
         'grep -Fxq "$tag" "$cache_file"',
-        # New (Part H): app auto-create + LOCAL_BUILD forwarding.
+        # Part H: app auto-create + LOCAL_BUILD forwarding.
         'flyctl apps list --json',
         'flyctl apps create "$fly_app"',
         'build_args=(--app "$fly_app" --push)',
@@ -334,8 +308,7 @@ def test_ensure_image_harness_matches_launcher():
         'printf \'%s\\n\' "$tag" >> "$cache_file"',
     ]
     for s in sentinels:
-        assert s in launcher_text, f"missing in launcher: {s}"
-        assert s in _HARNESS, f"missing in harness: {s}"
+        assert s in extracted, f"missing in extracted function body: {s}"
 
 
 # --- Part H: app auto-create + --local-build forwarding -----------------

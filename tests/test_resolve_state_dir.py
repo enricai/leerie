@@ -1,8 +1,17 @@
 """Tests for the LEERIE_STATE_HOST_DIR resolution block in the launcher.
 
-The resolution logic lives in the bash launcher (`leerie`); these tests use
-a minimal bash harness that mirrors the exact block and echoes the resolved
-LEERIE_STATE_HOST_DIR value.
+The resolution logic lives in the bash launcher (`leerie`); these tests
+extract the two real blocks under test — the `_state_dir_default` +
+CLI/env/toml resolution ladder, and the `_validate_state_ownership`
+sidecar check — verbatim out of the launcher (mirroring
+`tests/test_resolve_ec2_vars.py`'s `_extract_resolve_ec2_knob`), rather
+than hand-reproducing them. A hand-copied reproduction is body-blind by
+construction: the tests run a string literal defined in this file, so no
+change to the launcher's actual logic can affect them. This mattered in
+practice here — the previous hand-copied ownership harness's
+install-subtree basename list was missing `.leerie`, which the real
+launcher's list already carried; the drift was invisible to the old
+harness by construction.
 
 Precedence (lowest → highest):
   default ($HOME/.leerie/<basename>)
@@ -10,143 +19,76 @@ Precedence (lowest → highest):
   → LEERIE_STATE_DIR env var
   → --state-dir CLI flag
 
-A second harness (`_OWNERSHIP_HARNESS`) covers the `_validate_state_ownership`
-sidecar check, which gates cross-repo basename collisions and refuses to
-write into the leerie install directory.
+Verified live per N13's documented trap: an inert sabotage (e.g.
+removing the `[ -f "$USER_REPO/leerie.toml" ]` guard around the toml
+read) is not a valid falsification — it passes with or without the
+extraction, since a missing toml file already makes the subsequent
+`grep` fail silently. The discriminating falsification used here is
+inverting the CLI/env precedence in the resolution ladder (moving the
+`--state-dir` CLI block ahead of the env-var block so CLI no longer
+wins): with the extraction, `test_cli_overrides_env` and
+`test_precedence_cli_beats_env_beats_toml_beats_default` fail; against
+the old hand-copied harness they could not have, since that harness
+never read the launcher's source at all.
 """
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+LAUNCHER = REPO_ROOT / "leerie"
 
-# Bash harness that mirrors the LEERIE_STATE_HOST_DIR resolution block from
-# `leerie`. Takes USER_REPO as $1 and HOME as $2; remaining args are CLI.
-_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
-USER_REPO="$1"
-HOME="$2"
-export HOME
-shift 2   # remaining args are simulated CLI
 
-_state_dir_default() {
-  local basename
-  basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
-  echo "$HOME/.leerie/$basename"
-}
+def _extract_state_dir_block() -> str:
+    """The REAL `_state_dir_default` + CLI/env/toml resolution ladder,
+    lifted out of the launcher verbatim, ending at
+    `export LEERIE_STATE_HOST_DIR`. See module docstring for the
+    body-blindness rationale and the live falsification result."""
+    src = LAUNCHER.read_text()
+    start = src.index("_state_dir_default() {")
+    end_marker = "export LEERIE_STATE_HOST_DIR\n"
+    end = src.index(end_marker, start) + len(end_marker)
+    return src[start:end]
 
-LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
 
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | head -1 \
-                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_state_dir" ]; then
-    case "$_toml_state_dir" in
-      "~")   _toml_state_dir="$HOME" ;;
-      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
-    esac
-    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
-  fi
-  unset _toml_state_dir
-fi
+def _extract_ownership_function() -> str:
+    """The REAL `_validate_state_ownership` function body, lifted out of
+    the launcher verbatim (brace-matched via the first `\\n}\\n` after the
+    opening line, mirroring `_extract_resolve_ec2_knob`'s technique)."""
+    src = LAUNCHER.read_text()
+    start = src.index("_validate_state_ownership() {")
+    end = src.index("\n}\n", start) + len("\n}\n")
+    return src[start:end]
 
-if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
-fi
 
-_cli_state_dir=""
-_prev_was_state_dir=false
-for arg in "$@"; do
-  if $_prev_was_state_dir; then
-    _cli_state_dir="$arg"
-    _prev_was_state_dir=false
-    continue
-  fi
-  case "$arg" in
-    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
-    --state-dir)   _prev_was_state_dir=true ;;
-  esac
-done
-if [ -n "$_cli_state_dir" ]; then
-  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
-fi
-unset _cli_state_dir _prev_was_state_dir
+# Bash harness wrapper: sets USER_REPO/HOME, sources the real resolution
+# block, and echoes the resolved LEERIE_STATE_HOST_DIR value.
+def _harness() -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'USER_REPO="$1"\n'
+        'HOME="$2"\n'
+        "export HOME\n"
+        "shift 2   # remaining args are simulated CLI\n"
+        f"{_extract_state_dir_block()}\n"
+        'echo "$LEERIE_STATE_HOST_DIR"\n'
+    )
 
-case "$LEERIE_STATE_HOST_DIR" in
-  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
-  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
-esac
 
-echo "$LEERIE_STATE_HOST_DIR"
-"""
-
-# Bash harness covering the _validate_state_ownership sidecar check.
-# Takes USER_REPO=$1, LEERIE_STATE_HOST_DIR=$2; exits 0 on accept, 1 on reject.
-_OWNERSHIP_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
-USER_REPO="$1"
-LEERIE_STATE_HOST_DIR="$2"
-
-_validate_state_ownership() {
-  local dir="$LEERIE_STATE_HOST_DIR"
-  if [ ! -e "$dir" ]; then
-    if ! mkdir -p "$dir"; then
-      echo "leerie: could not create state dir $dir" >&2
-      exit 1
-    fi
-    printf '%s\n' "$USER_REPO" > "$dir/.owner"
-    return 0
-  fi
-  if [ ! -d "$dir" ]; then
-    echo "leerie: state-dir target $dir exists but is not a directory" >&2
-    exit 1
-  fi
-  if [ -f "$dir/.owner" ]; then
-    local recorded
-    recorded="$(head -1 "$dir/.owner" 2>/dev/null || true)"
-    if [ "$recorded" = "$USER_REPO" ]; then
-      return 0
-    fi
-    echo "leerie: state-dir collision at $dir" >&2
-    echo "  owner on file: $recorded" >&2
-    echo "  current repo:  $USER_REPO" >&2
-    exit 1
-  fi
-  if [ -d "$dir/runs" ] || [ -d "$dir/worktrees" ]; then
-    printf '%s\n' "$USER_REPO" > "$dir/.owner"
-    return 0
-  fi
-  if [ -d "$dir/.git" ] || [ -x "$dir/leerie" ]; then
-    echo "leerie: state-dir target $dir looks like the leerie install directory" >&2
-    exit 1
-  fi
-  local _parent _basename
-  _parent="$(dirname "$dir")"
-  _basename="$(basename "$dir")"
-  if [ -d "$_parent/.git" ] && [ -x "$_parent/leerie" ]; then
-    case "$_basename" in
-      chain|commands|docs|orchestrator|prompts|scripts|skills|tests|.claude-plugin|.github)
-        echo "leerie: state-dir target $dir is a subdirectory of the leerie install dir at $_parent" >&2
-        exit 1
-        ;;
-    esac
-  fi
-  printf '%s\n' "$USER_REPO" > "$dir/.owner"
-}
-
-_validate_state_ownership
-"""
+# Bash harness wrapper for the ownership check: sets USER_REPO/
+# LEERIE_STATE_HOST_DIR, sources the real function, and calls it.
+def _ownership_harness() -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'USER_REPO="$1"\n'
+        'LEERIE_STATE_HOST_DIR="$2"\n'
+        f"{_extract_ownership_function()}\n"
+        "_validate_state_ownership\n"
+    )
 
 
 def _run(
@@ -160,7 +102,7 @@ def _run(
     """Run the harness; return (stdout, stderr). Raises on non-zero exit
     unless expect_fail=True."""
     result = subprocess.run(
-        ["bash", "-c", _HARNESS, "--", str(user_repo), str(fake_home)]
+        ["bash", "-c", _harness(), "--", str(user_repo), str(fake_home)]
         + cli_args,
         env={**{"PATH": "/usr/bin:/bin"}, **env},
         capture_output=True,
@@ -179,7 +121,7 @@ def _run_ownership(
 ) -> tuple[int, str, str]:
     """Run the ownership harness; return (returncode, stdout, stderr)."""
     result = subprocess.run(
-        ["bash", "-c", _OWNERSHIP_HARNESS, "--", user_repo, str(state_dir)],
+        ["bash", "-c", _ownership_harness(), "--", user_repo, str(state_dir)],
         env={"PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
