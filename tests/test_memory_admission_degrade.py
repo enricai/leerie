@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import re
 import textwrap
 
 import pytest
@@ -134,7 +135,18 @@ def test_wired_at_wave_entry(leerie):
     calls it and hands the result to the wave's Semaphore. An unwired fix is
     the failure mode CLAUDE.md records for the coverage gate."""
     src = inspect.getsource(leerie.phase_execute)
-    assert "_degrade_max_parallel_for_wave(caps[\"max_parallel\"])" in src
+    # Match the call with its arguments IN ORDER. Three independent
+    # substring checks are positionally blind, and both arguments are ints:
+    # swapping them passes every one of them while sizing each wave against
+    # a ~6.3 GiB "max_parallel" and a single-digit "demand estimate".
+    assert re.search(
+        r'_degrade_max_parallel_for_wave\(\s*caps\["max_parallel"\],'
+        r'\s*caps\.get\("worker_demand_estimate_bytes"\)',
+        src), (
+        "phase_execute must call the degrade with (max_parallel, demand "
+        "estimate) in that order — else a heap-declaring repo's waves are "
+        "sized on the build-peak constant N14-16 showed is too small, or "
+        "worse, on transposed arguments")
     i_call = src.index("_degrade_max_parallel_for_wave")
     i_sem = src.index("asyncio.Semaphore(wave_max_parallel)")
     assert i_call < i_sem, "the degrade must precede the Semaphore it sizes"
@@ -224,21 +236,56 @@ class TestComposesWithTheBlockingGate:
             "have known about — otherwise it is dead weight")
 
     def test_the_two_read_the_same_threshold(self, leerie):
-        """Both stages key on `_WORKER_BUILD_PEAK_BYTES`. If one drifted to
-        a different constant they would disagree about whether the same
-        slice has room — the degrade sizing a wave the gate then blocks, or
-        worse, admitting one it should not have."""
+        """Both stages must size on the SAME per-worker demand figure. If
+        one drifted they would disagree about whether the same slice has
+        room — the degrade sizing a wave the gate then blocks, or worse,
+        admitting one it should not have.
+
+        The demand figure is now a *parameter* threaded from
+        `caps["worker_demand_estimate_bytes"]` rather than a hard-coded
+        constant (N14-16: the build-peak constant understates a repo that
+        declares its own Node heap). The invariant is unchanged — what
+        moved is where the number comes from — so this pins two things:
+        both fall back to the same constant when nothing is passed, and
+        both take the override by parameter."""
         for fn in (leerie._degrade_max_parallel_for_wave,
                    leerie._await_worker_memory_admission):
             src = inspect.getsource(fn)
             assert "_WORKER_BUILD_PEAK_BYTES" in src, (
-                f"{fn.__name__} no longer references the shared build-peak "
-                f"constant")
-        # And the default really is the same object, not two equal literals.
-        deg = inspect.signature(
-            leerie._degrade_max_parallel_for_wave).parameters[
-                "build_peak_bytes"].default
-        gate = inspect.signature(
-            leerie._await_worker_memory_admission).parameters[
-                "build_peak_bytes"].default
-        assert deg == gate == leerie._WORKER_BUILD_PEAK_BYTES
+                f"{fn.__name__} no longer falls back to the shared "
+                f"build-peak constant")
+            sig = inspect.signature(fn).parameters["build_peak_bytes"]
+            assert sig.default is None, (
+                f"{fn.__name__}'s demand figure must be an injectable "
+                f"parameter, not a def-time constant")
+        # Behavioural, not textual: drive BOTH stages with nothing supplied
+        # against the same slice and require them to agree on how many
+        # workers fit. A substring check cannot see a drifted fallback —
+        # changing one function's default to `_WORKER_BUILD_PEAK_BYTES * 2`
+        # leaves every source assertion above green while the two stages
+        # start disagreeing about the same slice, which is precisely the
+        # failure this test is named for.
+        est = leerie._WORKER_BUILD_PEAK_BYTES
+        assert leerie.resolve_worker_demand_estimate(None) == est
+        # A slice with headroom for exactly two workers at the shared
+        # fallback: the degrade must size a wave to 2, and the gate must
+        # admit the 2nd and refuse the 3rd.
+        slice_max = est * 4
+        unreclaimable = est * 2
+        leerie._active_admissions.clear()
+        import unittest.mock as _mock
+        with _mock.patch.object(leerie, "_cgroup_slice_info",
+                                lambda: (slice_max, 0, unreclaimable)):
+            assert leerie._degrade_max_parallel_for_wave(5) == 2
+            tok1 = asyncio.run(leerie._await_worker_memory_admission(
+                max_wait_sec=0.0, poll_interval_sec=0.0))
+            assert tok1 is not None, "first worker must admit"
+            tok2 = asyncio.run(leerie._await_worker_memory_admission(
+                max_wait_sec=0.0, poll_interval_sec=0.0))
+            assert tok2 is not None, "second worker must admit"
+        leerie._active_admissions.clear()
+        # A declared heap raises BOTH, by construction — one resolver feeds
+        # both call sites (phase_execute and _invoke_admitted).
+        raised = leerie.resolve_worker_demand_estimate(9 * 1024**3)
+        assert raised == 9 * 1024**3 + leerie._NODE_HEAP_HEADROOM_BYTES
+        assert raised > est

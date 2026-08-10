@@ -114,7 +114,9 @@ the flag exists. The full rationale for the wave model is in
 [`DESIGN.md`](DESIGN.md) §5.
 
 The merged plan lives at `<state-root>/plan.json`; per-subtask spec
-files appear at `<state-root>/subtasks/<id>.json`. `<state-root>`
+files appear at `<state-root>/subtasks/<id>.json`; the task document
+itself is written verbatim to `<state-root>/task.md`, which is what
+each spec's `_task_ref` points at. `<state-root>`
 defaults to `$HOME/.leerie/<basename>/`; override with
 `LEERIE_STATE_DIR`, `--state-dir`, or `state_dir =` in `leerie.toml`.
 
@@ -340,7 +342,9 @@ local setup) because nerdctl can't reach Keychain. See
   the pre-0.3 all-sonnet behavior in one knob, set `--model sonnet` or
   `LEERIE_MODEL=sonnet`.
 - `--max-workers N` — cap total `claude -p` subprocess count over the
-  run. Default: `200` (`DEFAULT_CAPS["max_total_workers"]`). Also
+  run. Default: `2000` (`DEFAULT_CAPS["max_total_workers"]`) — a runaway
+  backstop, not a capacity limit; the per-subtask retry caps are what
+  bound a looping run. Also
   `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`
   (same precedence as `--confidence-rounds`: CLI > env > TOML > default).
   Note that the post-work conformance phase (DESIGN §9) spawns up to

@@ -80,38 +80,54 @@ def test_state_init_calls_the_run_id_setter(leerie):
     )
 
 
-def test_run_id_log_call_is_not_gated_behind_resume():
-    """The `log(f\"run id: ...\")` call in the resumable-planning entry
-    point must sit OUTSIDE `if not args.resume:` — a resumed run
-    previously never announced its id at all."""
+def test_run_id_log_call_has_no_enclosing_gate():
+    """The `log(f"run id: ...")` call must sit at `_run_phases`' body
+    depth, with NO enclosing `if` of any kind.
+
+    The predecessor of this test asserted only that the call was not
+    inside `if not args.resume:`. That is the wrong invariant, and it
+    passed for months while the bug was live: the call had been lifted out
+    of that specific gate but left nested inside `if "waves" not in
+    st.data:` -> `if "plans_after_classify" not in st.data:`, so every
+    resume that had already checkpointed past classify — every resume into
+    execution, the common case — still announced nothing. Naming one
+    forbidden gate can never catch the next one; "no gate at all" is the
+    property that actually holds."""
     import pathlib
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     src = (repo_root / "orchestrator" / "leerie.py").read_text()
     tree = ast.parse(src)
 
-    found = []
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
 
-    class Visitor(ast.NodeVisitor):
-        def visit_If(self, node: ast.If) -> None:
-            test_src = ast.unparse(node.test)
-            if test_src == "not args.resume":
-                for stmt in ast.walk(node):
-                    if (
-                        isinstance(stmt, ast.Call)
-                        and isinstance(stmt.func, ast.Name)
-                        and stmt.func.id == "log"
-                    ):
-                        call_src = ast.unparse(stmt)
-                        if "run id" in call_src:
-                            found.append(call_src)
-            self.generic_visit(node)
+    sites = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "log"
+                and node.args):
+            continue
+        if "run id" not in ast.unparse(node.args[0]):
+            continue
+        gates, cur = [], parent.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.If):
+                gates.append(ast.unparse(cur.test))
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                sites.append((cur.name, gates))
+                break
+            cur = parent.get(cur)
 
-    Visitor().visit(tree)
-    assert not found, (
-        "the run-id log() call must not sit inside `if not args.resume:` "
-        f"— found: {found}"
-    )
+    assert sites, "no `log(f\"run id: ...\")` call found at all"
+    for fn_name, gates in sites:
+        assert not gates, (
+            f"the run-id log() in {fn_name}() is gated behind {gates} — it "
+            f"must fire on every path, fresh and resume alike"
+        )
 
 
 def test_run_id_log_call_still_exists_unconditionally():
@@ -120,3 +136,75 @@ def test_run_id_log_call_still_exists_unconditionally():
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     src = (repo_root / "orchestrator" / "leerie.py").read_text()
     assert 'log(f"run id: {st.run_id}")' in src
+
+
+def test_resume_into_execution_announces_the_run_id(tmp_path, capsys,
+                                                    monkeypatch):
+    """Behavioural counterpart to the structural check above, and the one
+    that actually reproduces the reported failure: a state.json already
+    checkpointed past `plans_after_classify` must still print the run id.
+
+    This is the state the old placement was silent on, so it fails before
+    the hoist and passes after — a falsification that changes an
+    observable rather than a source-text shape."""
+    import asyncio
+    import importlib.util
+    import pathlib
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "leerie_emit", repo_root / "orchestrator" / "leerie.py")
+    leerie = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(leerie)
+
+    run_dir = tmp_path / "runs" / "abc123def456"
+    run_dir.mkdir(parents=True)
+
+    class _St:
+        run_id = "abc123def456"
+        run_dir = None
+        path = None
+        data = {}
+
+        def load(self):
+            return True
+
+        def save(self):
+            pass
+
+    st = _St()
+    st.run_dir = run_dir
+    st.path = run_dir / "state.json"
+    # Checkpointed past classify and all the way through scheduling — the
+    # shape a resume into execution actually has.
+    st.data = {
+        "task": "do a thing",
+        "worker_count": 12,
+        "categories": ["feature-implementation"],
+        "waves": [["feat-001"]],
+        "plans_after_classify": [],
+        "finished_at": None,
+    }
+
+    class _Args:
+        resume = True
+
+    # Stop immediately after the announcement; everything downstream needs
+    # a real run and is covered elsewhere.
+    class _Stop(BaseException):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _Stop
+
+    monkeypatch.setattr(leerie, "_validate_resume_state", _boom)
+
+    with pytest.raises(_Stop):
+        asyncio.run(leerie._run_phases(
+            _Args(), {}, tmp_path, st, "codebase", "normal", {}, {}))
+
+    out = capsys.readouterr()
+    assert "run id: abc123def456" in (out.out + out.err), (
+        "a resume that already checkpointed past classify announced no run "
+        "id — the N8 failure"
+    )

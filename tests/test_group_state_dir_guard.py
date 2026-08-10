@@ -49,70 +49,28 @@ LAUNCHER = REPO_ROOT / "leerie"
 # Env: set LEERIE_STATE_HOST_DIR and/or LEERIE_STATE_DIR as needed.
 # Output: the resolved LEERIE_STATE_HOST_DIR value.
 # ---------------------------------------------------------------------------
-_MEMBER_RESOLUTION_HARNESS = r"""
-#!/usr/bin/env bash
-set -euo pipefail
-USER_REPO="$1"
-HOME="$2"
-export HOME
-shift 2   # remaining args are simulated CLI flags
+# Extracted verbatim from the launcher rather than reproduced. The copy this
+# replaced was logic-identical to `leerie`'s block, but body-blind by
+# construction — nothing here read or executed the launcher, so no change to
+# it could fail these tests. Its own docstring cited SIX launcher line
+# numbers, every one of which had already drifted (the block moved from
+# ~:502-561 to :785-844), which is the drift this shape exists to prevent.
+#
+# Imported from test_resolve_state_dir rather than re-derived: that module
+# owns the extraction, and a second copy of a RULE drifts exactly the way a
+# second copy of a LIST does (see tests/test_no_duplicate_launcher_blocks.py).
+from tests.test_resolve_state_dir import _extract_state_dir_block
 
-_state_dir_default() {
-  local basename
-  basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
-  echo "$HOME/.leerie/$basename"
-}
-
-LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
-
-if [ -f "$USER_REPO/leerie.toml" ]; then
-  _toml_state_dir="$( { grep -E '^[[:space:]]*state_dir[[:space:]]*=' \
-                            "$USER_REPO/leerie.toml" 2>/dev/null \
-                        || true; } \
-                      | head -1 \
-                      | sed -E 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*//;
-                                s/[[:space:]]*$//;
-                                s/^"(.*)"$/\1/;
-                                s/^'"'"'(.*)'"'"'$/\1/')"
-  if [ -n "$_toml_state_dir" ]; then
-    case "$_toml_state_dir" in
-      "~")   _toml_state_dir="$HOME" ;;
-      "~/"*) _toml_state_dir="$HOME/${_toml_state_dir#"~/"}" ;;
-    esac
-    LEERIE_STATE_HOST_DIR="$_toml_state_dir"
-  fi
-  unset _toml_state_dir
-fi
-
-if [ -n "${LEERIE_STATE_DIR:-}" ]; then
-  LEERIE_STATE_HOST_DIR="$LEERIE_STATE_DIR"
-fi
-
-_cli_state_dir=""
-_prev_was_state_dir=false
-for arg in "$@"; do
-  if $_prev_was_state_dir; then
-    _cli_state_dir="$arg"
-    _prev_was_state_dir=false
-    continue
-  fi
-  case "$arg" in
-    --state-dir=*) _cli_state_dir="${arg#--state-dir=}" ;;
-    --state-dir)   _prev_was_state_dir=true ;;
-  esac
-done
-if [ -n "$_cli_state_dir" ]; then
-  LEERIE_STATE_HOST_DIR="$_cli_state_dir"
-fi
-unset _cli_state_dir _prev_was_state_dir
-
-case "$LEERIE_STATE_HOST_DIR" in
-  "~")   LEERIE_STATE_HOST_DIR="$HOME" ;;
-  "~/"*) LEERIE_STATE_HOST_DIR="$HOME/${LEERIE_STATE_HOST_DIR#"~/"}" ;;
-esac
-
-echo "$LEERIE_STATE_HOST_DIR"
-"""
+_MEMBER_RESOLUTION_HARNESS = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    'USER_REPO="$1"\n'
+    'HOME="$2"\n'
+    "export HOME\n"
+    "shift 2\n"
+    + _extract_state_dir_block()
+    + '\necho "$LEERIE_STATE_HOST_DIR"\n'
+)
 
 
 def _resolve_member_dir(

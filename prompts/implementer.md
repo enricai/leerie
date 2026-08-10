@@ -72,9 +72,17 @@ resolves correctly against the clone's own path regardless of where it lives.
 The subtask spec includes the `source_of_truth`, the clarification
 answers, and this subtask's `success_criteria_seed`, `depends_on`,
 `investigation_notes`, and `files_likely_touched`. It does not inline
-the overall task text — `_task_ref` names the path to `plan.json`,
-whose top-level `"task"` field carries it; read that file if you need
-the full task context beyond your `success_criteria_seed`.
+the overall task text — `_task_ref` names the path to a markdown file
+holding it verbatim; read that file if you need the full task context
+beyond your `success_criteria_seed`.
+
+The spec's `_task_ref_bytes` field gives that file's size. It is
+usually small, but a task document can run past the Read tool's limit
+on a single call. If `_task_ref_bytes` is large (say over 100,000),
+do not read the whole file: grep it for the terms your subtask is
+about, or page it with the Read tool's `offset` and `limit`. A Read
+that exceeds the limit returns an error instead of content, so
+reaching for it blindly costs you a turn and tells you nothing.
 
 ## Artifacts from upstream subtasks
 
