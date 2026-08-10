@@ -4981,6 +4981,17 @@ async def _await_worker_memory_admission(
         waited += poll_interval_sec
 
 
+# Headroom reserved above a repo-declared Node heap when reconciling the
+# per-worker ceiling with it (see _declared_node_heap_bytes) — the resident
+# `claude -p` process shares the worker's cgroup with the build/test
+# subprocess tree, same 2048 MiB figure P9's NODE_OPTIONS injection uses for
+# the mirror-image calculation (cap -> heap, here heap -> cap). Kept as its
+# own constant rather than importing _invoke's inline literal, since that
+# literal is source-coupled to tests/test_resolve_worker_memory_max.py's AST
+# checks and must not be touched by unrelated work.
+_NODE_HEAP_HEADROOM_BYTES = 2048 * 1024 * 1024
+
+
 def resolve_worker_memory_max(repo_root: Path,
                               max_parallel: int,
                               cli_value: str | None = None) -> int:
@@ -4996,18 +5007,66 @@ def resolve_worker_memory_max(repo_root: Path,
 
     All sources accept the same format ("4G", "512M", "1024") and are
     validated by _parse_memory_size, which die()s on bad input — bad
-    config is caught at startup, not during a worker spawn."""
+    config is caught at startup, not during a worker spawn.
+
+    Reconciled against any `--max-old-space-size` the repo's own BLT
+    commands declare (N14-16 — `_declared_node_heap_bytes`): Node's declared
+    heap overrides whatever NODE_OPTIONS leerie injects for that one
+    subprocess, so a ceiling smaller than heap + headroom guarantees an
+    in-cgroup OOM regardless of source. When the resolved value (from any
+    source) undershoots that floor: an auto-derived value is raised to it
+    (bounded by the shared slice budget, when known); an explicit
+    CLI/env/file value is left as the operator's decision but refused with
+    an actionable die() naming --worker-memory-max, since silently
+    overriding an explicit cap would be a different kind of surprise."""
+    explicit_source: str | None = None
     if cli_value is not None:
-        return _parse_memory_size(cli_value, "--worker-memory-max")
-    env = os.environ.get(WORKER_MEMORY_MAX_ENV, "").strip()
-    if env:
-        return _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
-    cfg = repo_root / WORKER_MEMORY_MAX_FILE
-    file_val = _read_toml_key(cfg, "worker_memory_max")
-    if file_val is not None:
-        return _parse_memory_size(file_val,
-                                  f"{cfg}: worker_memory_max")
-    return _auto_worker_memory_max(max_parallel)
+        val = _parse_memory_size(cli_value, "--worker-memory-max")
+        explicit_source = "--worker-memory-max"
+    else:
+        env = os.environ.get(WORKER_MEMORY_MAX_ENV, "").strip()
+        if env:
+            val = _parse_memory_size(env, WORKER_MEMORY_MAX_ENV)
+            explicit_source = WORKER_MEMORY_MAX_ENV
+        else:
+            cfg = repo_root / WORKER_MEMORY_MAX_FILE
+            file_val = _read_toml_key(cfg, "worker_memory_max")
+            if file_val is not None:
+                val = _parse_memory_size(file_val, f"{cfg}: worker_memory_max")
+                explicit_source = f"{cfg}: worker_memory_max"
+            else:
+                val = _auto_worker_memory_max(max_parallel)
+
+    declared_heap_bytes = _declared_node_heap_bytes(repo_root)
+    if not declared_heap_bytes:
+        return val
+    needed = declared_heap_bytes + _NODE_HEAP_HEADROOM_BYTES
+    if val >= needed:
+        return val
+
+    heap_mib = declared_heap_bytes / 1024**2
+    needed_mib = needed / 1024**2
+    val_mib = val / 1024**2
+    if explicit_source is not None:
+        die(f"the repo's build/lint/test commands declare a Node heap of "
+            f"{heap_mib:.0f} MiB (--max-old-space-size), but {explicit_source} "
+            f"sets the per-worker memory ceiling to only {val_mib:.0f} MiB -- "
+            f"raise --worker-memory-max to at least {needed_mib:.0f} MiB "
+            f"(declared heap + {_NODE_HEAP_HEADROOM_BYTES / 1024**2:.0f} MiB "
+            f"headroom for the resident claude process)")
+
+    info = _cgroup_slice_info()
+    slice_max_bytes = info[0] if info is not None else None
+    if slice_max_bytes is not None and needed > slice_max_bytes:
+        die(f"the repo's build/lint/test commands declare a Node heap of "
+            f"{heap_mib:.0f} MiB (--max-old-space-size), which needs "
+            f"{needed_mib:.0f} MiB of per-worker memory headroom -- that "
+            f"does not fit within the shared leerie.slice budget of "
+            f"{slice_max_bytes / 1024**2:.0f} MiB even alone. Raise the "
+            f"slice's memory.max, or lower the repo's declared heap, or "
+            f"pin a smaller --worker-memory-max deliberately if you accept "
+            f"the OOM risk")
+    return needed
 
 
 def resolve_worker_pids_max(repo_root: Path,
@@ -23897,6 +23956,39 @@ def resolve_blt(repo_root: Path) -> dict[str, str]:
         else:
             out[ax] = inferred[ax]
     return out
+
+
+_NODE_HEAP_FLAG_RE = re.compile(r"--max-old-space-size=(\d+)")
+
+
+def _declared_node_heap_bytes(repo_root: Path) -> int | None:
+    """Max `--max-old-space-size` (MiB, converted to bytes) declared across
+    the repo's effective build/lint/test commands (`resolve_blt`), or None
+    if no BLT command declares the flag.
+
+    Node 20+ derives its default V8 heap ceiling from the *host*, but an
+    explicit `--max-old-space-size` overrides that entirely — the heap
+    adjusts to that limit and Node throws OOM if it is crossed, regardless
+    of container size (see N14-16 in PENDING_ISSUES). A repo's own test/
+    build/lint command commonly sets this (directly, or via
+    `NODE_OPTIONS=--max-old-space-size=N <cmd>`), and that inline
+    assignment overrides whatever `NODE_OPTIONS` leerie itself injects for
+    that one subprocess (P9, `_invoke`) — so a declared heap bigger than
+    the per-worker cgroup ceiling guarantees an in-cgroup OOM leerie's own
+    injection cannot prevent. `resolve_worker_memory_max` uses this to
+    reconcile the ceiling with what the repo actually needs."""
+    blt = resolve_blt(repo_root)
+    max_mb: int | None = None
+    for cmd in blt.values():
+        if not cmd:
+            continue
+        for m in _NODE_HEAP_FLAG_RE.finditer(cmd):
+            mb = int(m.group(1))
+            if max_mb is None or mb > max_mb:
+                max_mb = mb
+    if max_mb is None:
+        return None
+    return max_mb * 1024 * 1024
 
 
 def _validate_conformance_result(result: dict, worktree: str) -> str | None:
