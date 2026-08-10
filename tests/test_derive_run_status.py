@@ -136,9 +136,20 @@ def test_status_killed_remote(leerie):
     assert leerie._derive_run_status(rj, {}) == "killed"
 
 
-def test_status_killed_without_machine_id_is_corrupt(leerie):
-    """Invariant: killed_at requires fly_machine_id."""
+def test_status_killed_without_machine_id_is_local_kill_not_corrupt(leerie):
+    """N7: killed_at with no machine id and no other Fly/EC2 evidence is
+    a valid local (nerdctl) kill, not a corrupt sidecar."""
     rj = {"killed_at": "2026-05-29T16:00:00+00:00"}
+    assert leerie._derive_run_status(rj, {}) == "killed"
+
+
+def test_status_killed_without_machine_id_but_fly_evidence_is_corrupt(leerie):
+    """Invariant: killed_at on a run showing Fly evidence (image_tag)
+    still requires fly_machine_id or ec2_instance_id."""
+    rj = {
+        "killed_at": "2026-05-29T16:00:00+00:00",
+        "image_tag": "registry.fly.io/leerie:0.6.7",
+    }
     assert leerie._derive_run_status(rj, {}) == "corrupt-sidecar"
 
 
