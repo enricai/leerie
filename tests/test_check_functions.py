@@ -689,12 +689,35 @@ class TestCheckOverlapJudgeOutput:
 # --- check_implementer_output ------------------------------------------ #
 
 class TestCheckImplementerOutput:
+    # A `complete` result is no longer clean without production_evidence
+    # (DESIGN §9 *Evidence must be production-grounded*), so the two
+    # expects-empty tests below carry it. That is the contract change, not
+    # test noise: an implementer that never ran its own new path against
+    # real repo state is exactly what run fa979580 shipped four times.
+    # check_production_evidence's own branches are covered in
+    # tests/test_production_evidence.py.
+    _EVIDENCE = {"exercised": True, "how": "pytest -k foo",
+                 "observed": "2 passed"}
+
     def test_clean(self, leerie):
-        result = {"status": "complete", "criteria_results": [
-            {"criterion": "test passes", "met": True}]}
+        result = {"status": "complete",
+                  "criteria_results": [
+                      {"criterion": "test passes", "met": True}],
+                  "production_evidence": self._EVIDENCE}
         subtask = {"files_likely_touched": ["src/foo.ts"]}
         assert leerie.check_implementer_output(
             result, subtask, {"src/foo.ts"}) == []
+
+    def test_clean_result_without_evidence_is_gated(self, leerie):
+        """Anti-vacuity partner to `test_clean`: strip only the evidence
+        from an otherwise-clean result and the gate must fire, or the
+        addition above is decorative."""
+        result = {"status": "complete", "criteria_results": [
+            {"criterion": "test passes", "met": True}]}
+        subtask = {"files_likely_touched": ["src/foo.ts"]}
+        issues = leerie.check_implementer_output(
+            result, subtask, {"src/foo.ts"})
+        assert any("NO_PRODUCTION_EVIDENCE" in i for i in issues)
 
     def test_no_planned_files_touched(self, leerie):
         result = {"status": "complete"}
@@ -712,7 +735,8 @@ class TestCheckImplementerOutput:
         assert any("UNMET_CRITERION" in i for i in issues)
 
     def test_no_criteria_is_ok(self, leerie):
-        result = {"status": "complete"}
+        result = {"status": "complete",
+                  "production_evidence": self._EVIDENCE}
         assert leerie.check_implementer_output(
             result, {}, {"src/foo.ts"}) == []
 

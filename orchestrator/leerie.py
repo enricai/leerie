@@ -401,6 +401,11 @@ STATE_FIELDS = (
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
     "conformance",
+    # Subtask ids whose conformer produced no result (crash / timeout), so a
+    # subtask that was never reviewed is distinguishable from one that
+    # passed. Adjacent to `conformance` because the two are only meaningful
+    # together — see DESIGN §9.
+    "unreviewed_subtasks",
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
     # entries collected during phase_reconcile (DESIGN §5
@@ -1264,6 +1269,48 @@ def _confidence_schema(axes: list[str]) -> dict:
         },
     }
 
+
+def _production_evidence_schema() -> dict:
+    """DESIGN §9 *Evidence must be production-grounded*.
+
+    Did the worker run the path it just wrote against the repo **as it
+    actually is**, and what did it observe? Every other gate asks whether
+    the code matches its specification; none asks whether the specification
+    matches reality, and a wrong specification propagates cleanly through
+    implementer, criteria, conformer and the final whole-tree pass. Measured
+    on run `fa979580`: a heap resolver verified against a
+    `.leerie/config.toml` fixture — a shape 0 of the 5 managed repos use —
+    returned `None` on the two repos that motivated the finding, while every
+    criterion was ticked.
+
+    Deliberately FLAT and with a single required inner field, per
+    `_confidence_schema`'s docstring: the decoder corruption in
+    anthropics/claude-code#49747 is triggered by many required parameters
+    mixed with verbose strings, and it destroys the whole payload rather
+    than the one field. `exercised` is a bare bool for the same reason. The
+    object itself is optional at the top level — absence is handled by
+    `check_production_evidence`, which gates, rather than by rejecting the
+    submission and losing everything else in it.
+    """
+    return {
+        "type": "object",
+        "required": ["exercised"],
+        "properties": {
+            # Did the new path actually run against real repo state?
+            "exercised": {"type": "boolean"},
+            # The command that ran it — recorded so it is replayable.
+            "how": {"type": "string"},
+            # What came back. The point of the whole field: "resolve_blt()
+            # returns 'pnpm run test', heap None" is the defect, stated.
+            "observed": {"type": "string"},
+            # Required by check_production_evidence when exercised is false.
+            # "I could not make this fire here" is a legitimate answer and a
+            # recorded one; silence is not.
+            "unexercisable_reason": {"type": "string"},
+        },
+    }
+
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
@@ -1594,6 +1641,11 @@ SCHEMAS: dict[str, dict] = {
             },
             # §8 + §12 structural enforcement via _confidence_schema.
             "confidence": _confidence_schema(["root_cause", "solution"]),
+            # DESIGN §9 *Evidence must be production-grounded*. The
+            # implementer is the first place this can be asked, and the
+            # cheapest: it has the repo mounted and has just written the
+            # path. Optional here; check_production_evidence gates.
+            "production_evidence": _production_evidence_schema(),
             "checkpoint_path": {"type": ["string", "null"]},
             "blocker": {"type": ["string", "null"]},
             "summary": {"type": "string"},
@@ -1826,6 +1878,9 @@ SCHEMAS: dict[str, dict] = {
             # fails its own JSON schema. This self-score is ADVISORY; the
             # gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
+            # DESIGN §9 *Evidence must be production-grounded*. Optional at
+            # this layer on purpose; check_production_evidence gates on it.
+            "production_evidence": _production_evidence_schema(),
         },
     },
     "patch_generator": {
@@ -8034,7 +8089,67 @@ def check_implementer_output(
                     f"UNMET_CRITERION: claims complete but "
                     f"criterion {cr.get('criterion', '?')!r} "
                     "is not met")
+        issues.extend(check_production_evidence(result))
 
+    return issues
+
+
+def check_production_evidence(result: dict) -> list[str]:
+    """DESIGN §9 *Evidence must be production-grounded*.
+
+    Every other check here asks whether the code matches its specification.
+    This one asks whether the worker ever ran the path it wrote against the
+    repo as it actually is. On run `fa979580` a heap resolver ticked every
+    criterion against a `.leerie/config.toml` fixture — a shape 0 of the 5
+    managed repos use — and returned `None` on both repos that motivated
+    the finding. Nothing in the run could see that.
+
+    Pure JSON→verdict set logic over already-structured fields (no prose is
+    read), per CLAUDE.md's *Language-to-JSON* rule.
+
+    Gates on ABSENCE deliberately (DESIGN §8 *Findings carry a severity* —
+    the default is gating): the field is optional in the schema so that a
+    worker omitting it loses one judgment rather than the whole payload,
+    which is what requiring it would cost (`_confidence_schema`'s docstring
+    records the measured 40.9%-valid outcome of that mistake). Gating on
+    absence is what keeps optional from meaning ignorable.
+
+    Not a proof of correctness — a fixture can be right and a real repo
+    still take another branch. It converts "I could not make this fire
+    here" from silence into a recorded, reviewable outcome.
+    """
+    issues: list[str] = []
+    ev = result.get("production_evidence")
+
+    if not isinstance(ev, dict):
+        return ["NO_PRODUCTION_EVIDENCE: the result does not record whether "
+                "the new code path was ever exercised against real repo "
+                "state — run it and report `production_evidence`"]
+
+    exercised = ev.get("exercised")
+    if exercised is True:
+        # `how`/`observed` are optional in the schema (decoder-safety), but
+        # an exercised claim with neither is indistinguishable from the bare
+        # assertion this check exists to replace.
+        if not str(ev.get("how") or "").strip() and \
+                not str(ev.get("observed") or "").strip():
+            issues.append(
+                "UNSUPPORTED_PRODUCTION_EVIDENCE: exercised=true but neither "
+                "`how` nor `observed` is recorded — name the command you ran "
+                "and what it returned")
+        return issues
+
+    if exercised is False:
+        if not str(ev.get("unexercisable_reason") or "").strip():
+            issues.append(
+                "UNEXERCISED_PRODUCTION_PATH: the new code path was not run "
+                "against real repo state and no `unexercisable_reason` is "
+                "given — either exercise it or say why it cannot be")
+        return issues
+
+    issues.append(
+        f"MALFORMED_PRODUCTION_EVIDENCE: `exercised` must be a boolean, "
+        f"got {type(exercised).__name__}")
     return issues
 
 
@@ -26481,6 +26596,14 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                         "result": None,
                         "warnings": ["settled complete via mid-run satisfied "
                                      "rescue; no diff to conform"],
+                        # Deliberately NOT added to `unreviewed_subtasks`.
+                        # `reviewed: False` is literally true — no conformer
+                        # ran — but this is a review that was never *needed*
+                        # (zero commits, no diff to attack), not one that was
+                        # attempted and died. Conflating the two would put a
+                        # correctly-skipped subtask in the operator-facing
+                        # warning and train them to ignore it.
+                        "reviewed": False,
                     }
                     st.save()
                     return {"subtask_id": sid, "status": "complete",
@@ -26574,7 +26697,22 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             st.data.setdefault("conformance", {})[sid] = {
                 "result": conf_res,
                 "warnings": conf_warnings,
+                # DESIGN §9: a conformer that never produced a result did
+                # not review this subtask. Without this flag that outcome is
+                # indistinguishable in `subtask_status` from a clean pass —
+                # measured across every run on one host, 170 of 680 conformer
+                # attempts (25%) produce no result, and run fa979580 shipped
+                # two such subtasks as `complete`. Recorded rather than
+                # promoted to a blocking status because the phase is advisory
+                # by design (DESIGN §9) and the measured yield when it DOES
+                # run is 3.3% (17 of 510) — so an unreviewed subtask is
+                # usually fine. What it must not be is invisible.
+                "reviewed": conf_res is not None,
             }
+            if conf_res is None:
+                st.data.setdefault("unreviewed_subtasks", [])
+                if sid not in st.data["unreviewed_subtasks"]:
+                    st.data["unreviewed_subtasks"].append(sid)
             st.save()
 
             # DESIGN §9 *The one gating axis: solution completeness*. The
@@ -27896,6 +28034,15 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations.{pr_suffix} Work is on "
         f"{_compute_run_branch(st.run_id)}; working branch unchanged.")
+    # DESIGN §9: an unreviewed subtask is one whose conformer never
+    # produced a result. It is still `complete` — the phase is advisory —
+    # but the operator should not have to read the log to find out that a
+    # quarter of the review phase silently did nothing.
+    unreviewed = st.data.get("unreviewed_subtasks") or []
+    if unreviewed:
+        log(f"note — {len(unreviewed)} of {nsub} subtasks completed WITHOUT "
+            f"a conformance review (worker crashed or timed out): "
+            f"{', '.join(sorted(unreviewed))}")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
             f"${tel.get('cost_usd', 0.0):,.2f}, "
