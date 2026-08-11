@@ -5212,10 +5212,19 @@ schemas, and emits `NO_PRODUCTION_EVIDENCE` (field absent or not an object),
 `UNSUPPORTED_PRODUCTION_EVIDENCE` (`exercised: true` with neither `how` nor
 `observed`), `UNEXERCISED_PRODUCTION_PATH` (`exercised: false` with no
 `unexercisable_reason`), or `MALFORMED_PRODUCTION_EVIDENCE` (`exercised` not a
-bool). Called from `check_implementer_output` on the `status == "complete"`
-branch only — a blocked implementer has no finished path to exercise — so it
-routes through the existing bounded `implementer_confidence_retries` retry and
-never blocks a run permanently.
+bool). It has **two call sites with deliberately different severities**. From
+`check_implementer_output`, on the `status == "complete"` branch only (a
+blocked implementer has no finished path to exercise), it routes through the
+existing bounded `implementer_confidence_retries` retry and so never blocks a
+run permanently. From `_settle_subtask`'s conformance block it is **advisory**
+— the output extends `conf_warnings`, never `blocked_reason` — because
+`solution_defects` is deliberately the one gating conformer axis (DESIGN §9)
+and an advisory phase must not acquire a second way to stop a run. The
+conformer's copy is the more independent observation of the two (it attacks a
+diff it did not write), which is why it is asked for at all; it is read only
+when `conf_res is not None`, since a crashed conformer has no result to
+inspect and would otherwise draw a spurious `NO_PRODUCTION_EVIDENCE` on top of
+the crash warning that already explains it.
 
 Two shape decisions are load-bearing and must not be "tidied". The field is
 **optional in the schema and gating in the check**: requiring it would cost the

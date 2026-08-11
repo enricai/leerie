@@ -895,6 +895,38 @@ whose one non-obvious test is the partial-caps case: every other test supplies
 that omits it (`run_recapture_deps`, `run_rebaser`, `_replay_capture` each
 build their own minimal caps) AND only on the branch that runs when the
 warning fires.
+The **production-grounded evidence gate** (DESIGN §9 — every other gate asks
+whether the code matches its specification, none asks whether the
+specification matches reality) is covered by `tests/test_production_evidence.py`
+and `tests/test_unreviewed_subtasks.py`. Three traps are not obvious from the
+test names. **(1) The field is optional in the schema and gating in the
+check, and that is ONE decision, not two.** Requiring it costs the entire
+submission rather than the one field — `_confidence_schema`'s docstring
+records that measured at 40.9% valid on `plan_overlap_judge`, with 84 of its
+85 failures being a single required field — while gating on absence is what
+stops "optional" from meaning "ignorable". `test_schema_field_is_optional_at_the_top_level`
+and `test_absent_evidence_gates` are anti-vacuity partners: remove either and
+the field becomes decorative. The object is also flat with one required inner
+bool for the same decoder-corruption reason (anthropics/claude-code#49747).
+**(2) The conformer's copy must be READ, not merely declared.** It shipped
+once as a dead field — on both schemas, with exactly one call site and no
+mention in `conformer.md` — while DESIGN and IMPLEMENTATION both described it
+as consumed. It is wired **advisory** (extends `conf_warnings`, never
+`blocked_reason`), because `solution_defects` is deliberately the one gating
+conformer axis and an advisory phase must not gain a new way to stop a run;
+`test_conformer_side_is_advisory_not_gating` pins the distinction by
+inspecting the statement, not just the call. **(3) Source scans here strip
+comments first.** Both `conformance[sid] = {...}` write sites carry comments
+naming `unreviewed_subtasks` while explaining why one of them must not touch
+it, so a raw substring scan matches the prose describing what it forbids and
+fails on correct code — the same trap the zombie-reaper guard documents. The
+helper also bounds each site at its closing `st.save()` rather than by a
+character count: a fixed window was tried twice and truncated mid-statement
+both times, reporting a key as missing when it was merely past the cutoff.
+Note the two write sites mean different things — the mid-run satisfied-rescue
+sentinel sets `reviewed: False` but is deliberately excluded from
+`unreviewed_subtasks`, since a zero-commit subtask has no diff to review and
+folding it into the operator warning is how a warning becomes noise.
 Memory-OOM naming
 (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending

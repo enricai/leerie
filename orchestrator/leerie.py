@@ -26690,6 +26690,15 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     "surfaced as advisory, subtask still complete")
             if conf_res is not None:
                 res["conformance"] = conf_res
+                # DESIGN §9 *Evidence must be production-grounded*. The
+                # conformer's evidence is a genuinely independent second
+                # observation — it attacks a diff it did not write — so it
+                # is worth asking for. ADVISORY, unlike the implementer's:
+                # `solution_defects` is deliberately the ONE gating conformer
+                # axis (below), and turning this phase into a second blocking
+                # gate would trade a measured 3.3% defect yield for a new way
+                # for an advisory phase to stop a run.
+                conf_warnings.extend(check_production_evidence(conf_res))
             if conf_warnings:
                 res["conformance_warnings"] = conf_warnings
                 for w in conf_warnings:
@@ -26709,10 +26718,22 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # usually fine. What it must not be is invisible.
                 "reviewed": conf_res is not None,
             }
+            # Symmetric on purpose. `_settle_subtask` is a `while True:`
+            # loop and this block can run more than once for one sid (the
+            # completeness gate sets `continuation = True` and re-drives),
+            # so an append-only record would keep reporting a subtask a
+            # later round DID review. Tracing today's control flow that
+            # ordering looks unreachable — a crashed conformer yields no
+            # `solution_defects`, so nothing re-drives after it — but the
+            # invariant is one line to hold unconditionally, and a
+            # reachability argument rots the moment someone adds another
+            # continuation source.
+            unreviewed = st.data.setdefault("unreviewed_subtasks", [])
             if conf_res is None:
-                st.data.setdefault("unreviewed_subtasks", [])
-                if sid not in st.data["unreviewed_subtasks"]:
-                    st.data["unreviewed_subtasks"].append(sid)
+                if sid not in unreviewed:
+                    unreviewed.append(sid)
+            elif sid in unreviewed:
+                unreviewed.remove(sid)
             st.save()
 
             # DESIGN §9 *The one gating axis: solution completeness*. The

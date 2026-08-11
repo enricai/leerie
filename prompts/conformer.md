@@ -301,6 +301,39 @@ is worse than an honest empty array (it triggers a wasted re-drive). But a
 **shallow** empty array — you did not actually try to break the diff — is the
 exact failure this gate exists to catch. Attack first, then report.
 
+### 5b. Check the diff fires in production — `production_evidence` (advisory)
+
+You are attacking a diff you did not write, which makes you the second and
+more independent place to ask: **does this mechanism run at all against this
+repo as it actually is?**
+
+Run the changed path against real repo state and report what you saw:
+
+```json
+"production_evidence": {
+  "exercised": true,
+  "how": "python3 -c 'import leerie; print(leerie.resolve_blt(Path(\".\")))'",
+  "observed": "{'test': 'pnpm run test'} -> declared heap: None"
+}
+```
+
+Do not take the implementer's fixtures as evidence of this. A fixture shows
+the code handles the input someone imagined; it says nothing about the input
+this repo produces. Build the real input by calling the real producer. If the
+two disagree, the fixture is wrong.
+
+`exercised: false` with an `unexercisable_reason` is a legitimate answer — a
+Fly-only branch cannot be exercised on a local run, and saying so is more
+useful than a fabricated observation. Silence is what is forbidden.
+
+This axis is **advisory**: it surfaces as a conformance warning and never
+gates. `solution_defects` (§5) remains the only gating axis here.
+
+Why it exists: a fix once ticked every criterion against a fixture shape **0
+of the 5 repos this project manages use**, returned nothing on the two repos
+whose crashes motivated it, and passed six conformance reviews — including a
+whole-tree final pass — before anyone noticed.
+
 ### 6. Score your own work (DESIGN §8 disciplines) — advisory
 
 Before reporting, score your conformance pass on a 1–10 axis

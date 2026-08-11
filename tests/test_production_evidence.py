@@ -204,6 +204,53 @@ def test_gate_runs_only_on_a_complete_result(leerie):
     assert any(i.startswith("NO_PRODUCTION_EVIDENCE:") for i in issues)
 
 
+def test_wired_into_the_conformance_phase(leerie):
+    """The conformer's copy must be READ, not merely declared.
+
+    Shipped once as a dead field: `_production_evidence_schema()` was on both
+    schemas while `check_production_evidence` had exactly one call site, and
+    `conformer.md` never mentioned it — so the conformer carried a field
+    nothing asked it to fill and nothing consumed, while DESIGN and
+    IMPLEMENTATION both described it as consumed.
+    """
+    src = inspect.getsource(leerie)
+    assert "check_production_evidence(conf_res)" in src, \
+        "the conformer's production_evidence is declared but never read"
+
+
+def test_conformer_side_is_advisory_not_gating(leerie):
+    """It must extend the conformance WARNINGS, not the gating axis.
+
+    `solution_defects` is deliberately the one gating conformer axis
+    (DESIGN §9); routing this into a second blocking gate would let an
+    advisory phase stop a run over a field a worker merely omitted.
+    """
+    src = inspect.getsource(leerie)
+    i = src.index("check_production_evidence(conf_res)")
+    stmt = src[src.rindex("\n", 0, i) + 1:i + 40]
+    assert "conf_warnings.extend" in stmt, (
+        f"expected the conformer's evidence to become a warning, got: "
+        f"{stmt.strip()!r}")
+
+
+def test_conformer_evidence_only_read_when_a_result_exists(leerie):
+    """A crashed conformer has no result to inspect; calling the check on
+    `None` would emit a spurious NO_PRODUCTION_EVIDENCE on top of the crash
+    warning that already explains the situation."""
+    src = inspect.getsource(leerie)
+    i = src.index("check_production_evidence(conf_res)")
+    assert "if conf_res is not None:" in src[max(0, i - 900):i]
+
+
+def test_conformer_prompt_asks_for_the_field(leerie):
+    import pathlib
+    p = (pathlib.Path(__file__).resolve().parent.parent
+         / "prompts" / "conformer.md").read_text()
+    assert "production_evidence" in p
+    assert "unexercisable_reason" in p
+    assert "advisory" in p.lower()
+
+
 def test_prompt_asks_for_the_field(leerie):
     """§12: code enforces, the prompt documents. A gate the prompt never
     mentions is answered by retries, not by evidence."""

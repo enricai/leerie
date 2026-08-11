@@ -47,13 +47,20 @@ def _conformance_write_sites(leerie) -> list[str]:
     marker = 'st.data.setdefault("conformance", {})[sid] = {'
     out = []
     for chunk in src.split(marker)[1:]:
+        # Bounded SEMANTICALLY, at the `st.save()` that closes each block,
+        # rather than by a character count. A fixed window was tried twice
+        # and truncated mid-statement both times — reporting a key as
+        # missing when it was simply past the cutoff, which is a guard that
+        # fails on correct code.
+        end = chunk.find("st.save()")
+        body = chunk[:end + len("st.save()")] if end != -1 else chunk
         # Comments are STRIPPED before scanning. Both bodies carry comments
         # that name `unreviewed_subtasks` while explaining why one of them
         # must not touch it, so a raw substring scan matches the prose
         # describing the thing it forbids and the negative assertions below
         # fail on correct code. Same trap the zombie-reaper guard documents
         # (it strips its docstring via `ast` for the identical reason).
-        code = "\n".join(ln for ln in chunk[:1800].splitlines()
+        code = "\n".join(ln for ln in body.splitlines()
                          if not ln.strip().startswith("#"))
         out.append(code)
     return out
@@ -114,10 +121,30 @@ def test_summary_names_the_unreviewed_subtasks(leerie):
     assert "WITHOUT" in src and "join(sorted(unreviewed))" in src
 
 
+def test_a_later_successful_review_clears_the_entry(leerie):
+    """The record must be symmetric: appended on a crash, DISCARDED on a
+    later success.
+
+    `_settle_subtask` is a `while True:` loop and this block can run more
+    than once per subtask (the completeness gate re-drives), so an
+    append-only list would keep naming a subtask a later round did review.
+    Tracing today's flow that ordering looks unreachable — a crashed
+    conformer produces no `solution_defects`, so nothing re-drives after it
+    — but the invariant is one line to hold unconditionally, and a
+    reachability argument rots the moment a new continuation source lands.
+    Pinned structurally because reaching the second round for real needs a
+    live worktree and two spawned conformers.
+    """
+    site = [s for s in _conformance_write_sites(leerie)
+            if "unreviewed_subtasks" in s][0]
+    assert "elif sid in unreviewed:" in site
+    assert "unreviewed.remove(sid)" in site
+
+
 def test_no_duplicate_ids_recorded(leerie):
     """A subtask re-driven by the completeness gate reaches the recording
     site more than once; the operator should see it named once."""
     sites = _conformance_write_sites(leerie)
     crash_site = [s for s in sites if "unreviewed_subtasks" in s]
     assert len(crash_site) == 1
-    assert 'not in st.data["unreviewed_subtasks"]' in crash_site[0]
+    assert "if sid not in unreviewed:" in crash_site[0]
