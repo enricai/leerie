@@ -167,47 +167,71 @@ def test_only_both_halves_deliver_the_prompt_in_time(hoisted, threaded,
                                                      expect_delivered):
     """Behavioural proof that neither half alone suffices.
 
-    Models the CLI faithfully in the one respect that matters: a consumer
-    that gives up on stdin after a deadline and never looks again. Uses a
-    plain `asyncio.Event` deadline rather than a real subprocess so the test
-    is fast and platform-independent — the failure being reproduced is one
-    of *scheduling*, not of process semantics.
+    Uses a REAL child process, which is the whole point. An earlier draft
+    modelled the deadline with an in-process `asyncio.Event` + `wait_for`
+    and was wrong in the one way that mattered: a blocked event loop also
+    freezes the model's own timer, so whether the deadline or the write won
+    came down to ready-queue ordering — which differs across CPython
+    versions. It passed on 3.12+ and reported `GOT` for the two blocking
+    variants on 3.10/3.11. The real CLI is a separate process whose 3 s
+    clock runs regardless of what leerie's loop is doing; only a real
+    subprocess reproduces that, and it does so identically on every version.
+
+    Scaled down 10x from the real 3 s deadline to keep the test quick.
     """
     import asyncio
+    import sys
     import time
 
-    DEADLINE = 0.30          # stands in for the CLI's 3 s
-    BLOCK = 0.45             # stands in for a slow broker round-trip
+    DEADLINE = 0.30          # stands in for the CLI's hard-coded 3 s
+    BLOCK = 0.90             # stands in for a slow broker round-trip
+
+    # Mirrors the CLI: wait for the first stdin byte until a deadline, then
+    # stop listening. `select` gives the child its own OS-level clock.
+    #
+    # It announces READY before arming that clock, and the parent waits for
+    # it, so interpreter startup cannot eat into the margin. Without that
+    # handshake a slow runner shifts the child's deadline later than the
+    # parent's block and the two TIMEOUT variants flip to GOT — the same
+    # class of environment-dependence that made the previous draft of this
+    # test fail on 3.10/3.11 while passing locally.
+    CHILD = (
+        "import sys, select\n"
+        "print('READY', flush=True)\n"
+        f"r, _, _ = select.select([sys.stdin], [], [], {DEADLINE})\n"
+        "print('GOT' if r else 'TIMEOUT', flush=True)\n"
+    )
 
     async def scenario():
-        delivered = asyncio.Event()
-        started = time.monotonic()
-
-        async def child():
-            try:
-                await asyncio.wait_for(delivered.wait(), DEADLINE)
-                return "GOT"
-            except asyncio.TimeoutError:
-                return "TIMEOUT"          # gives up, stops listening
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", CHILD,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        ready = await asyncio.wait_for(proc.stdout.readline(), 30)
+        assert ready.strip() == b"READY", ready
 
         async def feed():
-            delivered.set()
-
-        child_task = asyncio.create_task(child())
-        await asyncio.sleep(0)            # let the child start waiting
+            try:
+                proc.stdin.write(b"x" * 1024)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                      # child already gone — the D case
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
         feeder = asyncio.create_task(feed()) if hoisted else None
         if threaded:
             await asyncio.to_thread(time.sleep, BLOCK)
         else:
-            time.sleep(BLOCK)             # blocks the whole loop
+            time.sleep(BLOCK)             # blocks the whole event loop
         if feeder is None:
             feeder = asyncio.create_task(feed())
 
-        result = await child_task
-        await feeder
-        assert time.monotonic() - started >= BLOCK
-        return result
+        out, _ = await asyncio.gather(proc.stdout.read(), feeder)
+        await proc.wait()
+        return out.decode().strip()
 
     got = asyncio.run(scenario())
     assert got == ("GOT" if expect_delivered else "TIMEOUT"), (
