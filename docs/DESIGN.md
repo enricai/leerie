@@ -6277,6 +6277,76 @@ Two further disciplines apply, and they sit at the §12 axis:
   axis cannot gate on vague "looks incomplete" prose. When the diff is empty or
   unreadable the axis fails open (advisory, never gates) — there is nothing to
   attack.
+- **Evidence must be production-grounded: a fix that never fires is not a
+  fix.** Every gate described above asks whether the code matches its
+  specification. None asks whether the specification matches reality, and a
+  wrong specification propagates cleanly through implementer, criteria,
+  conformer, and the final whole-tree pass. Measured on run `fa979580` (2026-
+  08-10): four fixes shipped inert, six conformers reported zero defects, the
+  final conformer certified the tree at confidence 8.5, and the run exited 0.
+  The clearest instance resolved a repo's declared Node heap by scanning the
+  BLT command strings, verified against a `.leerie/config.toml` fixture
+  declaring the heap inline — a shape **0 of the 5 repos leerie manages
+  use**, while 2 of 5 declare it in `package.json`. Executed against the real
+  repos, the shipped resolver returned `None` where the corrected one returns
+  8192 and 4096 MiB. Every criterion was met; the mechanism never ran once in
+  production.
+
+  The response is a `production_evidence` field on the implementer and
+  conformer results: the worker must exercise the path it just wrote against
+  the repo **as it actually is**, and record the command and what it observed.
+  The requirement is not proof of correctness — a fixture can be right and a
+  real repo still take a different branch. It is that *"I could not make this
+  fire here"* becomes a recorded, gating outcome instead of silence. A worker
+  that cannot exercise the path must say so and why; absence of the field
+  gates, matching *Findings carry a severity* below.
+
+  Two adjacent disciplines follow from the same measurement and are prompt-
+  level rather than mechanical, because neither can be checked in general.
+  **A new decision point logs which branch it took, including the branch that
+  does nothing** — the one finding in that run whose mechanism logged its own
+  failure (`cgroup destroy failed …; dir may be leaked`) was discovered from
+  that line, while the resolver with zero `log()` calls was found only by a
+  later manual audit. And **when a test forces a constant to be duplicated,
+  the test is the defect** — an AST check pinning a literal `2048` led an
+  implementer to correctly refuse to break it and instead declare a second
+  constant, writing the divergence into the spec as a rule; the two figures
+  then disagreed by 384 MiB, which is precisely what a shared constant exists
+  to prevent.
+
+  Two candidate gates were tested against the same run and **refused**.
+  *Red-before-green* — requiring the new tests to fail on the base tree — is
+  free and worthless here: measured, all four findings already satisfied it (9
+  of 13 for the heap fix), because a new test against new code trivially
+  fails before the code exists. What has value is reproducing the reported
+  *symptom*, which is a different and much stronger requirement, and which
+  would have caught the one finding in that run that had already been fixed by
+  an earlier PR before the run began. *Producer-branch coverage* — requiring
+  tests to exercise both branches of the producer feeding the fix — also fails:
+  instrumented, the inference branch executed even under the defective
+  fixture, so the gate passes while the defect stands.
+- **A stale finding is not a bug.** The evidence contract above asks whether
+  a fix fires; this asks whether the failure it fixes still happens. On run
+  `fa979580` a subtask "fixed" a cgroup leak that an earlier PR had already
+  fixed **before the run began**, and shipped an event-loop stall doing it.
+  Nothing asked. `bugfix-` subtasks therefore record a `symptom_evidence`
+  object — did the reported symptom reproduce on the base tree, how, and what
+  was observed — and a subtask that could not reproduce it says so.
+
+  **Advisory, and the asymmetry with the evidence gate is deliberate.** A
+  retry cannot make a stale finding un-stale: it asks the same worker the
+  same question, so gating would spend budget without changing the answer,
+  and a second gating evidence field would stack retry pressure on the
+  first. What is wanted here is *surfacing* — "this may already be done" is
+  the most valuable thing such a subtask can report, and it only has to be
+  visible once.
+
+  Note what this is **not**: "the new tests fail on the base tree" is free
+  and proves nothing. Measured on that run, all four findings' tests already
+  failed on base (9 of 13 for one of them), because a new test against code
+  that does not yet exist trivially fails. The claim wanted is behavioural,
+  which is why the field asks for a command and an observation rather than a
+  boolean the worker can assert for nothing.
 - **No backsliding.** The conformer can add commits but must not write to
   protected paths. The diff-scope check — no writes to `.leerie/`,
   `.git/`, or `.claude/` *except for the user-deliverable subtrees*

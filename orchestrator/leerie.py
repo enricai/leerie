@@ -401,6 +401,16 @@ STATE_FIELDS = (
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
     "conformance",
+    # Subtask ids whose conformer produced no result (crash / timeout), so a
+    # subtask that was never reviewed is distinguishable from one that
+    # passed. Adjacent to `conformance` because the two are only meaningful
+    # together — see DESIGN §9.
+    "unreviewed_subtasks",
+    # sid -> check_symptom_evidence findings for `bugfix-` subtasks. Kept
+    # beside the row above because both answer "what should the operator
+    # know about a subtask that reports itself complete?" — see DESIGN §9
+    # *A stale finding is not a bug*.
+    "symptom_findings",
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
     # entries collected during phase_reconcile (DESIGN §5
@@ -1264,6 +1274,48 @@ def _confidence_schema(axes: list[str]) -> dict:
         },
     }
 
+
+def _production_evidence_schema() -> dict:
+    """DESIGN §9 *Evidence must be production-grounded*.
+
+    Did the worker run the path it just wrote against the repo **as it
+    actually is**, and what did it observe? Every other gate asks whether
+    the code matches its specification; none asks whether the specification
+    matches reality, and a wrong specification propagates cleanly through
+    implementer, criteria, conformer and the final whole-tree pass. Measured
+    on run `fa979580`: a heap resolver verified against a
+    `.leerie/config.toml` fixture — a shape 0 of the 5 managed repos use —
+    returned `None` on the two repos that motivated the finding, while every
+    criterion was ticked.
+
+    Deliberately FLAT and with a single required inner field, per
+    `_confidence_schema`'s docstring: the decoder corruption in
+    anthropics/claude-code#49747 is triggered by many required parameters
+    mixed with verbose strings, and it destroys the whole payload rather
+    than the one field. `exercised` is a bare bool for the same reason. The
+    object itself is optional at the top level — absence is handled by
+    `check_production_evidence`, which gates, rather than by rejecting the
+    submission and losing everything else in it.
+    """
+    return {
+        "type": "object",
+        "required": ["exercised"],
+        "properties": {
+            # Did the new path actually run against real repo state?
+            "exercised": {"type": "boolean"},
+            # The command that ran it — recorded so it is replayable.
+            "how": {"type": "string"},
+            # What came back. The point of the whole field: "resolve_blt()
+            # returns 'pnpm run test', heap None" is the defect, stated.
+            "observed": {"type": "string"},
+            # Required by check_production_evidence when exercised is false.
+            # "I could not make this fire here" is a legitimate answer and a
+            # recorded one; silence is not.
+            "unexercisable_reason": {"type": "string"},
+        },
+    }
+
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
@@ -1594,6 +1646,29 @@ SCHEMAS: dict[str, dict] = {
             },
             # §8 + §12 structural enforcement via _confidence_schema.
             "confidence": _confidence_schema(["root_cause", "solution"]),
+            # DESIGN §9 *Evidence must be production-grounded*. The
+            # implementer is the first place this can be asked, and the
+            # cheapest: it has the repo mounted and has just written the
+            # path. Optional here; check_production_evidence gates.
+            "production_evidence": _production_evidence_schema(),
+            # DESIGN §9 *A stale finding is not a bug*. `bugfix-` subtasks
+            # only. Same flat, single-required-bool shape as the field above,
+            # for the same decoder-safety reason.
+            "symptom_evidence": {
+                "type": "object",
+                "required": ["reproduced"],
+                "properties": {
+                    # Did the reported symptom actually occur on the base
+                    # tree, before any of this subtask's work?
+                    "reproduced": {"type": "boolean"},
+                    "how": {"type": "string"},
+                    "observed": {"type": "string"},
+                    # Why it could not be reproduced. A finding that no
+                    # longer reproduces is usually already fixed — which is
+                    # the outcome this exists to surface.
+                    "not_reproduced_reason": {"type": "string"},
+                },
+            },
             "checkpoint_path": {"type": ["string", "null"]},
             "blocker": {"type": ["string", "null"]},
             "summary": {"type": "string"},
@@ -1826,6 +1901,9 @@ SCHEMAS: dict[str, dict] = {
             # fails its own JSON schema. This self-score is ADVISORY; the
             # gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
+            # DESIGN §9 *Evidence must be production-grounded*. Optional at
+            # this layer on purpose; check_production_evidence gates on it.
+            "production_evidence": _production_evidence_schema(),
         },
     },
     "patch_generator": {
@@ -8016,7 +8094,24 @@ def check_integrator_output(result: dict) -> list[str]:
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
 ) -> list[str]:
-    """Mechanical checks on an implementer's complete result."""
+    """Mechanical checks on an implementer's complete result.
+
+    `subtask` is required to be a dict and the contract is enforced rather
+    than accommodated. The tempting accommodation — `subtask = subtask or {}`
+    — is measurably worse than the crash: an empty dict yields an empty
+    `planned`, so `NO_PLANNED_FILES_TOUCHED` can never fire and a caller's
+    mistake silently disables a check instead of announcing itself. That is
+    the inert-mechanism failure class DESIGN §9 exists to prevent, so this
+    raises early with a message naming the parameter rather than throwing an
+    incidental `AttributeError` further down (cf.
+    `tests/test_phase_planning_coverage_gate.py::TestProgrammingErrorsPropagate`:
+    a programming error must not be reported as an advisory degrade).
+    """
+    if not isinstance(subtask, dict):
+        raise TypeError(
+            f"check_implementer_output: subtask must be a dict, got "
+            f"{type(subtask).__name__} — do NOT 'fix' this by defaulting to "
+            f"{{}}, which silently disables NO_PLANNED_FILES_TOUCHED")
     issues: list[str] = []
     planned = set(subtask.get("files_likely_touched", []) or [])
 
@@ -8034,7 +8129,129 @@ def check_implementer_output(
                     f"UNMET_CRITERION: claims complete but "
                     f"criterion {cr.get('criterion', '?')!r} "
                     "is not met")
+        issues.extend(check_production_evidence(result))
 
+    return issues
+
+
+def check_symptom_evidence(result: dict, sid: str) -> list[str]:
+    """DESIGN §9 *A stale finding is not a bug* — advisory, `bugfix-` only.
+
+    Run `fa979580`'s N18 subtask "fixed" a leak that #190 had already fixed
+    before the run began, and shipped an event-loop stall doing it. Nothing
+    asked whether the reported symptom still happened.
+
+    **Advisory, deliberately.** These strings are logged and recorded, never
+    fed to `check_implementer_output` — two differences from
+    `check_production_evidence`, each with a reason. A retry does not
+    surface a stale finding, it just asks the same worker again; and a
+    second *gating* evidence field would stack retry pressure on top of the
+    production-evidence gate, which is the cost this repo has already
+    measured once (`_confidence_schema`'s docstring).
+
+    Scoped by id prefix rather than by inspecting the task text, per
+    CLAUDE.md's *Language-to-JSON* rule — `_ID_PREFIXES` already makes the
+    prefix a structured fact.
+
+    Takes the **orchestrator's** `sid`, not the worker's echoed
+    `result["subtask_id"]`, which nothing in this module ever cross-checks
+    against the real id: a worker that echoed `feat-001` while working on
+    `bugfix-005` would otherwise slip past the prefix scope entirely. It
+    also takes the one string it needs rather than the whole subtask dict,
+    which removes a `None`-dereference by construction instead of guarding
+    it — and the guard would have been the wrong fix anyway, since
+    `subtask or {}` yields an empty sid, which fails the prefix test and
+    silently disables this check.
+
+    Plain "the tests fail on base" is NOT this and is worthless: measured on
+    that run, all four findings' new tests already failed on base (9 of 13
+    for one), because a new test against code that does not exist yet
+    trivially fails. The claim wanted here is behavioural.
+    """
+    # No `sid or ""` coercion, deliberately. `sid` is a required positional
+    # on the only call site, so a non-string is a contract violation — and
+    # swallowing it would return `[]`, silently disabling this check. That is
+    # the same shape as the `subtask or {}` this function's sibling refuses
+    # (see `check_implementer_output`), and it would be inconsistent to
+    # condemn it there and practise it here.
+    if not sid.startswith("bugfix-"):
+        return []
+
+    ev = result.get("symptom_evidence")
+    if not isinstance(ev, dict):
+        return ["NO_SYMPTOM_EVIDENCE: a bugfix subtask did not record whether "
+                "the reported symptom actually reproduces on the base tree — "
+                "a finding that no longer reproduces may already be fixed"]
+
+    reproduced = ev.get("reproduced")
+    if reproduced is False:
+        detail = str(ev.get("not_reproduced_reason") or "").strip()
+        return ["SYMPTOM_DID_NOT_REPRODUCE: the reported symptom could not be "
+                "reproduced on the base tree — the finding may already be "
+                "fixed, and this subtask may be re-fixing it"
+                + (f": {detail}" if detail else "")]
+    if reproduced is not True:
+        return [f"MALFORMED_SYMPTOM_EVIDENCE: `reproduced` must be a boolean, "
+                f"got {type(reproduced).__name__}"]
+    return []
+
+
+def check_production_evidence(result: dict) -> list[str]:
+    """DESIGN §9 *Evidence must be production-grounded*.
+
+    Every other check here asks whether the code matches its specification.
+    This one asks whether the worker ever ran the path it wrote against the
+    repo as it actually is. On run `fa979580` a heap resolver ticked every
+    criterion against a `.leerie/config.toml` fixture — a shape 0 of the 5
+    managed repos use — and returned `None` on both repos that motivated
+    the finding. Nothing in the run could see that.
+
+    Pure JSON→verdict set logic over already-structured fields (no prose is
+    read), per CLAUDE.md's *Language-to-JSON* rule.
+
+    Gates on ABSENCE deliberately (DESIGN §8 *Findings carry a severity* —
+    the default is gating): the field is optional in the schema so that a
+    worker omitting it loses one judgment rather than the whole payload,
+    which is what requiring it would cost (`_confidence_schema`'s docstring
+    records the measured 40.9%-valid outcome of that mistake). Gating on
+    absence is what keeps optional from meaning ignorable.
+
+    Not a proof of correctness — a fixture can be right and a real repo
+    still take another branch. It converts "I could not make this fire
+    here" from silence into a recorded, reviewable outcome.
+    """
+    issues: list[str] = []
+    ev = result.get("production_evidence")
+
+    if not isinstance(ev, dict):
+        return ["NO_PRODUCTION_EVIDENCE: the result does not record whether "
+                "the new code path was ever exercised against real repo "
+                "state — run it and report `production_evidence`"]
+
+    exercised = ev.get("exercised")
+    if exercised is True:
+        # `how`/`observed` are optional in the schema (decoder-safety), but
+        # an exercised claim with neither is indistinguishable from the bare
+        # assertion this check exists to replace.
+        if not str(ev.get("how") or "").strip() and \
+                not str(ev.get("observed") or "").strip():
+            issues.append(
+                "UNSUPPORTED_PRODUCTION_EVIDENCE: exercised=true but neither "
+                "`how` nor `observed` is recorded — name the command you ran "
+                "and what it returned")
+        return issues
+
+    if exercised is False:
+        if not str(ev.get("unexercisable_reason") or "").strip():
+            issues.append(
+                "UNEXERCISED_PRODUCTION_PATH: the new code path was not run "
+                "against real repo state and no `unexercisable_reason` is "
+                "given — either exercise it or say why it cannot be")
+        return issues
+
+    issues.append(
+        f"MALFORMED_PRODUCTION_EVIDENCE: `exercised` must be a boolean, "
+        f"got {type(exercised).__name__}")
     return issues
 
 
@@ -26071,6 +26288,17 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"malformed result: {err}")
             break
 
+        # DESIGN §9 *Evidence must be production-grounded*. The whole-tree
+        # pass is the LAST gate before a run is declared done, and it is the
+        # one conformer with the broadest view — on run fa979580 it certified
+        # four inert fixes with `solution_defects: []` at confidence 8.5.
+        # Advisory here for the same reason as the per-subtask call site:
+        # `solution_defects` is deliberately the only gating conformer axis,
+        # and this phase must not acquire a second way to stop a run.
+        warnings.extend(
+            f"final conformer round {c_round}: {w}"
+            for w in check_production_evidence(res))
+
         # Protected-path rollback: same discipline as the per-subtask
         # loop, but using `_protected_paths_since(before_sha)` instead
         # of `check_diff_scope` — the latter is hardcoded to diff
@@ -26425,6 +26653,29 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.save()
                 continue
 
+        # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
+        # result and in the log, never routed into `check_implementer_output`
+        # — a retry cannot make a stale finding un-stale, and a second gating
+        # evidence field would stack retry pressure on the production-evidence
+        # gate. Runs only on the success path: a blocked subtask has no claim
+        # to substantiate.
+        if status == "complete":
+            _sym_findings = check_symptom_evidence(res, sid)
+            for _sym in _sym_findings:
+                log(f"  {sid}: {_sym}")
+                res.setdefault("symptom_warnings", []).append(_sym)
+            # Persisted, not just logged. `phase_execute` keeps results in
+            # memory and writes only `blocked` reasons out of them, so a
+            # result-only record dies with the process — while "this bugfix
+            # may be re-fixing something already fixed" is exactly what an
+            # operator wants in the run record rather than by grepping a
+            # 600 KB log. Same argument, and the same shape, as
+            # `unreviewed_subtasks` above.
+            if _sym_findings:
+                st.data.setdefault("symptom_findings", {})[sid] = _sym_findings
+            else:
+                st.data.get("symptom_findings", {}).pop(sid, None)
+
         st.data.setdefault("subtask_status", {})[sid] = status
         if status == "complete":
             # A prior failed attempt may have written this sid into the
@@ -26481,6 +26732,14 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                         "result": None,
                         "warnings": ["settled complete via mid-run satisfied "
                                      "rescue; no diff to conform"],
+                        # Deliberately NOT added to `unreviewed_subtasks`.
+                        # `reviewed: False` is literally true — no conformer
+                        # ran — but this is a review that was never *needed*
+                        # (zero commits, no diff to attack), not one that was
+                        # attempted and died. Conflating the two would put a
+                        # correctly-skipped subtask in the operator-facing
+                        # warning and train them to ignore it.
+                        "reviewed": False,
                     }
                     st.save()
                     return {"subtask_id": sid, "status": "complete",
@@ -26567,6 +26826,15 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     "surfaced as advisory, subtask still complete")
             if conf_res is not None:
                 res["conformance"] = conf_res
+                # DESIGN §9 *Evidence must be production-grounded*. The
+                # conformer's evidence is a genuinely independent second
+                # observation — it attacks a diff it did not write — so it
+                # is worth asking for. ADVISORY, unlike the implementer's:
+                # `solution_defects` is deliberately the ONE gating conformer
+                # axis (below), and turning this phase into a second blocking
+                # gate would trade a measured 3.3% defect yield for a new way
+                # for an advisory phase to stop a run.
+                conf_warnings.extend(check_production_evidence(conf_res))
             if conf_warnings:
                 res["conformance_warnings"] = conf_warnings
                 for w in conf_warnings:
@@ -26574,7 +26842,34 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             st.data.setdefault("conformance", {})[sid] = {
                 "result": conf_res,
                 "warnings": conf_warnings,
+                # DESIGN §9: a conformer that never produced a result did
+                # not review this subtask. Without this flag that outcome is
+                # indistinguishable in `subtask_status` from a clean pass —
+                # measured across every run on one host, 170 of 680 conformer
+                # attempts (25%) produce no result, and run fa979580 shipped
+                # two such subtasks as `complete`. Recorded rather than
+                # promoted to a blocking status because the phase is advisory
+                # by design (DESIGN §9) and the measured yield when it DOES
+                # run is 3.3% (17 of 510) — so an unreviewed subtask is
+                # usually fine. What it must not be is invisible.
+                "reviewed": conf_res is not None,
             }
+            # Symmetric on purpose. `_settle_subtask` is a `while True:`
+            # loop and this block can run more than once for one sid (the
+            # completeness gate sets `continuation = True` and re-drives),
+            # so an append-only record would keep reporting a subtask a
+            # later round DID review. Tracing today's control flow that
+            # ordering looks unreachable — a crashed conformer yields no
+            # `solution_defects`, so nothing re-drives after it — but the
+            # invariant is one line to hold unconditionally, and a
+            # reachability argument rots the moment someone adds another
+            # continuation source.
+            unreviewed = st.data.setdefault("unreviewed_subtasks", [])
+            if conf_res is None:
+                if sid not in unreviewed:
+                    unreviewed.append(sid)
+            elif sid in unreviewed:
+                unreviewed.remove(sid)
             st.save()
 
             # DESIGN §9 *The one gating axis: solution completeness*. The
@@ -27896,6 +28191,26 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations.{pr_suffix} Work is on "
         f"{_compute_run_branch(st.run_id)}; working branch unchanged.")
+    # DESIGN §9: an unreviewed subtask is one whose conformer never
+    # produced a result. It is still `complete` — the phase is advisory —
+    # but the operator should not have to read the log to find out that a
+    # quarter of the review phase silently did nothing.
+    unreviewed = st.data.get("unreviewed_subtasks") or []
+    if unreviewed:
+        log(f"note — {len(unreviewed)} of {nsub} subtasks completed WITHOUT "
+            f"a conformance review (worker crashed or timed out): "
+            f"{', '.join(sorted(unreviewed))}")
+    # DESIGN §9 *A stale finding is not a bug*. Only the actionable finding is
+    # surfaced here: `NO_SYMPTOM_EVIDENCE` is worker hygiene and would fire on
+    # most runs until the field is adopted, and a summary line that fires
+    # every run is how a warning stops being read.
+    _stale = sorted(
+        sid for sid, findings in (st.data.get("symptom_findings") or {}).items()
+        if any(f.startswith("SYMPTOM_DID_NOT_REPRODUCE") for f in findings))
+    if _stale:
+        log(f"note — {len(_stale)} bugfix subtask(s) could not reproduce the "
+            f"symptom they were written to fix, so the finding may already "
+            f"have been fixed: {', '.join(_stale)}")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
             f"${tel.get('cost_usd', 0.0):,.2f}, "

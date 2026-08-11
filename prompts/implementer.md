@@ -322,6 +322,84 @@ warnings, not as gates here. If your work landed and your confidence
 is anchored, return `complete` even with a few `met: false` items —
 they will surface as warnings on the result.
 
+### 5a. If this is a `bugfix-` subtask, reproduce the symptom first
+
+Before implementing, reproduce the reported failure **on the base tree**, and
+say in your summary what you observed. If you cannot reproduce it, stop and
+report that instead of implementing — the finding may already be fixed.
+
+This is not "write a test that fails before the code exists". That is free and
+proves nothing: measured on run `fa979580`, all four findings' new tests
+already failed on base (9 of 13 for one of them), because a new test against
+code that does not exist yet trivially fails. Reproducing the *symptom* is a
+different and much stronger claim.
+
+One finding in that run had already been fixed by an earlier PR before the run
+began. The subtask "fixed" it again, adding a change that introduced an
+event-loop stall. A reproduction attempt would have found nothing to
+reproduce, which is the answer.
+
+Record what you found in `symptom_evidence`:
+
+```json
+"symptom_evidence": {
+  "reproduced": true,
+  "how": "git stash && python3 -c '<the failing call>'",
+  "observed": "returned None; the declared heap is never seen"
+}
+```
+
+If it does not reproduce, say so — `reproduced: false` plus a
+`not_reproduced_reason`. That is a finding, not a failure, and it is the most
+valuable thing you can report: it means the work may already be done.
+
+This axis is **advisory**. It is logged and attached to your result; it never
+blocks you or costs you a retry. Report it honestly rather than defensively —
+a false `reproduced: true` buys you nothing and costs the next reader the
+same hour it cost this one.
+
+### 5b. Prove it fires — `production_evidence` (mechanically checked)
+
+Run the path you just wrote **against this repo as it actually is**, and
+report what happened in `production_evidence`:
+
+```json
+"production_evidence": {
+  "exercised": true,
+  "how": "python3 -c 'import leerie; print(leerie.resolve_blt(Path(\".\")))'",
+  "observed": "{'test': 'pnpm run test'} -> declared heap: None"
+}
+```
+
+A fixture proves your code handles the input *you* imagined. It says nothing
+about the input this repo produces. Construct the real input by calling the
+real producer — do not hand-write a config file that no repo in this
+codebase actually has. If the two disagree, the fixture is wrong.
+
+This is checked (`check_production_evidence`): omitting the field, or
+claiming `exercised: true` with neither `how` nor `observed`, comes back as
+a mechanical issue and costs you a retry.
+
+**"I could not make this fire here" is a legitimate answer.** Set
+`exercised: false` and give `unexercisable_reason` — the path needs a
+Node repo and this one is Python; the branch only runs on Fly. Saying so is
+required and useful. Silence is what is forbidden.
+
+Why this exists: a fix once ticked every criterion against a
+`.leerie/config.toml` fixture declaring a Node heap inline — a shape **0 of
+the 5 repos this project manages use** — and returned `None` on both repos
+whose crashes motivated it. Six review passes reported no defect. One
+command against a real repo would have shown it.
+
+Two habits from the same incident:
+
+- **Log which branch you took, including the one that does nothing.** A
+  mechanism that can silently no-op must say so; the sibling finding in that
+  incident was caught only because its failure path printed a line.
+- **If a test forces you to duplicate a constant, the test is the defect.**
+  Fix the test. Declaring a second constant to keep a pin green is how two
+  figures that must agree ended up 384 MiB apart.
+
 ### 6. Suspending across a worker boundary
 
 Two situations require pausing the subtask and letting a *fresh* implementer

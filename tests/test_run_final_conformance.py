@@ -113,6 +113,16 @@ def _clean_result(**overrides):
         "tests": {"ran": False, "passed": False, "command": "(none)",
                   "summary": ""},
         "summary": "nothing to do",
+        # DESIGN §9 *Evidence must be production-grounded*: the whole-tree
+        # pass runs `check_production_evidence` on its result, so a
+        # well-formed conformer result now carries this. Without it the
+        # "clean" result below is not clean — it warns, which is the
+        # behaviour `test_clean_result_without_evidence_warns` pins.
+        "production_evidence": {
+            "exercised": True,
+            "how": "pytest -q",
+            "observed": "6252 passed",
+        },
     }
     base.update(overrides)
     return base
@@ -206,6 +216,35 @@ def test_clean_result_writes_final_block(env):
     assert block["result"] is not None
     assert block["result"]["subtask_id"] == "_final"
     assert block["warnings"] == []
+
+
+def test_clean_result_without_evidence_warns(env):
+    """Anti-vacuity partner to the test above, and the only BEHAVIOURAL
+    coverage of the final pass's production-evidence check.
+
+    Adding `production_evidence` to `_clean_result()` fixes CI; on its own it
+    would merely silence the signal. Stripping the field from an otherwise
+    identical result must produce the warning — that is what proves the
+    fixture change reflects the check rather than hiding it.
+
+    The whole-tree pass is where this matters most: on run `fa979580` it
+    certified four inert fixes with `solution_defects: []` at confidence 8.5.
+    Until now it was pinned only by source inspection
+    (`test_final_conformance_checks_production_evidence`).
+    """
+    c = env["leerie"]
+    result = _clean_result()
+    del result["production_evidence"]
+    _stub_claude_p(c, [result])
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    warnings = env["st"].data["conformance"]["_final"]["warnings"]
+    assert any("NO_PRODUCTION_EVIDENCE" in w for w in warnings), warnings
+    # Advisory, not blocking: the result is still recorded.
+    assert env["st"].data["conformance"]["_final"]["result"] is not None
 
 
 # --- malformed output: surfaced as warning, loop breaks -------------------

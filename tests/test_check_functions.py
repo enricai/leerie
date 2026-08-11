@@ -689,12 +689,35 @@ class TestCheckOverlapJudgeOutput:
 # --- check_implementer_output ------------------------------------------ #
 
 class TestCheckImplementerOutput:
+    # A `complete` result is no longer clean without production_evidence
+    # (DESIGN §9 *Evidence must be production-grounded*), so the two
+    # expects-empty tests below carry it. That is the contract change, not
+    # test noise: an implementer that never ran its own new path against
+    # real repo state is exactly what run fa979580 shipped four times.
+    # check_production_evidence's own branches are covered in
+    # tests/test_production_evidence.py.
+    _EVIDENCE = {"exercised": True, "how": "pytest -k foo",
+                 "observed": "2 passed"}
+
     def test_clean(self, leerie):
-        result = {"status": "complete", "criteria_results": [
-            {"criterion": "test passes", "met": True}]}
+        result = {"status": "complete",
+                  "criteria_results": [
+                      {"criterion": "test passes", "met": True}],
+                  "production_evidence": self._EVIDENCE}
         subtask = {"files_likely_touched": ["src/foo.ts"]}
         assert leerie.check_implementer_output(
             result, subtask, {"src/foo.ts"}) == []
+
+    def test_clean_result_without_evidence_is_gated(self, leerie):
+        """Anti-vacuity partner to `test_clean`: strip only the evidence
+        from an otherwise-clean result and the gate must fire, or the
+        addition above is decorative."""
+        result = {"status": "complete", "criteria_results": [
+            {"criterion": "test passes", "met": True}]}
+        subtask = {"files_likely_touched": ["src/foo.ts"]}
+        issues = leerie.check_implementer_output(
+            result, subtask, {"src/foo.ts"})
+        assert any("NO_PRODUCTION_EVIDENCE" in i for i in issues)
 
     def test_no_planned_files_touched(self, leerie):
         result = {"status": "complete"}
@@ -711,8 +734,33 @@ class TestCheckImplementerOutput:
             result, subtask, set())
         assert any("UNMET_CRITERION" in i for i in issues)
 
+    def test_non_dict_subtask_raises_rather_than_silently_passing(self, leerie):
+        """The valuable half of this hardening — and it guards a FIX, not a bug.
+
+        The function already fails loudly on a non-dict `subtask`. The hazard
+        is the tempting "fix": `subtask = subtask or {}`. Measured, an empty
+        dict yields an empty `planned`, so `NO_PLANNED_FILES_TOUCHED` can
+        never fire — a caller's mistake would silently disable a check
+        instead of announcing itself, which is the inert-mechanism class
+        DESIGN §9 exists to prevent. This test fails against that change and
+        passes against the raise, which is the only reason it is here.
+        """
+        for bad in (None, "feat-001", ["feat-001"], 3):
+            with pytest.raises(TypeError, match="must be a dict"):
+                leerie.check_implementer_output(
+                    {"status": "complete"}, bad, {"src/foo.ts"})
+
+    def test_empty_subtask_dict_is_accepted_and_silent(self, leerie):
+        """Anti-vacuity partner: `{}` is a LEGITIMATE input (a subtask spec
+        file that does not exist yet), so the guard must reject non-dicts
+        without rejecting the empty dict the real call site can produce."""
+        assert leerie.check_implementer_output(
+            {"status": "complete",
+             "production_evidence": self._EVIDENCE}, {}, {"src/foo.ts"}) == []
+
     def test_no_criteria_is_ok(self, leerie):
-        result = {"status": "complete"}
+        result = {"status": "complete",
+                  "production_evidence": self._EVIDENCE}
         assert leerie.check_implementer_output(
             result, {}, {"src/foo.ts"}) == []
 

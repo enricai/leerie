@@ -895,6 +895,75 @@ whose one non-obvious test is the partial-caps case: every other test supplies
 that omits it (`run_recapture_deps`, `run_rebaser`, `_replay_capture` each
 build their own minimal caps) AND only on the branch that runs when the
 warning fires.
+The **production-grounded evidence gate** (DESIGN §9 — every other gate asks
+whether the code matches its specification, none asks whether the
+specification matches reality) is covered by `tests/test_production_evidence.py`
+and `tests/test_unreviewed_subtasks.py`. Three traps are not obvious from the
+test names. **(1) The field is optional in the schema and gating in the
+check, and that is ONE decision, not two.** Requiring it costs the entire
+submission rather than the one field — `_confidence_schema`'s docstring
+records that measured at 40.9% valid on `plan_overlap_judge`, with 84 of its
+85 failures being a single required field — while gating on absence is what
+stops "optional" from meaning "ignorable". `test_schema_field_is_optional_at_the_top_level`
+and `test_absent_evidence_gates` are anti-vacuity partners: remove either and
+the field becomes decorative. The object is also flat with one required inner
+bool for the same decoder-corruption reason (anthropics/claude-code#49747).
+**(2) The conformer's copy must be READ, not merely declared.** It shipped
+once as a dead field — on both schemas, with exactly one call site and no
+mention in `conformer.md` — while DESIGN and IMPLEMENTATION both described it
+as consumed. It is wired **advisory** (extends `conf_warnings`, never
+`blocked_reason`), because `solution_defects` is deliberately the one gating
+conformer axis and an advisory phase must not gain a new way to stop a run;
+`test_conformer_side_is_advisory_not_gating` pins the distinction by
+inspecting the statement, not just the call. **(3) Source scans here strip
+comments first.** Both `conformance[sid] = {...}` write sites carry comments
+naming `unreviewed_subtasks` while explaining why one of them must not touch
+it, so a raw substring scan matches the prose describing what it forbids and
+fails on correct code — the same trap the zombie-reaper guard documents. The
+helper also bounds each site at its closing `st.save()` rather than by a
+character count: a fixed window was tried twice and truncated mid-statement
+both times, reporting a key as missing when it was merely past the cutoff.
+Note the two write sites mean different things — the mid-run satisfied-rescue
+sentinel sets `reviewed: False` but is deliberately excluded from
+`unreviewed_subtasks`, since a zero-commit subtask has no diff to review and
+folding it into the operator warning is how a warning becomes noise.
+`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the
+`bugfix-`-only sibling that asks whether the reported symptom still reproduces
+on the base tree — run fa979580's N18 subtask re-fixed a leak an earlier PR had
+already fixed, shipping an event-loop stall on the way. Three traps. **(1) It is
+advisory and must stay that way**: the output never reaches
+`check_implementer_output`, because those issues drive
+`implementer_confidence_retries` and a retry cannot make a stale finding
+un-stale — it asks the same worker the same question — while a second *gating*
+evidence field would stack retry pressure on the production-evidence gate.
+`test_not_wired_into_the_gating_check` is the pin, and making it gating fails
+exactly that test. Advisory does NOT mean ephemeral: the findings are also
+persisted to `symptom_findings` in `state.json` (results are in-memory only —
+`phase_execute` writes just `blocked` reasons out of them), cleared for a sid
+whose later attempt reports cleanly so a re-driven subtask carries no stale
+entry, and surfaced by `phase_finalize` for the `SYMPTOM_DID_NOT_REPRODUCE`
+case ONLY — `NO_SYMPTOM_EVIDENCE` is worker hygiene and a summary line that
+fires every run is how a warning stops being read. **(2) "The new tests fail on base" is NOT this and is
+worthless** — measured on that run all four findings' tests already failed on
+base (9 of 13 for one), because a new test against absent code trivially fails;
+the field therefore asks for a command and an observation, not a bare boolean.
+**(3) Scoped by id prefix**, not by reading the task text (*Language-to-JSON*),
+so it is silent on the feature/test/docs subtasks that have no prior symptom.
+The prefix comes from the ORCHESTRATOR's `sid`, never from the worker's
+echoed `result["subtask_id"]` — nothing in the module cross-checks that
+echo, so a worker reporting `feat-001` while working on `bugfix-005` would
+slip the scope entirely. Taking the sid string rather than the subtask dict
+also removes a `None`-dereference by construction, and neither this check
+nor `check_implementer_output` coerces a bad argument (`sid or ""`,
+`subtask or {}`): both shapes swallow a contract violation and leave the
+check silently disabled — measured, an empty subtask dict makes
+`NO_PLANNED_FILES_TOUCHED` unable to fire — so both raise instead, each
+pinned by its own non-coercion test.
+The same change wired `check_production_evidence` into `_run_final_conformance`
+— #197 wired the per-subtask site and missed the whole-tree pass, which is the
+last gate before a run is declared done and the one that certified four inert
+fixes at confidence 8.5. It runs after `_validate_conformance_result` so a
+shape-rejected payload is not also reported as missing a field.
 Memory-OOM naming
 (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending

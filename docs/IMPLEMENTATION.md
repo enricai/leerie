@@ -5201,9 +5201,72 @@ resolved from the issue code per the table above, not from the check function.
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` | `judgment_check_rounds` (3) |
 | Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (3) |
-| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION` | `implementer_confidence_retries` (2) |
+| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
 | Integrator | `check_integrator_output(result)` | — | `judgment_check_rounds` (3) |
 | Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
+
+`check_production_evidence(result) -> list[str]` (DESIGN §9 *Evidence must be
+production-grounded*) reads the `production_evidence` object that
+`_production_evidence_schema()` puts on the **implementer** and **conformer**
+schemas, and emits `NO_PRODUCTION_EVIDENCE` (field absent or not an object),
+`UNSUPPORTED_PRODUCTION_EVIDENCE` (`exercised: true` with neither `how` nor
+`observed`), `UNEXERCISED_PRODUCTION_PATH` (`exercised: false` with no
+`unexercisable_reason`), or `MALFORMED_PRODUCTION_EVIDENCE` (`exercised` not a
+bool). It has **two call sites with deliberately different severities**. From
+`check_implementer_output`, on the `status == "complete"` branch only (a
+blocked implementer has no finished path to exercise), it routes through the
+existing bounded `implementer_confidence_retries` retry and so never blocks a
+run permanently. From `_settle_subtask`'s conformance block it is **advisory**
+— the output extends `conf_warnings`, never `blocked_reason` — because
+`solution_defects` is deliberately the one gating conformer axis (DESIGN §9)
+and an advisory phase must not acquire a second way to stop a run. The
+conformer's copy is the more independent observation of the two (it attacks a
+diff it did not write), which is why it is asked for at all; it is read only
+when `conf_res is not None`, since a crashed conformer has no result to
+inspect and would otherwise draw a spurious `NO_PRODUCTION_EVIDENCE` on top of
+the crash warning that already explains it.
+
+It has **three** call sites. Two are described above; the third is
+`_run_final_conformance`, the whole-tree pass, where it is likewise advisory
+(extends that phase's `warnings`) and runs **after**
+`_validate_conformance_result` — checking a payload already rejected for a
+shape error would report a missing field as a second, misleading defect. That
+site matters disproportionately: it is the last gate before a run is declared
+done, and on run `fa979580` it certified four inert fixes with
+`solution_defects: []` at confidence 8.5.
+
+`check_symptom_evidence(result, sid) -> list[str]` (DESIGN §9 *A stale
+finding is not a bug*) is its sibling for `bugfix-` subtasks, reading a
+`symptom_evidence` object of the same flat shape on the **implementer** schema
+only — the conformer neither wrote the fix nor has a base tree to reproduce
+against. It emits `NO_SYMPTOM_EVIDENCE`, `SYMPTOM_DID_NOT_REPRODUCE` (the
+useful one — the finding may already be fixed) or
+`MALFORMED_SYMPTOM_EVIDENCE`. **Advisory, and deliberately asymmetric with the
+gate above**: the output is logged, attached to the result as `symptom_warnings`, **and
+persisted to `symptom_findings` in `state.json`** (results themselves are
+in-memory only, so a result-only record would die with the process); it is
+*never* routed into `check_implementer_output`,
+because a retry cannot make a stale finding un-stale and a second gating
+evidence field would stack retry pressure on the first. Scoped by id prefix
+rather than by reading task text (CLAUDE.md *Language-to-JSON*), and run only
+on the `status == "complete"` path. It takes the **orchestrator's** `sid`, not
+the worker's echoed `result["subtask_id"]` — nothing cross-checks that echo,
+so scoping on it would let a worker reporting the wrong id slip the prefix —
+and taking the one string it needs rather than the subtask dict removes a
+`None`-dereference by construction. Pinned by
+`tests/test_symptom_evidence.py`.
+
+Two shape decisions are load-bearing and must not be "tidied". The field is
+**optional in the schema and gating in the check**: requiring it would cost the
+entire submission on a miss rather than the one field (`_confidence_schema`'s
+docstring records the measured 40.9%-valid outcome of that mistake on
+`plan_overlap_judge`, where 84 of 85 failures were a single required field),
+while gating on absence is what stops optional from meaning ignorable. And the
+object is **flat with one required inner field, a bare bool** — the verbose
+`how`/`observed` strings are optional because
+anthropics/claude-code#49747's decoder corruption is triggered by many required
+parameters mixed with verbose strings. `tests/test_production_evidence.py`
+pins both.
 
 `PHANTOM_ARTIFACT` resolves a collision's `artifact` against the union of
 every subtask's `files_likely_touched` **as well as** the working tree, not
@@ -8292,6 +8355,8 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). Keys are subtask ids *or* the literal `_final` sentinel; values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. The `_final` entry holds the post-integration whole-tree conformer pass's output (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph); the leading-underscore convention guarantees no collision with subtask ids, which always start with a `<verb>-` prefix per `_ID_PREFIXES`. The per-subtask entries are populated only on subtasks whose implementer reached `status: "complete"`; the `_final` entry is populated whenever `_run_final_conformance` ran (skipped only when the staging worktree or `working_branch` is absent, or on `resume` after the pass already recorded a result). See DESIGN §9 *Post-work conformance* |
+| `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. Written beside the `conformance` entry, which also gains a `reviewed` bool. Recorded rather than promoted to a blocking status: the phase is advisory by design (DESIGN §9) and its measured yield when it does run is 3.3% (17 of 510 invocations across every run on one host), so an unreviewed subtask is usually fine — what it must not be is invisible. Measured 170 of 680 attempts (25%) produce no result; run `fa979580` shipped two such subtasks as `complete`. See DESIGN §9 *Post-work conformance* |
+| `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for `bugfix-` subtasks only (DESIGN §9 *A stale finding is not a bug*). Written on the success path beside `unreviewed_subtasks`, and cleared for a sid whose later attempt reports cleanly, so a re-driven subtask does not carry a stale entry. Persisted rather than left on the result because `phase_execute` keeps results in memory and writes only `blocked` reasons out of them — and `SYMPTOM_DID_NOT_REPRODUCE` ("this bugfix may be re-fixing something an earlier change already fixed") is precisely what belongs in the run record rather than in a 600 KB log. `phase_finalize` surfaces only that finding, not `NO_SYMPTOM_EVIDENCE`, which is worker hygiene and would fire on most runs until the field is adopted. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `_run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. Read by `_write_plan()` and persisted as the `preconditions` section of `plan.json`. Empty list when no planner declared any external requirement (the common case). |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. Two producers, distinguished by shape: `_filter_offtree_subtasks()` drops subtasks whose `files_likely_touched` resolved outside the run's repo root (value `{reasons: [str], files: [str]}`); `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) drops subtasks the `satisfied_probe` judged already met on the base tree (value `{reason: "already_satisfied", evidence: str, checked: [str]}`); and the post-execution no-commits re-probe in `_settle_subtask` records a subtask whose criteria are already met on the run-branch HEAD (value `{reason: "already_satisfied_mid_run", evidence: str, checked: [str]}` — same shape, judged against the run-branch HEAD instead of the base tree; DESIGN §8 *The mid-run sibling case*). The `mid_run` label names the moment the rescue fires (post-execution, this run), not the provenance: it covers both a sibling committing the deliverable this run and a subtask already satisfied on the base tree (DESIGN §8 *Scope*). Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
