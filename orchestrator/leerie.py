@@ -14130,6 +14130,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # broker calls synchronous still fails (the blocked loop never schedules
     # it); making the broker calls async but creating the task afterwards
     # also still fails (the write lands after the child is already gone).
+    #
+    # This task is created OUTSIDE the try/finally below, so an exception
+    # before the gather would leave it pending with stdin unclosed. Accepted
+    # rather than guarded: everything between here and that try is either a
+    # plain assignment or a call whose helper swallows OSError itself
+    # (`_cgroup_create` / `_cgroup_enroll`), and `_DescendantTracker.start`
+    # is a bare `create_task`. More to the point, `proc` is spawned outside
+    # that try too — so any exception in this window already leaks a live
+    # worker process, which is strictly worse than a pending feeder and is
+    # the pre-existing shape this does not change.
     feeder = asyncio.create_task(_feed_stdin())
     # cgroup containment: ask the cgroup broker to create the worker cgroup
     # and enroll the worker (and every descendant it forks — the kernel
