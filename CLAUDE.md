@@ -2106,6 +2106,36 @@ single pipe buffer and the single-argv ceiling this fix routes around.
 were updated in the same change to assert against `stdin_data` instead of
 an argv element, since both stub `_invoke` to inspect what `claude_p`
 constructs.
+Routing the prompt over stdin then created a **deadline** the argv form
+never had, and `tests/test_stdin_feeder_ordering.py` guards it. `claude -p`
+waits a hard-coded 3 s for its first stdin byte (`KJr(process.stdin, 3000)`
+in the CLI bundle — no env var), then drops its own `data` listener, so a
+late write is DISCARDED and the worker exits 1 on `Input must be provided`.
+leerie made two SYNCHRONOUS broker round-trips between the spawn and the
+first write, each bounded by `_cgroup_request`'s 5 s timeout — an accepted
+stall larger than the deadline in front of it, i.e. the failure was
+permitted by construction, while the comment at that site called the stall
+"negligible". Measured across every run on one host: **218 workers lost,
+12.4% of all invocations in the affected runs**, retried up to 4x each with
+every attempt charged to `max_total_workers`, spanning v0.9.95–v0.16.0.
+`_cgroup_enroll`'s docstring had already recorded the pair in a different
+run as "two apparently-unconnected events" — they are one event.
+**Both halves of the fix are load-bearing**, which is what the file mostly
+exists to pin: a reproduction harness scored all four combinations and only
+`create_task` at the spawn AND `to_thread` on both broker calls delivers the
+prompt — hoisting alone fails because the blocked loop never schedules the
+task, and `to_thread` alone fails because the write lands after the child is
+already gone. A future edit keeping one and dropping the other silently
+reopens a 12% budget leak, so `test_only_both_halves_deliver_the_prompt_in_time`
+drives all four combinations behaviourally rather than trusting the source
+order. Two harness traps here, both hit on the first draft and both the
+comment-matching class this file documents elsewhere: the region is dense
+with comments that necessarily name `_feed_stdin`, `await` and
+`_cgroup_enroll` while explaining the ordering, so `_invoke_src` strips
+comments via `tokenize` (not a `#` heuristic — a `#` inside a string
+literal would corrupt the result); and `async def _feed_stdin():` contains
+`_feed_stdin()` as a substring, so a bare `.count()` reports two calls for
+correct code and the call-site scan has to exclude the definition.
 The appended system prompt (docs/IMPLEMENTATION.md §3 "Appended system
 prompt transport — file, with a probe + inline fallback" — the second
 large argv element that compounds with the user prompt toward the same
