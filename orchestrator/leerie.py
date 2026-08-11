@@ -8168,7 +8168,13 @@ def check_symptom_evidence(result: dict, sid: str) -> list[str]:
     for one), because a new test against code that does not exist yet
     trivially fails. The claim wanted here is behavioural.
     """
-    if not str(sid or "").startswith("bugfix-"):
+    # No `sid or ""` coercion, deliberately. `sid` is a required positional
+    # on the only call site, so a non-string is a contract violation — and
+    # swallowing it would return `[]`, silently disabling this check. That is
+    # the same shape as the `subtask or {}` this function's sibling refuses
+    # (see `check_implementer_output`), and it would be inconsistent to
+    # condemn it there and practise it here.
+    if not sid.startswith("bugfix-"):
         return []
 
     ev = result.get("symptom_evidence")

@@ -949,6 +949,16 @@ base (9 of 13 for one), because a new test against absent code trivially fails;
 the field therefore asks for a command and an observation, not a bare boolean.
 **(3) Scoped by id prefix**, not by reading the task text (*Language-to-JSON*),
 so it is silent on the feature/test/docs subtasks that have no prior symptom.
+The prefix comes from the ORCHESTRATOR's `sid`, never from the worker's
+echoed `result["subtask_id"]` — nothing in the module cross-checks that
+echo, so a worker reporting `feat-001` while working on `bugfix-005` would
+slip the scope entirely. Taking the sid string rather than the subtask dict
+also removes a `None`-dereference by construction, and neither this check
+nor `check_implementer_output` coerces a bad argument (`sid or ""`,
+`subtask or {}`): both shapes swallow a contract violation and leave the
+check silently disabled — measured, an empty subtask dict makes
+`NO_PLANNED_FILES_TOUCHED` unable to fire — so both raise instead, each
+pinned by its own non-coercion test.
 The same change wired `check_production_evidence` into `_run_final_conformance`
 — #197 wired the per-subtask site and missed the whole-tree pass, which is the
 last gate before a run is declared done and the one that certified four inert

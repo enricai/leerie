@@ -57,6 +57,30 @@ def test_scoping_uses_the_orchestrators_sid_not_the_workers_echo(leerie):
         {"subtask_id": "bugfix-005"}, "feat-001") == []
 
 
+@pytest.mark.parametrize("bad", [None, 3, ["bugfix-001"], {"id": "bugfix-001"}])
+def test_non_string_sid_raises_rather_than_silently_passing(leerie, bad):
+    """The sibling rule, applied to this function's own parameter.
+
+    `check_implementer_output` refuses `subtask or {}` because an empty dict
+    makes `NO_PLANNED_FILES_TOUCHED` unable to fire. `str(sid or "")` here
+    was the identical shape: a non-string `sid` produced `""`, which fails
+    the `bugfix-` prefix, so the check returned `[]` and silently disabled
+    itself. Loud beats quiet for a contract violation, and the two sibling
+    checks should be pinned by the same rule rather than two different ones.
+    """
+    with pytest.raises((AttributeError, TypeError)):
+        leerie.check_symptom_evidence(
+            {"symptom_evidence": {"reproduced": False}}, bad)
+
+
+def test_empty_sid_is_accepted_and_silent(leerie):
+    """Anti-vacuity partner: `""` is a *string*, so it is not a contract
+    violation — it is simply not a bugfix id, and must return `[]` rather
+    than raise. The guard must reject non-strings without rejecting this."""
+    assert leerie.check_symptom_evidence(
+        {"symptom_evidence": {"reproduced": False}}, "") == []
+
+
 # ---- the four outcomes ----------------------------------------------------
 
 def test_absent_evidence_is_flagged(leerie):
