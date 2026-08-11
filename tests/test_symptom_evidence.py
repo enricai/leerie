@@ -161,3 +161,89 @@ def test_prompt_asks_for_the_field(leerie):
          / "prompts" / "implementer.md").read_text()
     assert "symptom_evidence" in p
     assert "not_reproduced_reason" in p
+
+
+# ---- persistence + surfacing ---------------------------------------------
+
+def test_findings_are_persisted_not_just_logged(leerie):
+    """`phase_execute` keeps results in memory and writes only `blocked`
+    reasons out of them, so a result-only record dies with the process —
+    while "this bugfix may be re-fixing something already fixed" is exactly
+    what belongs in the run record. Same argument, and same shape, as
+    `unreviewed_subtasks`."""
+    src = inspect.getsource(leerie)
+    i = src.index("check_symptom_evidence(res, subtask)")
+    window = src[i:i + 1200]
+    assert 'st.data.setdefault("symptom_findings", {})[sid]' in window
+
+
+def test_state_key_is_declared_and_adjacent(leerie):
+    """`STATE_FIELDS` is checked against the IMPLEMENTATION.md §8 table in
+    both directions by `test_state_fields.py`; adjacency to
+    `unreviewed_subtasks` keeps the two operator-facing signals together."""
+    fields = list(leerie.STATE_FIELDS)
+    assert "symptom_findings" in fields
+    assert abs(fields.index("symptom_findings")
+               - fields.index("unreviewed_subtasks")) == 1
+
+
+def test_a_clean_later_attempt_clears_a_stale_entry(leerie):
+    """`_settle_subtask` is a `while True:` loop and the completeness gate
+    re-drives, so an append-only record would keep reporting a finding a
+    later attempt no longer makes — the same staleness bug already fixed
+    once for `unreviewed_subtasks`."""
+    src = inspect.getsource(leerie)
+    i = src.index("check_symptom_evidence(res, subtask)")
+    window = src[i:i + 1200]
+    assert 'st.data.get("symptom_findings", {}).pop(sid, None)' in window
+
+
+def _code_only(src: str) -> str:
+    """`src` with comments removed.
+
+    Required for the negative assertion below, and for the reason this
+    repo documents repeatedly: the code comment there *names*
+    `NO_SYMPTOM_EVIDENCE` while explaining why it is excluded, so a raw
+    substring scan matches the prose describing the thing it forbids and
+    fails on correct code. `tokenize` rather than a `#` heuristic, so a
+    `#` inside a string literal cannot corrupt the result.
+    """
+    import io
+    import tokenize
+    out, last_line, last_col = [], 1, 0
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.start[0] > last_line:
+            out.append("\n" * (tok.start[0] - last_line))
+            last_col = 0
+        if tok.type == tokenize.COMMENT:
+            last_line, last_col = tok.end
+            continue
+        if tok.start[1] > last_col:
+            out.append(" " * (tok.start[1] - last_col))
+        out.append(tok.string)
+        last_line, last_col = tok.end
+    return "".join(out)
+
+
+def test_summary_surfaces_only_the_actionable_finding(leerie):
+    """`NO_SYMPTOM_EVIDENCE` is worker hygiene and would fire on most runs
+    until the field is adopted. A summary line that fires every run is how a
+    warning stops being read — the failure mode the satisfied-rescue
+    sentinel is deliberately excluded from `unreviewed_subtasks` to avoid."""
+    src = _code_only(inspect.getsource(leerie.phase_finalize))
+    assert "symptom_findings" in src
+    assert "SYMPTOM_DID_NOT_REPRODUCE" in src
+    assert "NO_SYMPTOM_EVIDENCE" not in src
+
+
+def test_state_round_trips(leerie, tmp_path):
+    root = tmp_path / ".leerie"
+    (root / "runs" / "r1").mkdir(parents=True)
+    st = leerie.State(root, "r1")
+    st.data = {"task": "t", "worker_count": 0,
+               "symptom_findings": {"bugfix-005": ["SYMPTOM_DID_NOT_REPRODUCE: x"]}}
+    st.save()
+    import json
+    on_disk = json.loads((root / "runs" / "r1" / "state.json").read_text())
+    assert on_disk["symptom_findings"]["bugfix-005"] == [
+        "SYMPTOM_DID_NOT_REPRODUCE: x"]

@@ -937,7 +937,13 @@ advisory and must stay that way**: the output never reaches
 un-stale — it asks the same worker the same question — while a second *gating*
 evidence field would stack retry pressure on the production-evidence gate.
 `test_not_wired_into_the_gating_check` is the pin, and making it gating fails
-exactly that test. **(2) "The new tests fail on base" is NOT this and is
+exactly that test. Advisory does NOT mean ephemeral: the findings are also
+persisted to `symptom_findings` in `state.json` (results are in-memory only —
+`phase_execute` writes just `blocked` reasons out of them), cleared for a sid
+whose later attempt reports cleanly so a re-driven subtask carries no stale
+entry, and surfaced by `phase_finalize` for the `SYMPTOM_DID_NOT_REPRODUCE`
+case ONLY — `NO_SYMPTOM_EVIDENCE` is worker hygiene and a summary line that
+fires every run is how a warning stops being read. **(2) "The new tests fail on base" is NOT this and is
 worthless** — measured on that run all four findings' tests already failed on
 base (9 of 13 for one), because a new test against absent code trivially fails;
 the field therefore asks for a command and an observation, not a bare boolean.

@@ -406,6 +406,11 @@ STATE_FIELDS = (
     # passed. Adjacent to `conformance` because the two are only meaningful
     # together — see DESIGN §9.
     "unreviewed_subtasks",
+    # sid -> check_symptom_evidence findings for `bugfix-` subtasks. Kept
+    # beside the row above because both answer "what should the operator
+    # know about a subtask that reports itself complete?" — see DESIGN §9
+    # *A stale finding is not a bug*.
+    "symptom_findings",
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
     # entries collected during phase_reconcile (DESIGN §5
@@ -26623,9 +26628,21 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # gate. Runs only on the success path: a blocked subtask has no claim
         # to substantiate.
         if status == "complete":
-            for _sym in check_symptom_evidence(res, subtask):
+            _sym_findings = check_symptom_evidence(res, subtask)
+            for _sym in _sym_findings:
                 log(f"  {sid}: {_sym}")
                 res.setdefault("symptom_warnings", []).append(_sym)
+            # Persisted, not just logged. `phase_execute` keeps results in
+            # memory and writes only `blocked` reasons out of them, so a
+            # result-only record dies with the process — while "this bugfix
+            # may be re-fixing something already fixed" is exactly what an
+            # operator wants in the run record rather than by grepping a
+            # 600 KB log. Same argument, and the same shape, as
+            # `unreviewed_subtasks` above.
+            if _sym_findings:
+                st.data.setdefault("symptom_findings", {})[sid] = _sym_findings
+            else:
+                st.data.get("symptom_findings", {}).pop(sid, None)
 
         st.data.setdefault("subtask_status", {})[sid] = status
         if status == "complete":
@@ -28151,6 +28168,17 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         log(f"note — {len(unreviewed)} of {nsub} subtasks completed WITHOUT "
             f"a conformance review (worker crashed or timed out): "
             f"{', '.join(sorted(unreviewed))}")
+    # DESIGN §9 *A stale finding is not a bug*. Only the actionable finding is
+    # surfaced here: `NO_SYMPTOM_EVIDENCE` is worker hygiene and would fire on
+    # most runs until the field is adopted, and a summary line that fires
+    # every run is how a warning stops being read.
+    _stale = sorted(
+        sid for sid, findings in (st.data.get("symptom_findings") or {}).items()
+        if any(f.startswith("SYMPTOM_DID_NOT_REPRODUCE") for f in findings))
+    if _stale:
+        log(f"note — {len(_stale)} bugfix subtask(s) could not reproduce the "
+            f"symptom they were written to fix, so the finding may already "
+            f"have been fixed: {', '.join(_stale)}")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
             f"${tel.get('cost_usd', 0.0):,.2f}, "
