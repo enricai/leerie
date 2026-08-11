@@ -14045,6 +14045,42 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - reserve_mb, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
+    # Defined BEFORE the spawn so it can be started as a task the instant
+    # `proc` exists — see the ordering comment at the `create_task` below.
+    # It closes over `proc` and `stdin_data` only, both of which are bound
+    # by the time the task first runs.
+    async def _feed_stdin():
+        # Writes `stdin_data` to the child's stdin, then closes it so the
+        # CLI sees EOF and starts processing rather than blocking for
+        # more input. Runs concurrently with `_read_stream`/`_drain_stderr`
+        # rather than write-then-await — the incident's live measurement
+        # showed a 150KB write completing at t=0.26s with the child's
+        # first stdout event at t=0.69s (write-then-read is safe on that
+        # CLI version), but a concurrent feeder costs nothing and removes
+        # the dependency on that ordering holding on future CLI versions.
+        # No-op (proc.stdin is None) when `stdin_data` is None — the
+        # DEVNULL branch below never gives the child a writable stdin.
+        if stdin_data is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin_data.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The child closed its read end before consuming the whole
+            # payload (e.g. it exited early, or errored before reading
+            # stdin at all). That is a fact about the worker's exit, not
+            # this feeder's — `_read_stream`/`proc.wait()` already
+            # surface the worker's actual outcome, so swallow rather
+            # than let this coroutine's exception blow up the gather and
+            # mask that outcome.
+            #
+            # NOTE this swallow is why the stdin-starvation failure below
+            # left no leerie-side trace: the worker's own stderr said what
+            # happened, but leerie's causal role in it did not.
+            pass
+        finally:
+            proc.stdin.close()
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -14080,17 +14116,45 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # operational chatter and stays gated.
     if verbosity != "quiet":
         log(f"  [{sid}] spawned (pid={proc.pid})")
+    # Start feeding the prompt IMMEDIATELY — before the broker round-trips
+    # below. The CLI waits a hard-coded 3 s for its first stdin byte
+    # (`KJr(process.stdin, 3000)` in the bundle), then removes its own
+    # `data` listener and proceeds without it, so a late write is DISCARDED
+    # and the worker dies with "Input must be provided either through stdin
+    # or as a prompt argument". Measured across every run on one host: 218
+    # workers lost this way, 12.4% of all invocations in the affected runs,
+    # retried up to 4x each and every attempt charged to `max_total_workers`.
+    #
+    # Both halves of this fix are load-bearing and each was verified alone
+    # against a reproduction harness. Creating the task here but leaving the
+    # broker calls synchronous still fails (the blocked loop never schedules
+    # it); making the broker calls async but creating the task afterwards
+    # also still fails (the write lands after the child is already gone).
+    #
+    # This task is created OUTSIDE the try/finally below, so an exception
+    # before the gather would leave it pending with stdin unclosed. Accepted
+    # rather than guarded: everything between here and that try is either a
+    # plain assignment or a call whose helper swallows OSError itself
+    # (`_cgroup_create` / `_cgroup_enroll`), and `_DescendantTracker.start`
+    # is a bare `create_task`. More to the point, `proc` is spawned outside
+    # that try too — so any exception in this window already leaks a live
+    # worker process, which is strictly worse than a pending feeder and is
+    # the pre-existing shape this does not change.
+    feeder = asyncio.create_task(_feed_stdin())
     # cgroup containment: ask the cgroup broker to create the worker cgroup
     # and enroll the worker (and every descendant it forks — the kernel
-    # propagates cgroup membership down the process tree). These are
-    # synchronous socket round-trips to the broker made directly in this
-    # coroutine (not via asyncio.to_thread): they briefly block the event
-    # loop, but the broker's replies are tiny/fast and bounded by
-    # `_cgroup_request`'s 5 s timeout, so the stall is negligible and no
-    # deadlock is possible (the broker never calls back into leerie).
-    # `destroy` is the one exception and IS dispatched via to_thread in the
+    # propagates cgroup membership down the process tree). Dispatched via
+    # `asyncio.to_thread` because they are synchronous socket round-trips:
+    # run inline they block the WHOLE event loop, including every sibling
+    # worker's feeder, for up to `_cgroup_request`'s 5 s timeout apiece.
+    # That bound is larger than the CLI's 3 s stdin patience, so the old
+    # inline form permitted the starvation above BY CONSTRUCTION — the
+    # comment that used to sit here called the stall "negligible", which is
+    # the assumption the incident falsified. No deadlock is possible either
+    # way (the broker never calls back into leerie).
+    # `destroy` is the same shape and IS dispatched via to_thread in the
     # finally below — it blocks for the broker's whole drain (seconds, not
-    # milliseconds), which is a different order of stall entirely.
+    # milliseconds), which is a larger stall of the same kind.
     # Containment enforcement itself was already gated at run start
     # (_enforce_and_record_cgroup_containment); here a per-worker failure
     # returns None / False and the worker runs without its own sub-cgroup
@@ -14111,11 +14175,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     cgroup_enroll_failure: str | None = None
     if (worker_memory_max_bytes is not None
             and worker_pids_max is not None):
-        cgroup_sid = _cgroup_create(_cgroup_worker_sid(run_id, sid),
-                                    worker_memory_max_bytes,
-                                    worker_pids_max)
+        cgroup_sid = await asyncio.to_thread(
+            _cgroup_create, _cgroup_worker_sid(run_id, sid),
+            worker_memory_max_bytes, worker_pids_max)
         if cgroup_sid is not None:
-            cgroup_enroll_failure = _cgroup_enroll(cgroup_sid, proc.pid)
+            cgroup_enroll_failure = await asyncio.to_thread(
+                _cgroup_enroll, cgroup_sid, proc.pid)
     # Track every descendant PID that ever appears under this worker. Claude
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
     # long-running commands (test runners, builds, dev servers); those
@@ -14400,34 +14465,6 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     "claude -p stderr emitted a line exceeding the "
                     f"10 MiB buffer limit: {e}") from e
 
-    async def _feed_stdin():
-        # Writes `stdin_data` to the child's stdin, then closes it so the
-        # CLI sees EOF and starts processing rather than blocking for
-        # more input. Runs concurrently with `_read_stream`/`_drain_stderr`
-        # rather than write-then-await — the incident's live measurement
-        # showed a 150KB write completing at t=0.26s with the child's
-        # first stdout event at t=0.69s (write-then-read is safe on that
-        # CLI version), but a concurrent feeder costs nothing and removes
-        # the dependency on that ordering holding on future CLI versions.
-        # No-op (proc.stdin is None) when `stdin_data` is None — the
-        # DEVNULL branch above never gives the child a writable stdin.
-        if stdin_data is None or proc.stdin is None:
-            return
-        try:
-            proc.stdin.write(stdin_data.encode())
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            # The child closed its read end before consuming the whole
-            # payload (e.g. it exited early, or errored before reading
-            # stdin at all). That is a fact about the worker's exit, not
-            # this feeder's — `_read_stream`/`proc.wait()` already
-            # surface the worker's actual outcome, so swallow rather
-            # than let this coroutine's exception blow up the gather and
-            # mask that outcome.
-            pass
-        finally:
-            proc.stdin.close()
-
     async def _idle_watchdog():
         # Observation-only stall detector. Wakes every `warn_sec` seconds
         # and warns if the worker has emitted no stdout bytes for that
@@ -14480,8 +14517,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         _ASYNCIO_MANAGED_PIDS.add(proc.pid)
         try:
             await asyncio.wait_for(
+                # `feeder` is the task started right after the spawn, NOT a
+                # fresh `_feed_stdin()` call — awaiting it here is what keeps
+                # its exceptions surfaced and its lifetime bounded by the
+                # same timeout as the rest.
                 asyncio.gather(_read_stream(), _drain_stderr(),
-                               _feed_stdin(), proc.wait()),
+                               feeder, proc.wait()),
                 timeout=timeout)
         except asyncio.TimeoutError:
             # Cancel the watchdog BEFORE the termination awaits so it

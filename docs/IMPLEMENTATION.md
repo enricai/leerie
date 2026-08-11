@@ -3826,6 +3826,25 @@ through stdin too, `_invoke`'s PIPE-vs-DEVNULL branch, and a real
 subprocess/real-pipe round trip for a 150,063-byte payload proving no
 deadlock between the concurrent feeder and the stdout/stderr readers.
 
+**The feeder must be queued before anything can block the event loop, and
+nothing on that path may block it.** `claude -p` waits a hard-coded **3 s**
+for its first stdin byte (`KJr(process.stdin, 3000)` in the CLI bundle; no
+env var), then removes its own `data` listener and proceeds without it — a
+late write is **discarded**, not buffered, and the worker exits 1 with
+`Input must be provided either through stdin or as a prompt argument`.
+leerie previously made two *synchronous* broker round-trips
+(`_cgroup_create`, `_cgroup_enroll`) between the spawn and the first write,
+each bounded by `_cgroup_request`'s **5 s** timeout — an accepted stall
+larger than the deadline in front of it, so the failure was permitted by
+construction. Measured before the fix: **218 workers lost this way, 12.4% of
+all invocations in the affected runs**, retried up to 4× each with every
+attempt charged to `max_total_workers`, on versions 0.9.95 through 0.16.0.
+`asyncio.create_task(_feed_stdin())` now runs immediately after the spawn
+and both broker calls go through `asyncio.to_thread` (matching
+`_cgroup_destroy`, which already did). **Both halves are required** — with
+either alone the prompt still misses the deadline, verified against a
+reproduction harness and pinned in `tests/test_stdin_feeder_ordering.py`.
+
 #### Appended system prompt transport — file, with a probe + inline fallback
 
 The appended system prompt (`system_prompt`, e.g. `reconciler.md` at
