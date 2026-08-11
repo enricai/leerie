@@ -5235,7 +5235,7 @@ site matters disproportionately: it is the last gate before a run is declared
 done, and on run `fa979580` it certified four inert fixes with
 `solution_defects: []` at confidence 8.5.
 
-`check_symptom_evidence(result, subtask) -> list[str]` (DESIGN §9 *A stale
+`check_symptom_evidence(result, sid) -> list[str]` (DESIGN §9 *A stale
 finding is not a bug*) is its sibling for `bugfix-` subtasks, reading a
 `symptom_evidence` object of the same flat shape on the **implementer** schema
 only — the conformer neither wrote the fix nor has a base tree to reproduce
@@ -5249,7 +5249,11 @@ in-memory only, so a result-only record would die with the process); it is
 because a retry cannot make a stale finding un-stale and a second gating
 evidence field would stack retry pressure on the first. Scoped by id prefix
 rather than by reading task text (CLAUDE.md *Language-to-JSON*), and run only
-on the `status == "complete"` path. Pinned by
+on the `status == "complete"` path. It takes the **orchestrator's** `sid`, not
+the worker's echoed `result["subtask_id"]` — nothing cross-checks that echo,
+so scoping on it would let a worker reporting the wrong id slip the prefix —
+and taking the one string it needs rather than the subtask dict removes a
+`None`-dereference by construction. Pinned by
 `tests/test_symptom_evidence.py`.
 
 Two shape decisions are load-bearing and must not be "tidied". The field is

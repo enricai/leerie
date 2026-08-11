@@ -40,32 +40,34 @@ import pytest
 def test_non_bugfix_subtasks_are_silent(leerie, sid):
     """A subtask that is not fixing a reported symptom has none to
     reproduce. Demanding evidence there would fire on most of a plan."""
-    assert leerie.check_symptom_evidence({"subtask_id": sid}, {}) == []
+    assert leerie.check_symptom_evidence({}, sid) == []
 
 
-def test_id_is_read_from_the_subtask_when_the_result_omits_it(leerie):
-    """`subtask_id` is schema-required but the check must not depend on the
-    worker having echoed it back correctly to be scoped."""
-    out = leerie.check_symptom_evidence(
-        {"symptom_evidence": {"reproduced": True, "how": "x"}},
-        {"id": "bugfix-002"})
-    assert out == []
-    # ...and the scoping still applies from that source.
-    assert leerie.check_symptom_evidence({}, {"id": "feat-002"}) == []
+def test_scoping_uses_the_orchestrators_sid_not_the_workers_echo(leerie):
+    """The sid comes from the orchestrator, never from `result["subtask_id"]`.
+
+    Nothing in the module cross-checks the worker's echoed `subtask_id`
+    against the real id, so scoping on it would let a worker that echoed
+    `feat-001` while working on `bugfix-005` slip past the prefix entirely.
+    Both assertions below would flip if the echo were trusted.
+    """
+    assert leerie.check_symptom_evidence(
+        {"subtask_id": "feat-001"}, "bugfix-005") != []
+    assert leerie.check_symptom_evidence(
+        {"subtask_id": "bugfix-005"}, "feat-001") == []
 
 
 # ---- the four outcomes ----------------------------------------------------
 
 def test_absent_evidence_is_flagged(leerie):
-    out = leerie.check_symptom_evidence({"subtask_id": "bugfix-001"}, {})
+    out = leerie.check_symptom_evidence({}, "bugfix-001")
     assert len(out) == 1 and out[0].startswith("NO_SYMPTOM_EVIDENCE:")
 
 
 def test_reproduced_symptom_is_silent(leerie):
     assert leerie.check_symptom_evidence(
-        {"subtask_id": "bugfix-001",
-         "symptom_evidence": {"reproduced": True, "how": "git stash && ...",
-                              "observed": "leaked 3 dirs"}}, {}) == []
+        {"symptom_evidence": {"reproduced": True, "how": "git stash && ...",
+                              "observed": "leaked 3 dirs"}}, "bugfix-001") == []
 
 
 def test_unreproduced_symptom_is_surfaced(leerie):
@@ -76,9 +78,8 @@ def test_unreproduced_symptom_is_surfaced(leerie):
     worker of failing.
     """
     out = leerie.check_symptom_evidence(
-        {"subtask_id": "bugfix-005",
-         "symptom_evidence": {"reproduced": False,
-                              "not_reproduced_reason": "fixed by #190"}}, {})
+        {"symptom_evidence": {"reproduced": False,
+                              "not_reproduced_reason": "fixed by #190"}}, "bugfix-001")
     assert len(out) == 1
     assert out[0].startswith("SYMPTOM_DID_NOT_REPRODUCE:")
     assert "fixed by #190" in out[0], "the worker's reason must survive"
@@ -87,7 +88,7 @@ def test_unreproduced_symptom_is_surfaced(leerie):
 
 def test_unreproduced_without_a_reason_still_surfaces(leerie):
     out = leerie.check_symptom_evidence(
-        {"subtask_id": "bugfix-005", "symptom_evidence": {"reproduced": False}}, {})
+        {"symptom_evidence": {"reproduced": False}}, "bugfix-005")
     assert len(out) == 1 and out[0].startswith("SYMPTOM_DID_NOT_REPRODUCE:")
     assert not out[0].rstrip().endswith(":"), "dangling colon with no detail"
 
@@ -97,14 +98,14 @@ def test_non_boolean_reproduced_is_flagged(leerie, bad):
     """Keys on `is True` / `is False`, so a truthy string must not read as a
     reproduction."""
     out = leerie.check_symptom_evidence(
-        {"subtask_id": "bugfix-001", "symptom_evidence": {"reproduced": bad}}, {})
+        {"symptom_evidence": {"reproduced": bad}}, "bugfix-001")
     assert len(out) == 1 and out[0].startswith("MALFORMED_SYMPTOM_EVIDENCE:")
 
 
 def test_non_dict_evidence_is_flagged(leerie):
     for bad in ("reproduced", ["reproduced"], 7):
         out = leerie.check_symptom_evidence(
-            {"subtask_id": "bugfix-001", "symptom_evidence": bad}, {})
+            {"symptom_evidence": bad}, "bugfix-001")
         assert out and out[0].startswith("NO_SYMPTOM_EVIDENCE:")
 
 
@@ -147,7 +148,7 @@ def test_not_wired_into_the_gating_check(leerie):
 
 def test_wired_as_advisory_on_the_success_path(leerie):
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, subtask)")
+    i = src.index("check_symptom_evidence(res, sid)")
     window = src[i - 400:i + 300]
     assert 'status == "complete"' in window, \
         "must run only on the success path — a blocked subtask has no claim"
@@ -172,7 +173,7 @@ def test_findings_are_persisted_not_just_logged(leerie):
     what belongs in the run record. Same argument, and same shape, as
     `unreviewed_subtasks`."""
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, subtask)")
+    i = src.index("check_symptom_evidence(res, sid)")
     window = src[i:i + 1200]
     assert 'st.data.setdefault("symptom_findings", {})[sid]' in window
 
@@ -193,7 +194,7 @@ def test_a_clean_later_attempt_clears_a_stale_entry(leerie):
     later attempt no longer makes — the same staleness bug already fixed
     once for `unreviewed_subtasks`."""
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, subtask)")
+    i = src.index("check_symptom_evidence(res, sid)")
     window = src[i:i + 1200]
     assert 'st.data.get("symptom_findings", {}).pop(sid, None)' in window
 

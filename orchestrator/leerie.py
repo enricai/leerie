@@ -8094,7 +8094,24 @@ def check_integrator_output(result: dict) -> list[str]:
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
 ) -> list[str]:
-    """Mechanical checks on an implementer's complete result."""
+    """Mechanical checks on an implementer's complete result.
+
+    `subtask` is required to be a dict and the contract is enforced rather
+    than accommodated. The tempting accommodation — `subtask = subtask or {}`
+    — is measurably worse than the crash: an empty dict yields an empty
+    `planned`, so `NO_PLANNED_FILES_TOUCHED` can never fire and a caller's
+    mistake silently disables a check instead of announcing itself. That is
+    the inert-mechanism failure class DESIGN §9 exists to prevent, so this
+    raises early with a message naming the parameter rather than throwing an
+    incidental `AttributeError` further down (cf.
+    `tests/test_phase_planning_coverage_gate.py::TestProgrammingErrorsPropagate`:
+    a programming error must not be reported as an advisory degrade).
+    """
+    if not isinstance(subtask, dict):
+        raise TypeError(
+            f"check_implementer_output: subtask must be a dict, got "
+            f"{type(subtask).__name__} — do NOT 'fix' this by defaulting to "
+            f"{{}}, which silently disables NO_PLANNED_FILES_TOUCHED")
     issues: list[str] = []
     planned = set(subtask.get("files_likely_touched", []) or [])
 
@@ -8117,7 +8134,7 @@ def check_implementer_output(
     return issues
 
 
-def check_symptom_evidence(result: dict, subtask: dict) -> list[str]:
+def check_symptom_evidence(result: dict, sid: str) -> list[str]:
     """DESIGN §9 *A stale finding is not a bug* — advisory, `bugfix-` only.
 
     Run `fa979580`'s N18 subtask "fixed" a leak that #190 had already fixed
@@ -8136,13 +8153,22 @@ def check_symptom_evidence(result: dict, subtask: dict) -> list[str]:
     CLAUDE.md's *Language-to-JSON* rule — `_ID_PREFIXES` already makes the
     prefix a structured fact.
 
+    Takes the **orchestrator's** `sid`, not the worker's echoed
+    `result["subtask_id"]`, which nothing in this module ever cross-checks
+    against the real id: a worker that echoed `feat-001` while working on
+    `bugfix-005` would otherwise slip past the prefix scope entirely. It
+    also takes the one string it needs rather than the whole subtask dict,
+    which removes a `None`-dereference by construction instead of guarding
+    it — and the guard would have been the wrong fix anyway, since
+    `subtask or {}` yields an empty sid, which fails the prefix test and
+    silently disables this check.
+
     Plain "the tests fail on base" is NOT this and is worthless: measured on
     that run, all four findings' new tests already failed on base (9 of 13
     for one), because a new test against code that does not exist yet
     trivially fails. The claim wanted here is behavioural.
     """
-    sid = str(result.get("subtask_id") or subtask.get("id") or "")
-    if not sid.startswith("bugfix-"):
+    if not str(sid or "").startswith("bugfix-"):
         return []
 
     ev = result.get("symptom_evidence")
@@ -26628,7 +26654,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # gate. Runs only on the success path: a blocked subtask has no claim
         # to substantiate.
         if status == "complete":
-            _sym_findings = check_symptom_evidence(res, subtask)
+            _sym_findings = check_symptom_evidence(res, sid)
             for _sym in _sym_findings:
                 log(f"  {sid}: {_sym}")
                 res.setdefault("symptom_warnings", []).append(_sym)

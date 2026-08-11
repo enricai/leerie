@@ -734,6 +734,30 @@ class TestCheckImplementerOutput:
             result, subtask, set())
         assert any("UNMET_CRITERION" in i for i in issues)
 
+    def test_non_dict_subtask_raises_rather_than_silently_passing(self, leerie):
+        """The valuable half of this hardening — and it guards a FIX, not a bug.
+
+        The function already fails loudly on a non-dict `subtask`. The hazard
+        is the tempting "fix": `subtask = subtask or {}`. Measured, an empty
+        dict yields an empty `planned`, so `NO_PLANNED_FILES_TOUCHED` can
+        never fire — a caller's mistake would silently disable a check
+        instead of announcing itself, which is the inert-mechanism class
+        DESIGN §9 exists to prevent. This test fails against that change and
+        passes against the raise, which is the only reason it is here.
+        """
+        for bad in (None, "feat-001", ["feat-001"], 3):
+            with pytest.raises(TypeError, match="must be a dict"):
+                leerie.check_implementer_output(
+                    {"status": "complete"}, bad, {"src/foo.ts"})
+
+    def test_empty_subtask_dict_is_accepted_and_silent(self, leerie):
+        """Anti-vacuity partner: `{}` is a LEGITIMATE input (a subtask spec
+        file that does not exist yet), so the guard must reject non-dicts
+        without rejecting the empty dict the real call site can produce."""
+        assert leerie.check_implementer_output(
+            {"status": "complete",
+             "production_evidence": self._EVIDENCE}, {}, {"src/foo.ts"}) == []
+
     def test_no_criteria_is_ok(self, leerie):
         result = {"status": "complete",
                   "production_evidence": self._EVIDENCE}
