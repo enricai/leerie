@@ -927,6 +927,27 @@ Note the two write sites mean different things — the mid-run satisfied-rescue
 sentinel sets `reviewed: False` but is deliberately excluded from
 `unreviewed_subtasks`, since a zero-commit subtask has no diff to review and
 folding it into the operator warning is how a warning becomes noise.
+`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the
+`bugfix-`-only sibling that asks whether the reported symptom still reproduces
+on the base tree — run fa979580's N18 subtask re-fixed a leak an earlier PR had
+already fixed, shipping an event-loop stall on the way. Three traps. **(1) It is
+advisory and must stay that way**: the output never reaches
+`check_implementer_output`, because those issues drive
+`implementer_confidence_retries` and a retry cannot make a stale finding
+un-stale — it asks the same worker the same question — while a second *gating*
+evidence field would stack retry pressure on the production-evidence gate.
+`test_not_wired_into_the_gating_check` is the pin, and making it gating fails
+exactly that test. **(2) "The new tests fail on base" is NOT this and is
+worthless** — measured on that run all four findings' tests already failed on
+base (9 of 13 for one), because a new test against absent code trivially fails;
+the field therefore asks for a command and an observation, not a bare boolean.
+**(3) Scoped by id prefix**, not by reading the task text (*Language-to-JSON*),
+so it is silent on the feature/test/docs subtasks that have no prior symptom.
+The same change wired `check_production_evidence` into `_run_final_conformance`
+— #197 wired the per-subtask site and missed the whole-tree pass, which is the
+last gate before a run is declared done and the one that certified four inert
+fixes at confidence 8.5. It runs after `_validate_conformance_result` so a
+shape-rejected payload is not also reported as missing a field.
 Memory-OOM naming
 (DESIGN §6 *Detecting memory OOM*) —
 the `empty_handoff` seam that prefers a worker's named OOM cause (offending

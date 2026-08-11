@@ -1646,6 +1646,24 @@ SCHEMAS: dict[str, dict] = {
             # cheapest: it has the repo mounted and has just written the
             # path. Optional here; check_production_evidence gates.
             "production_evidence": _production_evidence_schema(),
+            # DESIGN §9 *A stale finding is not a bug*. `bugfix-` subtasks
+            # only. Same flat, single-required-bool shape as the field above,
+            # for the same decoder-safety reason.
+            "symptom_evidence": {
+                "type": "object",
+                "required": ["reproduced"],
+                "properties": {
+                    # Did the reported symptom actually occur on the base
+                    # tree, before any of this subtask's work?
+                    "reproduced": {"type": "boolean"},
+                    "how": {"type": "string"},
+                    "observed": {"type": "string"},
+                    # Why it could not be reproduced. A finding that no
+                    # longer reproduces is usually already fixed — which is
+                    # the outcome this exists to surface.
+                    "not_reproduced_reason": {"type": "string"},
+                },
+            },
             "checkpoint_path": {"type": ["string", "null"]},
             "blocker": {"type": ["string", "null"]},
             "summary": {"type": "string"},
@@ -8092,6 +8110,53 @@ def check_implementer_output(
         issues.extend(check_production_evidence(result))
 
     return issues
+
+
+def check_symptom_evidence(result: dict, subtask: dict) -> list[str]:
+    """DESIGN §9 *A stale finding is not a bug* — advisory, `bugfix-` only.
+
+    Run `fa979580`'s N18 subtask "fixed" a leak that #190 had already fixed
+    before the run began, and shipped an event-loop stall doing it. Nothing
+    asked whether the reported symptom still happened.
+
+    **Advisory, deliberately.** These strings are logged and recorded, never
+    fed to `check_implementer_output` — two differences from
+    `check_production_evidence`, each with a reason. A retry does not
+    surface a stale finding, it just asks the same worker again; and a
+    second *gating* evidence field would stack retry pressure on top of the
+    production-evidence gate, which is the cost this repo has already
+    measured once (`_confidence_schema`'s docstring).
+
+    Scoped by id prefix rather than by inspecting the task text, per
+    CLAUDE.md's *Language-to-JSON* rule — `_ID_PREFIXES` already makes the
+    prefix a structured fact.
+
+    Plain "the tests fail on base" is NOT this and is worthless: measured on
+    that run, all four findings' new tests already failed on base (9 of 13
+    for one), because a new test against code that does not exist yet
+    trivially fails. The claim wanted here is behavioural.
+    """
+    sid = str(result.get("subtask_id") or subtask.get("id") or "")
+    if not sid.startswith("bugfix-"):
+        return []
+
+    ev = result.get("symptom_evidence")
+    if not isinstance(ev, dict):
+        return ["NO_SYMPTOM_EVIDENCE: a bugfix subtask did not record whether "
+                "the reported symptom actually reproduces on the base tree — "
+                "a finding that no longer reproduces may already be fixed"]
+
+    reproduced = ev.get("reproduced")
+    if reproduced is False:
+        detail = str(ev.get("not_reproduced_reason") or "").strip()
+        return ["SYMPTOM_DID_NOT_REPRODUCE: the reported symptom could not be "
+                "reproduced on the base tree — the finding may already be "
+                "fixed, and this subtask may be re-fixing it"
+                + (f": {detail}" if detail else "")]
+    if reproduced is not True:
+        return [f"MALFORMED_SYMPTOM_EVIDENCE: `reproduced` must be a boolean, "
+                f"got {type(reproduced).__name__}"]
+    return []
 
 
 def check_production_evidence(result: dict) -> list[str]:
@@ -26186,6 +26251,17 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"malformed result: {err}")
             break
 
+        # DESIGN §9 *Evidence must be production-grounded*. The whole-tree
+        # pass is the LAST gate before a run is declared done, and it is the
+        # one conformer with the broadest view — on run fa979580 it certified
+        # four inert fixes with `solution_defects: []` at confidence 8.5.
+        # Advisory here for the same reason as the per-subtask call site:
+        # `solution_defects` is deliberately the only gating conformer axis,
+        # and this phase must not acquire a second way to stop a run.
+        warnings.extend(
+            f"final conformer round {c_round}: {w}"
+            for w in check_production_evidence(res))
+
         # Protected-path rollback: same discipline as the per-subtask
         # loop, but using `_protected_paths_since(before_sha)` instead
         # of `check_diff_scope` — the latter is hardcoded to diff
@@ -26539,6 +26615,17 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.data.setdefault("subtask_status", {})[sid] = "in_progress"
                 st.save()
                 continue
+
+        # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
+        # result and in the log, never routed into `check_implementer_output`
+        # — a retry cannot make a stale finding un-stale, and a second gating
+        # evidence field would stack retry pressure on the production-evidence
+        # gate. Runs only on the success path: a blocked subtask has no claim
+        # to substantiate.
+        if status == "complete":
+            for _sym in check_symptom_evidence(res, subtask):
+                log(f"  {sid}: {_sym}")
+                res.setdefault("symptom_warnings", []).append(_sym)
 
         st.data.setdefault("subtask_status", {})[sid] = status
         if status == "complete":

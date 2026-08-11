@@ -339,6 +339,25 @@ began. The subtask "fixed" it again, adding a change that introduced an
 event-loop stall. A reproduction attempt would have found nothing to
 reproduce, which is the answer.
 
+Record what you found in `symptom_evidence`:
+
+```json
+"symptom_evidence": {
+  "reproduced": true,
+  "how": "git stash && python3 -c '<the failing call>'",
+  "observed": "returned None; the declared heap is never seen"
+}
+```
+
+If it does not reproduce, say so — `reproduced: false` plus a
+`not_reproduced_reason`. That is a finding, not a failure, and it is the most
+valuable thing you can report: it means the work may already be done.
+
+This axis is **advisory**. It is logged and attached to your result; it never
+blocks you or costs you a retry. Report it honestly rather than defensively —
+a false `reproduced: true` buys you nothing and costs the next reader the
+same hour it cost this one.
+
 ### 5b. Prove it fires — `production_evidence` (mechanically checked)
 
 Run the path you just wrote **against this repo as it actually is**, and

@@ -5226,6 +5226,30 @@ when `conf_res is not None`, since a crashed conformer has no result to
 inspect and would otherwise draw a spurious `NO_PRODUCTION_EVIDENCE` on top of
 the crash warning that already explains it.
 
+It has **three** call sites. Two are described above; the third is
+`_run_final_conformance`, the whole-tree pass, where it is likewise advisory
+(extends that phase's `warnings`) and runs **after**
+`_validate_conformance_result` — checking a payload already rejected for a
+shape error would report a missing field as a second, misleading defect. That
+site matters disproportionately: it is the last gate before a run is declared
+done, and on run `fa979580` it certified four inert fixes with
+`solution_defects: []` at confidence 8.5.
+
+`check_symptom_evidence(result, subtask) -> list[str]` (DESIGN §9 *A stale
+finding is not a bug*) is its sibling for `bugfix-` subtasks, reading a
+`symptom_evidence` object of the same flat shape on the **implementer** schema
+only — the conformer neither wrote the fix nor has a base tree to reproduce
+against. It emits `NO_SYMPTOM_EVIDENCE`, `SYMPTOM_DID_NOT_REPRODUCE` (the
+useful one — the finding may already be fixed) or
+`MALFORMED_SYMPTOM_EVIDENCE`. **Advisory, and deliberately asymmetric with the
+gate above**: the output is logged and attached to the result as
+`symptom_warnings`, and is *never* routed into `check_implementer_output`,
+because a retry cannot make a stale finding un-stale and a second gating
+evidence field would stack retry pressure on the first. Scoped by id prefix
+rather than by reading task text (CLAUDE.md *Language-to-JSON*), and run only
+on the `status == "complete"` path. Pinned by
+`tests/test_symptom_evidence.py`.
+
 Two shape decisions are load-bearing and must not be "tidied". The field is
 **optional in the schema and gating in the check**: requiring it would cost the
 entire submission on a miss rather than the one field (`_confidence_schema`'s

@@ -6325,6 +6325,28 @@ Two further disciplines apply, and they sit at the §12 axis:
   tests to exercise both branches of the producer feeding the fix — also fails:
   instrumented, the inference branch executed even under the defective
   fixture, so the gate passes while the defect stands.
+- **A stale finding is not a bug.** The evidence contract above asks whether
+  a fix fires; this asks whether the failure it fixes still happens. On run
+  `fa979580` a subtask "fixed" a cgroup leak that an earlier PR had already
+  fixed **before the run began**, and shipped an event-loop stall doing it.
+  Nothing asked. `bugfix-` subtasks therefore record a `symptom_evidence`
+  object — did the reported symptom reproduce on the base tree, how, and what
+  was observed — and a subtask that could not reproduce it says so.
+
+  **Advisory, and the asymmetry with the evidence gate is deliberate.** A
+  retry cannot make a stale finding un-stale: it asks the same worker the
+  same question, so gating would spend budget without changing the answer,
+  and a second gating evidence field would stack retry pressure on the
+  first. What is wanted here is *surfacing* — "this may already be done" is
+  the most valuable thing such a subtask can report, and it only has to be
+  visible once.
+
+  Note what this is **not**: "the new tests fail on the base tree" is free
+  and proves nothing. Measured on that run, all four findings' tests already
+  failed on base (9 of 13 for one of them), because a new test against code
+  that does not yet exist trivially fails. The claim wanted is behavioural,
+  which is why the field asks for a command and an observation rather than a
+  boolean the worker can assert for nothing.
 - **No backsliding.** The conformer can add commits but must not write to
   protected paths. The diff-scope check — no writes to `.leerie/`,
   `.git/`, or `.claude/` *except for the user-deliverable subtrees*

@@ -259,3 +259,38 @@ def test_prompt_asks_for_the_field(leerie):
          / "prompts" / "implementer.md").read_text()
     assert "production_evidence" in p
     assert "unexercisable_reason" in p
+
+
+# ---- the whole-tree final pass (DESIGN §9) --------------------------------
+
+def test_final_conformance_checks_production_evidence(leerie):
+    """The last gate before a run is declared done must ask the question too.
+
+    On run `fa979580` the whole-tree pass certified four inert fixes with
+    `solution_defects: []` at confidence 8.5 — it has the broadest view of
+    any conformer and was the one place the question was never asked. #197
+    wired the per-subtask call site and missed this one.
+    """
+    src = inspect.getsource(leerie._run_final_conformance)
+    assert "check_production_evidence(res)" in src
+
+
+def test_final_conformance_evidence_is_advisory(leerie):
+    """Extends `warnings`, never a blocking path — same reasoning as the
+    per-subtask site: `solution_defects` is the only gating conformer axis,
+    and the final pass must not gain a second way to stop a run."""
+    src = inspect.getsource(leerie._run_final_conformance)
+    i = src.index("check_production_evidence(res)")
+    stmt = src[src.rindex("warnings", 0, i):i]
+    assert "warnings.extend" in stmt, (
+        f"expected the final pass's evidence to become a warning, got "
+        f"{stmt.strip()!r}")
+
+
+def test_final_conformance_checks_after_shape_validation(leerie):
+    """A malformed result `break`s before this; checking a payload that
+    failed `_validate_conformance_result` would report a missing field on a
+    result that was already rejected for a different reason."""
+    src = inspect.getsource(leerie._run_final_conformance)
+    assert src.index("_validate_conformance_result(res") < \
+        src.index("check_production_evidence(res)")
