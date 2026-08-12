@@ -140,8 +140,8 @@ def test_block_present_in_launcher():
     # bare `resume`/`list` at position 1 never gets a chance to pass.
     assert "resume|list)" in src
     other_verbs_guard = (
-        'finalize|stop|kill|re-seed|accept-blocked|attach|chain|group|'
-        'config|status|version)'
+        'finalize|stop|kill|re-seed|accept-blocked|accept-integration|'
+        'attach|chain|group|config|status|version)'
     )
     assert other_verbs_guard in src, (
         "The other-launcher-verbs guard arm is missing or has drifted — "
