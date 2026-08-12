@@ -271,6 +271,95 @@ def test_freshness_check_narration_lines_ignored(leerie, tmp_path):
     assert leerie._validate_checkpoint(str(p), worktree_root=worktree) is None
 
 
+# ----- sentinel-vs-path parsing (N22) -----------------------------------------
+#
+# `_parse_touched_file_line`'s first-token strip set (`` `,:;()[] ``)
+# deliberately excludes "." so that "./x", "../x", and ".github/..." keep
+# parsing as real paths. That same exclusion used to let a truthful "None."
+# narration line survive with its trailing period intact, match the "."
+# check in the path-shaped branch, and get treated as a path named "None." —
+# tripping the freshness check on a checkpoint that legitimately touched no
+# files. The fix special-cases a small sentinel set (checked with a bare
+# trailing period peeled off, not added to the general strip set) ahead of
+# the path-shaped check.
+
+@pytest.mark.parametrize("body", [
+    "None.",
+    "none.",
+    "N/A",
+    "na",
+    "-",
+    "Nothing.",
+])
+def test_parse_touched_file_line_sentinel_not_treated_as_path(leerie, body):
+    # Direct unit check on the parser: a sentinel/narration line must
+    # resolve to no path, regardless of the trailing period a full
+    # sentence carries.
+    path_str, is_deleted = leerie._parse_touched_file_line(f"- {body}")
+    assert path_str is None, f"expected no path for sentinel body={body!r}, got {path_str!r}"
+    assert is_deleted is False
+
+
+@pytest.mark.parametrize("path", [
+    "./src/app.ts",
+    "../lib/x.ts",
+    ".github/workflows/ci.yml",
+    ".env",
+    "README.md",
+])
+def test_parse_touched_file_line_real_paths_still_parse(leerie, path):
+    # Regression matrix from the work order: none of these must be
+    # swallowed by the sentinel fix.
+    path_str, is_deleted = leerie._parse_touched_file_line(f"- {path} — updated")
+    assert path_str == path
+    assert is_deleted is False
+
+
+@pytest.mark.parametrize("body", [
+    "None.",
+    "none.",
+    "N/A",
+    "na",
+    "-",
+    "Nothing.",
+])
+def test_freshness_check_sentinel_touched_section_passes(leerie, tmp_path, body):
+    # End-to-end reproduction of the N22 bug: `## Files touched` carries a
+    # truthful "no files touched" sentinel line plus a narration sentence
+    # (so the pre-existing placeholder-only rejection above doesn't fire
+    # for an unrelated reason and mask what's under test). Pre-fix,
+    # `_parse_touched_file_line` returned the sentinel token itself as a
+    # path (its trailing "." survived the strip set), and the freshness
+    # check then flagged that fabricated path as stale since no such file
+    # exists in the worktree. Post-fix it must pass cleanly.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    content = _full_good_checkpoint().replace(
+        "- src/api/handler.py — added new route\n",
+        f"- {body}\n"
+        "- No files were touched; this was an investigation-only pass.\n")
+    p = tmp_path / f"sentinel-{body.strip('./').replace('/', '_')}.md"
+    p.write_text(content)
+    err = leerie._validate_checkpoint(str(p), worktree_root=worktree)
+    assert err is None, f"expected sentinel body={body!r} to pass, got error: {err!r}"
+
+
+def test_freshness_check_real_path_regression_matrix_still_checked(leerie, tmp_path):
+    # The regression matrix paths must still be subject to the freshness
+    # check — none of them are sentinels, so a missing one still flags stale.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    content = _full_good_checkpoint().replace(
+        "- src/api/handler.py — added new route\n",
+        "- .env — added new config var\n")
+    p = tmp_path / "real-path-missing.md"
+    p.write_text(content)
+    err = leerie._validate_checkpoint(str(p), worktree_root=worktree)
+    assert err is not None
+    assert ".env" in err
+    assert "stale" in err or "deleted" in err
+
+
 # ----- backward compatibility ------------------------------------------------
 
 def test_validate_checkpoint_works_without_worktree_root(leerie, tmp_path):
