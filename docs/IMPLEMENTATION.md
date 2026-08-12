@@ -7974,8 +7974,12 @@ subtask.
   no registry entry, what a hard crash (ENOSPC, SIGKILL) leaves behind and
   which neither field can express as blocked. It bypasses both status
   checks, so it validates the sid against the scheduled set (`waves`) to
-  stop a typo minting a bogus `subtask_status` entry. The default stays
-  strict, keeping `--force` a deliberate operator act. Pinned in
+  stop a typo minting a bogus `subtask_status` entry — **when `waves` is
+  present**, which is every run where a subtask can be blocked or
+  abandoned, since `waves` is populated at scheduling and nothing can be
+  abandoned before then. Legacy or pre-scheduling state carries no `waves`
+  and degrades open rather than refusing a legitimate accept. The default
+  stays strict, keeping `--force` a deliberate operator act. Pinned in
   `tests/test_accept_blocked.py` (absent-key accepted, neither-field still
   refused, forced-abandoned accepted, forced-typo refused).
 
