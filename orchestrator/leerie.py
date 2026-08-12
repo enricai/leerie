@@ -1806,18 +1806,25 @@ SCHEMAS: dict[str, dict] = {
         },
     },
     "conformer": {
-        # DESIGN §9 *Post-work conformance*: an advisory worker that runs
-        # after the implementer's success path. Schema requires the
-        # build/lint/tests objects so a worker that skipped the honesty
-        # discipline fails its own JSON gate before the orchestrator reads
-        # it; cross-field invariants (residuals require non-empty
-        # rules_files_read, fixed-violations cite a rule, updates cite a
-        # path) are enforced by _validate_conformance_result().
+        # DESIGN §9 *Post-work conformance*. Advisory worker run after the
+        # implementer; cross-field invariants are in _validate_conformance_
+        # result(). solution_defects is the one gating axis (DESIGN §9).
+        #
+        # FLATTENED 2026-08-12 (N29): was the largest schema in the file and
+        # the only one reliably rejected by the strict-output proxy's
+        # grammar compiler ("The compiled grammar is too large"), silently
+        # disabling constrained decoding for the heaviest worker every run.
+        # rule_violations_fixed/rule_violations_residual (isomorphic {rule,
+        # ...} shapes) and docs_updates/tests_updates (isomorphic {path,
+        # reason} shapes) are each now one discriminated array — same
+        # technique as `tag_ops` in SCHEMAS["reconciler"].
+        # `_expand_conformer_output` fans the wire shape back into the four
+        # arrays every consumer here was written against; no field a check
+        # reads was dropped.
         "type": "object",
         "required": [
             "subtask_id", "rules_files_read",
-            "rule_violations_fixed", "rule_violations_residual",
-            "docs_updates", "tests_updates",
+            "rule_violations", "file_updates",
             "build", "lint", "tests", "summary",
             "solution_defects",
         ],
@@ -1825,46 +1832,31 @@ SCHEMAS: dict[str, dict] = {
             "subtask_id": {"type": "string"},
             "rules_files_read": {
                 "type": "array", "items": {"type": "string"}},
-            "rule_violations_fixed": {
+            # status discriminates fixed vs. residual.
+            "rule_violations": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["rule", "fix", "evidence"],
+                    "required": ["status", "rule"],
                     "properties": {
+                        "status": {"type": "string",
+                                   "enum": ["fixed", "residual"]},
                         "rule": {"type": "string"},
                         "fix": {"type": "string"},
                         "evidence": {"type": "string"},
-                    },
-                },
-            },
-            "rule_violations_residual": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["rule", "why_not_fixed"],
-                    "properties": {
-                        "rule": {"type": "string"},
                         "why_not_fixed": {"type": "string"},
                     },
                 },
             },
-            "docs_updates": {
+            # kind discriminates docs vs. tests.
+            "file_updates": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["path", "reason"],
+                    "required": ["kind", "path", "reason"],
                     "properties": {
-                        "path": {"type": "string"},
-                        "reason": {"type": "string"},
-                    },
-                },
-            },
-            "tests_updates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["path", "reason"],
-                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["docs", "tests"]},
                         "path": {"type": "string"},
                         "reason": {"type": "string"},
                     },
@@ -1874,21 +1866,8 @@ SCHEMAS: dict[str, dict] = {
             "lint": _CONFORMER_BLT_PROP,
             "tests": _CONFORMER_BLT_PROP,
             "summary": {"type": "string"},
-            # DESIGN §9 *The one gating axis: solution completeness*. The
-            # conformer's independent adversarial attack on the IMPLEMENTER's
-            # committed diff (which it did not write — its own conformance
-            # edits are a separate, later layer). Each entry names a concrete
-            # behavioral gap the diff does not handle: an unhandled input, a
-            # missing guard, a decoy/shortcut, a sibling call site left
-            # unedited. This is the ONE gating axis (build/lint/test and the
-            # confidence self-score below stay advisory). A non-empty set of
-            # ACTIONABLE defects (each carrying a concrete_case + where —
-            # _validate_conformance_result drops the rest as non-actionable, so
-            # the gate cannot fire on vague "looks incomplete" prose) re-drives
-            # the implementer with the defects folded in as mandatory criteria
-            # (bounded by completeness_retry_rounds), or blocks on exhaustion.
-            # Not gameable by weakening a test: there is no bar to lower, only
-            # a concrete constructed input to report or not.
+            # Anti-gaming: a defect gates only with a concrete_case + where
+            # (_validate_conformance_result drops the rest as non-actionable).
             "solution_defects": {
                 "type": "array",
                 "items": {
@@ -1902,30 +1881,14 @@ SCHEMAS: dict[str, dict] = {
                                           "sibling_site_unedited",
                                           "wrong_selector",
                                           "decoy_or_shortcut"]},
-                        # The specific input / path / site — not a vague
-                        # "incomplete". This concreteness is the anti-gaming
-                        # guard: the gate keys on it. minLength:1 rejects an
-                        # empty string at the JSON layer (worker retries via
-                        # claude_p) so it never reaches validate_conformance_
-                        # result's cross-field check — which would break the
-                        # whole conformance loop early. Mirrors dep_capture's
-                        # minLength discipline.
                         "concrete_case": {"type": "string", "minLength": 1},
-                        # file:line or function the diff should have handled.
                         "where": {"type": "string", "minLength": 1},
                         "why_ships_a_defect": {"type": "string", "minLength": 1},
                     },
                 },
             },
-            # §8 + §12 structural enforcement via _confidence_schema.
-            # The orchestrator loops on observable signals (residuals,
-            # build/lint/test), not the score — but requiring the
-            # discipline fields ensures a worker that skipped self-gating
-            # fails its own JSON schema. This self-score is ADVISORY; the
-            # gating axis is solution_defects above (DESIGN §8/§9).
+            # Advisory; gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
-            # DESIGN §9 *Evidence must be production-grounded*. Optional at
-            # this layer on purpose; check_production_evidence gates on it.
             "production_evidence": _production_evidence_schema(),
         },
     },
@@ -7749,6 +7712,57 @@ def _expand_reconciler_output(out: dict) -> dict:
             item["reason"] = req["reason"]
         sub["requires"].append(item)
     expanded["_dangling_requires"] = dangling
+    return expanded
+
+
+def _expand_conformer_output(out: dict) -> dict:
+    """Fan the flattened conformer wire output back into the four arrays
+    every consumer (`_validate_conformance_result`, `_summarize_residuals`,
+    `_final_conformance_payload`) was written against.
+
+    `SCHEMAS["conformer"]` is flattened for grammar compilation (N29): the
+    isomorphic `rule_violations_fixed`/`rule_violations_residual` pair
+    collapses to one `rule_violations` array keyed by `status`, and
+    `docs_updates`/`tests_updates` collapses to one `file_updates` array
+    keyed by `kind`. An entry with an unrecognised discriminator is dropped
+    rather than guessed, same discipline as `_expand_reconciler_output`'s
+    `tag_ops` handling.
+
+    Returns a NEW dict; the input is not mutated (the raw worker output is
+    persisted as telemetry and must stay as-emitted). Non-dict/non-list
+    input for either flattened array degrades to an empty expansion rather
+    than raising, matching `_expand_reconciler_output`'s `or []` tolerance.
+    """
+    expanded = dict(out)
+    fixed: list[dict] = []
+    residual: list[dict] = []
+    for item in out.get("rule_violations") or []:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status == "fixed":
+            fixed.append({"rule": item.get("rule", ""),
+                          "fix": item.get("fix", ""),
+                          "evidence": item.get("evidence", "")})
+        elif status == "residual":
+            residual.append({"rule": item.get("rule", ""),
+                             "why_not_fixed": item.get("why_not_fixed", "")})
+    expanded["rule_violations_fixed"] = fixed
+    expanded["rule_violations_residual"] = residual
+
+    docs: list[dict] = []
+    tests: list[dict] = []
+    for item in out.get("file_updates") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip().lower()
+        row = {"path": item.get("path", ""), "reason": item.get("reason", "")}
+        if kind == "docs":
+            docs.append(row)
+        elif kind == "tests":
+            tests.append(row)
+    expanded["docs_updates"] = docs
+    expanded["tests_updates"] = tests
     return expanded
 
 
@@ -25235,14 +25249,15 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
     # abort the run.
     try:
         st.bump_workers(caps)
-        return await claude_p(user_prompt="\n".join(up),
-                              system_prompt=sys_prompt,
-                              schema_key="conformer", cwd=worktree,
-                              allowed_tools=ACT_TOOLS, max_turns=60,
-                              autonomous=True, caps=caps, st=st,
-                              model=models["conformer"],
-                              effort=efforts["conformer"],
-                              sid=f"{sid}-conformer")
+        raw = await claude_p(user_prompt="\n".join(up),
+                             system_prompt=sys_prompt,
+                             schema_key="conformer", cwd=worktree,
+                             allowed_tools=ACT_TOOLS, max_turns=60,
+                             autonomous=True, caps=caps, st=st,
+                             model=models["conformer"],
+                             effort=efforts["conformer"],
+                             sid=f"{sid}-conformer")
+        return _expand_conformer_output(raw)
     except PidExhaustedError:
         # Re-raised rather than swallowed like the generic WorkerError
         # below (of which this is a subclass): the caller
@@ -26359,6 +26374,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"after {timeout}s")
             break
 
+        res = _expand_conformer_output(res)
         last_res = res
         # _validate_conformance_result enforces shape rules
         # (residuals-imply-rules-files-read, every fixed violation

@@ -4700,7 +4700,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Step | Function | Behavior |
 |------|----------|----------|
 | Discover rules files | `_discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `docs/DESIGN-SYSTEM.md`, `docs/DESIGN_SYSTEM.md`, `docs/UI.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. The design-system candidates (`docs/DESIGN-SYSTEM.md` and spelling variants) exist so a repo's component/color/banner conventions reach both the conformer and the implementer (DESIGN §9). |
-| Run conformer | `_run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Accepts optional `extra_feedback: str \| None` — when non-None, appended to the user prompt (used for Pattern B backgrounding-retry feedback from prior round). Catches `WorkerError` and returns `None` (surfaced as a warning). |
+| Run conformer | `_run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Accepts optional `extra_feedback: str \| None` — when non-None, appended to the user prompt (used for Pattern B backgrounding-retry feedback from prior round). Catches `WorkerError` and returns `None` (surfaced as a warning). The raw structured output is passed through `_expand_conformer_output()` (N29) before returning, restoring the flattened wire shape into the four arrays every downstream step below expects. |
 | Validate output | `_validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
 | Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` is snapshotted **once before the round loop** (a per-round HEAD would fold in prior conformer commits and miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; for each owned file, a clobber is a deletion at HEAD or a blob reverted to the base version (three-way blob compare via `_blob_sha`, which uses `git rev-parse --verify -q` to avoid the bare-`rev-parse` missing-path footgun) while a legit conformer edit leaves a distinct third blob and is not flagged. Warns **always**; under `--strict-conformer` also `_rollback_conformer_commits()` to the implementer HEAD **and blocks** — a `clobbered_files` flag threaded to the post-loop `blocked_reason` (per-subtask) / `final_blocked` (final) sets a block even when `_conformance_clean(last_res)` is True, so a clobber is never silently completed. Not auto-rolled-back in advisory mode — a legitimate revert-to-base is git-indistinguishable from a clobber. The final-tree pass applies the same guard with `base=run_branch`, `impl_head=staging HEAD snapshotted before that pass`. |
@@ -8652,19 +8652,17 @@ type. Required fields, current shape:
   invariant — that the integrator's commit never touches `.leerie/` files).
 - **conformer** — required: `subtask_id`, `rules_files_read` (array of
   strings — paths the conformer was handed by `_discover_rules_files`; empty
-  list when none were found), `rule_violations_fixed` (array of
-  `{rule, fix, evidence}` — `rule` is the verbatim line from a rules file
-  that was being honored, `fix` describes the change made, `evidence` cites
-  the file/lines touched), `rule_violations_residual` (array of
-  `{rule, why_not_fixed}` — violations the conformer spotted but did not
-  resolve, with the reason), `docs_updates` (array of `{path, reason}` —
-  documentation files updated to reflect the diff), `tests_updates` (array
-  of `{path, reason}` — tests added or amended to cover the diff), `build`,
-  `lint`, `tests` (each an object `{ran (bool), passed (bool), command
-  (string), summary (optional string)}` — only `ran`, `passed`, and
-  `command` are required; `summary` is advisory and may be omitted —
-  `ran: false` when the tool is not applicable to the repo; `passed` is
-  irrelevant when `ran: false`),
+  list when none were found), `rule_violations` (array of
+  `{status: enum[fixed, residual], rule, fix, evidence, why_not_fixed}` —
+  `status` discriminates; a `fixed` entry carries `fix`/`evidence`, a
+  `residual` entry carries `why_not_fixed`, both left optional on the wire
+  rather than schema-conditional), `file_updates` (array of
+  `{kind: enum[docs, tests], path, reason}` — `kind` discriminates which of
+  the two update kinds the entry is), `build`, `lint`, `tests` (each an
+  object `{ran (bool), passed (bool), command (string), summary (optional
+  string)}` — only `ran`, `passed`, and `command` are required; `summary`
+  is advisory and may be omitted — `ran: false` when the tool is not
+  applicable to the repo; `passed` is irrelevant when `ran: false`),
   `summary` (string — one-line description of what the conformance pass
   did), and `solution_defects` (array of `{kind:
   enum[unhandled_input, unhandled_path, missing_guard, sibling_site_unedited,
@@ -8681,18 +8679,43 @@ type. Required fields, current shape:
   structural part of DESIGN §9 *Post-work conformance*: a conformer that skipped
   its own honesty discipline (e.g. wrote `passed: true` without a `command`, or
   omitted the self-gate block) fails the schema before the orchestrator
-  reads it. The cross-field invariants — residuals require a non-empty
+  reads it.
+
+  **FLATTENED 2026-08-12 (N29):** `SCHEMAS["conformer"]` was the largest
+  schema in the file (6,236 source bytes) and the only worker reliably
+  rejected by the strict-output proxy's grammar compiler ("The compiled
+  grammar is too large"), silently disabling `--dangerously-force-strict-
+  output` for the heaviest, most-invoked worker on every run that used the
+  flag. The two isomorphic array-pair shapes — `rule_violations_fixed` +
+  `rule_violations_residual` ({rule, ...}), and `docs_updates` +
+  `tests_updates` ({path, reason}) — are each collapsed into one
+  discriminated array on the wire (`rule_violations` keyed by `status`,
+  `file_updates` keyed by `kind`), the same technique `SCHEMAS["reconciler"]`
+  uses for `tag_ops`. `_expand_conformer_output()` fans the wire shape back
+  into the four original arrays immediately after the worker call (both
+  call sites — `_run_conformer()` for the per-subtask pass and
+  `_run_final_conformance()`'s inline `claude_p` call for the whole-tree
+  pass), so `_validate_conformance_result()`, `_summarize_residuals()`, and
+  `_final_conformance_payload()` are unchanged and still read
+  `rule_violations_fixed`/`rule_violations_residual`/`docs_updates`/
+  `tests_updates`. An entry with an unrecognised `status`/`kind` is dropped
+  rather than guessed. Pinned by `tests/test_conformer_schema_shrink.py`
+  (source-byte size vs. `plan_overlap_judge`'s unrejected line, hardened
+  wire-byte shrink, and lossless round-trip through
+  `_expand_conformer_output`).
+
+  The cross-field invariants — residuals require a non-empty
   `rules_files_read`, every `rule_violations_fixed` item cites a non-empty
   `rule`, every `docs_updates` / `tests_updates` `path` exists in the
   worktree, and every `solution_defects` item carries a non-empty
   `concrete_case` and `where` (a defect without a concrete case is
   non-actionable and dropped, so the gate cannot fire on vague prose) — are
-  enforced by `_validate_conformance_result()`. `confidence` is optional
-  (P3, 2026-08-05 — no longer schema-required, still declared in
-  `properties`): when present it is the worker-internal self-gate, not
-  consumed by the orchestrator — shape is `conformance` (number 1–10),
-  `basis` (string), `falsifiers_tested` (array of strings, optional),
-  `contradictions_reconciled` (array of strings, optional); when
+  enforced by `_validate_conformance_result()` against the expanded shape.
+  `confidence` is optional (P3, 2026-08-05 — no longer schema-required,
+  still declared in `properties`): when present it is the worker-internal
+  self-gate, not consumed by the orchestrator — shape is `conformance`
+  (number 1–10), `basis` (string), `falsifiers_tested` (array of strings,
+  optional), `contradictions_reconciled` (array of strings, optional); when
   conformance is below 9.0 the gap is stated in `basis` (there is no
   `gap_to_close` — removed 2026-08-03).
 - **judge** — required: `passed` (bool — aggregate verdict, true only when all

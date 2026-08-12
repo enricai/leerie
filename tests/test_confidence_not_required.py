@@ -65,10 +65,8 @@ _FIXTURES = {
     "conformer": {
         "subtask_id": "bugfix-001",
         "rules_files_read": [],
-        "rule_violations_fixed": [],
-        "rule_violations_residual": [],
-        "docs_updates": [],
-        "tests_updates": [],
+        "rule_violations": [],
+        "file_updates": [],
         "build": {"ran": True, "passed": True, "command": "true", "summary": "ok"},
         "lint": {"ran": True, "passed": True, "command": "true", "summary": "ok"},
         "tests": {"ran": True, "passed": True, "command": "true", "summary": "ok"},
