@@ -433,7 +433,12 @@ $_diagnosis"
       local _hook_name
       # Vendor-text grep kept only as a supplementary "which hook" naming
       # signal, per N24's scope note — never as the classification itself.
-      _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1)"
+      # `|| true` guards against `set -o pipefail`: under the non-branded-
+      # hook case this grep is EXPECTED to find nothing, and pipefail would
+      # otherwise make that no-match propagate as the pipeline's exit status
+      # (even though `head -1` itself succeeds), aborting the whole function
+      # under `set -e` before the hint below ever prints.
+      _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1 || true)"
       echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
       echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
       echo "    git push -u origin $run_branch --no-verify" >&2
