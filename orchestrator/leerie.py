@@ -11563,6 +11563,14 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     first = body.split()[0].strip("`,:;()[]")
     if not first or first.startswith("#"):
         return (None, False)
+    # A truthful "None." sentinel carries a trailing sentence period that
+    # would otherwise survive the strip set above and read as path-shaped
+    # (it contains a "."). Check the sentinel set against the token with
+    # a bare trailing period removed, without adding "." to the general
+    # strip set — that breaks './x', '../x', and '.github/...' parsing.
+    sentinel_candidate = first[:-1] if first.endswith(".") and not first.endswith("..") else first
+    if sentinel_candidate.lower() in {"none", "n/a", "na", "-", "nothing"}:
+        return (None, False)
     # Only treat as a path if it has a separator or a dot — a bare word
     # like "refactored" is narration, not a path.
     if "/" in first or "." in first:
