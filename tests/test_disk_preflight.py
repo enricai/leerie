@@ -83,20 +83,29 @@ class TestPreflightDiskCheck:
         assert not called
 
     def test_healthy_disk_is_a_noop_at_preflight(self, tmp_path, monkeypatch):
-        # A healthy disk ratio must not die() on the disk check itself —
-        # drive far enough to prove the disk gate passed silently, without
-        # needing a real git repo (the next checks would die() for their
-        # own unrelated reasons in a bare tmp_path, which is fine — we only
-        # assert the *disk* check did not fire).
+        # A healthy disk ratio must not die() on the disk check itself.
+        # Stub every downstream check to a clean pass so preflight runs to
+        # completion — proving control flow reached and passed every check
+        # after the disk gate, rather than merely dying somewhere later for
+        # an unrelated reason (which would tell us nothing about the disk
+        # check specifically).
+        async def _fake_run_proc(argv, *a, **k):
+            if argv[:2] == ["git", "config"]:
+                return mock.Mock(returncode=0, stdout="ok\n")
+            if argv[:2] == ["git", "status"]:
+                return mock.Mock(returncode=0, stdout="")
+            if argv[:2] == ["git", "show-ref"]:
+                return mock.Mock(returncode=1, stdout="")
+            raise AssertionError(f"unexpected run_proc call: {argv}")
+
+        monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
+        monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+        monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
         with mock.patch.object(leerie.shutil, "disk_usage",
                                 return_value=_fake_usage(0.90)):
-            monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
-            with pytest.raises(SystemExit) as exc_info:
-                asyncio.run(leerie.preflight(tmp_path, skip_smoke=True))
-        # die() -> sys.exit(1); confirms flow reached past the disk check
-        # into the (here, real and failing-for-other-reasons) git identity
-        # check rather than dying on disk space.
-        assert exc_info.value.code == 1
+            # skip_smoke=True skips the live claude -p call; no SystemExit
+            # anywhere means every check, including the disk gate, passed.
+            asyncio.run(leerie.preflight(tmp_path, skip_smoke=True))
 
 
 class TestPhaseExecuteDiskLowSpace:
