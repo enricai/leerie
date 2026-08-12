@@ -6038,8 +6038,62 @@ silently drops one side's behavior entirely. Wired into `integrate_wave` as a
 non-empty `defects` array `die()`s immediately with the concrete defect named
 (an integrator cannot always mechanically re-derive a correct behavioral
 resolution from a semantic finding the same way a planner can add a subtask,
-so no re-drive). Will persist to `state.data["integration_gate"]` (not yet
-implemented — see feat-006 follow-up).
+so no re-drive). Persists to `state.data["integration_gate"][sid]` and
+`state.data["integration_defects"][sid]` — see "Integration gate resume +
+`accept-integration`" below.
+
+### Integration gate resume + `accept-integration`
+
+Unlike `wiring_gate`, which is written only on a clean pass,
+`state.data["integration_gate"][sid]` is written **before** `die()`ing:
+`{defects: list[str], advisories: list[str], merge_commit_sha: str, accepted:
+bool}` (`accepted` is `not defects` on a fresh judge verdict — true for a
+clean pass, false for a gating finding). A non-empty `defects` entry is
+mirrored to the flatter `state.data["integration_defects"][sid]` (a plain
+`list[str]`), which is what `accept-integration` clears. Both keys let a
+resume distinguish "this sid's merge was never reviewed" (both keys absent)
+from "reviewed and rejected, not yet accepted" (`integration_gate[sid]`
+present, `accepted: False`) from "reviewed and either clean or
+operator-accepted" (`accepted: True`) — `wiring_gate`'s single "written only
+on pass" key cannot express the middle state, which is exactly the state a
+run stuck on a false-positive `integration_judge` verdict is in.
+
+`integrate_wave`'s per-sid loop consults `integration_gate[sid]` **before**
+re-driving `integrate.sh`/the integrator: `integrate.sh`'s `git merge --no-ff`
+is idempotent, so on resume it would just see the branch already merged (rc
+0, "Already up to date") and short-circuit straight to `integrated.append`
+*without ever re-invoking the judge* — the judge only ever runs from inside
+the conflict/integrator branch. A present, not-yet-`accepted` entry instead
+re-invokes the judge directly against the already-committed merge via the
+shared `_run_integration_judge_gate` helper (used by both the normal
+post-integrator-commit call site and this resume call site, so the
+invoke/partition/persist/die sequence cannot drift between them); a present,
+`accepted` entry skips straight to `integrated.append` with no judge call at
+all. `phase_execute`'s wave loop has a matching adjustment: the
+already-complete-subtasks resume shortcut (`if not remaining: ... skip the
+whole wave`) additionally checks for any wave sid with a pending,
+un-accepted `integration_gate` entry (`pending_gate_sids`) and, when one
+exists, does NOT take the shortcut — otherwise `integrate_wave` (and its gate
+re-check) would never be reached again for that wave, silently advancing
+`completed_waves` past a rejected merge. Such sids get a `{"status":
+"complete"}` stand-in `results` entry (their original `intent`/
+`criteria_results` are not persisted anywhere this far removed from the
+original settle, so the resumed judge re-invocation runs with an empty
+`incoming_intent`/`incoming_criteria` — cosmetic only, since the judge's
+primary evidence is the merge diff itself).
+
+`leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]`
+mirrors `accept-blocked`'s shape and local/Fly/EC2 state-mutation machinery
+exactly (same runtime auto-detection via `_auto_detect_run_runtime`, same
+run-id/subtask-id allowlist validation, same wake-mutate-pause dance for a
+stopped Fly machine or EC2 instance, same `ACCEPTED:`/`NOOP:`/`ERROR:`
+sentinel-line convention for the ssh/ssm-piped mutation to survive
+`flyctl`'s exit-code flattening) — only the mutated field and precondition
+differ: it flips `integration_gate[sid]["accepted"]` to `True` and pops
+`sid` from `integration_defects` (`NOOP:` if already accepted, `ERROR:` if
+`sid` has no `integration_gate` entry at all). A subsequent `resume` then
+takes the `accepted` branch above and advances past the finding without
+re-invoking the judge.
 
 **`plan_overlap_judge`'s `judgment` self-score gets no new verifier — it is
 dropped, and its existing deterministic validators become its sole gate.**
@@ -8372,6 +8426,8 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `classification_coverage_gate` | dict | audit record from `phase_classification_gate` (DESIGN §8 *Independent adversarial verification*) — the final `classification_judge` output `{categories_reviewed, miscategorizations, rationale}`. Written once the gate clears (immediately, or after re-classifying). Absent when the judge crashed every round (degrade path returns without persisting). |
 | `wiring_gate` | dict | audit record from `phase_wiring_gate` (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8) — the final `wiring_judge` output `{plan_reviewed, wiring_defects, rationale}` plus a `repairs` array of `{sid, tag, provider, channel}` for every edge the gate added (`channel` is `"tag"`, `"id"`, or `"cofile_cluster"`; on the id channel `tag` and `provider` are both the named subtask id). Single pass (no `make_feedback_prompt` — see §5½ *Mechanical-feedback loops*): the judge's defects are passed through `_repair_missing_requires` and only the unrepaired residual `die()`s. Written only when the gate CLEARS (no residual), which is also what makes it the correct resume key — `plan_snapshot` is written before the gate runs and is therefore present even on a run the gate killed, so keying the skip on it silently bypassed a failed gate. `repairs` is `[]` on a plan that needed none. Absent when the judge crashed every round, or when the gate died. The deterministic `check_plan_wiring` that runs alongside it does not persist — it `die()`s or passes silently. |
 | `provision_recipe_gate` | dict | audit record from `phase_provision_gate` (DESIGN §8, §6½) — the final `provision_judge` output `{recipe_reviewed, recipe_failures, rationale}`. Detect-and-die, single pass (no `make_feedback_prompt`): written once the judge's first round clears; a found recipe failure `die()`s immediately instead of re-provisioning. Absent when no recipe was detected (`kind: none`) or the judge crashed every round. |
+| `integration_gate` | dict[str, dict] | per-sid audit record from `integrate_wave`'s `integration_judge` gate — `{sid: {defects: list[str], advisories: list[str], merge_commit_sha: str, accepted: bool}}`. Unlike `wiring_gate`, written BEFORE `die()`ing, not only on a clean pass — `accepted` is `not defects` on a fresh verdict (True for clean, False for a gating finding) and is flipped to `True` by `leerie accept-integration <run-id> <sid>`. `integrate_wave` consults this key BEFORE re-driving `integrate.sh`/the integrator for a sid: a present, not-yet-`accepted` entry re-invokes the judge directly against the already-committed merge (`integrate.sh` alone is idempotent and would just see the branch already merged, short-circuiting past the judge entirely); a present, `accepted` entry skips straight to `integrated.append`. Absent for a sid whose merge never needed the integrator (the judge only runs post-integrator-merge, on a conflict) and for a sid the judge has never reviewed at all. |
+| `integration_defects` | dict[str, list[str]] | per-sid flat mirror of `integration_gate[sid]["defects"]` for the sids with a currently-gating (not-yet-accepted) finding — the record `accept-integration` clears (popped, along with the whole key when it empties, once accepted or once a re-invoked judge comes back clean). Kept as a separate key alongside `integration_gate` per the audit-key contract this field pair was specified against. Absent when no sid currently has a gating defect. |
 | `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `_run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |

@@ -387,6 +387,7 @@ below for full details and modifier flags.
 | `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
 | `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
 | `accept-blocked <run-id> <subtask-id>` | Accept a blocked subtask so `resume` skips it. |
+| `accept-integration <run-id> <subtask-id>` | Accept a recorded `integration_judge` finding for a subtask so `resume` stops re-invoking the judge for it. |
 | `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see `docs/IMPLEMENTATION.md` "Chain verbs"). |
 | `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see `docs/IMPLEMENTATION.md` "Run-group verbs"). |
 | `version` | Print `leerie <version>` and exit. |

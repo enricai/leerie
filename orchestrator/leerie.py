@@ -492,6 +492,29 @@ STATE_FIELDS = (
     # re-check on the fully-merged plan*, §8) — the final wiring_judge output.
     # Absent when the judge crashed every round.
     "wiring_gate",
+    # integration_gate: per-sid audit record from integrate_wave's
+    # integration_judge gate (DESIGN §8) — {sid: {defects, advisories,
+    # merge_commit_sha, accepted}}. Written BEFORE die()ing (unlike
+    # wiring_gate, which is written only on a clean pass) so a resume can
+    # tell "not yet reviewed" (key absent) from "reviewed and rejected"
+    # (`accepted: False`) from "reviewed and clean, or operator-accepted"
+    # (`accepted: True`) — the `accept-integration <run-id> <sid>` verb
+    # flips `accepted` to True. `integrate_wave` consults this key BEFORE
+    # re-driving integrate.sh/the integrator: a present-and-not-accepted
+    # entry re-invokes the judge directly against the already-committed
+    # merge (integrate.sh alone would just see the branch already merged
+    # and short-circuit past the judge entirely). Absent for a sid whose
+    # merge never needed the integrator (no conflict — the judge only runs
+    # post-integrator-merge).
+    "integration_gate",
+    # integration_defects: per-sid list[str] of the gating defect strings
+    # from the most recent `integration_gate[sid]` entry that found a
+    # behavioral defect — the record `accept-integration` marks accepted.
+    # Mirrors `integration_gate[sid]["defects"]"` (kept as a separate,
+    # flatter key per the parent subtask's audit-key contract) and is
+    # popped once a re-invoked judge comes back clean. Absent when no sid
+    # has ever had a gating defect.
+    "integration_defects",
     # provision_recipe_gate: audit record from phase_provision_gate (DESIGN §8,
     # §6½) — the final provision_judge output. Absent when no recipe was
     # detected (kind:none) or the judge crashed every round.
@@ -27099,6 +27122,146 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         rescue_index.unlink(missing_ok=True)
 
 
+async def _run_integration_judge_gate(
+        sid: str, staging: Path, incoming_subtask: dict,
+        integrated_so_far: list[str], caps: dict, st: State,
+        models: dict[str, str], efforts: dict[str, str | None]) -> None:
+    """Invoke `integration_judge` against the merge already committed to
+    `staging` for `sid`, persist the verdict to
+    `state.data["integration_gate"][sid]` (and `["integration_defects"][sid]`
+    on a gating finding) BEFORE `die()`ing, and `die()` on an unresolved
+    (not-yet-`accepted`) defect.
+
+    Called from two places in `integrate_wave`: right after an integrator
+    commits a conflict resolution (the normal path), and — on `resume` —
+    directly against a merge a *prior* invocation already committed and the
+    judge already rejected (`accept-integration` not yet run for this sid).
+    Both call sites need the identical invoke/partition/persist/die
+    sequence; unifying them is what lets a resume re-invoke the judge
+    without re-driving `integrate.sh`/the integrator, which would just see
+    the branch already merged and short-circuit past the judge entirely.
+    """
+    sys_prompt_judge = _load_prompt("integration_judge")
+    repo_root = Path(os.getcwd())
+
+    # Build context: the merged diff, both parent subtask intents, and
+    # the list of already-integrated subtasks that were potential
+    # conflict sources.
+    merge_head_sha = (await run_proc(
+        ["git", "rev-parse", "HEAD"], cwd=str(staging)
+    )).stdout.strip()
+    merge_diff = (await run_proc(
+        ["git", "show", "--format=%B", merge_head_sha],
+        cwd=str(staging)
+    )).stdout
+
+    payload_judge = {
+        "sid": sid,
+        "incoming_intent": incoming_subtask.get("intent", ""),
+        "incoming_criteria": incoming_subtask.get("criteria_results", []),
+        "integrated_so_far": list(integrated_so_far),
+        "merge_commit_sha": merge_head_sha,
+        "merge_diff": merge_diff,
+    }
+
+    async def _invoke_integration_judge() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            f"CONFLICT RESOLUTION TO REVIEW:\n"
+            f"Incoming subtask: {sid}\n"
+            f"Intent: {payload_judge['incoming_intent']}\n\n"
+            f"Already-integrated subtasks: "
+            f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
+            f"MERGED RESULT:\n"
+            f"Commit: {merge_head_sha}\n\n"
+            f"{merge_diff}\n\n"
+            f"Attack the merged result for behavioral breakage. "
+            f"Return only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt_judge,
+            schema_key="integration_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("integration_judge", MODEL_DEFAULT),
+            effort=efforts.get("integration_judge"),
+            sid=f"integration_judge-{sid}",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check_integration(judge_result: dict) -> list[str]:
+        # Thin adapter for `_run_checked_loop`'s `check=` contract.
+        # Deliberately side-effect free: this runs once per round
+        # inside the loop AND again after it, so logging here would
+        # emit each advisory 2-4 times. The post-loop call site logs
+        # the advisory list once.
+        return _partition_integration_defects(judge_result, repo_root)[0]
+
+    # No make_feedback_prompt: detect-and-die, single pass. The
+    # integrator cannot mechanically fix a semantic finding without
+    # re-resolving the conflict from scratch.
+    judge_result, judge_warnings = await _run_checked_loop(
+        invoke=_invoke_integration_judge,
+        check=_check_integration,
+        name=f"integration_judge-{sid}",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    for w in judge_warnings:
+        log(f"  integration-judge-{sid}: {w}")
+
+    if judge_result is None:
+        # The judge crashed every round (infrastructure). The merge is
+        # already committed and passed the mechanical checks, so degrade
+        # rather than undo it. Nothing is persisted — a WorkerError
+        # degrade never reached a verdict, so a resume should re-attempt
+        # the gate rather than inherit one.
+        log(f"  ⚠  integration-judge for {sid} crashed every round; "
+            "degrading (merge preserved, check_merge_committed already ran)")
+        return
+
+    # The single place advisories are logged — see
+    # `_partition_integration_defects`' docstring for why this is
+    # not done inside `_check_integration`.
+    remaining_defects, advisories = _partition_integration_defects(
+        judge_result, repo_root)
+    for a in advisories:
+        log(f"  ⚠  integration-judge-{sid}: advisory {a}")
+
+    # Persisted BEFORE die()ing (unlike wiring_gate, which is written only
+    # on a clean pass) — the point is a resume must be able to tell "not
+    # yet reviewed" from "reviewed and rejected" so it knows to re-invoke
+    # the judge rather than silently skip past a rejected merge.
+    st.data.setdefault("integration_gate", {})[sid] = {
+        "defects": remaining_defects,
+        "advisories": advisories,
+        "merge_commit_sha": merge_head_sha,
+        "accepted": not remaining_defects,
+    }
+    if remaining_defects:
+        st.data.setdefault("integration_defects", {})[sid] = remaining_defects
+    else:
+        st.data.get("integration_defects", {}).pop(sid, None)
+    st.save()
+
+    if remaining_defects:
+        # Found behavioral breakage. Unlike the wiring gate (pre-merge),
+        # we already have a committed merge, so the abort instruction
+        # differs.
+        die(
+            f"integration gate found behavioral defect(s) in the merge "
+            f"for {sid}:\n" +
+            "\n".join(f"  • {d}" for d in remaining_defects) +
+            f"\n\nAn independent review found the merge is textually "
+            f"clean (no conflict markers, committed) but behaviorally "
+            f"broken. The merge has been committed to staging. Either "
+            f"revert it manually and resolve the conflict differently "
+            f"then re-run with resume, revise one of the conflicting "
+            f"subtasks' approaches then re-run with resume, or accept "
+            f"the finding with `leerie accept-integration "
+            f"{st.run_id} {sid}` and re-run with resume."
+        )
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -27128,6 +27291,29 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
+            continue
+        gate = st.data.get("integration_gate", {}).get(sid)
+        if gate is not None:
+            # A prior invocation already ran integrate.sh/the integrator for
+            # this sid and the merge is already committed to staging — the
+            # judge only ever runs post-merge-commit, so a present entry
+            # means we must not re-drive integrate.sh at all (it would just
+            # see the branch already merged, short-circuit at rc 0, and
+            # skip straight past the judge, silently readvancing the wave
+            # onto a merge the gate never cleared).
+            if gate.get("accepted"):
+                integrated.append(sid)
+                integrated_so_far.append(sid)
+            else:
+                # Not yet accepted via `accept-integration` — re-invoke the
+                # judge directly against the already-committed merge. This
+                # is the resume path for the incident this gate exists to
+                # let an operator recover from.
+                await _run_integration_judge_gate(
+                    sid, staging, results.get(sid, {}), integrated_so_far,
+                    caps, st, models, efforts)
+                integrated.append(sid)
+                integrated_so_far.append(sid)
             continue
         proc = await _run_script("integrate.sh", sid, st.run_id)
         if proc.returncode == 0:
@@ -27244,107 +27430,13 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # call sites. Detect-and-die, single pass: an integrator cannot
             # mechanically fix a semantic finding from an independent judge
             # without a fresh conflict-resolution attempt, so re-driving would
-            # reproduce the same merge.
-            sys_prompt_judge = _load_prompt("integration_judge")
-            repo_root = Path(os.getcwd())
-
-            # Build context: the merged diff, both parent subtask intents, and
-            # the list of already-integrated subtasks that were potential
-            # conflict sources.
-            merge_head_sha = (await run_proc(
-                ["git", "rev-parse", "HEAD"], cwd=str(staging)
-            )).stdout.strip()
-            merge_diff = (await run_proc(
-                ["git", "show", "--format=%B", merge_head_sha],
-                cwd=str(staging)
-            )).stdout
-
-            # Get the incoming subtask's details
-            incoming_subtask = results.get(sid, {})
-
-            payload_judge = {
-                "sid": sid,
-                "incoming_intent": incoming_subtask.get("intent", ""),
-                "incoming_criteria": incoming_subtask.get("criteria_results", []),
-                "integrated_so_far": list(integrated_so_far),
-                "merge_commit_sha": merge_head_sha,
-                "merge_diff": merge_diff,
-            }
-
-            async def _invoke_integration_judge() -> dict:
-                st.bump_workers(caps)
-                user_prompt = (
-                    f"CONFLICT RESOLUTION TO REVIEW:\n"
-                    f"Incoming subtask: {sid}\n"
-                    f"Intent: {payload_judge['incoming_intent']}\n\n"
-                    f"Already-integrated subtasks: "
-                    f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
-                    f"MERGED RESULT:\n"
-                    f"Commit: {merge_head_sha}\n\n"
-                    f"{merge_diff}\n\n"
-                    f"Attack the merged result for behavioral breakage. "
-                    f"Return only the JSON object per your schema."
-                )
-                return await claude_p(
-                    user_prompt=user_prompt, system_prompt=sys_prompt_judge,
-                    schema_key="integration_judge", cwd=str(repo_root),
-                    allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
-                    caps=caps, st=st,
-                    model=models.get("integration_judge", MODEL_DEFAULT),
-                    effort=efforts.get("integration_judge"),
-                    sid=f"integration_judge-{sid}",
-                    add_dirs=st.data.get("inspect_dirs") or None,
-                )
-
-            def _check_integration(judge_result: dict) -> list[str]:
-                # Thin adapter for `_run_checked_loop`'s `check=` contract.
-                # Deliberately side-effect free: this runs once per round
-                # inside the loop AND again after it, so logging here would
-                # emit each advisory 2-4 times. The post-loop call site logs
-                # the advisory list once.
-                return _partition_integration_defects(judge_result, repo_root)[0]
-
-            # No make_feedback_prompt: detect-and-die, single pass. The
-            # integrator cannot mechanically fix a semantic finding without
-            # re-resolving the conflict from scratch.
-            judge_result, judge_warnings = await _run_checked_loop(
-                invoke=_invoke_integration_judge,
-                check=_check_integration,
-                name=f"integration_judge-{sid}",
-                max_rounds=caps["judgment_check_rounds"],
-            )
-            for w in judge_warnings:
-                log(f"  integration-judge-{sid}: {w}")
-
-            if judge_result is None:
-                # The judge crashed every round (infrastructure). The merge is
-                # already committed and passed the mechanical checks, so degrade
-                # rather than undo it.
-                log(f"  ⚠  integration-judge for {sid} crashed every round; "
-                    "degrading (merge preserved, check_merge_committed already ran)")
-            else:
-                # The single place advisories are logged — see
-                # `_partition_integration_defects`' docstring for why this is
-                # not done inside `_check_integration`.
-                remaining_defects, advisories = _partition_integration_defects(
-                    judge_result, repo_root)
-                for a in advisories:
-                    log(f"  ⚠  integration-judge-{sid}: advisory {a}")
-                if remaining_defects:
-                    # Found behavioral breakage. Unlike the wiring gate (pre-merge),
-                    # we already have a committed merge, so the abort instruction
-                    # differs.
-                    die(
-                        f"integration gate found behavioral defect(s) in the merge "
-                        f"for {sid}:\n" +
-                        "\n".join(f"  • {d}" for d in remaining_defects) +
-                        f"\n\nAn independent review found the merge is textually "
-                        f"clean (no conflict markers, committed) but behaviorally "
-                        f"broken. The merge has been committed to staging. Either "
-                        f"revert it manually and resolve the conflict differently, "
-                        f"or accept the finding and revise one of the conflicting "
-                        f"subtasks' approaches, then re-run with resume."
-                    )
+            # reproduce the same merge. Persists to
+            # `state.data["integration_gate"][sid]` and re-runs on `resume`
+            # via the gate check at the top of this loop — see
+            # `_run_integration_judge_gate`.
+            await _run_integration_judge_gate(
+                sid, staging, results.get(sid, {}), integrated_so_far,
+                caps, st, models, efforts)
 
             integrated.append(sid)
             integrated_so_far.append(sid)
@@ -27428,7 +27520,17 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # the point of resume.
         prior = st.data.get("subtask_status", {})
         remaining = [sid for sid in wave if prior.get(sid) != "complete"]
-        if not remaining:
+        # A sid whose implementer already completed but whose
+        # integration_judge finding is still un-`accept`ed must not be
+        # silently skipped here: `integrate_wave` was never reached for it
+        # this invocation, so the gate check at its loop's top (the one
+        # that re-invokes the judge on resume) never runs either. Without
+        # this, the wave-already-complete shortcut below would advance
+        # `completed_waves` past a merge the gate rejected.
+        gate = st.data.get("integration_gate", {})
+        pending_gate_sids = [sid for sid in wave
+                              if gate.get(sid) and not gate[sid].get("accepted")]
+        if not remaining and not pending_gate_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"all {len(wave)} subtask(s) already complete, skipping")
             st.data["completed_waves"] = wi + 1
@@ -27452,6 +27554,16 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
 
         pairs = await _gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = dict(pairs)
+        # Stand-in entries for sids whose implementer completed in a prior
+        # invocation but who still have a pending, un-accepted
+        # integration_gate finding (see `pending_gate_sids` above) — they
+        # are not in `remaining`/`results` this round, and `integrate_wave`
+        # requires `results[sid]["status"] == "complete"` to process a sid
+        # at all. The gate re-invocation itself only needs `sid`'s status;
+        # `intent`/`criteria_results` are unavailable this far removed from
+        # the original settle and are omitted rather than fabricated.
+        for sid in pending_gate_sids:
+            results.setdefault(sid, {"status": "complete"})
 
         blocked = [s for s, r in results.items()
                    if r.get("status") in ("blocked", "failed")]

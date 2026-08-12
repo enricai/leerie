@@ -35,73 +35,74 @@ EFFORTS = {"integrator": "low", "integration_judge": "medium"}
 
 class TestWiring:
     def test_invokes_integration_judge_after_merge_committed(self, leerie):
-        """The judge is invoked after check_merge_committed passes, before
-        appending to integrated."""
+        """The judge (via the shared `_run_integration_judge_gate` helper —
+        see the "Integration gate resume" refactor) is invoked after
+        check_merge_committed passes, before appending to integrated."""
         src = inspect.getsource(leerie.integrate_wave)
-        assert 'schema_key="integration_judge"' in src
-        # The judge call must sit between check_merge_committed and the
-        # LAST integrated.append(sid) line (after the judge block).
+        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
+        assert 'schema_key="integration_judge"' in gate_src
+        # The helper call must sit between check_merge_committed and the
+        # LAST integrated.append(sid) line (after the judge block) in
+        # integrate_wave's own source.
         i_merge_check = src.index("check_merge_committed(staging)")
-        i_judge = src.index('schema_key="integration_judge"')
-        # Find the last occurrence of integrated.append(sid)
+        i_helper_call = src.index("await _run_integration_judge_gate(",
+                                   i_merge_check)
         i_append = src.rindex("integrated.append(sid)")
-        assert i_merge_check < i_judge < i_append
+        assert i_merge_check < i_helper_call < i_append
 
     def test_uses_run_checked_loop(self, leerie):
         """integration_judge is invoked via _run_checked_loop for bounded
         fresh-session retry on WorkerError."""
-        src = inspect.getsource(leerie.integrate_wave)
-        # Find the integration_judge invocation context
-        judge_idx = src.index('schema_key="integration_judge"')
-        # Look backward from the judge call to find _run_checked_loop
-        before_judge = src[:judge_idx]
-        assert "_run_checked_loop(" in src
+        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
+        judge_idx = gate_src.index('schema_key="integration_judge"')
+        assert "_run_checked_loop(" in gate_src
         # The loop should be nearby the judge invocation
-        loop_idx = src.rindex("_run_checked_loop(", 0, judge_idx + 1000)
-        assert loop_idx < judge_idx
+        loop_idx = gate_src.index("_run_checked_loop(", judge_idx)
+        assert loop_idx > judge_idx
 
     def test_is_detect_and_die_no_re_drive(self, leerie):
         """The integration gate is detect-and-die, single pass — it does NOT
         re-drive the integrator (cannot mechanically fix a semantic finding),
         i.e. it passes no make_feedback_prompt to _run_checked_loop for the
         judge invocation."""
-        src = inspect.getsource(leerie.integrate_wave)
-        # There are TWO _run_checked_loop calls: one for the integrator
-        # (HAS make_feedback_prompt), one for the integration_judge (does NOT).
-        # Find the judge's _run_checked_loop by looking after the judge def.
-        judge_def_idx = src.index("def _check_integration(judge_result: dict)")
-        judge_loop_idx = src.index("_run_checked_loop(", judge_def_idx)
+        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
+        # There is exactly one _run_checked_loop call in this helper (the
+        # judge's — the integrator's own loop lives in integrate_wave, which
+        # DOES pass make_feedback_prompt).
+        judge_def_idx = gate_src.index("def _check_integration(judge_result: dict)")
+        judge_loop_idx = gate_src.index("_run_checked_loop(", judge_def_idx)
         # Find the end of that _run_checked_loop call
-        loop_end = src.index(")", judge_loop_idx + 500)
-        judge_loop_block = src[judge_loop_idx:loop_end]
+        loop_end = gate_src.index(")", judge_loop_idx + 500)
+        judge_loop_block = gate_src[judge_loop_idx:loop_end]
         # This loop should NOT have make_feedback_prompt
         assert "make_feedback_prompt=" not in judge_loop_block
 
     def test_dies_on_concrete_defect(self, leerie):
         """A non-empty concrete-defect result die()s with the defect named."""
-        src = inspect.getsource(leerie.integrate_wave)
+        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
         # After the judge invocation, there must be a die() on defects
-        judge_idx = src.index('schema_key="integration_judge"')
-        after_judge = src[judge_idx:]
+        judge_idx = gate_src.index('schema_key="integration_judge"')
+        after_judge = gate_src[judge_idx:]
         assert "die(" in after_judge
         assert "integration gate found behavioral defect" in after_judge
 
     def test_degrades_on_worker_error(self, leerie):
         """A WorkerError on every round degrades: merge preserved (no revert),
         since check_merge_committed already ran."""
-        src = inspect.getsource(leerie.integrate_wave)
-        judge_idx = src.index('schema_key="integration_judge"')
-        after_judge = src[judge_idx:]
+        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
+        judge_idx = gate_src.index('schema_key="integration_judge"')
+        after_judge = gate_src[judge_idx:]
         # Must check for judge_result is None and degrade
         assert "if judge_result is None:" in after_judge
         assert "degrading" in after_judge
-        # Must NOT revert/abort the merge on None
+        # Must NOT revert/abort the merge on None. The None branch is a
+        # single `if` block that returns immediately — bound it precisely
+        # by that `return`, not by the next `else:`/`die(` text (both of
+        # which appear later, in this helper's clean/gating-defect path,
+        # and a prose comment mentioning `die()ing` also falls inside a
+        # loosely-bounded window).
         none_branch_start = after_judge.index("if judge_result is None:")
-        # Look for the next die() or else: to bound the None branch
-        try:
-            none_branch_end = after_judge.index("else:", none_branch_start)
-        except ValueError:
-            none_branch_end = after_judge.index("integrated.append(sid)", none_branch_start)
+        none_branch_end = after_judge.index("return", none_branch_start)
         none_branch = after_judge[none_branch_start:none_branch_end]
         assert "merge --abort" not in none_branch
         assert "die(" not in none_branch

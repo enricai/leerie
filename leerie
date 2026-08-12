@@ -1889,6 +1889,263 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     fi
     exit 0
     ;;
+  accept-integration)
+    # Mark a recorded integration_gate finding for <sid> accepted so
+    # resume's gate check (integrate_wave, orchestrator/leerie.py) stops
+    # re-invoking integration_judge for it and treats the already-committed
+    # merge as fine to advance past. Mirrors accept-blocked's shape and
+    # local/Fly/EC2 state-mutation machinery exactly; the only difference is
+    # which state.json field is mutated and the not-yet-accepted-vs-accepted
+    # precondition.
+    # Usage: leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _ai_run_id=""
+    _ai_sid=""
+    _ai_runtime=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runtime) _ai_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _ai_runtime="${1#--runtime=}"; shift ;;
+        --*) remote_log "unknown accept-integration flag: $1"; exit 1 ;;
+        *)
+          if [ -z "$_ai_run_id" ]; then _ai_run_id="$1"; shift
+          elif [ -z "$_ai_sid" ]; then _ai_sid="$1"; shift
+          else remote_log "unexpected accept-integration arg: $1"; exit 1
+          fi
+          ;;
+      esac
+    done
+    if [ -z "$_ai_run_id" ] || [ -z "$_ai_sid" ]; then
+      remote_log "accept-integration requires <run-id> <subtask-id>"
+      echo "  Usage: leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
+      exit 1
+    fi
+    # Same allowlist discipline as accept-blocked (SECURITY.md "Command
+    # injection") — both positionals reach a state-mutating write path and,
+    # on the Fly path, a remote-shell double-parse.
+    case "$_ai_run_id" in
+      *[!A-Za-z0-9._-]*)
+        remote_log "accept-integration: invalid run-id '$_ai_run_id' (allowed chars: A-Za-z0-9._-)"
+        exit 1 ;;
+    esac
+    case "$_ai_sid" in
+      *[!A-Za-z0-9._-]*)
+        remote_log "accept-integration: invalid subtask-id '$_ai_sid' (allowed chars: A-Za-z0-9._-)"
+        exit 1 ;;
+    esac
+    if [ -n "$_ai_runtime" ] && [ "$_ai_runtime" != "fly" ] && [ "$_ai_runtime" != "local" ] && [ "$_ai_runtime" != "ec2" ]; then
+      remote_log "accept-integration: --runtime must be 'local', 'fly', or 'ec2' (got '$_ai_runtime')"
+      exit 1
+    fi
+    _ai_detected="$(_auto_detect_run_runtime "$_ai_run_id" "$_ai_runtime")" || _ai_detected=""
+    if [ -n "$_ai_detected" ]; then
+      _ai_runtime="$_ai_detected"
+    elif [ "$_ai_runtime" != "fly" ] && [ "$_ai_runtime" != "ec2" ]; then
+      _ai_runtime="local"
+    fi
+    _ai_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ai_run_id"
+    if [ ! -d "$_ai_state_dir" ]; then
+      remote_log "accept-integration: no run dir at $_ai_state_dir"
+      exit 1
+    fi
+    _ai_state_file="$_ai_state_dir/state.json"
+    # Same sentinel convention as accept-blocked's _ab_mutate (ACCEPTED: /
+    # NOOP: / ERROR:) so both the local exit code and the Fly/EC2
+    # grep-the-output path can tell the outcome apart.
+    _ai_mutate='
+import json, os, sys, tempfile
+path, sid = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        st = json.load(f)
+except FileNotFoundError:
+    print(f"ERROR: state.json not found at {path}", file=sys.stderr)
+    sys.exit(1)
+gate = st.get("integration_gate", {})
+entry = gate.get(sid)
+if entry is None:
+    print(f"ERROR: subtask {sid!r} not found in integration_gate", file=sys.stderr)
+    sys.exit(1)
+if entry.get("accepted"):
+    print(f"NOOP: subtask {sid!r} integration finding is already accepted")
+    sys.exit(0)
+entry["accepted"] = True
+defects = st.get("integration_defects", {})
+if isinstance(defects, dict):
+    defects.pop(sid, None)
+    if not defects:
+        st.pop("integration_defects", None)
+with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
+    json.dump(st, tmp, indent=2)
+    tmp.write("\n")
+    tmp_path = tmp.name
+os.replace(tmp_path, path)
+print(f"ACCEPTED: {sid!r} integration finding accepted")
+'
+    if [ "$_ai_runtime" = "ec2" ]; then
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _ai_aws_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ai_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _ai_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _ai_aws_creds_exports="$(resolve_aws_credentials ${_ai_aws_creds_args[@]+"${_ai_aws_creds_args[@]}"})" || exit 1
+      eval "$_ai_aws_creds_exports"
+      unset _ai_aws_creds_args _ai_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_ai_state_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "accept-integration: no ec2_instance_id found for run $_ai_run_id"
+        exit 1
+      fi
+      export LEERIE_RUN_ID="$_ai_run_id"
+      _ai_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
+      case "$_ai_ec2_state" in
+        terminated|shutting-down|"")
+          remote_log "accept-integration: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ai_started_instance=false
+      if [ "$_ai_ec2_state" != "running" ]; then
+        remote_log "accept-integration: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
+          remote_log "accept-integration: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          exit 1
+        fi
+        _ai_started_instance=true
+      fi
+      _ai_teardown_ec2() {
+        if [ "$_ai_started_instance" = true ]; then
+          stop_instance
+          _ensure_run_json "$_ai_state_dir" || true
+          update_run_json "$_ai_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+        fi
+      }
+      _ai_remote_state="/work/.leerie/runs/$_ai_run_id/state.json"
+      _ai_out="$(printf '%s' "$_ai_mutate" \
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
+      _ai_sentinel="$(printf '%s\n' "$_ai_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ai_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "accept-integration: $_ai_sentinel"
+          ;;
+        *)
+          remote_log "accept-integration: failed to modify state on instance"
+          [ -n "$_ai_out" ] && remote_log "  output: $_ai_out"
+          _ai_teardown_ec2
+          exit 1
+          ;;
+      esac
+      if [ -f "$_ai_state_file" ]; then
+        python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
+      fi
+      _ai_teardown_ec2
+      remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
+      exit 0
+    fi
+    if [ "$_ai_runtime" = "fly" ]; then
+      if [ -z "${LEERIE_FLY_APP:-}" ]; then
+        remote_log "accept-integration: LEERIE_FLY_APP is required for Fly runs"
+        exit 1
+      fi
+      FLY_APP="${LEERIE_FLY_APP:-}"
+      export FLY_APP
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/provision.sh"
+      require_flyctl || exit 1
+      LEERIE_MACHINE_ID="$_ai_run_id"
+      export LEERIE_MACHINE_ID
+      export LEERIE_RUN_ID="$_ai_run_id"
+      _ai_started_machine=false
+      _ai_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' \
+                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | tr -d '[:space:]' || true)"
+      case "$_ai_mstate" in
+        started|starting) : ;;
+        stopped)
+          remote_log "accept-integration: starting paused machine $LEERIE_MACHINE_ID..."
+          if ! flyctl machine start "$LEERIE_MACHINE_ID" --app "$FLY_APP" >/dev/null 2>&1; then
+            remote_log "accept-integration: flyctl machine start failed for $LEERIE_MACHINE_ID"
+            exit 1
+          fi
+          _ai_started_machine=true
+          wait_for_started "$LEERIE_MACHINE_ID" || {
+            remote_log "accept-integration: machine $LEERIE_MACHINE_ID never reached started state"
+            stop_machine
+            exit 1
+          }
+          ;;
+        destroyed|"")
+          remote_log "accept-integration: machine $LEERIE_MACHINE_ID is destroyed or missing — cannot modify state"
+          exit 1
+          ;;
+        *)
+          remote_log "accept-integration: machine $LEERIE_MACHINE_ID is in state '$_ai_mstate' — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ai_teardown() {
+        if [ "$_ai_started_machine" = true ]; then
+          stop_machine
+          _ensure_run_json "$_ai_state_dir" || true
+          update_run_json "$_ai_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            fly_machine_id "$LEERIE_MACHINE_ID" || true
+        fi
+      }
+      if ! wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID"; then
+        remote_log "accept-integration: machine $LEERIE_MACHINE_ID never became SSH-ready"
+        _ai_teardown
+        exit 1
+      fi
+      _ai_remote_state="/work/.leerie/runs/$_ai_run_id/state.json"
+      _ai_out="$(printf '%s' "$_ai_mutate" \
+        | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+            --pty=false -C "python3 - '$_ai_remote_state' '$_ai_sid'" 2>&1 || true)"
+      _ai_sentinel="$(printf '%s\n' "$_ai_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ai_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "accept-integration: $_ai_sentinel"
+          ;;
+        *)
+          remote_log "accept-integration: failed to modify state on machine"
+          [ -n "$_ai_out" ] && remote_log "  output: $_ai_out"
+          _ai_teardown
+          exit 1
+          ;;
+      esac
+      if [ -f "$_ai_state_file" ]; then
+        python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid" >/dev/null 2>&1 || true
+      fi
+      _ai_teardown
+      remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
+    else
+      # Local: state.json is on the host (bind-mounted into containers).
+      if [ ! -f "$_ai_state_file" ]; then
+        remote_log "accept-integration: no state.json at $_ai_state_file"
+        exit 1
+      fi
+      python3 -c "$_ai_mutate" "$_ai_state_file" "$_ai_sid"
+      remote_log "accept-integration: done. Resume via: leerie resume $_ai_run_id"
+    fi
+    exit 0
+    ;;
   re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
     # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
@@ -5870,7 +6127,7 @@ for arg in "$@"; do
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    finalize|stop|kill|re-seed|accept-blocked|attach|chain|group|config|status|version)
+    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|status|version)
       # Launcher-only verbs — normally dispatched at the top-level case
       # (line ~945) when they appear as $1. If one appears here it was
       # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
