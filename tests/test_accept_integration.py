@@ -33,6 +33,11 @@ import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+from tests.test_accept_blocked import (
+    _expected_remote_state,
+    _make_fake_flyctl,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -363,3 +368,84 @@ def test_skip_integration_check_reaches_finalize_with_zero_judge_calls(
         "integration_judge invocation, even for a sid with a prior "
         "rejected finding")
     assert sid in out, "the skip must still let the sid reach finalize"
+
+
+# ---------------------------------------------------------------------------
+# Remote transports. `accept-integration` mirrors `accept-blocked`'s
+# local/Fly/EC2 machinery, and until now only the local arm was exercised --
+# the same coverage asymmetry that let three structurally-identical copies
+# drift elsewhere in this repo. The Fly stub is imported from
+# tests/test_accept_blocked.py rather than reimplemented (the convention
+# tests/test_fetch_branch_leerie_streamback.py follows), so a change to the
+# transport's shape breaks both files together instead of one silently.
+# ---------------------------------------------------------------------------
+
+def _run_accept_integration_fly(state_path: Path, sid: str,
+                                flyctl: Path) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
+    env["LEERIE_FLY_APP"] = "test-app"
+    env["LEERIE_NONINTERACTIVE"] = "1"
+    env["MACHINE_START_TIMEOUT"] = "10"
+    env["PATH"] = f"{flyctl.parent}:{env.get('PATH', '')}"
+    run_id = state_path.parent.name
+    return subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-integration", run_id, sid,
+         "--runtime", "fly"],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_fly_path_accepts_an_integration_finding(tmp_path):
+    """Wakes the machine, pipes the mutate program over stdin, passes both
+    `-C` positionals correctly (the stub asserts arg1 is the expected remote
+    state path), and flips `accepted` on the machine's copy."""
+    sf = _make_state(tmp_path, {
+        "feat-001": {"defects": [{"what": "races on shutdown"}],
+                     "accepted": False},
+    })
+    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    r = _run_accept_integration_fly(sf, "feat-001", flyctl)
+
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    st = json.loads(sf.read_text())
+    assert st["integration_gate"]["feat-001"]["accepted"] is True
+    assert "ACCEPTED:" in (r.stdout + r.stderr)
+
+
+def test_fly_path_reports_noop_on_already_accepted(tmp_path):
+    sf = _make_state(tmp_path, {
+        "feat-001": {"defects": [], "accepted": True},
+    })
+    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    r = _run_accept_integration_fly(sf, "feat-001", flyctl)
+
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "NOOP:" in (r.stdout + r.stderr)
+
+
+def test_fly_path_rejects_an_injection_sid_before_any_transport(tmp_path):
+    """The `-C` string is double-parsed by the remote shell, so the sid
+    allowlist has to run before flyctl is invoked at all."""
+    sf = _make_state(tmp_path, {"feat-001": {"defects": [], "accepted": False}})
+    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    r = _run_accept_integration_fly(sf, "feat-001'; touch pwned; '", flyctl)
+
+    assert r.returncode != 0
+    assert "invalid subtask-id" in (r.stdout + r.stderr)
+    assert not (tmp_path / "pwned").exists()
+    assert json.loads(sf.read_text())["integration_gate"]["feat-001"]["accepted"] is False
+
+
+def test_all_three_runtimes_are_wired_for_accept_integration():
+    """Structural pin, mirroring test_accept_blocked.py's transport sweep:
+    the verb must dispatch local, Fly AND EC2. A missing arm fails closed at
+    runtime with an unrelated error, which is hard to attribute."""
+    src = (REPO_ROOT / "leerie").read_text()
+    start = src.index("  accept-integration)")
+    end = src.index("\n  *)", start)
+    arm = src[start:end]
+    for needle in ("ec2_remote_exec", "flyctl", "RUNTIME"):
+        assert needle in arm, (
+            f"accept-integration's launcher arm never mentions {needle!r} -- "
+            "one of the three transports is unwired")

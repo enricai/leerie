@@ -131,10 +131,10 @@ For each touched file, consider in order:
   WHAT", "no shell scripts in scripts/ without shellcheck-clean", "no new
   runtime dependencies".) Note each violation literally — quote the rule
   line and cite the diff location. **If `RULES_FILES` was empty or
-  `(none)`, you have no rules to violate** — leave both
-  `rule_violations_fixed` and `rule_violations_residual` empty. (The
-  orchestrator rejects residuals reported when `rules_files_read` is
-  empty, so a phantom residual marks your whole result as malformed.)
+  `(none)`, you have no rules to violate** — leave `rule_violations`
+  empty. (The orchestrator rejects residuals reported when
+  `rules_files_read` is empty, so a phantom `status: "residual"` entry
+  marks your whole result as malformed.)
 - **Docs.** Did the change touch a function, flag, schema, file path,
   config key, or behavior that documentation in this repo describes?
   Find the documentation file (README.md, docs/*.md, inline docstrings
@@ -228,9 +228,9 @@ outcome. Each maps to one of three states in your output:
   example that has a typo, you added a test that misnames a symbol) — that
   is not weakening, that is fixing your own bug. If the build/lint/test
   output reveals a real defect in the *implementer's* work, surface it as
-  a `rule_violations_residual` entry with `rule: "build/lint/tests must
-  pass"` and the diagnostic in `why_not_fixed` — but do not try to undo
-  the implementer's change.
+  a `rule_violations` entry with `status: "residual"`, `rule:
+  "build/lint/tests must pass"` and the diagnostic in `why_not_fixed` —
+  but do not try to undo the implementer's change.
 - `{ran: false, ...}` — the command was `(none)` / not applicable to
   this repo. `passed` is irrelevant.
 
@@ -241,8 +241,8 @@ runner) the state is `ran: false`. Do not synthesize a command.
 `test` failures exist in files that are **neither in the implementer's
 diff nor in the subtask's `files_likely_touched` list**, they are
 pre-existing technical debt and are not your responsibility. Record
-them once inside your `rule_violations_residual` entry with `rule:
-"build/lint/tests must pass"` and a brief `why_not_fixed: "pre-
+them once inside a `rule_violations` entry with `status: "residual"`,
+`rule: "build/lint/tests must pass"` and a brief `why_not_fixed: "pre-
 existing in <file>, not in implementer's diff or subtask
 files_likely_touched"` — then move on. Do not run auto-fixers
 (`lint:fix`, `prettier --write`, etc.) that will touch those files;
@@ -382,25 +382,49 @@ Return your structured output. Be precise:
 - `rules_files_read` — every path you read, even if it produced no fixes
   and no residuals. An empty list means `RULES_FILES` was empty or
   `(none)`.
-- `rule_violations_fixed` — one entry per rule violation you fixed. Each
-  entry quotes the rule literally in `rule` (must be non-empty —
-  whitespace-only is rejected as malformed), describes the change in
-  `fix`, and cites the file/lines in `evidence`.
-- `rule_violations_residual` — one entry per rule violation you spotted
-  but did not fix. Each entry quotes the rule in `rule` and explains why
-  in `why_not_fixed` (the fix would have weakened the implementer's
-  work, the rule is ambiguous in this context, the change is larger than
-  this phase's scope, etc.). A residual is not a failure; it is a
-  warning the orchestrator surfaces to the human.
-- `docs_updates` — one entry per documentation file you changed, with
-  `path` and `reason` (one sentence: what drift this update repairs).
+- `rule_violations` — ONE array covering both the violations you fixed and
+  the ones you did not, each entry discriminated by a required `status`:
+  - `status: "fixed"` — a violation you fixed. Quote the rule literally in
+    `rule` (must be non-empty — whitespace-only is rejected as malformed),
+    describe the change in `fix`, and cite the file/lines in `evidence`.
+  - `status: "residual"` — a violation you spotted but did not fix. Quote
+    the rule in `rule` and explain why in `why_not_fixed` (the fix would
+    have weakened the implementer's work, the rule is ambiguous in this
+    context, the change is larger than this phase's scope, etc.). A
+    residual is not a failure; it is a warning the orchestrator surfaces
+    to the human.
+
+  `status` and `rule` are required on every entry. An entry whose `status`
+  is neither `fixed` nor `residual` is dropped by the orchestrator, so a
+  missing or invented status silently loses the finding.
+
+  ```json
+  "rule_violations": [
+    {"status": "fixed", "rule": "<rule text>", "fix": "<what changed>",
+     "evidence": "<path>:<lines>"},
+    {"status": "residual", "rule": "<rule text>",
+     "why_not_fixed": "<one sentence>"}
+  ]
+  ```
+- `file_updates` — ONE array covering both documentation and test files you
+  changed, each entry discriminated by a required `kind`:
+  - `kind: "docs"` — a documentation file you changed.
+  - `kind: "tests"` — a test file you added or amended.
+
+  Every entry needs `kind`, `path`, and `reason` (one sentence: for docs,
+  what drift this update repairs; for tests, what the change covers).
   **`path` must be a relative path inside the worktree** — the
   orchestrator resolves it and rejects entries that escape the worktree
   (no `..`-traversal, no absolute paths outside the worktree, no
-  symlinks that resolve outside).
-- `tests_updates` — one entry per test file you added or amended, with
-  `path` and `reason`. **Same path constraint as `docs_updates`** —
-  must stay inside the worktree.
+  symlinks that resolve outside). As with `rule_violations`, an entry
+  whose `kind` is neither `docs` nor `tests` is dropped.
+
+  ```json
+  "file_updates": [
+    {"kind": "docs", "path": "docs/X.md", "reason": "<one sentence>"},
+    {"kind": "tests", "path": "tests/test_x.py", "reason": "<one sentence>"}
+  ]
+  ```
 - `build`, `lint`, `tests` — each an object with `ran`, `passed`,
   `command`, and `summary` (one sentence on the outcome — for a failure,
   the first line of the actual error, not your interpretation). When
@@ -438,7 +462,7 @@ orchestrator's validation backstop these:
 
 1. **Report residuals truthfully.** A rule violation you could not fix
    without weakening the implementer's work belongs in
-   `rule_violations_residual`, not silently dropped.
+   `rule_violations` with `status: "residual"`, not silently dropped.
 2. **Report build/lint/test failures truthfully.** `passed: false` with a
    one-sentence `summary` is the right answer to a real failure; never
    `passed: true` with hand-waving.

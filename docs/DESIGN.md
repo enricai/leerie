@@ -538,6 +538,32 @@ that subtask. This preserves the invariant that external preconditions are
 a human concern while giving the operator an escape hatch for runs that
 would otherwise loop indefinitely.
 
+**The integration gate needs the same escape hatch, for a sharper
+reason.** `integrate_wave` dies on a behavioral defect reported by
+`integration_judge` — an LLM. A false positive there permanently kills a
+run *after* full planning and implementation spend, and the merge is
+already committed to staging, so `resume` re-runs the same judge against
+the same tree and reaches the same verdict. The die() message advised
+"accept the finding", which named no mechanism that existed.
+
+Two pieces make that advice real, and both are necessary. `integrate_wave`
+persists the judge's verdict to `integration_gate[sid]` *before* it dies,
+so a resume can distinguish "not yet reviewed" from "reviewed and
+rejected" from "reviewed and accepted" — `integrate.sh`'s merge is
+idempotent, so without the audit key a resume would see the branch already
+merged and skip silently past a rejected verdict. Then
+`accept-integration <run-id> <subtask-id>` flips that record's `accepted`
+flag, mirroring `accept-blocked`'s local/Fly/EC2 state-mutation machinery.
+Without the key the verb would be undone by the next resume; without the
+verb the key would only ever record a refusal. A resume with an
+unaccepted finding re-invokes the judge rather than dying on the stale
+record, so a verdict that no longer reproduces resolves itself.
+
+`--skip-integration-check` disables the gate wholesale, matching the five
+other gates that already carry a bypass. It is independent of the
+acceptance path: the flag prevents the judge from running at all, while
+acceptance settles a finding the judge has already produced.
+
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
@@ -2688,6 +2714,44 @@ the repo's CLAUDE.md are both loaded into every worker's context — and, when
 the strict-output proxy is active, names it first (see §7 *Forcing
 constrained decoding*).
 
+**Worktrees are also pruned mid-run, not only at cleanup.** Once
+`integrate_wave` reports a subtask's branch merged into staging, that
+subtask's worktree is dead weight — the commits live in the branch, which
+survives worktree removal — so `phase_execute` removes it immediately
+rather than waiting for run end. Without this, every worktree a run ever
+created persisted until the run finished: at 30–87 subtasks against a
+repo whose `node_modules` is ~1.4 GB, that is the measured 51 GB that
+killed two runs with an unhandled `ENOSPC`.
+
+The prune is scoped to *integrated* subtasks specifically. A `blocked` or
+`failed` subtask keeps its worktree, because that tree is exactly what an
+operator inspects by hand before settling it with `accept-blocked` or
+`accept-integration`. Pruning the whole wave instead would destroy the
+evidence those verbs exist to act on.
+
+**Why a worktree costs what it does.** The per-worktree figure varies by
+roughly 20x with something leerie does not control, which is why the disk
+check measures it rather than assuming it. Package managers like pnpm are
+content-addressed and normally *hardlink* from a shared store into each
+`node_modules`, so a second checkout of the same dependency set costs
+almost nothing — measured on a host where the store and the tree share a
+mount, 95.4% of `node_modules` bytes are hardlinked and the private
+remainder is 65 MiB against a 1.37 GiB tree. But leerie bind-mounts the
+package-manager store and the state directory as *separate* mounts, and
+Linux refuses `link()` across different mounts even when both resolve to
+the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
+new_path.mnt` check returns `EXDEV`). The store therefore cannot hardlink
+into a worktree, pnpm falls back to copying, and each worktree pays full
+freight. That is the second, independent multiplier behind the 51 GB —
+the mid-run prune bounds how many such trees coexist, and the disk check
+sizes against a measured one rather than a guessed constant.
+
+Colocating the store with the worktrees on one mount would collapse the
+per-worktree cost by that same ~20x and is the more fundamental fix, but
+it changes runtime behaviour across the local, Fly and EC2 runtimes and
+both privilege models, so it is deliberately held as a separate change
+rather than folded into the guardrail.
+
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
@@ -4085,14 +4149,15 @@ coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `resume`,
-`stop`, `kill`, `accept-blocked`, or `finalize` targets a run
+`stop`, `kill`, `accept-blocked`, `accept-integration`, or `finalize`
+targets a run
 whose state directory contains a `fly-machine.json` or
 `ec2-instance.json` sidecar and no explicit `--runtime` was given, the
 launcher auto-promotes to `fly` or `ec2` respectively via the shared
 `_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
 as a thin Fly-only wrapper for call sites not yet migrated). `stop`,
-`kill`, `accept-blocked`, `finalize` and `resume` all wire real EC2
-actions; no verb fails closed on EC2 any more. `resume` promotes
+`kill`, `accept-blocked`, `accept-integration`, `finalize` and `resume`
+all wire real EC2 actions; no verb fails closed on EC2 any more. `resume` promotes
 `RUNTIME=ec2` exactly as it promotes `fly`, reaching the dispatch
 branch's sidecar → `resume_instance()` path. `finalize` streams the
 completed run back with `fetch_state_ec2()` and then runs the same
@@ -6567,10 +6632,26 @@ progress — without depending on a channel that does not exist:
    again; the chain is capped. Exhausting the cap means the subtask was
    mis-scoped — it is reported as blocked for re-decomposition, not retried
    forever.
-5. **Involuntary handoffs reuse the same envelope.** A worker that hits the
-   per-process wall-clock cap (`worker_timeout_sec`, default 90 min) or that
-   produces no schema-valid result after retry is forced into the same
-   `incomplete-handoff` shape by the orchestrator. The successor is spawned
+5. **Involuntary handoffs reuse the same envelope.** A worker that hits its
+   per-process wall-clock ceiling or that produces no schema-valid result
+   after retry is forced into the same `incomplete-handoff` shape by the
+   orchestrator.
+
+   That ceiling is **per worker type**, not one number for everything. A
+   single global cap has to be sized for the slowest worker, so a hung
+   `classifier` — real work measured at a p99 of about 7 minutes — held its
+   phase for the same 90 minutes a full `implementer` legitimately needs.
+   The ceilings are therefore derived from the observed duration
+   distribution of the run corpus rather than chosen, with headroom over
+   each worker's slowest *observed* call, not merely its p99: a rule
+   anchored only to a percentile can sit under the tail it was derived
+   from, which for the planner it demonstrably did. Workers whose derived
+   ceiling reaches the global cap are simply left at it.
+
+   Because that distribution comes from one host, an operator can bypass
+   the whole table with an explicit global override — necessarily a bypass
+   rather than a bound, since the operator who needs it is the one whose
+   worker is being killed at a ceiling measured on a faster machine. The successor is spawned
    exactly as for a voluntary handoff and validates whatever partial
    checkpoint exists. If no checkpoint was written, the missing-checkpoint
    case routes through the corrective-retry path (see §13 caps) and is

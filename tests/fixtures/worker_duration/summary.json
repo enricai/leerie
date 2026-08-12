@@ -1,0 +1,176 @@
+{
+  "_comment": "Derived per-worker-type duration distribution (seconds) from a real leerie state root. Regenerate with scripts/measure/worker_durations.py. Raw calls.ndjson is not committed: it contains full prompt/response text.",
+  "worker_timeout_sec_at_measurement": 5400,
+  "total_calls": 15951,
+  "censored_calls": 1,
+  "workers": {
+    "fit_judge": {
+      "n": 4504,
+      "p50": 23.3,
+      "p95": 90.8,
+      "p99": 624.8,
+      "max": 658.3,
+      "censored_at_cap": 0
+    },
+    "planner": {
+      "n": 2662,
+      "p50": 242.8,
+      "p95": 709.8,
+      "p99": 1696.8,
+      "max": 5247.6,
+      "censored_at_cap": 0
+    },
+    "conformer": {
+      "n": 2534,
+      "p50": 777.8,
+      "p95": 2665.8,
+      "p99": 4115.5,
+      "max": 5608.9,
+      "censored_at_cap": 1
+    },
+    "satisfied_probe": {
+      "n": 2230,
+      "p50": 23.8,
+      "p95": 101.2,
+      "p99": 617.9,
+      "max": 1051.0,
+      "censored_at_cap": 0
+    },
+    "implementer": {
+      "n": 2191,
+      "p50": 269.7,
+      "p95": 1061.1,
+      "p99": 2127.6,
+      "max": 5357.2,
+      "censored_at_cap": 0
+    },
+    "classifier": {
+      "n": 334,
+      "p50": 92.8,
+      "p95": 212.2,
+      "p99": 411.7,
+      "max": 748.2,
+      "censored_at_cap": 0
+    },
+    "splitter": {
+      "n": 264,
+      "p50": 39.6,
+      "p95": 154.0,
+      "p99": 663.7,
+      "max": 715.8,
+      "censored_at_cap": 0
+    },
+    "plan_overlap_judge": {
+      "n": 195,
+      "p50": 127.5,
+      "p95": 309.0,
+      "p99": 605.7,
+      "max": 819.3,
+      "censored_at_cap": 0
+    },
+    "classification_judge": {
+      "n": 181,
+      "p50": 30.2,
+      "p95": 112.4,
+      "p99": 622.3,
+      "max": 638.0,
+      "censored_at_cap": 0
+    },
+    "reconciler": {
+      "n": 105,
+      "p50": 76.1,
+      "p95": 205.6,
+      "p99": 226.3,
+      "max": 282.2,
+      "censored_at_cap": 0
+    },
+    "provision_judge": {
+      "n": 99,
+      "p50": 18.5,
+      "p95": 320.7,
+      "p99": 617.9,
+      "max": 620.2,
+      "censored_at_cap": 0
+    },
+    "artifact_registry": {
+      "n": 89,
+      "p50": 28.3,
+      "p95": 183.3,
+      "p99": 620.9,
+      "max": 625.2,
+      "censored_at_cap": 0
+    },
+    "task_coverage_judge": {
+      "n": 89,
+      "p50": 44.4,
+      "p95": 161.4,
+      "p99": 277.3,
+      "max": 294.4,
+      "censored_at_cap": 0
+    },
+    "wiring_judge": {
+      "n": 77,
+      "p50": 88.5,
+      "p95": 223.9,
+      "p99": 259.4,
+      "max": 269.6,
+      "censored_at_cap": 0
+    },
+    "integrator": {
+      "n": 75,
+      "p50": 123.8,
+      "p95": 403.0,
+      "p99": 590.0,
+      "max": 699.1,
+      "censored_at_cap": 0
+    },
+    "dep_capture": {
+      "n": 72,
+      "p50": 12.1,
+      "p95": 40.5,
+      "p99": 113.3,
+      "max": 227.2,
+      "censored_at_cap": 0
+    },
+    "pr_writer": {
+      "n": 63,
+      "p50": 36.7,
+      "p95": 76.6,
+      "p99": 91.4,
+      "max": 101.1,
+      "censored_at_cap": 0
+    },
+    "rebaser": {
+      "n": 62,
+      "p50": 46.9,
+      "p95": 307.8,
+      "p99": 456.9,
+      "max": 596.2,
+      "censored_at_cap": 0
+    },
+    "integration_judge": {
+      "n": 60,
+      "p50": 59.3,
+      "p95": 188.7,
+      "p99": 244.3,
+      "max": 309.3,
+      "censored_at_cap": 0
+    },
+    "adherence_judge": {
+      "n": 34,
+      "p50": 32.5,
+      "p95": 190.1,
+      "p99": 553.0,
+      "max": 648.6,
+      "censored_at_cap": 0
+    },
+    "provision": {
+      "n": 31,
+      "p50": 27.4,
+      "p95": 114.7,
+      "p99": 490.1,
+      "max": 634.0,
+      "censored_at_cap": 0
+    }
+  }
+}

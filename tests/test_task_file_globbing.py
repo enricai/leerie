@@ -141,37 +141,48 @@ class TestUnreachableTaskReferences:
     """`_glob_task_references` silently drops a path outside the repo --
     correct for prose, but a `~`-prefixed or absolute path that the planner
     can genuinely never read (e.g. a plan file left in `~/.claude/plans/`)
-    should not vanish without a trace."""
+    should not vanish without a trace.
 
-    def test_home_relative_plan_path_warns(self):
+    `repo_root` is required (not defaulted to cwd): the `../` shape added by
+    N33 has to resolve against the repo, and a cwd default would silently
+    resolve against whatever directory the container happened to start in.
+    These cases are all `/`- or `~`-shaped, so the root only has to exist."""
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        root = tmp_path / "repo"
+        root.mkdir()
+        return root
+
+    def test_home_relative_plan_path_warns(self, repo):
         got = leerie._unreachable_task_references(
-            "Implement the plan in ~/.claude/plans/redesign.md")
+            "Implement the plan in ~/.claude/plans/redesign.md", repo)
         assert got == ["~/.claude/plans/redesign.md"]
 
-    def test_ordinary_prose_does_not_warn(self):
+    def test_ordinary_prose_does_not_warn(self, repo):
         assert leerie._unreachable_task_references(
-            "e.g. do this, i.e. not that") == []
-        assert leerie._unreachable_task_references("this is * important") == []
-        assert leerie._unreachable_task_references("**Root** cause **log**") == []
+            "e.g. do this, i.e. not that", repo) == []
+        assert leerie._unreachable_task_references("this is * important", repo) == []
+        assert leerie._unreachable_task_references("**Root** cause **log**", repo) == []
 
-    def test_genuine_in_repo_reference_does_not_warn(self, tmp_path, monkeypatch):
+    def test_genuine_in_repo_reference_does_not_warn(self, repo, tmp_path, monkeypatch):
         (tmp_path / "spec.md").write_text("spec")
         monkeypatch.chdir(tmp_path)
         assert leerie._unreachable_task_references(
-            "see spec.md for details") == []
+            "see spec.md for details", repo) == []
 
-    def test_absolute_path_outside_repo_still_warns(self, tmp_path):
+    def test_absolute_path_outside_repo_still_warns(self, repo, tmp_path):
         missing = tmp_path / "nowhere" / "plan.md"
-        got = leerie._unreachable_task_references(f"see {missing} for details")
+        got = leerie._unreachable_task_references(f"see {missing} for details", repo)
         assert got == [str(missing)]
 
-    def test_existing_home_relative_path_does_not_warn(self, tmp_path, monkeypatch):
+    def test_existing_home_relative_path_does_not_warn(self, repo, tmp_path, monkeypatch):
         home = tmp_path / "home"
         home.mkdir()
         (home / "plan.md").write_text("plan")
         monkeypatch.setenv("HOME", str(home))
         assert leerie._unreachable_task_references(
-            "see ~/plan.md for details") == []
+            "see ~/plan.md for details", repo) == []
 
     # --- the reference must come back CLEAN (N33) ------------------------
     #
@@ -180,25 +191,25 @@ class TestUnreachableTaskReferences:
     # Same class as `_parse_touched_file_line`'s `None.` defect: punctuation
     # the tokenizer never stripped.
 
-    def test_reference_ending_a_sentence_has_no_trailing_period(self):
+    def test_reference_ending_a_sentence_has_no_trailing_period(self, repo):
         assert leerie._unreachable_task_references(
-            "See /etc/nonexistent-leerie-thing.conf.") == [
+            "See /etc/nonexistent-leerie-thing.conf.", repo) == [
                 "/etc/nonexistent-leerie-thing.conf"]
 
-    def test_backticked_reference_keeps_no_backtick_or_period(self):
+    def test_backticked_reference_keeps_no_backtick_or_period(self, repo):
         """The incident's exact shape: a backticked path ending a sentence.
         The two pre-existing strips run in a fixed order, so the backtick is
         unreachable behind the period unless it is rstripped."""
         assert leerie._unreachable_task_references(
-            "Specs live in `~/.claude/plans/so-we-have-to-giggly-gray.md`."
-        ) == ["~/.claude/plans/so-we-have-to-giggly-gray.md"]
+            "Specs live in `~/.claude/plans/so-we-have-to-giggly-gray.md`.",
+            repo) == ["~/.claude/plans/so-we-have-to-giggly-gray.md"]
 
-    def test_parenthesised_reference_is_clean(self):
+    def test_parenthesised_reference_is_clean(self, repo):
         assert leerie._unreachable_task_references(
-            "(see ~/.claude/plans/nope-not-here.md)") == [
-                "~/.claude/plans/nope-not-here.md"]
+            "(see ~/.claude/plans/nope-not-here.md)",
+            repo) == ["~/.claude/plans/nope-not-here.md"]
 
-    def test_a_leading_dot_is_never_stripped(self, tmp_path, monkeypatch):
+    def test_a_leading_dot_is_never_stripped(self, repo, tmp_path, monkeypatch):
         """rstrip, never strip. `.env`, `.github/...`, `./x` and `../x` are
         all real paths whose LEADING dot is meaningful -- a two-sided strip
         mangles every one of them, measured on the sibling defect.
@@ -208,5 +219,88 @@ class TestUnreachableTaskReferences:
         this observable rather than vacuous.
         """
         assert leerie._unreachable_task_references(
-            "check /nonexistent-leerie-root/.github/workflows/ci.yml.") == [
+            "check /nonexistent-leerie-root/.github/workflows/ci.yml.", repo) == [
                 "/nonexistent-leerie-root/.github/workflows/ci.yml"]
+
+
+# ---------------------------------------------------------------------------
+# N33: parent-relative (`../`) references. The shape most likely to mislead,
+# because the file usually DOES exist on the host -- it is simply outside the
+# repo, so `_glob_task_references`' containment re-check drops it and the
+# planner never sees it. The operator has no reason to suspect that.
+# ---------------------------------------------------------------------------
+
+def test_parent_relative_reference_outside_the_repo_is_flagged(leerie, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    outside = tmp_path / "notes.md"
+    outside.write_text("the real instructions\n")
+
+    refs = leerie._unreachable_task_references(
+        "Follow the plan in ../notes.md exactly.", repo)
+
+    assert refs == ["../notes.md"], (
+        "a ../ reference resolving outside the repo must be flagged even "
+        "though the file exists -- the planner cannot read it")
+
+
+def test_parent_relative_reference_back_inside_the_repo_is_not_flagged(leerie, tmp_path):
+    """`../` that lands back inside the root is reachable; warning on it
+    would be the false positive that teaches operators to ignore this."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "spec.md").write_text("real spec\n")
+
+    refs = leerie._unreachable_task_references(
+        "See src/../spec.md for the contract.", repo)
+
+    assert refs == []
+
+
+def test_parent_relative_reference_to_nothing_is_flagged(leerie, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    refs = leerie._unreachable_task_references(
+        "Implement ../gone/spec.md please.", repo)
+    assert refs == ["../gone/spec.md"]
+
+
+def test_parent_relative_warning_does_not_relax_the_containment_guard(leerie, tmp_path):
+    """The warning sits BESIDE the containment guard, never replaces it.
+
+    `_glob_task_references` must still refuse to hand the planner a file
+    outside the repo -- that guard exists because admitting separator-bearing
+    tokens once reached /bin/bash. Flagging the same token for the operator
+    must not start admitting it.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    outside = tmp_path / "notes.md"
+    outside.write_text("outside content\n")
+
+    task = "Follow ../notes.md exactly."
+    assert leerie._unreachable_task_references(task, repo) == ["../notes.md"]
+    assert leerie._glob_task_references(task, repo) == [], (
+        "the containment guard was relaxed -- a file outside the repo is now "
+        "being handed to the planner")
+
+
+def test_prose_with_dot_dot_slash_is_not_flagged(leerie, tmp_path):
+    """False-positive control: the token filters still apply, so ordinary
+    prose and bare emphasis never reach the warning."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    for prose in ("Compare **before** and **after** states.",
+                  "Use e.g. the second approach.",
+                  "Ratio is 3/4 of the total."):
+        assert leerie._unreachable_task_references(prose, repo) == [], prose
+
+
+def test_absolute_and_tilde_shapes_still_flagged_with_a_repo_root(leerie, tmp_path):
+    """Regression control: adding the ../ branch must not disturb the two
+    shapes that already worked, now that the function takes a root."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    refs = leerie._unreachable_task_references(
+        "Read ~/.claude/plans/nope-xyz.md and /tmp/nope-xyz-abs.md first.", repo)
+    assert refs == ["~/.claude/plans/nope-xyz.md", "/tmp/nope-xyz-abs.md"]

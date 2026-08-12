@@ -198,7 +198,8 @@ DEFAULT_CAPS = {
     # If a worker emits no stdout events for this many seconds, log a
     # warning naming the worker, its PID, the elapsed silence, and any
     # stderr tail. Observation-only — does not kill the worker. The
-    # 90-min `worker_timeout_sec` remains the only kill. Surfaces the
+    # wall-clock timeout (per-worker via TIMEOUT_DEFAULT_PER_WORKER, else
+    # this 90-min cap) remains the only kill. Surfaces the
     # silent-hang failure class that otherwise gives the user zero
     # feedback between phase start and the 90-min hard kill.
     "worker_idle_warn_sec": 300,
@@ -543,8 +544,12 @@ STATE_FIELDS = (
     # base if the override branch isn't the actual fork point.
     "pr_base_branch",
     # leerie_version: the version string from .claude-plugin/plugin.json at
-    # the time the run started (or resumed). Persisted so the PR footer can
-    # show the exact version that produced the run, which aids debugging.
+    # the time the run ORIGINALLY started — seeded once and immutable across
+    # resumes (N38). A resume that rewrote it re-attributed the run's whole
+    # event history to whatever release happened to be installed later, which
+    # made pre-fix failures read as post-fix ones. The per-resume history
+    # lives in `leerie_versions` below. Persisted so the PR footer can show
+    # the exact version that produced the run, which aids debugging.
     "leerie_version",
     # leerie_commit: the short sha of $LEERIE_REPO's HEAD at run start, from
     # the launcher's LEERIE_COMMIT. None when leerie was installed from a
@@ -777,15 +782,23 @@ RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
 
 # N30: minimum fraction of the state-dir filesystem's total capacity that
 # must remain free. Below this, leerie refuses to start (preflight) or
-# pauses resumably (mid-run). A fixed byte threshold was considered and
-# rejected — DESIGN's N30 finding is explicit that the right threshold
-# scales with per-worktree cost * remaining subtasks, a quantity that
-# needs external-repo measurement (pnpm store-sharing across worktrees)
-# this subtask's source_of_truth=codebase cannot obtain. A fraction of
-# free space is the finding's own stated fallback: it scales with disk
-# size (a huge disk and a tiny one both get a proportional safety margin)
-# without pretending to know per-run byte cost.
+# pauses resumably (mid-run). This is the FLOOR, not the whole rule — see
+# `_disk_required_bytes` below for the measured, worktree-sized bound that
+# sits on top of it. A proportional floor scales with disk size (a huge
+# disk and a tiny one both keep a proportional margin) without pretending
+# to know per-run byte cost.
 DISK_MIN_FREE_RATIO = 0.05  # 5% free
+
+# Multiplier on the measured worktree cost, covering the staging worktree
+# plus ordinary growth within a wave (a worker installing a dependency its
+# subtask adds). Not a guess about disk size — it multiplies a quantity that
+# is measured on the running repo.
+_DISK_HEADROOM_SAFETY = 1.25
+
+# Measured per-run, keyed by run dir: one subtask worktree's real disk cost.
+# Cached because the walk is O(files-in-node_modules) and the answer does not
+# meaningfully move within a run.
+_WORKTREE_SIZE_CACHE: dict[str, int] = {}
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -860,6 +873,21 @@ WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
 # A positive integer — see resolve_worker_pids_max.
 WORKER_PIDS_MAX_ENV = "LEERIE_WORKER_PIDS_MAX"
 WORKER_PIDS_MAX_FILE = SOURCE_OF_TRUTH_FILE
+
+# Global per-worker wall-clock ceiling, in seconds. Same resolution shape:
+# CLI --worker-timeout wins; then LEERIE_WORKER_TIMEOUT env; then
+# worker_timeout_sec in leerie.toml; then DEFAULT_CAPS["worker_timeout_sec"].
+#
+# This exists because `TIMEOUT_DEFAULT_PER_WORKER` LOWERS the ceiling for 18
+# worker types off a corpus measured on one host, and its own comment
+# concedes "a slower machine, a colder cache, or a larger repo all shift the
+# whole distribution right." Without an override an operator whose
+# `classifier` legitimately runs past its 1236 s ceiling on a cold cache gets
+# a forced `incomplete-handoff` and no way to raise it — every comparable cap
+# (`max_parallel`, `worker_pids_max`, `max_workers`, `confidence_rounds`)
+# carries CLI > env > TOML, and this one shipped with none.
+WORKER_TIMEOUT_ENV = "LEERIE_WORKER_TIMEOUT"
+WORKER_TIMEOUT_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
 # step at finalize. Resolution order: --no-push CLI flag → LEERIE_NO_PUSH
@@ -1170,6 +1198,94 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "conformer": "low",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
+
+# Per-worker wall-clock ceilings, in seconds (N25). A worker absent from this
+# table falls through to `DEFAULT_CAPS["worker_timeout_sec"]` (5400 s / 90
+# min), which remains the global backstop — this table only ever *lowers* the
+# ceiling for worker types measured to be much faster, so a hung classifier
+# no longer holds its phase for the same 90 minutes as a full implementer.
+#
+# The values are DERIVED, not chosen. `tests/fixtures/worker_duration/
+# summary.json` holds the measured per-worker distribution (15,951 calls
+# across 21 worker types, 153 runs; regenerate with
+# `scripts/measure/worker_durations.py <state-root>`), and each entry is
+#
+#     min(cap, max(_WORKER_TIMEOUT_FLOOR_SEC, ceil(p99*3), ceil(max*1.2)))
+#
+# The x3-of-p99 headroom is deliberate: the work order's own constraint is
+# that "a timeout below a legitimate p99 turns a slow worker into a failed
+# one," and this corpus is one host's — a slower machine, a colder cache, or
+# a larger repo all shift the whole distribution right. The floor keeps a
+# worker with a tiny or unusually fast sample from getting a ceiling that
+# normal variance trips.
+#
+# The `max*1.2` term is not decoration. `planner`'s p99 is 1,696.8 s, so the
+# x3 rule alone yields 5,091 s — but its observed MAXIMUM is 5,247.6 s, so
+# that ceiling would have killed a planner run this very corpus contains.
+# Guarding on the observed max instead pushes planner to the global cap,
+# where it is omitted. A rule derived only from a percentile can sit under
+# the tail it was derived from; this is the term that prevents it.
+#
+# Censoring check (the reason these p99s can be trusted at all): `_invoke`
+# bounds one attempt with `wait_for(timeout=...)`, so a latency at the cap is
+# a killed worker, not a measured duration. Exactly 1 of 15,951 calls sits at
+# or above the cap (0.006%), so the distribution is effectively uncensored.
+# `conformer`, `implementer` and `planner` land at the global cap under the
+# rule and are therefore omitted rather than listed redundantly at 5400.
+_WORKER_TIMEOUT_FLOOR_SEC = 600
+TIMEOUT_DEFAULT_PER_WORKER: dict[str, int] = {
+    "fit_judge": 1875,             # p99 624.8
+    "satisfied_probe": 1854,       # p99 617.9
+    "classifier": 1236,            # p99 411.7
+    "splitter": 1992,              # p99 663.7
+    "plan_overlap_judge": 1818,    # p99 605.7
+    "classification_judge": 1867,  # p99 622.3
+    "reconciler": 679,             # p99 226.3
+    "provision_judge": 1854,       # p99 617.9
+    "artifact_registry": 1863,     # p99 620.9
+    "task_coverage_judge": 832,    # p99 277.3
+    "wiring_judge": 779,           # p99 259.4
+    "integrator": 1770,            # p99 590.0
+    "dep_capture": 600,            # p99 113.3 -> floor
+    "pr_writer": 600,              # p99  91.4 -> floor
+    "rebaser": 1371,               # p99 456.9
+    "integration_judge": 733,      # p99 244.3
+    "adherence_judge": 1659,       # p99 553.0
+    "provision": 1471,             # p99 490.1
+}
+
+
+def resolve_worker_timeout(worker: str, caps: dict) -> int:
+    """Wall-clock ceiling for one `worker` invocation, in seconds.
+
+    Two tiers, and which one applies turns on whether the operator said
+    anything:
+
+    - **No explicit global** (the resolved cap still equals
+      `DEFAULT_CAPS["worker_timeout_sec"]`): the per-worker table applies,
+      lowering the ceiling for the 18 measured-fast worker types and leaving
+      everything else at the default.
+    - **An explicit global** (`--worker-timeout` / `LEERIE_WORKER_TIMEOUT` /
+      `worker_timeout_sec` in `leerie.toml` resolved to anything else): that
+      value wins outright and the table is bypassed.
+
+    The explicit tier has to win rather than merely bound, or the escape
+    hatch does not reach the case that needs it. The table is derived from a
+    corpus measured on ONE host, and its own comment concedes a slower
+    machine or colder cache shifts the whole distribution right — so the
+    operator most likely to reach for the flag is precisely the one whose
+    `classifier` is being killed at its 1236 s table ceiling. A `min()`
+    against the global would leave that operator with no way up. This mirrors
+    `resolve_worker_memory_max`, where an explicit value likewise bypasses
+    the derivation instead of being clamped by it.
+    """
+    global_cap = caps.get("worker_timeout_sec",
+                          DEFAULT_CAPS["worker_timeout_sec"])
+    if global_cap != DEFAULT_CAPS["worker_timeout_sec"]:
+        return global_cap
+    return TIMEOUT_DEFAULT_PER_WORKER.get(worker, global_cap)
+
+
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
@@ -5422,6 +5538,24 @@ def resolve_worker_memory_max(repo_root: Path,
     return needed
 
 
+def resolve_worker_timeout_sec(repo_root: Path,
+                               cli_value: int | None = None) -> int:
+    """Resolve the GLOBAL per-worker wall-clock ceiling. Order:
+    --worker-timeout CLI flag → LEERIE_WORKER_TIMEOUT env →
+    leerie.toml `worker_timeout_sec` → DEFAULT_CAPS["worker_timeout_sec"].
+
+    Distinct from `resolve_worker_timeout(worker, caps)`, which picks the
+    ceiling for ONE worker; this resolves the global that feeds it. An
+    explicitly set value bypasses `TIMEOUT_DEFAULT_PER_WORKER` entirely —
+    see that function's docstring for why the escape hatch has to win rather
+    than clamp."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=WORKER_TIMEOUT_ENV, file_key="worker_timeout_sec",
+        file_name=WORKER_TIMEOUT_FILE,
+        default=DEFAULT_CAPS["worker_timeout_sec"])
+
+
 def resolve_worker_pids_max(repo_root: Path,
                             cli_value: int | None = None) -> int:
     """Resolve the per-worker cgroup PID cap (pids.max). Order:
@@ -6327,6 +6461,109 @@ def _disk_free_ratio(path: Path) -> float:
         p = p.parent
     usage = shutil.disk_usage(p)
     return usage.free / usage.total
+
+
+def _measure_worktree_bytes(leerie_dir: Path) -> int | None:
+    """MARGINAL disk cost of one more subtask worktree, measured on this
+    repo (N30). Returns None when no subtask worktree exists to measure.
+
+    **Marginal, not total, and that distinction is the whole point.** Each
+    file is charged `st_blocks * 512 / st_nlink`. A file the package manager
+    hardlinked in from its content-addressed store already occupies those
+    blocks — creating another worktree does not spend them again — so
+    charging the full size answers the wrong question. Dividing by the link
+    count is the right discriminator *by construction*, with no need to
+    detect the host's mount topology:
+
+    - Store and worktree on separate mounts (leerie's own container layout —
+      the pnpm store and the state dir are distinct bind mounts, and Linux
+      refuses `link()` across mounts with EXDEV): the package manager falls
+      back to copying, `st_nlink == 1`, and the file is charged in full.
+    - Store and worktree sharing a mount: `st_nlink` counts the store plus
+      every sibling worktree, and the charge falls to roughly the true
+      marginal cost.
+
+    Measured on a real 1.37 GiB `node_modules`: inode-deduped total 1.31 GiB
+    versus 65 MiB genuinely private to the tree — a 20.7x difference. An
+    earlier revision counted the deduped total and would have demanded ~20x
+    too much space on exactly the well-configured host, which is the failure
+    the measurement exists to avoid.
+
+    Takes the LARGEST candidate rather than an arbitrary one: `iterdir()`
+    yields raw `readdir()` order, so `[0]` is neither sorted nor stable
+    across hosts, and worst-case sizing is the conservative direction for a
+    headroom check. Blocking (`os.walk` over tens of thousands of files —
+    measured 2.1 s warm), so callers on the event loop must use
+    `asyncio.to_thread`.
+    """
+    worktrees = leerie_dir / "worktrees"
+    if not worktrees.is_dir():
+        return None
+    cache_key = str(leerie_dir)
+    if cache_key in _WORKTREE_SIZE_CACHE:
+        return _WORKTREE_SIZE_CACHE[cache_key]
+    candidates = [d for d in worktrees.iterdir()
+                  if d.is_dir() and d.name != "staging"]
+    if not candidates:
+        return None
+
+    largest = 0
+    for candidate in candidates:
+        total = 0
+        seen: set[tuple[int, int]] = set()
+        for dirpath, _dirnames, filenames in os.walk(candidate,
+                                                    followlinks=False):
+            for name in filenames:
+                try:
+                    st_info = os.lstat(os.path.join(dirpath, name))
+                except OSError:
+                    continue  # raced with a worker deleting a build artifact
+                key = (st_info.st_dev, st_info.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += (st_info.st_blocks * 512) // max(st_info.st_nlink, 1)
+        largest = max(largest, total)
+    _WORKTREE_SIZE_CACHE[cache_key] = largest
+    return largest
+
+
+def _disk_required_bytes(leerie_dir: Path, caps: dict) -> int | None:
+    """Free bytes this run needs to finish its next wave, or None if not yet
+    measurable (N30).
+
+    **Scaled by `max_parallel`, NOT by remaining subtasks.** That is a direct
+    consequence of the N31 prune landing: `phase_execute` removes each
+    subtask's worktree as soon as `integrate_wave` reports it merged, so the
+    number of worktrees on disk at once is bounded by the wave's concurrency
+    plus staging — not by how much work is left. Sizing against remaining
+    subtasks would over-demand by an order of magnitude on a long run and
+    pause a run that was never going to fill the disk.
+
+    The per-worktree figure is the MARGINAL cost of one more tree, measured
+    by `_measure_worktree_bytes` rather than assumed, because it varies by
+    ~20x with something leerie does not control: whether the package-manager
+    store can hardlink into the worktree. leerie bind-mounts the pnpm store
+    (`leerie:6779`) and the state dir (`leerie:8307`) as SEPARATE mounts, and
+    Linux refuses `link()` across different mounts even when both resolve to
+    one filesystem (`do_linkat`'s `old_path.mnt != new_path.mnt` check,
+    EXDEV), so pnpm falls back to copying and each worktree pays full
+    freight. Where the store and the tree DO share a mount, 95.4% of
+    node_modules bytes are hardlinked and a second checkout costs 65 MiB
+    instead of 1.37 GiB. Charging per `st_nlink` makes the measurement
+    answer that question by itself — see `_measure_worktree_bytes`.
+
+    Multiplied by `max_parallel` alone, not `+ 1`: the measured tree and
+    staging both already exist on disk at the moment of the check, so their
+    bytes are already absent from `disk_usage().free` and counting them
+    again would double-charge. What the next wave actually adds is up to
+    `max_parallel` fresh worktrees.
+    """
+    per_worktree = _measure_worktree_bytes(leerie_dir)
+    if not per_worktree:
+        return None
+    max_parallel = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
+    return int(per_worktree * max_parallel * _DISK_HEADROOM_SAFETY)
 
 
 def _disk_headroom_message(path: Path, ratio: float) -> str:
@@ -8582,7 +8819,7 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
     return matched
 
 
-def _unreachable_task_references(task: str) -> list[str]:
+def _unreachable_task_references(task: str, repo_root: Path) -> list[str]:
     """Flag task tokens that point outside the repo and resolve to nothing.
 
     A task that delegates its operative content to a path the planner can
@@ -8593,7 +8830,18 @@ def _unreachable_task_references(task: str) -> list[str]:
     reference never even reaches that guard. This is advisory only: it
     never touches `_glob_task_references`'s return value or candidate
     filtering, it only surfaces what would otherwise vanish without a
-    trace."""
+    trace.
+
+    Covers three shapes, all invisible to the planner for different
+    mechanical reasons: absolute (`/…`, excluded as a candidate), `~`-
+    prefixed (never expanded), and **parent-relative (`../…`)**. The last
+    one survives the token-level guard and is dropped later, by
+    `_glob_task_references`'s `is_relative_to(root)` containment re-check —
+    so it needs `repo_root` to be recognised here, and it is the shape most
+    likely to mislead, since the file often really does exist on the host
+    and the operator has no reason to suspect the planner cannot see it.
+    A `../` reference that resolves back INSIDE the repo is reachable and is
+    only flagged if it resolves to nothing."""
     tokens: list[str] = []
     for token in task.split():
         token = token.strip("\"'(),;:").strip("*_`")
@@ -8617,11 +8865,26 @@ def _unreachable_task_references(task: str) -> list[str]:
         has_sep = "/" in token
         if not (has_ext or has_sep):
             continue
-        if token.startswith("/") or token.startswith("~"):
+        if (token.startswith("/") or token.startswith("~")
+                or token.startswith("../")):
             tokens.append(token)
+    root = repo_root.resolve()
     unreachable: list[str] = []
     for token in tokens:
-        if not Path(token).expanduser().is_file():
+        if token.startswith("../"):
+            # Resolved against the repo root, mirroring how
+            # `_glob_task_references` globs (`repo_root / token`) and then
+            # re-checks containment. Flagged when it escapes the root — the
+            # planner cannot read it even though it may well exist — or when
+            # it escapes nothing but resolves to no file at all.
+            try:
+                resolved = (root / token).resolve()
+                if resolved.is_relative_to(root) and resolved.is_file():
+                    continue
+            except (OSError, ValueError):
+                pass
+            unreachable.append(token)
+        elif not Path(token).expanduser().is_file():
             unreachable.append(token)
     return unreachable
 
@@ -14521,18 +14784,37 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     if stdin_data is not None:
         import tempfile  # noqa: PLC0415
         stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-")
-        # fdopen rather than a bare os.write: os.write returns a count and
-        # is permitted to short-write, so writing a 150KB prompt with it
-        # would deliver a TRUNCATED payload on the day it ever did — the
-        # worker would then run on a silently incomplete prompt instead of
-        # failing visibly, which is strictly worse than the bug this
-        # transport replaced. The buffered writer loops internally.
-        with os.fdopen(stdin_fd, "wb") as staged:
-            staged.write(stdin_data.encode())
-        # Opened for reading and handed to the child as its stdin. The
-        # child inherits a dup of this descriptor, so closing ours in the
-        # `finally` does not disturb a still-running worker.
-        stdin_file = open(stdin_path, "rb")
+        # The staging itself is guarded, not just the spawn below. `mkstemp`
+        # has already created the file by this point, so a failure in the
+        # write or the reopen strands it — and the failure most likely to
+        # occur here is ENOSPC, i.e. exactly the disk-exhaustion condition
+        # (N30) that a leaked ~150KB file per retry makes worse. Reap it,
+        # then re-raise unchanged so the real cause is never masked.
+        #
+        # Scope: this reaps the PATH. The realistic failure — ENOSPC from
+        # `staged.write()` — happens inside the `with`, which closes the
+        # descriptor on its way out. `os.fdopen` itself raising would leak
+        # the raw fd (verified: CPython does not close it on a failed
+        # construction), but that path needs an invalid mode on a
+        # just-returned mkstemp fd, i.e. a programming error rather than a
+        # runtime condition.
+        try:
+            # fdopen rather than a bare os.write: os.write returns a count and
+            # is permitted to short-write, so writing a 150KB prompt with it
+            # would deliver a TRUNCATED payload on the day it ever did — the
+            # worker would then run on a silently incomplete prompt instead of
+            # failing visibly, which is strictly worse than the bug this
+            # transport replaced. The buffered writer loops internally.
+            with os.fdopen(stdin_fd, "wb") as staged:
+                staged.write(stdin_data.encode())
+            # Opened for reading and handed to the child as its stdin. The
+            # child inherits a dup of this descriptor, so closing ours in the
+            # `finally` does not disturb a still-running worker.
+            stdin_file = open(stdin_path, "rb")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(stdin_path)
+            raise
 
     # The spawn is guarded because the staged file is created BEFORE the
     # try/finally that normally reaps it, and `create_subprocess_exec` is a
@@ -14938,6 +15220,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # Observation-only stall detector. Wakes every `warn_sec` seconds
         # and warns if the worker has emitted no stdout bytes for that
         # long. Never kills the worker — the 90-min `worker_timeout_sec`
+        # (per-worker via TIMEOUT_DEFAULT_PER_WORKER, else the 90-min cap)
         # remains the only kill. Surfaces the silent-hang failure class
         # that motivated this watchdog: a `claude -p` worker that gets
         # stuck before its first `system/init` event would otherwise
@@ -15422,9 +15705,22 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
     on machines that had one (DESIGN §6 *Zombie reaping*).
 
     `WNOHANG` keeps this non-blocking: a recorded PID that is still alive is
-    skipped now and retried next tick. A PID that is gone (already reaped, or
-    never ours) raises and is dropped. Spawned as a background task by
-    `_orchestrate()` and cancelled in its `finally`, mirroring `_memory_sampler`."""
+    skipped now and retried next tick.
+
+    A raise does NOT by itself mean "drop it" (N36). `ChildProcessError`
+    (ECHILD) on a recorded PID is ambiguous: for a live grandchild — the
+    dominant case here, since these PIDs come from a *worker's* subtree — it
+    means "not ours **yet**", because the worker, not this process, is still
+    the parent. Treating that as "gone" dropped the PID permanently, so the
+    orphan that later reparented was no longer on the allowlist and nothing
+    ever waited it (measured: 779 zombies, ~90% of one container's PID
+    table). The arm therefore consults `_pid_still_exists` and only discards
+    a PID confirmed absent, bounding retention at `_ECHILD_RETRY_MAX_SEC` so
+    a PID that never reparents cannot grow the set without limit. Any other
+    `OSError` is unambiguous and still discards.
+
+    Spawned as a background task by `_orchestrate()` and cancelled in its
+    `finally`, mirroring `_memory_sampler`."""
     while True:
         try:
             for pid in list(_REAPABLE_PIDS):
@@ -15694,7 +15990,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 cmd.append("--dangerously-skip-permissions")
             return cmd
 
-        timeout = caps["worker_timeout_sec"]
+        # Per-worker ceiling (N25), bounded above by the global cap. A hung
+        # `classifier` — measured p99 412 s — no longer holds its phase for
+        # the same 90 minutes a full `implementer` legitimately needs.
+        timeout = resolve_worker_timeout(schema_key, caps)
 
         async def _spawn(retry_note: str) -> dict:
             """One `_invoke` + telemetry + NDJSON capture + non-clean-exit
@@ -18623,7 +18922,7 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_files:
         log(f"  task references {len(task_files)} file(s); "
             "planner will read them")
-    unreachable_refs = _unreachable_task_references(task)
+    unreachable_refs = _unreachable_task_references(task, repo_root)
     if unreachable_refs:
         log(f"  task references {len(unreachable_refs)} path(s) outside the "
             f"repo that leerie cannot read: {', '.join(unreachable_refs)}")
@@ -24708,7 +25007,10 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         # — is an acceptable trade for that recovery chance. An
         # operator-supervised mode that wanted fail-fast semantics
         # would need a separate cap (not currently in scope).
-        timeout = caps.get("worker_timeout_sec", "?")
+        # The ceiling this worker actually ran under, not the global cap
+        # (N25): the two differ for any worker in TIMEOUT_DEFAULT_PER_WORKER,
+        # and reporting the global would name a number that never applied.
+        timeout = resolve_worker_timeout("implementer", caps)
         return {"subtask_id": sid, "status": "incomplete-handoff",
                 "checkpoint_path": str(leerie_dir / "checkpoints" / f"{sid}.md"),
                 "summary": (f"worker timed out after {timeout}s "
@@ -25520,7 +25822,7 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
         # don't let the worker-timeout traceback escape. The conformer
         # phase is advisory; a timed-out conformer becomes one more
         # warning, not a run-killer.
-        timeout = caps.get("worker_timeout_sec", "?")
+        timeout = resolve_worker_timeout("conformer", caps)
         log(f"  {sid}: conformer timed out after {timeout}s")
         return None
 
@@ -26615,7 +26917,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"WorkerError: {e}")
             break
         except subprocess.TimeoutExpired:
-            timeout = caps.get("worker_timeout_sec", "?")
+            timeout = resolve_worker_timeout("conformer", caps)
             warnings.append(f"final conformer round {c_round}: timed out "
                             f"after {timeout}s")
             break
@@ -27843,6 +28145,38 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                 f"before wave {wi + 1} of {len(waves)}: "
                 f"{_disk_headroom_message(leerie_dir, ratio)}")
 
+        # Measured bound on top of the proportional floor: once a worktree
+        # has been measured we know what one more actually costs on THIS
+        # repo and host, so the check stops being a guess. Scaled by wave
+        # concurrency rather than remaining subtasks — the N31 prune below
+        # bounds how many worktrees coexist. Never lowers the floor.
+        #
+        # The measurement itself is seeded AFTER the wave completes and
+        # before the prune (see below), because that is the only moment a
+        # fully-populated subtask worktree exists: at wave entry the
+        # previous wave's trees have been pruned, and a wave cannot even be
+        # reached with un-integrated trees left over (the `blocked` guard
+        # die()s first). So wave 1 falls back to the ratio floor and waves
+        # 2+ consult the cached measurement — `to_thread` because the walk
+        # spans tens of thousands of files (2.1 s warm, measured) and this
+        # runs on the orchestrator's event loop.
+        required = await asyncio.to_thread(_disk_required_bytes, leerie_dir, caps)
+        if required is not None:
+            free = shutil.disk_usage(leerie_dir).free
+            if free < required:
+                per_worktree = await asyncio.to_thread(
+                    _measure_worktree_bytes, leerie_dir)
+                # Quote the same max_parallel the arithmetic used, not a
+                # second read that could disagree with it.
+                sized_for = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
+                raise DiskLowSpace(
+                    f"before wave {wi + 1} of {len(waves)}: "
+                    f"{free / (1024 ** 3):.1f} GB free, but this wave needs "
+                    f"~{required / (1024 ** 3):.1f} GB "
+                    f"({per_worktree / (1024 ** 3):.2f} GB per additional "
+                    f"worktree x {sized_for} parallel, measured on this "
+                    "repo). Free space and resume, or lower --max-parallel.")
+
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
         # individual spawn (the retired _await_worker_memory_admission poll
@@ -27933,6 +28267,25 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # visible signature of a silent integration skip.
         log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
             f"{expected} completed subtask(s)")
+
+        # N30: seed the per-worktree measurement BEFORE the prune below.
+        # This is the only moment in a run when a fully-populated subtask
+        # worktree exists to measure: dependencies are installed by the
+        # worker itself mid-subtask (DESIGN §6½ *Worker-driven install*), so
+        # a freshly-created tree is source-only, and the prune removes every
+        # populated one seconds from now. Measuring at wave entry instead —
+        # which is where the check runs — always found an empty
+        # `worktrees/` and silently disabled the whole bound.
+        #
+        # Cached per run dir, so the wave-entry check on every subsequent
+        # wave consults this value. Best-effort: a measurement failure must
+        # not cost a wave that has already been paid for.
+        try:
+            await asyncio.to_thread(_measure_worktree_bytes, leerie_dir)
+        except OSError as e:
+            log(f"  disk: could not measure worktree size "
+                f"({type(e).__name__}: {e}); headroom check falls back to "
+                "the free-space ratio")
 
         # N31: the worktree (including node_modules) is dead weight once
         # its branch is merged into staging — pruning it here, instead of
@@ -29625,6 +29978,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "/proc/meminfo when unset. Also "
                          f"{WORKER_MEMORY_MAX_ENV} env var or "
                          "worker_memory_max in leerie.toml")
+    ap.add_argument("--worker-timeout", type=_positive_int, metavar="SEC",
+                    help="global per-worker wall-clock ceiling in seconds "
+                         "(positive integer; default "
+                         f"{DEFAULT_CAPS['worker_timeout_sec']}). Setting it "
+                         "BYPASSES the measured per-worker table "
+                         "(TIMEOUT_DEFAULT_PER_WORKER), which otherwise "
+                         "lowers the ceiling for fast worker types — raise "
+                         "it when a worker is being killed at a table "
+                         "ceiling derived on a faster host. "
+                         f"Also {WORKER_TIMEOUT_ENV} env var or "
+                         "worker_timeout_sec in leerie.toml")
     ap.add_argument("--worker-pids-max", type=_positive_int, metavar="N",
                     help="per-worker cgroup PID cap (positive integer; "
                          f"default {DEFAULT_CAPS['worker_pids_max']}). "
@@ -29941,6 +30305,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # broker writes it to the worker cgroup's pids.max.
     caps["worker_pids_max"] = resolve_worker_pids_max(
         Path(os.getcwd()), args.worker_pids_max)
+    # Global wall-clock ceiling. Read by resolve_worker_timeout(worker, caps)
+    # at every claude_p spawn; an explicit value there bypasses the measured
+    # per-worker table (N25).
+    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(
+        Path(os.getcwd()), args.worker_timeout)
     caps["strict_conformer"] = args.strict_conformer
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q
