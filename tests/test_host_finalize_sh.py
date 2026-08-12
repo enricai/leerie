@@ -348,14 +348,32 @@ exit 0
 
 def test_diagnoses_husky_pre_push_hook_failure(tmp_path):
     """git push fails with a husky pre-push hook failure buried under an
-    unrelated cosmetic warning → the diagnostic names the hook and points
-    at --no-verify, alongside (not instead of) the raw stderr."""
+    unrelated cosmetic warning, AND a real executable pre-push hook is
+    present (the mechanical N24 probe) → the diagnostic names the hook
+    and points at --no-verify, alongside (not instead of) the raw
+    stderr. The husky-text stub here is only exercised as the
+    supplementary "which hook" naming signal; classification itself
+    comes from the stubbed rev-parse --git-path pointing at a real,
+    executable hooks/pre-push file."""
     run_dir = _make_run(tmp_path, "feat-h-aaaaaa", run_json={
         "branch": "leerie/runs/feat-h-aaaaaa",
         "working_branch": "main",
         "finished_at": "2026-05-29T16:00:00+00:00",
     })
-    git_body = '''
+    user_repo = tmp_path / "user-repo"
+    hooks_dir = user_repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-push"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    git_body = f'''
+if [ "$1" = "-C" ] && [ "$3" = "config" ]; then
+  exit 1
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "{hooks_dir}"
+  exit 0
+fi
 if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "npm warn config production Use --omit=dev instead." >&2
   echo "husky - pre-push script failed (code 254)" >&2

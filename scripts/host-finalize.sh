@@ -52,6 +52,48 @@ _host_finalize_update_run_json() {
   mv "$tmp" "$sidecar"
 }
 
+# _host_finalize_pre_push_hook_present <repo> — mechanical hook-classification
+# probe (N24). Resolves the hooks directory the same way git itself does
+# (honoring `core.hooksPath` when set, falling back to git's own git-dir-
+# relative default via `rev-parse --git-path hooks` so worktrees and
+# non-standard `.git` layouts resolve correctly too) and tests for an
+# executable `pre-push` file there. Echoes the resolved hook path and
+# returns 0 when an executable pre-push hook exists, 1 otherwise. This is
+# structural — it never inspects push stderr text, unlike vendor-specific
+# prose (husky's banner, "exit code 254") which is arbitrary and misses
+# non-husky or newer-husky hook failures entirely.
+_host_finalize_pre_push_hook_present() {
+  local repo="$1"
+  local hooks_dir
+  hooks_dir="$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$hooks_dir" ]; then
+    case "$hooks_dir" in
+      /*) : ;;                              # already absolute
+      *) hooks_dir="$repo/$hooks_dir" ;;    # relative to the worktree top
+    esac
+  else
+    hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null || true)"
+    # --git-path is always relative to the directory `-C` pointed at, not
+    # to our own cwd (the launcher/repo may differ), so anchor it there.
+    case "$hooks_dir" in
+      /*|"") : ;;
+      *) hooks_dir="$repo/$hooks_dir" ;;
+    esac
+  fi
+  [ -n "$hooks_dir" ] && [ -x "$hooks_dir/pre-push" ]
+}
+
+# _host_finalize_is_auth_or_network_push_error <stderr> — a small, stable
+# exclusion list of git's OWN fixed failure messages (not third-party hook
+# prose). When an executable pre-push hook is present, stderr matching one
+# of these is treated as a genuine push/auth/network failure rather than a
+# hook failure, since git emits the same wording regardless of what hooks
+# happen to be installed.
+_host_finalize_is_auth_or_network_push_error() {
+  printf '%s' "$1" | grep -qiE \
+    'authentication failed|permission denied \(publickey\)|could not resolve host|could not read from remote repository|unable to access|connection timed out|connection refused|repository not found|no route to host'
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
@@ -386,8 +428,11 @@ $_diagnosis"
     echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
     echo "  Push stderr was:" >&2
     printf '    %s\n' "$push_stderr" >&2
-    if printf '%s' "$push_stderr" | grep -qiE 'husky|pre-push script failed|exit code 254'; then
+    if _host_finalize_pre_push_hook_present "$USER_REPO" \
+        && ! _host_finalize_is_auth_or_network_push_error "$push_stderr"; then
       local _hook_name
+      # Vendor-text grep kept only as a supplementary "which hook" naming
+      # signal, per N24's scope note — never as the classification itself.
       _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1)"
       echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
       echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
