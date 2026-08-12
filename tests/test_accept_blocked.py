@@ -86,6 +86,20 @@ def test_errors_on_running_subtask(tmp_path):
     assert "expected blocked or failed" in r.stderr
 
 
+def test_accepts_when_registry_disagrees_with_status_string(tmp_path):
+    # The N19+N22-composed shape: st['blocked'] carries the sid (the
+    # authoritative record of blockage) but subtask_status[sid] is
+    # 'incomplete-handoff', not 'blocked'/'failed'. Gate on registry
+    # membership, not the status string.
+    sf = _make_state(tmp_path, {"s1": "incomplete-handoff"},
+                     blocked={"s1": "checkpoint pending"})
+    r = _run_accept(sf, "s1")
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    assert st["subtask_status"]["s1"] == "complete"
+    assert "s1" not in st.get("blocked", {})
+
+
 def test_cleans_up_empty_blocked_dict(tmp_path):
     sf = _make_state(tmp_path, {"s1": "blocked"},
                      blocked={"s1": "reason"})

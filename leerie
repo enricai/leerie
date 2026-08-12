@@ -1680,11 +1680,12 @@ if cur is None:
 if cur == "complete":
     print(f"NOOP: subtask {sid!r} is already complete")
     sys.exit(0)
-if cur not in ("blocked", "failed"):
+bl = st.get("blocked", {})
+in_registry = isinstance(bl, dict) and sid in bl
+if not in_registry and cur not in ("blocked", "failed"):
     print(f"ERROR: subtask {sid!r} has status {cur!r} (expected blocked or failed)", file=sys.stderr)
     sys.exit(1)
 ss[sid] = "complete"
-bl = st.get("blocked", {})
 if isinstance(bl, dict):
     bl.pop(sid, None)
     if not bl:
