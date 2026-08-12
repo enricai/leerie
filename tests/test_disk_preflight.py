@@ -404,7 +404,7 @@ class TestMeasuredWorktreeSizing:
     def test_returns_none_before_any_worktree_exists(self, tmp_path):
         assert leerie._measure_worktree_bytes(tmp_path) is None
         assert leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS), 4) is None
+            tmp_path, 4) is None
 
     def test_staging_is_not_treated_as_a_subtask_worktree(self, tmp_path):
         self._worktree(tmp_path, "staging", 4096)
@@ -479,6 +479,72 @@ class TestMeasuredWorktreeSizing:
             f"the same as a single-copy tree ({both}) -- both must pay full "
             "freight, since neither has a link outside the tree")
 
+    def test_directory_bytes_are_summed_outside_the_predicate(self):
+        """Portable half of the directory guard.
+
+        The behavioural test below skips on tmpfs (which reports
+        `st_blocks == 0` for directories), and `tmp_path` is on tmpfs on many
+        hosts -- so on those it proves nothing. This checks the mechanism
+        structurally instead, the way `HAS_JQ`/`HAS_TREESITTER`-gated suites
+        in this repo pair an environment-dependent test with one that always
+        runs.
+        """
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(leerie._measure_worktree_bytes)))
+
+        # `dir_bytes` must be accumulated from a stat on the walk's dirpath...
+        assigns = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.AugAssign)
+                   and isinstance(n.target, ast.Name)
+                   and n.target.id == "dir_bytes"]
+        assert assigns, (
+            "_measure_worktree_bytes no longer accumulates directory bytes; "
+            "directories are always marginal (they cannot be hardlinked) and "
+            "are ~1.5x of the cost where the store shares a mount")
+
+        # ...and added to the total OUTSIDE the in_tree/nlink comparison,
+        # which would otherwise zero every directory (nlink >= 2, in_tree 1).
+        src = inspect.getsource(leerie._measure_worktree_bytes)
+        assert "dir_bytes + sum(" in src, (
+            "directory bytes are no longer added outside the link predicate; "
+            "routed through it they would all be charged zero")
+
+    def test_directories_are_charged_outside_the_link_predicate(self, tmp_path):
+        """Directories are the one thing that is ALWAYS marginal.
+
+        Linux forbids hardlinks to directories, so a new worktree always
+        allocates its own. They must bypass the link predicate rather than
+        pass through it: a directory's `st_nlink` is >= 2 (`.`, its parent's
+        entry, each child's `..`) against an in-tree count of 1, so
+        `in_tree >= nlink` charges every one of them ZERO. Adding
+        `_dirnames` to the walk would therefore not have fixed anything --
+        verified before writing this.
+
+        Measured on a real node_modules: 34.0 MiB across 8,531 dirs. That is
+        a 1.5x under-charge where the store shares a mount, because there the
+        files are nearly all store-linked and cost nothing, so the
+        directories ARE most of the marginal cost.
+
+        Skipped on filesystems that report `st_blocks == 0` for directories
+        (tmpfs does), since there is nothing to measure there.
+        """
+        deep = tmp_path / "worktrees" / "feat-001"
+        for i in range(12):
+            deep = deep / f"level{i}"
+        deep.mkdir(parents=True)
+
+        probe = os.lstat(tmp_path / "worktrees" / "feat-001").st_blocks
+        if probe == 0:
+            pytest.skip("filesystem reports st_blocks == 0 for directories")
+
+        measured = leerie._measure_worktree_bytes(tmp_path)
+        assert measured, (
+            "a tree of directories measured zero -- directories are being "
+            "charged through the link predicate, which always zeroes them")
+
     def test_largest_candidate_wins_not_an_arbitrary_one(self, tmp_path):
         """`iterdir()` yields raw readdir order -- neither sorted nor stable
         across hosts. Picking `[0]` could size the wave off a stale or
@@ -507,26 +573,32 @@ class TestMeasuredWorktreeSizing:
         could not catch it.
         """
         self._worktree(tmp_path, "feat-001", 1_000_000)
-        caps = dict(leerie.DEFAULT_CAPS, max_parallel=5)
-
-        small = leerie._disk_required_bytes(tmp_path, caps, 2)
-        large = leerie._disk_required_bytes(tmp_path, caps, 8)
+        small = leerie._disk_required_bytes(tmp_path, 2)
+        large = leerie._disk_required_bytes(tmp_path, 8)
 
         assert small is not None and large is not None
         assert large == pytest.approx(small * 4, rel=0.01), (
             "the requirement does not track the wave size")
 
-    def test_requirement_ignores_max_parallel(self, tmp_path):
-        """Anti-regression for the same premise: concurrency must not enter
-        the arithmetic at all, or the 4x under-demand returns."""
-        self._worktree(tmp_path, "feat-001", 1_000_000)
-        low = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=1), 10)
-        high = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=32), 10)
-        assert low == high, (
-            "max_parallel still affects the requirement; peak coexistence is "
-            "the wave size, not the concurrency")
+    def test_signature_carries_no_concurrency_argument(self):
+        """The requirement must depend on the wave, never on concurrency.
+
+        The previous version of this test passed `max_parallel=1` vs `32`
+        and asserted the answer did not move — which *pinned the deadness*
+        of a parameter the function had stopped reading, and would have
+        passed unchanged if the parameter were deleted. A signature guard
+        fails on reintroduction instead, which is the property that matters:
+        peak worktree coexistence is the wave's size, because the prune runs
+        once per wave rather than per subtask.
+        """
+        import inspect
+        params = set(inspect.signature(leerie._disk_required_bytes).parameters)
+        assert "worktree_count" in params
+        for banned in ("caps", "max_parallel"):
+            assert banned not in params, (
+                f"_disk_required_bytes takes {banned!r} again — the "
+                "requirement must not depend on concurrency, and an unread "
+                "parameter is dead surface")
 
     def test_measurement_is_cached_per_run_dir(self, tmp_path):
         """The walk is O(files in node_modules); re-running it every wave on
@@ -634,7 +706,8 @@ class TestMeasurementIsSeededWhereWorktreesExist:
             "it and the bound is dead code again")
 
     def test_every_measure_call_is_off_the_event_loop(self):
-        """`os.walk` over a real node_modules is 2.1 s warm (58,172 files).
+        """`os.walk` over a real node_modules is ~1.4 s warm / ~2.5 s cold
+        (58,172 files).
         This repo's worst recent bug (#198/#200, 218 workers lost, 12.4% of
         invocations) was a blocked orchestrator loop, and #200's fix was
         `to_thread` for exactly this shape."""
@@ -676,7 +749,7 @@ class TestMeasurementIsSeededWhereWorktreesExist:
 
         # Wave N+1 entry: the requirement must still be computable.
         required = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS), 4)
+            tmp_path, 4)
         assert required is not None, (
             "after the prune the requirement went unmeasurable — the cached "
             "seed is not carrying across the wave boundary, which is the "
@@ -689,7 +762,7 @@ class TestMeasurementIsSeededWhereWorktreesExist:
         (tmp_path / "worktrees" / "staging").mkdir(parents=True)
         assert leerie._measure_worktree_bytes(tmp_path) is None
         assert leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS), 4) is None
+            tmp_path, 4) is None
 
 
 class TestZeroMeasurementIsNotCached:
@@ -714,13 +787,28 @@ class TestZeroMeasurementIsNotCached:
         assert later and later >= 900_000, (
             "the populated tree was not measured — the cached zero stuck")
 
-    def test_zero_warns_once(self, tmp_path, capsys):
-        leerie._worktree_measure_empty_warned = False
+    def test_zero_warns_once(self, tmp_path, capsys, monkeypatch):
+        """The warning is the ONLY signal that the measured bound went away.
+
+        The previous version captured output into an unused local and
+        asserted the module flag flipped — which any zero measurement does.
+        It verified neither that a warning was emitted nor that the second
+        call stayed silent, i.e. neither half of its own name. It also left
+        the process-global flag mutated for the rest of the session.
+        """
+        monkeypatch.setattr(leerie, "_worktree_measure_empty_warned", False)
         (tmp_path / "worktrees" / "feat-001").mkdir(parents=True)
+
         leerie._measure_worktree_bytes(tmp_path)
-        first = capsys.readouterr().err + capsys.readouterr().out
+        first = capsys.readouterr()
+        assert "measured 0 bytes" in (first.out + first.err), (
+            "the degrade to the ratio floor was silent")
+
         leerie._measure_worktree_bytes(tmp_path)
-        assert leerie._worktree_measure_empty_warned is True
+        second = capsys.readouterr()
+        assert "measured 0 bytes" not in (second.out + second.err), (
+            "the warning repeated — 'once per process' is the whole point, "
+            "since this fires per wave on an affected run")
 
     def test_refresh_keeps_a_running_max_across_waves(self, tmp_path):
         """A docs-only first wave must not pin a small figure for the run."""

@@ -196,10 +196,14 @@ def test_ordinary_hook_related_text_is_not_treated_as_auth_or_network():
 
 
 # ---------------------------------------------------------------------------
-# The N24 corpus. Every GIT_FAILURES entry was reproduced against real `git
-# push` on a real repo (including a local HTTP server returning 401 for the
-# Authentication-failed shape, and a real publickey denial against github.com);
-# every HOOK_FAILURES entry is realistic pre-push hook output.
+# The N24 corpus. Eight of the nine GIT_FAILURES entries were reproduced
+# against real `git push` on a real repo (including a local HTTP server
+# returning 401 for the Authentication-failed shape, and a real publickey
+# denial against github.com). The exception is `ssh-timeout`, which is
+# hand-authored: it carries BSD/macOS's `Operation timed out` wording, which
+# a Linux host does not emit (Linux says `Connection timed out`), and the
+# classifier accepts both. Flagged rather than quietly presented as a
+# reproduction. Every HOOK_FAILURES entry is realistic pre-push hook output.
 #
 # The classifier gates an operator hint, so both directions matter: a missed
 # git failure sends them to `--no-verify`, which cannot fix credentials, and a
@@ -286,5 +290,10 @@ def test_hook_output_never_classifies_as_auth_or_network(label, stderr_text):
 
 def test_corpus_covers_both_directions():
     """Anti-vacuity: a corpus that drifted to one side would let a
-    classifier that answers a constant score perfectly."""
+    classifier that answers a constant score perfectly.
+
+    This asserts on literals in this file, so it cannot detect a product
+    regression — its only job is to stop the corpus itself from being
+    hollowed out until one direction is untested.
+    """
     assert len(GIT_FAILURES) >= 8 and len(HOOK_FAILURES) >= 8

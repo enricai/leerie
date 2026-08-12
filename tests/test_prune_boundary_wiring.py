@@ -117,15 +117,41 @@ def test_integrate_wave_never_reports_a_non_complete_subtask(leerie):
         "'complete' — the prune loop's input may now include blocked or "
         "failed subtasks")
 
-    # Polarity matters and a bare "some Compare exists" check misses it: the
+    # Polarity matters, and a bare "some Compare exists" check misses it: the
     # guard clause is `if status != "complete": continue`, so flipping the
     # operator inverts which subtasks reach `integrated` while leaving the
     # comparison node in place.
-    operators = {type(op).__name__
-                 for n in compares for op in n.ops}
-    assert operators <= {"NotEq", "Eq"}, (
-        f"unexpected comparison operator(s) against 'complete': {operators}")
-    assert "NotEq" in operators or "Eq" in operators
+    #
+    # An earlier attempt at this asserted `operators <= {"NotEq", "Eq"}` and
+    # `"NotEq" in operators or "Eq" in operators` — both of which a flip
+    # satisfies, so it was still vacuous for the property it named. What
+    # actually discriminates is the pairing of the operator with what the
+    # branch DOES: `!=` must skip (continue), `==` must not.
+    skipping = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Compare)
+                and any(isinstance(c, ast.Constant) and c.value == "complete"
+                        for c in test.comparators)):
+            continue
+        op = type(test.ops[0]).__name__
+        body_skips = any(isinstance(stmt, ast.Continue) for stmt in node.body)
+        skipping.append((op, body_skips))
+
+    assert skipping, (
+        "no `if <status> <op> 'complete':` branch found in integrate_wave — "
+        "the filter that makes `integrated` safe for the prune is gone")
+    for op, body_skips in skipping:
+        if op == "NotEq":
+            assert body_skips, (
+                "`!= \"complete\"` no longer skips the subtask; non-complete "
+                "subtasks would now reach `integrated` and be pruned")
+        elif op == "Eq":
+            assert not body_skips, (
+                "`== \"complete\"` now skips — the polarity is inverted, so "
+                "COMPLETE subtasks are dropped and blocked ones integrated")
 
 
 def test_prune_helper_never_deletes_the_branch(leerie):

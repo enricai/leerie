@@ -2717,8 +2717,13 @@ constrained decoding*).
 **Worktrees are also pruned mid-run, not only at cleanup.** Once
 `integrate_wave` reports a subtask's branch merged into staging, that
 subtask's worktree is dead weight — the commits live in the branch, which
-survives worktree removal — so `phase_execute` removes it immediately
-rather than waiting for run end. Without this, every worktree a run ever
+survives worktree removal — so `phase_execute` removes it at the end of
+that wave rather than waiting for run end. Note the granularity: the prune
+runs **once per wave**, after every subtask in it has been integrated, not
+as each one finishes. So peak worktree coexistence is the size of a wave,
+which is what the disk check must size against; assuming the finer
+granularity is what made an earlier version of that check demand four
+times too little. Without this, every worktree a run ever
 created persisted until the run finished: at 30–87 subtasks against a
 repo whose `node_modules` is ~1.4 GB, that is the measured 51 GB that
 killed two runs with an unhandled `ENOSPC`.
@@ -2735,7 +2740,7 @@ check measures it rather than assuming it. Package managers like pnpm are
 content-addressed and normally *hardlink* from a shared store into each
 `node_modules`, so a second checkout of the same dependency set costs
 almost nothing — measured on a host where the store and the tree share a
-mount, 95.4% of `node_modules` bytes are hardlinked and the private
+mount, 95.18% of `node_modules` bytes are hardlinked and the private
 remainder is 65 MiB against a 1.37 GiB tree. But leerie bind-mounts the
 package-manager store and the state directory as *separate* mounts, and
 Linux refuses `link()` across different mounts even when both resolve to
@@ -2743,8 +2748,8 @@ the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
 new_path.mnt` check returns `EXDEV`). The store therefore cannot hardlink
 into a worktree, pnpm falls back to copying, and each worktree pays full
 freight. That is the second, independent multiplier behind the 51 GB —
-the mid-run prune bounds how many such trees coexist, and the disk check
-sizes against a measured one rather than a guessed constant.
+the mid-run prune bounds coexistence to one wave's worth of trees, and the
+disk check sizes against a measured one rather than a guessed constant.
 
 Colocating the store with the worktrees on one mount would collapse the
 per-worktree cost by that same ~20x and is the more fundamental fix, but

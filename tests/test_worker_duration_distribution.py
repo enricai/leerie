@@ -6,8 +6,9 @@ observed per-worker-type duration distribution in the run corpus'
 failed one." Until that distribution existed, no table was allowed to ship.
 
 It exists now. `tests/fixtures/worker_duration/summary.json` is the derived
-aggregate of a real state root -- 15,951 calls across 21 worker types from
-153 runs -- produced by `scripts/measure/worker_durations.py`. The raw
+aggregate of a real state root -- 15,951 calls across 21 worker types --
+produced by `scripts/measure/worker_durations.py`. (The run count is not
+recorded in the fixture, so it is not asserted anywhere.) The raw
 `calls.ndjson` is deliberately not committed: it carries full prompt and
 response text for every invocation.
 
@@ -350,7 +351,10 @@ class TestOverrideReachesEveryConsumer:
             "cap is higher — the exact failure its comment forbids")
 
         # Never below the import-time floor: a lowered worker cap must not
-        # make the proxy the first to quit either.
+        # make the proxy the first to quit either. This half is a tautology
+        # given the `max()` in the constructor — it pins the intent, not a
+        # behaviour the constructor could get wrong; the assertion above is
+        # the one that fails on revert.
         lowered = leerie._StrictOutputProxy(
             max_parallel=2, upstream_timeout_sec=60)
         assert lowered._upstream_timeout == leerie._STRICT_PROXY_TIMEOUT_SEC

@@ -236,6 +236,14 @@ DEFAULT_CAPS = {
     # resolved at run start by resolve_worker_demand_estimate, which raises
     # it only for a repo declaring its own Node heap (N14-16).
     "worker_demand_estimate_bytes": None,
+    # Whether the operator set the global wall-clock ceiling anywhere (N25).
+    # Declared here for the same reason as the row above — it is resolved at
+    # run start rather than configured — and because `resolve_worker_timeout`
+    # keys the table bypass on it. False means "nothing was set, apply the
+    # per-worker table"; the value cannot be derived from
+    # `worker_timeout_sec` itself, since explicitly passing the default is
+    # indistinguishable from passing nothing.
+    "worker_timeout_explicit": False,
     # Per-worker cgroup v2 PID cap. Catches runaway fork-bomb behavior
     # from a worker's tool subtree while still admitting a legitimate
     # heavy conformance run. The prior default of 256 was too low for a
@@ -6510,10 +6518,11 @@ def _warn_worktree_measure_empty_once(candidate_count: int) -> None:
         "falls back to the free-space ratio")
 
 
-def _measure_worktree_bytes(leerie_dir: Path,
+def _measure_worktree_bytes(leerie_dir: Path, *,
                             refresh: bool = False) -> int | None:
     """MARGINAL disk cost of one more subtask worktree, measured on this
-    repo (N30). Returns None when no subtask worktree exists to measure.
+    repo (N30). Returns the cached figure when there is nothing new to
+    measure, and `None` only when nothing has ever been measured.
 
     **Marginal, not total, and that distinction is the whole point.** An
     inode is charged only when **every one of its links lives inside the
@@ -6539,8 +6548,16 @@ def _measure_worktree_bytes(leerie_dir: Path,
 
         inode-deduped total ................. 1.31 GiB
         st_blocks // st_nlink ...............  596 MiB
-        empirical marginal cost .............   64.8 MiB
-        all-links-in-tree (this rule) .......   64.8 MiB
+        all-links-in-tree, files only .......   64.8 MiB
+        + directories (this rule) ...........   98.8 MiB
+
+    Note what the third row is and is not: on that corpus every chargeable
+    byte comes from inodes with `st_nlink == 1`, so the interesting half of
+    the predicate (`nlink > 1` but all links in-tree) contributes zero there
+    and the figure does not, on its own, distinguish this rule from a plain
+    `nlink == 1` test. It is a calibration against the two rejected rules,
+    not an independent measurement of marginal cost — a `df`-delta against a
+    real second checkout would be that, and does not exist.
 
     Both rejected rules shipped before this one. The deduped total ignores
     sharing entirely and over-demands ~20x. Dividing by `st_nlink` looks
@@ -6553,7 +6570,7 @@ def _measure_worktree_bytes(leerie_dir: Path,
     yields raw `readdir()` order, so `[0]` is neither sorted nor stable
     across hosts, and worst-case sizing is the conservative direction for a
     headroom check. Blocking (`os.walk` over tens of thousands of files —
-    measured 2.1 s warm), so callers on the event loop must use
+    measured ~1.4 s warm / ~2.5 s cold), so callers on the event loop must use
     `asyncio.to_thread`.
     """
     cache_key = str(leerie_dir)
@@ -6576,8 +6593,23 @@ def _measure_worktree_bytes(leerie_dir: Path,
         # the whole tree has been walked.
         sizes: dict[tuple[int, int], tuple[int, int]] = {}
         in_tree: dict[tuple[int, int], int] = {}
+        dir_bytes = 0
         for dirpath, _dirnames, filenames in os.walk(candidate,
                                                      followlinks=False):
+            # Directories are charged unconditionally, bypassing the link
+            # predicate below. Linux forbids hardlinks to directories, so a
+            # new worktree always allocates its own — they are the one thing
+            # that is always marginal. They must NOT go through the
+            # predicate: a directory's st_nlink is >= 2 (`.`, its parent's
+            # entry, and each child's `..`) against an in-tree count of 1,
+            # so `in_tree >= nlink` would charge every one of them zero.
+            # Measured on a real node_modules: 34.0 MiB across 8,531 dirs,
+            # which is a 1.5x under-charge where the store shares a mount
+            # (files there are nearly all store-linked and cost nothing).
+            try:
+                dir_bytes += os.lstat(dirpath).st_blocks * 512
+            except OSError:
+                pass
             for name in filenames:
                 try:
                     st_info = os.lstat(os.path.join(dirpath, name))
@@ -6586,7 +6618,7 @@ def _measure_worktree_bytes(leerie_dir: Path,
                 key = (st_info.st_dev, st_info.st_ino)
                 in_tree[key] = in_tree.get(key, 0) + 1
                 sizes[key] = (st_info.st_blocks * 512, st_info.st_nlink)
-        largest = max(largest, sum(
+        largest = max(largest, dir_bytes + sum(
             size for key, (size, nlink) in sizes.items()
             if in_tree[key] >= nlink))
 
@@ -6605,18 +6637,10 @@ def _measure_worktree_bytes(leerie_dir: Path,
     return _WORKTREE_SIZE_CACHE[cache_key]
 
 
-def _disk_required_bytes(leerie_dir: Path, caps: dict,
+def _disk_required_bytes(leerie_dir: Path,
                          worktree_count: int) -> int | None:
     """Free bytes this run needs to finish its next wave, or None if not yet
     measurable (N30).
-
-    **Scaled by `max_parallel`, NOT by remaining subtasks.** That is a direct
-    consequence of the N31 prune landing: `phase_execute` removes each
-    subtask's worktree as soon as `integrate_wave` reports it merged, so the
-    number of worktrees on disk at once is bounded by the wave's concurrency
-    plus staging — not by how much work is left. Sizing against remaining
-    subtasks would over-demand by an order of magnitude on a long run and
-    pause a run that was never going to fill the disk.
 
     The per-worktree figure is the MARGINAL cost of one more tree, measured
     by `_measure_worktree_bytes` rather than assumed, because it varies by
@@ -6626,10 +6650,12 @@ def _disk_required_bytes(leerie_dir: Path, caps: dict,
     Linux refuses `link()` across different mounts even when both resolve to
     one filesystem (`do_linkat`'s `old_path.mnt != new_path.mnt` check,
     EXDEV), so pnpm falls back to copying and each worktree pays full
-    freight. Where the store and the tree DO share a mount, 95.4% of
-    node_modules bytes are hardlinked and a second checkout costs 65 MiB
-    instead of 1.37 GiB. Charging per `st_nlink` makes the measurement
-    answer that question by itself — see `_measure_worktree_bytes`.
+    freight. Where the store and the tree DO share a mount, 95.18% of
+    node_modules bytes are hardlinked, so the files cost almost nothing and
+    the marginal cost collapses to the directories plus the private
+    remainder. `_measure_worktree_bytes` answers that by charging an inode
+    only when all of its links are inside the tree, and charging every
+    directory unconditionally.
 
     **Multiplied by the WAVE's size, not by `max_parallel`.** An earlier
     revision used `max_parallel` on the premise that the N31 prune "removes
@@ -28262,46 +28288,6 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                 f"before wave {wi + 1} of {len(waves)}: "
                 f"{_disk_headroom_message(leerie_dir, ratio)}")
 
-        # Measured bound on top of the proportional floor: once a worktree
-        # has been measured we know what one more actually costs on THIS
-        # repo and host, so the check stops being a guess. Scaled by wave
-        # concurrency rather than remaining subtasks — the N31 prune below
-        # bounds how many worktrees coexist. Never lowers the floor.
-        #
-        # The measurement itself is seeded AFTER the wave completes and
-        # before the prune (see below), because that is the only moment a
-        # fully-populated subtask worktree exists: at wave entry the
-        # previous wave's trees have been pruned, and a wave cannot even be
-        # reached with un-integrated trees left over (the `blocked` guard
-        # die()s first). So wave 1 falls back to the ratio floor and waves
-        # 2+ consult the cached measurement — `to_thread` because the walk
-        # spans tens of thousands of files (2.1 s warm, measured) and this
-        # runs on the orchestrator's event loop.
-        # Guarded like the seed below: a measurement failure must never cost
-        # a wave. `iterdir()` can raise PermissionError/FileNotFoundError on
-        # a resume whose worktrees moved, and `to_thread` itself raises
-        # RuntimeError when the thread table is exhausted.
-        try:
-            required = await asyncio.to_thread(
-                _disk_required_bytes, leerie_dir, caps, len(wave))
-            per_worktree = await asyncio.to_thread(
-                _measure_worktree_bytes, leerie_dir)
-        except Exception as e:
-            log(f"  disk: headroom check unavailable "
-                f"({type(e).__name__}: {e}); proceeding on the ratio floor")
-            required = per_worktree = None
-        if required is not None and per_worktree is not None:
-            free = shutil.disk_usage(leerie_dir).free
-            if free < required:
-                raise DiskLowSpace(
-                    f"before wave {wi + 1} of {len(waves)}: "
-                    f"{free / (1024 ** 3):.1f} GB free, but this wave needs "
-                    f"~{required / (1024 ** 3):.1f} GB "
-                    f"({per_worktree / (1024 ** 3):.2f} GB per additional "
-                    f"worktree x {len(wave)} subtask(s) in this wave, "
-                    "measured on this repo). Free space and resume, or "
-                    "re-plan with fewer subtasks per wave.")
-
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
         # individual spawn (the retired _await_worker_memory_admission poll
@@ -28347,6 +28333,54 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         else:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
+
+
+        # N30 measured bound, on top of the proportional floor above. Placed
+        # HERE, after `remaining` — not at wave entry — because `remaining`
+        # is what will actually get a worktree. Sizing against `len(wave)`
+        # over-demanded on exactly the path this feature exists to survive: a
+        # resume with 19 of 20 subtasks already complete asked for 20 trees'
+        # worth of space to build one, and a wave that is skipped entirely
+        # (the `continue` above) could raise for work that never happens.
+        # Already-complete-but-un-pruned trees from a died-mid-wave run are
+        # likewise already on disk, so their bytes are absent from `free`
+        # and charging for them again is the double-count the "not + 1 for
+        # staging" reasoning in _disk_required_bytes rejects.
+        #
+        # The measurement is seeded after the wave completes and before the
+        # prune (see below) — the only moment a fully-populated worktree
+        # exists. Wave 1 therefore falls back to the ratio floor; waves 2+
+        # consult the cached figure. `to_thread` because the walk spans tens
+        # of thousands of files and this runs on the orchestrator's loop.
+        #
+        # Guarded: a measurement failure must never cost a wave that is
+        # already paid for. `iterdir()` raises PermissionError/
+        # FileNotFoundError on a resume whose worktrees moved, and
+        # `to_thread` raises RuntimeError when the thread table is
+        # exhausted. `except Exception` cannot swallow DiskLowSpace or its
+        # siblings — they subclass BaseException precisely so broad handlers
+        # cannot eat them.
+        wave_worktrees = max(len(remaining), 1)
+        try:
+            required = await asyncio.to_thread(
+                _disk_required_bytes, leerie_dir, wave_worktrees)
+            per_worktree = await asyncio.to_thread(
+                _measure_worktree_bytes, leerie_dir)
+        except Exception as e:
+            log(f"  disk: headroom check unavailable "
+                f"({type(e).__name__}: {e}); proceeding on the ratio floor")
+            required = per_worktree = None
+        if required is not None and per_worktree is not None:
+            free = shutil.disk_usage(leerie_dir).free
+            if free < required:
+                raise DiskLowSpace(
+                    f"before wave {wi + 1} of {len(waves)}: "
+                    f"{free / (1024 ** 3):.1f} GB free, but this wave needs "
+                    f"~{required / (1024 ** 3):.1f} GB "
+                    f"({per_worktree / (1024 ** 3):.2f} GB per additional "
+                    f"worktree x {wave_worktrees} subtask(s) still to run, "
+                    "measured on this repo). Free space and resume, or "
+                    "re-plan with fewer subtasks per wave.")
 
         # Clear stale terminal status so _get_progress counts retried
         # subtasks as "running" (absent = running per _get_progress).
@@ -28407,7 +28441,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # not cost a wave that has already been paid for.
         try:
             await asyncio.to_thread(_measure_worktree_bytes, leerie_dir,
-                                    True)
+                                    refresh=True)
         except Exception as e:
             log(f"  disk: could not measure worktree size "
                 f"({type(e).__name__}: {e}); headroom check falls back to "
