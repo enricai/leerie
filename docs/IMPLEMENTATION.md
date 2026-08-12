@@ -4066,6 +4066,47 @@ on `subtype`, which is a misleading `"success"`. `main()` treats it as a
 resumable `EXIT_LOCKED` pause and names the likely remedy — dropping
 `--dangerously-force-strict-output` (see `_model_arg` below).
 
+#### Disk headroom (N30)
+
+Two call sites share `_disk_free_ratio(path)` (walks up to the nearest
+existing ancestor of `path`, then `shutil.disk_usage(p).free / .total`)
+against a module constant `DISK_MIN_FREE_RATIO = 0.05` (5% free) —
+DESIGN's N30 finding's own stated fallback: a fraction of free space
+scales with disk size without pretending to know per-run byte cost,
+which a fixed threshold cannot (the corpus varies by an order of
+magnitude in per-run footprint, and the "right" threshold — per-worktree
+cost × remaining subtasks — needs external-repo pnpm-store-sharing
+measurement this fix does not have).
+
+1. **Preflight** (`preflight(leerie_dir, ...)`, check "0.5", before the git
+   identity checks and before the live smoke test — i.e. before any
+   worker spawns): `_disk_free_ratio(leerie_dir)` below the threshold
+   `die()`s with an actionable message (`_disk_headroom_message`) naming
+   the measured free/total GB and the filesystem path. `leerie_dir` here
+   is `st.run_dir`, already created by `main()` before `preflight` runs,
+   so it resolves to the state-dir filesystem.
+2. **Mid-run** (`phase_execute`'s wave loop, once per wave — before that
+   wave's memory-admission/settle work begins): the same check raises
+   `DiskLowSpace` (a `BaseException`, same shape as `ContextOverflow` —
+   never a `WorkerError`, so `_run_checked_loop` cannot swallow it into a
+   retry) rather than `die()`ing, since workers have already spawned and
+   there is state worth preserving. `main()` catches it in its own arm
+   (mirroring the `ContextOverflow` arm immediately above it): worktree-
+   only cleanup (`_cleanup_on_abnormal_exit(st, full_purge=False)`),
+   best-effort `capture_repo_deps`, a resume hint, and `EXIT_LOCKED` — the
+   same resumable-pause convention documented above for rate-limiting.
+   `DiskLowSpace` was added to every existing `except (Exception,
+   TerminalAuthFailure, RateLimitedExit, ContextOverflow)` dep_capture
+   guard alongside its siblings, since those tuples exist to catch the
+   whole `BaseException` exit-signal family.
+
+A healthy disk is a no-op at both checkpoints — the preflight check falls
+through to the next check, and the wave loop proceeds to its normal work.
+Pinned in `tests/test_disk_preflight.py`: near-zero free space triggers
+`die()` at preflight before any subprocess runs; a mid-run drop raises
+`DiskLowSpace` before wave-entry work starts; a healthy ratio is silent at
+both sites.
+
 #### Terminal auth failure
 
 `_is_terminal_auth_failure(envelope)` is checked in `claude_p()` **before**
@@ -4296,7 +4337,7 @@ Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 
 | Phase | Function(s) | What it does |
 |-------|-------------|--------------|
-| Preflight | `preflight` | git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. `setup-run.sh` repeats the external-branch check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
+| Preflight | `preflight` | disk headroom on the state-dir filesystem (N30 — see "Disk headroom" above), git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. `setup-run.sh` repeats the external-branch check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive. On a fresh (non-resumed) run, `run.json`'s identity fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`, `task`) are written immediately BEFORE this phase runs — not after, as originally implemented — so any early-exit path reachable from classification (including the classification gate's no-work routing, below) sees a fully-identified `run.json` rather than one carrying only `_finish_no_work_run`'s own `{finished_at, no_push, no_verify}` (DESIGN §8 *Reaching the cleared-but-empty state from classification*) |
 |   • Classification gate | `phase_classification_gate` | independent adversarial verifier of the classifier's category set (DESIGN §8 *Independent adversarial verification*). One `classification_judge` worker attacks the chosen categories against the task + codebase; a non-empty `miscategorizations` array (a missing category the work requires, or a spurious one) re-drives `phase_classify` via `_run_checked_loop` (bounded by `judgment_check_rounds`, and cut short earlier by `_run_checked_loop`'s own oscillation guard when a round's issues repeat an earlier round's exactly — DESIGN §8 *The CRITIC retry pattern's oscillation guard*). Across rounds, the gate accumulates a `judge_confirmed` set — every category the judge has reviewed without objection or explicitly asked to add — and passes it into the re-invoked `phase_classify`, so `check_classifier_output`'s `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` self-check never strips a category the judge has already vetted (the fix for a real oscillation incident where a genuinely 3-category task never held all three categories at once). On exhaustion, `die()`s with the residuals named — UNLESS `st.data["likely_already_satisfied"]` is `True` with non-empty evidence, in which case it routes to `_finish_no_work_run` (the same terminal state `_detect_no_work` produces post-plan; DESIGN §8 *Reaching the cleared-but-empty state from classification*) and returns `True`, signaling the caller (`_run_phases`) to stop the pipeline. Gates before provision/plan spend. Runs inside the `plans_after_classify` checkpoint block (DESIGN §6 "Resumable planning"), so a resume past classify skips it. Persists to `state.data["classification_coverage_gate"]`. |
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ *Persistent out-of-repo dependency bake*). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `_synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `_detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — for baked ecosystems (Python/Ruby/Rust/Go), the block is informational only; for Node, it carries the residual offline-relink command (not run by the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `_run_streaming` so their output is visible live. Skipped on `resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |

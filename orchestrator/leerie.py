@@ -775,6 +775,18 @@ EXIT_LOCKED = 75
 # persisted `max_total_workers` budget so a stuck run never runs away.
 RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
 
+# N30: minimum fraction of the state-dir filesystem's total capacity that
+# must remain free. Below this, leerie refuses to start (preflight) or
+# pauses resumably (mid-run). A fixed byte threshold was considered and
+# rejected — DESIGN's N30 finding is explicit that the right threshold
+# scales with per-worktree cost * remaining subtasks, a quantity that
+# needs external-repo measurement (pnpm store-sharing across worktrees)
+# this subtask's source_of_truth=codebase cannot obtain. A fraction of
+# free space is the finding's own stated fallback: it scales with disk
+# size (a huge disk and a tiny one both get a proportional safety margin)
+# without pretending to know per-run byte cost.
+DISK_MIN_FREE_RATIO = 0.05  # 5% free
+
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
 # per-repo leerie.toml → 'both'. CLI/env are session knobs, so they
@@ -2760,6 +2772,32 @@ class ContextOverflow(BaseException):
     `_model_arg`) — after which `leerie resume` picks the run back up.
 
     Carries only raw_message: str — the verbatim envelope `result`."""
+    def __init__(self, raw_message: str):
+        super().__init__(raw_message)
+        self.raw_message = raw_message
+
+
+class DiskLowSpace(BaseException):
+    """Raised when the periodic mid-run headroom check (N30) finds free
+    space on the state-dir filesystem below `DISK_MIN_FREE_RATIO`.
+
+    Unlike the preflight check in `preflight()` (which die()s outright —
+    no worker has spawned yet, so there is nothing to preserve), a mid-run
+    drop must not crash: `_settle_subtask`/`integrate_wave` results for
+    already-completed subtasks are only safe once `State.save()` has
+    persisted them, and an unhandled `OSError: [Errno 28] No space left on
+    device` from underneath one of those writes (the shape that killed
+    `funeralworks 9751c048` and `navegando e491ef59`) is indistinguishable
+    from any other crash. Reusing the existing EXIT_LOCKED resumable-pause
+    path (same shape as RateLimitedExit/ContextOverflow) means the operator
+    frees space and runs `leerie resume` rather than losing the run.
+
+    Inherits BaseException for the same reason as its siblings above — it
+    must propagate through asyncio's gather and broad `except Exception`
+    handlers without being swallowed.
+
+    Carries only raw_message: str — a human-readable summary of the
+    measured free-space ratio and path, surfaced to the user on exit."""
     def __init__(self, raw_message: str):
         super().__init__(raw_message)
         self.raw_message = raw_message
@@ -6279,6 +6317,30 @@ async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
 # test suites, enforcing structural rules.
 # =========================================================================
 
+def _disk_free_ratio(path: Path) -> float:
+    """Free-space fraction (0.0-1.0) of the filesystem holding `path`
+    (N30). Uses `shutil.disk_usage`, which resolves to whatever
+    filesystem `path` (or its nearest existing ancestor) actually lives
+    on — the state-dir filesystem, at both call sites below."""
+    p = path
+    while not p.exists():
+        p = p.parent
+    usage = shutil.disk_usage(p)
+    return usage.free / usage.total
+
+
+def _disk_headroom_message(path: Path, ratio: float) -> str:
+    p = path
+    while not p.exists():
+        p = p.parent
+    usage = shutil.disk_usage(p)
+    free_gb = usage.free / (1024 ** 3)
+    total_gb = usage.total / (1024 ** 3)
+    return (f"only {ratio:.1%} free ({free_gb:.1f} GB of {total_gb:.1f} GB) "
+            f"on the filesystem holding {path} — below the "
+            f"{DISK_MIN_FREE_RATIO:.0%} minimum")
+
+
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
@@ -6293,6 +6355,21 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "process's children and their exit statuses are unreadable. "
             "Every subprocess would report a bogus failure. This is an "
             "environment problem, not a leerie configuration problem.")
+
+    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
+    # worktrees continuously, and the first failing write under a full disk
+    # was previously an unhandled `OSError: [Errno 28] No space left on
+    # device` from whatever line happened to be writing. Checked on the
+    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
+    # before any worker spawns, so a disk that is already too full to
+    # safely run refuses cleanly instead of dying mid-run.
+    ratio = _disk_free_ratio(leerie_dir)
+    if ratio < DISK_MIN_FREE_RATIO:
+        die(f"insufficient disk space to start a run: "
+            f"{_disk_headroom_message(leerie_dir, ratio)}. "
+            "Free up space (see CLAUDE.md's retention guidance / "
+            "`leerie list` + manual pruning of old runs under the state "
+            "root) and retry.")
 
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
@@ -10964,7 +11041,7 @@ async def _backstop_capture_prior_runs(
         # abort the backstop loop (or, in main()'s exit handlers, skip the
         # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as exc:
+                ContextOverflow, DiskLowSpace) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -11049,7 +11126,7 @@ def run_recapture_deps(
         # See the backstop guard above: TerminalAuthFailure / RateLimitedExit
         # are BaseException subclasses that a bare `except Exception` misses.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as exc:
+                ContextOverflow, DiskLowSpace) as exc:
             log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
 
     if not ran_any and not force:
@@ -11180,7 +11257,7 @@ def run_rebaser(
     # would miss, and this call must never propagate past host-finalize.sh's
     # best-effort rebase step.
     except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow) as exc:
+            ContextOverflow, DiskLowSpace) as exc:
         return {
             "status": "failed",
             "final_branch_state": "worker invocation error",
@@ -27682,6 +27759,19 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     for wi in range(start, len(waves)):
         wave = waves[wi]
 
+        # N30: periodic mid-run headroom check, once per wave — each wave
+        # spawns worktrees/logs/calls.ndjson writes, so this is the natural
+        # per-iteration point to catch a disk that has drained since the
+        # preflight check. Unlike preflight (which die()s — nothing to
+        # preserve yet), a mid-run drop raises DiskLowSpace so main() can
+        # pause resumably instead of crashing on an unhandled OSError from
+        # underneath the next State.save()/worktree write.
+        ratio = _disk_free_ratio(leerie_dir)
+        if ratio < DISK_MIN_FREE_RATIO:
+            raise DiskLowSpace(
+                f"before wave {wi + 1} of {len(waves)}: "
+                f"{_disk_headroom_message(leerie_dir, ratio)}")
+
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
         # individual spawn (the retired _await_worker_memory_admission poll
@@ -28458,7 +28548,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
     except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow) as _cap_exc:
+            ContextOverflow, DiskLowSpace) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -30198,8 +30288,42 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 caps=caps, models=models, efforts=efforts,
             ))
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during context-overflow pause "
+                f"({_cap_exc})")
+        exit_code = EXIT_LOCKED
+
+    except DiskLowSpace as e:
+        # N30: the periodic mid-run headroom check in phase_execute found
+        # free space on the state-dir filesystem below DISK_MIN_FREE_RATIO.
+        # Resumable, not fatal — the remedy is an operator freeing space,
+        # after which the run's on-disk state (worktrees, branches,
+        # state.json) is untouched and `leerie resume` picks it back up.
+        # Mirrors the ContextOverflow arm just above.
+        full_purge = False
+        st.save()
+        log(f"disk headroom low — {e.raw_message}")
+        log("  Free up space on the state-dir filesystem "
+            "(old runs under the state root are the usual culprit), "
+            f"then resume with: leerie resume {st.run_id}")
+        abnormal = False
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except Exception:
+            pass
+        # Best-effort dep_capture, matching every other terminating arm.
+        # Guarded against the whole exit-signal family for the reason the
+        # auth-locked arm documents below: these subclass BaseException, and a
+        # re-raise escaping here would skip the `exit_code` assignment and
+        # crash the run with exit 1 instead of pausing resumably.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow, DiskLowSpace) as _cap_exc:
+            log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
 
@@ -30237,7 +30361,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
         # crash the run with exit 1 — defeating this whole resumable-pause arm.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -30292,7 +30416,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # `except Exception` misses, which would skip the `exit_code =
             # EXIT_LOCKED` below and crash the pause with exit 1.
             except (Exception, TerminalAuthFailure, RateLimitedExit,
-                    ContextOverflow) as _cap_exc:
+                    ContextOverflow, DiskLowSpace) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -30345,7 +30469,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the cancel arm still reaches its `exit_code = 130`.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -30370,7 +30494,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the signal arm still reaches its `exit_code = 128 + signum`.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
