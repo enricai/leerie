@@ -76,10 +76,8 @@ def test_container_entry_chowns_claude_json_in_rootful_guard():
     freshly-copied root-owned file needs an explicit chown there -- same
     reasoning as the other /home/leerie ownership fixes in that guard."""
     block = _entry_sh_rootful_block()
-    assert (
-        "[ -f /home/leerie/.claude.json ] && chown leerie: /home/leerie/.claude.json"
-        in block
-    )
+    assert "if [ -f /home/leerie/.claude.json ]; then" in block
+    assert "chown leerie: /home/leerie/.claude.json" in block
 
 
 def test_falsify_reverting_to_single_file_mount_fails_the_guard():

@@ -16093,7 +16093,7 @@ class State:
     prevents.
 
     The lock is on the *directory*, not state.json: `save()`'s atomic
-    `tmp.replace(self.path)` would orphan a state.json-bound fd from
+    `os.replace(tmp, self.path)` would orphan a state.json-bound fd from
     the new inode, opening a multi-second window where a racer could
     acquire on the unlocked replacement. Directory inodes are never
     replaced, so the lock fd stays valid for the process lifetime.
@@ -16188,7 +16188,7 @@ class State:
         """Atomic write via temp-file rename.
 
         The flock is on `self.run_dir`, not `self.path`, so the
-        `tmp.replace(self.path)` inode swap below does not affect lock
+        `os.replace(tmp, self.path)` inode swap below does not affect lock
         ownership. The directory inode is stable for the run's
         lifetime.
 
@@ -16196,11 +16196,19 @@ class State:
         write or the atomic rename) is reraised as `DiskLowSpace` so the
         caller pauses resumably (EXIT_LOCKED) via the same N30 path as the
         proactive `_disk_free_ratio` checks, instead of crashing with an
-        unhandled `OSError: [Errno 28] No space left on device`."""
+        unhandled `OSError: [Errno 28] No space left on device`.
+
+        Uses `os.replace()` rather than `Path.replace()` deliberately: on
+        Python 3.10, `pathlib`'s accessor captures a direct reference to
+        `os.replace` at class-definition time, so a test (or caller) that
+        patches the `os` module's `replace` attribute afterward does not
+        affect what `Path.replace()` actually calls — only Python 3.12's
+        rewritten pathlib looks it up dynamically. Calling `os.replace()`
+        explicitly keeps the ENOSPC-catch behavior version-independent."""
         tmp = self.path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(self.data, indent=2))
-            tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
+            os.replace(tmp, self.path)   # atomic on POSIX; best-effort on Windows
         except OSError as e:
             if e.errno == errno.ENOSPC:
                 raise DiskLowSpace(

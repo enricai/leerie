@@ -1831,11 +1831,17 @@ The lock primitive itself:
   exit regardless.
 - `State.save`'s locking behavior is unchanged: the flock is on the run
   directory inode, not the state.json inode, so the
-  `tmp.replace(self.path)` swap inside `save()` does not affect the
+  `os.replace(tmp, self.path)` swap inside `save()` does not affect the
   lock. Docstring updated to make this explicit. (`save()`'s body was
   later extended, unrelated to locking, to catch an `OSError(ENOSPC, ...)`
   from either half of the write and reraise it as `DiskLowSpace` — see
-  §"Disk headroom (N30)".)
+  §"Disk headroom (N30)". The rename call was changed from
+  `Path.replace()` to `os.replace()` explicitly: on Python 3.10,
+  `pathlib`'s accessor binds `os.replace` at class-definition time, so a
+  caller patching the `os` module's `replace` attribute afterward does
+  not affect `Path.replace()` — only Python 3.12's rewritten pathlib
+  looks it up dynamically. `os.replace()` keeps the behavior
+  version-independent.)
 Two checked construction sites that catch `StateLockedError`:
 
 - `main()` at the `State(leerie_root, run_id, repo_root=repo_root)` call:

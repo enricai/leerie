@@ -204,7 +204,9 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   # .claude.json (copied into place above, root-owned since it's a fresh
   # file inside the container's own filesystem) needs the same rootful
   # chown-to-leerie treatment as everything else in this guard.
-  [ -f /home/leerie/.claude.json ] && chown leerie: /home/leerie/.claude.json 2>/dev/null || true
+  if [ -f /home/leerie/.claude.json ]; then
+    chown leerie: /home/leerie/.claude.json 2>/dev/null || true
+  fi
   # The Dockerfile's `mise install --system` creates /tmp/.cache/mise/
   # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an
   # ephemeral overlay so this is never seen; on Fly the rootfs preserves
