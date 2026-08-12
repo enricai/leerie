@@ -135,3 +135,40 @@ class TestRegressionOnTheMeasuredShape:
         task = ("**N1** — *critical*. See docs/DESIGN.md for the rationale.\n"
                 "* bullet one\n* bullet two\n**Root cause**: unknown\n")
         assert names(leerie._glob_task_references(task, repo)) == ["DESIGN.md"]
+
+
+class TestUnreachableTaskReferences:
+    """`_glob_task_references` silently drops a path outside the repo --
+    correct for prose, but a `~`-prefixed or absolute path that the planner
+    can genuinely never read (e.g. a plan file left in `~/.claude/plans/`)
+    should not vanish without a trace."""
+
+    def test_home_relative_plan_path_warns(self):
+        got = leerie._unreachable_task_references(
+            "Implement the plan in ~/.claude/plans/redesign.md")
+        assert got == ["~/.claude/plans/redesign.md"]
+
+    def test_ordinary_prose_does_not_warn(self):
+        assert leerie._unreachable_task_references(
+            "e.g. do this, i.e. not that") == []
+        assert leerie._unreachable_task_references("this is * important") == []
+        assert leerie._unreachable_task_references("**Root** cause **log**") == []
+
+    def test_genuine_in_repo_reference_does_not_warn(self, tmp_path, monkeypatch):
+        (tmp_path / "spec.md").write_text("spec")
+        monkeypatch.chdir(tmp_path)
+        assert leerie._unreachable_task_references(
+            "see spec.md for details") == []
+
+    def test_absolute_path_outside_repo_still_warns(self, tmp_path):
+        missing = tmp_path / "nowhere" / "plan.md"
+        got = leerie._unreachable_task_references(f"see {missing} for details")
+        assert got == [str(missing)]
+
+    def test_existing_home_relative_path_does_not_warn(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "plan.md").write_text("plan")
+        monkeypatch.setenv("HOME", str(home))
+        assert leerie._unreachable_task_references(
+            "see ~/plan.md for details") == []

@@ -379,6 +379,7 @@ STATE_FIELDS = (
     "skip_adherence_check",
     "skip_coverage_check",
     "skip_completeness_check",
+    "skip_integration_check",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -492,6 +493,29 @@ STATE_FIELDS = (
     # re-check on the fully-merged plan*, §8) — the final wiring_judge output.
     # Absent when the judge crashed every round.
     "wiring_gate",
+    # integration_gate: per-sid audit record from integrate_wave's
+    # integration_judge gate (DESIGN §8) — {sid: {defects, advisories,
+    # merge_commit_sha, accepted}}. Written BEFORE die()ing (unlike
+    # wiring_gate, which is written only on a clean pass) so a resume can
+    # tell "not yet reviewed" (key absent) from "reviewed and rejected"
+    # (`accepted: False`) from "reviewed and clean, or operator-accepted"
+    # (`accepted: True`) — the `accept-integration <run-id> <sid>` verb
+    # flips `accepted` to True. `integrate_wave` consults this key BEFORE
+    # re-driving integrate.sh/the integrator: a present-and-not-accepted
+    # entry re-invokes the judge directly against the already-committed
+    # merge (integrate.sh alone would just see the branch already merged
+    # and short-circuit past the judge entirely). Absent for a sid whose
+    # merge never needed the integrator (no conflict — the judge only runs
+    # post-integrator-merge).
+    "integration_gate",
+    # integration_defects: per-sid list[str] of the gating defect strings
+    # from the most recent `integration_gate[sid]` entry that found a
+    # behavioral defect — the record `accept-integration` marks accepted.
+    # Mirrors `integration_gate[sid]["defects"]"` (kept as a separate,
+    # flatter key per the parent subtask's audit-key contract) and is
+    # popped once a re-invoked judge comes back clean. Absent when no sid
+    # has ever had a gating defect.
+    "integration_defects",
     # provision_recipe_gate: audit record from phase_provision_gate (DESIGN §8,
     # §6½) — the final provision_judge output. Absent when no recipe was
     # detected (kind:none) or the judge crashed every round.
@@ -529,6 +553,15 @@ STATE_FIELDS = (
     # commit while install.sh tracks `main`, so every run between releases
     # reports the same version whether or not it carries a given fix.
     "leerie_commit",
+    # leerie_versions: append-only history of `{version, commit, at}`
+    # snapshots, one per resume (plus one seeded at the original run start).
+    # leerie_version/leerie_commit above are immutable across resumes by
+    # design (N38) — a resume overwriting them with whatever is installed
+    # NOW made a resumed run's failures read as attributable to the wrong
+    # release. This list is where the "what was actually installed at each
+    # resume" fact lives instead, without disturbing the original-run
+    # attribution the other two fields exist for.
+    "leerie_versions",
     # dep_capture_done: set to True in state.json and written as a sentinel
     # file (<run_dir>/dep_capture.done) after capture_repo_deps completes a
     # successful write. The run-start backstop checks the sentinel file to
@@ -741,6 +774,18 @@ EXIT_LOCKED = 75
 # just re-hits the same clean pause and sleeps again — cheap, and bounded by the
 # persisted `max_total_workers` budget so a stuck run never runs away.
 RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
+
+# N30: minimum fraction of the state-dir filesystem's total capacity that
+# must remain free. Below this, leerie refuses to start (preflight) or
+# pauses resumably (mid-run). A fixed byte threshold was considered and
+# rejected — DESIGN's N30 finding is explicit that the right threshold
+# scales with per-worktree cost * remaining subtasks, a quantity that
+# needs external-repo measurement (pnpm store-sharing across worktrees)
+# this subtask's source_of_truth=codebase cannot obtain. A fraction of
+# free space is the finding's own stated fallback: it scales with disk
+# size (a huge disk and a tiny one both get a proportional safety margin)
+# without pretending to know per-run byte cost.
+DISK_MIN_FREE_RATIO = 0.05  # 5% free
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -958,6 +1003,16 @@ SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # leerie.toml → False.
 SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
 SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-integration-check bypass (the integration_judge behavioral-defect
+# gate — DESIGN §8 *Independent adversarial verification*). Unlike the
+# accept-integration/audit-key mechanism (which accepts one already-found
+# finding), this skips the worker spawn entirely, matching every sibling
+# advisory/gating check's escape hatch. Resolution order:
+# --skip-integration-check CLI flag → LEERIE_SKIP_INTEGRATION_CHECK env →
+# skip_integration_check in leerie.toml → False.
+SKIP_INTEGRATION_CHECK_ENV = "LEERIE_SKIP_INTEGRATION_CHECK"
+SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by _build_repo_map() so
@@ -1783,18 +1838,25 @@ SCHEMAS: dict[str, dict] = {
         },
     },
     "conformer": {
-        # DESIGN §9 *Post-work conformance*: an advisory worker that runs
-        # after the implementer's success path. Schema requires the
-        # build/lint/tests objects so a worker that skipped the honesty
-        # discipline fails its own JSON gate before the orchestrator reads
-        # it; cross-field invariants (residuals require non-empty
-        # rules_files_read, fixed-violations cite a rule, updates cite a
-        # path) are enforced by _validate_conformance_result().
+        # DESIGN §9 *Post-work conformance*. Advisory worker run after the
+        # implementer; cross-field invariants are in _validate_conformance_
+        # result(). solution_defects is the one gating axis (DESIGN §9).
+        #
+        # FLATTENED 2026-08-12 (N29): was the largest schema in the file and
+        # the only one reliably rejected by the strict-output proxy's
+        # grammar compiler ("The compiled grammar is too large"), silently
+        # disabling constrained decoding for the heaviest worker every run.
+        # rule_violations_fixed/rule_violations_residual (isomorphic {rule,
+        # ...} shapes) and docs_updates/tests_updates (isomorphic {path,
+        # reason} shapes) are each now one discriminated array — same
+        # technique as `tag_ops` in SCHEMAS["reconciler"].
+        # `_expand_conformer_output` fans the wire shape back into the four
+        # arrays every consumer here was written against; no field a check
+        # reads was dropped.
         "type": "object",
         "required": [
             "subtask_id", "rules_files_read",
-            "rule_violations_fixed", "rule_violations_residual",
-            "docs_updates", "tests_updates",
+            "rule_violations", "file_updates",
             "build", "lint", "tests", "summary",
             "solution_defects",
         ],
@@ -1802,46 +1864,31 @@ SCHEMAS: dict[str, dict] = {
             "subtask_id": {"type": "string"},
             "rules_files_read": {
                 "type": "array", "items": {"type": "string"}},
-            "rule_violations_fixed": {
+            # status discriminates fixed vs. residual.
+            "rule_violations": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["rule", "fix", "evidence"],
+                    "required": ["status", "rule"],
                     "properties": {
+                        "status": {"type": "string",
+                                   "enum": ["fixed", "residual"]},
                         "rule": {"type": "string"},
                         "fix": {"type": "string"},
                         "evidence": {"type": "string"},
-                    },
-                },
-            },
-            "rule_violations_residual": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["rule", "why_not_fixed"],
-                    "properties": {
-                        "rule": {"type": "string"},
                         "why_not_fixed": {"type": "string"},
                     },
                 },
             },
-            "docs_updates": {
+            # kind discriminates docs vs. tests.
+            "file_updates": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["path", "reason"],
+                    "required": ["kind", "path", "reason"],
                     "properties": {
-                        "path": {"type": "string"},
-                        "reason": {"type": "string"},
-                    },
-                },
-            },
-            "tests_updates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["path", "reason"],
-                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["docs", "tests"]},
                         "path": {"type": "string"},
                         "reason": {"type": "string"},
                     },
@@ -1851,21 +1898,8 @@ SCHEMAS: dict[str, dict] = {
             "lint": _CONFORMER_BLT_PROP,
             "tests": _CONFORMER_BLT_PROP,
             "summary": {"type": "string"},
-            # DESIGN §9 *The one gating axis: solution completeness*. The
-            # conformer's independent adversarial attack on the IMPLEMENTER's
-            # committed diff (which it did not write — its own conformance
-            # edits are a separate, later layer). Each entry names a concrete
-            # behavioral gap the diff does not handle: an unhandled input, a
-            # missing guard, a decoy/shortcut, a sibling call site left
-            # unedited. This is the ONE gating axis (build/lint/test and the
-            # confidence self-score below stay advisory). A non-empty set of
-            # ACTIONABLE defects (each carrying a concrete_case + where —
-            # _validate_conformance_result drops the rest as non-actionable, so
-            # the gate cannot fire on vague "looks incomplete" prose) re-drives
-            # the implementer with the defects folded in as mandatory criteria
-            # (bounded by completeness_retry_rounds), or blocks on exhaustion.
-            # Not gameable by weakening a test: there is no bar to lower, only
-            # a concrete constructed input to report or not.
+            # Anti-gaming: a defect gates only with a concrete_case + where
+            # (_validate_conformance_result drops the rest as non-actionable).
             "solution_defects": {
                 "type": "array",
                 "items": {
@@ -1879,30 +1913,14 @@ SCHEMAS: dict[str, dict] = {
                                           "sibling_site_unedited",
                                           "wrong_selector",
                                           "decoy_or_shortcut"]},
-                        # The specific input / path / site — not a vague
-                        # "incomplete". This concreteness is the anti-gaming
-                        # guard: the gate keys on it. minLength:1 rejects an
-                        # empty string at the JSON layer (worker retries via
-                        # claude_p) so it never reaches validate_conformance_
-                        # result's cross-field check — which would break the
-                        # whole conformance loop early. Mirrors dep_capture's
-                        # minLength discipline.
                         "concrete_case": {"type": "string", "minLength": 1},
-                        # file:line or function the diff should have handled.
                         "where": {"type": "string", "minLength": 1},
                         "why_ships_a_defect": {"type": "string", "minLength": 1},
                     },
                 },
             },
-            # §8 + §12 structural enforcement via _confidence_schema.
-            # The orchestrator loops on observable signals (residuals,
-            # build/lint/test), not the score — but requiring the
-            # discipline fields ensures a worker that skipped self-gating
-            # fails its own JSON schema. This self-score is ADVISORY; the
-            # gating axis is solution_defects above (DESIGN §8/§9).
+            # Advisory; gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
-            # DESIGN §9 *Evidence must be production-grounded*. Optional at
-            # this layer on purpose; check_production_evidence gates on it.
             "production_evidence": _production_evidence_schema(),
         },
     },
@@ -2759,6 +2777,32 @@ class ContextOverflow(BaseException):
         self.raw_message = raw_message
 
 
+class DiskLowSpace(BaseException):
+    """Raised when the periodic mid-run headroom check (N30) finds free
+    space on the state-dir filesystem below `DISK_MIN_FREE_RATIO`.
+
+    Unlike the preflight check in `preflight()` (which die()s outright —
+    no worker has spawned yet, so there is nothing to preserve), a mid-run
+    drop must not crash: `_settle_subtask`/`integrate_wave` results for
+    already-completed subtasks are only safe once `State.save()` has
+    persisted them, and an unhandled `OSError: [Errno 28] No space left on
+    device` from underneath one of those writes (the shape that killed
+    `funeralworks 9751c048` and `navegando e491ef59`) is indistinguishable
+    from any other crash. Reusing the existing EXIT_LOCKED resumable-pause
+    path (same shape as RateLimitedExit/ContextOverflow) means the operator
+    frees space and runs `leerie resume` rather than losing the run.
+
+    Inherits BaseException for the same reason as its siblings above — it
+    must propagate through asyncio's gather and broad `except Exception`
+    handlers without being swallowed.
+
+    Carries only raw_message: str — a human-readable summary of the
+    measured free-space ratio and path, surfaced to the user on exit."""
+    def __init__(self, raw_message: str):
+        super().__init__(raw_message)
+        self.raw_message = raw_message
+
+
 class TerminalAuthFailure(BaseException):
     """Raised when a `claude -p` envelope shows the container's OAuth
     session has expired or was never logged in — a state that cannot
@@ -3369,6 +3413,28 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     branch = f"leerie/subtasks/{run_id}/{sid}"
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
     await run_proc(["git", "branch", "-D", branch])
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except OSError:
+            pass
+    await run_proc(["git", "worktree", "prune"])
+
+
+async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
+    """Remove a subtask's worktree directory (including node_modules etc.)
+    once its branch has been merged into staging, WITHOUT touching the
+    branch itself — the branch is still needed for finalize/PR history.
+    Mirrors the git-worktree-remove + rmtree-fallback pattern in
+    `_cleanup_on_abnormal_exit` (:3280-3315), scoped to one sid instead of
+    every worktree.
+
+    Tolerates the worktree already being absent: `git worktree remove
+    --force` returns nonzero when its target is missing, which is the
+    expected idempotent case. Never raises — a failed prune is disk
+    pressure deferred to run-end cleanup, not a reason to fail the wave."""
+    worktree = leerie_dir / "worktrees" / sid
+    await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
     if worktree.exists():
         try:
             shutil.rmtree(worktree, ignore_errors=True)
@@ -5742,6 +5808,26 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_COMPLETENESS_CHECK_FILE)
 
 
+def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-integration-check preference. Order:
+    --skip-integration-check CLI flag (action='store_true') →
+    LEERIE_SKIP_INTEGRATION_CHECK env var →
+    skip_integration_check in leerie.toml → False.
+
+    When True, `integrate_wave` never invokes `integration_judge` — the
+    independent adversarial verification of a committed merge (DESIGN §8) —
+    for any subtask in this run. This is a full-phase skip, independent of
+    the accept-integration/audit-key mechanism, which only accepts a
+    finding the judge already produced. Off by default; use only when the
+    operator knows the gate is misfiring for this repo and wants to bypass
+    the discipline entirely."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_INTEGRATION_CHECK_ENV,
+        file_key="skip_integration_check",
+        file_name=SKIP_INTEGRATION_CHECK_FILE)
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper. Rejects non-positive integers with the
     standard argparse error message. Used by --confidence-rounds."""
@@ -6231,6 +6317,30 @@ async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
 # test suites, enforcing structural rules.
 # =========================================================================
 
+def _disk_free_ratio(path: Path) -> float:
+    """Free-space fraction (0.0-1.0) of the filesystem holding `path`
+    (N30). Uses `shutil.disk_usage`, which resolves to whatever
+    filesystem `path` (or its nearest existing ancestor) actually lives
+    on — the state-dir filesystem, at both call sites below."""
+    p = path
+    while not p.exists():
+        p = p.parent
+    usage = shutil.disk_usage(p)
+    return usage.free / usage.total
+
+
+def _disk_headroom_message(path: Path, ratio: float) -> str:
+    p = path
+    while not p.exists():
+        p = p.parent
+    usage = shutil.disk_usage(p)
+    free_gb = usage.free / (1024 ** 3)
+    total_gb = usage.total / (1024 ** 3)
+    return (f"only {ratio:.1%} free ({free_gb:.1f} GB of {total_gb:.1f} GB) "
+            f"on the filesystem holding {path} — below the "
+            f"{DISK_MIN_FREE_RATIO:.0%} minimum")
+
+
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
@@ -6245,6 +6355,21 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "process's children and their exit statuses are unreadable. "
             "Every subprocess would report a bogus failure. This is an "
             "environment problem, not a leerie configuration problem.")
+
+    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
+    # worktrees continuously, and the first failing write under a full disk
+    # was previously an unhandled `OSError: [Errno 28] No space left on
+    # device` from whatever line happened to be writing. Checked on the
+    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
+    # before any worker spawns, so a disk that is already too full to
+    # safely run refuses cleanly instead of dying mid-run.
+    ratio = _disk_free_ratio(leerie_dir)
+    if ratio < DISK_MIN_FREE_RATIO:
+        die(f"insufficient disk space to start a run: "
+            f"{_disk_headroom_message(leerie_dir, ratio)}. "
+            "Free up space (see CLAUDE.md's retention guidance / "
+            "`leerie list` + manual pruning of old runs under the state "
+            "root) and retry.")
 
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
@@ -7729,6 +7854,57 @@ def _expand_reconciler_output(out: dict) -> dict:
     return expanded
 
 
+def _expand_conformer_output(out: dict) -> dict:
+    """Fan the flattened conformer wire output back into the four arrays
+    every consumer (`_validate_conformance_result`, `_summarize_residuals`,
+    `_final_conformance_payload`) was written against.
+
+    `SCHEMAS["conformer"]` is flattened for grammar compilation (N29): the
+    isomorphic `rule_violations_fixed`/`rule_violations_residual` pair
+    collapses to one `rule_violations` array keyed by `status`, and
+    `docs_updates`/`tests_updates` collapses to one `file_updates` array
+    keyed by `kind`. An entry with an unrecognised discriminator is dropped
+    rather than guessed, same discipline as `_expand_reconciler_output`'s
+    `tag_ops` handling.
+
+    Returns a NEW dict; the input is not mutated (the raw worker output is
+    persisted as telemetry and must stay as-emitted). Non-dict/non-list
+    input for either flattened array degrades to an empty expansion rather
+    than raising, matching `_expand_reconciler_output`'s `or []` tolerance.
+    """
+    expanded = dict(out)
+    fixed: list[dict] = []
+    residual: list[dict] = []
+    for item in out.get("rule_violations") or []:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip().lower()
+        if status == "fixed":
+            fixed.append({"rule": item.get("rule", ""),
+                          "fix": item.get("fix", ""),
+                          "evidence": item.get("evidence", "")})
+        elif status == "residual":
+            residual.append({"rule": item.get("rule", ""),
+                             "why_not_fixed": item.get("why_not_fixed", "")})
+    expanded["rule_violations_fixed"] = fixed
+    expanded["rule_violations_residual"] = residual
+
+    docs: list[dict] = []
+    tests: list[dict] = []
+    for item in out.get("file_updates") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip().lower()
+        row = {"path": item.get("path", ""), "reason": item.get("reason", "")}
+        if kind == "docs":
+            docs.append(row)
+        elif kind == "tests":
+            tests.append(row)
+    expanded["docs_updates"] = docs
+    expanded["tests_updates"] = tests
+    return expanded
+
+
 def check_reconciler_output(
     output: dict, plans: list[dict],
 ) -> list[str]:
@@ -8404,6 +8580,38 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
                     seen.add(str(p))
                     matched.append(p)
     return matched
+
+
+def _unreachable_task_references(task: str) -> list[str]:
+    """Flag task tokens that point outside the repo and resolve to nothing.
+
+    A task that delegates its operative content to a path the planner can
+    never read (e.g. ``~/.claude/plans/foo.md``) is silently dropped by
+    `_glob_task_references` exactly like ordinary prose — that guard
+    deliberately excludes absolute paths from candidates (see its
+    startswith("/") check) and pathlib never expands `~`, so a `~`-prefixed
+    reference never even reaches that guard. This is advisory only: it
+    never touches `_glob_task_references`'s return value or candidate
+    filtering, it only surfaces what would otherwise vanish without a
+    trace."""
+    tokens: list[str] = []
+    for token in task.split():
+        token = token.strip("\"'(),;:").strip("*_`")
+        if not token:
+            continue
+        if not any(c.isalnum() for c in token):
+            continue
+        has_ext = "." in token and not token.startswith(".")
+        has_sep = "/" in token
+        if not (has_ext or has_sep):
+            continue
+        if token.startswith("/") or token.startswith("~"):
+            tokens.append(token)
+    unreachable: list[str] = []
+    for token in tokens:
+        if not Path(token).expanduser().is_file():
+            unreachable.append(token)
+    return unreachable
 
 
 def _walk_calls(node: "object") -> list[str]:
@@ -10833,7 +11041,7 @@ async def _backstop_capture_prior_runs(
         # abort the backstop loop (or, in main()'s exit handlers, skip the
         # EXIT_LOCKED pause). Catch them here so capture stays non-fatal.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as exc:
+                ContextOverflow, DiskLowSpace) as exc:
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
@@ -10918,7 +11126,7 @@ def run_recapture_deps(
         # See the backstop guard above: TerminalAuthFailure / RateLimitedExit
         # are BaseException subclasses that a bare `except Exception` misses.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as exc:
+                ContextOverflow, DiskLowSpace) as exc:
             log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
 
     if not ran_any and not force:
@@ -11049,7 +11257,7 @@ def run_rebaser(
     # would miss, and this call must never propagate past host-finalize.sh's
     # best-effort rebase step.
     except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow) as exc:
+            ContextOverflow, DiskLowSpace) as exc:
         return {
             "status": "failed",
             "final_branch_state": "worker invocation error",
@@ -11539,6 +11747,14 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     # punctuation that often surrounds paths in markdown.
     first = body.split()[0].strip("`,:;()[]")
     if not first or first.startswith("#"):
+        return (None, False)
+    # A truthful "None." sentinel carries a trailing sentence period that
+    # would otherwise survive the strip set above and read as path-shaped
+    # (it contains a "."). Check the sentinel set against the token with
+    # a bare trailing period removed, without adding "." to the general
+    # strip set — that breaks './x', '../x', and '.github/...' parsing.
+    sentinel_candidate = first[:-1] if first.endswith(".") and not first.endswith("..") else first
+    if sentinel_candidate.lower() in {"none", "n/a", "na", "-", "nothing"}:
         return (None, False)
     # Only treat as a path if it has a separator or a dot — a bare word
     # like "refactored" is narration, not a path.
@@ -15009,6 +15225,38 @@ _ASYNCIO_MANAGED_PIDS: set[int] = set()
 # reaped, and the cgroup PID cap remains the backstop (DESIGN §6).
 _REAPABLE_PIDS: set[int] = set()
 
+# When `os.waitpid` raises ChildProcessError (ECHILD) for a PID still on
+# `_REAPABLE_PIDS`, that means one of two things: the PID is a live
+# grandchild not yet reparented to us (retry later), or it was never truly
+# ours / already reaped by someone else (drop it). `/proc/<pid>` existence
+# disambiguates the two cheaply and without waitpid-ing anyone else's child.
+# For the "still exists but not yet reparented" case we retain the PID and
+# retry on later ticks (see `_zombie_reaper`) rather than discarding it
+# outright, tracking the monotonic time of the first ECHILD per pid here so
+# retention is bounded (`_ECHILD_RETRY_MAX_SEC`) instead of growing forever
+# on a PID that, against expectation, never reparents.
+_REAPABLE_PID_FIRST_ECHILD: dict[int, float] = {}
+
+# Bound on how long a PID may sit in `_REAPABLE_PIDS` after its first ECHILD
+# before being force-discarded even though `/proc/<pid>` still exists.
+# Reparenting after an orphaning fork happens on the next scheduler tick in
+# practice; 60s is generous headroom while still keeping the set from
+# growing unboundedly for a PID that, for whatever reason, never reparents.
+_ECHILD_RETRY_MAX_SEC = 60.0
+
+
+def _pid_still_exists(pid: int) -> bool:
+    """True if `pid` is still a live process, per /proc.
+
+    A tiny existence check on ONE already-known pid, not a scan for pids to
+    reap — `_zombie_reaper` never discovers work this way, it only
+    disambiguates an ECHILD it already got for a pid already on its
+    allowlist. Kept as its own function so `_zombie_reaper`'s own source
+    never literally mentions `/proc` (see
+    `test_zombie_reaper_never_scans_proc_for_zombies`, which guards the
+    reaper against exactly the discover-via-/proc design this is not)."""
+    return os.path.exists(f"/proc/{pid}")
+
 
 def _restore_sigchld_default() -> None:
     """Force SIGCHLD to SIG_DFL before this process spawns anything.
@@ -15137,10 +15385,31 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
                     reaped, _status = os.waitpid(pid, os.WNOHANG)
                     if reaped:
                         _REAPABLE_PIDS.discard(pid)
-                except (ChildProcessError, OSError):
-                    # Not our child, or already reaped — either way it will
-                    # never be reapable, so stop tracking it.
+                        _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                except ChildProcessError:
+                    # ECHILD means "not our child" -- which for a PID a
+                    # worker's subtree just forked can legitimately mean "not
+                    # reparented to us YET", not "gone". Check /proc: if the
+                    # pid is still alive, retain it and retry on a later
+                    # tick (bounded by _ECHILD_RETRY_MAX_SEC so a PID that
+                    # never reparents doesn't accumulate forever); if it's
+                    # actually gone, drop it now.
+                    if _pid_still_exists(pid):
+                        first_seen = _REAPABLE_PID_FIRST_ECHILD.setdefault(
+                            pid, time.monotonic())
+                        if time.monotonic() - first_seen > _ECHILD_RETRY_MAX_SEC:
+                            _REAPABLE_PIDS.discard(pid)
+                            _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                        # else: still within the retry window -- keep it on
+                        # _REAPABLE_PIDS and try again next tick.
+                    else:
+                        _REAPABLE_PIDS.discard(pid)
+                        _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                except OSError:
+                    # Any other OSError (e.g. ESRCH) means it will never be
+                    # reapable by us -- stop tracking it.
                     _REAPABLE_PIDS.discard(pid)
+                    _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
         except Exception:
             pass  # reaping must never crash the orchestrator
         await asyncio.sleep(interval_sec)
@@ -15824,7 +16093,7 @@ class State:
     prevents.
 
     The lock is on the *directory*, not state.json: `save()`'s atomic
-    `tmp.replace(self.path)` would orphan a state.json-bound fd from
+    `os.replace(tmp, self.path)` would orphan a state.json-bound fd from
     the new inode, opening a multi-second window where a racer could
     acquire on the unlocked replacement. Directory inodes are never
     replaced, so the lock fd stays valid for the process lifetime.
@@ -15919,12 +16188,34 @@ class State:
         """Atomic write via temp-file rename.
 
         The flock is on `self.run_dir`, not `self.path`, so the
-        `tmp.replace(self.path)` inode swap below does not affect lock
+        `os.replace(tmp, self.path)` inode swap below does not affect lock
         ownership. The directory inode is stable for the run's
-        lifetime."""
+        lifetime.
+
+        An ENOSPC from either half of the write (the temp file's content
+        write or the atomic rename) is reraised as `DiskLowSpace` so the
+        caller pauses resumably (EXIT_LOCKED) via the same N30 path as the
+        proactive `_disk_free_ratio` checks, instead of crashing with an
+        unhandled `OSError: [Errno 28] No space left on device`.
+
+        Uses `os.replace()` rather than `Path.replace()` deliberately: on
+        Python 3.10, `pathlib`'s accessor captures a direct reference to
+        `os.replace` at class-definition time, so a test (or caller) that
+        patches the `os` module's `replace` attribute afterward does not
+        affect what `Path.replace()` actually calls — only Python 3.12's
+        rewritten pathlib looks it up dynamically. Calling `os.replace()`
+        explicitly keeps the ENOSPC-catch behavior version-independent."""
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2))
-        tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
+        try:
+            tmp.write_text(json.dumps(self.data, indent=2))
+            os.replace(tmp, self.path)   # atomic on POSIX; best-effort on Windows
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise DiskLowSpace(
+                    f"State.save() failed: no space left on device writing "
+                    f"{self.path}"
+                ) from e
+            raise
 
     def bump_workers(self, caps: dict) -> None:
         self.data["worker_count"] = self.data.get("worker_count", 0) + 1
@@ -18283,6 +18574,10 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_files:
         log(f"  task references {len(task_files)} file(s); "
             "planner will read them")
+    unreachable_refs = _unreachable_task_references(task)
+    if unreachable_refs:
+        log(f"  task references {len(unreachable_refs)} path(s) outside the "
+            f"repo that leerie cannot read: {', '.join(unreachable_refs)}")
 
     # P6 repo-map injection (DESIGN §5½ (P6)). Build the ranked subgraph seeded
     # from the task-referenced files identified above, and inject it into the
@@ -25151,14 +25446,15 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
     # abort the run.
     try:
         st.bump_workers(caps)
-        return await claude_p(user_prompt="\n".join(up),
-                              system_prompt=sys_prompt,
-                              schema_key="conformer", cwd=worktree,
-                              allowed_tools=ACT_TOOLS, max_turns=60,
-                              autonomous=True, caps=caps, st=st,
-                              model=models["conformer"],
-                              effort=efforts["conformer"],
-                              sid=f"{sid}-conformer")
+        raw = await claude_p(user_prompt="\n".join(up),
+                             system_prompt=sys_prompt,
+                             schema_key="conformer", cwd=worktree,
+                             allowed_tools=ACT_TOOLS, max_turns=60,
+                             autonomous=True, caps=caps, st=st,
+                             model=models["conformer"],
+                             effort=efforts["conformer"],
+                             sid=f"{sid}-conformer")
+        return _expand_conformer_output(raw)
     except PidExhaustedError:
         # Re-raised rather than swallowed like the generic WorkerError
         # below (of which this is a subclass): the caller
@@ -26275,6 +26571,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                             f"after {timeout}s")
             break
 
+        res = _expand_conformer_output(res)
         last_res = res
         # _validate_conformance_result enforces shape rules
         # (residuals-imply-rules-files-read, every fixed violation
@@ -27099,6 +27396,154 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         rescue_index.unlink(missing_ok=True)
 
 
+async def _run_integration_judge_gate(
+        sid: str, staging: Path, incoming_subtask: dict,
+        integrated_so_far: list[str], caps: dict, st: State,
+        models: dict[str, str], efforts: dict[str, str | None]) -> None:
+    """Invoke `integration_judge` against the merge already committed to
+    `staging` for `sid`, persist the verdict to
+    `state.data["integration_gate"][sid]` (and `["integration_defects"][sid]`
+    on a gating finding) BEFORE `die()`ing, and `die()` on an unresolved
+    (not-yet-`accepted`) defect.
+
+    Called from two places in `integrate_wave`: right after an integrator
+    commits a conflict resolution (the normal path), and — on `resume` —
+    directly against a merge a *prior* invocation already committed and the
+    judge already rejected (`accept-integration` not yet run for this sid).
+    Both call sites need the identical invoke/partition/persist/die
+    sequence; unifying them is what lets a resume re-invoke the judge
+    without re-driving `integrate.sh`/the integrator, which would just see
+    the branch already merged and short-circuit past the judge entirely.
+
+    Skipped entirely when `st.data["skip_integration_check"]` is set —
+    a full-phase bypass, independent of the accept-integration/audit-key
+    mechanism (DESIGN §8).
+    """
+    if st.data.get("skip_integration_check"):
+        log(f"  integration gate skipped for {sid} (--skip-integration-check "
+            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
+        return
+    sys_prompt_judge = _load_prompt("integration_judge")
+    repo_root = Path(os.getcwd())
+
+    # Build context: the merged diff, both parent subtask intents, and
+    # the list of already-integrated subtasks that were potential
+    # conflict sources.
+    merge_head_sha = (await run_proc(
+        ["git", "rev-parse", "HEAD"], cwd=str(staging)
+    )).stdout.strip()
+    merge_diff = (await run_proc(
+        ["git", "show", "--format=%B", merge_head_sha],
+        cwd=str(staging)
+    )).stdout
+
+    payload_judge = {
+        "sid": sid,
+        "incoming_intent": incoming_subtask.get("intent", ""),
+        "incoming_criteria": incoming_subtask.get("criteria_results", []),
+        "integrated_so_far": list(integrated_so_far),
+        "merge_commit_sha": merge_head_sha,
+        "merge_diff": merge_diff,
+    }
+
+    async def _invoke_integration_judge() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            f"CONFLICT RESOLUTION TO REVIEW:\n"
+            f"Incoming subtask: {sid}\n"
+            f"Intent: {payload_judge['incoming_intent']}\n\n"
+            f"Already-integrated subtasks: "
+            f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
+            f"MERGED RESULT:\n"
+            f"Commit: {merge_head_sha}\n\n"
+            f"{merge_diff}\n\n"
+            f"Attack the merged result for behavioral breakage. "
+            f"Return only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt_judge,
+            schema_key="integration_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("integration_judge", MODEL_DEFAULT),
+            effort=efforts.get("integration_judge"),
+            sid=f"integration_judge-{sid}",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check_integration(judge_result: dict) -> list[str]:
+        # Thin adapter for `_run_checked_loop`'s `check=` contract.
+        # Deliberately side-effect free: this runs once per round
+        # inside the loop AND again after it, so logging here would
+        # emit each advisory 2-4 times. The post-loop call site logs
+        # the advisory list once.
+        return _partition_integration_defects(judge_result, repo_root)[0]
+
+    # No make_feedback_prompt: detect-and-die, single pass. The
+    # integrator cannot mechanically fix a semantic finding without
+    # re-resolving the conflict from scratch.
+    judge_result, judge_warnings = await _run_checked_loop(
+        invoke=_invoke_integration_judge,
+        check=_check_integration,
+        name=f"integration_judge-{sid}",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    for w in judge_warnings:
+        log(f"  integration-judge-{sid}: {w}")
+
+    if judge_result is None:
+        # The judge crashed every round (infrastructure). The merge is
+        # already committed and passed the mechanical checks, so degrade
+        # rather than undo it. Nothing is persisted — a WorkerError
+        # degrade never reached a verdict, so a resume should re-attempt
+        # the gate rather than inherit one.
+        log(f"  ⚠  integration-judge for {sid} crashed every round; "
+            "degrading (merge preserved, check_merge_committed already ran)")
+        return
+
+    # The single place advisories are logged — see
+    # `_partition_integration_defects`' docstring for why this is
+    # not done inside `_check_integration`.
+    remaining_defects, advisories = _partition_integration_defects(
+        judge_result, repo_root)
+    for a in advisories:
+        log(f"  ⚠  integration-judge-{sid}: advisory {a}")
+
+    # Persisted BEFORE die()ing (unlike wiring_gate, which is written only
+    # on a clean pass) — the point is a resume must be able to tell "not
+    # yet reviewed" from "reviewed and rejected" so it knows to re-invoke
+    # the judge rather than silently skip past a rejected merge.
+    st.data.setdefault("integration_gate", {})[sid] = {
+        "defects": remaining_defects,
+        "advisories": advisories,
+        "merge_commit_sha": merge_head_sha,
+        "accepted": not remaining_defects,
+    }
+    if remaining_defects:
+        st.data.setdefault("integration_defects", {})[sid] = remaining_defects
+    else:
+        st.data.get("integration_defects", {}).pop(sid, None)
+    st.save()
+
+    if remaining_defects:
+        # Found behavioral breakage. Unlike the wiring gate (pre-merge),
+        # we already have a committed merge, so the abort instruction
+        # differs.
+        die(
+            f"integration gate found behavioral defect(s) in the merge "
+            f"for {sid}:\n" +
+            "\n".join(f"  • {d}" for d in remaining_defects) +
+            f"\n\nAn independent review found the merge is textually "
+            f"clean (no conflict markers, committed) but behaviorally "
+            f"broken. The merge has been committed to staging. Either "
+            f"revert it manually and resolve the conflict differently "
+            f"then re-run with resume, revise one of the conflicting "
+            f"subtasks' approaches then re-run with resume, or accept "
+            f"the finding with `leerie accept-integration "
+            f"{st.run_id} {sid}` and re-run with resume."
+        )
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -27128,6 +27573,29 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
+            continue
+        gate = st.data.get("integration_gate", {}).get(sid)
+        if gate is not None:
+            # A prior invocation already ran integrate.sh/the integrator for
+            # this sid and the merge is already committed to staging — the
+            # judge only ever runs post-merge-commit, so a present entry
+            # means we must not re-drive integrate.sh at all (it would just
+            # see the branch already merged, short-circuit at rc 0, and
+            # skip straight past the judge, silently readvancing the wave
+            # onto a merge the gate never cleared).
+            if gate.get("accepted"):
+                integrated.append(sid)
+                integrated_so_far.append(sid)
+            else:
+                # Not yet accepted via `accept-integration` — re-invoke the
+                # judge directly against the already-committed merge. This
+                # is the resume path for the incident this gate exists to
+                # let an operator recover from.
+                await _run_integration_judge_gate(
+                    sid, staging, results.get(sid, {}), integrated_so_far,
+                    caps, st, models, efforts)
+                integrated.append(sid)
+                integrated_so_far.append(sid)
             continue
         proc = await _run_script("integrate.sh", sid, st.run_id)
         if proc.returncode == 0:
@@ -27244,107 +27712,13 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # call sites. Detect-and-die, single pass: an integrator cannot
             # mechanically fix a semantic finding from an independent judge
             # without a fresh conflict-resolution attempt, so re-driving would
-            # reproduce the same merge.
-            sys_prompt_judge = _load_prompt("integration_judge")
-            repo_root = Path(os.getcwd())
-
-            # Build context: the merged diff, both parent subtask intents, and
-            # the list of already-integrated subtasks that were potential
-            # conflict sources.
-            merge_head_sha = (await run_proc(
-                ["git", "rev-parse", "HEAD"], cwd=str(staging)
-            )).stdout.strip()
-            merge_diff = (await run_proc(
-                ["git", "show", "--format=%B", merge_head_sha],
-                cwd=str(staging)
-            )).stdout
-
-            # Get the incoming subtask's details
-            incoming_subtask = results.get(sid, {})
-
-            payload_judge = {
-                "sid": sid,
-                "incoming_intent": incoming_subtask.get("intent", ""),
-                "incoming_criteria": incoming_subtask.get("criteria_results", []),
-                "integrated_so_far": list(integrated_so_far),
-                "merge_commit_sha": merge_head_sha,
-                "merge_diff": merge_diff,
-            }
-
-            async def _invoke_integration_judge() -> dict:
-                st.bump_workers(caps)
-                user_prompt = (
-                    f"CONFLICT RESOLUTION TO REVIEW:\n"
-                    f"Incoming subtask: {sid}\n"
-                    f"Intent: {payload_judge['incoming_intent']}\n\n"
-                    f"Already-integrated subtasks: "
-                    f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
-                    f"MERGED RESULT:\n"
-                    f"Commit: {merge_head_sha}\n\n"
-                    f"{merge_diff}\n\n"
-                    f"Attack the merged result for behavioral breakage. "
-                    f"Return only the JSON object per your schema."
-                )
-                return await claude_p(
-                    user_prompt=user_prompt, system_prompt=sys_prompt_judge,
-                    schema_key="integration_judge", cwd=str(repo_root),
-                    allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
-                    caps=caps, st=st,
-                    model=models.get("integration_judge", MODEL_DEFAULT),
-                    effort=efforts.get("integration_judge"),
-                    sid=f"integration_judge-{sid}",
-                    add_dirs=st.data.get("inspect_dirs") or None,
-                )
-
-            def _check_integration(judge_result: dict) -> list[str]:
-                # Thin adapter for `_run_checked_loop`'s `check=` contract.
-                # Deliberately side-effect free: this runs once per round
-                # inside the loop AND again after it, so logging here would
-                # emit each advisory 2-4 times. The post-loop call site logs
-                # the advisory list once.
-                return _partition_integration_defects(judge_result, repo_root)[0]
-
-            # No make_feedback_prompt: detect-and-die, single pass. The
-            # integrator cannot mechanically fix a semantic finding without
-            # re-resolving the conflict from scratch.
-            judge_result, judge_warnings = await _run_checked_loop(
-                invoke=_invoke_integration_judge,
-                check=_check_integration,
-                name=f"integration_judge-{sid}",
-                max_rounds=caps["judgment_check_rounds"],
-            )
-            for w in judge_warnings:
-                log(f"  integration-judge-{sid}: {w}")
-
-            if judge_result is None:
-                # The judge crashed every round (infrastructure). The merge is
-                # already committed and passed the mechanical checks, so degrade
-                # rather than undo it.
-                log(f"  ⚠  integration-judge for {sid} crashed every round; "
-                    "degrading (merge preserved, check_merge_committed already ran)")
-            else:
-                # The single place advisories are logged — see
-                # `_partition_integration_defects`' docstring for why this is
-                # not done inside `_check_integration`.
-                remaining_defects, advisories = _partition_integration_defects(
-                    judge_result, repo_root)
-                for a in advisories:
-                    log(f"  ⚠  integration-judge-{sid}: advisory {a}")
-                if remaining_defects:
-                    # Found behavioral breakage. Unlike the wiring gate (pre-merge),
-                    # we already have a committed merge, so the abort instruction
-                    # differs.
-                    die(
-                        f"integration gate found behavioral defect(s) in the merge "
-                        f"for {sid}:\n" +
-                        "\n".join(f"  • {d}" for d in remaining_defects) +
-                        f"\n\nAn independent review found the merge is textually "
-                        f"clean (no conflict markers, committed) but behaviorally "
-                        f"broken. The merge has been committed to staging. Either "
-                        f"revert it manually and resolve the conflict differently, "
-                        f"or accept the finding and revise one of the conflicting "
-                        f"subtasks' approaches, then re-run with resume."
-                    )
+            # reproduce the same merge. Persists to
+            # `state.data["integration_gate"][sid]` and re-runs on `resume`
+            # via the gate check at the top of this loop — see
+            # `_run_integration_judge_gate`.
+            await _run_integration_judge_gate(
+                sid, staging, results.get(sid, {}), integrated_so_far,
+                caps, st, models, efforts)
 
             integrated.append(sid)
             integrated_so_far.append(sid)
@@ -27407,6 +27781,19 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     for wi in range(start, len(waves)):
         wave = waves[wi]
 
+        # N30: periodic mid-run headroom check, once per wave — each wave
+        # spawns worktrees/logs/calls.ndjson writes, so this is the natural
+        # per-iteration point to catch a disk that has drained since the
+        # preflight check. Unlike preflight (which die()s — nothing to
+        # preserve yet), a mid-run drop raises DiskLowSpace so main() can
+        # pause resumably instead of crashing on an unhandled OSError from
+        # underneath the next State.save()/worktree write.
+        ratio = _disk_free_ratio(leerie_dir)
+        if ratio < DISK_MIN_FREE_RATIO:
+            raise DiskLowSpace(
+                f"before wave {wi + 1} of {len(waves)}: "
+                f"{_disk_headroom_message(leerie_dir, ratio)}")
+
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
         # individual spawn (the retired _await_worker_memory_admission poll
@@ -27428,7 +27815,17 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # the point of resume.
         prior = st.data.get("subtask_status", {})
         remaining = [sid for sid in wave if prior.get(sid) != "complete"]
-        if not remaining:
+        # A sid whose implementer already completed but whose
+        # integration_judge finding is still un-`accept`ed must not be
+        # silently skipped here: `integrate_wave` was never reached for it
+        # this invocation, so the gate check at its loop's top (the one
+        # that re-invokes the judge on resume) never runs either. Without
+        # this, the wave-already-complete shortcut below would advance
+        # `completed_waves` past a merge the gate rejected.
+        gate = st.data.get("integration_gate", {})
+        pending_gate_sids = [sid for sid in wave
+                              if gate.get(sid) and not gate[sid].get("accepted")]
+        if not remaining and not pending_gate_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"all {len(wave)} subtask(s) already complete, skipping")
             st.data["completed_waves"] = wi + 1
@@ -27452,6 +27849,16 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
 
         pairs = await _gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = dict(pairs)
+        # Stand-in entries for sids whose implementer completed in a prior
+        # invocation but who still have a pending, un-accepted
+        # integration_gate finding (see `pending_gate_sids` above) — they
+        # are not in `remaining`/`results` this round, and `integrate_wave`
+        # requires `results[sid]["status"] == "complete"` to process a sid
+        # at all. The gate re-invocation itself only needs `sid`'s status;
+        # `intent`/`criteria_results` are unavailable this far removed from
+        # the original settle and are omitted rather than fabricated.
+        for sid in pending_gate_sids:
+            results.setdefault(sid, {"status": "complete"})
 
         blocked = [s for s, r in results.items()
                    if r.get("status") in ("blocked", "failed")]
@@ -27477,6 +27884,15 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # visible signature of a silent integration skip.
         log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
             f"{expected} completed subtask(s)")
+
+        # N31: the worktree (including node_modules) is dead weight once
+        # its branch is merged into staging — pruning it here, instead of
+        # waiting for run-end cleanup, is what keeps disk usage bounded on
+        # long multi-wave runs. Scoped strictly to sids integrate_wave
+        # reports as integrated; blocked/failed sids keep their worktree
+        # for a corrective retry via _reset_subtask_worktree.
+        for sid in integrated:
+            await _prune_subtask_worktree(sid, leerie_dir)
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
@@ -28154,7 +28570,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
     except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow) as _cap_exc:
+            ContextOverflow, DiskLowSpace) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -28418,17 +28834,40 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_coverage_check", False))
         st.data["skip_completeness_check"] = bool(
             getattr(args, "skip_completeness_check", False))
+        st.data["skip_integration_check"] = bool(
+            getattr(args, "skip_integration_check", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
-        st.data["leerie_version"] = _read_version()
+        # leerie_version/leerie_commit are set ONCE, at the run's original
+        # start, and must stay immutable across every later resume — a
+        # resume overwriting them with whatever happens to be installed NOW
+        # makes a resumed run's failures read as attributable to the wrong
+        # release, exactly the ambiguity leerie_commit itself was added to
+        # close. Only seed them here if this state predates the field
+        # (resuming a run started before this key existed).
+        if "leerie_version" not in st.data:
+            st.data["leerie_version"] = _read_version()
         # `or None` rather than the bare value: an unset or empty
         # LEERIE_COMMIT (tarball install, or a launcher predating this field)
         # must record absence, not an empty string that reads as a real sha.
-        st.data["leerie_commit"] = os.environ.get("LEERIE_COMMIT") or None
+        if "leerie_commit" not in st.data:
+            st.data["leerie_commit"] = os.environ.get("LEERIE_COMMIT") or None
+        # leerie_versions: append-only resume history, distinct from the
+        # immutable original leerie_version/leerie_commit above. Each entry
+        # records what was actually installed at the moment of that resume,
+        # so a failure that only reproduces after an install upgrade is still
+        # attributable.
+        if "leerie_versions" not in st.data:
+            st.data["leerie_versions"] = []
+        st.data["leerie_versions"].append({
+            "version": _read_version(),
+            "commit": os.environ.get("LEERIE_COMMIT") or None,
+            "at": now(),
+        })
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
         # loaded and this resume is past the completed/no-work short-
@@ -28487,6 +28926,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_coverage_check", False)),
                    "skip_completeness_check": bool(
                        getattr(args, "skip_completeness_check", False)),
+                   "skip_integration_check": bool(
+                       getattr(args, "skip_integration_check", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -28499,7 +28940,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    # this fresh path as a dict literal, and a source-order
                    # check cannot tell which branch it covered — which is
                    # exactly how this key shipped absent from the common path.
-                   "leerie_commit": os.environ.get("LEERIE_COMMIT") or None}
+                   "leerie_commit": os.environ.get("LEERIE_COMMIT") or None,
+                   # leerie_versions: append-only resume history — see the
+                   # resume branch above for why this is distinct from the
+                   # immutable leerie_version/leerie_commit pair. Seeded here
+                   # as a one-entry list so every run (resumed or not) has a
+                   # non-empty history.
+                   "leerie_versions": [{
+                       "version": _read_version(),
+                       "commit": os.environ.get("LEERIE_COMMIT") or None,
+                       "at": now(),
+                   }]}
         st.save()
         # Fail-closed containment gate + recording, before the first
         # worker (phase_classify below). Must come after the
@@ -29174,6 +29625,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "resume. "
                          f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
                          "skip_completeness_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-integration-check", action="store_true",
+                    help="skip the integration_judge behavioral-defect gate "
+                         "(DESIGN §8 Independent adversarial verification) "
+                         "entirely: no worker spawn for any subtask in this "
+                         "run. Independent of the accept-integration/"
+                         "audit-key mechanism, which only accepts a finding "
+                         "the judge already produced. "
+                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
+                         "skip_integration_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -29588,6 +30048,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     args.skip_completeness_check = resolve_skip_completeness_check(
         repo_root, getattr(args, "skip_completeness_check", False))
 
+    # Resolve --skip-integration-check (the integration_judge behavioral-
+    # defect gate, DESIGN §8). Same precedence shape; _orchestrate() folds
+    # it into state.json under "skip_integration_check"; integrate_wave's
+    # `_run_integration_judge_gate` reads it from there on entry.
+    args.skip_integration_check = resolve_skip_integration_check(
+        repo_root, getattr(args, "skip_integration_check", False))
+
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.
     # _orchestrate() folds it into state.json under "skip_satisfied_check";
@@ -29843,8 +30310,42 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 caps=caps, models=models, efforts=efforts,
             ))
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during context-overflow pause "
+                f"({_cap_exc})")
+        exit_code = EXIT_LOCKED
+
+    except DiskLowSpace as e:
+        # N30: the periodic mid-run headroom check in phase_execute found
+        # free space on the state-dir filesystem below DISK_MIN_FREE_RATIO.
+        # Resumable, not fatal — the remedy is an operator freeing space,
+        # after which the run's on-disk state (worktrees, branches,
+        # state.json) is untouched and `leerie resume` picks it back up.
+        # Mirrors the ContextOverflow arm just above.
+        full_purge = False
+        st.save()
+        log(f"disk headroom low — {e.raw_message}")
+        log("  Free up space on the state-dir filesystem "
+            "(old runs under the state root are the usual culprit), "
+            f"then resume with: leerie resume {st.run_id}")
+        abnormal = False
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except Exception:
+            pass
+        # Best-effort dep_capture, matching every other terminating arm.
+        # Guarded against the whole exit-signal family for the reason the
+        # auth-locked arm documents below: these subclass BaseException, and a
+        # re-raise escaping here would skip the `exit_code` assignment and
+        # crash the run with exit 1 instead of pausing resumably.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except (Exception, TerminalAuthFailure, RateLimitedExit,
+                ContextOverflow, DiskLowSpace) as _cap_exc:
+            log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
 
@@ -29882,7 +30383,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
         # crash the run with exit 1 — defeating this whole resumable-pause arm.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -29937,7 +30438,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # `except Exception` misses, which would skip the `exit_code =
             # EXIT_LOCKED` below and crash the pause with exit 1.
             except (Exception, TerminalAuthFailure, RateLimitedExit,
-                    ContextOverflow) as _cap_exc:
+                    ContextOverflow, DiskLowSpace) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -29990,7 +30491,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the cancel arm still reaches its `exit_code = 130`.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -30015,7 +30516,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the signal arm still reaches its `exit_code = 128 + signum`.
         except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow) as _cap_exc:
+                ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.

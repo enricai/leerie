@@ -252,8 +252,11 @@ def test_clean_result_without_evidence_warns(env):
 def test_malformed_result_surfaces_warning(env):
     c = env["leerie"]
     # residual without files_read — cross-field invariant violation.
+    # Uses the wire (pre-expansion) field name since this flows through
+    # the real claude_p stub -> _expand_conformer_output path.
     bad = _clean_result(
-        rule_violations_residual=[{"rule": "x", "why_not_fixed": "y"}],
+        rule_violations=[{"status": "residual", "rule": "x",
+                          "why_not_fixed": "y"}],
     )
     state = _stub_claude_p(c, [bad])
 

@@ -20,10 +20,8 @@ def _minimal_conformer_instance(axis_without_summary: dict) -> dict:
     return {
         "subtask_id": "bugfix-002",
         "rules_files_read": [],
-        "rule_violations_fixed": [],
-        "rule_violations_residual": [],
-        "docs_updates": [],
-        "tests_updates": [],
+        "rule_violations": [],
+        "file_updates": [],
         "build": axis_without_summary,
         "lint": axis_without_summary,
         "tests": axis_without_summary,

@@ -168,7 +168,10 @@ class TestWiring:
         assert "capture_repo_deps(" in arm, (
             "the ContextOverflow arm skips the best-effort dep capture its "
             "sibling terminating arms all perform")
-        assert "ContextOverflow)" in arm, (
+        assert "except (Exception, TerminalAuthFailure, RateLimitedExit," in arm \
+            and "ContextOverflow" in arm.split(
+                "except (Exception, TerminalAuthFailure, RateLimitedExit,", 1)[1] \
+                .split(") as", 1)[0], (
             "the arm's own capture guard must catch ContextOverflow — "
             "capture_repo_deps calls claude_p, which can raise it again")
         # The capture must precede the exit_code assignment; an escape past an

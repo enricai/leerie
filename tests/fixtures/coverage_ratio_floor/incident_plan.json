@@ -1,0 +1,121 @@
+{
+  "_comment": "Shape-matched to the navegando ef49d433... incident (N34): the classifier's structured required_items extraction from a 22-finding audit document, and the 4-item subset the actual planned/reconciled plan addressed (docs-001..003 + feat-001). Numbers only -- no task prose is parsed by this fixture or by the predicate under test; 'covered_source_refs' stands in for whatever structured signal a future planner/reconciler field would have to surface (open question in task.md N34: 'the honest answer may be that the classifier or planner has to surface it').",
+  "task": "Findings.md \u2014 the per-repo index of prior security/compliance audit findings.",
+  "required_items": [
+    {
+      "item": "A1a CSP header missing",
+      "source_ref": "FINDINGS.md#finding-1"
+    },
+    {
+      "item": "A1b mic permission not gated",
+      "source_ref": "FINDINGS.md#finding-2"
+    },
+    {
+      "item": "B1 GDPR purge job absent",
+      "source_ref": "FINDINGS.md#finding-3"
+    },
+    {
+      "item": "C1 SSE fan-out unbounded",
+      "source_ref": "FINDINGS.md#finding-4"
+    },
+    {
+      "item": "C2 broadcast completion not awaited",
+      "source_ref": "FINDINGS.md#finding-5"
+    },
+    {
+      "item": "E1 free paid plan default wrong",
+      "source_ref": "FINDINGS.md#finding-6"
+    },
+    {
+      "item": "E2 quota window reset missing",
+      "source_ref": "FINDINGS.md#finding-7"
+    },
+    {
+      "item": "A3 env validation absent",
+      "source_ref": "FINDINGS.md#finding-8"
+    },
+    {
+      "item": "A5 email HTML escaping missing",
+      "source_ref": "FINDINGS.md#finding-9"
+    },
+    {
+      "item": "A6 seed password reset flow",
+      "source_ref": "FINDINGS.md#finding-10"
+    },
+    {
+      "item": "A7 React Compiler pinned to beta",
+      "source_ref": "FINDINGS.md#finding-11"
+    },
+    {
+      "item": "D1 cooldown TOCTOU",
+      "source_ref": "FINDINGS.md#finding-12"
+    },
+    {
+      "item": "D2 rate limiter bypass",
+      "source_ref": "FINDINGS.md#finding-13"
+    },
+    {
+      "item": "D3 session fixation",
+      "source_ref": "FINDINGS.md#finding-14"
+    },
+    {
+      "item": "A8 CORS wildcard",
+      "source_ref": "FINDINGS.md#finding-15"
+    },
+    {
+      "item": "A9 CSRF token reuse",
+      "source_ref": "FINDINGS.md#finding-16"
+    },
+    {
+      "item": "A10 XSS in markdown render",
+      "source_ref": "FINDINGS.md#finding-17"
+    },
+    {
+      "item": "A12 stale cache invalidation",
+      "source_ref": "FINDINGS.md#finding-18"
+    },
+    {
+      "item": "A13 webhook signature unchecked",
+      "source_ref": "FINDINGS.md#finding-19"
+    },
+    {
+      "item": "A14 admin route unauthenticated",
+      "source_ref": "FINDINGS.md#finding-20"
+    },
+    {
+      "item": "A15 audit log gap",
+      "source_ref": "FINDINGS.md#finding-21"
+    },
+    {
+      "item": "F1 backup retention unset",
+      "source_ref": "FINDINGS.md#finding-22"
+    }
+  ],
+  "plan_subtasks": [
+    {
+      "id": "docs-001",
+      "title": "Update README with findings summary"
+    },
+    {
+      "id": "docs-002",
+      "title": "Add .env.example entries"
+    },
+    {
+      "id": "docs-003",
+      "title": "Document React Compiler beta pin"
+    },
+    {
+      "id": "feat-001",
+      "title": "Add backup retention config"
+    }
+  ],
+  "covered_source_refs": [
+    "FINDINGS.md#finding-8",
+    "FINDINGS.md#finding-9",
+    "FINDINGS.md#finding-11",
+    "FINDINGS.md#finding-22"
+  ],
+  "expected_required_count": 22,
+  "expected_covered_count": 4,
+  "expected_ratio": 0.18181818181818182
+}

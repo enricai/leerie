@@ -348,14 +348,32 @@ exit 0
 
 def test_diagnoses_husky_pre_push_hook_failure(tmp_path):
     """git push fails with a husky pre-push hook failure buried under an
-    unrelated cosmetic warning → the diagnostic names the hook and points
-    at --no-verify, alongside (not instead of) the raw stderr."""
+    unrelated cosmetic warning, AND a real executable pre-push hook is
+    present (the mechanical N24 probe) → the diagnostic names the hook
+    and points at --no-verify, alongside (not instead of) the raw
+    stderr. The husky-text stub here is only exercised as the
+    supplementary "which hook" naming signal; classification itself
+    comes from the stubbed rev-parse --git-path pointing at a real,
+    executable hooks/pre-push file."""
     run_dir = _make_run(tmp_path, "feat-h-aaaaaa", run_json={
         "branch": "leerie/runs/feat-h-aaaaaa",
         "working_branch": "main",
         "finished_at": "2026-05-29T16:00:00+00:00",
     })
-    git_body = '''
+    user_repo = tmp_path / "user-repo"
+    hooks_dir = user_repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-push"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    git_body = f'''
+if [ "$1" = "-C" ] && [ "$3" = "config" ]; then
+  exit 1
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "{hooks_dir}"
+  exit 0
+fi
 if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "npm warn config production Use --omit=dev instead." >&2
   echo "husky - pre-push script failed (code 254)" >&2
@@ -381,6 +399,81 @@ def test_does_not_diagnose_ordinary_push_failure(tmp_path):
     git_body = '''
 if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
   echo "fatal: Authentication failed for '"'"'https://github.com/o/r.git/'"'"'" >&2
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 1, r.stderr
+    assert "--no-verify" not in r.stderr
+    assert "pre-push" not in r.stderr
+
+
+def test_diagnoses_non_branded_hook_failure_via_mechanical_probe(tmp_path):
+    """N24: a push failure whose stderr contains NONE of the vendor-specific
+    strings the old grep-only detector required ('husky', 'pre-push script
+    failed', 'exit code 254') is still classified as a hook failure, because
+    classification is now driven by the mechanical probe -- an executable
+    hooks/pre-push resolved via core.hooksPath (honoring a non-standard
+    location like .husky/_, the real husky v8+ layout) -- not by grepping
+    push stderr text. Falsifies the pre-fix grep-only detector: this exact
+    stderr does not match 'husky|pre-push script failed|exit code 254'."""
+    run_dir = _make_run(tmp_path, "feat-m-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-m-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    user_repo = tmp_path / "user-repo"
+    hooks_dir = user_repo / ".husky" / "_"
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-push"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "config" ]; then
+  echo ".husky/_"
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
+  echo "> project@1.0.0 preflight" >&2
+  echo "> pnpm exec lint-staged" >&2
+  echo "eslint found 3 errors" >&2
+  echo "error: failed to push some refs to origin" >&2
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 1, r.stderr
+    assert "pre-push" in r.stderr
+    assert "--no-verify" in r.stderr
+    # None of the old grep-only detector's vendor strings appear anywhere
+    # in the stub's stderr, so a grep-only classifier would have stayed
+    # silent here.
+    for banned in ("husky", "pre-push script failed", "exit code 254"):
+        assert banned not in r.stderr.lower()
+
+
+def test_unreachable_remote_not_diagnosed_as_hook_failure(tmp_path):
+    """N24: git's own fixed 'could not resolve host' failure text, with NO
+    pre-push hook configured at all, must not be classified as a hook
+    failure -- the mechanical probe correctly reports no executable
+    hooks/pre-push, so the auth/network exclusion list never even needs to
+    fire here (it's the hook-presence check itself that stays negative)."""
+    run_dir = _make_run(tmp_path, "feat-u-aaaaaa", run_json={
+        "branch": "leerie/runs/feat-u-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "config" ]; then
+  exit 1
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "push" ] || [ "$1" = "push" ]; then
+  echo "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com" >&2
   exit 1
 fi
 exit 0

@@ -22,6 +22,7 @@ import os
 import subprocess
 import textwrap
 import sys
+import time
 
 import pytest
 
@@ -351,3 +352,91 @@ def test_zombie_reaper_survives_no_children(leerie):
             pass
 
     asyncio.run(_run())
+
+
+@linux_only
+def test_zombie_reaper_retains_pid_on_early_echild_then_reaps_after_reparent(leerie):
+    """N36 regression: an ECHILD for a pid still on `_REAPABLE_PIDS` must not
+    be treated as "gone" when the pid is a live grandchild that has not yet
+    reparented to us -- only once it's confirmed absent (or successfully
+    reaped) may it be dropped.
+
+    Reproduces the real shape: this test process becomes a subreaper, forks
+    a `mid` process that forks a `grandchild` and then (deliberately, via a
+    short sleep) stays alive for a beat before exiting. While `mid` is still
+    alive the grandchild is not yet our child, so a `waitpid` on it raises
+    ECHILD even though the pid is very much alive and will reparent to us
+    shortly. Only after `mid` exits does the grandchild reparent to this
+    process; only after the grandchild itself exits can it actually be
+    reaped.
+    """
+    assert leerie._become_subreaper(), (
+        "prctl(PR_SET_CHILD_SUBREAPER) failed -- cannot exercise the "
+        "reparent-after-ECHILD race without it")
+
+    read_fd, write_fd = os.pipe()
+    mid_pid = os.fork()
+    if mid_pid == 0:  # mid
+        os.close(read_fd)
+        grandchild_pid = os.fork()
+        if grandchild_pid == 0:  # grandchild
+            os.close(write_fd)
+            time.sleep(0.3)
+            os._exit(0)
+        os.write(write_fd, f"{grandchild_pid}\n".encode())
+        os.close(write_fd)
+        # Stay alive briefly so the grandchild is provably still `mid`'s
+        # child (not yet ours) when the parent registers and ticks.
+        time.sleep(0.15)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        with os.fdopen(read_fd) as f:
+            grandchild_pid = int(f.readline().strip())
+
+        leerie._mark_reapable({grandchild_pid})
+
+        async def _early_tick():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.05)  # well within mid's 0.15s hold
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_early_tick())
+
+        assert grandchild_pid in leerie._REAPABLE_PIDS, (
+            "an early ECHILD (grandchild not yet reparented) must retain the "
+            "pid, not discard it -- discarding here means the eventual "
+            "orphan is never reaped and rots as a zombie against pids.max")
+
+        async def _wait_for_reap():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            try:
+                for _ in range(100):
+                    await asyncio.sleep(0.02)
+                    if grandchild_pid not in leerie._REAPABLE_PIDS:
+                        return
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(_wait_for_reap())
+
+        assert grandchild_pid not in leerie._REAPABLE_PIDS, (
+            "grandchild was never reaped after reparenting and exiting")
+        with pytest.raises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)
+    finally:
+        leerie._REAPABLE_PIDS.discard(grandchild_pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(grandchild_pid, None)
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(mid_pid, 0)
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(grandchild_pid, 0)
