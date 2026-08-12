@@ -100,6 +100,31 @@ def test_accepts_when_registry_disagrees_with_status_string(tmp_path):
     assert "s1" not in st.get("blocked", {})
 
 
+def test_accepts_in_progress_subtask_when_in_registry(tmp_path):
+    # Same N21/N22 shape as test_accepts_when_registry_disagrees_with_status_string
+    # but with subtask_status='in_progress' -- the gate must key off blocked-dict
+    # membership for ANY non-complete status string, not just incomplete-handoff.
+    sf = _make_state(tmp_path, {"s1": "in_progress"},
+                     blocked={"s1": "worker died mid-run"})
+    r = _run_accept(sf, "s1")
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    assert st["subtask_status"]["s1"] == "complete"
+    assert "s1" not in st.get("blocked", {})
+
+
+def test_accepts_blocked_status_without_registry_entry(tmp_path):
+    # Regression pin for the precedence the fix chose: subtask_status='blocked'
+    # (or 'failed') alone -- with no corresponding entry in the blocked dict --
+    # still accepts, since `cur in ("blocked", "failed")` is an independent OR
+    # branch alongside registry membership, not a replacement for it.
+    sf = _make_state(tmp_path, {"s1": "blocked"})
+    r = _run_accept(sf, "s1")
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    assert st["subtask_status"]["s1"] == "complete"
+
+
 def test_cleans_up_empty_blocked_dict(tmp_path):
     sf = _make_state(tmp_path, {"s1": "blocked"},
                      blocked={"s1": "reason"})
