@@ -1207,7 +1207,7 @@ EFFORT_ENV = "LEERIE_EFFORT"
 #
 # The values are DERIVED, not chosen. `tests/fixtures/worker_duration/
 # summary.json` holds the measured per-worker distribution (15,951 calls
-# across 21 worker types, 153 runs; regenerate with
+# across 21 worker types; regenerate with
 # `scripts/measure/worker_durations.py <state-root>`), and each entry is
 #
 #     min(cap, max(_WORKER_TIMEOUT_FLOOR_SEC, ceil(p99*3), ceil(max*1.2)))
@@ -1261,13 +1261,20 @@ def resolve_worker_timeout(worker: str, caps: dict) -> int:
     Two tiers, and which one applies turns on whether the operator said
     anything:
 
-    - **No explicit global** (the resolved cap still equals
-      `DEFAULT_CAPS["worker_timeout_sec"]`): the per-worker table applies,
-      lowering the ceiling for the 18 measured-fast worker types and leaving
-      everything else at the default.
+    - **No explicit global**: the per-worker table applies, lowering the
+      ceiling for the 18 measured-fast worker types and leaving everything
+      else at the default. Bounded by the global so a lowered default still
+      lowers every worker.
     - **An explicit global** (`--worker-timeout` / `LEERIE_WORKER_TIMEOUT` /
-      `worker_timeout_sec` in `leerie.toml` resolved to anything else): that
-      value wins outright and the table is bypassed.
+      `worker_timeout_sec` in `leerie.toml`): that value wins outright and
+      the table is bypassed.
+
+    Keyed on `caps["worker_timeout_explicit"]`, NOT on whether the resolved
+    int differs from the default. Comparing values made `--worker-timeout
+    5400` — the one gesture an operator debugging timeouts is most likely to
+    try — indistinguishable from setting nothing, silently leaving
+    `classifier` at 1236 s. Resolvers return a plain int, so the
+    explicit/implicit bit has to be carried separately.
 
     The explicit tier has to win rather than merely bound, or the escape
     hatch does not reach the case that needs it. The table is derived from a
@@ -1281,9 +1288,9 @@ def resolve_worker_timeout(worker: str, caps: dict) -> int:
     """
     global_cap = caps.get("worker_timeout_sec",
                           DEFAULT_CAPS["worker_timeout_sec"])
-    if global_cap != DEFAULT_CAPS["worker_timeout_sec"]:
+    if caps.get("worker_timeout_explicit"):
         return global_cap
-    return TIMEOUT_DEFAULT_PER_WORKER.get(worker, global_cap)
+    return min(TIMEOUT_DEFAULT_PER_WORKER.get(worker, global_cap), global_cap)
 
 
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -5556,6 +5563,24 @@ def resolve_worker_timeout_sec(repo_root: Path,
         default=DEFAULT_CAPS["worker_timeout_sec"])
 
 
+def resolve_worker_timeout_explicit(repo_root: Path,
+                               cli_value: int | None = None) -> bool:
+    """True when the operator set the global ceiling anywhere.
+
+    `_resolve_positive_int_pref` returns a plain `int`, so "5400 because the
+    operator asked" and "5400 because nothing was set" are indistinguishable
+    downstream — which made an explicit `--worker-timeout 5400` a silent
+    no-op. This re-walks the same three tiers and reports only whether any
+    of them spoke; `resolve_worker_timeout_sec` still owns the value and its
+    validation."""
+    if cli_value is not None:
+        return True
+    if os.environ.get(WORKER_TIMEOUT_ENV, "").strip():
+        return True
+    return _read_toml_key(repo_root / WORKER_TIMEOUT_FILE,
+                          "worker_timeout_sec") is not None
+
+
 def resolve_worker_pids_max(repo_root: Path,
                             cli_value: int | None = None) -> int:
     """Resolve the per-worker cgroup PID cap (pids.max). Order:
@@ -6463,31 +6488,66 @@ def _disk_free_ratio(path: Path) -> float:
     return usage.free / usage.total
 
 
-def _measure_worktree_bytes(leerie_dir: Path) -> int | None:
+_worktree_measure_empty_warned = False
+
+
+def _warn_worktree_measure_empty_once(candidate_count: int) -> None:
+    """Emit at most one warning per process when a worktree measurement
+    totals zero despite candidates existing (N30).
+
+    Zero is indistinguishable from "not measurable" at the call site, and
+    both make `_disk_required_bytes` return None — so without this line the
+    measured bound degrades to the proportional floor with no trace at all.
+    Reachable when every file's blocks are already shared out of the tree,
+    or on a filesystem that reports `st_blocks == 0` (inline-data ext4,
+    small btrfs extents, some FUSE mounts)."""
+    global _worktree_measure_empty_warned
+    if _worktree_measure_empty_warned:
+        return
+    _worktree_measure_empty_warned = True
+    log(f"  disk: measured 0 bytes across {candidate_count} worktree(s); "
+        "the per-worktree headroom bound is unavailable and the check "
+        "falls back to the free-space ratio")
+
+
+def _measure_worktree_bytes(leerie_dir: Path,
+                            refresh: bool = False) -> int | None:
     """MARGINAL disk cost of one more subtask worktree, measured on this
     repo (N30). Returns None when no subtask worktree exists to measure.
 
-    **Marginal, not total, and that distinction is the whole point.** Each
-    file is charged `st_blocks * 512 / st_nlink`. A file the package manager
-    hardlinked in from its content-addressed store already occupies those
-    blocks — creating another worktree does not spend them again — so
-    charging the full size answers the wrong question. Dividing by the link
-    count is the right discriminator *by construction*, with no need to
-    detect the host's mount topology:
+    **Marginal, not total, and that distinction is the whole point.** An
+    inode is charged only when **every one of its links lives inside the
+    walked tree** (`in_tree_count == st_nlink`). If any link is outside, the
+    blocks already exist and are reachable from elsewhere — another worktree
+    links to them rather than allocating them again, so the marginal cost is
+    zero.
+
+    That predicate is exact in both regimes, with no need to detect the
+    host's mount topology:
 
     - Store and worktree on separate mounts (leerie's own container layout —
       the pnpm store and the state dir are distinct bind mounts, and Linux
       refuses `link()` across mounts with EXDEV): the package manager falls
-      back to copying, `st_nlink == 1`, and the file is charged in full.
-    - Store and worktree sharing a mount: `st_nlink` counts the store plus
-      every sibling worktree, and the charge falls to roughly the true
-      marginal cost.
+      back to copying, every file has `st_nlink == 1` and one in-tree name,
+      so the whole tree is charged.
+    - Store and worktree sharing a mount: a store-linked file has a name
+      outside the tree, `in_tree_count < st_nlink`, and it is charged
+      nothing.
 
-    Measured on a real 1.37 GiB `node_modules`: inode-deduped total 1.31 GiB
-    versus 65 MiB genuinely private to the tree — a 20.7x difference. An
-    earlier revision counted the deduped total and would have demanded ~20x
-    too much space on exactly the well-configured host, which is the failure
-    the measurement exists to avoid.
+    Measured on a real 1.37 GiB `node_modules`, against the alternatives
+    considered:
+
+        inode-deduped total ................. 1.31 GiB
+        st_blocks // st_nlink ...............  596 MiB
+        empirical marginal cost .............   64.8 MiB
+        all-links-in-tree (this rule) .......   64.8 MiB
+
+    Both rejected rules shipped before this one. The deduped total ignores
+    sharing entirely and over-demands ~20x. Dividing by `st_nlink` looks
+    like it accounts for sharing but does not: `st_nlink` counts names
+    *inside* the tree too, so it is not a store-vs-tree discriminator — it
+    under-charges an intra-tree link farm and over-charges store-shared
+    files, landing 9.2x above the real figure.
 
     Takes the LARGEST candidate rather than an arbitrary one: `iterdir()`
     yields raw `readdir()` order, so `[0]` is neither sorted nor stable
@@ -6496,39 +6556,57 @@ def _measure_worktree_bytes(leerie_dir: Path) -> int | None:
     measured 2.1 s warm), so callers on the event loop must use
     `asyncio.to_thread`.
     """
+    cache_key = str(leerie_dir)
+    cached = _WORKTREE_SIZE_CACHE.get(cache_key)
+    if cached is not None and not refresh:
+        return cached
+
     worktrees = leerie_dir / "worktrees"
     if not worktrees.is_dir():
-        return None
-    cache_key = str(leerie_dir)
-    if cache_key in _WORKTREE_SIZE_CACHE:
-        return _WORKTREE_SIZE_CACHE[cache_key]
+        return cached
     candidates = [d for d in worktrees.iterdir()
                   if d.is_dir() and d.name != "staging"]
     if not candidates:
-        return None
+        return cached
 
     largest = 0
     for candidate in candidates:
-        total = 0
-        seen: set[tuple[int, int]] = set()
+        # Two passes over one tree's stat results, because the predicate
+        # needs the per-inode in-tree name count, which is only known once
+        # the whole tree has been walked.
+        sizes: dict[tuple[int, int], tuple[int, int]] = {}
+        in_tree: dict[tuple[int, int], int] = {}
         for dirpath, _dirnames, filenames in os.walk(candidate,
-                                                    followlinks=False):
+                                                     followlinks=False):
             for name in filenames:
                 try:
                     st_info = os.lstat(os.path.join(dirpath, name))
                 except OSError:
                     continue  # raced with a worker deleting a build artifact
                 key = (st_info.st_dev, st_info.st_ino)
-                if key in seen:
-                    continue
-                seen.add(key)
-                total += (st_info.st_blocks * 512) // max(st_info.st_nlink, 1)
-        largest = max(largest, total)
-    _WORKTREE_SIZE_CACHE[cache_key] = largest
-    return largest
+                in_tree[key] = in_tree.get(key, 0) + 1
+                sizes[key] = (st_info.st_blocks * 512, st_info.st_nlink)
+        largest = max(largest, sum(
+            size for key, (size, nlink) in sizes.items()
+            if in_tree[key] >= nlink))
+
+    if not largest:
+        # A zero total means "nothing to measure", NOT "measured zero".
+        # Caching it silently disabled the check for the rest of the run —
+        # verified: the bound stayed dead even after the tree filled — so
+        # leave the cache untouched and say so once.
+        _warn_worktree_measure_empty_once(len(candidates))
+        return cached
+
+    # Running max across waves. A first wave that happens to be docs-only
+    # would otherwise pin a few-MB figure for the whole run and leave the
+    # bound toothless for every heavy wave after it.
+    _WORKTREE_SIZE_CACHE[cache_key] = max(largest, cached or 0)
+    return _WORKTREE_SIZE_CACHE[cache_key]
 
 
-def _disk_required_bytes(leerie_dir: Path, caps: dict) -> int | None:
+def _disk_required_bytes(leerie_dir: Path, caps: dict,
+                         worktree_count: int) -> int | None:
     """Free bytes this run needs to finish its next wave, or None if not yet
     measurable (N30).
 
@@ -6553,17 +6631,26 @@ def _disk_required_bytes(leerie_dir: Path, caps: dict) -> int | None:
     instead of 1.37 GiB. Charging per `st_nlink` makes the measurement
     answer that question by itself — see `_measure_worktree_bytes`.
 
-    Multiplied by `max_parallel` alone, not `+ 1`: the measured tree and
-    staging both already exist on disk at the moment of the check, so their
-    bytes are already absent from `disk_usage().free` and counting them
-    again would double-charge. What the next wave actually adds is up to
-    `max_parallel` fresh worktrees.
+    **Multiplied by the WAVE's size, not by `max_parallel`.** An earlier
+    revision used `max_parallel` on the premise that the N31 prune "removes
+    each worktree as its subtask integrates, so the number coexisting is
+    bounded by wave concurrency". The code says otherwise: worktrees are
+    created per subtask inside `_settle_subtask`, but the prune loop runs
+    ONCE, after `integrate_wave` has processed the entire wave. Peak
+    coexistence is therefore the wave's size. On a 20-subtask wave at
+    `max_parallel=5` that premise under-demanded by 4x — and under-demand is
+    the unsafe direction here, since the check then declines to pause and the
+    disk fills, which is the ENOSPC failure this exists to prevent.
+
+    `worktree_count` is passed in rather than derived so the caller can hand
+    over the wave it is about to run. Not `+ 1` for staging: staging and the
+    measured tree already exist on disk, so their bytes are already absent
+    from `disk_usage().free` and counting them again would double-charge.
     """
     per_worktree = _measure_worktree_bytes(leerie_dir)
     if not per_worktree:
         return None
-    max_parallel = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
-    return int(per_worktree * max_parallel * _DISK_HEADROOM_SAFETY)
+    return int(per_worktree * max(worktree_count, 1) * _DISK_HEADROOM_SAFETY)
 
 
 def _disk_headroom_message(path: Path, ratio: float) -> str:
@@ -11339,6 +11426,13 @@ def run_recapture_deps(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
+    # Same reason resolve_models/_efforts are called here: these
+    # entrypoints have no CLI, but env and leerie.toml must still
+    # be honoured. Without this the per-worker table pins them
+    # (rebaser 1371s, dep_capture 600s) with no way to raise it.
+    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+        repo_root)
 
     if run_id is not None:
         target_run_dir = leerie_root / "runs" / run_id
@@ -11460,6 +11554,13 @@ def run_rebaser(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
+    # Same reason resolve_models/_efforts are called here: this
+    # entrypoint has no CLI, but env and leerie.toml must still be
+    # honoured. Without it the per-worker table pins the rebaser at
+    # 1371s with no way to raise it.
+    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+        repo_root)
 
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
@@ -13258,7 +13359,15 @@ class _StrictOutputProxy:
     _UPSTREAM = "https://api.anthropic.com"
 
     def __init__(self, max_parallel: int,
-                 verbosity: str = VERBOSITY_DEFAULT) -> None:
+                 verbosity: str = VERBOSITY_DEFAULT,
+                 upstream_timeout_sec: int = _STRICT_PROXY_TIMEOUT_SEC) -> None:
+        # Tracks the RESOLVED worker ceiling, not the frozen default. The
+        # module constant is `DEFAULT_CAPS["worker_timeout_sec"]` evaluated at
+        # import, so once `--worker-timeout` could raise the cap above it the
+        # proxy became able to give up first — the exact outcome the
+        # constant's own comment says it exists to prevent.
+        self._upstream_timeout = max(upstream_timeout_sec,
+                                     _STRICT_PROXY_TIMEOUT_SEC)
         self._server: asyncio.base_events.Server | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         # +8 so the pool is never the ceiling: a wave's workers plus the
@@ -13355,7 +13464,7 @@ class _StrictOutputProxy:
                                      data=body if body else None,
                                      headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=_STRICT_PROXY_TIMEOUT_SEC) as r:
+            with urllib.request.urlopen(req, timeout=self._upstream_timeout) as r:
                 return r.status, list(r.headers.items()), r.read()
         except urllib.error.HTTPError as e:
             return e.code, list(e.headers.items()), e.read()
@@ -16342,6 +16451,14 @@ async def _replay_capture(record: dict, *,
 
         replay_st = _ReplayState(tmp_run_dir, tmp_state_path)
         caps = dict(DEFAULT_CAPS)
+        # Honour the operator's global ceiling here too, for the same reason
+        # the two host-side entrypoints do: a replay has no CLI, but env and
+        # leerie.toml are still theirs to set. `repo_root` is not a parameter
+        # of this function, so use the same cwd the replayed call runs in.
+        _replay_root = Path(cwd or os.getcwd())
+        caps["worker_timeout_sec"] = resolve_worker_timeout_sec(_replay_root)
+        caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+            _replay_root)
 
         # Replay deliberately omits `effort=`: captured records don't
         # store the original `--effort` level, so a faithful replay
@@ -28160,22 +28277,30 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # 2+ consult the cached measurement — `to_thread` because the walk
         # spans tens of thousands of files (2.1 s warm, measured) and this
         # runs on the orchestrator's event loop.
-        required = await asyncio.to_thread(_disk_required_bytes, leerie_dir, caps)
-        if required is not None:
+        # Guarded like the seed below: a measurement failure must never cost
+        # a wave. `iterdir()` can raise PermissionError/FileNotFoundError on
+        # a resume whose worktrees moved, and `to_thread` itself raises
+        # RuntimeError when the thread table is exhausted.
+        try:
+            required = await asyncio.to_thread(
+                _disk_required_bytes, leerie_dir, caps, len(wave))
+            per_worktree = await asyncio.to_thread(
+                _measure_worktree_bytes, leerie_dir)
+        except Exception as e:
+            log(f"  disk: headroom check unavailable "
+                f"({type(e).__name__}: {e}); proceeding on the ratio floor")
+            required = per_worktree = None
+        if required is not None and per_worktree is not None:
             free = shutil.disk_usage(leerie_dir).free
             if free < required:
-                per_worktree = await asyncio.to_thread(
-                    _measure_worktree_bytes, leerie_dir)
-                # Quote the same max_parallel the arithmetic used, not a
-                # second read that could disagree with it.
-                sized_for = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
                 raise DiskLowSpace(
                     f"before wave {wi + 1} of {len(waves)}: "
                     f"{free / (1024 ** 3):.1f} GB free, but this wave needs "
                     f"~{required / (1024 ** 3):.1f} GB "
                     f"({per_worktree / (1024 ** 3):.2f} GB per additional "
-                    f"worktree x {sized_for} parallel, measured on this "
-                    "repo). Free space and resume, or lower --max-parallel.")
+                    f"worktree x {len(wave)} subtask(s) in this wave, "
+                    "measured on this repo). Free space and resume, or "
+                    "re-plan with fewer subtasks per wave.")
 
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
@@ -28281,8 +28406,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # wave consults this value. Best-effort: a measurement failure must
         # not cost a wave that has already been paid for.
         try:
-            await asyncio.to_thread(_measure_worktree_bytes, leerie_dir)
-        except OSError as e:
+            await asyncio.to_thread(_measure_worktree_bytes, leerie_dir,
+                                    True)
+        except Exception as e:
             log(f"  disk: could not measure worktree size "
                 f"({type(e).__name__}: {e}); headroom check falls back to "
                 "the free-space ratio")
@@ -29064,7 +29190,10 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
     # the tasks above so a crash, SIGINT or SIGTERM cannot leave the port held.
     global _STRICT_PROXY
     if caps.get("force_strict_output"):
-        _STRICT_PROXY = _StrictOutputProxy(caps["max_parallel"], verbosity)
+        _STRICT_PROXY = _StrictOutputProxy(
+            caps["max_parallel"], verbosity,
+            caps.get("worker_timeout_sec",
+                     DEFAULT_CAPS["worker_timeout_sec"]))
         try:
             port = await _STRICT_PROXY.start()
         except OSError as e:
@@ -29986,7 +30115,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "(TIMEOUT_DEFAULT_PER_WORKER), which otherwise "
                          "lowers the ceiling for fast worker types — raise "
                          "it when a worker is being killed at a table "
-                         "ceiling derived on a faster host. "
+                         "ceiling derived on a faster host. Passing the "
+                         "default explicitly still counts as setting it. "
                          f"Also {WORKER_TIMEOUT_ENV} env var or "
                          "worker_timeout_sec in leerie.toml")
     ap.add_argument("--worker-pids-max", type=_positive_int, metavar="N",
@@ -30309,6 +30439,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # at every claude_p spawn; an explicit value there bypasses the measured
     # per-worker table (N25).
     caps["worker_timeout_sec"] = resolve_worker_timeout_sec(
+        Path(os.getcwd()), args.worker_timeout)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
         Path(os.getcwd()), args.worker_timeout)
     caps["strict_conformer"] = args.strict_conformer
 

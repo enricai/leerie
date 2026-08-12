@@ -6649,9 +6649,18 @@ progress — without depending on a channel that does not exist:
    ceiling reaches the global cap are simply left at it.
 
    Because that distribution comes from one host, an operator can bypass
-   the whole table with an explicit global override — necessarily a bypass
-   rather than a bound, since the operator who needs it is the one whose
-   worker is being killed at a ceiling measured on a faster machine. The successor is spawned
+   the whole table with an explicit global override — `caps["worker_timeout_sec"]`
+   (default 5400 s / 90 min, overridable per-repo via `--worker-timeout` /
+   `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec` in leerie.toml).
+   Necessarily a bypass rather than a bound: the operator who needs it is
+   the one whose worker is being killed at a ceiling measured on a faster
+   machine, so a `min()` against the table would leave them no way up.
+
+   The bypass keys on **whether the operator set anything**, not on whether
+   the resolved number differs from the default. Comparing values made
+   explicitly passing the default — the first thing someone debugging a
+   timeout tries — indistinguishable from passing nothing, silently leaving
+   every listed worker on its table ceiling. The successor is spawned
    exactly as for a voluntary handoff and validates whatever partial
    checkpoint exists. If no checkpoint was written, the missing-checkpoint
    case routes through the corrective-retry path (see §13 caps) and is

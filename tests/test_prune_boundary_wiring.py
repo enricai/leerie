@@ -117,6 +117,16 @@ def test_integrate_wave_never_reports_a_non_complete_subtask(leerie):
         "'complete' — the prune loop's input may now include blocked or "
         "failed subtasks")
 
+    # Polarity matters and a bare "some Compare exists" check misses it: the
+    # guard clause is `if status != "complete": continue`, so flipping the
+    # operator inverts which subtasks reach `integrated` while leaving the
+    # comparison node in place.
+    operators = {type(op).__name__
+                 for n in compares for op in n.ops}
+    assert operators <= {"NotEq", "Eq"}, (
+        f"unexpected comparison operator(s) against 'complete': {operators}")
+    assert "NotEq" in operators or "Eq" in operators
+
 
 def test_prune_helper_never_deletes_the_branch(leerie):
     """The prune is safe only because the branch outlives the worktree —

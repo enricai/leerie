@@ -456,6 +456,8 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # (TIMEOUT_DEFAULT_PER_WORKER), which otherwise lowers the ceiling for fast
 # worker types using a distribution measured on one host — so raise it when
 # a worker is being killed at a ceiling derived on a faster machine.
+# Detection is on whether you set it at all, so passing the default
+# explicitly still bypasses the table.
 # Positive integer seconds; same precedence: CLI > env > leerie.toml.
 export LEERIE_WORKER_TIMEOUT=9000
 ./leerie "task" --worker-timeout 9000

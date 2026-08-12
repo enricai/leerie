@@ -21,6 +21,8 @@ to parse run.json), so they run unconditionally.
 from __future__ import annotations
 
 import subprocess
+
+import pytest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -124,28 +126,38 @@ def test_custom_hooksPath_with_no_hook_file_is_absent(tmp_path):
 
 
 def test_auth_and_network_exclusion_list_overrides_hook_presence():
-    """Even with a hook present, a genuine auth/network failure message
-    (git's own fixed wording, not third-party hook prose) must be
-    recognized so it is never misclassified as a hook failure."""
+    """Even with a hook present, a genuine auth/network failure must be
+    recognised so it is never misclassified as a hook failure.
+
+    Cases are FULL stderr, as `host_finalize` captures it — not isolated
+    fragments. That matters since the classifier became git-framed: an
+    `ssh:` or `git@host:` line counts only when git also emits its
+    `fatal: Could not read from remote repository` companion, which is what
+    separates the push's own transport failure from a hook that ssh'd
+    somewhere and failed. Every real `git push` reproduction shows the two
+    lines together; a bare fragment is deliberately not classified. The full
+    20-case corpus is at the bottom of this file.
+    """
     cases = [
         "fatal: Authentication failed for 'https://github.com/o/r.git/'",
-        "ssh: connect to host github.com port 22: Connection refused",
-        "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com",
-        "git@github.com: Permission denied (publickey).",
-        "remote: Repository not found.",
+        "ssh: connect to host github.com port 22: Connection refused\n"
+        "fatal: Could not read from remote repository.",
+        "fatal: unable to access 'https://github.com/o/r.git/': "
+        "Could not resolve host: github.com",
+        "git@github.com: Permission denied (publickey).\n"
+        "fatal: Could not read from remote repository.",
+        "remote: Repository not found.\n"
+        "fatal: repository 'https://github.com/o/r.git/' not found",
         # N24 regression, reproduced against real git 2026-08-12: the
         # non-interactive HTTPS credential failure. A pre-push hook runs
         # BEFORE authentication, so with a hook installed this stderr was
         # classified as a HOOK failure and the operator was told to retry
-        # with `--no-verify` — which cannot fix a credential problem. The
-        # shipped pattern only had `could not read from remote repository`,
-        # a different sentence, so nothing here matched.
+        # with `--no-verify` — which cannot fix a credential problem.
         "fatal: could not read Username for 'https://github.com': "
         "terminal prompts disabled",
-        # OpenSSH's offered-method list form. git normally also emits
-        # "Could not read from remote repository." alongside it, so this is
-        # defence in depth rather than the sole catch.
-        "git@github.com: Permission denied (publickey,password).",
+        # OpenSSH's offered-method list form.
+        "git@github.com: Permission denied (publickey,password).\n"
+        "fatal: Could not read from remote repository.",
     ]
     for stderr_text in cases:
         assert _is_auth_or_network(stderr_text) is True, stderr_text
@@ -181,3 +193,98 @@ def test_ordinary_hook_related_text_is_not_treated_as_auth_or_network():
     ]
     for stderr_text in tool_prose_with_could_not_read:
         assert _is_auth_or_network(stderr_text) is False, stderr_text
+
+
+# ---------------------------------------------------------------------------
+# The N24 corpus. Every GIT_FAILURES entry was reproduced against real `git
+# push` on a real repo (including a local HTTP server returning 401 for the
+# Authentication-failed shape, and a real publickey denial against github.com);
+# every HOOK_FAILURES entry is realistic pre-push hook output.
+#
+# The classifier gates an operator hint, so both directions matter: a missed
+# git failure sends them to `--no-verify`, which cannot fix credentials, and a
+# matched hook failure hides the hint that would have helped.
+#
+# Scored when this landed: the previous bare-phrase list got 9/9 git but only
+# 4/11 hook; this two-part, git-framed classifier gets 9/9 and 11/11.
+# ---------------------------------------------------------------------------
+
+GIT_FAILURES = [
+    ("https-no-credentials",
+     "git: 'credential-osxkeychain' is not a git command. See 'git --help'.\n"
+     "fatal: could not read Username for 'https://github.com': "
+     "terminal prompts disabled"),
+    ("unresolvable-host",
+     "fatal: unable to access 'https://nope.invalid/x.git/': "
+     "Could not resolve host: nope.invalid"),
+    ("connection-refused",
+     "ssh: connect to host localhost port 1: Connection refused\n"
+     "fatal: Could not read from remote repository."),
+    ("not-a-repository",
+     "fatal: '/nonexistent/path/repo.git' does not appear to be a git repository\n"
+     "fatal: Could not read from remote repository."),
+    ("authentication-failed",
+     "fatal: Authentication failed for 'http://127.0.0.1:8771/x.git/'"),
+    ("publickey-denied",
+     "git@github.com: Permission denied (publickey).\n"
+     "fatal: Could not read from remote repository."),
+    ("publickey-multi-method",
+     "git@github.com: Permission denied (publickey,password).\n"
+     "fatal: Could not read from remote repository."),
+    ("repository-not-found",
+     "remote: Repository not found.\n"
+     "fatal: repository 'https://github.com/o/r.git/' not found"),
+    ("ssh-timeout",
+     "ssh: connect to host github.com port 22: Operation timed out\n"
+     "fatal: Could not read from remote repository."),
+]
+
+HOOK_FAILURES = [
+    ("eslint-config", "Error: Could not read config file: .eslintrc.json\n"
+                      "error: failed to push some refs to 'origin'"),
+    ("jest-source-map", "Could not read source map for file.js\n"
+                        "error: failed to push some refs to 'origin'"),
+    # Postgres says FATAL: too, and case-insensitively that is `fatal:`.
+    ("postgres-auth", 'FATAL: password authentication failed for user "postgres"\n'
+                      "error: failed to push some refs to 'origin'"),
+    ("psycopg-refused",
+     "psycopg2.OperationalError: could not connect to server: Connection refused\n"
+     "error: failed to push some refs to 'origin'"),
+    ("curl-dns", "curl: (6) Could not resolve host: registry.example.com\n"
+                 "error: failed to push some refs to 'origin'"),
+    # Java's `Error:` is why `error:` is not a git-framing prefix.
+    ("java-jarfile", "Error: Unable to access jarfile build/app.jar"),
+    ("npm-404", "npm ERR! 404 repository not found : @acme/pkg"),
+    ("jest-timeout", "FAIL src/a.test.ts - connection timed out after 5000ms"),
+    ("husky-branded", "husky - pre-push script failed (code 1)"),
+    ("typecheck", "\u2716 typecheck failed: 3 errors in src/app.ts\n"
+                  "error: failed to push some refs to '../remote.git'"),
+    # A hook that ssh'd somewhere: an ssh: line WITHOUT git's companion
+    # "could not read from remote repository" is the hook's problem.
+    ("hook-ssh-deploy",
+     "ssh: connect to host deploy.internal port 22: Connection refused\n"
+     "error: deploy smoke-test hook failed"),
+]
+
+
+@pytest.mark.parametrize("label,stderr_text", GIT_FAILURES,
+                         ids=[c[0] for c in GIT_FAILURES])
+def test_real_git_failures_classify_as_auth_or_network(label, stderr_text):
+    assert _is_auth_or_network(stderr_text) is True, (
+        f"{label}: a real git failure was classified as a hook failure; the "
+        "operator would be told to retry with --no-verify, which cannot fix "
+        "a credential or network problem")
+
+
+@pytest.mark.parametrize("label,stderr_text", HOOK_FAILURES,
+                         ids=[c[0] for c in HOOK_FAILURES])
+def test_hook_output_never_classifies_as_auth_or_network(label, stderr_text):
+    assert _is_auth_or_network(stderr_text) is False, (
+        f"{label}: ordinary tool output matched the auth/network list, so a "
+        "genuine hook failure loses the --no-verify hint this gates")
+
+
+def test_corpus_covers_both_directions():
+    """Anti-vacuity: a corpus that drifted to one side would let a
+    classifier that answers a constant score perfectly."""
+    assert len(GIT_FAILURES) >= 8 and len(HOOK_FAILURES) >= 8

@@ -238,24 +238,49 @@ class TestResolveWorkerTimeout:
         assert (leerie.resolve_worker_timeout("a_worker_invented_tomorrow", caps)
                 == caps["worker_timeout_sec"])
 
-    def test_an_explicit_global_bypasses_the_table_in_both_directions(self, leerie):
-        """The escape hatch. An explicitly-set global wins outright.
+    def test_an_explicit_global_bypasses_the_table(self, leerie):
+        """The escape hatch, keyed on EXPLICITNESS rather than on the value.
 
-        Load-bearing that it wins rather than clamps: the table is derived
-        from ONE host's corpus, so the operator reaching for the flag is
-        precisely the one whose worker is being killed at a ceiling derived
-        on a faster machine. `min(table, global)` would leave them no way up
-        -- raising the global would change nothing for any listed worker.
+        Load-bearing that it wins rather than clamps: the table comes from
+        one host's corpus, so the operator reaching for the flag is exactly
+        the one whose worker is being killed at a ceiling measured on a
+        faster machine. A `min()` against the global would leave them no way
+        up.
         """
-        raised = dict(leerie.DEFAULT_CAPS, worker_timeout_sec=9000)
+        raised = dict(leerie.DEFAULT_CAPS, worker_timeout_sec=9000,
+                      worker_timeout_explicit=True)
         assert leerie.resolve_worker_timeout("classifier", raised) == 9000, (
             "raising the global did not lift a table-listed worker -- the "
             "escape hatch cannot reach the case that needs it")
         assert leerie.resolve_worker_timeout("implementer", raised) == 9000
 
-        lowered = dict(leerie.DEFAULT_CAPS, worker_timeout_sec=300)
+        lowered = dict(leerie.DEFAULT_CAPS, worker_timeout_sec=300,
+                       worker_timeout_explicit=True)
         assert leerie.resolve_worker_timeout("classifier", lowered) == 300
         assert leerie.resolve_worker_timeout("implementer", lowered) == 300
+
+    def test_explicitly_setting_the_default_is_not_a_silent_no_op(self, leerie):
+        """`--worker-timeout 5400` is the single gesture an operator
+        debugging timeouts is most likely to try first.
+
+        Detecting the bypass by comparing the resolved int against the
+        default made it indistinguishable from setting nothing, so the
+        operator asked for 5400 and `classifier` silently stayed at 1236.
+        Explicitness is carried as its own flag for exactly this case.
+        """
+        caps = dict(leerie.DEFAULT_CAPS,
+                    worker_timeout_sec=leerie.DEFAULT_CAPS["worker_timeout_sec"],
+                    worker_timeout_explicit=True)
+        assert (leerie.resolve_worker_timeout("classifier", caps)
+                == leerie.DEFAULT_CAPS["worker_timeout_sec"]), (
+            "explicitly setting the default still fell through to the table")
+
+    def test_an_unset_global_still_bounds_the_table(self, leerie):
+        """With no explicit value the table applies, but a lowered default
+        must still lower every worker -- the table may only ever tighten."""
+        caps = dict(leerie.DEFAULT_CAPS, worker_timeout_sec=300)
+        assert leerie.resolve_worker_timeout("classifier", caps) == 300
+        assert leerie.resolve_worker_timeout("implementer", caps) == 300
 
     def test_the_table_applies_when_no_explicit_global_is_set(self, leerie):
         """Anti-vacuity partner: with the default global untouched the table
@@ -304,3 +329,51 @@ class TestResolveWorkerTimeout:
         src = inspect.getsource(leerie.claude_p)
         assert "resolve_worker_timeout(schema_key, caps)" in src
         assert 'timeout = caps["worker_timeout_sec"]' not in src
+
+
+class TestOverrideReachesEveryConsumer:
+    """A knob that resolves correctly but never reaches its consumers is
+    documented-but-inert — the class `tests/test_no_dead_resolutions.py`
+    exists for. These pin the three seams the resolver has to cross."""
+
+    def test_strict_output_proxy_tracks_the_resolved_ceiling(self, leerie):
+        """`_STRICT_PROXY_TIMEOUT_SEC` is `DEFAULT_CAPS["worker_timeout_sec"]`
+        evaluated at import. Its own comment promises "the proxy is never the
+        component that gives up first — a shorter bound would kill requests
+        the worker is still legitimately waiting on". Once --worker-timeout
+        could raise the cap past it, the frozen constant broke that promise.
+        """
+        raised = leerie._StrictOutputProxy(
+            max_parallel=2, upstream_timeout_sec=9000)
+        assert raised._upstream_timeout == 9000, (
+            "the proxy still gives up at the frozen default while the worker "
+            "cap is higher — the exact failure its comment forbids")
+
+        # Never below the import-time floor: a lowered worker cap must not
+        # make the proxy the first to quit either.
+        lowered = leerie._StrictOutputProxy(
+            max_parallel=2, upstream_timeout_sec=60)
+        assert lowered._upstream_timeout == leerie._STRICT_PROXY_TIMEOUT_SEC
+
+    def test_orchestrate_passes_the_resolved_cap_to_the_proxy(self, leerie):
+        import inspect
+        src = inspect.getsource(leerie._orchestrate)
+        assert '_StrictOutputProxy(' in src
+        assert 'caps.get("worker_timeout_sec"' in src, (
+            "the proxy is constructed without the resolved ceiling")
+
+    def test_host_side_entrypoints_resolve_the_global(self, leerie):
+        """run_rebaser / run_recapture_deps / _replay_capture build their own
+        caps and never run main()'s assignment, so without this the table
+        pins them (rebaser 1371s, dep_capture 600s) with no way up. All three
+        already call resolve_models/resolve_efforts for the same reason."""
+        import inspect
+        for fn in (leerie.run_rebaser, leerie.run_recapture_deps,
+                   leerie._replay_capture):
+            src = inspect.getsource(fn)
+            assert "resolve_worker_timeout_sec(" in src, (
+                f"{fn.__name__} never resolves the global worker timeout, so "
+                "LEERIE_WORKER_TIMEOUT and leerie.toml are inert there")
+            assert "worker_timeout_explicit" in src, (
+                f"{fn.__name__} resolves the value but not its explicitness, "
+                "so an explicit default is a silent no-op there")

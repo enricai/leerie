@@ -403,7 +403,8 @@ class TestMeasuredWorktreeSizing:
 
     def test_returns_none_before_any_worktree_exists(self, tmp_path):
         assert leerie._measure_worktree_bytes(tmp_path) is None
-        assert leerie._disk_required_bytes(tmp_path, dict(leerie.DEFAULT_CAPS)) is None
+        assert leerie._disk_required_bytes(
+            tmp_path, dict(leerie.DEFAULT_CAPS), 4) is None
 
     def test_staging_is_not_treated_as_a_subtask_worktree(self, tmp_path):
         self._worktree(tmp_path, "staging", 4096)
@@ -416,61 +417,67 @@ class TestMeasuredWorktreeSizing:
         measured = leerie._measure_worktree_bytes(tmp_path)
         assert measured is not None and measured >= 200_000
 
-    def test_store_hardlinked_bytes_are_charged_marginally(self, tmp_path):
-        """THE invariant the measurement exists for, and the one an earlier
-        revision got backwards.
+    def test_store_hardlinked_bytes_are_charged_nothing(self, tmp_path):
+        """THE invariant, and the one two earlier revisions got wrong.
 
-        The question is not "how big is this tree" but "what does ONE MORE
-        tree cost". A file the package manager hardlinked in from its
-        content-addressed store already occupies its blocks; another
-        worktree does not spend them again. Charging `st_blocks / st_nlink`
-        answers that by construction, with no need to detect the host's
-        mount topology.
+        The question is what ONE MORE tree costs. A file the package manager
+        hardlinked in from its content-addressed store already occupies its
+        blocks and is reachable from outside the tree, so another worktree
+        links to it and spends nothing. The rule charges an inode only when
+        every one of its links is inside the walked tree.
 
-        Measured on a real 1.37 GiB node_modules: inode-deduped total
-        1.31 GiB vs 65 MiB genuinely private -- a 20.7x gap. The previous
-        version of this test linked files *inside* the same tree and
-        asserted the total did not move, which pins intra-tree dedup: a real
-        property, but not this one, and it passed against a measurement that
-        would have over-demanded ~20x on any store-sharing host.
+        Two rejected predecessors, both measured on a real 1.37 GiB
+        node_modules: the inode-deduped total returned 1.31 GiB (ignores
+        sharing entirely, ~20x over), and `st_blocks // st_nlink` returned
+        596 MiB -- which *looks* like it accounts for sharing but does not,
+        because st_nlink counts names inside the tree too. The empirical
+        marginal cost is 64.8 MiB, which this rule reproduces exactly.
         """
         wt = self._worktree(tmp_path, "feat-001", 400_000)
+        (wt / "private.bin").write_bytes(b"y" * 50_000)
         copied = leerie._measure_worktree_bytes(tmp_path)
 
-        # Now link the same content from OUTSIDE the tree, exactly as a
-        # package-manager store does. The blocks are unchanged; what changes
-        # is that they are now shared, so one more worktree costs less.
+        # Link the big file from OUTSIDE the tree, exactly as a store does.
         store = tmp_path / "store"
         store.mkdir()
         os.link(wt / "blob.bin", store / "cafebabe")
-        # The cache is per run dir and deliberately has no invalidation, so
-        # re-measuring the same dir needs an explicit drop. The autouse
-        # fixture only brackets the test.
         leerie._WORKTREE_SIZE_CACHE.clear()
         shared = leerie._measure_worktree_bytes(tmp_path)
 
         assert shared < copied, (
-            f"a file hardlinked from an out-of-tree store measured the same "
-            f"as a copied one ({copied} -> {shared}); the requirement would "
-            "over-demand ~20x on every host where the store shares a mount")
-        assert shared == pytest.approx(copied / 2, rel=0.05), (
-            "with exactly two links the marginal charge should be about half")
+            f"a store-linked file measured the same as a copied one "
+            f"({copied} -> {shared}); the requirement would over-demand on "
+            "every host where the store shares a mount with the worktree")
+        # Only the genuinely private file remains chargeable.
+        assert 40_000 < shared < 120_000, (
+            f"expected roughly the 50KB private file, got {shared} -- the "
+            "store-linked blob is still being charged")
 
-    def test_intra_tree_duplicate_inodes_are_still_counted_once(self, tmp_path):
-        """Kept from the previous version, narrowed to what it actually
-        proves: walking must not charge the same inode twice for two names
-        inside one tree."""
+    def test_intra_tree_link_farm_is_charged_in_full(self, tmp_path):
+        """A file whose every link is inside this tree costs a new tree the
+        full amount -- there is nothing outside to link to.
+
+        The previous version of this test asserted the two-name tree was
+        "counted once" and passed while the tree was actually charged HALF
+        (the `st_blocks // st_nlink` rule), i.e. it passed for the wrong
+        reason. The predicate is in-tree-name-count vs st_nlink, so a link
+        farm confined to the tree is charged, and only an outside link
+        discounts.
+        """
         wt = self._worktree(tmp_path, "feat-001", 400_000)
         os.link(wt / "blob.bin", wt / "second-name.bin")
         two_names = leerie._measure_worktree_bytes(tmp_path)
 
-        other = tmp_path / "worktrees" / "feat-002"
-        other.mkdir(parents=True)
-        (other / "blob.bin").write_bytes(b"x" * 400_000)
         leerie._WORKTREE_SIZE_CACHE.clear()
-        # feat-002 is a single-link copy of the same size; the two-name tree
-        # must not measure larger than it purely from the extra name.
-        assert two_names <= leerie._measure_worktree_bytes(tmp_path)
+        solo = tmp_path / "worktrees" / "feat-002"
+        solo.mkdir(parents=True)
+        (solo / "blob.bin").write_bytes(b"x" * 400_000)
+        both = leerie._measure_worktree_bytes(tmp_path)
+
+        assert two_names == pytest.approx(both, rel=0.05), (
+            f"a tree with two names for one inode ({two_names}) should cost "
+            f"the same as a single-copy tree ({both}) -- both must pay full "
+            "freight, since neither has a link outside the tree")
 
     def test_largest_candidate_wins_not_an_arbitrary_one(self, tmp_path):
         """`iterdir()` yields raw readdir order -- neither sorted nor stable
@@ -485,26 +492,41 @@ class TestMeasuredWorktreeSizing:
             f"measured {measured}, which is not the largest candidate -- "
             "selection is order-dependent")
 
-    def test_requirement_scales_with_max_parallel_not_remaining_subtasks(self, tmp_path):
-        """Load-bearing consequence of the N31 prune.
+    def test_requirement_scales_with_the_wave_size(self, tmp_path):
+        """Load-bearing, and the premise an earlier revision got backwards.
 
-        Worktrees are removed as each subtask integrates, so the number
-        coexisting is bounded by wave concurrency. Scaling by remaining
-        subtasks instead would over-demand by an order of magnitude on a
-        long run and pause runs that were never going to fill the disk.
+        That revision scaled by `max_parallel`, reasoning that the N31 prune
+        removes each worktree as its subtask integrates. It does not: the
+        prune loop runs ONCE, after `integrate_wave` has processed the whole
+        wave, so every subtask's worktree coexists. A 20-subtask wave at
+        `max_parallel=5` was therefore sized 4x too small -- and under-demand
+        is the unsafe direction, because the check then declines to pause and
+        the disk fills.
+
+        The old name and docstring encoded the wrong premise, so the suite
+        could not catch it.
         """
         self._worktree(tmp_path, "feat-001", 1_000_000)
+        caps = dict(leerie.DEFAULT_CAPS, max_parallel=5)
 
+        small = leerie._disk_required_bytes(tmp_path, caps, 2)
+        large = leerie._disk_required_bytes(tmp_path, caps, 8)
+
+        assert small is not None and large is not None
+        assert large == pytest.approx(small * 4, rel=0.01), (
+            "the requirement does not track the wave size")
+
+    def test_requirement_ignores_max_parallel(self, tmp_path):
+        """Anti-regression for the same premise: concurrency must not enter
+        the arithmetic at all, or the 4x under-demand returns."""
+        self._worktree(tmp_path, "feat-001", 1_000_000)
         low = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=2))
+            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=1), 10)
         high = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=8))
-
-        assert low is not None and high is not None
-        assert high > low, "the requirement does not respond to --max-parallel"
-        # The measured tree and staging already exist on disk, so only the
-        # NEW worktrees are charged: 8 slots vs 2, not 9 vs 3.
-        assert high == pytest.approx(low * 4, rel=0.01)
+            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=32), 10)
+        assert low == high, (
+            "max_parallel still affects the requirement; peak coexistence is "
+            "the wave size, not the concurrency")
 
     def test_measurement_is_cached_per_run_dir(self, tmp_path):
         """The walk is O(files in node_modules); re-running it every wave on
@@ -654,7 +676,7 @@ class TestMeasurementIsSeededWhereWorktreesExist:
 
         # Wave N+1 entry: the requirement must still be computable.
         required = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=4))
+            tmp_path, dict(leerie.DEFAULT_CAPS), 4)
         assert required is not None, (
             "after the prune the requirement went unmeasurable — the cached "
             "seed is not carrying across the wave boundary, which is the "
@@ -666,4 +688,53 @@ class TestMeasurementIsSeededWhereWorktreesExist:
         and must fall through rather than invent a number."""
         (tmp_path / "worktrees" / "staging").mkdir(parents=True)
         assert leerie._measure_worktree_bytes(tmp_path) is None
-        assert leerie._disk_required_bytes(tmp_path, dict(leerie.DEFAULT_CAPS)) is None
+        assert leerie._disk_required_bytes(
+            tmp_path, dict(leerie.DEFAULT_CAPS), 4) is None
+
+
+class TestZeroMeasurementIsNotCached:
+    """A zero total means "nothing to measure", not "measured zero".
+
+    Reproduced against the previous revision: a zero was written to the
+    cache, `_disk_required_bytes` read it back through `if not
+    per_worktree`, and the measured bound stayed dead for the rest of the
+    run — even after the worktree filled up. Silent, because both outcomes
+    return None at the call site.
+    """
+
+    def test_zero_is_not_cached_and_a_later_measurement_wins(self, tmp_path):
+        (tmp_path / "worktrees" / "feat-001").mkdir(parents=True)
+        assert leerie._measure_worktree_bytes(tmp_path) is None
+        assert str(tmp_path) not in leerie._WORKTREE_SIZE_CACHE, (
+            "a zero measurement was cached; the check is now permanently "
+            "disabled for this run")
+
+        (tmp_path / "worktrees" / "feat-001" / "big.bin").write_bytes(b"x" * 900_000)
+        later = leerie._measure_worktree_bytes(tmp_path)
+        assert later and later >= 900_000, (
+            "the populated tree was not measured — the cached zero stuck")
+
+    def test_zero_warns_once(self, tmp_path, capsys):
+        leerie._worktree_measure_empty_warned = False
+        (tmp_path / "worktrees" / "feat-001").mkdir(parents=True)
+        leerie._measure_worktree_bytes(tmp_path)
+        first = capsys.readouterr().err + capsys.readouterr().out
+        leerie._measure_worktree_bytes(tmp_path)
+        assert leerie._worktree_measure_empty_warned is True
+
+    def test_refresh_keeps_a_running_max_across_waves(self, tmp_path):
+        """A docs-only first wave must not pin a small figure for the run."""
+        wt = tmp_path / "worktrees" / "feat-001"
+        wt.mkdir(parents=True)
+        (wt / "small.bin").write_bytes(b"x" * 100_000)
+        first = leerie._measure_worktree_bytes(tmp_path, refresh=True)
+
+        (wt / "big.bin").write_bytes(b"y" * 2_000_000)
+        # Without refresh the cache answers; with it, the larger wave wins.
+        assert leerie._measure_worktree_bytes(tmp_path) == first
+        grown = leerie._measure_worktree_bytes(tmp_path, refresh=True)
+        assert grown > first
+
+        # And it never shrinks back on a later, lighter wave.
+        (wt / "big.bin").unlink()
+        assert leerie._measure_worktree_bytes(tmp_path, refresh=True) == grown
