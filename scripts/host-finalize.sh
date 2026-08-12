@@ -57,8 +57,8 @@ _host_finalize_update_run_json() {
 # (honoring `core.hooksPath` when set, falling back to git's own git-dir-
 # relative default via `rev-parse --git-path hooks` so worktrees and
 # non-standard `.git` layouts resolve correctly too) and tests for an
-# executable `pre-push` file there. Echoes the resolved hook path and
-# returns 0 when an executable pre-push hook exists, 1 otherwise. This is
+# executable `pre-push` file there. Returns 0 when an executable pre-push
+# hook exists, 1 otherwise; prints nothing. This is
 # structural — it never inspects push stderr text, unlike vendor-specific
 # prose (husky's banner, "exit code 254") which is arbitrary and misses
 # non-husky or newer-husky hook failures entirely.
@@ -89,9 +89,31 @@ _host_finalize_pre_push_hook_present() {
 # of these is treated as a genuine push/auth/network failure rather than a
 # hook failure, since git emits the same wording regardless of what hooks
 # happen to be installed.
+#
+# git's non-interactive HTTPS credential failure is `fatal: could not read
+# Username for 'https://…': terminal prompts disabled` — a different
+# sentence from `could not read from remote repository`, so matching only
+# the latter missed it entirely. A pre-push hook runs BEFORE authentication,
+# so it succeeds and the push then fails on credentials; that stderr matched
+# nothing here and the operator was told to retry with `--no-verify`, which
+# cannot help. Reproduced against real git 2026-08-12.
+#
+# Both `could not read` forms are spelled out rather than collapsed to the
+# bare prefix. A bare `could not read` matches arbitrary third-party hook
+# output — measured, it swallows eslint's `Could not read config file:
+# .eslintrc.json` and jest's `Could not read source map`, classifying a real
+# hook failure as auth/network and suppressing the very hint this function
+# exists to produce. That would break the invariant stated above: git's OWN
+# fixed messages, never third-party prose.
+#
+# `permission denied \(publickey` is left unterminated on purpose: OpenSSH
+# emits the offered-method list, e.g. `Permission denied
+# (publickey,password)`. In practice git also emits `Could not read from
+# remote repository.` alongside it, so this line is defence in depth rather
+# than the only thing catching that shape.
 _host_finalize_is_auth_or_network_push_error() {
   printf '%s' "$1" | grep -qiE \
-    'authentication failed|permission denied \(publickey\)|could not resolve host|could not read from remote repository|unable to access|connection timed out|connection refused|repository not found|no route to host'
+    'authentication failed|permission denied \(publickey|could not resolve host|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access|connection timed out|connection refused|repository not found|no route to host'
 }
 
 host_finalize() {

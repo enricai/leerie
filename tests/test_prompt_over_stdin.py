@@ -33,9 +33,11 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -376,6 +378,65 @@ def test_prompt_file_is_cleaned_up(leerie, leerie_dir, monkeypatch):
 
     assert paths and not os.path.exists(paths[0]), (
         f"staged prompt file {paths[0]} survived the call")
+
+
+def test_staged_file_is_reaped_when_staging_itself_fails(leerie, leerie_dir,
+                                                         monkeypatch, tmp_path):
+    """N39 follow-up: the staging must not leak when the WRITE fails.
+
+    `mkstemp` creates the file before anything is written to it, so a
+    failure in the write or the reopen strands it. The guard originally
+    covered only `create_subprocess_exec`, one statement later.
+
+    This matters because the overwhelmingly likely failure here is ENOSPC —
+    which is precisely the disk-exhaustion condition N30 exists to handle,
+    and one leaked ~150KB file per retry feeds it. Verified by injection
+    rather than by inspection: a real OSError is raised from inside the
+    write, and the temp directory is asserted empty afterwards.
+    """
+    # `tempfile.tempdir`, NOT the TMPDIR env var: `gettempdir()` caches its
+    # answer on first use, and by the time this test runs some earlier
+    # mkstemp has already fixed it at /tmp. Setting the env var therefore
+    # changes nothing, the leaked file lands in /tmp, and an assertion
+    # against tmp_path finds an empty directory and PASSES — measured, this
+    # test reported green against the unguarded code it exists to catch.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    real_fdopen = os.fdopen
+
+    def exploding_fdopen(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+        real_write = handle.write
+
+        def boom(_data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        handle.write = boom
+        return handle
+
+    monkeypatch.setattr(os, "fdopen", exploding_fdopen)
+
+    spawned = []
+
+    async def fake(*cmd, **kwargs):  # pragma: no cover - must never run
+        spawned.append(cmd)
+        raise AssertionError("spawn reached despite a staging failure")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="t-enospc", leerie_dir=leerie_dir,
+            verbosity="quiet", stdin_data="hello"))
+
+    assert excinfo.value.errno == errno.ENOSPC, (
+        "the original failure must propagate unchanged, not be masked by "
+        "the cleanup")
+    assert not spawned, "the child was spawned even though staging failed"
+
+    leaked = [p for p in tmp_path.iterdir() if p.name.startswith("leerie-prompt-")]
+    assert not leaked, f"staging failure leaked {[p.name for p in leaked]}"
 
 
 # ---------------------------------------------------------------------------

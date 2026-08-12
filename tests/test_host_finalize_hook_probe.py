@@ -133,6 +133,19 @@ def test_auth_and_network_exclusion_list_overrides_hook_presence():
         "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com",
         "git@github.com: Permission denied (publickey).",
         "remote: Repository not found.",
+        # N24 regression, reproduced against real git 2026-08-12: the
+        # non-interactive HTTPS credential failure. A pre-push hook runs
+        # BEFORE authentication, so with a hook installed this stderr was
+        # classified as a HOOK failure and the operator was told to retry
+        # with `--no-verify` — which cannot fix a credential problem. The
+        # shipped pattern only had `could not read from remote repository`,
+        # a different sentence, so nothing here matched.
+        "fatal: could not read Username for 'https://github.com': "
+        "terminal prompts disabled",
+        # OpenSSH's offered-method list form. git normally also emits
+        # "Could not read from remote repository." alongside it, so this is
+        # defence in depth rather than the sole catch.
+        "git@github.com: Permission denied (publickey,password).",
     ]
     for stderr_text in cases:
         assert _is_auth_or_network(stderr_text) is True, stderr_text
@@ -143,3 +156,28 @@ def test_ordinary_hook_related_text_is_not_treated_as_auth_or_network():
     accidentally match the narrow, git-owned exclusion list."""
     assert _is_auth_or_network("husky - pre-push script failed (code 254)") is False
     assert _is_auth_or_network("acme-corp: commit policy violation") is False
+    # The verbatim stderr of a real failing pre-push hook, captured from git
+    # 2026-08-12. Git contributes only the second line — there is no
+    # hook-identifying text at all, which is why classification is
+    # structural (_host_finalize_pre_push_hook_present) rather than textual.
+    # Broadening the exclusion list for `could not read` must not start
+    # swallowing this.
+    real_hook_failure = (
+        "✖ typecheck failed: 3 errors in src/app.ts\n"
+        "error: failed to push some refs to '../remote.git'"
+    )
+    assert _is_auth_or_network(real_hook_failure) is False
+
+    # Tool prose that contains git-ish words. The exclusion list must match
+    # git's OWN sentences, not the bare prefix: a bare `could not read`
+    # swallows both of these, classifies a real hook failure as
+    # auth/network, and suppresses the `--no-verify` hint that is the whole
+    # point of the probe. Measured against the real patterns 2026-08-12.
+    tool_prose_with_could_not_read = [
+        "Error: Could not read config file: .eslintrc.json\n"
+        "error: failed to push some refs to 'origin'",
+        "Could not read source map for file.js\n"
+        "error: failed to push some refs to 'origin'",
+    ]
+    for stderr_text in tool_prose_with_could_not_read:
+        assert _is_auth_or_network(stderr_text) is False, stderr_text

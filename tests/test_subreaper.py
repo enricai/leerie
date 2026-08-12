@@ -440,3 +440,100 @@ def test_zombie_reaper_retains_pid_on_early_echild_then_reaps_after_reparent(lee
             os.waitpid(mid_pid, 0)
         with contextlib.suppress(ChildProcessError, OSError):
             os.waitpid(grandchild_pid, 0)
+
+
+# ---------------------------------------------------------------------------
+# The ECHILD retry BOUND (N36). Retaining a pid across ECHILD is the fix;
+# retaining it forever is a leak of a different kind -- a set instead of a
+# process table -- which is why the work order rated this 85% ("the mechanism
+# is certain; the bookkeeping is not").
+#
+# Measured 2026-08-12: setting `_ECHILD_RETRY_MAX_SEC` to 12345.0 left every
+# test in this file green, so the bound was entirely unguarded. These three
+# close that.
+# ---------------------------------------------------------------------------
+
+def _echild_forever_pid() -> int:
+    """A pid that is alive but can never be `waitpid`ed by us.
+
+    Our own pid: `os.waitpid(os.getpid(), WNOHANG)` raises ECHILD (we are not
+    our own child) while `/proc/<pid>` obviously exists -- precisely the
+    "alive but not ours (yet)" state the retry arm exists for, held
+    indefinitely so the bound is what decides the outcome.
+    """
+    return os.getpid()
+
+
+@linux_only
+def test_echild_retention_is_bounded(leerie, monkeypatch):
+    """A pid that never becomes reapable is dropped once past the window."""
+    monkeypatch.setattr(leerie, "_ECHILD_RETRY_MAX_SEC", 0.05)
+    pid = _echild_forever_pid()
+    leerie._mark_reapable({pid})
+    try:
+        async def _tick_past_the_window():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.35)   # >> 0.05s bound, many ticks
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_tick_past_the_window())
+
+        assert pid not in leerie._REAPABLE_PIDS, (
+            "a pid stuck in ECHILD past _ECHILD_RETRY_MAX_SEC was retained "
+            "forever -- _REAPABLE_PIDS grows unbounded across a long run, "
+            "which is the leak the bound exists to prevent")
+    finally:
+        leerie._REAPABLE_PIDS.discard(pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+
+
+@linux_only
+def test_echild_pid_is_retained_inside_the_window(leerie, monkeypatch):
+    """Anti-vacuity control for the test above.
+
+    Without this, a reaper that dropped every ECHILD pid immediately -- the
+    original N36 defect -- would also satisfy "not in _REAPABLE_PIDS".
+    """
+    monkeypatch.setattr(leerie, "_ECHILD_RETRY_MAX_SEC", 3600.0)
+    pid = _echild_forever_pid()
+    leerie._mark_reapable({pid})
+    try:
+        async def _tick_inside_the_window():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.15)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_tick_inside_the_window())
+
+        assert pid in leerie._REAPABLE_PIDS, (
+            "an ECHILD pid well inside the retry window was dropped -- this "
+            "is the original N36 defect (ECHILD read as 'gone' rather than "
+            "'not ours yet'), and the eventual orphan is never reaped")
+    finally:
+        leerie._REAPABLE_PIDS.discard(pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+
+
+def test_echild_retry_window_value_is_pinned(leerie):
+    """The 60s value is only safe because of a coupling elsewhere.
+
+    `_DescendantTracker._poll_loop` re-marks every observed descendant each
+    `_DESCENDANT_POLL_SEC` (0.5s) for as long as the worker lives, so a pid
+    dropped at the window's end is re-added within a tick and gets a fresh
+    window. That is what keeps a worker outliving the bound -- the common
+    case, since implementers run for minutes -- from permanently losing its
+    descendants from the allowlist.
+
+    If either constant moves, that reasoning has to be redone, so both are
+    pinned together rather than separately.
+    """
+    assert leerie._ECHILD_RETRY_MAX_SEC == 60.0
+    assert leerie._DESCENDANT_POLL_SEC == 0.5
+    assert leerie._DESCENDANT_POLL_SEC < leerie._ECHILD_RETRY_MAX_SEC, (
+        "the tracker must re-mark descendants far more often than the ECHILD "
+        "window expires, or a live worker's descendants fall off the "
+        "allowlist and their orphans are never reaped")

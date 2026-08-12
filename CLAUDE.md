@@ -281,8 +281,18 @@ tests/                      pytest suite
 ./leerie resume
 
 # Accept a blocked subtask so resume skips it (e.g., E2E tests
-# that need external deps the container can't provide):
-./leerie accept-blocked <run-id> <subtask-id>
+# that need external deps the container can't provide). --force settles a
+# subtask abandoned mid-flight (in_progress, no `blocked` registry entry —
+# what an ENOSPC or SIGKILL leaves behind):
+./leerie accept-blocked <run-id> <subtask-id> [--force]
+
+# Accept an integration_judge behavioral finding so resume advances past it.
+# The verdict is recorded in state.json's `integration_gate` BEFORE
+# integrate_wave dies, so acceptance survives the next resume; without this
+# the merge is already committed to staging and resume re-reaches the same
+# verdict forever. A false positive from that judge otherwise kills a run
+# after full planning + implementation spend:
+./leerie accept-integration <run-id> <subtask-id>
 
 # Generate .leerie/config.toml with auto-detected BLT commands (host-only, no container):
 ./leerie config --init
@@ -441,6 +451,15 @@ export LEERIE_MAX_PARALLEL=6
 export LEERIE_WORKER_PIDS_MAX=4096
 ./leerie "task" --worker-pids-max 4096
 
+# Override the per-worker wall-clock ceiling (default 5400s / 90 min).
+# Setting this BYPASSES the measured per-worker table
+# (TIMEOUT_DEFAULT_PER_WORKER), which otherwise lowers the ceiling for fast
+# worker types using a distribution measured on one host — so raise it when
+# a worker is being killed at a ceiling derived on a faster machine.
+# Positive integer seconds; same precedence: CLI > env > leerie.toml.
+export LEERIE_WORKER_TIMEOUT=9000
+./leerie "task" --worker-timeout 9000
+
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
 
@@ -495,6 +514,14 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # blocking finalize on every resume. Also LEERIE_SKIP_COMPLETENESS_CHECK=1
 # or `skip_completeness_check = true` in leerie.toml. Default: off.
 ./leerie "task" --skip-completeness-check
+
+# Skip the phase-5 integration_judge behavioral-defect gate entirely — no
+# worker spawn for any subtask in this run. Independent of the
+# accept-integration verb above, which settles a finding the judge has
+# already produced; this stops it producing one. Also
+# LEERIE_SKIP_INTEGRATION_CHECK=1 or `skip_integration_check = true` in
+# leerie.toml. Default: off.
+./leerie "task" --skip-integration-check
 
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + resume).

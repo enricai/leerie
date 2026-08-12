@@ -1622,7 +1622,7 @@ PY
     done
     if [ -z "$_ab_run_id" ] || [ -z "$_ab_sid" ]; then
       remote_log "accept-blocked requires <run-id> <subtask-id>"
-      echo "  Usage: leerie accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
+      echo "  Usage: leerie accept-blocked <run-id> <subtask-id> [--force] [--runtime fly|ec2|local]" >&2
       exit 1
     fi
     # Validate both positional args against a strict allowlist BEFORE they
@@ -4286,7 +4286,8 @@ _first_is_resume=false
 [ "${1:-}" = "resume" ] && _first_is_resume=true
 _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
---worker-pids-max --source-of-truth --runtime --aws-region --aws-profile \
+--worker-pids-max --worker-timeout --source-of-truth --runtime \
+--aws-region --aws-profile \
 --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --judge-dir \
