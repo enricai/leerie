@@ -1,0 +1,40 @@
+{"call_type": "planner", "latency_ms": 118000, "success": true, "input_tokens": 12000, "output_tokens": 3000}
+{"call_type": "planner", "latency_ms": 132000, "success": true, "input_tokens": 13000, "output_tokens": 3100}
+{"call_type": "planner", "latency_ms": 141000, "success": true, "input_tokens": 14000, "output_tokens": 3300}
+{"call_type": "planner", "latency_ms": 155000, "success": true, "input_tokens": 15000, "output_tokens": 3500}
+{"call_type": "planner", "latency_ms": 176000, "success": true, "input_tokens": 16000, "output_tokens": 3700}
+{"call_type": "planner", "latency_ms": 189000, "success": true, "input_tokens": 17000, "output_tokens": 3900}
+{"call_type": "planner", "latency_ms": 203000, "success": true, "input_tokens": 18000, "output_tokens": 4100}
+{"call_type": "planner", "latency_ms": 244000, "success": true, "input_tokens": 19000, "output_tokens": 4300}
+{"call_type": "planner", "latency_ms": 297000, "success": false, "failure_kind": "worker_error", "input_tokens": 20000, "output_tokens": 100}
+{"call_type": "planner", "latency_ms": 355000, "success": true, "input_tokens": 21000, "output_tokens": 4900}
+{"call_type": "fit_judge", "latency_ms": 9000, "success": true, "input_tokens": 1200, "output_tokens": 150}
+{"call_type": "fit_judge", "latency_ms": 11000, "success": true, "input_tokens": 1300, "output_tokens": 160}
+{"call_type": "fit_judge", "latency_ms": 12500, "success": true, "input_tokens": 1250, "output_tokens": 155}
+{"call_type": "fit_judge", "latency_ms": 13000, "success": true, "input_tokens": 1400, "output_tokens": 170}
+{"call_type": "fit_judge", "latency_ms": 14200, "success": true, "input_tokens": 1350, "output_tokens": 165}
+{"call_type": "fit_judge", "latency_ms": 15800, "success": true, "input_tokens": 1500, "output_tokens": 180}
+{"call_type": "fit_judge", "latency_ms": 17000, "success": true, "input_tokens": 1450, "output_tokens": 175}
+{"call_type": "fit_judge", "latency_ms": 18400, "success": true, "input_tokens": 1600, "output_tokens": 190}
+{"call_type": "fit_judge", "latency_ms": 21000, "success": false, "failure_kind": "worker_error", "input_tokens": 1700, "output_tokens": 20}
+{"call_type": "fit_judge", "latency_ms": 24000, "success": true, "input_tokens": 1650, "output_tokens": 200}
+{"call_type": "implementer", "latency_ms": 210000, "success": true, "input_tokens": 30000, "output_tokens": 8000}
+{"call_type": "implementer", "latency_ms": 245000, "success": true, "input_tokens": 31000, "output_tokens": 8200}
+{"call_type": "implementer", "latency_ms": 268000, "success": true, "input_tokens": 32000, "output_tokens": 8400}
+{"call_type": "implementer", "latency_ms": 289000, "success": true, "input_tokens": 33000, "output_tokens": 8600}
+{"call_type": "implementer", "latency_ms": 312000, "success": true, "input_tokens": 34000, "output_tokens": 8800}
+{"call_type": "implementer", "latency_ms": 340000, "success": true, "input_tokens": 35000, "output_tokens": 9000}
+{"call_type": "implementer", "latency_ms": 371000, "success": true, "input_tokens": 36000, "output_tokens": 9200}
+{"call_type": "implementer", "latency_ms": 410000, "success": true, "input_tokens": 37000, "output_tokens": 9400}
+{"call_type": "implementer", "latency_ms": 455000, "success": false, "failure_kind": "context_overflow", "input_tokens": 38000, "output_tokens": 200}
+{"call_type": "implementer", "latency_ms": 520000, "success": true, "input_tokens": 39000, "output_tokens": 9800}
+{"call_type": "classifier", "latency_ms": 15000, "success": true, "input_tokens": 5000, "output_tokens": 400}
+{"call_type": "classifier", "latency_ms": 17000, "success": true, "input_tokens": 5100, "output_tokens": 410}
+{"call_type": "classifier", "latency_ms": 18500, "success": true, "input_tokens": 5200, "output_tokens": 420}
+{"call_type": "classifier", "latency_ms": 19800, "success": true, "input_tokens": 5300, "output_tokens": 430}
+{"call_type": "classifier", "latency_ms": 21000, "success": true, "input_tokens": 5400, "output_tokens": 440}
+{"call_type": "classifier", "latency_ms": 22500, "success": true, "input_tokens": 5500, "output_tokens": 450}
+{"call_type": "classifier", "latency_ms": 24000, "success": true, "input_tokens": 5600, "output_tokens": 460}
+{"call_type": "classifier", "latency_ms": 26000, "success": true, "input_tokens": 5700, "output_tokens": 470}
+{"call_type": "classifier", "latency_ms": 29000, "success": true, "input_tokens": 5800, "output_tokens": 480}
+{"call_type": "classifier", "latency_ms": 33000, "success": true, "input_tokens": 5900, "output_tokens": 490}
