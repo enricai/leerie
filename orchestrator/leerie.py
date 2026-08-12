@@ -8474,6 +8474,38 @@ def _glob_task_references(task: str, repo_root: Path) -> list[Path]:
     return matched
 
 
+def _unreachable_task_references(task: str) -> list[str]:
+    """Flag task tokens that point outside the repo and resolve to nothing.
+
+    A task that delegates its operative content to a path the planner can
+    never read (e.g. ``~/.claude/plans/foo.md``) is silently dropped by
+    `_glob_task_references` exactly like ordinary prose — that guard
+    deliberately excludes absolute paths from candidates (see its
+    startswith("/") check) and pathlib never expands `~`, so a `~`-prefixed
+    reference never even reaches that guard. This is advisory only: it
+    never touches `_glob_task_references`'s return value or candidate
+    filtering, it only surfaces what would otherwise vanish without a
+    trace."""
+    tokens: list[str] = []
+    for token in task.split():
+        token = token.strip("\"'(),;:").strip("*_`")
+        if not token:
+            continue
+        if not any(c.isalnum() for c in token):
+            continue
+        has_ext = "." in token and not token.startswith(".")
+        has_sep = "/" in token
+        if not (has_ext or has_sep):
+            continue
+        if token.startswith("/") or token.startswith("~"):
+            tokens.append(token)
+    unreachable: list[str] = []
+    for token in tokens:
+        if not Path(token).expanduser().is_file():
+            unreachable.append(token)
+    return unreachable
+
+
 def _walk_calls(node: "object") -> list[str]:
     """Collect identifier names from call-expression function positions.
 
@@ -18412,6 +18444,10 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_files:
         log(f"  task references {len(task_files)} file(s); "
             "planner will read them")
+    unreachable_refs = _unreachable_task_references(task)
+    if unreachable_refs:
+        log(f"  task references {len(unreachable_refs)} path(s) outside the "
+            f"repo that leerie cannot read: {', '.join(unreachable_refs)}")
 
     # P6 repo-map injection (DESIGN §5½ (P6)). Build the ranked subgraph seeded
     # from the task-referenced files identified above, and inject it into the
