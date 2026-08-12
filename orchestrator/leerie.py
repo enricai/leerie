@@ -552,6 +552,15 @@ STATE_FIELDS = (
     # commit while install.sh tracks `main`, so every run between releases
     # reports the same version whether or not it carries a given fix.
     "leerie_commit",
+    # leerie_versions: append-only history of `{version, commit, at}`
+    # snapshots, one per resume (plus one seeded at the original run start).
+    # leerie_version/leerie_commit above are immutable across resumes by
+    # design (N38) — a resume overwriting them with whatever is installed
+    # NOW made a resumed run's failures read as attributable to the wrong
+    # release. This list is where the "what was actually installed at each
+    # resume" fact lives instead, without disturbing the original-run
+    # attribution the other two fields exist for.
+    "leerie_versions",
     # dep_capture_done: set to True in state.json and written as a sentinel
     # file (<run_dir>/dep_capture.done) after capture_repo_deps completes a
     # successful write. The run-start backstop checks the sentinel file to
@@ -28613,11 +28622,32 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
-        st.data["leerie_version"] = _read_version()
+        # leerie_version/leerie_commit are set ONCE, at the run's original
+        # start, and must stay immutable across every later resume — a
+        # resume overwriting them with whatever happens to be installed NOW
+        # makes a resumed run's failures read as attributable to the wrong
+        # release, exactly the ambiguity leerie_commit itself was added to
+        # close. Only seed them here if this state predates the field
+        # (resuming a run started before this key existed).
+        if "leerie_version" not in st.data:
+            st.data["leerie_version"] = _read_version()
         # `or None` rather than the bare value: an unset or empty
         # LEERIE_COMMIT (tarball install, or a launcher predating this field)
         # must record absence, not an empty string that reads as a real sha.
-        st.data["leerie_commit"] = os.environ.get("LEERIE_COMMIT") or None
+        if "leerie_commit" not in st.data:
+            st.data["leerie_commit"] = os.environ.get("LEERIE_COMMIT") or None
+        # leerie_versions: append-only resume history, distinct from the
+        # immutable original leerie_version/leerie_commit above. Each entry
+        # records what was actually installed at the moment of that resume,
+        # so a failure that only reproduces after an install upgrade is still
+        # attributable.
+        if "leerie_versions" not in st.data:
+            st.data["leerie_versions"] = []
+        st.data["leerie_versions"].append({
+            "version": _read_version(),
+            "commit": os.environ.get("LEERIE_COMMIT") or None,
+            "at": now(),
+        })
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
         # loaded and this resume is past the completed/no-work short-
@@ -28688,7 +28718,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    # this fresh path as a dict literal, and a source-order
                    # check cannot tell which branch it covered — which is
                    # exactly how this key shipped absent from the common path.
-                   "leerie_commit": os.environ.get("LEERIE_COMMIT") or None}
+                   "leerie_commit": os.environ.get("LEERIE_COMMIT") or None,
+                   # leerie_versions: append-only resume history — see the
+                   # resume branch above for why this is distinct from the
+                   # immutable leerie_version/leerie_commit pair. Seeded here
+                   # as a one-entry list so every run (resumed or not) has a
+                   # non-empty history.
+                   "leerie_versions": [{
+                       "version": _read_version(),
+                       "commit": os.environ.get("LEERIE_COMMIT") or None,
+                       "at": now(),
+                   }]}
         st.save()
         # Fail-closed containment gate + recording, before the first
         # worker (phase_classify below). Must come after the
