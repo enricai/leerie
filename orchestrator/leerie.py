@@ -3372,6 +3372,28 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     await run_proc(["git", "worktree", "prune"])
 
 
+async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
+    """Remove a subtask's worktree directory (including node_modules etc.)
+    once its branch has been merged into staging, WITHOUT touching the
+    branch itself — the branch is still needed for finalize/PR history.
+    Mirrors the git-worktree-remove + rmtree-fallback pattern in
+    `_cleanup_on_abnormal_exit` (:3280-3315), scoped to one sid instead of
+    every worktree.
+
+    Tolerates the worktree already being absent: `git worktree remove
+    --force` returns nonzero when its target is missing, which is the
+    expected idempotent case. Never raises — a failed prune is disk
+    pressure deferred to run-end cleanup, not a reason to fail the wave."""
+    worktree = leerie_dir / "worktrees" / sid
+    await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except OSError:
+            pass
+    await run_proc(["git", "worktree", "prune"])
+
+
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
     """Shared tail of the rate-limit auto-resume path (DESIGN §6 *Rate-limited
     → auto-resume*): worktree-only cleanup (state + run branch preserved),
@@ -27675,6 +27697,15 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # visible signature of a silent integration skip.
         log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
             f"{expected} completed subtask(s)")
+
+        # N31: the worktree (including node_modules) is dead weight once
+        # its branch is merged into staging — pruning it here, instead of
+        # waiting for run-end cleanup, is what keeps disk usage bounded on
+        # long multi-wave runs. Scoped strictly to sids integrate_wave
+        # reports as integrated; blocked/failed sids keep their worktree
+        # for a corrective retry via _reset_subtask_worktree.
+        for sid in integrated:
+            await _prune_subtask_worktree(sid, leerie_dir)
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
