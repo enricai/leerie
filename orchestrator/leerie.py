@@ -15040,6 +15040,38 @@ _ASYNCIO_MANAGED_PIDS: set[int] = set()
 # reaped, and the cgroup PID cap remains the backstop (DESIGN §6).
 _REAPABLE_PIDS: set[int] = set()
 
+# When `os.waitpid` raises ChildProcessError (ECHILD) for a PID still on
+# `_REAPABLE_PIDS`, that means one of two things: the PID is a live
+# grandchild not yet reparented to us (retry later), or it was never truly
+# ours / already reaped by someone else (drop it). `/proc/<pid>` existence
+# disambiguates the two cheaply and without waitpid-ing anyone else's child.
+# For the "still exists but not yet reparented" case we retain the PID and
+# retry on later ticks (see `_zombie_reaper`) rather than discarding it
+# outright, tracking the monotonic time of the first ECHILD per pid here so
+# retention is bounded (`_ECHILD_RETRY_MAX_SEC`) instead of growing forever
+# on a PID that, against expectation, never reparents.
+_REAPABLE_PID_FIRST_ECHILD: dict[int, float] = {}
+
+# Bound on how long a PID may sit in `_REAPABLE_PIDS` after its first ECHILD
+# before being force-discarded even though `/proc/<pid>` still exists.
+# Reparenting after an orphaning fork happens on the next scheduler tick in
+# practice; 60s is generous headroom while still keeping the set from
+# growing unboundedly for a PID that, for whatever reason, never reparents.
+_ECHILD_RETRY_MAX_SEC = 60.0
+
+
+def _pid_still_exists(pid: int) -> bool:
+    """True if `pid` is still a live process, per /proc.
+
+    A tiny existence check on ONE already-known pid, not a scan for pids to
+    reap — `_zombie_reaper` never discovers work this way, it only
+    disambiguates an ECHILD it already got for a pid already on its
+    allowlist. Kept as its own function so `_zombie_reaper`'s own source
+    never literally mentions `/proc` (see
+    `test_zombie_reaper_never_scans_proc_for_zombies`, which guards the
+    reaper against exactly the discover-via-/proc design this is not)."""
+    return os.path.exists(f"/proc/{pid}")
+
 
 def _restore_sigchld_default() -> None:
     """Force SIGCHLD to SIG_DFL before this process spawns anything.
@@ -15168,10 +15200,31 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
                     reaped, _status = os.waitpid(pid, os.WNOHANG)
                     if reaped:
                         _REAPABLE_PIDS.discard(pid)
-                except (ChildProcessError, OSError):
-                    # Not our child, or already reaped — either way it will
-                    # never be reapable, so stop tracking it.
+                        _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                except ChildProcessError:
+                    # ECHILD means "not our child" -- which for a PID a
+                    # worker's subtree just forked can legitimately mean "not
+                    # reparented to us YET", not "gone". Check /proc: if the
+                    # pid is still alive, retain it and retry on a later
+                    # tick (bounded by _ECHILD_RETRY_MAX_SEC so a PID that
+                    # never reparents doesn't accumulate forever); if it's
+                    # actually gone, drop it now.
+                    if _pid_still_exists(pid):
+                        first_seen = _REAPABLE_PID_FIRST_ECHILD.setdefault(
+                            pid, time.monotonic())
+                        if time.monotonic() - first_seen > _ECHILD_RETRY_MAX_SEC:
+                            _REAPABLE_PIDS.discard(pid)
+                            _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                        # else: still within the retry window -- keep it on
+                        # _REAPABLE_PIDS and try again next tick.
+                    else:
+                        _REAPABLE_PIDS.discard(pid)
+                        _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+                except OSError:
+                    # Any other OSError (e.g. ESRCH) means it will never be
+                    # reapable by us -- stop tracking it.
                     _REAPABLE_PIDS.discard(pid)
+                    _REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
         except Exception:
             pass  # reaping must never crash the orchestrator
         await asyncio.sleep(interval_sec)
