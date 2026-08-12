@@ -143,6 +143,13 @@ def test_integrate_wave_never_reports_a_non_complete_subtask(leerie):
     assert skipping, (
         "no `if <status> <op> 'complete':` branch found in integrate_wave — "
         "the filter that makes `integrated` safe for the prune is gone")
+    # Containment as well as polarity. The per-operator arms below say nothing
+    # about an operator neither arm names, so rewriting the test as `is not` or
+    # `not in` would fall through both and assert nothing at all.
+    assert {op for op, _ in skipping} <= {"NotEq", "Eq"}, (
+        "the completeness filter now compares with an operator this guard "
+        f"does not model ({sorted({op for op, _ in skipping})}) — the polarity "
+        "arms below would silently not apply")
     for op, body_skips in skipping:
         if op == "NotEq":
             assert body_skips, (

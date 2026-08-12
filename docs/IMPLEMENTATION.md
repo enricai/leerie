@@ -4126,75 +4126,39 @@ proportional ratio is the **floor**, not the whole rule: it scales with
 disk size without pretending to know per-run byte cost, and it is the
 only check available before any worktree exists.
 
-On top of it, the mid-run check adds a **measured** bound,
-`_disk_required_bytes(leerie_dir, caps)`:
+**The proportional ratio is the whole rule.** A per-worktree *measured*
+bound sat on top of it through four revisions and was withdrawn. Recording
+what was tried, because the intuition that produced it is easy to have again
+and each attempt looked correct until it was measured:
 
-    per_worktree = _measure_worktree_bytes(leerie_dir)   # MARGINAL, cached
-    required     = per_worktree * max(worktree_count, 1) * _DISK_HEADROOM_SAFETY
+| attempt | rule | why it was wrong |
+|---|---|---|
+| 1 | (bound existed, but the check ran where no worktree survived) | unreachable dead code — the N31 prune removes every integrated worktree at wave end, and a wave cannot advance with un-integrated ones, so the measurement always found an empty directory |
+| 2 | sum `st_blocks`, de-duplicated by inode | measured **total**, not marginal: 1.31 GiB where the true cost of one more tree was 65 MiB, a ~20x over-demand on any host whose package-manager store shares a mount |
+| 3 | `st_blocks // st_nlink` | `st_nlink` counts names *inside* the tree too, so it is not a store-vs-tree discriminator; returned 596 MiB, still 9x high |
+| 4 | charge an inode only when all its links are in-tree, plus every directory | the directory term made an *empty* worktree measure 4096 bytes on any block-allocating filesystem, which silently killed the "nothing to measure" sentinel and cached a meaningless figure. Invisible under a tmpfs `/tmp`; two tests failed on ext4 |
 
-`_measure_worktree_bytes(leerie_dir, *, refresh=False)` walks the **largest**
-existing subtask worktree (never `staging`, which is one long-lived tree
-rather than a per-subtask cost; largest rather than `iterdir()[0]` because
-raw `readdir()` order is neither sorted nor stable across hosts, and
-worst-case is the conservative direction for a headroom check) and charges:
+Two independent scaling errors ran alongside those: sizing by `max_parallel`
+(the prune runs once per *wave*, so peak coexistence is the wave's size, a 4x
+under-demand) and then by `len(wave)` (a resume with 19 of 20 subtasks
+complete asked for 20 trees' space to build one). Retried `blocked`/`failed`
+subtasks compounded it — their worktrees deliberately survive and
+`new-worktree.sh` reuses them, so charging for them double-counts bytes
+already absent from `free`.
 
-- **a file's blocks only when every one of its links is inside that tree**
-  (`in_tree_count >= st_nlink`), and
-- **every directory unconditionally**, outside that predicate.
+The quantity itself is the problem: the marginal cost of a not-yet-created
+worktree depends on whether the package-manager store can hardlink into it
+(a mount topology leerie does not control — see DESIGN §6's `EXDEV` note),
+on how many siblings exist at measurement time, and on a peak count that
+depends on scheduling. It is measurable from *outside* — a `df` delta across
+a real second checkout in a real container — and that is the only basis on
+which it should be rebuilt. `tests/test_disk_preflight.py` carries a guard
+asserting the withdrawal held, so a fifth attempt fails there first.
 
-It returns the cached figure when there is nothing new to measure, `None`
-only when nothing has ever been measured, and refuses to cache a zero. With
-`refresh=True` it re-walks and keeps a running max. The walk is O(files in
-`node_modules`) — 58,172 files in ~1.4-2.5 s depending on cache warmth —
-which is why both call sites go through `asyncio.to_thread`.
-
-Five things here are load-bearing, four of them learned by getting them
-wrong first:
-
-- **The charge is MARGINAL, not total.** The question is what one *more*
-  worktree costs. A file hardlinked in from the package manager's
-  content-addressed store already occupies its blocks and is reachable from
-  outside the tree, so another worktree links to it and spends nothing.
-  Two rejected predecessors, both measured on a real 1.37 GiB tree: the
-  inode-deduped total returned **1.31 GiB** (ignores sharing, ~20x over),
-  and `st_blocks // st_nlink` returned **596 MiB** — which looks like it
-  accounts for sharing but does not, since `st_nlink` counts names inside
-  the tree too.
-- **Directories bypass the link predicate**, because Linux forbids hardlinks
-  to directories: a new worktree always allocates its own. They must not go
-  *through* the predicate — a directory's `st_nlink` is >= 2 (`.`, its
-  parent's entry, each child's `..`) against an in-tree count of 1, so
-  `in_tree >= nlink` would charge every one of them zero. Measured: 34.0 MiB
-  across 8,531 dirs, i.e. a 1.5x under-charge where the store shares a mount
-  (there the files cost nothing, so the directories *are* most of the
-  marginal cost). Current total on that tree: **98.8 MiB** (64.8 files +
-  34.0 dirs).
-- **The measurement is seeded before the N31 prune, not at the check.** By
-  wave entry the previous wave's worktrees are gone, so the measurement
-  found nothing and the bound was unreachable dead code. `phase_execute`
-  therefore measures immediately *before* the prune loop, the one moment a
-  fully-populated tree exists (dependencies are installed by the worker
-  itself mid-subtask, DESIGN §6½ *Worker-driven install*).
-- **It scales by the number of subtasks that will actually run**
-  (`len(remaining)`), evaluated *after* the resume filter and the
-  already-complete short-circuit. Peak coexistence is a wave's worth of
-  trees, because the prune runs once per wave — but sizing against
-  `len(wave)` over-demanded on resume, asking for 20 trees' space to build
-  one when 19 were already complete, and could raise for a wave that gets
-  skipped entirely.
-- **Neither call may run on the event loop.** This repo's worst recent bug
-  (#198/#200, 218 workers lost) was a blocked orchestrator loop.
-  `tests/test_disk_preflight.py` pins both call sites via AST rather than a
-  source scan, because `_measure_worktree_bytes` appears twice in
-  `phase_execute` and a textual ordering check silently matched the wrong
-  occurrence.
-
-The running max never decreases, which is deliberate: under-demand is the
-failure this guards, and a heavy wave's figure is the safer estimate to
-carry forward. The cost is that a heavy first wave followed by light ones
-can pause a run that would not have filled the disk; that self-heals on
-`resume`, since the cache is per-process and completed waves short-circuit
-before the seed.
+**What the floor alone still guarantees.** N30 was filed because disk
+exhaustion "surfaces as a raw `OSError: [Errno 28]` from whatever happened to
+be writing." Four mechanisms answer that, none of which needed the measured
+bound:
 
 1. **Preflight** (`preflight(leerie_dir, ...)`, check "0.5", before the git
    identity checks and before the live smoke test — i.e. before any

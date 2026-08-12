@@ -2721,9 +2721,7 @@ survives worktree removal — so `phase_execute` removes it at the end of
 that wave rather than waiting for run end. Note the granularity: the prune
 runs **once per wave**, after every subtask in it has been integrated, not
 as each one finishes. So peak worktree coexistence is the size of a wave,
-which is what the disk check must size against; assuming the finer
-granularity is what made an earlier version of that check demand four
-times too little. Without this, every worktree a run ever
+which is what any per-worktree sizing would have to account for. Without this, every worktree a run ever
 created persisted until the run finished: at 30–87 subtasks against a
 repo whose `node_modules` is ~1.4 GB, that is the measured 51 GB that
 killed two runs with an unhandled `ENOSPC`.
@@ -2747,9 +2745,17 @@ Linux refuses `link()` across different mounts even when both resolve to
 the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
 new_path.mnt` check returns `EXDEV`). The store therefore cannot hardlink
 into a worktree, pnpm falls back to copying, and each worktree pays full
-freight. That is the second, independent multiplier behind the 51 GB —
-the mid-run prune bounds coexistence to one wave's worth of trees, and the
-disk check sizes against a measured one rather than a guessed constant.
+freight. That is the second, independent multiplier behind the 51 GB, and
+the mid-run prune bounds coexistence to one wave's worth of trees.
+
+This explains *why* worktrees are expensive; it deliberately does not drive
+a gate. A per-worktree measured bound was built on this reasoning and
+withdrawn after four failed revisions — the marginal cost of a
+not-yet-created worktree depends on a mount topology leerie does not
+control, on how many siblings exist when it is measured, and on a peak count
+that depends on scheduling. The disk guardrail is the proportional free-space
+floor plus a resumable pause; see IMPLEMENTATION.md's "Disk headroom (N30)"
+for what was tried.
 
 Colocating the store with the worktrees on one mount would collapse the
 per-worktree cost by that same ~20x and is the more fundamental fix, but

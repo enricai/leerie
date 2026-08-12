@@ -35,6 +35,15 @@ def test_default_cap_is_5400(leerie):
     assert leerie.DEFAULT_CAPS["worker_timeout_sec"] == 5400
 
 
+def test_explicitness_is_declared_in_default_caps(leerie):
+    """The consumer reads it with `.get()`, so a missing key is falsy and the
+    declaration is behaviourally inert — deleting it breaks nothing at runtime.
+    It is declared anyway (CLAUDE.md: caps are real entries in DEFAULT_CAPS,
+    not implicit), and pinned here so the declaration is not quietly dropped as
+    dead weight."""
+    assert leerie.DEFAULT_CAPS["worker_timeout_explicit"] is False
+
+
 def test_env_var_name(leerie):
     assert leerie.WORKER_TIMEOUT_ENV == "LEERIE_WORKER_TIMEOUT"
 
