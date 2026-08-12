@@ -26,7 +26,7 @@ combined, end-to-end transport contract the incident write-up demands:
     exercised separately
   - the schema stays inline (`--json-schema`, never a `@file` form)
   - a stubbed spawn fed the full payload does not raise E2BIG and does
-    not deadlock (bounded via a concurrent feeder)
+    not deadlock (the payload is staged to a file before the spawn)
 
 Does not cover the coverage-gate (root cause A) or dep_capture budget
 sites — those are separate subtasks.
@@ -238,7 +238,7 @@ class TestIncidentShapedTransport:
 # ---------------------------------------------------------------------------
 # Stubbed spawn: the incident payload must not raise E2BIG and must not
 # deadlock, exercised through _invoke's real asyncio spawn + concurrent
-# feeder against a stubbed asyncio.create_subprocess_exec (no live
+# staging against a stubbed asyncio.create_subprocess_exec (no live
 # `claude` binary required).
 # ---------------------------------------------------------------------------
 
@@ -324,20 +324,27 @@ def test_stubbed_spawn_does_not_raise_e2big_at_incident_scale(
     assert envelope["is_error"] is False
 
 
-def test_stubbed_spawn_feeds_full_payload_without_deadlock(
+def test_stubbed_spawn_stages_full_payload_before_exec(
         leerie, leerie_dir, monkeypatch):
-    """The concurrent feeder writes the entire incident-scale payload
-    and closes stdin (EOF) rather than blocking on a write-then-read
-    ordering — asserted by inspecting the mock's captured stdin."""
+    """The entire incident-scale payload is readable on the child's stdin
+    at the moment of spawn.
+
+    Read inside the fake, before `_invoke` proceeds: the guarantee is that
+    the payload was already there, and checking afterwards cannot tell that
+    apart from a write that happened during the run. (The CLI drops its
+    stdin listener 3 s after spawn, so "during the run" is exactly the
+    failure mode — see tests/test_stdin_feeder_ordering.py.)
+    """
     user_prompt = _incident_shaped_user_prompt()
-    proc_holder: dict = {}
+    seen: dict = {}
 
     async def fake(*cmd, **kwargs):
+        handed = kwargs.get("stdin")
+        handed.seek(0)
+        seen["at_spawn"] = handed.read()
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False, "result": "{}"})]
-        proc = _MockProc(events)
-        proc_holder["proc"] = proc
-        return proc
+        return _MockProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
 
@@ -346,9 +353,7 @@ def test_stubbed_spawn_feeds_full_payload_without_deadlock(
         sid="incident-feed", leerie_dir=leerie_dir, verbosity="quiet",
         stdin_data=user_prompt))
 
-    proc = proc_holder["proc"]
-    assert proc.stdin.written == user_prompt.encode()
-    assert proc.stdin.closed is True
+    assert seen["at_spawn"] == user_prompt.encode()
 
 
 def test_real_subprocess_incident_payload_no_deadlock(leerie, leerie_dir):
@@ -356,7 +361,7 @@ def test_real_subprocess_incident_payload_no_deadlock(leerie, leerie_dir):
     exact 150,063-byte incident payload is delivered and read back
     without hanging, bounded by _invoke's own asyncio.wait_for timeout
     rather than relying on pytest-level enforcement — if the concurrent
-    feeder/reader pairing deadlocked, this test would hang instead of
+    stdin/reader pairing deadlocked, this test would hang instead of
     failing cleanly."""
     import sys
 

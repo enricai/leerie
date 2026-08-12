@@ -20,14 +20,18 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run_accept(state_path: Path, sid: str) -> subprocess.CompletedProcess:
+def _run_accept(state_path: Path, sid: str,
+                force: bool = False) -> subprocess.CompletedProcess:
     """Run the accept-blocked mutation via the launcher."""
     env = {k: v for k, v in os.environ.items()}
     env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
     run_id = state_path.parent.name
+    argv = [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, sid,
+            "--runtime", "local"]
+    if force:
+        argv.append("--force")
     return subprocess.run(
-        [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, sid,
-         "--runtime", "local"],
+        argv,
         env=env,
         capture_output=True,
         text=True,
@@ -36,12 +40,15 @@ def _run_accept(state_path: Path, sid: str) -> subprocess.CompletedProcess:
 
 
 def _make_state(tmp_path: Path, subtask_status: dict,
-                blocked: dict | None = None) -> Path:
+                blocked: dict | None = None,
+                waves: list | None = None) -> Path:
     run_dir = tmp_path / "runs" / "test-run-001"
     run_dir.mkdir(parents=True)
     state = {"subtask_status": subtask_status}
     if blocked is not None:
         state["blocked"] = blocked
+    if waves is not None:
+        state["waves"] = waves
     state_file = run_dir / "state.json"
     state_file.write_text(json.dumps(state, indent=2))
     return state_file
@@ -321,3 +328,93 @@ def test_rejects_traversal_run_id(tmp_path):
     )
     assert r.returncode != 0
     assert "invalid run-id" in (r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# The two fields can disagree by ABSENCE, not just by value (N21/N22).
+#
+# The pre-existing "registry disagrees" tests above both read that as *a
+# different status string*. Measured across the run corpus, the single real
+# disagreement was the other shape: a subtask in `blocked` with NO
+# subtask_status entry at all — its checkpoint was rejected (the N22
+# `## Files touched: None.` defect) before any status was written. The gate
+# resolved the registry only AFTER a `cur is None` early-exit, so the one
+# case that actually occurred was the one it refused.
+# ---------------------------------------------------------------------------
+
+def test_accepts_when_absent_from_subtask_status_but_in_registry(tmp_path):
+    """The measured incident: `_self/d1207301`'s refactor-013."""
+    sf = _make_state(
+        tmp_path, {"other-1": "complete"},
+        blocked={"refactor-013": "checkpoint invalid: `## Files touched` "
+                                 "lists 'None.' but the file does not exist"})
+    r = _run_accept(sf, "refactor-013")
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    assert st["subtask_status"]["refactor-013"] == "complete"
+    assert "refactor-013" not in st.get("blocked", {})
+
+
+def test_still_refuses_a_sid_in_neither_field(tmp_path):
+    """Anti-vacuity for the test above: the relaxation must not accept
+    everything. A sid in neither field is a typo, not a blocked subtask."""
+    sf = _make_state(tmp_path, {"s1": "blocked"}, blocked={"s1": "r"})
+    r = _run_accept(sf, "nonexistent-9")
+    assert r.returncode != 0
+    assert "not found in subtask_status" in r.stderr
+
+
+def test_force_settles_a_subtask_abandoned_mid_flight(tmp_path):
+    """`in_progress` with NO registry entry — what a hard crash (ENOSPC,
+    SIGKILL) leaves behind, and what neither field can express as blocked.
+    Observed on `9751c048`'s test-015. Without --force it must stay refused,
+    so the default gate keeps its meaning."""
+    sf = _make_state(tmp_path, {"test-015": "in_progress"}, blocked={},
+                     waves=[["test-015"]])
+    refused = _run_accept(sf, "test-015")
+    assert refused.returncode != 0
+    assert "expected blocked or failed" in refused.stderr
+
+    forced = _run_accept(sf, "test-015", force=True)
+    assert forced.returncode == 0, forced.stderr
+    st = json.loads(sf.read_text())
+    assert st["subtask_status"]["test-015"] == "complete"
+
+
+def test_force_still_rejects_a_sid_not_in_the_plan(tmp_path):
+    """--force bypasses both status fields, so without this it would mint a
+    bogus subtask_status entry from a typo."""
+    sf = _make_state(tmp_path, {"test-015": "in_progress"}, blocked={},
+                     waves=[["test-015"]])
+    r = _run_accept(sf, "test-999", force=True)
+    assert r.returncode != 0
+    assert "not in the plan" in r.stderr
+    st = json.loads(sf.read_text())
+    assert "test-999" not in st["subtask_status"]
+
+
+def test_force_reaches_every_transport(tmp_path):
+    """`--force` must be threaded through ALL of accept-blocked's transports.
+
+    The verb has five invocation sites — local, the Fly and EC2 remote
+    commands, and the two host-side state mirrors. Wiring only the local one
+    leaves `--force` silently ignored on Fly/EC2: the flag parses, the verb
+    reports success, and the mutation refuses on the far side. That is the
+    same partial-fix shape `tests/test_resolve_aws_launcher.py` documents
+    for `_resolve_ec2_knob`, where fixing one arm of a multi-arm dispatch
+    read as done.
+
+    Structural because the remote arms need a live machine to exercise: pin
+    that no invocation of the mutation program passes the sid WITHOUT the
+    force argument following it.
+    """
+    src = (REPO_ROOT / "leerie").read_text()
+    invocations = [ln.strip() for ln in src.splitlines()
+                   if '"$_ab_mutate" "$_ab_state_file" "$_ab_sid"' in ln
+                   or "'$_ab_remote_state' '$_ab_sid'" in ln]
+    assert invocations, "found no accept-blocked mutation invocations to check"
+    unwired = [ln for ln in invocations if "_ab_force" not in ln]
+    assert not unwired, (
+        "these accept-blocked invocations do not forward --force, so the "
+        "flag is silently ignored on that transport:\n  "
+        + "\n  ".join(unwired))

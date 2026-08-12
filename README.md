@@ -387,7 +387,7 @@ below for full details and modifier flags.
 | `re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
 | `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
 | `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
-| `accept-blocked <run-id> <subtask-id>` | Accept a blocked subtask so `resume` skips it. |
+| `accept-blocked <run-id> <subtask-id> [--force]` | Accept a blocked subtask so `resume` skips it. `--force` also settles one abandoned mid-flight (e.g. after a crash), where neither status field records it as blocked. |
 | `accept-integration <run-id> <subtask-id>` | Accept a recorded `integration_judge` finding for a subtask so `resume` stops re-invoking the judge for it. |
 | `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see `docs/IMPLEMENTATION.md` "Chain verbs"). |
 | `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see `docs/IMPLEMENTATION.md` "Run-group verbs"). |
