@@ -1690,7 +1690,11 @@ in_registry = isinstance(bl, dict) and sid in bl
 # --force settles a subtask abandoned mid-flight: `in_progress` with no
 # registry entry, which is what a hard crash (ENOSPC, SIGKILL) leaves behind
 # and which neither field can express as "blocked". Validated against the
-# scheduled sid set, so a typo cannot mint a bogus status entry.
+# scheduled sid set (waves) WHEN PRESENT — which is every run where a
+# subtask can be blocked or abandoned, since waves is populated at
+# scheduling and nothing can be abandoned before then. Legacy or
+# pre-scheduling state carries no waves and degrades open rather than
+# refusing a legitimate accept.
 if force:
     known = {s for wave in (st.get("waves") or []) for s in wave}
     if known and sid not in known:

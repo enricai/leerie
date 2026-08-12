@@ -237,29 +237,17 @@ class _MockStream:
         return line
 
 
-class _MockStdinWriter:
-    def __init__(self):
-        self.written = b""
-        self.closed = False
-
-    def write(self, data: bytes):
-        self.written += data
-
-    async def drain(self):
-        pass
-
-    def close(self):
-        self.closed = True
-
-
 class _MockProc:
-    def __init__(self, stdout_lines: list[str], returncode: int = 0,
-                 with_stdin: bool = False):
+    def __init__(self, stdout_lines: list[str], returncode: int = 0):
         self.stdout = _MockStream(stdout_lines)
         self.stderr = _MockStream([])
         self.returncode = returncode
         self.pid = _MOCK_PID_SENTINEL
-        self.stdin = _MockStdinWriter() if with_stdin else None
+        # Always None: the prompt is staged to a file before the spawn, so
+        # the child is never handed a writable stdin. A mock that modelled
+        # one would imply `_invoke` still writes to the child after exec —
+        # the transport this suite exists to prove was replaced.
+        self.stdin = None
 
     def kill(self):
         pass
@@ -302,7 +290,7 @@ def test_invoke_passes_a_readable_file_when_stdin_data_given(
             captured["content"] = handed.read()
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        return _MockProc(events, with_stdin=False)
+        return _MockProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     payload = "hello prompt"
@@ -328,7 +316,7 @@ def test_invoke_still_uses_devnull_when_no_stdin_data(leerie, leerie_dir,
         captured.update(kwargs)
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        return _MockProc(events, with_stdin=False)
+        return _MockProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     asyncio.run(leerie._invoke(
@@ -357,7 +345,7 @@ def test_full_payload_is_on_disk_before_the_child_exists(
         seen["at_spawn"] = handed.read()
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        return _MockProc(events, with_stdin=False)
+        return _MockProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     payload = "p" * 150_063  # the incident's exact overflow size
@@ -378,7 +366,7 @@ def test_prompt_file_is_cleaned_up(leerie, leerie_dir, monkeypatch):
         paths.append(kwargs["stdin"].name)
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        return _MockProc(events, with_stdin=False)
+        return _MockProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     asyncio.run(leerie._invoke(

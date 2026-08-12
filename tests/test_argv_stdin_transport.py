@@ -258,28 +258,17 @@ class _MockStream:
         return line
 
 
-class _MockStdinWriter:
-    def __init__(self):
-        self.written = b""
-        self.closed = False
-
-    def write(self, data: bytes):
-        self.written += data
-
-    async def drain(self):
-        pass
-
-    def close(self):
-        self.closed = True
-
-
 class _MockProc:
     def __init__(self, stdout_lines, returncode: int = 0):
         self.stdout = _MockStream(stdout_lines)
         self.stderr = _MockStream([])
         self.returncode = returncode
         self.pid = 999_999_997
-        self.stdin = _MockStdinWriter()
+        # Always None: the prompt is staged to a file before the spawn, so
+        # the child is never handed a writable stdin. A mock that modelled
+        # one would imply `_invoke` still writes to the child after exec —
+        # the transport this suite exists to prove was replaced.
+        self.stdin = None
 
     def kill(self):
         pass
