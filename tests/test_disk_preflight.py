@@ -227,24 +227,24 @@ class TestMainHandlesDiskLowSpace:
             "sibling terminating arms all perform")
 
 
-class TestStateSaveDoesNotCatchENOSPC:
-    """N30's mitigation is exclusively the proactive `_disk_free_ratio`
+class TestStateSaveCatchesENOSPC:
+    """N30's mitigation is not exclusively the proactive `_disk_free_ratio`
     checks in `preflight()`/`phase_execute` (covered above) — `State.save()`
-    itself carries no `try`/`except OSError` around its
-    `tmp.write_text()`/`tmp.replace()` pair. Confirmed by grep: no
-    `errno.ENOSPC`/`e.errno` handling exists anywhere near `State.save()` or
-    its callers, and the un-classified-exception arm in `main()`
-    (`except BaseException as e:`) re-raises rather than pausing.
+    itself also wraps its `tmp.write_text()`/`tmp.replace()` pair, since a
+    disk can cross zero between one periodic check and the next write. An
+    `OSError(errno.ENOSPC, ...)` from either half is reraised as
+    `DiskLowSpace`, the same exception class/pause path the proactive
+    checks use, rather than propagating as an unhandled `OSError`.
 
-    This test reproduces the work order's evidence shape directly against a
-    real `State` instance: a genuine `OSError(28, "No space left on
-    device")` from the write step propagates out of `save()` unhandled,
-    exactly as it does today. It exists as an honest regression/gap marker,
-    not a false claim that this specific call site was hardened — if a
-    future change adds a save()-level catch, this test's
-    `pytest.raises(OSError)` is what must be updated alongside it."""
+    This reproduces the work order's evidence shape directly against a
+    real `State` instance: falsified against the unfixed code (confirmed by
+    grep, see `test_pre_fix_shape_is_documented` below), a genuine
+    `OSError(28, "No space left on device")` from the write step used to
+    propagate out of `save()` unhandled; now it is caught and surfaces as
+    `DiskLowSpace`, which `main()`'s handler (see `TestMainHandlesDiskLowSpace`
+    above) turns into a resumable EXIT_LOCKED pause rather than a crash."""
 
-    def test_enospc_during_write_text_propagates_unhandled(self, tmp_path, monkeypatch):
+    def test_enospc_during_write_text_is_caught_as_disklowspace(self, tmp_path, monkeypatch):
         leerie_root = tmp_path / "state-root"
         st = leerie.State(leerie_root, "run-enospc")
         try:
@@ -254,13 +254,13 @@ class TestStateSaveDoesNotCatchENOSPC:
                 raise OSError(28, "No space left on device")
 
             monkeypatch.setattr(leerie.Path, "write_text", _raise_enospc)
-            with pytest.raises(OSError) as exc_info:
+            with pytest.raises(leerie.DiskLowSpace) as exc_info:
                 st.save()
-            assert exc_info.value.errno == 28
+            assert "no space" in exc_info.value.raw_message.lower()
         finally:
             st.release_lock()
 
-    def test_enospc_during_replace_propagates_unhandled(self, tmp_path, monkeypatch):
+    def test_enospc_during_replace_is_caught_as_disklowspace(self, tmp_path, monkeypatch):
         # The atomic-rename half (os.replace) is the other half of the
         # write path and fails the same way under ENOSPC on some
         # filesystems/journal configurations (e.g. the destination
@@ -275,17 +275,48 @@ class TestStateSaveDoesNotCatchENOSPC:
                 raise OSError(28, "No space left on device")
 
             monkeypatch.setattr(leerie.os, "replace", _raise_enospc)
-            with pytest.raises(OSError) as exc_info:
+            with pytest.raises(leerie.DiskLowSpace):
                 st.save()
-            assert exc_info.value.errno == 28
         finally:
             st.release_lock()
 
-    def test_grep_confirms_no_enospc_handling_near_save(self):
+    def test_non_enospc_oserror_still_propagates_as_oserror(self, tmp_path, monkeypatch):
+        # Only ENOSPC is reinterpreted as a disk-space pause; any other
+        # I/O failure (permissions, a read-only mount unrelated to
+        # capacity, etc.) must not be misreported as "disk full".
+        leerie_root = tmp_path / "state-root"
+        st = leerie.State(leerie_root, "run-eacces")
+        try:
+            st.data = {"task": "x"}
+
+            def _raise_eacces(self, *a, **k):
+                raise OSError(13, "Permission denied")
+
+            monkeypatch.setattr(leerie.Path, "write_text", _raise_eacces)
+            with pytest.raises(OSError) as exc_info:
+                st.save()
+            assert exc_info.value.errno == 13
+            assert not isinstance(exc_info.value, leerie.DiskLowSpace)
+        finally:
+            st.release_lock()
+
+    def test_disklowspace_from_save_still_reaches_mains_handler(self):
+        # DiskLowSpace is a BaseException regardless of which of the three
+        # raise sites (preflight, phase_execute, or now State.save())
+        # produced it, so it is caught by the identical `except
+        # DiskLowSpace as e:` arm in main() pinned in
+        # TestMainHandlesDiskLowSpace — no separate save()-specific handler
+        # is required.
+        assert issubclass(leerie.DiskLowSpace, BaseException)
+
+    def test_pre_fix_shape_is_documented(self):
+        # Regression guard for the historical gap this test class replaced:
+        # State.save() must now actually reference DiskLowSpace/ENOSPC —
+        # a revert back to the silent-propagation shape fails here.
         import inspect
         src = inspect.getsource(leerie.State.save)
-        assert "except" not in src
-        assert "ENOSPC" not in src
+        assert "ENOSPC" in src
+        assert "DiskLowSpace" in src
 
 
 class TestDiskCheckThresholdIsProportionalNotAFixedByteCount:

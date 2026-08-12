@@ -16190,10 +16190,24 @@ class State:
         The flock is on `self.run_dir`, not `self.path`, so the
         `tmp.replace(self.path)` inode swap below does not affect lock
         ownership. The directory inode is stable for the run's
-        lifetime."""
+        lifetime.
+
+        An ENOSPC from either half of the write (the temp file's content
+        write or the atomic rename) is reraised as `DiskLowSpace` so the
+        caller pauses resumably (EXIT_LOCKED) via the same N30 path as the
+        proactive `_disk_free_ratio` checks, instead of crashing with an
+        unhandled `OSError: [Errno 28] No space left on device`."""
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2))
-        tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
+        try:
+            tmp.write_text(json.dumps(self.data, indent=2))
+            tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                raise DiskLowSpace(
+                    f"State.save() failed: no space left on device writing "
+                    f"{self.path}"
+                ) from e
+            raise
 
     def bump_workers(self, caps: dict) -> None:
         self.data["worker_count"] = self.data.get("worker_count", 0) + 1
