@@ -447,3 +447,245 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
     # Should pass — vague defects don't gate
     out = asyncio.run(_run())
     assert "feat-001" in out
+
+
+# --- integration_gate resume + accept-integration (bugfix-001-1) --------
+
+
+def _staging_repo(leerie_dir):
+    import subprocess
+    staging = leerie_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(staging), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"],
+                   cwd=str(staging), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"],
+                   cwd=str(staging), check=True, capture_output=True)
+    (staging / "file.txt").write_text("content\n")
+    subprocess.run(["git", "add", "."], cwd=str(staging), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(staging),
+                   check=True, capture_output=True)
+    return staging
+
+
+def test_defect_persisted_to_state_before_die(leerie, tmp_path, monkeypatch):
+    """(a) integrate_wave writes integration_gate/integration_defects[sid]
+    BEFORE die()ing — the incident shape: a committed merge, a behavioral
+    defect, and a state.json that must survive the die() so a resume can
+    read it back."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete", "intent": "add feature",
+                           "criteria_results": []}}
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integrator":
+            return {"status": "resolved", "resolution_summary": "merged",
+                    "confidence": {"resolution": 9.0, "basis": "clean"}}
+        elif kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [{
+                "kind": "dropped_change",
+                "concrete_scenario": "side A's validation was silently dropped",
+                "location": "src/auth.py:42",
+                "why_broken": "input no longer validated"
+            }], "rationale": "found breakage"}
+        return {}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "check_merge_committed",
+                        AsyncMock(return_value=None))
+    monkeypatch.setattr(leerie, "check_integrator_commit",
+                        AsyncMock(return_value=None))
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, tmp_path / ".leerie", _caps(leerie),
+            st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+
+    # The state was persisted BEFORE the die() fired.
+    entry = st.data["integration_gate"]["feat-001"]
+    assert entry["accepted"] is False
+    assert any("dropped_change" in d for d in entry["defects"])
+    assert st.data["integration_defects"]["feat-001"] == entry["defects"]
+
+
+def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
+        leerie, tmp_path, monkeypatch):
+    """(c) On a resume, a sid with a present-but-unaccepted integration_gate
+    entry re-invokes the judge directly — WITHOUT calling integrate.sh (the
+    merge is already committed; integrate.sh's `git merge` is idempotent and
+    would just see "Already up to date" and skip straight past the judge)."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    _staging_repo(leerie_dir)
+
+    # Simulate the state left behind by a prior invocation that die()d
+    # inside the judge gate.
+    st.data["integration_gate"] = {
+        "feat-001": {"defects": ["INTEGRATION_DEFECT (dropped_change) x"],
+                     "advisories": [], "merge_commit_sha": "abc123",
+                     "accepted": False}}
+    st.data["integration_defects"] = {
+        "feat-001": ["INTEGRATION_DEFECT (dropped_change) x"]}
+    st.save()
+
+    results = {"feat-001": {"status": "complete"}}
+
+    integrate_sh_called = False
+    judge_called = False
+
+    async def fake_claude_p(**kwargs):
+        nonlocal judge_called
+        if kwargs.get("schema_key") == "integration_judge":
+            judge_called = True
+            return {"merge_reviewed": True, "defects": [],
+                    "rationale": "clean on re-review"}
+        return {}
+
+    async def fake_run_script(script, sid, run_id):
+        nonlocal integrate_sh_called
+        integrate_sh_called = True
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert judge_called, "resume must re-invoke integration_judge"
+    assert not integrate_sh_called, (
+        "resume must NOT re-drive integrate.sh — it would just see the "
+        "branch already merged and short-circuit past the judge")
+    assert "feat-001" in out
+    assert st.data["integration_gate"]["feat-001"]["accepted"] is True
+    assert "feat-001" not in st.data.get("integration_defects", {})
+
+
+def test_resume_still_dies_when_defect_not_accepted(
+        leerie, tmp_path, monkeypatch):
+    """A resume that re-invokes the judge and gets the SAME defect back
+    must still die() — accept-integration is the only way past it."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    _staging_repo(leerie_dir)
+
+    st.data["integration_gate"] = {
+        "feat-001": {"defects": ["INTEGRATION_DEFECT (dropped_change) x"],
+                     "advisories": [], "merge_commit_sha": "abc123",
+                     "accepted": False}}
+    st.save()
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [{
+                "kind": "dropped_change",
+                "concrete_scenario": "still broken",
+                "location": "src/auth.py:42",
+                "why_broken": "still not validated"
+            }], "rationale": "still broken"}
+        return {}
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+    assert st.data["integration_gate"]["feat-001"]["accepted"] is False
+
+
+def test_accepted_finding_skips_the_judge_entirely(leerie, tmp_path, monkeypatch):
+    """(d) After `accept-integration` flips `accepted` to True, a subsequent
+    resume must not re-invoke the judge (nor integrate.sh) — it just
+    advances past the finding."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    _staging_repo(leerie_dir)
+
+    # State as accept-integration would leave it.
+    st.data["integration_gate"] = {
+        "feat-001": {"defects": ["INTEGRATION_DEFECT (dropped_change) x"],
+                     "advisories": [], "merge_commit_sha": "abc123",
+                     "accepted": True}}
+    st.save()
+
+    results = {"feat-001": {"status": "complete"}}
+
+    calls = {"judge": False, "integrate_sh": False}
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integration_judge":
+            calls["judge"] = True
+        return {}
+
+    async def fake_run_script(script, sid, run_id):
+        calls["integrate_sh"] = True
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert not calls["judge"], "an accepted finding must not re-invoke the judge"
+    assert not calls["integrate_sh"], "an accepted finding must not re-drive integrate.sh"
+    assert "feat-001" in out
