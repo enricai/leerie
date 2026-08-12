@@ -1,0 +1,186 @@
+{
+  "_comment": "Several ordinary, healthy plans modeled on this repo's existing adherence_gate/wiring_repair_corpus fixture families (a goal-only task with no checklist, a small fully-covered checklist, an intentionally-phased partial rollout, and a near-complete checklist) -- used to measure the false-positive rate of a proposed coverage-ratio floor (N34) BEFORE any such floor is implemented. See test_coverage_ratio_floor_regression.py.",
+  "plans": {
+    "no_required_items": {
+      "_comment": "The dominant real-world case (Check-3 corpus: required_items empty/absent on ~all 21 sampled runs) -- an ordinary goal-only task with no enumerable checklist at all. A ratio floor keyed on len(required_items)==0 must never fire here, or it regresses the exact false-positive class the deleted check_required_items_coverage was retired for.",
+      "task": "Add a /volumes endpoint to the storage service with tests and docs.",
+      "required_items": [],
+      "plan_subtasks": [
+        {
+          "id": "feat-001",
+          "title": "Implement /volumes endpoint"
+        },
+        {
+          "id": "test-001",
+          "title": "Add endpoint tests"
+        }
+      ],
+      "covered_source_refs": []
+    },
+    "full_coverage": {
+      "_comment": "A small enumerable checklist the plan addresses completely.",
+      "task": "Ship the 5 items in MIGRATION_CHECKLIST.md.",
+      "required_items": [
+        {
+          "item": "checklist item 1",
+          "source_ref": "MIGRATION_CHECKLIST.md#item-1"
+        },
+        {
+          "item": "checklist item 2",
+          "source_ref": "MIGRATION_CHECKLIST.md#item-2"
+        },
+        {
+          "item": "checklist item 3",
+          "source_ref": "MIGRATION_CHECKLIST.md#item-3"
+        },
+        {
+          "item": "checklist item 4",
+          "source_ref": "MIGRATION_CHECKLIST.md#item-4"
+        },
+        {
+          "item": "checklist item 5",
+          "source_ref": "MIGRATION_CHECKLIST.md#item-5"
+        }
+      ],
+      "plan_subtasks": [
+        {
+          "id": "feat-001",
+          "title": "Item 1-2"
+        },
+        {
+          "id": "feat-002",
+          "title": "Item 3-4"
+        },
+        {
+          "id": "feat-003",
+          "title": "Item 5"
+        }
+      ],
+      "covered_source_refs": [
+        "MIGRATION_CHECKLIST.md#item-1",
+        "MIGRATION_CHECKLIST.md#item-2",
+        "MIGRATION_CHECKLIST.md#item-3",
+        "MIGRATION_CHECKLIST.md#item-4",
+        "MIGRATION_CHECKLIST.md#item-5"
+      ]
+    },
+    "phased_rollout": {
+      "_comment": "A LEGITIMATE, healthy plan that intentionally covers a minority of an enumerated list: the task itself scopes the run to phase 1 of a 10-item backlog, deferring the rest to follow-up work explicitly named in the task. required_items still enumerates all 10 (they are real, structured items from the source doc) but only 3 are in scope for this run -- a naive ratio floor cannot distinguish this from the N34 incident's under-planning without also reading the scoping prose, which is exactly the prose-parsing this predicate is forbidden from doing. This is the false-positive case this fixture exists to demonstrate.",
+      "task": "ROADMAP.md lists 10 follow-up items from the Q2 retro. Phase 1 of 3: implement only items 1-3 this run; items 4-10 are tracked as separate follow-up tickets and explicitly out of scope for this task.",
+      "required_items": [
+        {
+          "item": "roadmap item 1",
+          "source_ref": "ROADMAP.md#item-1"
+        },
+        {
+          "item": "roadmap item 2",
+          "source_ref": "ROADMAP.md#item-2"
+        },
+        {
+          "item": "roadmap item 3",
+          "source_ref": "ROADMAP.md#item-3"
+        },
+        {
+          "item": "roadmap item 4",
+          "source_ref": "ROADMAP.md#item-4"
+        },
+        {
+          "item": "roadmap item 5",
+          "source_ref": "ROADMAP.md#item-5"
+        },
+        {
+          "item": "roadmap item 6",
+          "source_ref": "ROADMAP.md#item-6"
+        },
+        {
+          "item": "roadmap item 7",
+          "source_ref": "ROADMAP.md#item-7"
+        },
+        {
+          "item": "roadmap item 8",
+          "source_ref": "ROADMAP.md#item-8"
+        },
+        {
+          "item": "roadmap item 9",
+          "source_ref": "ROADMAP.md#item-9"
+        },
+        {
+          "item": "roadmap item 10",
+          "source_ref": "ROADMAP.md#item-10"
+        }
+      ],
+      "plan_subtasks": [
+        {
+          "id": "feat-001",
+          "title": "Roadmap item 1"
+        },
+        {
+          "id": "feat-002",
+          "title": "Roadmap item 2"
+        },
+        {
+          "id": "feat-003",
+          "title": "Roadmap item 3"
+        }
+      ],
+      "covered_source_refs": [
+        "ROADMAP.md#item-1",
+        "ROADMAP.md#item-2",
+        "ROADMAP.md#item-3"
+      ]
+    },
+    "high_partial_coverage": {
+      "_comment": "An ordinary healthy plan that covers most but not literally all of a small checklist (one item deferred to a documented follow-up subtask note, not silently dropped).",
+      "task": "Address the 6 items in RELEASE_CHECKLIST.md before cutting v2.0.",
+      "required_items": [
+        {
+          "item": "release item 1",
+          "source_ref": "RELEASE_CHECKLIST.md#item-1"
+        },
+        {
+          "item": "release item 2",
+          "source_ref": "RELEASE_CHECKLIST.md#item-2"
+        },
+        {
+          "item": "release item 3",
+          "source_ref": "RELEASE_CHECKLIST.md#item-3"
+        },
+        {
+          "item": "release item 4",
+          "source_ref": "RELEASE_CHECKLIST.md#item-4"
+        },
+        {
+          "item": "release item 5",
+          "source_ref": "RELEASE_CHECKLIST.md#item-5"
+        },
+        {
+          "item": "release item 6",
+          "source_ref": "RELEASE_CHECKLIST.md#item-6"
+        }
+      ],
+      "plan_subtasks": [
+        {
+          "id": "feat-001",
+          "title": "Items 1-3"
+        },
+        {
+          "id": "feat-002",
+          "title": "Items 4-5"
+        }
+      ],
+      "covered_source_refs": [
+        "RELEASE_CHECKLIST.md#item-1",
+        "RELEASE_CHECKLIST.md#item-2",
+        "RELEASE_CHECKLIST.md#item-3",
+        "RELEASE_CHECKLIST.md#item-4",
+        "RELEASE_CHECKLIST.md#item-5"
+      ]
+    }
+  },
+  "expected_ratios": {
+    "no_required_items": null,
+    "full_coverage": 1.0,
+    "phased_rollout": 0.3,
+    "high_partial_coverage": 0.8333333333333334
+  }
+}
