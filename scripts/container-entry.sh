@@ -156,6 +156,27 @@ fi
 
 cd /work
 
+# -- .claude.json: copy from the staged directory mount into place. --
+# Local nerdctl mounts the whole per-run host scratch dir ($STAGE) at
+# /opt/leerie-claude-json-src, read-only, rather than bind-mounting
+# .claude.json itself onto /home/leerie/.claude.json (see
+# the leerie launcher's AUTH_MOUNTS comment for the corruption this
+# avoids: rename() onto a bind-mounted single file returns EBUSY, forcing
+# the CLI to truncate-in-place, which is not atomic under concurrent
+# workers). We copy it into place here, as a real file inside the
+# container's own filesystem, so the CLI's normal atomic rename() works.
+# This mirrors what seed-auth.sh/ec2-seed-auth.sh already do for the
+# remote runtimes (tar-copy, never a live bind mount of this file).
+#
+# Absent on the Fly/EC2 paths (they seed .claude.json directly, no such
+# mount exists there), so this is a no-op there. Left root-owned for now
+# under rootless (correct there — see the rootful guard below, which
+# chowns it to leerie only in the rootful case, same reasoning as the
+# other /home/leerie ownership fixes it already contains).
+if [ -f /opt/leerie-claude-json-src/.claude.json ]; then
+  cp /opt/leerie-claude-json-src/.claude.json /home/leerie/.claude.json
+fi
+
 # /work ownership fix. On the Fly path, when FLY_VM_DISK_GB is set in
 # provision.sh a per-machine Fly volume is mounted at /work — and the
 # mount masks the Dockerfile's baked `chown leerie:` layer (the volume
@@ -180,6 +201,10 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   # needs literal leerie ownership — applied here instead.
   chown leerie: /home/leerie 2>/dev/null || true
   chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg 2>/dev/null || true
+  # .claude.json (copied into place above, root-owned since it's a fresh
+  # file inside the container's own filesystem) needs the same rootful
+  # chown-to-leerie treatment as everything else in this guard.
+  [ -f /home/leerie/.claude.json ] && chown leerie: /home/leerie/.claude.json 2>/dev/null || true
   # The Dockerfile's `mise install --system` creates /tmp/.cache/mise/
   # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an
   # ephemeral overlay so this is never seen; on Fly the rootfs preserves

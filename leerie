@@ -6309,6 +6309,16 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE" 2>/dev/null' EXI
 # The projects[] block stores prior-session per-project state
 # (lastSessionId, lastCost, MCP allowlists). Stripping it gives the
 # worker a clean slate on /work as a brand-new project.
+#
+# Written at $STAGE/.claude.json (not a dedicated subdirectory) because
+# $STAGE is also the exact tree scripts/remote/seed-auth.sh /
+# ec2-seed-auth.sh tar-pipe wholesale to Fly/EC2 machines (tar -czC
+# "$STAGE" .) — moving this file to a subdirectory would silently change
+# where it lands on those remote runtimes too. The local-only fix below
+# instead mounts the whole of $STAGE read-only at a staging path and has
+# container-entry.sh copy just .claude.json out of it — see the
+# AUTH_MOUNTS comment below for why a single-file bind mount of this path
+# corrupts it under concurrent workers.
 python3 - "$HOME/.claude.json" "$STAGE/.claude.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -6670,7 +6680,21 @@ fi
 # -- Mount each staged file/dir at its default in-container path. --
 # Files mount as files; dirs mount as dirs. The container sees the
 # normal default paths — no env-var redirection needed.
-AUTH_MOUNTS+=(-v "$STAGE/.claude.json:/home/leerie/.claude.json")
+#
+# .claude.json is the one exception: it is NOT bind-mounted directly onto
+# /home/leerie/.claude.json. The CLI rewrites that file via a
+# rename()-based atomic write (tmp file + rename() onto the target);
+# rename() onto a bind-mounted single file returns EBUSY, forcing the CLI
+# to fall back to truncate-in-place, which under concurrent workers has a
+# demonstrated empty-file corruption window (N19). Instead, the whole of
+# $STAGE (which already contains the projects-stripped .claude.json — see
+# the STAGE-assembly comment above) is bind-mounted read-only at a
+# staging path, and container-entry.sh copies just .claude.json out of it
+# into place at container start, as a real file inside the container's
+# own filesystem — mirroring the pattern seed-auth.sh/ec2-seed-auth.sh
+# already use for the remote runtimes (tar-copy, never a live bind mount
+# of this file).
+AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-claude-json-src:ro")
 AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/leerie/.claude")
 for relpath in .gitconfig .gitconfig.local .gitignore \
                .gitignore_global .git-credentials .netrc; do
