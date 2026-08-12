@@ -172,6 +172,170 @@ class TestDiskLowSpaceExceptionClass:
         assert exc.raw_message == "only 1.0% free"
 
 
+class TestMainHandlesDiskLowSpace:
+    """main()'s `except DiskLowSpace as e:` arm must pause resumably
+    (EXIT_LOCKED, a `resume` hint, and a `st.save()` so the run stays
+    recoverable) rather than letting the mid-run raise crash the process.
+
+    Source-coupling only, mirroring
+    `test_context_overflow_classifier.py::TestWiring` — the suite does not
+    drive `main()` to a real process exit, so this pins the handler's
+    control flow directly."""
+
+    def _arm(self) -> str:
+        import inspect
+        src = inspect.getsource(leerie.main)
+        assert "except DiskLowSpace as e:" in src
+        # Split on the next TOP-LEVEL handler (4-space indent). A bare
+        # "except " would truncate at the inner `except Exception:` guarding
+        # the cleanup call, hiding the `exit_code` assignment after it —
+        # the same trap test_context_overflow_classifier.py documents.
+        return src.split("except DiskLowSpace as e:", 1)[1] \
+                  .split("\n    except ", 1)[0]
+
+    def test_pauses_with_exit_locked_not_a_crash(self):
+        arm = self._arm()
+        assert "EXIT_LOCKED" in arm, "must pause resumably, not exit(1)/raise"
+        assert "resume" in arm, "must tell the operator how to continue"
+
+    def test_persists_state_before_pausing(self):
+        # The run is only resumable if state.json reflects the pause —
+        # an in-memory-only pause would resume from stale disk state.
+        arm = self._arm()
+        assert "st.save()" in arm
+
+    def test_does_not_re_raise(self):
+        # The generic `except BaseException as e:` arm above re-raises
+        # (crashing the process with a traceback) — DiskLowSpace's own arm
+        # must be a distinct, earlier handler that does not fall through
+        # to that behavior.
+        import inspect
+        src = inspect.getsource(leerie.main)
+        assert src.index("except DiskLowSpace as e:") < \
+            src.index("except BaseException as e:")
+        arm = self._arm()
+        # A bare "raise" (no exception name) re-raises the currently
+        # handled exception; comments elsewhere in the arm legitimately
+        # discuss re-raising ("re-raise escaping here"), so only a real
+        # `raise` statement (start-of-line, ignoring indentation) counts.
+        assert not any(line.strip() == "raise" for line in arm.splitlines())
+
+    def test_runs_a_guarded_dep_capture_like_its_siblings(self):
+        arm = self._arm()
+        assert "capture_repo_deps(" in arm, (
+            "the DiskLowSpace arm skips the best-effort dep capture its "
+            "sibling terminating arms all perform")
+
+
+class TestStateSaveDoesNotCatchENOSPC:
+    """N30's mitigation is exclusively the proactive `_disk_free_ratio`
+    checks in `preflight()`/`phase_execute` (covered above) — `State.save()`
+    itself carries no `try`/`except OSError` around its
+    `tmp.write_text()`/`tmp.replace()` pair. Confirmed by grep: no
+    `errno.ENOSPC`/`e.errno` handling exists anywhere near `State.save()` or
+    its callers, and the un-classified-exception arm in `main()`
+    (`except BaseException as e:`) re-raises rather than pausing.
+
+    This test reproduces the work order's evidence shape directly against a
+    real `State` instance: a genuine `OSError(28, "No space left on
+    device")` from the write step propagates out of `save()` unhandled,
+    exactly as it does today. It exists as an honest regression/gap marker,
+    not a false claim that this specific call site was hardened — if a
+    future change adds a save()-level catch, this test's
+    `pytest.raises(OSError)` is what must be updated alongside it."""
+
+    def test_enospc_during_write_text_propagates_unhandled(self, tmp_path, monkeypatch):
+        leerie_root = tmp_path / "state-root"
+        st = leerie.State(leerie_root, "run-enospc")
+        try:
+            st.data = {"task": "x"}
+
+            def _raise_enospc(self, *a, **k):
+                raise OSError(28, "No space left on device")
+
+            monkeypatch.setattr(leerie.Path, "write_text", _raise_enospc)
+            with pytest.raises(OSError) as exc_info:
+                st.save()
+            assert exc_info.value.errno == 28
+        finally:
+            st.release_lock()
+
+    def test_enospc_during_replace_propagates_unhandled(self, tmp_path, monkeypatch):
+        # The atomic-rename half (os.replace) is the other half of the
+        # write path and fails the same way under ENOSPC on some
+        # filesystems/journal configurations (e.g. the destination
+        # directory's own metadata write, distinct from the temp file's
+        # content write above).
+        leerie_root = tmp_path / "state-root"
+        st = leerie.State(leerie_root, "run-enospc-2")
+        try:
+            st.data = {"task": "x"}
+
+            def _raise_enospc(*a, **k):
+                raise OSError(28, "No space left on device")
+
+            monkeypatch.setattr(leerie.os, "replace", _raise_enospc)
+            with pytest.raises(OSError) as exc_info:
+                st.save()
+            assert exc_info.value.errno == 28
+        finally:
+            st.release_lock()
+
+    def test_grep_confirms_no_enospc_handling_near_save(self):
+        import inspect
+        src = inspect.getsource(leerie.State.save)
+        assert "except" not in src
+        assert "ENOSPC" not in src
+
+
+class TestDiskCheckThresholdIsProportionalNotAFixedByteCount:
+    """The N30 finding's own DESIGN note (leerie.py's comment directly above
+    `DISK_MIN_FREE_RATIO`) explicitly considered and rejected a fixed-byte
+    threshold: the "right" threshold scales with per-worktree cost *
+    remaining subtasks, a quantity that needs external-repo measurement
+    (pnpm store-sharing across worktrees, etc.) unavailable to a
+    codebase-only investigation. The shipped fallback — a *fraction* of the
+    filesystem's total capacity — is that finding's own documented
+    fallback: it scales with disk size instead of pretending to know a
+    per-run byte cost. This class pins that the shipped constant is that
+    proportional shape (not a hard-coded byte/GB constant), and that both
+    call sites (preflight + mid-run) share the one constant rather than
+    each hard-coding their own number."""
+
+    def test_constant_is_a_fraction_not_a_byte_count(self):
+        assert 0 < leerie.DISK_MIN_FREE_RATIO < 1
+
+    def test_message_scales_with_total_disk_size(self, tmp_path):
+        # A 10 GB disk and a 1000 GB disk at the same ratio both cross the
+        # threshold at the same fraction, not the same absolute byte count.
+        with mock.patch.object(leerie.shutil, "disk_usage",
+                                return_value=_fake_usage(0.01, total=10 * 1024 ** 3)):
+            small = leerie._disk_free_ratio(tmp_path)
+        with mock.patch.object(leerie.shutil, "disk_usage",
+                                return_value=_fake_usage(0.01, total=1000 * 1024 ** 3)):
+            large = leerie._disk_free_ratio(tmp_path)
+        assert small == pytest.approx(large) == pytest.approx(0.01)
+        assert small < leerie.DISK_MIN_FREE_RATIO
+        assert large < leerie.DISK_MIN_FREE_RATIO
+
+    def test_preflight_and_midrun_share_the_one_constant(self):
+        import inspect
+        preflight_src = inspect.getsource(leerie.preflight)
+        execute_src = inspect.getsource(leerie.phase_execute)
+        assert "DISK_MIN_FREE_RATIO" in preflight_src
+        assert "DISK_MIN_FREE_RATIO" in execute_src
+
+    def test_rationale_for_the_ratio_over_a_formula_is_documented(self):
+        # Not a fixed constant chosen blind: the source comment records the
+        # explicit rejection of a fixed-byte threshold and why. Pinned so a
+        # future edit can't silently drop the rationale while keeping the
+        # constant.
+        import inspect
+        src = inspect.getsource(leerie)
+        assert "per-worktree cost" in src
+        assert "remaining subtasks" in src
+
+
 class TestDepCaptureGuardsIncludeDiskLowSpace:
     """The dep_capture best-effort guards elsewhere in main()/backstop
     capture already catch the whole BaseException exit-signal family
