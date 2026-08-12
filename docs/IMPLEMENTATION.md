@@ -1829,10 +1829,13 @@ The lock primitive itself:
   `_lock_fd` was set — `__init__` can raise before that field
   exists). Best-effort; the kernel guarantees release on process
   exit regardless.
-- `State.save` is unchanged in body. The flock is on the run
+- `State.save`'s locking behavior is unchanged: the flock is on the run
   directory inode, not the state.json inode, so the
   `tmp.replace(self.path)` swap inside `save()` does not affect the
-  lock. Docstring updated to make this explicit.
+  lock. Docstring updated to make this explicit. (`save()`'s body was
+  later extended, unrelated to locking, to catch an `OSError(ENOSPC, ...)`
+  from either half of the write and reraise it as `DiskLowSpace` — see
+  §"Disk headroom (N30)".)
 Two checked construction sites that catch `StateLockedError`:
 
 - `main()` at the `State(leerie_root, run_id, repo_root=repo_root)` call:
@@ -4102,10 +4105,22 @@ measurement this fix does not have).
 
 A healthy disk is a no-op at both checkpoints — the preflight check falls
 through to the next check, and the wave loop proceeds to its normal work.
+
+3. **`State.save()` itself** is a third, reactive checkpoint alongside the
+   two proactive ones above: a disk can cross zero between one periodic
+   check and the next write, so `save()`'s `tmp.write_text()` /
+   `tmp.replace()` pair is wrapped in a `try/except OSError` that reraises
+   an `errno.ENOSPC` failure as the same `DiskLowSpace`, caught by the same
+   `main()` arm described above. Any other `OSError` (permissions, a
+   read-only mount unrelated to capacity) propagates unchanged.
+
 Pinned in `tests/test_disk_preflight.py`: near-zero free space triggers
 `die()` at preflight before any subprocess runs; a mid-run drop raises
 `DiskLowSpace` before wave-entry work starts; a healthy ratio is silent at
-both sites.
+all three sites; a real `State.save()` call under a monkeypatched
+`Path.write_text`/`os.replace` raising `OSError(ENOSPC, ...)` is caught and
+reraised as `DiskLowSpace`, while a non-ENOSPC `OSError` still propagates
+as-is.
 
 #### Terminal auth failure
 
