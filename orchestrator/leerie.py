@@ -379,6 +379,7 @@ STATE_FIELDS = (
     "skip_adherence_check",
     "skip_coverage_check",
     "skip_completeness_check",
+    "skip_integration_check",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -990,6 +991,16 @@ SKIP_COVERAGE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # leerie.toml → False.
 SKIP_COMPLETENESS_CHECK_ENV = "LEERIE_SKIP_COMPLETENESS_CHECK"
 SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-integration-check bypass (the integration_judge behavioral-defect
+# gate — DESIGN §8 *Independent adversarial verification*). Unlike the
+# accept-integration/audit-key mechanism (which accepts one already-found
+# finding), this skips the worker spawn entirely, matching every sibling
+# advisory/gating check's escape hatch. Resolution order:
+# --skip-integration-check CLI flag → LEERIE_SKIP_INTEGRATION_CHECK env →
+# skip_integration_check in leerie.toml → False.
+SKIP_INTEGRATION_CHECK_ENV = "LEERIE_SKIP_INTEGRATION_CHECK"
+SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by _build_repo_map() so
@@ -5757,6 +5768,26 @@ def resolve_skip_completeness_check(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_COMPLETENESS_CHECK_ENV,
         file_key="skip_completeness_check",
         file_name=SKIP_COMPLETENESS_CHECK_FILE)
+
+
+def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-integration-check preference. Order:
+    --skip-integration-check CLI flag (action='store_true') →
+    LEERIE_SKIP_INTEGRATION_CHECK env var →
+    skip_integration_check in leerie.toml → False.
+
+    When True, `integrate_wave` never invokes `integration_judge` — the
+    independent adversarial verification of a committed merge (DESIGN §8) —
+    for any subtask in this run. This is a full-phase skip, independent of
+    the accept-integration/audit-key mechanism, which only accepts a
+    finding the judge already produced. Off by default; use only when the
+    operator knows the gate is misfiring for this repo and wants to bypass
+    the discipline entirely."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_INTEGRATION_CHECK_ENV,
+        file_key="skip_integration_check",
+        file_name=SKIP_INTEGRATION_CHECK_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -27284,7 +27315,15 @@ async def _run_integration_judge_gate(
     sequence; unifying them is what lets a resume re-invoke the judge
     without re-driving `integrate.sh`/the integrator, which would just see
     the branch already merged and short-circuit past the judge entirely.
+
+    Skipped entirely when `st.data["skip_integration_check"]` is set —
+    a full-phase bypass, independent of the accept-integration/audit-key
+    mechanism (DESIGN §8).
     """
+    if st.data.get("skip_integration_check"):
+        log(f"  integration gate skipped for {sid} (--skip-integration-check "
+            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
+        return
     sys_prompt_judge = _load_prompt("integration_judge")
     repo_root = Path(os.getcwd())
 
@@ -28683,6 +28722,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_coverage_check", False))
         st.data["skip_completeness_check"] = bool(
             getattr(args, "skip_completeness_check", False))
+        st.data["skip_integration_check"] = bool(
+            getattr(args, "skip_integration_check", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -28773,6 +28814,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_coverage_check", False)),
                    "skip_completeness_check": bool(
                        getattr(args, "skip_completeness_check", False)),
+                   "skip_integration_check": bool(
+                       getattr(args, "skip_integration_check", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -29470,6 +29513,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "resume. "
                          f"Also {SKIP_COMPLETENESS_CHECK_ENV} env or "
                          "skip_completeness_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-integration-check", action="store_true",
+                    help="skip the integration_judge behavioral-defect gate "
+                         "(DESIGN §8 Independent adversarial verification) "
+                         "entirely: no worker spawn for any subtask in this "
+                         "run. Independent of the accept-integration/"
+                         "audit-key mechanism, which only accepts a finding "
+                         "the judge already produced. "
+                         f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
+                         "skip_integration_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -29883,6 +29935,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # and _run_final_conformance read it from there.
     args.skip_completeness_check = resolve_skip_completeness_check(
         repo_root, getattr(args, "skip_completeness_check", False))
+
+    # Resolve --skip-integration-check (the integration_judge behavioral-
+    # defect gate, DESIGN §8). Same precedence shape; _orchestrate() folds
+    # it into state.json under "skip_integration_check"; integrate_wave's
+    # `_run_integration_judge_gate` reads it from there on entry.
+    args.skip_integration_check = resolve_skip_integration_check(
+        repo_root, getattr(args, "skip_integration_check", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.
