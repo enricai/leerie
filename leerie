@@ -3051,8 +3051,11 @@ except Exception:
       fi
     fi
     # Detect --no-verify and --no-push from $@ for consistency with the
-    # normal post-run path.
-    NO_VERIFY_PUSH=false
+    # normal post-run path. Seed from any inherited environment value first
+    # (NO_VERIFY_PUSH=true is a documented host-finalize.sh escape hatch) —
+    # an unconditional reset here would clobber it before the argv scan ever
+    # runs.
+    NO_VERIFY_PUSH="${NO_VERIFY_PUSH:-false}"
     _FINALIZE_NO_PUSH=false
     for _a in "$@"; do
       [ "$_a" = "--no-verify" ] && NO_VERIFY_PUSH=true
@@ -4948,9 +4951,12 @@ fi
 # provision_machine registers the EXIT trap. The trap's clean-exit
 # branch calls host_finalize, which reads NO_VERIFY_PUSH; exporting it
 # late (after the trap fires) would make `--no-verify` silently
-# inoperative on the Fly path. CLI-only (no env/TOML mirror — matches
-# CLAUDE.md's explicit-user-request principle for hook-skipping).
-NO_VERIFY_PUSH=false
+# inoperative on the Fly path. CLI-only for --no-verify itself (no env/TOML
+# mirror — matches CLAUDE.md's explicit-user-request principle for
+# hook-skipping), but an inherited NO_VERIFY_PUSH env value
+# (host-finalize.sh's documented escape hatch) must survive the argv scan
+# rather than being unconditionally reset.
+NO_VERIFY_PUSH="${NO_VERIFY_PUSH:-false}"
 for arg in "$@"; do
   if [ "$arg" = "--no-verify" ]; then
     NO_VERIFY_PUSH=true
