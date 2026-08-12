@@ -8597,6 +8597,18 @@ def _unreachable_task_references(task: str) -> list[str]:
     tokens: list[str] = []
     for token in task.split():
         token = token.strip("\"'(),;:").strip("*_`")
+        # Sentence punctuation trailing a reference, stripped from the RIGHT
+        # only. A reference ending a sentence, or wrapped in backticks inside
+        # one, otherwise reaches the operator warning as "`~/plans/x.md`." —
+        # the mangled form they then go looking for. The two strips above
+        # cannot do it: they run in a fixed order, so the backtick in
+        # "`x.md`." is unreachable behind the period.
+        #
+        # rstrip, never strip: a LEADING dot is meaningful (`.env`,
+        # `.github/workflows/ci.yml`) and a leading `./` or `../` is a real
+        # relative path. Measured on the sibling `_parse_touched_file_line`
+        # defect, a two-sided strip mangled all three.
+        token = token.rstrip("`.,;:!?)]}\"'")
         if not token:
             continue
         if not any(c.isalnum() for c in token):
@@ -14364,13 +14376,25 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   active_token: str | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
-    `stdin_data`, when given, is fed to the child's stdin by a concurrent
-    feeder task and stdin is closed afterward — this is how `claude_p`
-    hands the worker its (potentially 100KB+) prompt without putting it
+    `stdin_data`, when given, is written to a temp file that becomes the
+    child's stdin — this is how `claude_p` hands the worker its
+    (potentially 100KB+) prompt without putting it
     on argv, where a single element over Linux's MAX_ARG_STRLEN (131,071
     bytes, not raisable) raises `OSError: [Errno 7] Argument list too
-    long` at exec time. When `stdin_data` is None (e.g. the smoke-test
-    caller, whose prompt is a fixed short string), stdin is closed
+    long` at exec time. A file rather than a pipe because the CLI waits a
+    hard-coded 3 s for its FIRST stdin byte (`r6r(process.stdin,3000)` in
+    the bundle, surfaced as "no stdin data received in 3s") and then drops
+    its own `data` listener, discarding a late write. A pipe makes that
+    deadline a race against the orchestrator's event loop; a file has the
+    first byte readable at exec, so there is no deadline to lose. Measured
+    A/B under synchronous bursts on the parent loop (the shape
+    `_read_stream` produces when parsing several workers' JSON at once):
+    pipe+feeder lost 20/20 prompts at both 400 ms and 900 ms bursts, file
+    lost 0/20, and file stayed at 0/20 under 10x CPU oversubscription
+    (load 97). Note raw CPU contention alone never reproduced it — 3x
+    oversubscription cost 0/40 on BOTH transports — so the mechanism is
+    loop-blocking, not a busy host. When `stdin_data` is None (e.g. the
+    smoke-test caller, whose prompt is a fixed short string), stdin is closed
     immediately via DEVNULL — unchanged from the prior behavior.
 
     The CLI is invoked with `--output-format stream-json --verbose`; each
@@ -14478,65 +14502,80 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         cap_mb = max(worker_memory_max_bytes // (1024 * 1024) - reserve_mb, 256)
         worker_env["NODE_OPTIONS"] = f"--max-old-space-size={cap_mb}"
 
-    # Defined BEFORE the spawn so it can be started as a task the instant
-    # `proc` exists — see the ordering comment at the `create_task` below.
-    # It closes over `proc` and `stdin_data` only, both of which are bound
-    # by the time the task first runs.
-    async def _feed_stdin():
-        # Writes `stdin_data` to the child's stdin, then closes it so the
-        # CLI sees EOF and starts processing rather than blocking for
-        # more input. Runs concurrently with `_read_stream`/`_drain_stderr`
-        # rather than write-then-await — the incident's live measurement
-        # showed a 150KB write completing at t=0.26s with the child's
-        # first stdout event at t=0.69s (write-then-read is safe on that
-        # CLI version), but a concurrent feeder costs nothing and removes
-        # the dependency on that ordering holding on future CLI versions.
-        # No-op (proc.stdin is None) when `stdin_data` is None — the
-        # DEVNULL branch below never gives the child a writable stdin.
-        if stdin_data is None or proc.stdin is None:
-            return
-        try:
-            proc.stdin.write(stdin_data.encode())
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            # The child closed its read end before consuming the whole
-            # payload (e.g. it exited early, or errored before reading
-            # stdin at all). That is a fact about the worker's exit, not
-            # this feeder's — `_read_stream`/`proc.wait()` already
-            # surface the worker's actual outcome, so swallow rather
-            # than let this coroutine's exception blow up the gather and
-            # mask that outcome.
-            #
-            # NOTE this swallow is why the stdin-starvation failure below
-            # left no leerie-side trace: the worker's own stderr said what
-            # happened, but leerie's causal role in it did not.
-            pass
-        finally:
-            proc.stdin.close()
+    # The prompt is staged to a temp file BEFORE the spawn, and that file —
+    # already positioned at byte 0 with the whole payload on disk — becomes
+    # the child's stdin. The CLI's 3 s first-byte deadline is therefore
+    # satisfied by construction: there is no writer left to be scheduled
+    # late, because there is no writer at all. This replaces a concurrent
+    # feeder task, which made delivery a race against the orchestrator's
+    # event loop and lost that race 20/20 times under 400 ms loop bursts
+    # (see this function's docstring for the full A/B).
+    #
+    # Closed and unlinked in the `finally` below, on every exit path, the
+    # same lifecycle `_append_system_prompt_file_supported`'s temp file
+    # already uses. Created per `_invoke` call, so `claude_p`'s 2-attempt
+    # retry — which appends a retry note to `stdin_data` — gets a fresh
+    # file for the second attempt rather than replaying the first payload.
+    stdin_file = None
+    stdin_path = None
+    if stdin_data is not None:
+        import tempfile  # noqa: PLC0415
+        stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-")
+        # fdopen rather than a bare os.write: os.write returns a count and
+        # is permitted to short-write, so writing a 150KB prompt with it
+        # would deliver a TRUNCATED payload on the day it ever did — the
+        # worker would then run on a silently incomplete prompt instead of
+        # failing visibly, which is strictly worse than the bug this
+        # transport replaced. The buffered writer loops internally.
+        with os.fdopen(stdin_fd, "wb") as staged:
+            staged.write(stdin_data.encode())
+        # Opened for reading and handed to the child as its stdin. The
+        # child inherits a dup of this descriptor, so closing ours in the
+        # `finally` does not disturb a still-running worker.
+        stdin_file = open(stdin_path, "rb")
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        # stdin=PIPE when the caller has a prompt to feed (the normal
-        # `claude_p` path — the user prompt no longer travels on argv,
-        # see `build()`'s comment); DEVNULL otherwise. Either way the
-        # worker never inherits the orchestrator's stdin, which inside a
-        # `nerdctl run -it` container is /dev/pts/0 — a real TTY. A CLI
-        # that branches on isatty() (e.g. to prompt for permission)
-        # would hang invisibly waiting for input that never arrives.
-        # The PIPE is fed by `_feed_stdin` below and closed once the
-        # write completes, so it is just as terminal-free as DEVNULL —
-        # the worker still never sees a live TTY.
-        stdin=(asyncio.subprocess.PIPE if stdin_data is not None
-               else asyncio.subprocess.DEVNULL),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=10 * 1024 * 1024,
-        # Session/PG leader so `_terminate_proc_tree` can reap the tool-call
-        # grandchildren `claude -p` spawns (vitest, dev servers, etc.).
-        start_new_session=True,
-        env=worker_env,
-    )
+    # The spawn is guarded because the staged file is created BEFORE the
+    # try/finally that normally reaps it, and `create_subprocess_exec` is a
+    # fork: under the `pids.max` exhaustion this codebase already handles
+    # elsewhere it raises, and every retry would then strand another
+    # ~150KB file. Disk exhaustion is not hypothetical here either — it has
+    # killed runs (hence the `_disk_free_ratio` preflight) — so a leak on
+    # the failure path feeds the very condition that produced the failure.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            # The staged prompt file when the caller has a prompt to feed (the
+            # normal `claude_p` path — the user prompt no longer travels on
+            # argv, see `build()`'s comment); DEVNULL otherwise. Either way the
+            # worker never inherits the orchestrator's stdin, which inside a
+            # `nerdctl run -it` container is /dev/pts/0 — a real TTY. A CLI
+            # that branches on isatty() (e.g. to prompt for permission)
+            # would hang invisibly waiting for input that never arrives.
+            # A regular file is not a TTY either, and it reaches EOF on its own
+            # once read, so the CLI still sees the end-of-input it needs to
+            # start processing — the close the old feeder had to perform.
+            stdin=(stdin_file if stdin_file is not None
+                   else asyncio.subprocess.DEVNULL),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=10 * 1024 * 1024,
+            # Session/PG leader so `_terminate_proc_tree` can reap the
+            # tool-call grandchildren `claude -p` spawns (vitest, dev
+            # servers, etc.).
+            start_new_session=True,
+            env=worker_env,
+        )
+    except BaseException:
+        # Reap the staged file, then let the original failure propagate
+        # unchanged — this must not mask why the spawn failed.
+        if stdin_file is not None:
+            with contextlib.suppress(OSError):
+                stdin_file.close()
+        if stdin_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(stdin_path)
+        raise
     # Spawn heartbeat: surfaces *that* the worker was launched before the
     # await blocks on its first event. Without this line, the user sees
     # the phase header and then silence until the first stream-json event
@@ -14549,41 +14588,38 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # operational chatter and stays gated.
     if verbosity != "quiet":
         log(f"  [{sid}] spawned (pid={proc.pid})")
-    # Start feeding the prompt IMMEDIATELY — before the broker round-trips
-    # below. The CLI waits a hard-coded 3 s for its first stdin byte
-    # (`KJr(process.stdin, 3000)` in the bundle), then removes its own
-    # `data` listener and proceeds without it, so a late write is DISCARDED
-    # and the worker dies with "Input must be provided either through stdin
-    # or as a prompt argument". Measured across every run on one host: 218
-    # workers lost this way, 12.4% of all invocations in the affected runs,
-    # retried up to 4x each and every attempt charged to `max_total_workers`.
+    # The prompt is ALREADY on the child's stdin at this point — it was
+    # staged to a file before the spawn, so nothing below can delay its
+    # delivery. That ordering used to be load-bearing and fragile: the CLI
+    # waits a hard-coded 3 s for its first stdin byte
+    # (`r6r(process.stdin,3000)` in the bundle, surfaced as "no stdin data
+    # received in 3s"), then removes its own `data` listener and proceeds
+    # without it, so a late write was DISCARDED and the worker died with
+    # "Input must be provided either through stdin or as a prompt
+    # argument". Measured across every run on one host: 218 workers lost
+    # that way, 12.4% of all invocations in the affected runs, retried up
+    # to 4x each and every attempt charged to `max_total_workers`.
     #
-    # Both halves of this fix are load-bearing and each was verified alone
-    # against a reproduction harness. Creating the task here but leaving the
-    # broker calls synchronous still fails (the blocked loop never schedules
-    # it); making the broker calls async but creating the task afterwards
-    # also still fails (the write lands after the child is already gone).
-    #
-    # This task is created OUTSIDE the try/finally below, so an exception
-    # before the gather would leave it pending with stdin unclosed. Accepted
-    # rather than guarded: everything between here and that try is either a
-    # plain assignment or a call whose helper swallows OSError itself
-    # (`_cgroup_create` / `_cgroup_enroll`), and `_DescendantTracker.start`
-    # is a bare `create_task`. More to the point, `proc` is spawned outside
-    # that try too — so any exception in this window already leaks a live
-    # worker process, which is strictly worse than a pending feeder and is
-    # the pre-existing shape this does not change.
-    feeder = asyncio.create_task(_feed_stdin())
+    # A concurrent feeder task (the previous fix) narrowed that window but
+    # could not close it: delivery still depended on the event loop
+    # scheduling the task within 3 s, and under bursts of synchronous work
+    # on the loop it lost 20/20 prompts. A file has no such dependency, so
+    # the broker round-trips below — and anything else that blocks the loop
+    # — are no longer able to starve a worker of its prompt.
     # cgroup containment: ask the cgroup broker to create the worker cgroup
     # and enroll the worker (and every descendant it forks — the kernel
     # propagates cgroup membership down the process tree). Dispatched via
     # `asyncio.to_thread` because they are synchronous socket round-trips:
-    # run inline they block the WHOLE event loop, including every sibling
-    # worker's feeder, for up to `_cgroup_request`'s 5 s timeout apiece.
-    # That bound is larger than the CLI's 3 s stdin patience, so the old
-    # inline form permitted the starvation above BY CONSTRUCTION — the
-    # comment that used to sit here called the stall "negligible", which is
-    # the assumption the incident falsified. No deadlock is possible either
+    # run inline they block the WHOLE event loop for up to
+    # `_cgroup_request`'s 5 s timeout apiece. The stdin deadline no longer
+    # depends on that (the prompt is already on disk), but every other
+    # coroutine still does — a sibling worker's `_read_stream`, the
+    # watchdog, `proc.wait()` — so keeping these off the loop remains
+    # correct. Historically this block was the direct cause of the stdin
+    # starvation: its 5 s bound is larger than the CLI's 3 s patience, so
+    # the old inline form permitted the failure BY CONSTRUCTION, and the
+    # comment that used to sit here called the stall "negligible" — the
+    # assumption the incident falsified. No deadlock is possible either
     # way (the broker never calls back into leerie).
     # `destroy` is the same shape and IS dispatched via to_thread in the
     # finally below — it blocks for the broker's whole drain (seconds, not
@@ -14950,12 +14986,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         _ASYNCIO_MANAGED_PIDS.add(proc.pid)
         try:
             await asyncio.wait_for(
-                # `feeder` is the task started right after the spawn, NOT a
-                # fresh `_feed_stdin()` call — awaiting it here is what keeps
-                # its exceptions surfaced and its lifetime bounded by the
-                # same timeout as the rest.
+                # No stdin task to await: the prompt was staged to a file
+                # before the spawn, so there is nothing left to deliver by
+                # the time this gather runs.
                 asyncio.gather(_read_stream(), _drain_stderr(),
-                               feeder, proc.wait()),
+                               proc.wait()),
                 timeout=timeout)
         except asyncio.TimeoutError:
             # Cancel the watchdog BEFORE the termination awaits so it
@@ -15038,6 +15073,20 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # cancellable, but the worker thread completes the round-trip
         # regardless, so the broker still receives the destroy.
         await asyncio.to_thread(_cgroup_destroy, cgroup_sid)
+
+        # Drop the staged prompt file. The child holds its own dup of the
+        # descriptor, so this neither disturbs a still-running worker nor
+        # leaves the payload on disk after one exits. Best-effort for the
+        # same reason every other teardown step here is: a cleanup failure
+        # must not mask the worker's real outcome.
+        if stdin_file is not None:
+            try:
+                stdin_file.close()
+            except OSError:
+                pass
+        if stdin_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(stdin_path)
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()

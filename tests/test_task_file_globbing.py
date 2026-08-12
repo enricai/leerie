@@ -172,3 +172,41 @@ class TestUnreachableTaskReferences:
         monkeypatch.setenv("HOME", str(home))
         assert leerie._unreachable_task_references(
             "see ~/plan.md for details") == []
+
+    # --- the reference must come back CLEAN (N33) ------------------------
+    #
+    # It is rendered straight into an operator warning, so trailing sentence
+    # punctuation makes them go looking for a path that was never written.
+    # Same class as `_parse_touched_file_line`'s `None.` defect: punctuation
+    # the tokenizer never stripped.
+
+    def test_reference_ending_a_sentence_has_no_trailing_period(self):
+        assert leerie._unreachable_task_references(
+            "See /etc/nonexistent-leerie-thing.conf.") == [
+                "/etc/nonexistent-leerie-thing.conf"]
+
+    def test_backticked_reference_keeps_no_backtick_or_period(self):
+        """The incident's exact shape: a backticked path ending a sentence.
+        The two pre-existing strips run in a fixed order, so the backtick is
+        unreachable behind the period unless it is rstripped."""
+        assert leerie._unreachable_task_references(
+            "Specs live in `~/.claude/plans/so-we-have-to-giggly-gray.md`."
+        ) == ["~/.claude/plans/so-we-have-to-giggly-gray.md"]
+
+    def test_parenthesised_reference_is_clean(self):
+        assert leerie._unreachable_task_references(
+            "(see ~/.claude/plans/nope-not-here.md)") == [
+                "~/.claude/plans/nope-not-here.md"]
+
+    def test_a_leading_dot_is_never_stripped(self, tmp_path, monkeypatch):
+        """rstrip, never strip. `.env`, `.github/...`, `./x` and `../x` are
+        all real paths whose LEADING dot is meaningful -- a two-sided strip
+        mangles every one of them, measured on the sibling defect.
+
+        Driven through an absolute path so the token actually reaches the
+        collector (only `/`- and `~`-prefixed tokens do), which is what makes
+        this observable rather than vacuous.
+        """
+        assert leerie._unreachable_task_references(
+            "check /nonexistent-leerie-root/.github/workflows/ci.yml.") == [
+                "/nonexistent-leerie-root/.github/workflows/ci.yml"]

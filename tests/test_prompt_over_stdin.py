@@ -11,13 +11,17 @@ Covers:
   - `build()` never puts the user prompt on argv, at any payload size
     (the argv-length property: no element can exceed MAX_ARG_STRLEN
     for a 150KB+ payload, because none of them carry it at all).
-  - `_invoke` spawns with `stdin=PIPE` (not DEVNULL) when `stdin_data`
-    is given, and DEVNULL when it is not (smoke-test / direct-cmd
-    callers unaffected).
-  - The concurrent stdin feeder delivers the full payload to a REAL
-    child process over a REAL OS pipe with no deadlock, for a payload
-    well over the 131,071-byte single-argv ceiling this fix exists to
-    route around.
+  - `_invoke` spawns with an already-readable temp FILE as stdin when
+    `stdin_data` is given, and DEVNULL when it is not (smoke-test /
+    direct-cmd callers unaffected). A file rather than a pipe because the
+    CLI drops its stdin listener 3 s after spawn, which made a pipe a race
+    against the orchestrator's event loop — measured 20/20 prompts lost
+    under 400 ms bursts of synchronous work on that loop, 0/20 with a file
+    (and 0/20 for a file at 10x CPU oversubscription). The file is staged
+    before the spawn and unlinked after the call.
+  - The full payload reaches a REAL child process with no deadlock, for a
+    payload well over the 131,071-byte single-argv ceiling this fix exists
+    to route around.
   - `claude_p` end-to-end (via a stubbed `_invoke`) sends a 150KB+
     prompt through as `stdin_data`, not as part of `cmd`.
   - The reconciler's size-gate retry prompt (`_build_size_retry_prompt`,
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 import pytest
@@ -271,25 +276,46 @@ def leerie_dir(tmp_path):
     return cd
 
 
-def test_invoke_uses_pipe_when_stdin_data_given(leerie, leerie_dir,
-                                                monkeypatch):
+def test_invoke_passes_a_readable_file_when_stdin_data_given(
+        leerie, leerie_dir, monkeypatch):
+    """The prompt must reach the child as an ALREADY-READABLE file, not a
+    pipe someone still has to write to.
+
+    The CLI drops its stdin listener 3 s after spawn
+    (`r6r(process.stdin,3000)`), so a pipe makes delivery a race against
+    the orchestrator's event loop — measured 20/20 prompts lost under
+    400 ms bursts of synchronous work on that loop. A regular file has the
+    payload on disk before the child exists, so there is no writer left to
+    schedule late and no deadline to lose.
+    """
     captured: dict = {}
 
     async def fake(*cmd, **kwargs):
-        captured.update(kwargs)
+        handed = kwargs.get("stdin")
+        captured["is_pipe"] = handed is asyncio.subprocess.PIPE
+        captured["readable"] = hasattr(handed, "read")
+        # Read it HERE, at spawn time. The payload must already be on disk
+        # and positioned at byte 0 — that is the whole guarantee, and it is
+        # only observable before `_invoke`'s cleanup closes the file.
+        if captured["readable"]:
+            handed.seek(0)
+            captured["content"] = handed.read()
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        return _MockProc(events, with_stdin=True)
+        return _MockProc(events, with_stdin=False)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    payload = "hello prompt"
     asyncio.run(leerie._invoke(
         ["claude", "-p"], cwd=str(leerie_dir.parent),
-        timeout=60, sid="t-pipe", leerie_dir=leerie_dir,
-        verbosity="quiet", stdin_data="hello prompt"))
+        timeout=60, sid="t-file", leerie_dir=leerie_dir,
+        verbosity="quiet", stdin_data=payload))
 
-    assert captured.get("stdin") == asyncio.subprocess.PIPE, (
-        "_invoke must pass stdin=PIPE when stdin_data is given, so the "
-        "feeder can write the prompt to the child")
+    assert not captured["is_pipe"], (
+        "_invoke must NOT hand the child a pipe — that reintroduces the "
+        "race the file transport exists to remove")
+    assert captured["readable"], "expected a readable file object as stdin"
+    assert captured["content"] == payload.encode()
 
 
 def test_invoke_still_uses_devnull_when_no_stdin_data(leerie, leerie_dir,
@@ -313,19 +339,25 @@ def test_invoke_still_uses_devnull_when_no_stdin_data(leerie, leerie_dir,
     assert captured.get("stdin") == asyncio.subprocess.DEVNULL
 
 
-def test_feeder_writes_full_payload_and_closes_stdin(leerie, leerie_dir,
-                                                      monkeypatch):
-    """The concurrent feeder writes the entire stdin_data payload and
-    closes the pipe afterward (EOF), so the child sees a complete,
-    terminated stream — not a hang waiting for more input."""
-    proc_holder: dict = {}
+def test_full_payload_is_on_disk_before_the_child_exists(
+        leerie, leerie_dir, monkeypatch):
+    """The ENTIRE payload must be readable at the moment of spawn.
+
+    A partial write would recreate the failure in a subtler form: the CLI
+    starts on an incomplete prompt instead of dying visibly. Asserting at
+    spawn time (inside the fake, before `_invoke` proceeds) is the point —
+    checking afterwards cannot distinguish "written before exec" from
+    "written during the run", which is the whole distinction here.
+    """
+    seen: dict = {}
 
     async def fake(*cmd, **kwargs):
+        handed = kwargs.get("stdin")
+        handed.seek(0)
+        seen["at_spawn"] = handed.read()
         events = [json.dumps({"type": "result", "subtype": "success",
                               "is_error": False})]
-        proc = _MockProc(events, with_stdin=True)
-        proc_holder["proc"] = proc
-        return proc
+        return _MockProc(events, with_stdin=False)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     payload = "p" * 150_063  # the incident's exact overflow size
@@ -334,9 +366,28 @@ def test_feeder_writes_full_payload_and_closes_stdin(leerie, leerie_dir,
         timeout=60, sid="t-feed", leerie_dir=leerie_dir,
         verbosity="quiet", stdin_data=payload))
 
-    proc = proc_holder["proc"]
-    assert proc.stdin.written == payload.encode()
-    assert proc.stdin.closed is True
+    assert seen["at_spawn"] == payload.encode()
+
+
+def test_prompt_file_is_cleaned_up(leerie, leerie_dir, monkeypatch):
+    """The staged file must not outlive the call — a leak here would
+    accumulate one 100KB+ file per worker invocation across a run."""
+    paths: list = []
+
+    async def fake(*cmd, **kwargs):
+        paths.append(kwargs["stdin"].name)
+        events = [json.dumps({"type": "result", "subtype": "success",
+                              "is_error": False})]
+        return _MockProc(events, with_stdin=False)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-clean", leerie_dir=leerie_dir,
+        verbosity="quiet", stdin_data="hello"))
+
+    assert paths and not os.path.exists(paths[0]), (
+        f"staged prompt file {paths[0]} survived the call")
 
 
 # ---------------------------------------------------------------------------
@@ -378,3 +429,34 @@ def test_real_subprocess_150kb_stdin_no_deadlock(leerie, leerie_dir):
     assert envelope["type"] == "result"
     assert envelope["is_error"] is False
     assert envelope["structured_output"]["nbytes"] == len(payload.encode())
+
+
+def test_no_staged_file_leaks_when_the_spawn_fails(leerie, leerie_dir,
+                                                    monkeypatch):
+    """A failed spawn must not strand the staged prompt.
+
+    The file is created BEFORE the try/finally that normally reaps it, and
+    `create_subprocess_exec` is a fork — under the `pids.max` exhaustion
+    this codebase handles elsewhere it raises EAGAIN, and every retry would
+    strand another ~150KB file. Disk exhaustion has killed runs here (hence
+    the `_disk_free_ratio` preflight), so leaking on the failure path feeds
+    the very condition that produced the failure.
+    """
+    import glob
+    import tempfile
+
+    pattern = os.path.join(tempfile.gettempdir(), "leerie-prompt-*")
+    before = set(glob.glob(pattern))
+
+    async def boom(*cmd, **kwargs):
+        raise OSError(11, "Resource temporarily unavailable")  # EAGAIN
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    with pytest.raises(OSError):
+        asyncio.run(leerie._invoke(
+            ["claude", "-p"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="t-leak", leerie_dir=leerie_dir,
+            verbosity="quiet", stdin_data="x" * 150_000))
+
+    assert not (set(glob.glob(pattern)) - before), (
+        "a failed spawn stranded its staged prompt file")

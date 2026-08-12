@@ -1605,10 +1605,12 @@ PY
     _ab_run_id=""
     _ab_sid=""
     _ab_runtime=""
+    _ab_force=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --runtime) _ab_runtime="${2:-}"; shift 2 ;;
         --runtime=*) _ab_runtime="${1#--runtime=}"; shift ;;
+        --force) _ab_force="--force"; shift ;;
         --*) remote_log "unknown accept-blocked flag: $1"; exit 1 ;;
         *)
           if [ -z "$_ab_run_id" ]; then _ab_run_id="$1"; shift
@@ -1658,14 +1660,15 @@ PY
     fi
     _ab_state_file="$_ab_state_dir/state.json"
     # Python program that validates and atomically mutates state.json.
-    # Reads (state_path, sid) from argv. Prints exactly one sentinel line
-    # prefixed ACCEPTED: / NOOP: / ERROR: so callers (esp. the Fly path,
+    # Reads (state_path, sid, force) from argv. Prints exactly one sentinel
+    # line prefixed ACCEPTED: / NOOP: / ERROR: so callers (esp. the Fly path,
     # which pipes this over `flyctl ssh console -C "python3 -"` and cannot
     # rely on the process exit code surviving flyctl's rc-flattening) can
     # grep the outcome. Exit code is still set for the local path.
     _ab_mutate='
 import json, os, sys, tempfile
 path, sid = sys.argv[1], sys.argv[2]
+force = len(sys.argv) > 3 and sys.argv[3] == "--force"
 try:
     with open(path) as f:
         st = json.load(f)
@@ -1674,15 +1677,32 @@ except FileNotFoundError:
     sys.exit(1)
 ss = st.get("subtask_status", {})
 cur = ss.get(sid)
-if cur is None:
+# The blocked registry is resolved FIRST, because it — not subtask_status —
+# is the authoritative record of a blocked subtask, and the two can disagree
+# by ABSENCE as well as by value. Measured across the run corpus, the single
+# real disagreement was exactly that shape: a subtask present in `blocked`
+# with no subtask_status entry at all (its checkpoint was rejected before a
+# status was ever written). Resolving the registry after a `cur is None`
+# early-exit made that case unacceptable — the one case that actually
+# occurred — while accepting only the value-mismatch case, which never did.
+bl = st.get("blocked", {})
+in_registry = isinstance(bl, dict) and sid in bl
+# --force settles a subtask abandoned mid-flight: `in_progress` with no
+# registry entry, which is what a hard crash (ENOSPC, SIGKILL) leaves behind
+# and which neither field can express as "blocked". Validated against the
+# scheduled sid set, so a typo cannot mint a bogus status entry.
+if force:
+    known = {s for wave in (st.get("waves") or []) for s in wave}
+    if known and sid not in known:
+        print(f"ERROR: subtask {sid!r} is not in the plan for this run", file=sys.stderr)
+        sys.exit(1)
+if cur is None and not (in_registry or force):
     print(f"ERROR: subtask {sid!r} not found in subtask_status", file=sys.stderr)
     sys.exit(1)
 if cur == "complete":
     print(f"NOOP: subtask {sid!r} is already complete")
     sys.exit(0)
-bl = st.get("blocked", {})
-in_registry = isinstance(bl, dict) and sid in bl
-if not in_registry and cur not in ("blocked", "failed"):
+if not force and not in_registry and cur not in ("blocked", "failed"):
     print(f"ERROR: subtask {sid!r} has status {cur!r} (expected blocked or failed)", file=sys.stderr)
     sys.exit(1)
 ss[sid] = "complete"
@@ -1753,7 +1773,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       }
       _ab_remote_state="/work/.leerie/runs/$_ab_run_id/state.json"
       _ab_out="$(printf '%s' "$_ab_mutate" \
-        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ab_remote_state' '$_ab_sid'" 2>&1 || true)"
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
       _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
@@ -1771,7 +1791,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # consistent (best-effort; host copy is optional — EC2 state.json
       # normally lives only on the instance until fetch-back).
       if [ -f "$_ab_state_file" ]; then
-        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
+        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
       fi
       _ab_teardown_ec2
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
@@ -1858,7 +1878,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # flattens the remote exit code.
       _ab_out="$(printf '%s' "$_ab_mutate" \
         | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-            --pty=false -C "python3 - '$_ab_remote_state' '$_ab_sid'" 2>&1 || true)"
+            --pty=false -C "python3 - '$_ab_remote_state' '$_ab_sid' $_ab_force" 2>&1 || true)"
       _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
                       | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
       case "$_ab_sentinel" in
@@ -1875,7 +1895,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       # Mirror the mutation onto the host copy so list / audits stay
       # consistent (best-effort; host copy is optional).
       if [ -f "$_ab_state_file" ]; then
-        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
+        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force >/dev/null 2>&1 || true
       fi
       _ab_teardown
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
@@ -1885,7 +1905,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         remote_log "accept-blocked: no state.json at $_ab_state_file"
         exit 1
       fi
-      python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid"
+      python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" $_ab_force
       remote_log "accept-blocked: done. Resume via: leerie resume $_ab_run_id"
     fi
     exit 0

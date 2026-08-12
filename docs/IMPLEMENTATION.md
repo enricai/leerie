@@ -3816,10 +3816,15 @@ negative case, which is truthy and would otherwise reach
 `build()` emits `["claude", "-p", ...]` with **no positional argument
 after `-p`** — the user prompt (task + subtask_views + any retry note)
 is fed to the child's stdin instead, via `_invoke()`'s `stdin_data`
-param and a concurrent `_feed_stdin` task that writes the payload and
-closes stdin so the CLI sees EOF. `_invoke()` passes `stdin=PIPE` when
-`stdin_data` is given and `stdin=DEVNULL` otherwise (callers with no
-prompt to feed, e.g. the preflight smoke test, are unaffected).
+param. `_invoke()` writes that payload to a temp file **before** the
+spawn and hands the child that file as its stdin; the file reaches EOF
+on its own once read, which is the end-of-input the CLI needs to start
+processing. `stdin=DEVNULL` otherwise (callers with no prompt to feed,
+e.g. the preflight smoke test, are unaffected). The file is closed and
+unlinked from `_invoke`'s `finally`, so a timed-out or crashed worker
+cannot leak it, and it is created per call — so `claude_p`'s 2-attempt
+retry, which appends a retry note, stages a fresh file rather than
+replaying the first payload.
 
 This exists because a single argv element cannot exceed Linux's
 `MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`, not raisable) —
@@ -3831,13 +3836,16 @@ over stdin with no error, so it must be absent, not merely supplemented.
 Pinned by `tests/test_prompt_over_stdin.py`: the argv-length property (no
 `build()`-constructed argv element exceeds `MAX_ARG_STRLEN` for a 150KB+
 prompt), the absent positional, the retry path routing `retry_note`
-through stdin too, `_invoke`'s PIPE-vs-DEVNULL branch, and a real
-subprocess/real-pipe round trip for a 150,063-byte payload proving no
-deadlock between the concurrent feeder and the stdout/stderr readers.
+through stdin too, `_invoke`'s file-vs-DEVNULL branch, the whole payload
+being readable *at spawn time* (asserted inside the spawn, since checking
+afterwards cannot distinguish "written before exec" from "written during
+the run"), the staged file being unlinked, and a real subprocess round
+trip for a 150,063-byte payload proving no deadlock with the
+stdout/stderr readers.
 
-**The feeder must be queued before anything can block the event loop, and
-nothing on that path may block it.** `claude -p` waits a hard-coded **3 s**
-for its first stdin byte (`KJr(process.stdin, 3000)` in the CLI bundle; no
+**The prompt must be readable at `exec`, not delivered afterwards.**
+`claude -p` waits a hard-coded **3 s**
+for its first stdin byte (`r6r(process.stdin,3000)` in the CLI bundle; no
 env var), then removes its own `data` listener and proceeds without it — a
 late write is **discarded**, not buffered, and the worker exits 1 with
 `Input must be provided either through stdin or as a prompt argument`.
@@ -3848,11 +3856,28 @@ larger than the deadline in front of it, so the failure was permitted by
 construction. Measured before the fix: **218 workers lost this way, 12.4% of
 all invocations in the affected runs**, retried up to 4× each with every
 attempt charged to `max_total_workers`, on versions 0.9.95 through 0.16.0.
-`asyncio.create_task(_feed_stdin())` now runs immediately after the spawn
-and both broker calls go through `asyncio.to_thread` (matching
-`_cgroup_destroy`, which already did). **Both halves are required** — with
-either alone the prompt still misses the deadline, verified against a
-reproduction harness and pinned in `tests/test_stdin_feeder_ordering.py`.
+
+A first fix hoisted the write into `asyncio.create_task(_feed_stdin())`
+immediately after the spawn and moved both broker calls to
+`asyncio.to_thread`. That **narrowed the window without closing it**:
+delivery still depended on the event loop *scheduling* the feeder within
+3 s, and 0.17.0 lost 5 subtasks in one run to exactly that. Measured A/B,
+identical parent, only the transport varying, with synchronous bursts on
+the parent loop (the shape `_read_stream` produces when parsing several
+workers' JSON at once): **pipe+feeder lost 20/20 prompts at both 400 ms
+and 900 ms bursts; a staged file lost 0/20**, and 0/20 again under 10×
+CPU oversubscription (load 97). Raw CPU contention alone never reproduced
+it — 96 hogs on 32 cores cost 0/40 on *both* transports — so the mechanism
+is loop-blocking, not a busy host.
+
+The transport is therefore a **file**, which has no writer to schedule and
+so no deadline to lose. The broker calls stay on `asyncio.to_thread`
+regardless: stdin no longer depends on it, but every other coroutine still
+does. Pinned in `tests/test_stdin_feeder_ordering.py`, which asserts the
+property negatively — no writer task, no `proc.stdin.write`, stdin never a
+PIPE — because that is the form a regression takes, plus a behavioural pair
+showing a pipe losing and a file winning against a real child under a
+blocked loop.
 
 #### Appended system prompt transport — file, with a probe + inline fallback
 
@@ -5413,7 +5438,7 @@ DESIGN.md §8 for the full rationale and the incident this replaced).
 | `_is_same_document(path, text_len, text)` | True when `path` holds exactly `text` modulo surrounding whitespace. Keeps a task file out of its own reference list: the planner already has the task verbatim, so listing the file asks it to re-read content it holds — ~71K tokens of duplication on the measured incident (185,565 B at the measured 2.6 B/token). `resolve_task_argument` returns stripped contents and discards the path, so identity is re-established by content rather than by threading the path through every caller. A size pre-check (±8 bytes) means only a same-length candidate is ever opened; `text_len` is the task's encoded length, passed in rather than recomputed because this runs once per candidate and the task can be hundreds of KB. |
 | `_repo_rel(path, repo_root)` | Repo-relative string for a path, falling back to its basename when it resolves outside the repo. Pure path arithmetic. |
 | `_format_task_file_references(files, repo_root)` | Names the files the task references so the planner reads them itself. A list of paths and nothing else — it must not open them. `None` when the task names no files. |
-| `_unreachable_task_references(task)` | Advisory sibling of `_glob_task_references` — never touches its return value or candidate filtering. Scans the same de-emphasized, `has_ext`-or-`has_sep`-and-alnum-filtered tokens, but flags only tokens starting with `/` or `~` (absolute paths and home-relative references, both of which `_glob_task_references` silently drops as candidates — pathlib never expands `~`, so a `~`-prefixed token never even reaches that guard) that resolve to zero files. `phase_plan` logs a single warning line when non-empty; the check never gates. |
+| `_unreachable_task_references(task)` | Advisory sibling of `_glob_task_references` — never touches its return value or candidate filtering. Scans the same de-emphasized, `has_ext`-or-`has_sep`-and-alnum-filtered tokens, but flags only tokens starting with `/` or `~` (absolute paths and home-relative references, both of which `_glob_task_references` silently drops as candidates — pathlib never expands `~`, so a `~`-prefixed token never even reaches that guard) that resolve to zero files. Trailing sentence punctuation is `rstrip`ped (`` ` ``, `.`, `,`, `;`, `:`, `!`, `?`, `)`, `]`, `}`, quotes) so a reference ending a sentence, or backticked inside one, does not reach the operator as ``​`~/plans/x.md`.`` — the mangled form they would then go looking for. The two pre-existing `strip` calls cannot do it: they run in a fixed order, leaving the backtick in `` `x.md`. `` unreachable behind the period. **`rstrip`, never `strip`** — a LEADING dot is meaningful (`.env`, `.github/workflows/ci.yml`) and a leading `./`/`../` is a real relative path; a two-sided strip mangles all three, measured on the sibling `_parse_touched_file_line` defect. `phase_plan` logs a single warning line when non-empty; the check never gates. |
 
 **Freeze guard (2026-07-19 incident, root cause A) — resolved by deletion.**
 A single incidental dotted token (e.g. `CLAUDE.md` mentioned once in a
@@ -7929,12 +7954,32 @@ blocks again indefinitely. The `accept-blocked` verb lets the
 operator acknowledge the external block so `resume` skips that
 subtask.
 
-- **`leerie accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2]`**
+- **`leerie accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2] [--force]`**
   — sets `subtask_status[sid]` to `"complete"` in state.json and removes
   the sid from the `blocked` dict (if present). On `resume`,
   `phase_execute`'s wave-skip filters subtasks whose `subtask_status` is
-  `"complete"`, so the accepted subtask never re-dispatches. Without an
-  explicit `--runtime`, the verb auto-detects via the shared
+  `"complete"`, so the accepted subtask never re-dispatches.
+
+  The gate resolves the `blocked` registry **before** testing
+  `subtask_status`, because that registry — not the status string — is the
+  authoritative record, and the two disagree by **absence** as well as by
+  value. Measured across the run corpus, the single real disagreement was
+  precisely the absent-key shape: a sid in `blocked` with no
+  `subtask_status` entry at all, because its checkpoint was rejected before
+  a status was written. Resolving the registry after a `cur is None`
+  early-exit made that one real case unacceptable while admitting only the
+  value-mismatch case, which never occurred.
+
+  `--force` settles a subtask abandoned **mid-flight** — `in_progress` with
+  no registry entry, what a hard crash (ENOSPC, SIGKILL) leaves behind and
+  which neither field can express as blocked. It bypasses both status
+  checks, so it validates the sid against the scheduled set (`waves`) to
+  stop a typo minting a bogus `subtask_status` entry. The default stays
+  strict, keeping `--force` a deliberate operator act. Pinned in
+  `tests/test_accept_blocked.py` (absent-key accepted, neither-field still
+  refused, forced-abandoned accepted, forced-typo refused).
+
+  Without an explicit `--runtime`, the verb auto-detects via the shared
   `_auto_detect_run_runtime` helper (which probes `fly-machine.json`
   then `ec2-instance.json` — the same sidecar-probe order `stop`
   uses), falling back to `local` only when neither sidecar is present.
