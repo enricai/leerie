@@ -13,13 +13,9 @@ A healthy disk is a no-op at both checkpoints.
 """
 import asyncio
 import shutil
-import os
-import shutil
 import sys
 from pathlib import Path
 from unittest import mock
-
-import os
 
 import pytest
 
@@ -208,6 +204,69 @@ class TestMainHandlesDiskLowSpace:
         arm = self._arm()
         assert "st.save()" in arm
 
+    def test_survives_a_save_that_is_still_failing(self):
+        """The save-origin path must SURVIVE this arm, not merely reach it.
+
+        This replaces a test that asserted only
+        `issubclass(DiskLowSpace, BaseException)` — already asserted at the
+        top of this file — and concluded from it that "no separate
+        save()-specific handler is required". That inference is what let the
+        defect ship: reaching the arm was never in doubt; surviving it was.
+
+        `State.save()` converts ENOSPC into DiskLowSpace, so on that path the
+        disk is at zero and the arm's own `st.save()` re-enters the call that
+        just failed, raising DiskLowSpace a SECOND time from inside the
+        handler. A sibling `except` of the same `try` does not see an
+        exception raised in another arm's body, so it escapes `main()`,
+        skipping the cleanup, the dep capture and the EXIT_LOCKED assignment
+        — an exit-1 traceback instead of a resumable pause.
+
+        Two properties, both checkable in the source: every `st.save()` in
+        this arm is guarded against DiskLowSpace, and `exit_code` is assigned
+        before the first of them, so nothing below it can cost the run its
+        disposition.
+        """
+        import ast
+        import textwrap
+        tree = ast.parse(textwrap.dedent(self._arm()))
+
+        def saves_in(node) -> list[ast.Call]:
+            return [n for n in ast.walk(node)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "save"]
+
+        all_saves = saves_in(tree)
+        assert all_saves, "the arm no longer saves at all"
+
+        guarded: list[ast.Call] = []
+        for t in [n for n in ast.walk(tree) if isinstance(n, ast.Try)]:
+            catches = {
+                nm.id
+                for h in t.handlers if h.type is not None
+                for nm in ast.walk(h.type) if isinstance(nm, ast.Name)
+            }
+            if "DiskLowSpace" in catches:
+                for stmt in t.body:
+                    guarded += saves_in(stmt)
+
+        assert len(guarded) == len(all_saves), (
+            f"{len(all_saves) - len(guarded)} st.save() call(s) in the "
+            "DiskLowSpace arm are not guarded against DiskLowSpace. On the "
+            "ENOSPC path such a call raises again from inside the handler "
+            "and the run exits 1 instead of pausing resumably")
+
+        exit_assign = min(
+            (n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "exit_code"
+                     for t in n.targets)),
+            default=None)
+        assert exit_assign is not None, "the arm never assigns exit_code"
+        assert exit_assign < min(n.lineno for n in all_saves), (
+            "`exit_code` is assigned after the save — if the save raises, "
+            "the run loses its EXIT_LOCKED disposition")
+
     def test_does_not_re_raise(self):
         # The generic `except BaseException as e:` arm above re-raises
         # (crashing the process with a traceback) — DiskLowSpace's own arm
@@ -234,7 +293,7 @@ class TestMainHandlesDiskLowSpace:
 class TestStateSaveCatchesENOSPC:
     """N30's mitigation is not exclusively the proactive `_disk_free_ratio`
     checks in `preflight()`/`phase_execute` (covered above) — `State.save()`
-    itself also wraps its `tmp.write_text()`/`tmp.replace()` pair, since a
+    itself also wraps its `tmp.write_text()`/`os.replace()` pair, since a
     disk can cross zero between one periodic check and the next write. An
     `OSError(errno.ENOSPC, ...)` from either half is reraised as
     `DiskLowSpace`, the same exception class/pause path the proactive
@@ -303,15 +362,6 @@ class TestStateSaveCatchesENOSPC:
             assert not isinstance(exc_info.value, leerie.DiskLowSpace)
         finally:
             st.release_lock()
-
-    def test_disklowspace_from_save_still_reaches_mains_handler(self):
-        # DiskLowSpace is a BaseException regardless of which of the three
-        # raise sites (preflight, phase_execute, or now State.save())
-        # produced it, so it is caught by the identical `except
-        # DiskLowSpace as e:` arm in main() pinned in
-        # TestMainHandlesDiskLowSpace — no separate save()-specific handler
-        # is required.
-        assert issubclass(leerie.DiskLowSpace, BaseException)
 
     def test_pre_fix_shape_is_documented(self):
         # Regression guard for the historical gap this test class replaced:

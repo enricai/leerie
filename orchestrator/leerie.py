@@ -5565,7 +5565,7 @@ def resolve_worker_timeout_sec(repo_root: Path,
 
 
 def resolve_worker_timeout_explicit(repo_root: Path,
-                               cli_value: int | None = None) -> bool:
+                                    cli_value: int | None = None) -> bool:
     """True when the operator set the global ceiling anywhere.
 
     `_resolve_positive_int_pref` returns a plain `int`, so "5400 because the
@@ -6527,9 +6527,9 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     if ratio < DISK_MIN_FREE_RATIO:
         die(f"insufficient disk space to start a run: "
             f"{_disk_headroom_message(leerie_dir, ratio)}. "
-            "Free up space (see CLAUDE.md's retention guidance / "
-            "`leerie list` + manual pruning of old runs under the state "
-            "root) and retry.")
+            "Free up space (`leerie list` to see past runs, then prune old "
+            "ones under the state root by hand — nothing reaps them "
+            "automatically) and retry.")
 
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
@@ -7187,7 +7187,7 @@ async def _label_migration_chunks(
             crit = (child.get("success_criteria_seed") or "").strip()
             if cid in labels and title and crit:
                 labels[cid] = (title, crit)
-    except WorkerError:
+    except (WorkerError, subprocess.TimeoutExpired):
         # Worker crashed — keep the distinct deterministic labels (§12: a
         # split must never silently produce identical children).
         log(f"_recursive_decompose: label-only splitter failed for "
@@ -7486,7 +7486,7 @@ async def _recursive_decompose(
             effort=efforts.get("fit_judge"),
             sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
         )
-    except WorkerError:
+    except (WorkerError, subprocess.TimeoutExpired):
         # Worker crashed mid-judgment (auth failure, killed session, PID
         # exhaustion) — degrade to leaf, the same disposition the depth cap
         # and no-progress guard below already reach when they cannot
@@ -7602,7 +7602,7 @@ async def _recursive_decompose(
                 effort=efforts.get("splitter"),
                 sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
             )
-        except WorkerError:
+        except (WorkerError, subprocess.TimeoutExpired):
             # Worker crashed mid-split (auth failure, killed session, PID
             # exhaustion) — degrade to leaf, the same disposition the depth
             # cap and no-progress guard above already reach when they cannot
@@ -10171,13 +10171,14 @@ async def _filter_satisfied_subtasks(
                     effort=efforts["satisfied_probe"],
                     sid=f"satisfied_probe-{sid}",
                 )
-            except WorkerError as e:
+            except (WorkerError, subprocess.TimeoutExpired) as e:
                 # A probe crash (e.g. claude_p schema failure twice) must
                 # NOT drop the subtask — fail safe toward keeping the work.
                 # Log and let the subtask survive. Deliberately NOT cached:
                 # no verdict was actually reached, so caching this would
                 # wrongly skip re-probing a subtask that was never judged.
-                log(f"  satisfied-probe {sid}: crashed ({e}); keeping "
+                log(f"  satisfied-probe {sid}: crashed "
+                    f"({_brief_worker_exc(e)}); keeping "
                     "subtask (fail-safe — no drop on probe failure)")
                 return
         # Persist the verdict as soon as it returns — for BOTH satisfied
@@ -10327,10 +10328,11 @@ async def _probe_criteria_satisfied_on_head(
             effort=efforts["satisfied_probe"],
             sid=f"satisfied_probe-head-{sid}",
         )
-    except WorkerError as e:
+    except (WorkerError, subprocess.TimeoutExpired) as e:
         # A probe crash must NOT rescue the subtask — fail safe toward the
         # existing retryable no-op path.
-        log(f"  satisfied-probe (HEAD) {sid}: crashed ({e}); not rescuing "
+        log(f"  satisfied-probe (HEAD) {sid}: crashed "
+            f"({_brief_worker_exc(e)}); not rescuing "
             "(fail-safe — no-op stays retryable)")
         return None
     if out.get("satisfied") is True:
@@ -12352,6 +12354,25 @@ def _validate_resume_state(data: dict) -> None:
 # =========================================================================
 class WorkerError(RuntimeError):
     pass
+
+
+def _brief_worker_exc(exc: BaseException) -> str:
+    """Render a worker-spawn failure for a log line, WITHOUT the argv.
+
+    `str(subprocess.TimeoutExpired)` interpolates `cmd` — for leerie that is
+    the entire `claude -p` command line, which on the inline-system-prompt
+    path carries a whole system prompt. `_run_implementer`'s own handler
+    documents the result as a 50 KB traceback dumped to the operator's
+    terminal, and avoids it by never binding the exception at all.
+
+    Every site that catches TimeoutExpired alongside WorkerError and wants to
+    say something about it goes through here instead. `exc.timeout` is the
+    ceiling that actually applied, so the message stays specific without the
+    payload.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"killed at its {exc.timeout}s wall-clock ceiling"
+    return str(exc)
 
 
 class DecompositionBudgetExceeded(WorkerError):
@@ -14756,9 +14777,25 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # child inherits a dup of this descriptor, so closing ours in the
             # `finally` does not disturb a still-running worker.
             stdin_file = open(stdin_path, "rb")
-        except BaseException:
+        except BaseException as exc:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+            # ENOSPC becomes DiskLowSpace, matching `State.save()`. Without
+            # this, the single largest disk write leerie makes per worker
+            # invocation (~150KB, once per attempt) was the one place that
+            # still surfaced N30's filed symptom verbatim — a raw
+            # `OSError: [Errno 28]` — because nothing upstream converts it:
+            # `claude_p`'s try catches only RateLimitedExit, so it reached
+            # main()'s terminal handler as an unhandled crash. The
+            # proactive ratio check runs once per WAVE and cannot see a disk
+            # that crosses zero mid-wave, which is exactly when this fires.
+            # Converting it routes the failure into the same resumable
+            # EXIT_LOCKED pause every other disk-exhaustion path uses.
+            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                raise DiskLowSpace(
+                    f"staging the worker prompt failed: no space left on "
+                    f"device writing {stdin_path}"
+                ) from exc
             raise
 
     # The spawn is guarded because the staged file is created BEFORE the
@@ -23487,10 +23524,11 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             sid="task_coverage_judge",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
-    except (WorkerError, OSError) as exc:
+    except (WorkerError, OSError, subprocess.TimeoutExpired) as exc:
         # This gate never terminates a run (see the docstring), so an
-        # infrastructure failure degrades: WorkerError, or an OSError from
-        # process spawn (a missing/unexecutable `claude`).
+        # infrastructure failure degrades: WorkerError, an OSError from
+        # process spawn (a missing/unexecutable `claude`), or a
+        # TimeoutExpired from the worker hitting its wall-clock ceiling.
         #
         # A programming error (TypeError, AttributeError, NameError, ...) is
         # NOT one of those and must propagate — swallowing it is what hid the
@@ -25991,9 +26029,11 @@ async def _run_checked_loop(
     for rnd in range(max_rounds):
         try:
             last_res = await invoke()
-        except WorkerError as exc:
-            # Infrastructure failure (PID exhaustion, OOM, a killed session),
-            # not a judgment about the work — so spend a round on a fresh
+        except (WorkerError, subprocess.TimeoutExpired) as exc:
+            # Infrastructure failure (PID exhaustion, OOM, a killed session,
+            # or a worker killed at its wall-clock ceiling — `_invoke` raises
+            # TimeoutExpired, which is NOT a WorkerError), not a judgment
+            # about the work — so spend a round on a fresh
             # `claude -p` session rather than abandoning the loop. This is
             # the "infrastructure-crash retry" the docstring above
             # distinguishes from a found-issue retry — it fires regardless
@@ -26007,7 +26047,13 @@ async def _run_checked_loop(
             # makes `_read_stream`'s own PID-cap message honest — it promises
             # "a fresh worker retries with a clean PID table", which was true
             # for implementers and false here.
-            warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
+            #
+            # `_brief_worker_exc` rather than `{exc}`: str() on a
+            # TimeoutExpired renders the whole `claude -p` argv (see its
+            # docstring).
+            warnings.append(
+                f"{name} round {rnd}: worker crashed: "
+                f"{_brief_worker_exc(exc)}")
             last_res = None
             continue
         except Exception as exc:
@@ -26661,7 +26707,8 @@ async def _capture_conformance_baseline(
     log("phase 4: capturing base-tree health baseline on staging")
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     log_path = st.run_dir / "logs" / "base-baseline.log"
-    timeout = float(caps.get("worker_timeout_sec") or 5400)
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
 
     # Install the provision recipe into staging so the suite can run.
     # Deps live only in worktrees (§6½); staging starts bare. Failure to
@@ -28143,7 +28190,6 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         else:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
-
 
         # Clear stale terminal status so _get_progress counts retried
         # subtasks as "running" (absent = running per _get_progress).
@@ -30643,19 +30689,36 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_code = EXIT_LOCKED
 
     except DiskLowSpace as e:
-        # N30: the periodic mid-run headroom check in phase_execute found
-        # free space on the state-dir filesystem below DISK_MIN_FREE_RATIO.
-        # Resumable, not fatal — the remedy is an operator freeing space,
+        # N30. TWO raise sites reach this arm, and they differ in a way that
+        # dictates the order of the statements below:
+        #   - phase_execute's periodic headroom check, which fires at
+        #     DISK_MIN_FREE_RATIO (5% free) — the disk still has room; and
+        #   - State.save()'s errno.ENOSPC conversion — the disk is at zero.
+        # Resumable in both cases: the remedy is an operator freeing space,
         # after which the run's on-disk state (worktrees, branches,
         # state.json) is untouched and `leerie resume` picks it back up.
-        # Mirrors the ContextOverflow arm just above.
+        #
+        # `abnormal` and `exit_code` are therefore set BEFORE any save, and
+        # the save is guarded. On the ENOSPC path an unguarded st.save() here
+        # re-enters the very call that just failed and raises DiskLowSpace a
+        # second time from inside this handler — which no sibling arm catches,
+        # so it escapes main() and skips the cleanup, the dep capture and the
+        # EXIT_LOCKED assignment, turning a resumable pause into an exit-1
+        # traceback. That is the same hazard the dep_capture guard below
+        # documents; this call is the likelier one to hit it.
         full_purge = False
-        st.save()
+        abnormal = False
+        exit_code = EXIT_LOCKED
+        try:
+            st.save()
+        except DiskLowSpace:
+            # Nothing left to persist to: the on-disk state.json is already
+            # the last successfully written one, which is what resume reads.
+            pass
         log(f"disk headroom low — {e.raw_message}")
         log("  Free up space on the state-dir filesystem "
             "(old runs under the state root are the usual culprit), "
             f"then resume with: leerie resume {st.run_id}")
-        abnormal = False
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
         except Exception:
@@ -30674,7 +30737,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
-        exit_code = EXIT_LOCKED
+        # `exit_code` / `abnormal` are deliberately NOT set here — they are
+        # set at the top of this arm, before the guarded save, so that every
+        # statement below them is best-effort.
 
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —

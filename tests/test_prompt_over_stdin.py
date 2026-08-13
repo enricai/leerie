@@ -424,16 +424,74 @@ def test_staged_file_is_reaped_when_staging_itself_fails(leerie, leerie_dir,
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
 
-    with pytest.raises(OSError) as excinfo:
+    # ENOSPC here is now converted to DiskLowSpace, matching `State.save()`.
+    # This staging write is the largest disk write leerie makes per worker
+    # invocation, and it was the last place that still surfaced N30's filed
+    # symptom verbatim — a raw `OSError: [Errno 28]` — because nothing
+    # upstream converts it (`claude_p`'s try catches only RateLimitedExit),
+    # so it reached main()'s terminal handler as an unhandled crash. The
+    # proactive ratio check runs once per WAVE and cannot see a disk that
+    # crosses zero mid-wave, which is precisely when this fires.
+    #
+    # The original assertion here was that the OSError propagates
+    # "unchanged, not masked by the cleanup". That concern is unchanged and
+    # still met: `raise ... from exc` keeps the real cause attached, which is
+    # asserted below. What changed is the routing, deliberately.
+    with pytest.raises(leerie.DiskLowSpace) as excinfo:
         asyncio.run(leerie._invoke(
             ["claude", "-p"], cwd=str(leerie_dir.parent),
             timeout=60, sid="t-enospc", leerie_dir=leerie_dir,
             verbosity="quiet", stdin_data="hello"))
 
-    assert excinfo.value.errno == errno.ENOSPC, (
-        "the original failure must propagate unchanged, not be masked by "
-        "the cleanup")
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, OSError) and cause.errno == errno.ENOSPC, (
+        "the original failure must remain attached as __cause__, not be "
+        "masked by the cleanup or by the conversion")
     assert not spawned, "the child was spawned even though staging failed"
+
+    leaked = [p for p in tmp_path.iterdir() if p.name.startswith("leerie-prompt-")]
+    assert not leaked, f"staging failure leaked {[p.name for p in leaked]}"
+
+
+def test_staging_failure_that_is_not_enospc_propagates_unchanged(
+        leerie, leerie_dir, monkeypatch, tmp_path):
+    """The ENOSPC conversion must stay narrow.
+
+    A permissions failure, a read-only mount, a bad descriptor — none of
+    those are disk exhaustion, and turning them into `DiskLowSpace` would
+    tell the operator to free space for a problem freeing space cannot fix,
+    and would route a genuine error into a resumable pause. Same shape as
+    `State.save()`, which reraises every non-ENOSPC `OSError` untouched.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    real_fdopen = os.fdopen
+
+    def exploding_fdopen(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+
+        def boom(_data):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        handle.write = boom
+        return handle
+
+    monkeypatch.setattr(os, "fdopen", exploding_fdopen)
+
+    async def fake(*cmd, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("spawn reached despite a staging failure")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="t-eacces", leerie_dir=leerie_dir,
+            verbosity="quiet", stdin_data="hello"))
+
+    assert not isinstance(excinfo.value, leerie.DiskLowSpace), (
+        "a non-ENOSPC OSError was converted to DiskLowSpace — the "
+        "conversion must key on errno, not on 'the staging failed'")
+    assert excinfo.value.errno == errno.EACCES
 
     leaked = [p for p in tmp_path.iterdir() if p.name.startswith("leerie-prompt-")]
     assert not leaked, f"staging failure leaked {[p.name for p in leaked]}"

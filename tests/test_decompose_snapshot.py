@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -405,6 +406,26 @@ class TestDecomposeSnapshotPersistence:
 # 3. Source-coupling: mirrors tests/test_plan_snapshot_wiring.py
 # ---------------------------------------------------------------------------
 
+def _catches_worker_error(src: str, from_idx: int) -> bool:
+    """Is there a handler naming WorkerError after *from_idx* in *src*?
+
+    Matches the handler by the exception NAME rather than by the literal
+    string `except WorkerError:`. These guards exist to pin that the crash
+    barrier is present, not to pin its exact spelling — and the spelling
+    legitimately changes: the arms now read
+    `except (WorkerError, subprocess.TimeoutExpired):`, since `_invoke`
+    raises TimeoutExpired for a worker killed at its wall-clock ceiling and
+    that is the same infrastructure class the barrier already degraded on.
+    A literal match failed on that widening while the barrier it guards was
+    strictly stronger.
+
+    Still fails if the handler is deleted, narrowed to a different exception,
+    or moved above the call — which is what these tests are for.
+    """
+    return re.search(r"except\s+[^\n:]*\bWorkerError\b[^\n:]*:",
+                     src[from_idx:]) is not None
+
+
 class TestSnapshotSourceCoupling:
     def test_declared_in_state_fields(self, leerie):
         assert "decompose_snapshot" in leerie.STATE_FIELDS
@@ -455,13 +476,12 @@ class TestSnapshotSourceCoupling:
         judge_idx = src.find('schema_key="fit_judge"')
         assert judge_idx != -1
         try_idx = src.rfind("try:", 0, judge_idx)
-        except_idx = src.find("except WorkerError:", judge_idx)
         assert try_idx != -1, (
             "the fit_judge claude_p call must be inside a try: block"
         )
-        assert except_idx != -1, (
-            "the fit_judge claude_p call must be followed by "
-            "except WorkerError: that degrades to leaf"
+        assert _catches_worker_error(src, judge_idx), (
+            "the fit_judge claude_p call must be followed by a handler "
+            "naming WorkerError that degrades to leaf"
         )
 
     def test_splitter_call_is_wrapped_in_try_except_workererror(self, leerie):
@@ -472,14 +492,13 @@ class TestSnapshotSourceCoupling:
         split_idx = src.find('schema_key="splitter"')
         assert split_idx != -1
         try_idx = src.rfind("try:", 0, split_idx)
-        except_idx = src.find("except WorkerError:", split_idx)
         assert try_idx != -1, (
             "the coupled-minority splitter claude_p call must be inside a "
             "try: block"
         )
-        assert except_idx != -1, (
+        assert _catches_worker_error(src, split_idx), (
             "the coupled-minority splitter claude_p call must be followed "
-            "by except WorkerError: that degrades to leaf"
+            "by a handler naming WorkerError that degrades to leaf"
         )
 
     def test_decompose_snapshot_precedes_the_die_gates(self, leerie):

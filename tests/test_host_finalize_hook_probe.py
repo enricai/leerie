@@ -1,8 +1,8 @@
 """Unit tests for scripts/host-finalize.sh's mechanical pre-push hook
 classification probe (N24).
 
-scripts/host-finalize.sh:389 used to detect a pre-push hook failure by
-grepping push stderr for vendor-specific prose ("husky", "pre-push script
+`host_finalize`'s push-failure branch used to detect a pre-push hook failure
+by grepping push stderr for vendor-specific prose ("husky", "pre-push script
 failed", "exit code 254") — arbitrary third-party text that misses any
 non-husky-branded or newer-husky hook failure entirely. These tests drive
 the replacement structural probe (`_host_finalize_pre_push_hook_present` +
@@ -131,12 +131,18 @@ def test_auth_and_network_exclusion_list_overrides_hook_presence():
 
     Cases are FULL stderr, as `host_finalize` captures it — not isolated
     fragments. That matters since the classifier became git-framed: an
-    `ssh:` or `git@host:` line counts only when git also emits its
-    `fatal: Could not read from remote repository` companion, which is what
-    separates the push's own transport failure from a hook that ssh'd
+    `ssh:` or `git@host:` transport failure is classified by git's own
+    `fatal: Could not read from remote repository` companion line, which is
+    what separates the push's own transport failure from a hook that ssh'd
     somewhere and failed. Every real `git push` reproduction shows the two
-    lines together; a bare fragment is deliberately not classified. The full
-    20-case corpus is at the bottom of this file.
+    lines together; a bare `ssh:` fragment is deliberately not classified.
+
+    Note the classifier has ONE arm. An earlier revision added a second,
+    `ssh:`-prefixed arm gated on that same companion line — but the first arm
+    already matches the companion line itself, so the second could never
+    change an answer. It is gone; the cases below are unaffected because the
+    companion line was always what classified them. The full 23-case corpus
+    is at the bottom of this file.
     """
     cases = [
         "fatal: Authentication failed for 'https://github.com/o/r.git/'",
@@ -168,8 +174,11 @@ def test_ordinary_hook_related_text_is_not_treated_as_auth_or_network():
     accidentally match the narrow, git-owned exclusion list."""
     assert _is_auth_or_network("husky - pre-push script failed (code 254)") is False
     assert _is_auth_or_network("acme-corp: commit policy violation") is False
-    # The verbatim stderr of a real failing pre-push hook, captured from git
-    # 2026-08-12. Git contributes only the second line — there is no
+    # The stderr of a real failing pre-push hook run against real git
+    # 2026-08-12. Only the second line is git's own output; the first is the
+    # hook's, and the hook was written for this reproduction — so this is a
+    # real git framing around authored hook text, not a captured incident.
+    # Git contributes only the second line — there is no
     # hook-identifying text at all, which is why classification is
     # structural (_host_finalize_pre_push_hook_present) rather than textual.
     # Broadening the exclusion list for `could not read` must not start
@@ -209,8 +218,15 @@ def test_ordinary_hook_related_text_is_not_treated_as_auth_or_network():
 # git failure sends them to `--no-verify`, which cannot fix credentials, and a
 # matched hook failure hides the hint that would have helped.
 #
-# Scored when this landed: the previous bare-phrase list got 9/9 git but only
-# 4/11 hook; this two-part, git-framed classifier gets 9/9 and 11/11.
+# Scored against this corpus: the previous bare-phrase list got 9/9 git but
+# only 5/14 hook; this git-framed classifier gets 9/9 and 14/14.
+#
+# Three of the hook cases were added after the fact, each pinning a real
+# misclassification: `postgres-perm-denied` (a regression introduced by an
+# earlier revision of this branch, which dropped the `\(publickey` qualifier),
+# and `hook-node-eacces` / `hook-resolves-db-host` (false positives that were
+# ALSO present on the merged bare-phrase list). All three are falsified —
+# they fail against the patterns that produced them and pass now.
 # ---------------------------------------------------------------------------
 
 GIT_FAILURES = [
@@ -251,6 +267,27 @@ HOOK_FAILURES = [
     # Postgres says FATAL: too, and case-insensitively that is `fatal:`.
     ("postgres-auth", 'FATAL: password authentication failed for user "postgres"\n'
                       "error: failed to push some refs to 'origin'"),
+    # The case that caught a real regression. A revision of this classifier
+    # dropped the `\\(publickey` qualifier from `permission denied`, leaving a
+    # bare phrase behind a case-INSENSITIVE `^(fatal|remote):` — so Postgres's
+    # other common connect failure classified as auth/network and the hook
+    # lost its --no-verify hint. `origin/main`'s pre-anchor list did NOT
+    # misfire on this, so it was a net-new regression, and the corpus had no
+    # case for it. It does now.
+    ("postgres-perm-denied",
+     'FATAL:  permission denied for database "appdb"\n'
+     "error: failed to push some refs to 'origin'"),
+    # Two shapes that were false positives on `origin/main` too, fixed here
+    # by requiring git's quote in `unable to access '` and by dropping the
+    # bare transport phrases the `^(fatal|remote):` anchor makes unreachable
+    # for real git. Both are ordinary hook output that happens to use git's
+    # vocabulary on a `fatal:`-shaped line.
+    ("hook-node-eacces",
+     "fatal: unable to access node: EACCES\n"
+     "error: failed to push some refs to 'origin'"),
+    ("hook-resolves-db-host",
+     "FATAL: could not resolve host: db.internal\n"
+     "error: failed to push some refs to 'origin'"),
     ("psycopg-refused",
      "psycopg2.OperationalError: could not connect to server: Connection refused\n"
      "error: failed to push some refs to 'origin'"),
@@ -295,5 +332,18 @@ def test_corpus_covers_both_directions():
     This asserts on literals in this file, so it cannot detect a product
     regression — its only job is to stop the corpus itself from being
     hollowed out until one direction is untested.
+
+    The floors match what the prose actually claims. They were `>= 8` while
+    every claim in this file, in `scripts/host-finalize.sh`, and in
+    `docs/IMPLEMENTATION.md` said 9 and 11 — a gap that permitted silently
+    dropping a git case and three hook cases, including the two carrying the
+    most discriminating power (`hook-ssh-deploy`, `postgres-auth`). Raise
+    these deliberately when adding cases; never lower them.
     """
-    assert len(GIT_FAILURES) >= 8 and len(HOOK_FAILURES) >= 8
+    assert len(GIT_FAILURES) >= 9, (
+        "the real-git corpus shrank below the 9 cases every claim about this "
+        "classifier cites")
+    assert len(HOOK_FAILURES) >= 14, (
+        "the hook corpus shrank below its documented size; the scored claim "
+        "is 14/14, which includes three regression cases "
+        "(postgres-perm-denied, hook-node-eacces, hook-resolves-db-host)")

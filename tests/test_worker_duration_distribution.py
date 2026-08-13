@@ -219,6 +219,38 @@ class TestTimeoutTableIsDerivedFromTheMeasurement:
             "re-derive whether the max guard is still load-bearing")
         assert "planner" not in leerie.TIMEOUT_DEFAULT_PER_WORKER
 
+    def test_every_measured_worker_below_the_cap_is_IN_the_table(self, leerie):
+        """The converse direction, which nothing else in this file covers.
+
+        Both tests above iterate `TIMEOUT_DEFAULT_PER_WORKER` — "every shipped
+        entry is reproducible". That is one-directional: deleting
+        `rebaser`/`provision`/`integrator`/`dep_capture`/`pr_writer` from the
+        table passes the entire suite, and those workers silently revert to
+        the 5400 s global while the feature appears intact. Only `classifier`
+        was incidentally protected, by two behavioural pins elsewhere.
+
+        The rule is exact and leaves no discretion: a measured worker whose
+        derived ceiling lands strictly below the cap belongs in the table, and
+        one that reaches the cap must be omitted (the sibling test above pins
+        that half). So the membership set is fully determined by the committed
+        summary, and this asserts it.
+        """
+        workers = _summary()["workers"]
+        cap = leerie.DEFAULT_CAPS["worker_timeout_sec"]
+        floor = leerie._WORKER_TIMEOUT_FLOOR_SEC
+        missing = []
+        for worker, row in workers.items():
+            derived = min(cap, max(floor,
+                                   math.ceil(row["p99"] * 3),
+                                   math.ceil(row["max"] * 1.2)))
+            if derived < cap and worker not in leerie.TIMEOUT_DEFAULT_PER_WORKER:
+                missing.append(f"{worker} (derives to {derived}s)")
+        assert not missing, (
+            "measured worker(s) whose derived ceiling is below the global cap "
+            "are absent from TIMEOUT_DEFAULT_PER_WORKER, so they silently keep "
+            f"the full {cap}s and the table's coverage shrank without a "
+            "failing test:\n  " + "\n  ".join(sorted(missing)))
+
     def test_slowest_workers_are_absent_and_keep_the_global_cap(self, leerie):
         """conformer/implementer/planner exceed the cap after the x3
         multiplier, so they are omitted rather than listed at 5400 -- an
@@ -310,6 +342,21 @@ class TestResolveWorkerTimeout:
             "the --worker-timeout resolution never reaches caps, so the flag "
             "is documented but inert")
         assert "args.worker_timeout" in src
+        # BOTH halves, for the reason the three minimal entrypoints are
+        # already checked for both (see the sweep below). The value alone is
+        # not enough: `resolve_worker_timeout` gates the table bypass on
+        # `caps["worker_timeout_explicit"]`, so without this line an explicit
+        # `--worker-timeout 5400` is indistinguishable from setting nothing
+        # and silently leaves `classifier` at its 1236 s table ceiling — the
+        # exact defect this branch fixed. Falsified: deleting only the
+        # explicitness assignment from main() leaves the two assertions above
+        # passing, because `args.worker_timeout` also appears on the value
+        # line. main() was the ONE caps site with no such guard.
+        assert ('caps["worker_timeout_explicit"] = '
+                "resolve_worker_timeout_explicit(") in src, (
+            "main() resolves the timeout value but not its explicitness, so "
+            "the table bypass never fires and an explicit --worker-timeout "
+            "is a silent no-op on the primary CLI path")
 
     def test_resolver_precedence_cli_over_env_over_file(self, leerie, tmp_path,
                                                         monkeypatch):
