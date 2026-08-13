@@ -329,13 +329,22 @@ def test_capture_baseline_never_uses_login_shell_flag(leerie):
     container's Docker-ENV-only PATH additions (e.g. mise's shims dir),
     so a `-lc` invocation silently reports `command not found` for a
     mise-managed runner (pnpm/npx) that resolves fine under `-c`."""
-    src = inspect.getsource(leerie._capture_conformance_baseline)
+    src = inspect.getsource(leerie._measure_blt)
     assert '"-lc"' not in src and "'-lc'" not in src, (
-        "_capture_conformance_baseline must never invoke a BLT command "
+        "_measure_blt must never invoke a BLT command "
         "with a login-shell (-lc) flag — it discards Docker ENV-only PATH.")
     assert '["bash", "-c", cmd]' in src, (
-        "_capture_conformance_baseline must invoke each BLT axis command "
+        "_measure_blt must invoke each BLT axis command "
         'as the exact argv ["bash", "-c", cmd] (non-login shell).')
+
+    # The pin followed the argv out of `_capture_conformance_baseline` when
+    # `_measure_blt` was extracted. Assert the baseline no longer builds a
+    # shell argv of its own, so the extraction cannot be quietly un-done by
+    # re-inlining a second (and possibly `-lc`) invocation beside the call.
+    cap = inspect.getsource(leerie._capture_conformance_baseline)
+    assert '"bash"' not in cap and "'bash'" not in cap, (
+        "_capture_conformance_baseline must delegate BLT execution to "
+        "_measure_blt, not build its own shell argv.")
 
 
 def test_capture_baseline_argv_is_bash_dash_c_exactly(leerie, tmp_path,

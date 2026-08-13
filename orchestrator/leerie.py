@@ -26771,6 +26771,120 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     return last_res, warnings, blocked_reason
 
 
+# Worktrees whose provision recipe has already been applied in THIS
+# orchestrator process, keyed by resolved absolute path. Module-level rather
+# than `State` on purpose: this is a per-process filesystem fact, not run
+# state, and re-installing once after a `resume` is both correct (a fresh
+# container has an empty worktree) and cheap against the shared
+# package-manager caches (DESIGN §6½).
+_DEPS_INSTALLED: set[str] = set()
+
+
+async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
+                                log_path: Path, verbosity: str,
+                                label_prefix: str = "baseline",
+                                log_prefix: str = "base-baseline") -> None:
+    """Apply the persisted provision recipe's install/build entries in
+    `tree`, at most once per worktree per orchestrator process.
+
+    Extracted from `_capture_conformance_baseline` so every tree leerie
+    measures can be made runnable the same way: deps live only in worktrees
+    (DESIGN §6½), so a tree nothing has installed into cannot run the suite
+    at all.
+
+    Non-fatal throughout. A failed install is deliberately left to surface
+    as whatever the subsequent build/lint/test command reports, rather than
+    raising here — that reported failure is the more useful signal, and it
+    is already classified (`_runner_missing` demotes a missing runner to
+    "could not measure" rather than RED)."""
+    key = os.path.realpath(tree)
+    if key in _DEPS_INSTALLED:
+        return
+    _DEPS_INSTALLED.add(key)
+    recipe = (st.data.get("provision") or {}).get("recipe") or []
+    for e in recipe:
+        if e.get("kind") not in ("install", "build") or not e.get("command"):
+            continue
+        wd = Path(tree) / (e.get("working_dir") or ".")
+        # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
+        # layers on top of the orchestrator's own environment rather than
+        # replacing it — `_run_streaming(env=None)` would otherwise mean
+        # "inherit everything," so an explicit dict here must still carry
+        # PATH etc.
+        entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
+        try:
+            await _run_streaming(
+                e["command"], cwd=str(wd), env=entry_env,
+                timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
+                log_path=log_path,
+                label=f"{label_prefix}-install: {' '.join(e['command'])}",
+                verbosity=verbosity)
+        except subprocess.TimeoutExpired:
+            log(f"  {log_prefix}: install timed out: "
+                f"{' '.join(e['command'])}")
+        except Exception as ex:  # non-fatal: BLT below will show the effect
+            log(f"  {log_prefix}: install error "
+                f"({type(ex).__name__}): {' '.join(e['command'])}")
+
+
+async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
+                       log_path: Path, verbosity: str,
+                       label_prefix: str = "baseline") -> dict:
+    """Run one build/lint/test axis command in `tree` and return its verdict.
+
+    The single place leerie executes a repo's own BLT command. Extracted
+    from `_capture_conformance_baseline` so the base-health baseline and
+    every later measurement share one implementation rather than drifting
+    apart (DESIGN §9).
+
+    Returns the axis dict every baseline consumer already reads —
+    `{ran, measured, passed, command, summary}`. The verdict is **exit-code
+    based**: 100% reliable, and it needs no per-framework output parsing.
+
+    The argv is `["bash", "-c", cmd]` and must never become `-lc` (N8): a
+    login shell sources /etc/profile and ~/.bash_profile and DISCARDS the
+    container's Docker-ENV-only PATH additions (e.g. mise's shims dir), so
+    a `-lc` invocation reports `command not found` for a runner that
+    resolves fine under `-c`."""
+    if not (cmd or "").strip():
+        # Every axis dict carries `measured` so no consumer needs a
+        # default; a not-applicable axis is unmeasured (and, being
+        # ran=False, is neither red nor green).
+        return {"ran": False, "measured": False, "passed": None,
+                "summary": "", "command": ""}
+    try:
+        rc, tail = await _run_streaming(
+            ["bash", "-c", cmd], cwd=str(tree), timeout=timeout,
+            log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
+            verbosity=verbosity)
+        summary = (tail or "").strip()[-400:]
+        if rc != 0 and _runner_missing(summary):
+            # The command didn't run — its runner isn't on PATH (e.g.
+            # the recipe's `pip install` failed, so pytest is absent).
+            # This is "could not measure," NOT "RED": recording it as
+            # red-with-`command not found` gives the conformer a
+            # useless delta and provokes it to re-derive the baseline
+            # destructively (git stash / checkout <base> -- .). Mark it
+            # unmeasurable so red-axis logic and the conformer prompt
+            # both skip it.
+            return {"ran": True, "measured": False, "passed": None,
+                    "command": cmd, "summary": summary}
+        return {
+            "ran": True, "measured": True, "passed": rc == 0,
+            "command": cmd,
+            # Keep a short tail for the RED warning / conformer context.
+            "summary": summary,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ran": True, "measured": True, "passed": False,
+                "command": cmd,
+                "summary": f"timed out after {int(timeout)}s"}
+    except Exception as ex:
+        return {"ran": False, "measured": False, "passed": None,
+                "command": cmd,
+                "summary": f"{type(ex).__name__}: {ex}"}
+
+
 def _runner_missing(summary: str) -> bool:
     """True if a failed baseline command failed because its runner is not
     on PATH (rather than a real test/build/lint failure). The canonical
@@ -26941,71 +27055,21 @@ async def _capture_conformance_baseline(
     # Deps live only in worktrees (§6½); staging starts bare. Failure to
     # install is non-fatal — a subsequent BLT command that needs deps will
     # simply exit non-zero, which is itself recorded as a RED axis.
-    recipe = (st.data.get("provision") or {}).get("recipe") or []
-    for e in recipe:
-        if e.get("kind") not in ("install", "build") or not e.get("command"):
-            continue
-        wd = staging / (e.get("working_dir") or ".")
-        # entry env (e.g. _normalize_node_threadpool's thread-pool caps)
-        # layers on top of the orchestrator's own environment rather than
-        # replacing it — `_run_streaming(env=None)` would otherwise mean
-        # "inherit everything," so an explicit dict here must still carry
-        # PATH etc.
-        entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
-        try:
-            await _run_streaming(
-                e["command"], cwd=str(wd), env=entry_env,
-                timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
-                log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
-                verbosity=verbosity)
-        except subprocess.TimeoutExpired:
-            log(f"  base-baseline: install timed out: {' '.join(e['command'])}")
-        except Exception as ex:  # non-fatal: BLT below will show the effect
-            log(f"  base-baseline: install error "
-                f"({type(ex).__name__}): {' '.join(e['command'])}")
+    # label_prefix / log_prefix differ, and deliberately: the pre-extraction
+    # code streamed each entry under `baseline-install:` while logging its
+    # failures as `base-baseline:`. Collapsing them to one prefix would be a
+    # silent behaviour change in operator-facing output.
+    await _ensure_worktree_deps(str(staging), st, caps, log_path=log_path,
+                                verbosity=verbosity,
+                                label_prefix="baseline",
+                                log_prefix="base-baseline")
 
     axes: dict[str, dict] = {}
     for axis in ("build", "lint", "tests"):
-        cmd = (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
-        if not cmd:
-            # Every axis dict carries `measured` so no consumer needs a
-            # default; a not-applicable axis is unmeasured (and, being
-            # ran=False, is neither red nor green).
-            axes[axis] = {"ran": False, "measured": False, "passed": None,
-                          "summary": "", "command": ""}
-            continue
-        try:
-            rc, tail = await _run_streaming(
-                ["bash", "-c", cmd], cwd=str(staging), timeout=timeout,
-                log_path=log_path, label=f"baseline-{axis}: {cmd}",
-                verbosity=verbosity)
-            summary = (tail or "").strip()[-400:]
-            if rc != 0 and _runner_missing(summary):
-                # The command didn't run — its runner isn't on PATH (e.g.
-                # the recipe's `pip install` failed, so pytest is absent).
-                # This is "could not measure," NOT "base is RED": recording
-                # it as red-with-`command not found` gives the conformer a
-                # useless delta and provokes it to re-derive the baseline
-                # destructively (git stash / checkout <base> -- .). Mark it
-                # unmeasurable so red-axis logic and the conformer prompt
-                # both skip it.
-                axes[axis] = {"ran": True, "measured": False, "passed": None,
-                              "command": cmd, "summary": summary}
-            else:
-                axes[axis] = {
-                    "ran": True, "measured": True, "passed": rc == 0,
-                    "command": cmd,
-                    # Keep a short tail for the RED warning / conformer context.
-                    "summary": summary,
-                }
-        except subprocess.TimeoutExpired:
-            axes[axis] = {"ran": True, "measured": True, "passed": False,
-                          "command": cmd,
-                          "summary": f"timed out after {int(timeout)}s"}
-        except Exception as ex:
-            axes[axis] = {"ran": False, "measured": False, "passed": None,
-                          "command": cmd,
-                          "summary": f"{type(ex).__name__}: {ex}"}
+        axes[axis] = await _measure_blt(
+            axis, (blt.get(_AXIS_CMD_KEY[axis]) or "").strip(), str(staging),
+            timeout=timeout, log_path=log_path, verbosity=verbosity,
+            label_prefix="baseline")
 
     # An axis is RED only if it actually ran AND was measurable AND failed.
     # Unmeasurable axes (runner missing) are neither red nor green — they
