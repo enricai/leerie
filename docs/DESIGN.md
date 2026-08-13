@@ -4719,8 +4719,30 @@ empty. The orchestrator handles this in two layers: runtime
 versions and the optional setup hook are pre-installed *in* the
 container before any worker runs, because they're cross-cutting
 state every worker shares; dependency installs (pnpm, pip, cargo,
-etc.) are deferred to each worker, which runs the install in its
-own worktree against shared package-manager caches.
+etc.) happen per worktree, against shared package-manager caches.
+
+**Who runs that install.** Both the orchestrator and the workers do,
+for different trees and at different moments. Since the orchestrator
+took over build/lint/test execution (§9), it needs deps present in a
+worktree before it can measure anything there, so it applies the
+recipe itself — **lazily, on the first axis it actually measures for
+that worktree, and at most once per worktree per process**. Workers
+still install for their own targeted work, and the recipe stays in
+their prompt for that reason.
+
+Lazy rather than eager at worktree creation, and the distinction is
+not cosmetic: a config-only or docs-only subtask correctly skips the
+install today, and pre-installing for every worktree would hand that
+cost back. Measured on the run that motivated this work, 44 of 91
+subtasks touched zero source files. What the ownership removes is the
+*repeat*: 263 installs ran across 161 worker logs — roughly 2.8 per
+worktree, since a subtask's implementer and conformer share one — to
+converge on the same state each time.
+
+The memo is keyed on the resolved absolute worktree path and lives in
+the process, not in run state: it records a filesystem fact, and
+re-installing once after a `resume` is correct, because a fresh
+container starts with an empty worktree.
 
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:

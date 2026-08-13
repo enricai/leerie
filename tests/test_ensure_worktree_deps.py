@@ -159,6 +159,78 @@ def test_a_failing_install_never_raises(leerie, st, streaming, tmp_path, exc):
     _go(leerie, tmp_path, st)   # must not raise
 
 
+# --------------------------------------------------------------------------
+# Wiring: _measure_axes owns the install, lazily
+# --------------------------------------------------------------------------
+
+def _repo(tmp_path, name="wt"):
+    import subprocess
+    d = tmp_path / name
+    d.mkdir()
+    for a in (["init", "-q"], ["config", "user.email", "t@e.com"],
+              ["config", "user.name", "t"]):
+        subprocess.run(["git", *a], cwd=d, check=True, capture_output=True)
+    (d / "a.txt").write_text("x\n")
+    subprocess.run(["git", "add", "-A"], cwd=d, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "i"], cwd=d, check=True,
+                   capture_output=True)
+    return d
+
+
+def _measure(leerie, tree, st, axes):
+    return asyncio.run(leerie._measure_axes(
+        str(tree), axes, st, {}, log_path=None, verbosity="quiet"))
+
+
+def test_measure_installs_before_the_first_real_measurement(
+        leerie, st, streaming, tmp_path):
+    calls = streaming()
+    d = _repo(tmp_path)
+    _measure(leerie, d, st, {"tests": "pytest"})
+    assert [c[0] for c in calls][0] == ["pnpm", "install"], (
+        "deps must be present before the axis command runs")
+
+
+def test_measure_does_not_install_when_every_axis_is_absent(
+        leerie, st, streaming, tmp_path):
+    """The docs-only case, and the reason the install is lazy rather than
+    eager at worktree creation: `_run_implementer` declines to pre-install
+    precisely because a config-only or docs-only subtask correctly skips it.
+    Measured, 44 of 91 subtasks in the motivating run touched zero source
+    files."""
+    calls = streaming()
+    d = _repo(tmp_path)
+    _measure(leerie, d, st, {"tests": "", "build": "", "lint": ""})
+    assert calls == []
+
+
+def test_measure_does_not_install_when_every_axis_is_a_memo_hit(
+        leerie, st, streaming, tmp_path):
+    """Serving a recorded verdict needs no dependencies."""
+    calls = streaming()
+    d = _repo(tmp_path)
+    _measure(leerie, d, st, {"tests": "pytest"})
+    n = len(calls)
+    _measure(leerie, d, st, {"tests": "pytest"})
+    assert len(calls) == n, "a memo hit must not install"
+
+
+def test_measure_installs_once_across_repeated_rounds(
+        leerie, st, streaming, tmp_path):
+    """Pre- and post-round measurements of a changing tree still install
+    only once for that worktree."""
+    import subprocess
+    calls = streaming()
+    d = _repo(tmp_path)
+    _measure(leerie, d, st, {"tests": "pytest"})
+    (d / "a.txt").write_text("changed\n")
+    subprocess.run(["git", "commit", "-aqm", "c"], cwd=d, check=True,
+                   capture_output=True)
+    _measure(leerie, d, st, {"tests": "pytest"})
+    installs = [c for c in calls if c[0] == ["pnpm", "install"]]
+    assert len(installs) == 1
+
+
 def test_a_failing_install_still_marks_the_tree_done(leerie, st, streaming,
                                                      tmp_path):
     """Retrying a broken install once per measurement would multiply the
