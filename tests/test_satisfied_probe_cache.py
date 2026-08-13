@@ -288,3 +288,53 @@ def test_verdict_reaches_disk_before_the_sweep_completes(
         "satisfied": False, "evidence": "still needed",
         "checked": ["a.py"], "base_sha": sha,
     }
+
+
+# ---------------------------------------------------------------------------
+# 6: a worker KILLED at its wall-clock ceiling is the same fail-safe case
+#
+# PR #203 widened this handler from `except WorkerError` to also catch
+# `subprocess.TimeoutExpired`, because `_invoke` raises the latter for a
+# worker killed at its ceiling and it is not a WorkerError. Six of the seven
+# handlers widened in that change had no behavioural test — only the
+# `_run_checked_loop` retry did. This is the one that matters most: the wrong
+# degrade here DROPS a subtask, i.e. silently loses planned work.
+# ---------------------------------------------------------------------------
+
+def test_timeout_keeps_subtask_and_writes_no_cache_entry(
+        leerie, tmp_path, monkeypatch):
+    """A killed probe must fail SAFE — keep the subtask, cache nothing.
+
+    Identical disposition to the WorkerError case above, and asserted the
+    same way: the cache key must be ABSENT, not merely the subtask present.
+    A probe that both kept the subtask and cached the timeout as a decided
+    verdict would pass a survives-only assertion while skipping the re-probe
+    on the next resume.
+    """
+    import subprocess
+
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-timeout")]}]
+
+    calls: dict[str, int] = {}
+
+    async def timing_out_claude_p(*, user_prompt, sid, **_kw):
+        stid = sid.split("satisfied_probe-", 1)[-1]
+        calls[stid] = calls.get(stid, 0) + 1
+        raise subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=1854)
+    monkeypatch.setattr(leerie, "claude_p", timing_out_claude_p)
+
+    res = _run(leerie._filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+
+    assert calls == {"feat-timeout": 1}
+    assert res is None
+    assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-timeout"], (
+        "a timed-out probe dropped the subtask — the one degrade direction "
+        "that silently loses planned work")
+    assert "feat-timeout" not in st.data.get("satisfied_probe_cache", {}), (
+        "a timeout was cached as a decided verdict, so the next resume would "
+        "skip re-probing a subtask that was never actually judged")

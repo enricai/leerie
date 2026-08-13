@@ -2302,9 +2302,13 @@ a `WorkerError` (infrastructure — PID exhaustion, OOM, a killed session) is
 re-invocation is a fresh `claude -p` session with a clean PID table — which
 is what `_read_stream`'s own PID-cap message already promised ("a fresh
 worker retries") and what was true for implementers but false for every
-`_run_checked_loop` caller until the retry existed. Any *other* exception is
-a leerie bug rather than a flaky worker, so it still abandons the loop
-immediately (`test_loop_crash_breaks`, which uses `RuntimeError` precisely to
+`_run_checked_loop` caller until the retry existed. A worker KILLED at its
+wall-clock ceiling is the same class and is retried too — `_invoke` raises
+`subprocess.TimeoutExpired`, which is not a `WorkerError` — though bounded to
+`_TIMEOUT_RETRY_MAX` attempts rather than the full round budget, since a
+timeout has already spent its whole ceiling before it is observed. Any
+*other* exception is a leerie bug rather than a flaky worker, so it still
+abandons the loop immediately (`test_loop_crash_breaks`, which uses `RuntimeError` precisely to
 pin that split). Also pinned: all-rounds-crash still returns `None` so the
 callers' `is None` escalation is unchanged, the retry is bounded at exactly
 `max_rounds`, and a crash must clear `last_res` so a stale earlier result is
@@ -3000,7 +3004,7 @@ stub captures the real kwargs, then `inspect.signature(leerie.claude_p).bind(...
 binds them against the live signature — generalizing
 `test_recursive_decompose.py`'s C0 guard) paired with
 `TestProgrammingErrorsPropagate`, which pins that the gate catches
-`WorkerError` and `OSError` **only**: a worker failure, or a failure to spawn
+`WorkerError`, `OSError` and `subprocess.TimeoutExpired` **only**: a worker failure, or a failure to spawn
 the process at all, is an expected advisory degrade (the gate's docstring
 promises it never terminates a run), while a `TypeError` is a leerie bug and
 must propagate rather than masquerade as one. `OSError` is disjoint from every
@@ -3577,20 +3581,26 @@ claim that the two fixes compose on one realistic payload.
 
 **A handler must SURVIVE its own exception, not merely catch it.**
 `main()`'s `except DiskLowSpace` arm opened with an unguarded `st.save()`
-— and `State.save()`'s own ENOSPC conversion is one of the two raise
-sites, so on the disk-full path that call re-entered the failure and
+— and `State.save()`'s own out-of-space conversion is one of the three
+raise sites, so on the disk-full path that call re-entered the failure and
 raised again *from inside the handler*. A sibling `except` of the same
 `try` does not see an exception raised in another arm's body, so it
 escaped `main()`, skipping the cleanup, the dep capture and the
 `EXIT_LOCKED` assignment: an exit-1 traceback where the whole arm exists
-to produce a resumable pause. The arm now sets `abnormal`/`exit_code`
-*before* any save and guards the save. Two lessons worth keeping. First,
+to produce a resumable pause. Three lessons worth keeping. First,
 the arm's own comment already documented this hazard for the
 `dep_capture` call ten lines below and guarded that one — the likelier
-re-raiser went unguarded because the comment named only one of the two
-raise sites, which is why `test_survives_a_save_that_is_still_failing`
-in `tests/test_disk_preflight.py` asserts *every* `st.save()` in the arm
-is inside a `try` naming `DiskLowSpace`, rather than pinning one call.
+re-raiser went unguarded because the comment named only one of the raise
+sites, which is why `test_survives_a_save_that_is_still_failing`
+in `tests/test_disk_preflight.py` asserts against *every* save in the arm
+rather than pinning one call. Third, **fixing one arm was not the fix**:
+eight other handlers in `main()` carried the identical bare `st.save()`,
+including the catch-all `except BaseException`, where a raise REPLACES the
+unhandled exception and leaves the real bug reachable only as
+`__context__`, which nothing prints. They all now route through
+`_save_state_best_effort`, which logs and never raises — deliberately
+broader than `except DiskLowSpace`, because a read-only run dir raises
+`PermissionError` (measured) and no conversion touches it.
 Second, the test it replaced asserted only
 `issubclass(DiskLowSpace, BaseException)` and concluded "no separate
 save()-specific handler is required" — a tautology that *reasoned* its
@@ -3638,10 +3648,41 @@ companion condition was a line the first arm already matched, and the
 first arm ran first. A second arm that cannot change an answer is worse
 than no arm, because three places documented it as the discriminator.
 
+## Commit messages are the permanent record
+
+This repo **squash-merges**, and the repository setting is
+`squash_merge_commit_message: COMMIT_MESSAGES`. So the squash body on `main`
+is the branch's **commit messages, concatenated** — a four-commit PR lands
+all four, in order, each prefixed with `*`. **The PR description is
+discarded.** Verify with `git log -1 <squash-sha> --format=%b` on any recent
+merge.
+
+Three consequences, each learned the hard way:
+
+- A correction belongs in a **commit message**, not only in the PR
+  description. A description rewritten before merge reaches nobody.
+- A branch that supersedes its own earlier work must say so in its **final**
+  commit message, because the superseded ones remain on `main` verbatim. PR
+  #203 landed with a body that opens by presenting a feature the same body
+  later withdraws — accurate in sequence, misleading at a glance.
+- A single-commit PR is the case where the two happen to look identical
+  (its lone message is the whole body). Do not generalise from it; that
+  inference is what produced the previous bullet.
+
+**Verify counts and claims in a commit message the way you verify code.**
+Four of five consecutive commit messages on one branch carried an unverified
+number — "16 tests deleted" (20), "all four are corrected" (three), "as it
+was before this branch" (the feature came from the previous PR), "three
+alternatives are load-bearing" (four). Every one was a figure measured
+against an earlier state and carried forward after the state changed. If a
+message states a count, re-derive it against the diff you are about to push.
+
 ## Task completion checklist
 
 Before marking a change complete:
 
+- [ ] Re-derive every count and claim in the commit message against the
+      actual diff — see "Commit messages are the permanent record" above.
 - [ ] Update `IMPLEMENTATION.md` if the change affected code surface
       described there.
 - [ ] Update `DESIGN.md` only if the architecture itself changed.

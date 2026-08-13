@@ -14,6 +14,7 @@ A healthy disk is a no-op at both checkpoints.
 import asyncio
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 from unittest import mock
 
@@ -201,8 +202,10 @@ class TestMainHandlesDiskLowSpace:
     def test_persists_state_before_pausing(self):
         # The run is only resumable if state.json reflects the pause —
         # an in-memory-only pause would resume from stale disk state.
+        # Via the best-effort helper, never a bare st.save(): see
+        # test_survives_a_save_that_is_still_failing.
         arm = self._arm()
-        assert "st.save()" in arm
+        assert "_save_state_best_effort(" in arm
 
     def test_survives_a_save_that_is_still_failing(self):
         """The save-origin path must SURVIVE this arm, not merely reach it.
@@ -221,40 +224,34 @@ class TestMainHandlesDiskLowSpace:
         skipping the cleanup, the dep capture and the EXIT_LOCKED assignment
         — an exit-1 traceback instead of a resumable pause.
 
-        Two properties, both checkable in the source: every `st.save()` in
-        this arm is guarded against DiskLowSpace, and `exit_code` is assigned
-        before the first of them, so nothing below it can cost the run its
-        disposition.
+        Two properties, both checkable in the source: the arm never calls
+        `st.save()` directly — every terminating arm now routes through
+        `_save_state_best_effort`, which cannot raise — and `exit_code` is
+        assigned before it, so nothing below can cost the run its
+        disposition. The helper is deliberately broader than an
+        `except DiskLowSpace` around the save: a read-only run dir raises
+        `PermissionError` (measured), which no conversion touches and which
+        a narrower guard let escape.
         """
         import ast
         import textwrap
         tree = ast.parse(textwrap.dedent(self._arm()))
 
-        def saves_in(node) -> list[ast.Call]:
-            return [n for n in ast.walk(node)
-                    if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "save"]
+        bare = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "save"
+                and ast.unparse(n) == "st.save()"]
+        assert not bare, (
+            f"{len(bare)} bare st.save() call(s) in the DiskLowSpace arm. On "
+            "an out-of-space or read-only filesystem such a call raises from "
+            "inside the handler, escapes main(), and the run exits 1 instead "
+            "of pausing resumably — use _save_state_best_effort")
 
-        all_saves = saves_in(tree)
-        assert all_saves, "the arm no longer saves at all"
-
-        guarded: list[ast.Call] = []
-        for t in [n for n in ast.walk(tree) if isinstance(n, ast.Try)]:
-            catches = {
-                nm.id
-                for h in t.handlers if h.type is not None
-                for nm in ast.walk(h.type) if isinstance(nm, ast.Name)
-            }
-            if "DiskLowSpace" in catches:
-                for stmt in t.body:
-                    guarded += saves_in(stmt)
-
-        assert len(guarded) == len(all_saves), (
-            f"{len(all_saves) - len(guarded)} st.save() call(s) in the "
-            "DiskLowSpace arm are not guarded against DiskLowSpace. On the "
-            "ENOSPC path such a call raises again from inside the handler "
-            "and the run exits 1 instead of pausing resumably")
+        helper = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "_save_state_best_effort"]
+        assert helper, "the arm no longer persists state at all"
 
         exit_assign = min(
             (n.lineno for n in ast.walk(tree)
@@ -263,7 +260,7 @@ class TestMainHandlesDiskLowSpace:
                      for t in n.targets)),
             default=None)
         assert exit_assign is not None, "the arm never assigns exit_code"
-        assert exit_assign < min(n.lineno for n in all_saves), (
+        assert exit_assign < min(n.lineno for n in helper), (
             "`exit_code` is assigned after the save — if the save raises, "
             "the run loses its EXIT_LOCKED disposition")
 
@@ -288,6 +285,88 @@ class TestMainHandlesDiskLowSpace:
         assert "capture_repo_deps(" in arm, (
             "the DiskLowSpace arm skips the best-effort dep capture its "
             "sibling terminating arms all perform")
+
+
+class TestSaveBestEffortHelper:
+    """`_save_state_best_effort` must never raise, and every terminating arm
+    in `main()` must use it.
+
+    The arm-local fix shipped in #203 was not enough: eight other handlers
+    carried the same bare `st.save()`, and the catch-all
+    `except BaseException` arm is the worst of them — a raise there REPLACES
+    the unhandled exception, so the operator sees a save error while the real
+    bug survives only as `__context__`, which nothing prints.
+    """
+
+    def _failing_state(self, exc: BaseException):
+        st = mock.Mock()
+        st.save = mock.Mock(side_effect=exc)
+        return st
+
+    def test_swallows_disklowspace(self, capsys):
+        st = self._failing_state(leerie.DiskLowSpace("no space"))
+        leerie._save_state_best_effort(st, "unit")   # must not raise
+        assert "could not persist state" in (capsys.readouterr().out
+                                             + capsys.readouterr().err)
+
+    def test_swallows_a_permission_error(self):
+        """Not every save failure is a disk failure — a read-only run dir
+        raises PermissionError, which no conversion turns into DiskLowSpace,
+        and which an `except DiskLowSpace` guard would have let escape."""
+        st = self._failing_state(PermissionError(13, "Permission denied"))
+        leerie._save_state_best_effort(st, "unit")
+
+    def test_swallows_a_baseexception(self):
+        """The catch-all arm must survive anything, including the
+        BaseException family that an `except Exception` guard misses."""
+        st = self._failing_state(KeyboardInterrupt())
+        leerie._save_state_best_effort(st, "unit")
+
+    def test_a_healthy_save_is_not_swallowed_silently(self, capsys):
+        st = mock.Mock()
+        st.save = mock.Mock()
+        leerie._save_state_best_effort(st, "unit")
+        st.save.assert_called_once()
+        out = capsys.readouterr()
+        assert "could not persist" not in (out.out + out.err), (
+            "a successful save must not warn")
+
+    def test_every_main_handler_uses_the_helper(self):
+        """No terminating arm may reintroduce a bare `st.save()`.
+
+        Source-coupled because `main()` cannot be driven to a real exit here.
+        Counting rather than naming the arms: a NEW handler added later gets
+        the same treatment without anyone remembering to extend a list.
+        """
+        import ast
+        import inspect
+        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie.main)))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for h in node.handlers:
+                name = ast.unparse(h.type) if h.type else "bare except"
+                for n in ast.walk(h):
+                    if (isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "save"
+                            and ast.unparse(n) == "st.save()"):
+                        offenders.append(f"{name} (line {n.lineno})")
+        assert not offenders, (
+            "these main() handlers still call st.save() directly; a raise "
+            "from inside an except block escapes main() and skips the "
+            "exit_code assignment:\n  " + "\n  ".join(offenders))
+
+    def test_the_helper_is_actually_used(self):
+        """Anti-vacuity for the sweep above: it passes trivially if nothing
+        saves at all, so require the helper to be present in quantity."""
+        import inspect
+        src = inspect.getsource(leerie.main)
+        assert src.count("_save_state_best_effort(") >= 7, (
+            "main() has far fewer best-effort saves than it has terminating "
+            "arms — the sweep above may be passing because the saves were "
+            "removed rather than guarded")
 
 
 class TestStateSaveCatchesENOSPC:

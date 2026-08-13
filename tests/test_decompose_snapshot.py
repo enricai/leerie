@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -530,3 +530,67 @@ class TestSnapshotSourceCoupling:
             "already be on disk for the decomposition spend to be "
             "recoverable."
         )
+
+
+# ---------------------------------------------------------------------------
+# 4. A worker killed at its ceiling degrades exactly like a crash
+#
+# PR #203 widened both `_recursive_decompose` barriers to catch
+# `subprocess.TimeoutExpired` alongside `WorkerError` — `_invoke` raises the
+# former for a worker killed at its wall-clock ceiling, and it is not a
+# WorkerError. The source-coupling guards above were relaxed to match the
+# handler by exception NAME so they tolerate that widening, but they do not
+# EXERCISE it. These do.
+# ---------------------------------------------------------------------------
+
+class TestTimeoutCrashBarrier:
+    def test_fit_judge_timeout_degrades_to_leaf(self, leerie):
+        """Same disposition as the WorkerError case: the node is accepted as
+        a leaf, unchanged, rather than propagating and discarding every
+        sibling subtask's already-paid-for fit/split decisions."""
+        import subprocess
+        subtask = {"id": "t-timeout-1", "title": "Some task",
+                   "success_criteria_seed": "crit",
+                   "files_likely_touched": ["a.py"]}
+        caps = _make_decompose_caps(leerie)
+        st = _make_decompose_state(leerie, caps)
+        models = {"fit_judge": "sonnet", "splitter": "sonnet"}
+        efforts = {"fit_judge": "medium", "splitter": "medium"}
+
+        async def timing_out(*args, schema_key, **kwargs):
+            assert schema_key == "fit_judge"
+            raise subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=1875)
+
+        with patch.object(leerie, "claude_p", new=timing_out):
+            leaves = _run(leerie._recursive_decompose(
+                subtask, 0, st, caps, models, efforts, Path("/tmp")))
+
+        assert leaves == [subtask]
+
+    def test_splitter_timeout_degrades_to_leaf(self, leerie):
+        """The coupled-minority splitter call, ~70 lines below the fit_judge
+        guard — the site whose barrier was missing entirely until D3's
+        surviving half landed."""
+        import subprocess
+        subtask = {"id": "t-timeout-2", "title": "Coupled task",
+                   "success_criteria_seed": "crit",
+                   "files_likely_touched": ["a.py", "b.py"]}
+        caps = _make_decompose_caps(leerie)
+        st = _make_decompose_state(leerie, caps)
+        models = {"fit_judge": "sonnet", "splitter": "sonnet"}
+        efforts = {"fit_judge": "medium", "splitter": "medium"}
+
+        async def fake(*args, schema_key, **kwargs):
+            if schema_key == "fit_judge":
+                return {"score": 0.1, "rationale": "diffuse", "diffuse": "x",
+                        "confidence": {"root_cause": 9.0, "solution": 9.0,
+                                       "basis": "ok", "falsifiers_tested": [],
+                                       "contradictions_reconciled": [],
+                                       "gap_to_close": {}}}
+            raise subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=1992)
+
+        with patch.object(leerie, "claude_p", new=fake):
+            leaves = _run(leerie._recursive_decompose(
+                subtask, 0, st, caps, models, efforts, Path("/tmp")))
+
+        assert leaves == [subtask]

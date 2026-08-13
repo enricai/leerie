@@ -112,7 +112,7 @@ _host_finalize_pre_push_hook_present() {
 # companion line (see the `connection-refused` / `publickey-denied` /
 # `ssh-timeout` corpus cases, which pass on arm 1).
 #
-# Two alternatives carry a deliberate qualifier, because `-i` makes git's
+# Three alternatives carry a deliberate qualifier, because `-i` makes git's
 # `fatal:` indistinguishable from a third-party `FATAL:`:
 #   - `authentication failed for '` keeps the quote: git writes `Authentication
 #     failed for '<url>'`, Postgres writes `FATAL: password authentication
@@ -134,14 +134,30 @@ _host_finalize_pre_push_hook_present() {
 # 9/9 on real git — including https connect-refused and DNS-failure, both
 # still caught via `unable to access '` — while removing the false
 # positives on a hook that emits `FATAL: could not resolve host: db.internal`
-# or `FATAL: connection refused`. Only three alternatives are load-bearing
-# for the corpus (`authentication failed for '`, `could not read from remote
-# repository`, `repository .*not found`); the rest are kept as git's exact
-# wording for shapes the corpus does not contain, and each is qualified
-# enough that it cannot match third-party prose.
+# or `FATAL: connection refused`. Ablating each surviving alternative in
+# turn, FOUR are load-bearing for the corpus: `authentication failed for '`,
+# `could not read from remote repository`, `unable to access '` (the sole
+# matcher for the DNS-failure case, since dropping the bare transport phrases
+# is what left it carrying that shape alone) and `repository .*not found`.
+# The rest are kept as git's exact wording for shapes the corpus does not
+# contain, and each is qualified enough that it cannot match third-party
+# prose. `tests/test_host_finalize_hook_probe.py` re-derives that count from
+# this regex and fails if this comment and the measurement disagree — the
+# claim said "three" for one release because it was written from an ablation
+# run against the PREVIOUS, wider alternative list and never re-run.
+#
+# A HERESTRING, not `printf | grep`: `grep -q` exits at its first match and
+# closes the pipe, so with more than a pipe buffer (64 KiB) still unread the
+# writer dies of SIGPIPE and — under the `set -o pipefail` every caller of
+# this file sets — the pipeline reports 141 even though grep MATCHED.
+# Measured: a 1.19 MB stderr whose first line is a real credential failure
+# classified as a hook failure, and the operator was told to retry with
+# `--no-verify`, which cannot fix credentials. A pre-push hook running a test
+# suite reaches that size easily.
 _host_finalize_git_framed_auth_or_network() {
-  printf '%s' "$1" | grep -qiE \
-    "^(fatal|remote):.*(authentication failed for '|permission denied \(publickey|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access '|repository .*not found)"
+  grep -qiE \
+    "^(fatal|remote):.*(authentication failed for '|permission denied \(publickey|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access '|repository .*not found)" \
+    <<<"$1"
 }
 
 _host_finalize_is_auth_or_network_push_error() {

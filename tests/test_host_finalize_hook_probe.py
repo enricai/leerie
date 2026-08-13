@@ -20,7 +20,10 @@ to parse run.json), so they run unconditionally.
 """
 from __future__ import annotations
 
+import os
+import re
 import subprocess
+import tempfile
 
 import pytest
 from pathlib import Path
@@ -44,13 +47,40 @@ def _hook_present(repo: Path) -> bool:
 
 
 def _is_auth_or_network(stderr_text: str) -> bool:
-    r = subprocess.run(
-        ["bash", "-c",
-         f". {HOST_FINALIZE_SH}; "
-         f'_host_finalize_is_auth_or_network_push_error "$1"',
-         "_", stderr_text],
-        capture_output=True, text=True, check=False,
-    )
+    """Classify under the SAME shell options the real callers set.
+
+    `set -euo pipefail` is load-bearing here, not decoration. Every script
+    that sources this file sets it (`leerie:17`,
+    `scripts/remote/provision.sh:42`), and the classifier used to be
+    `printf '%s' "$1" | grep -q …` — where `grep -q` exits at its first match
+    and closes the pipe, so on input larger than a pipe buffer the writer dies
+    of SIGPIPE and `pipefail` makes the pipeline report 141 **even though grep
+    matched**. A real credential failure then classified as a hook failure.
+
+    This harness ran `bash -c` with no options, which is precisely the
+    configuration in which that defect is invisible: it passed on the broken
+    code for a whole release. See `test_large_stderr_still_classifies`.
+
+    The payload travels via a FILE, not argv: a realistic hook stderr exceeds
+    Linux's 131,071-byte `MAX_ARG_STRLEN` and a bash `-c` argument cannot
+    carry it (verified — it raises `OSError` from `subprocess`). Production
+    reaches the same shape through `push_stderr="$(git push …)"`, so
+    `s="$(cat …)"` here is the faithful transport, not a workaround.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".stderr", delete=False) as fh:
+        fh.write(stderr_text)
+        payload = fh.name
+    try:
+        r = subprocess.run(
+            ["bash", "-c",
+             f"set -euo pipefail; . {HOST_FINALIZE_SH}; "
+             's="$(cat "$1")"; '
+             '_host_finalize_is_auth_or_network_push_error "$s"',
+             "_", payload],
+            capture_output=True, text=True, check=False,
+        )
+    finally:
+        os.unlink(payload)
     return r.returncode == 0
 
 
@@ -323,6 +353,84 @@ def test_hook_output_never_classifies_as_auth_or_network(label, stderr_text):
     assert _is_auth_or_network(stderr_text) is False, (
         f"{label}: ordinary tool output matched the auth/network list, so a "
         "genuine hook failure loses the --no-verify hint this gates")
+
+
+def test_large_stderr_still_classifies():
+    """The regression the harness above could not see.
+
+    A pre-push hook that runs a test suite emits megabytes. The classifier
+    reads the FULL captured stderr, so with `grep -q` behind a pipe the
+    writer took SIGPIPE and `pipefail` turned a successful match into rc 141.
+    Measured on 1.19 MB: the operator was told to retry with `--no-verify`
+    for a failure `--no-verify` cannot touch.
+
+    Both halves matter: the auth line must still be found when it is followed
+    by a mountain of hook output, and ordinary hook output of the same size
+    must still classify as a hook failure.
+    """
+    filler = "\n".join(f"  hook line {i}: {'y' * 40}" for i in range(20000))
+    assert len(filler) > 1_000_000, "filler is too small to cross a pipe buffer"
+
+    auth_then_noise = (
+        "fatal: Authentication failed for 'https://github.com/o/r.git/'\n" + filler)
+    assert _is_auth_or_network(auth_then_noise) is True, (
+        "a real credential failure buried under large hook output was "
+        "misclassified — the classifier is reading through a pipe again")
+
+    assert _is_auth_or_network(
+        "✖ typecheck failed: 3 errors\n" + filler
+        + "\nerror: failed to push some refs to 'origin'") is False, (
+        "large ordinary hook output classified as auth/network")
+
+
+def test_documented_load_bearing_count_matches_the_measurement():
+    """The prose in `host-finalize.sh` must match an ablation re-run here.
+
+    It claimed "three" for a release while the answer was four: the count was
+    measured against a WIDER alternative list, then four alternatives were
+    dropped — which is what left `unable to access '` carrying the DNS case
+    alone — and the claim was never re-derived. Same stale-number class as
+    the counts this repo keeps catching in commit messages, so it gets a
+    guard rather than another careful read.
+    """
+    text = HOST_FINALIZE_SH.read_text()
+    line = next(l for l in text.splitlines() if "^(fatal|remote):.*(" in l)
+    body = line[line.index(".*(") + 3:line.rindex(')"')]
+
+    alts, buf, depth, i = [], "", 0, 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\":
+            buf += body[i:i + 2]; i += 2; continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            alts.append(buf); buf = ""; i += 1; continue
+        buf += c; i += 1
+    alts.append(buf)
+    assert len(alts) >= 5, f"only parsed {len(alts)} alternatives; parser broke"
+
+    def matches(stderr_text: str, subset: list[str]) -> bool:
+        rx = re.compile(r"^(fatal|remote):.*(" + "|".join(subset) + ")",
+                        re.IGNORECASE)
+        return any(rx.search(l) for l in stderr_text.split("\n"))
+
+    load_bearing = []
+    for idx, alt in enumerate(alts):
+        without = alts[:idx] + alts[idx + 1:]
+        if sum(1 for _, t in GIT_FAILURES if matches(t, without)) < len(GIT_FAILURES):
+            load_bearing.append(alt)
+
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+             6: "six", 7: "seven"}
+    claimed = re.search(r"([A-Za-z]+) are load-bearing", text)
+    assert claimed, "host-finalize.sh no longer states a load-bearing count"
+    assert claimed.group(1).lower() == words[len(load_bearing)], (
+        f"the comment claims '{claimed.group(1)}' alternatives are "
+        f"load-bearing; re-deriving it from the live regex gives "
+        f"{len(load_bearing)}: {load_bearing}")
 
 
 def test_corpus_covers_both_directions():
