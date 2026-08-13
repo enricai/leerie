@@ -6604,6 +6604,74 @@ Replaying the motivating run's real round-1 output through the shipped
 predicate: **6 of 79 subtasks clean today, 37 on the axis channel alone, 53 once
 residuals carry a label.** The floor is code; the rest is the prompt earning it.
 
+**The orchestrator measures; the conformer consumes.** Build, lint and test
+are executed by the orchestrator, not by the conformer. The worker receives
+*results* — the exact command, the exit-code verdict, and an output tail — in a
+`BLT_RESULTS:` block, and is told it did not run them and must not re-run a
+full axis.
+
+This is §12 applied to the axis that was costing the most. Whether a suite ran,
+with what command, in which tree, at what scope, is mechanically knowable, so
+it belongs in `leerie.py`; whether a resulting failure is worth fixing is
+judgment, so it stays with the worker.
+
+Two things make it a real transfer rather than a request. The command strings
+are no longer injected, so running a full axis now requires the worker to
+synthesise one. And the orchestrator's measurement **overwrites** the
+conformer's self-reported `build`/`lint`/`tests` before any consumer reads
+them — the loop-continuation predicate, the residual summary, and the persisted
+`conformance` entry all see what was measured, never what was claimed. The
+worker's own report survives only as telemetry.
+
+Worth being precise about what this does *not* fix. Conformers were not
+over-firing: measured, 219 full-suite runs across 229 conformer calls, almost
+exactly the one-per-round the prompt asked for, and implementers ran the full
+suite zero times. The prompts were being followed. Moving execution into the
+orchestrator therefore saves little by itself — it is what makes the next two
+paragraphs possible.
+
+The conformer keeps **targeted falsifiers**, and they are promoted from
+exception to primary tool: `production_evidence` (§9) requires exercising the
+path the diff actually changed against the repo as it is, which is scoped work
+by construction and is not a suite run.
+
+**Per-subtask scope: a delta proxy, not the suite.** A subtask's conformer does
+not need to know whether the repo's whole suite is green. The whole-tree pass
+(§6) is where that question is asked, and it is the only place it can be
+answered about cross-subtask interaction. What the per-subtask pass needs is
+whether *this diff* broke something.
+
+So the per-subtask axes may run a **delta proxy** — a cheaper command scoped to
+the changed files — while the canonical command runs exactly twice per run:
+once at the base-health baseline and once (per round) on the integrated tree.
+The proportions that motivate this: the median subtask in the measured run
+touched **one** source file, yet every conformer round ran all 990 test files
+at ~499 s a time, against ~23 s for a scoped run of the same repo.
+
+A proxy is repo-declared (`test_scoped` / `build_scoped` in
+`.leerie/config.toml`) or inferred from two narrow signals, and is rendered
+from a template with `{files}` and `{base}`. It is **not a subset** of the
+canonical command and is not expected to be — `tsc --noEmit` catches a
+different set than `next build`. It is a cheap falsifier run once per subtask,
+backed by an expensive oracle run twice.
+
+Absence is the default in both directions: an axis with no resolvable proxy
+falls back to the canonical command rather than being skipped, and a changed
+file set that is empty skips the axis rather than rendering a bare runner —
+which would run everything, the exact inversion of the feature.
+`--subtask-tests full|scoped|off` lets an operator force either end.
+
+**The round signal is a regression, not a verdict.** Because a scoped result
+and a full baseline are not comparable, the base-health baseline cannot
+attribute a scoped failure to a subtask. Nor should it: the question is
+narrower. The orchestrator measures each axis immediately **before** a
+conformer round and again **after** it, with the identical command and scope,
+and compares those two. An axis green before and red after is a regression the
+conformer just introduced — attributable, with no output parsing and no
+framework knowledge. That is what continues the loop on a build/lint/test
+signal. Differing command strings are never compared, which is what stops a
+scoped `pre` being weighed against a canonical `post`.
+
 **Opt-in strict mode.** `--strict-conformer` (also `LEERIE_STRICT_CONFORMER`
 env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing
 with a blocking one: when conformer residuals remain after the round cap is

@@ -60,9 +60,15 @@ def test_conformer_audience_emphasizes_pre_build_install(leerie):
         [PNPM_INSTALL], audience="conformer")
     assert out is not None
     assert "PROVISION_RECIPE:" in out
-    # Conformer framing: ensure deps before BUILD/LINT/TEST.
-    assert "BUILD_CMD" in out and "LINT_CMD" in out and "TEST_CMD" in out
-    assert "ensure any residual deps and build artifacts" in out
+    # Conformer framing since the handover (DESIGN §9): the orchestrator
+    # applies the recipe itself before it measures build/lint/tests, so the
+    # block is no longer a "run these before BUILD_CMD" instruction. It is
+    # shown because a *targeted* command of the conformer's own may still
+    # need the deps present.
+    assert "BLT_RESULTS:" in out
+    assert "targeted" in out
+    assert "BUILD_CMD" not in out and "TEST_CMD" not in out, (
+        "the conformer is no longer handed raw axis command names")
 
 
 def test_polyglot_recipe_renders_every_install_entry(leerie):

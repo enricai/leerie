@@ -309,15 +309,20 @@ def test_baseline_maps_tests_axis_to_resolve_blt_test_key(leerie):
 
     Pins the mapping in source so a future refactor can't reintroduce the
     `blt.get("tests")` (always-None) bug."""
+    # The map was hoisted to module level when `_select_subtask_axes` became
+    # a second consumer; the pin follows it. Both halves still hold: the map
+    # says what it must, and the baseline still routes its lookup through it
+    # rather than a bare `blt.get(axis)` — which returns None for the "tests"
+    # axis and silently skips the test suite.
+    assert leerie._AXIS_CMD_KEY["tests"] == "test", (
+        "the axis-name->command-key map must send 'tests' to 'test'.")
+    assert leerie._AXIS_CMD_KEY["build"] == "build"
+    assert leerie._AXIS_CMD_KEY["lint"] == "lint"
     src = inspect.getsource(leerie._capture_conformance_baseline)
-    # The command lookup must go through the axis->cmd-key map, not a bare
-    # blt.get(axis) which would return None for the "tests" axis.
     assert "_AXIS_CMD_KEY" in src, (
         "_capture_conformance_baseline must map the 'tests' axis to "
         "resolve_blt's 'test' key — a bare blt.get('tests') is always None "
         "and silently skips the test suite.")
-    assert '"tests": "test"' in src, (
-        "the axis-name->command-key map must send 'tests' to 'test'.")
 
 
 # --- N8: non-login shell for baseline BLT commands -----------------------

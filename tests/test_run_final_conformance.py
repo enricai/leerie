@@ -277,6 +277,7 @@ def test_worker_error_does_not_raise(env):
     async def _stub(**kwargs):
         raise c.WorkerError("budget exhausted")
     c.claude_p = _stub
+    _stub_measure_axes(c, [_failing_axis(), _failing_axis(), {}, {}])
 
     # Must not raise — advisory framing.
     asyncio.run(c._run_final_conformance(
@@ -340,6 +341,27 @@ def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
 
 
+def _stub_measure_axes(leerie_mod, seq):
+    """Drive the orchestrator's own BLT measurement, which since the handover
+    (DESIGN §9) OVERWRITES whatever the conformer self-reported. A test that
+    needs a failing axis must fail it here — setting it on the worker's result
+    no longer reaches any consumer. Call order is pre0, post0, pre1, post1...
+    """
+    calls = {"n": 0}
+
+    async def _stub(tree, axes_map, st, caps, **kw):
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return dict(seq[i])
+    leerie_mod._measure_axes = _stub
+    return calls
+
+
+def _failing_axis(axis="build", command="npm run build", summary="fail"):
+    return {axis: {"ran": True, "measured": True, "passed": False,
+                   "command": command, "summary": summary}}
+
+
 def test_within_round_repetition_injects_feedback_into_next_round(env):
     """When _emit_bash_axis_warnings detects a within-round repetition
     (e.g. TEST_CMD run twice in one round — Pattern A) at the final,
@@ -392,6 +414,8 @@ def test_failing_axis_summarized_into_warnings(env):
                "summary": "compile error in src.py"},
     )
     _stub_claude_p(c, [failing] * env["caps"]["conformance_rounds"])
+    _stub_measure_axes(c, [_failing_axis(command="make", summary=
+                                         "compile error in src.py")])
 
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],

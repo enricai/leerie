@@ -392,6 +392,7 @@ STATE_FIELDS = (
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
+    "subtask_tests",
     "skip_base_baseline",
     "skip_repo_map",
     # overlap_replan_done: set once when phase_overlap_judge responds to an
@@ -823,6 +824,17 @@ SOURCE_OF_TRUTH_FILE = "leerie.toml"
 RUNTIME_VALUES = ("local", "fly", "ec2")
 RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
+
+# How much of the repo's suite a per-subtask conformance round measures
+# (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*).
+#   scoped — a diff-scoped proxy where one resolves, canonical otherwise
+#   full   — the canonical command, as before this knob existed
+#   off    — measure nothing per subtask; the final-tree pass still runs
+# The canonical command always runs at the base-health baseline and on the
+# final integrated tree regardless of this setting.
+SUBTASK_TESTS_VALUES = ("scoped", "full", "off")
+SUBTASK_TESTS_ENV = "LEERIE_SUBTASK_TESTS"
+SUBTASK_TESTS_FILE = SOURCE_OF_TRUTH_FILE
 
 # NOTE: leerie's own AWS region/profile knobs (LEERIE_AWS_REGION /
 # LEERIE_AWS_PROFILE, and the aws_region / aws_profile leerie.toml keys)
@@ -4863,6 +4875,21 @@ def resolve_runtime(repo_root: Path,
         allowed=RUNTIME_VALUES, default="local")
 
 
+def resolve_subtask_tests(repo_root: Path,
+                          cli_value: str | None = None) -> str:
+    """Resolve how much of the suite a per-subtask conformance round
+    measures. Order: --subtask-tests CLI flag → LEERIE_SUBTASK_TESTS env var
+    → leerie.toml → default 'scoped'. argparse validates `cli_value` via
+    choices=, so it is trusted when set; env and file values are rejected via
+    die() if not in SUBTASK_TESTS_VALUES — a bad config is caught at startup,
+    not part-way through a wave."""
+    return _resolve_enum_pref(
+        repo_root, cli_value,
+        env_var=SUBTASK_TESTS_ENV, file_key="subtask_tests",
+        file_name=SUBTASK_TESTS_FILE,
+        allowed=SUBTASK_TESTS_VALUES, default="scoped")
+
+
 def _resolve_str_pref(repo_root: Path, cli_value: str | None, *,
                       env_var: str, file_key: str, file_name: str,
                       default: str | None) -> str | None:
@@ -8090,6 +8117,14 @@ def _expand_reconciler_output(out: dict) -> dict:
 # `resolve_blt` keys the test axis "test" (singular); `_AXIS_CMD_KEY` bridges
 # the two and is the only place that mapping should live.
 _BLT_AXES: frozenset[str] = frozenset({"build", "lint", "tests"})
+
+# `resolve_blt` keys the test axis "test" (singular); the conformer's
+# structured output and the base-health baseline key it "tests" (plural).
+# This is the ONE place that mapping lives — a bare `blt.get("tests")` is
+# always None and silently skips the test suite, which is the bug this map
+# exists to prevent.
+_AXIS_CMD_KEY: dict[str, str] = {"build": "build", "lint": "lint",
+                                 "tests": "test"}
 
 
 def _expand_conformer_output(out: dict) -> dict:
@@ -25003,11 +25038,12 @@ def _format_provision_recipe_section(recipe: list[dict],
             "their deps are already at /opt/venv, /opt/bundle, etc. — so "
             "your worktree inherits them with zero install. The following "
             "residual commands are what could not be baked (Node offline "
-            "relink, build steps, etc.). Before running BUILD_CMD / "
-            "LINT_CMD / TEST_CMD, ensure any residual deps and build "
-            "artifacts are present — either run these command(s) first, "
-            "in the order shown, or react to a failing test/build that "
-            "diagnoses what's missing and run them then."
+            "relink, build steps, etc.). The orchestrator applies these "
+            "itself before it measures build/lint/tests, so you do not "
+            "need them for the BLT_RESULTS: block. They are listed because "
+            "a *targeted* command of your own may still need the deps "
+            "present — run them, in the order shown, if one fails "
+            "diagnosing something missing."
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
@@ -25422,6 +25458,124 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
     return out
 
 
+async def _changed_files(tree: str, base_ref: str) -> list[str]:
+    """Paths this worktree changed relative to `base_ref`.
+
+    `-z` rather than newline splitting: git C-quotes any path containing a
+    space or a non-ASCII byte in its default output, so `splitlines()` hands
+    back a quoted literal that does not exist on disk. Not hypothetical —
+    real test paths in the repo that motivated this work look like
+    `src/app/[locale]/(app)/settings/general/page.test.tsx`.
+
+    Two-dot, matching `check_diff_scope`: every subtask worktree is cut from
+    the current run-branch tip (`scripts/new-worktree.sh`) and integration
+    happens only at a wave boundary, so `<run_branch>..HEAD` is the subtask's
+    own diff in every wave."""
+    r = await run_proc(["git", "diff", "-z", "--name-only",
+                        f"{base_ref}..HEAD"], cwd=tree)
+    if r.returncode != 0:
+        return []
+    return [p for p in r.stdout.split("\0") if p]
+
+
+def _render_scoped(template: str | None, files: list[str],
+                   base_ref: str) -> str | None:
+    """Substitute `{files}` and `{base}` into a delta-proxy template.
+
+    Returns None when the template wants `{files}` and there are none. That
+    case must be a hard skip, not a bare runner invocation: rendering
+    `vitest related --run` with an empty file list runs EVERYTHING, which is
+    the exact inversion of the feature."""
+    if not template:
+        return None
+    if "{files}" in template:
+        if not files:
+            return None
+        template = template.replace(
+            "{files}", " ".join(shlex.quote(f) for f in files))
+    return template.replace("{base}", base_ref)
+
+
+def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
+    """Delta-proxy command *templates* for the test and build axes, keyed
+    `test` / `build` to match `resolve_blt`.
+
+    A proxy is deliberately **not** a subset of the canonical command, and is
+    not expected to be — `tsc --noEmit` catches a different set than
+    `next build`. It is a cheap falsifier run once per subtask, backed by an
+    expensive oracle run at the baseline and on the final tree (DESIGN §9).
+
+    Config-declared (`test_scoped` / `build_scoped` in `.leerie/config.toml`)
+    wins outright. Otherwise two narrow inferences, kept in this separate
+    function rather than folded into `_infer_build_lint_test` so the
+    launcher's mirrored bash inference and its parity guard
+    (`tests/test_config_verb.py`) stay untouched.
+
+    No lint tier: lint was measured at 0.4 h across a 51 h run, so scoping it
+    buys nothing and only adds a way to be wrong. No pytest inference either
+    — `{files}` for a repo whose changed file is `orchestrator/leerie.py`
+    renders `pytest orchestrator/leerie.py`, which collects nothing. Repos
+    like that declare nothing and fall back to the canonical command, which
+    is the honest outcome rather than a template that looks right and selects
+    nothing."""
+    declared = _load_blt_config(repo_root) or {}
+    out: dict[str, str] = {}
+    for key in ("test_scoped", "build_scoped"):
+        val = declared.get(key)
+        if val:
+            out[key[:-len("_scoped")]] = val
+
+    if "test" not in out:
+        if (next(repo_root.glob("vitest.config.*"), None) is not None
+                or next(repo_root.glob("vitest.workspace.*"), None) is not None):
+            # `related` takes SOURCE files and runs the tests importing them
+            # through vitest's own module graph. Preferred over
+            # `--changed <ref>` because the file list stays ours to compute.
+            # Static imports only (per vitest's docs), so a test reached
+            # solely via a dynamic import can be missed — acceptable for an
+            # advisory axis backed by a canonical final pass.
+            out["test"] = "npx vitest related --run {files} --passWithNoTests"
+        elif next(repo_root.glob("jest.config.*"), None) is not None:
+            out["test"] = ("npx jest --findRelatedTests {files} "
+                           "--passWithNoTests")
+    if "build" not in out and (repo_root / "tsconfig.json").is_file():
+        out["build"] = "npx tsc --noEmit"
+    return out
+
+
+def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
+                         files: list[str], base_ref: str,
+                         mode: str) -> tuple[dict[str, str], str]:
+    """`(axis name -> command, scope label)` for one subtask's conformance
+    round, given the resolved canonical commands and proxy templates.
+
+    Falls back to the canonical command for any axis whose proxy does not
+    resolve — an axis is never silently skipped. The scope label reports
+    `scoped` only when at least one axis actually used a proxy, so the
+    conformer prompt cannot claim a narrowing that did not happen."""
+    canonical = {"build": (blt.get("build") or "").strip(),
+                 "lint": (blt.get("lint") or "").strip(),
+                 "tests": (blt.get("test") or "").strip()}
+    if mode == "off":
+        return {}, "off"
+    if mode == "full":
+        return canonical, "full"
+    axes: dict[str, str] = {}
+    used_proxy = False
+    for axis in ("build", "lint", "tests"):
+        # `scoped` is keyed like resolve_blt (`test`, singular); the axis
+        # names are the conformer's (`tests`, plural). `_AXIS_CMD_KEY` is
+        # the one place that mapping lives.
+        rendered = _render_scoped(
+            scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref)
+        if rendered:
+            axes[axis] = rendered
+            used_proxy = True
+        else:
+            axes[axis] = canonical[axis]
+    return axes, ("scoped" if used_proxy else "full")
+
+
 def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
     """Read BLT-related keys from .leerie/config.toml.
 
@@ -25436,7 +25590,8 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
     if not cfg.exists():
         return None
     out: dict[str, str] = {}
-    for key in ("build", "lint", "test", "setup_packages"):
+    for key in ("build", "lint", "test", "setup_packages",
+                "build_scoped", "test_scoped"):
         val = _read_toml_key(cfg, key)
         if val is not None:
             out[key] = val
@@ -25888,7 +26043,8 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
                         efforts: dict[str, str | None],
                         rules_files: list[Path],
-                        blt_commands: dict[str, str],
+                        blt_results: dict[str, dict],
+                        blt_scope: str,
                         diff_base: str,
                         extra_feedback: str | None = None) -> dict | None:
     """Spawn one conformer for one subtask in its existing worktree.
@@ -25910,10 +26066,10 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
           "and commit any fixes here. Every commit subject must start "
           "with `conformer:`.",
           f"RULES_FILES: {rules_paths_str}",
-          f"BUILD_CMD: {blt_commands.get('build') or '(none)'}",
-          f"LINT_CMD: {blt_commands.get('lint') or '(none)'}",
-          f"TEST_CMD: {blt_commands.get('test') or '(none)'}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
+    blt_section = _format_blt_results_section(blt_results, blt_scope)
+    if blt_section is not None:
+        up.append(blt_section)
     baseline_section = _format_baseline_section(
         (st.data.get("conformance") or {}).get("_baseline"))
     if baseline_section is not None:
@@ -26288,6 +26444,92 @@ async def _run_checked_loop(
     return last_res, warnings
 
 
+def _format_blt_results_section(measured: dict[str, dict],
+                                scope: str) -> str | None:
+    """Render the orchestrator's own build/lint/test measurements as a
+    `BLT_RESULTS:` prompt block, or None when nothing was measured.
+
+    Replaces the `BUILD_CMD:` / `LINT_CMD:` / `TEST_CMD:` lines the conformer
+    used to receive. That substitution is the §12 lever: without the command
+    string the worker must synthesise one to run a full axis, which is a real
+    reduction in capability delivered by code rather than by asking."""
+    if not measured:
+        return None
+    lines = [f"BLT_RESULTS (scope: {scope}) — the orchestrator ran these "
+             "before this round, in this worktree. They are ground truth. "
+             "You did not run them and must not re-run a full axis:"]
+    for axis in ("build", "lint", "tests"):
+        a = measured.get(axis) or {}
+        if not a.get("ran"):
+            lines.append(f"- {axis}: not applicable to this repo")
+            continue
+        if not a.get("measured"):
+            lines.append(f"- {axis}: COULD NOT MEASURE — `{a.get('command', '')}` "
+                         "(its runner is not on PATH; attribute failures "
+                         "yourself for this axis)")
+            continue
+        lines.append(f"- {axis}: {'PASSED' if a.get('passed') else 'FAILED'} "
+                     f"— `{a.get('command', '')}`")
+        summary = (a.get("summary") or "").strip()
+        if summary and not a.get("passed"):
+            lines.append(f"    {summary}")
+    return "\n".join(lines)
+
+
+def _apply_measured_axes(conf_res: dict,
+                         measured: dict[str, dict]) -> dict:
+    """Replace the conformer's self-reported build/lint/test axes with the
+    orchestrator's measurement.
+
+    The second half of the §12 lever: once the orchestrator measures, what
+    the worker *claims* about an axis stops being load-bearing anywhere —
+    `_conformance_clean`, `_summarize_residuals` and the persisted
+    `conformance` entry all read the measured value instead.
+
+    Returns a NEW dict; the raw worker output is persisted as telemetry and
+    must stay as-emitted, the same discipline `_expand_conformer_output`
+    follows."""
+    if not measured or not isinstance(conf_res, dict):
+        return conf_res
+    out = dict(conf_res)
+    for axis in ("build", "lint", "tests"):
+        if axis in measured:
+            out[axis] = dict(measured[axis])
+    return out
+
+
+def _round_axis_regressions(pre: dict[str, dict],
+                            post: dict[str, dict]) -> list[str]:
+    """Axes measured green *before* a conformer round and red *after* it.
+
+    This is the only build/lint/test signal that continues the round loop
+    (DESIGN §9). It is attributable with no output parsing and no framework
+    knowledge: the same command, on the same worktree, either still passes or
+    it does not.
+
+    Three refusals, each load-bearing:
+    - an unmeasured side on either end yields nothing — no evidence is not
+      evidence of green;
+    - differing command strings are never compared, which is what stops a
+      scoped `pre` being weighed against a canonical `post`;
+    - red → red yields nothing. That is inherited debt, and re-driving the
+      conformer over it is the exact waste this work removes."""
+    out: list[str] = []
+    for axis in ("build", "lint", "tests"):
+        a = (pre or {}).get(axis) or {}
+        b = (post or {}).get(axis) or {}
+        if not a.get("measured") or not b.get("measured"):
+            continue
+        if a.get("command") != b.get("command"):
+            continue
+        if a.get("passed") and not b.get("passed"):
+            summary = (b.get("summary") or "").strip()[:300]
+            out.append(f"{axis}: passed before your changes this round and "
+                       f"fails after them — `{b.get('command', '')}`"
+                       + (f": {summary}" if summary else ""))
+    return out
+
+
 def _baseline_red_axes(baseline: dict | None) -> set[str]:
     """The build/lint/test axes that were already failing on the unmodified
     base tree, as a set. Empty when there is no baseline (skipped via
@@ -26638,12 +26880,37 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     # severest residual — it tried to destroy the implementer's work).
     clobbered_files: list[str] = []
 
+    # Which commands this subtask's rounds measure (DESIGN §9 *Per-subtask
+    # scope: a delta proxy, not the suite*). Resolved once: the changed-file
+    # set is the implementer's diff, and a conformer's own commits do not
+    # widen what this subtask is responsible for.
+    scoped_mode = st.data.get("subtask_tests") or "scoped"
+    changed = await _changed_files(worktree, run_branch)
+    subtask_axes, blt_scope = _select_subtask_axes(
+        blt, resolve_blt_scoped(repo_root), changed, run_branch, scoped_mode)
+    conf_log = leerie_dir / "logs" / f"{sid}-conformer.log"
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+
+    async def _measure(label: str) -> dict[str, dict]:
+        if not subtask_axes:
+            return {}
+        return await _measure_axes(
+            worktree, subtask_axes, st, caps, log_path=conf_log,
+            verbosity=verbosity, label_prefix=f"{sid}-{label}",
+            log_prefix=f"{sid}")
+
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
+        # Measure BEFORE the round, so the conformer reads results instead of
+        # spending its own turn budget waiting on a suite; and so the pair
+        # (pre, post) can attribute a regression to this round. On an
+        # unchanged tree the memo makes this free.
+        pre = await _measure("pre")
         try:
             last_res = await _run_conformer(
                 sid, leerie_dir, worktree, caps, st, models, efforts,
-                rules_files=rules_files, blt_commands=blt,
+                rules_files=rules_files, blt_results=pre,
+                blt_scope=blt_scope,
                 diff_base=run_branch, extra_feedback=blt_feedback)
         except PidExhaustedError as e:
             # N22: the build/lint/test the conformer ran spawned enough
@@ -26744,16 +27011,30 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             leerie_dir / "logs" / f"{sid}-conformer.log",
             f"conformer round {c_round}", warnings)
 
+        # Measure AFTER the round and overwrite the worker's self-report
+        # before anything reads it. From here on, what the conformer claimed
+        # about build/lint/test carries no weight anywhere — only what the
+        # orchestrator observed does.
+        post = await _measure("post")
+        last_res = _apply_measured_axes(last_res, post)
+        regressions = _round_axis_regressions(pre, post)
+        for r in regressions:
+            warnings.append(f"conformer round {c_round}: {r}")
+
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"conformer round {c_round}:")
             and ("auto-backgrounded" in w or "times in one round" in w)]
+        feedback_items = bg_retry_warnings + regressions
         blt_feedback = (
-            _format_check_feedback(bg_retry_warnings, c_round,
+            _format_check_feedback(feedback_items, c_round,
                                    caps["conformance_rounds"])
-            if bg_retry_warnings else None)
+            if feedback_items else None)
 
-        if _conformance_clean(last_res, baseline):
+        # A regression this round introduced is the one build/lint/test
+        # signal worth another round: unlike an absolute red axis it is
+        # attributable, and unlike inherited debt it is fixable here.
+        if _conformance_clean(last_res, baseline) and not regressions:
             break
 
     if last_res is not None:
@@ -27153,11 +27434,6 @@ async def _capture_conformance_baseline(
 
     repo_root = st.repo_root
     blt = resolve_blt(repo_root)
-    # resolve_blt keys the test axis "test" (singular); the conformer's
-    # structured-output result keys it "tests" (plural). Map the axis name
-    # we store/report ("tests", matching the conformer result + baseline
-    # consumers) to the resolve_blt command key ("test").
-    _AXIS_CMD_KEY = {"build": "build", "lint": "lint", "tests": "test"}
     if not any(blt.get(_AXIS_CMD_KEY[a]) for a in ("build", "lint", "tests")):
         log("phase 4: base-health baseline skipped — no build/lint/test "
             "commands resolved for this repo")
@@ -27279,8 +27555,25 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     staging_before_sha = await _branch_head_sha(str(staging))
     clobbered_files: list[str] = []
 
+    # The final pass always runs the CANONICAL commands, never a delta proxy
+    # (DESIGN §6). Its whole purpose is cross-subtask interaction breakage —
+    # a lint rule sensitive to file count, an import collision that compiled
+    # cleanly in isolation, a fixture two implementers each augmented — and
+    # none of that is visible to a diff-scoped selection.
+    final_axes = {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+                  for axis in ("build", "lint", "tests")}
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+
+    async def _measure_final(rnd: int, label: str) -> dict[str, dict]:
+        return await _measure_axes(
+            str(staging), final_axes, st, caps,
+            log_path=leerie_dir / "logs" / f"final-conformer-r{rnd}.log",
+            verbosity=verbosity, label_prefix=f"final-{label}",
+            log_prefix="final-conformer")
+
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
+        pre = await _measure_final(c_round, "pre")
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
         # but the spec / criteria lines are replaced with one sentence
@@ -27298,12 +27591,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             "worktree. Make and commit any fixes here. Every commit "
             "subject must start with `conformer:`.",
             f"RULES_FILES: {rules_paths_str}",
-            f"BUILD_CMD: {blt.get('build') or '(none)'}",
-            f"LINT_CMD: {blt.get('lint') or '(none)'}",
-            f"TEST_CMD: {blt.get('test') or '(none)'}",
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
+        blt_section = _format_blt_results_section(pre, "full")
+        if blt_section is not None:
+            up.append(blt_section)
         baseline_section = _format_baseline_section(
             (st.data.get("conformance") or {}).get("_baseline"))
         if baseline_section is not None:
@@ -27431,16 +27724,26 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
             f"final conformer round {c_round}", warnings)
 
+        # Same measure-after-and-overwrite as the per-subtask phase: the
+        # worker's self-reported axes stop being load-bearing here too.
+        post = await _measure_final(c_round, "post")
+        res = _apply_measured_axes(res, post)
+        last_res = res
+        regressions = _round_axis_regressions(pre, post)
+        for r in regressions:
+            warnings.append(f"final conformer round {c_round}: {r}")
+
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"final conformer round {c_round}:")
             and ("auto-backgrounded" in w or "times in one round" in w)]
+        feedback_items = bg_retry_warnings + regressions
         blt_feedback = (
-            _format_check_feedback(bg_retry_warnings, c_round,
+            _format_check_feedback(feedback_items, c_round,
                                    caps["conformance_rounds"])
-            if bg_retry_warnings else None)
+            if feedback_items else None)
 
-        if _conformance_clean(res, baseline):
+        if _conformance_clean(res, baseline) and not regressions:
             break
 
     if last_res is not None:
@@ -29610,6 +29913,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
+        st.data["subtask_tests"] = resolve_subtask_tests(
+            st.repo_root, getattr(args, "subtask_tests", None))
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
         # leerie_version/leerie_commit are set ONCE, at the run's original
@@ -29702,6 +30007,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
+                   "subtask_tests": resolve_subtask_tests(
+                       repo_root,
+                       getattr(args, "subtask_tests", None)),
                    "skip_base_baseline": bool(args.skip_base_baseline),
                    "skip_repo_map": bool(args.skip_repo_map),
                    "leerie_version": _read_version(),
@@ -30445,6 +30753,18 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "with resume after fixing. "
                          f"Also {STRICT_CONFORMER_ENV} env or "
                          "strict_conformer in leerie.toml. Default: off.")
+    ap.add_argument("--subtask-tests", choices=SUBTASK_TESTS_VALUES,
+                    default=None,
+                    help="how much of the repo's suite each per-subtask "
+                         "conformance round measures (DESIGN §9). 'scoped' "
+                         "(default) runs a diff-scoped proxy where one "
+                         "resolves and the canonical command otherwise; "
+                         "'full' always runs the canonical command; 'off' "
+                         "measures nothing per subtask. The canonical "
+                         "command always runs at the base-health baseline "
+                         "and on the final integrated tree regardless. "
+                         f"Also {SUBTASK_TESTS_ENV} env or subtask_tests "
+                         "in leerie.toml.")
     ap.add_argument("--skip-base-baseline", action="store_true",
                     help="skip the base-tree health baseline (DESIGN §9): the "
                          "once-per-run install-into-staging + build/lint/test "

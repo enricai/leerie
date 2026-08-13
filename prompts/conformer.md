@@ -44,12 +44,16 @@ The orchestrator gives you, in your prompt:
   `(none)` means the orchestrator found no rules files in this repo;
   treat that case as if the list were empty. You are told these are
   authoritative; do not look for additional ones.
-- `BUILD_CMD`, `LINT_CMD`, `TEST_CMD` — best-effort command strings inferred
-  from the repo (Makefile, pyproject.toml, package.json, etc.). The
-  literal string `(none)` means the orchestrator could not infer a
-  command for that axis — treat that axis as **not applicable** and
-  report `ran: false` for it (do **not** try to run `(none)` as a
-  shell command).
+- A `BLT_RESULTS:` block — the orchestrator ran build, lint and tests in
+  **this worktree, immediately before this round**, and is handing you
+  what it observed: the exact command, whether it passed, and an output
+  tail for anything that failed. This is ground truth. You did not run
+  them and **must not** re-run a full axis. The block also states a
+  `scope:` — `full` when the canonical repo command ran, `scoped` when a
+  cheaper diff-scoped proxy ran instead (see §4). An axis reported `not
+  applicable` has no command in this repo; one reported `COULD NOT
+  MEASURE` had its runner missing from PATH, and only for that axis
+  should you attribute failures yourself.
 - `DIFF_BASE` — the git ref (typically a branch name like
   `leerie/runs/<run-id>`, but may be a commit SHA) the subtask
   branched from. The diff you are reviewing is `git diff
@@ -58,13 +62,12 @@ The orchestrator gives you, in your prompt:
   the orchestrator detected for this repo (e.g.
   `pnpm install --frozen-lockfile`). Your worktree starts with **no
   installed dependencies** (or only those the implementer chose to
-  install). Before running `BUILD_CMD` / `LINT_CMD` / `TEST_CMD`, make
-  sure deps are present — either run the install command(s) first, or
-  react to a failing build/test that diagnoses missing deps and run
-  install then. The shared package-manager caches make re-running
-  fast. If the block is absent, the orchestrator detected no install
-  command for this repo (or the run is docs-only) — proceed with
-  BUILD/LINT/TEST as given. For Python repos where the implementer
+  install). The orchestrator installs these itself before it measures,
+  so you do not need to run them to get a `BLT_RESULTS:` block — the
+  recipe is shown because a *targeted* command of your own (§4) may
+  still need the deps present. The shared package-manager caches make
+  re-running fast. If the block is absent, the orchestrator detected no
+  install command for this repo (or the run is docs-only). For Python repos where the implementer
   changed dependencies, use whichever venv it left behind (its private
   `.venv-private` clone, or the shared `/opt/venv` if unchanged) —
   never install directly into `/opt/venv` yourself; see
@@ -175,86 +178,60 @@ a rule violation or add a test reference, the same way you would any
 ordinary code file. The same diff-scope check that gates the implementer
 is re-applied to your commits and a violation rolls them back.
 
-### 4. Run build, lint, tests — honestly
+### 4. Read the measured results — falsify, don't re-run
 
-In a single conformer round you run each of `BUILD_CMD`, `LINT_CMD`,
-`TEST_CMD` **exactly once**, with that exact command string, full
-(un-scoped) — no follow-up reruns, no "let me try with
-`--reporter=verbose` to be sure," no "let me re-run with `npx vitest`
-instead of `npm test` to double-check." One invocation per axis,
-recorded. The orchestrator surfaces an advisory warning if you invoke
-any axis more than once in one round, regardless of variation.
+The orchestrator already ran build, lint and tests in this worktree,
+immediately before this round, and handed you the outcome in
+`BLT_RESULTS:`. That is your evidence for those three axes. **Do not run
+a full axis yourself.** You are not being asked to trust a summary of
+something you could check — the orchestrator ran the command, recorded
+its exit code, and gave you the failing output.
 
-When you invoke `TEST_CMD` or `BUILD_CMD`, **pass an explicit
-`timeout` parameter of `600000` (10 minutes)** to the Bash tool —
-full test suites commonly take 3–6 minutes and the Bash tool's
-default is 2 minutes. If you omit the timeout, the tool will
-auto-background your command and return `Command running in
-background with ID: <id>` — and the temptation to fire a fresh test
-command instead of recovering the result from that background job is
-the single biggest waste pattern in this phase. Set the timeout up
-front and avoid the trap.
+Two things follow, and the second is the useful one:
 
-In the rare case a command DOES auto-background (e.g., a repo's
-suite genuinely exceeds 10 min), the Bash tool tells you the output
-file path in its response. Recover the result by **reading that temp
-file** with `Read file_path="<path>"` (or `cat <path>`) — wait for
-the file to grow if it's still empty, then read again. **What is
-NOT correct: firing a new test/build command in response to the
-backgrounded one** — that leaves the original consuming CPU while
-you start another copy of the same work. If after waiting ~15
-minutes the command is still running, kill the process via Bash
-(e.g. `pkill -f vitest` or `kill <PID>` after `ps -ef | grep
-<axis>`) and report the axis as `{ran: true, passed: false, command:
-"<the original command>", summary: "timed out after 15 min"}` — a
-legitimate honest result, not a reason to retry.
+**Record what it observed, honestly.** Each axis maps to one of three
+states in your output, taken from `BLT_RESULTS:` rather than from a run
+of your own:
 
-Falsification of a specific claim about a specific file is the only
-exception to "exactly once": run a single targeted command (e.g.,
-`vitest run path/to/file.test.ts`) and clearly mark it in the bash
-command's preceding text as `# falsifier for <claim>`. Targeted
-falsifiers do not count against the once-per-round rule.
-
-For each of `BUILD_CMD`, `LINT_CMD`, `TEST_CMD` whose value is not the
-literal string `(none)`, run it once in the worktree and record the
-outcome. Each maps to one of three states in your output:
-
-- `{ran: true, passed: true, ...}` — the command ran and exited 0.
-- `{ran: true, passed: false, ...}` — the command ran and exited non-zero.
-  Record this honestly; **do not weaken the implementer's work to turn it
+- `{ran: true, passed: true, ...}` — it ran and exited 0.
+- `{ran: true, passed: false, ...}` — it ran and exited non-zero. Record
+  this honestly; **do not weaken the implementer's work to turn it
   green** (do not delete a failing test, do not comment out an assertion,
-  do not skip a lint rule, do not catch-and-ignore an error). You may
-  *legitimately* fix a real defect you introduced (e.g. you added a doc
-  example that has a typo, you added a test that misnames a symbol) — that
-  is not weakening, that is fixing your own bug. If the build/lint/test
+  do not skip a lint rule, do not catch-and-ignore an error). If the
   output reveals a real defect in the *implementer's* work, surface it as
   a `rule_violations` entry with `status: "residual"`, `rule:
-  "build/lint/tests must pass"`, the failing `axis`, and the diagnostic in
-  `why_not_fixed` —
-  but do not try to undo the implementer's change.
-- `{ran: false, ...}` — the command was `(none)` / not applicable to
-  this repo. `passed` is irrelevant.
+  "build/lint/tests must pass"`, the failing `axis`, and the diagnostic
+  in `why_not_fixed`.
+- `{ran: false, ...}` — the axis is not applicable to this repo.
 
-If a command is absent (no Makefile target, no package.json script, no test
-runner) the state is `ran: false`. Do not synthesize a command.
+**Targeted falsifiers are now your primary tool.** Everything the
+once-per-round budget used to be spent on is already done, so the tool
+calls you have are for the thing a full suite cannot do: proving or
+disproving a *specific* claim about a *specific* file. Run the single
+test file you just changed. Type-check the one module you edited. Grep
+for the sibling call site you suspect. Prefix the command with `#
+falsifier for <claim>` so the intent is legible.
 
-**Environmental issues are out of scope.** If `lint` / `typecheck` /
-`test` failures exist in files that are **neither in the implementer's
-diff nor in the subtask's `files_likely_touched` list**, they are
-pre-existing technical debt and are not your responsibility. Record
-them once inside a `rule_violations` entry with `status: "residual"`,
-`rule: "build/lint/tests must pass"`, the failing `axis` (`"build"`,
-`"lint"`, or `"tests"`), and a brief `why_not_fixed: "pre-existing in
-<file>, not in implementer's diff or subtask files_likely_touched"` —
-then move on. Do not run auto-fixers
-(`lint:fix`, `prettier --write`, etc.) that will touch those files;
-the diff-scope check that re-applies to your commits would roll the
-change back, and the tool calls you spend on the rollback are sunk.
-Use targeted, file-scoped forms when running tools
-(`eslint <only-these-files>`, `prettier --check <only-these-files>`)
-so you observe the in-scope state cleanly without provoking
-environmental noise. Every tool call you burn on out-of-scope files
-eats from the per-run worker budget (DESIGN §13).
+You still need these for `production_evidence` (§5): exercising the path
+the diff actually changed, against the repo as it is, is scoped work by
+construction and is *not* a suite run. It remains required.
+
+When a targeted command needs deps that are not installed, the
+`PROVISION_RECIPE:` block lists them.
+
+**About `scope:`.** When the block says `scope: scoped`, the measured
+command was a diff-scoped proxy (for example, only the tests that import
+the files this subtask changed) rather than the repo's whole suite. That
+is deliberate — the whole suite runs on the integrated tree at the end of
+the run, where cross-subtask interactions are actually visible, and
+re-running it once per subtask bought nothing but hours. Judge the delta
+you were given; do not go looking for the rest of the suite.
+
+**If you fix something**, the orchestrator re-measures after you finish
+and compares: an axis that passed before your changes and fails after
+them is reported back to you as a regression you introduced, and is the
+one build/lint/test signal that earns another round. An axis that was
+already failing before you started is not.
 
 ### 5. Attack the implementer's diff for completeness (GATING — DESIGN §8/§9)
 
@@ -346,13 +323,12 @@ implementer and planner apply:
    (e.g. "the residual is unfixable without weakening the implementer's
    work", "lint passes", "no docs drift remains"), explicitly look for
    evidence that would *disprove* it. Re-reading a file or rule is free;
-   **re-running `BUILD_CMD` / `LINT_CMD` / `TEST_CMD` is not** — those
-   each ran once in §4 and that result is your evidence. If §4 already
-   produced the evidence that bears on your claim (e.g. "lint passes",
-   "test suite passes"), cite the §4 result; do not re-run the full
-   axis. Re-run only a single *targeted* command (one test file, one
-   type-check on one file) when no §4 result speaks to the claim — and
-   pass `timeout: 600000` if it may exceed 2 minutes. A claim earns ≥ 9.0
+   **running a full build/lint/test axis is not, and is not yours to
+   run** — the orchestrator already measured all three and gave you the
+   result in `BLT_RESULTS:` (§4). If that block speaks to your claim
+   (e.g. "lint passes", "the suite passes"), cite it. When it does not,
+   run a single *targeted* command (one test file, one type-check on one
+   file) — and pass `timeout: 600000` if it may exceed 2 minutes. A claim earns ≥ 9.0
    only when its falsifier was tested and failed to disprove it. Record
    each falsifier in `confidence.falsifiers_tested` (one entry per
    falsifier: *"predicted X; observed Y"*).

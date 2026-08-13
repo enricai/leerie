@@ -19,6 +19,32 @@ import subprocess
 from pathlib import Path
 
 
+def _stub_measure_axes(leerie_mod, axes):
+    """Make the orchestrator's own BLT measurement return `axes`.
+
+    Since the handover (DESIGN §9) the orchestrator measures build/lint/test
+    itself and OVERWRITES whatever the conformer self-reported, so a test that
+    wants a failing axis has to fail it here — setting it on the worker's
+    result no longer reaches any consumer, which is the point of the change.
+    """
+    seq = axes if isinstance(axes, list) else None
+    calls = {"n": 0}
+
+    async def _stub(tree, axes_map, st, caps, **kw):
+        if seq is None:
+            return dict(axes)
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return dict(seq[i])
+    leerie_mod._measure_axes = _stub
+    return calls
+
+
+def _failing_axis(axis="build", command="make", summary="oops"):
+    return {axis: {"ran": True, "measured": True, "passed": False,
+                   "command": command, "summary": summary}}
+
+
 def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
 
@@ -135,8 +161,8 @@ def _stub_run_conformer(leerie_mod, results_queue, *, commits=None):
     state = {"i": 0, "feedbacks": []}
 
     async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
-                    *, rules_files, blt_commands, diff_base,
-                    extra_feedback=None):
+                    *, rules_files, diff_base,
+                    extra_feedback=None, **_kw):
         i = state["i"]
         state["i"] += 1
         state["feedbacks"].append(extra_feedback)
@@ -223,8 +249,8 @@ def test_pid_exhaustion_attaches_pids_stat_to_warnings(env):
     c = env["leerie"]
 
     async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
-                    *, rules_files, blt_commands, diff_base,
-                    extra_feedback=None):
+                    *, rules_files, diff_base,
+                    extra_feedback=None, **_kw):
         raise c.PidExhaustedError(
             "worker t1-conformer exhausted its PID cgroup "
             "(pids.current=2048/2048, fork denials=7); every "
@@ -262,7 +288,7 @@ def test_run_conformer_reraises_pid_exhausted_error(env, monkeypatch):
         asyncio.run(c._run_conformer(
             env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
             env["st"], env["models"], {"conformer": None}, rules_files=[],
-            blt_commands={"build": "", "lint": "", "test": ""},
+            blt_results={}, blt_scope="off",
             diff_base=env["run_branch"]))
 
 
@@ -362,6 +388,9 @@ def test_rounds_cap_respected_with_residuals(env):
                "summary": "oops"},
     )
     state = _stub_run_conformer(c, [failing, failing, failing, failing])
+    # The failing axis must come from the ORCHESTRATOR now — a self-reported
+    # one is overwritten before any consumer sees it.
+    _stub_measure_axes(c, _failing_axis())
 
     res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
@@ -472,7 +501,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     result = asyncio.run(c._run_conformer(
         env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
         env["st"], env["models"], env["efforts"],
-        rules_files=[], blt_commands={"build": "", "lint": "", "test": ""},
+        rules_files=[], blt_results={}, blt_scope="off",
         diff_base="dummy"))
     assert result is None, "budget-exhausted conformer must return None"
 
@@ -646,6 +675,13 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
         build={"ran": True, "passed": False, "command": "npm run build",
                "summary": "fail"})
     state = _stub_run_conformer(c, [dirty, _clean_result()])
+    # Round 0 must stay non-clean so a round 1 happens at all; since
+    # the handover that has to be a measured failure, not a claimed one.
+    # measurement order is pre0, post0, pre1, post1 — fail the first two so
+    # round 0 is non-clean, then go green so round 1 exits.
+    _stub_measure_axes(c, [_failing_axis(command="npm run build"),
+                           _failing_axis(command="npm run build"),
+                           {}, {}])
 
     # Write a log that triggers the Pattern B warning: a Bash command
     # auto-backgrounded, then immediately retried with a fresh Bash.
@@ -682,6 +718,13 @@ def test_pattern_a_multi_invocation_now_injects_feedback(env):
         build={"ran": True, "passed": False, "command": "npm run build",
                "summary": "fail"})
     state = _stub_run_conformer(c, [dirty, _clean_result()])
+    # Round 0 must stay non-clean so a round 1 happens at all; since
+    # the handover that has to be a measured failure, not a claimed one.
+    # measurement order is pre0, post0, pre1, post1 — fail the first two so
+    # round 0 is non-clean, then go green so round 1 exits.
+    _stub_measure_axes(c, [_failing_axis(command="npm run build"),
+                           _failing_axis(command="npm run build"),
+                           {}, {}])
 
     # Write a log that triggers Pattern A only (multiple invocations,
     # no auto-backgrounding).
