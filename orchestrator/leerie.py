@@ -410,6 +410,12 @@ STATE_FIELDS = (
     "cgroup_containment",
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
+    # Per-run memo of orchestrator-measured build/lint/test verdicts, keyed
+    # by (axis, command, tree sha) — see `_measure_axes`. Deliberately placed
+    # BEFORE `conformance` rather than between it and `unreviewed_subtasks`:
+    # those two carry a documented adjacency pin (one records the review, the
+    # other its absence) and must not be separated.
+    "blt_results",
     "conformance",
     # Subtask ids whose conformer produced no result (crash / timeout), so a
     # subtask that was never reviewed is distinguishable from one that
@@ -26885,6 +26891,118 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
                 "summary": f"{type(ex).__name__}: {ex}"}
 
 
+async def _worktree_tree_sha(tree: str) -> str | None:
+    """`git rev-parse HEAD^{tree}` for `tree`, or None when the tree is not
+    safely identifiable by content.
+
+    Content-addressed on purpose: an empty conformer commit, a rebase, or two
+    worktrees that happen to converge all describe the same measurable state,
+    and a commit sha would miss every one of them.
+
+    Returns None — meaning *neither serve nor store a memo entry* — when the
+    worktree is dirty or git fails. `HEAD^{tree}` cannot see uncommitted
+    changes, and `_run_conformance_phase` explicitly tolerates a conformer
+    that left some behind, so a memo keyed on a dirty tree would describe
+    something other than what was measured."""
+    r = await run_proc(["git", "status", "--porcelain"], cwd=tree)
+    if r.returncode != 0 or r.stdout.strip():
+        return None
+    r = await run_proc(["git", "rev-parse", "HEAD^{tree}"], cwd=tree)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
+    """Key for one measured axis on one tree.
+
+    Deliberately NOT including a dependency fingerprint: lockfiles are
+    tracked files and are therefore already inside `tree_sha`, while the
+    provision recipe and the container image are constant within a run. A
+    separate fingerprint would add a second thing to keep correct without
+    distinguishing any state the tree sha does not."""
+    return hashlib.sha256(
+        f"{axis}\x00{cmd}\x00{tree_sha}".encode()).hexdigest()[:32]
+
+
+async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
+                        caps: dict, *, log_path: Path, verbosity: str,
+                        label_prefix: str = "baseline",
+                        log_prefix: str = "base-baseline",
+                        memo: bool = True) -> dict[str, dict]:
+    """Measure each axis in `axes` (axis name → command) on `tree`, serving
+    repeat measurements of an unchanged tree from `st.data["blt_results"]`.
+
+    This is what makes measuring before *and* after a conformer round
+    affordable: measured across a real 91-subtask run, 182 of 224 conformer
+    rounds (81%) committed nothing at all, so the post-round tree is usually
+    byte-identical to the pre-round one and the second measurement is free.
+
+    Deps are installed lazily, on the first real measurement for a worktree,
+    so a docs-only subtask whose axes are never measured never pays for an
+    install it does not need (the reason `_run_implementer` declines to
+    pre-install).
+
+    A verdict is stored only when it describes a reproducible fact: never for
+    a dirty tree (no stable key), and never for a crash, a timeout, or an
+    unmeasurable runner-missing result. That mirrors `satisfied_probe_cache`,
+    which deliberately does not cache a crashed probe — a verdict that was
+    never actually reached must be re-measured, not remembered."""
+    results: dict[str, dict] = {}
+    tree_sha = await _worktree_tree_sha(tree) if memo else None
+    store = st.data.setdefault("blt_results", {}) if memo else {}
+    installed = False
+    dirty = False
+
+    for axis, cmd in axes.items():
+        cmd = (cmd or "").strip()
+        if not cmd:
+            results[axis] = await _measure_blt(
+                axis, "", tree, timeout=0.0, log_path=log_path,
+                verbosity=verbosity, label_prefix=label_prefix)
+            continue
+
+        key = _blt_memo_key(axis, cmd, tree_sha) if tree_sha else None
+        if key and key in store:
+            results[axis] = dict(store[key])
+            log(f"  {log_prefix}: {axis} unchanged since last measurement "
+                f"— reusing recorded result")
+            continue
+
+        if not installed:
+            await _ensure_worktree_deps(
+                tree, st, caps, log_path=log_path, verbosity=verbosity,
+                label_prefix=label_prefix, log_prefix=log_prefix)
+            installed = True
+            # Installing can write into the worktree (lockfile churn,
+            # generated clients), so a sha taken before it may no longer
+            # describe the tree. Re-derive once, after the only step that
+            # can invalidate it.
+            if memo and not dirty:
+                tree_sha = await _worktree_tree_sha(tree)
+                if tree_sha is None:
+                    dirty = True
+
+        res = await _measure_blt(
+            axis, cmd, tree,
+            timeout=float(caps.get("worker_timeout_sec")
+                          or DEFAULT_CAPS["worker_timeout_sec"]),
+            log_path=log_path, verbosity=verbosity,
+            label_prefix=label_prefix)
+        results[axis] = res
+
+        if not (memo and tree_sha):
+            continue
+        if not res.get("ran") or not res.get("measured"):
+            continue                      # crashed, or runner absent
+        if str(res.get("summary", "")).startswith("timed out after"):
+            continue                      # never reached a verdict
+        store[_blt_memo_key(axis, cmd, tree_sha)] = dict(res)
+        st.save()
+
+    return results
+
+
 def _runner_missing(summary: str) -> bool:
     """True if a failed baseline command failed because its runner is not
     on PATH (rather than a real test/build/lint failure). The canonical
@@ -27059,17 +27177,18 @@ async def _capture_conformance_baseline(
     # code streamed each entry under `baseline-install:` while logging its
     # failures as `base-baseline:`. Collapsing them to one prefix would be a
     # silent behaviour change in operator-facing output.
-    await _ensure_worktree_deps(str(staging), st, caps, log_path=log_path,
-                                verbosity=verbosity,
-                                label_prefix="baseline",
-                                log_prefix="base-baseline")
-
-    axes: dict[str, dict] = {}
-    for axis in ("build", "lint", "tests"):
-        axes[axis] = await _measure_blt(
-            axis, (blt.get(_AXIS_CMD_KEY[axis]) or "").strip(), str(staging),
-            timeout=timeout, log_path=log_path, verbosity=verbosity,
-            label_prefix="baseline")
+    #
+    # `_measure_axes` owns the install now, lazily on the first axis that
+    # actually needs it. On this path that is equivalent to installing up
+    # front — the baseline always measures — but it keeps one code path for
+    # every caller rather than two that can drift.
+    axes = await _measure_axes(
+        str(staging),
+        {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+         for axis in ("build", "lint", "tests")},
+        st, {**caps, "worker_timeout_sec": timeout},
+        log_path=log_path, verbosity=verbosity,
+        label_prefix="baseline", log_prefix="base-baseline")
 
     # An axis is RED only if it actually ran AND was measurable AND failed.
     # Unmeasurable axes (runner missing) are neither red nor green — they
