@@ -167,6 +167,57 @@ def test_loop_worker_error_retries_then_succeeds(leerie):
         "the crash must still be surfaced as a warning, not swallowed")
 
 
+# --- TimeoutExpired is the same class of failure (N25) ---------------------
+# The per-worker timeout table lowers the ceiling for 18 worker types. Every
+# one of them reaches `claude -p` through a `_run_checked_loop` caller or a
+# bare `except WorkerError` site, and NONE of them had a TimeoutExpired
+# handler — the only three in the module serve implementer/conformer, which
+# are deliberately absent from the table. So a worker killed at its new,
+# lower ceiling took `except Exception: break` ("a bug in leerie itself"),
+# abandoned the loop and died, when the retry directly above it is exactly
+# the right treatment. Pre-existing at a uniform 5400 s; the table made it
+# ~4x more reachable, and the motivating case was a hung classifier.
+
+def test_loop_timeout_retries_like_a_worker_error(leerie):
+    """A killed-at-the-ceiling worker retries on a fresh session."""
+    import subprocess
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=1236)
+        return {"ok": True}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="classifier", max_rounds=3))
+    assert result == {"ok": True}, (
+        "a timeout must not abandon the loop — a hung worker killed at its "
+        "ceiling is an infrastructure failure, and the next round is a fresh "
+        "process. Treating it as a leerie bug kills the whole run")
+    assert len(calls) == 2, f"expected a retry after the timeout; got {calls}"
+
+
+def test_loop_timeout_warning_never_contains_the_argv(leerie):
+    """`str(TimeoutExpired)` renders `cmd` — for leerie the entire
+    `claude -p` command line, including an inlined system prompt on the
+    no-file-flag path. `_run_implementer`'s handler documents that as a 50 KB
+    terminal dump. The warning must name the ceiling instead."""
+    import subprocess
+    secret = "--append-system-prompt=" + ("S" * 500)
+
+    async def invoke():
+        raise subprocess.TimeoutExpired(cmd=["claude", "-p", secret],
+                                        timeout=1236)
+
+    _, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="classifier", max_rounds=1))
+    joined = " ".join(warnings)
+    assert "1236" in joined, "the ceiling that actually applied is not named"
+    assert secret not in joined and "append-system-prompt" not in joined, (
+        "the worker argv leaked into a warning line")
+
+
 def test_loop_worker_error_every_round_returns_none(leerie):
     """When every round crashes, the loop still returns None (callers'
     `is None` escalation path is unchanged) and bounds itself by max_rounds."""

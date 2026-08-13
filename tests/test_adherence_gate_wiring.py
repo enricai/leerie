@@ -24,6 +24,7 @@ test_dep_capture_wiring.py's inspect.getsource approach):
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -240,11 +241,20 @@ class TestAdherenceJudgeWorkerErrorDegrades:
         (break) — the mechanism phase_adherence_gate relies on to not
         discard the loop on a single transient crash."""
         src = inspect.getsource(leerie._run_checked_loop)
-        except_idx = src.find("except WorkerError as exc:")
-        assert except_idx != -1, (
+        # Matched by exception NAME, not by the literal `except WorkerError
+        # as exc:`. The arm is now
+        # `except (WorkerError, subprocess.TimeoutExpired) as exc:` — a
+        # worker killed at its wall-clock ceiling raises TimeoutExpired, which
+        # is the same infrastructure class this arm already retried, and a
+        # literal match failed on that widening while the retry it guards was
+        # strictly stronger. Still fails if the arm is deleted or narrowed to
+        # something that does not name WorkerError.
+        m = re.search(r"except\s+[^\n:]*\bWorkerError\b[^\n:]*as exc:", src)
+        assert m is not None, (
             "_run_checked_loop must catch WorkerError separately from "
             "other exceptions"
         )
+        except_idx = m.start()
         next_except_idx = src.find("except Exception as exc:", except_idx)
         assert next_except_idx != -1
         we_branch = src[except_idx:next_except_idx]

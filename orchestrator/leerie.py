@@ -236,6 +236,14 @@ DEFAULT_CAPS = {
     # resolved at run start by resolve_worker_demand_estimate, which raises
     # it only for a repo declaring its own Node heap (N14-16).
     "worker_demand_estimate_bytes": None,
+    # Whether the operator set the global wall-clock ceiling anywhere (N25).
+    # Declared here for the same reason as the row above — it is resolved at
+    # run start rather than configured — and because `resolve_worker_timeout`
+    # keys the table bypass on it. False means "nothing was set, apply the
+    # per-worker table"; the value cannot be derived from
+    # `worker_timeout_sec` itself, since explicitly passing the default is
+    # indistinguishable from passing nothing.
+    "worker_timeout_explicit": False,
     # Per-worker cgroup v2 PID cap. Catches runaway fork-bomb behavior
     # from a worker's tool subtree while still admitting a legitimate
     # heavy conformance run. The prior default of 256 was too low for a
@@ -782,23 +790,16 @@ RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
 
 # N30: minimum fraction of the state-dir filesystem's total capacity that
 # must remain free. Below this, leerie refuses to start (preflight) or
-# pauses resumably (mid-run). This is the FLOOR, not the whole rule — see
-# `_disk_required_bytes` below for the measured, worktree-sized bound that
-# sits on top of it. A proportional floor scales with disk size (a huge
-# disk and a tiny one both keep a proportional margin) without pretending
-# to know per-run byte cost.
+# pauses resumably (mid-run).
+#
+# A proportional fraction, and deliberately the ONLY rule. A per-worktree
+# measured bound was built on top of this and was wrong four separate ways
+# before being withdrawn — see IMPLEMENTATION.md's "Disk headroom (N30)"
+# section for what was tried and why each attempt failed. A fraction scales
+# with disk size (a huge disk and a tiny one both keep a proportional
+# margin) without pretending to know per-run byte cost, which is the
+# quantity that proved unmeasurable from inside the orchestrator.
 DISK_MIN_FREE_RATIO = 0.05  # 5% free
-
-# Multiplier on the measured worktree cost, covering the staging worktree
-# plus ordinary growth within a wave (a worker installing a dependency its
-# subtask adds). Not a guess about disk size — it multiplies a quantity that
-# is measured on the running repo.
-_DISK_HEADROOM_SAFETY = 1.25
-
-# Measured per-run, keyed by run dir: one subtask worktree's real disk cost.
-# Cached because the walk is O(files-in-node_modules) and the answer does not
-# meaningfully move within a run.
-_WORKTREE_SIZE_CACHE: dict[str, int] = {}
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -1207,7 +1208,7 @@ EFFORT_ENV = "LEERIE_EFFORT"
 #
 # The values are DERIVED, not chosen. `tests/fixtures/worker_duration/
 # summary.json` holds the measured per-worker distribution (15,951 calls
-# across 21 worker types, 153 runs; regenerate with
+# across 21 worker types; regenerate with
 # `scripts/measure/worker_durations.py <state-root>`), and each entry is
 #
 #     min(cap, max(_WORKER_TIMEOUT_FLOOR_SEC, ceil(p99*3), ceil(max*1.2)))
@@ -1261,13 +1262,20 @@ def resolve_worker_timeout(worker: str, caps: dict) -> int:
     Two tiers, and which one applies turns on whether the operator said
     anything:
 
-    - **No explicit global** (the resolved cap still equals
-      `DEFAULT_CAPS["worker_timeout_sec"]`): the per-worker table applies,
-      lowering the ceiling for the 18 measured-fast worker types and leaving
-      everything else at the default.
+    - **No explicit global**: the per-worker table applies, lowering the
+      ceiling for the 18 measured-fast worker types and leaving everything
+      else at the default. Bounded by the global so a lowered default still
+      lowers every worker.
     - **An explicit global** (`--worker-timeout` / `LEERIE_WORKER_TIMEOUT` /
-      `worker_timeout_sec` in `leerie.toml` resolved to anything else): that
-      value wins outright and the table is bypassed.
+      `worker_timeout_sec` in `leerie.toml`): that value wins outright and
+      the table is bypassed.
+
+    Keyed on `caps["worker_timeout_explicit"]`, NOT on whether the resolved
+    int differs from the default. Comparing values made `--worker-timeout
+    5400` — the one gesture an operator debugging timeouts is most likely to
+    try — indistinguishable from setting nothing, silently leaving
+    `classifier` at 1236 s. Resolvers return a plain int, so the
+    explicit/implicit bit has to be carried separately.
 
     The explicit tier has to win rather than merely bound, or the escape
     hatch does not reach the case that needs it. The table is derived from a
@@ -1281,9 +1289,9 @@ def resolve_worker_timeout(worker: str, caps: dict) -> int:
     """
     global_cap = caps.get("worker_timeout_sec",
                           DEFAULT_CAPS["worker_timeout_sec"])
-    if global_cap != DEFAULT_CAPS["worker_timeout_sec"]:
+    if caps.get("worker_timeout_explicit"):
         return global_cap
-    return TIMEOUT_DEFAULT_PER_WORKER.get(worker, global_cap)
+    return min(TIMEOUT_DEFAULT_PER_WORKER.get(worker, global_cap), global_cap)
 
 
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -5556,6 +5564,24 @@ def resolve_worker_timeout_sec(repo_root: Path,
         default=DEFAULT_CAPS["worker_timeout_sec"])
 
 
+def resolve_worker_timeout_explicit(repo_root: Path,
+                                    cli_value: int | None = None) -> bool:
+    """True when the operator set the global ceiling anywhere.
+
+    `_resolve_positive_int_pref` returns a plain `int`, so "5400 because the
+    operator asked" and "5400 because nothing was set" are indistinguishable
+    downstream — which made an explicit `--worker-timeout 5400` a silent
+    no-op. This re-walks the same three tiers and reports only whether any
+    of them spoke; `resolve_worker_timeout_sec` still owns the value and its
+    validation."""
+    if cli_value is not None:
+        return True
+    if os.environ.get(WORKER_TIMEOUT_ENV, "").strip():
+        return True
+    return _read_toml_key(repo_root / WORKER_TIMEOUT_FILE,
+                          "worker_timeout_sec") is not None
+
+
 def resolve_worker_pids_max(repo_root: Path,
                             cli_value: int | None = None) -> int:
     """Resolve the per-worker cgroup PID cap (pids.max). Order:
@@ -6463,109 +6489,6 @@ def _disk_free_ratio(path: Path) -> float:
     return usage.free / usage.total
 
 
-def _measure_worktree_bytes(leerie_dir: Path) -> int | None:
-    """MARGINAL disk cost of one more subtask worktree, measured on this
-    repo (N30). Returns None when no subtask worktree exists to measure.
-
-    **Marginal, not total, and that distinction is the whole point.** Each
-    file is charged `st_blocks * 512 / st_nlink`. A file the package manager
-    hardlinked in from its content-addressed store already occupies those
-    blocks — creating another worktree does not spend them again — so
-    charging the full size answers the wrong question. Dividing by the link
-    count is the right discriminator *by construction*, with no need to
-    detect the host's mount topology:
-
-    - Store and worktree on separate mounts (leerie's own container layout —
-      the pnpm store and the state dir are distinct bind mounts, and Linux
-      refuses `link()` across mounts with EXDEV): the package manager falls
-      back to copying, `st_nlink == 1`, and the file is charged in full.
-    - Store and worktree sharing a mount: `st_nlink` counts the store plus
-      every sibling worktree, and the charge falls to roughly the true
-      marginal cost.
-
-    Measured on a real 1.37 GiB `node_modules`: inode-deduped total 1.31 GiB
-    versus 65 MiB genuinely private to the tree — a 20.7x difference. An
-    earlier revision counted the deduped total and would have demanded ~20x
-    too much space on exactly the well-configured host, which is the failure
-    the measurement exists to avoid.
-
-    Takes the LARGEST candidate rather than an arbitrary one: `iterdir()`
-    yields raw `readdir()` order, so `[0]` is neither sorted nor stable
-    across hosts, and worst-case sizing is the conservative direction for a
-    headroom check. Blocking (`os.walk` over tens of thousands of files —
-    measured 2.1 s warm), so callers on the event loop must use
-    `asyncio.to_thread`.
-    """
-    worktrees = leerie_dir / "worktrees"
-    if not worktrees.is_dir():
-        return None
-    cache_key = str(leerie_dir)
-    if cache_key in _WORKTREE_SIZE_CACHE:
-        return _WORKTREE_SIZE_CACHE[cache_key]
-    candidates = [d for d in worktrees.iterdir()
-                  if d.is_dir() and d.name != "staging"]
-    if not candidates:
-        return None
-
-    largest = 0
-    for candidate in candidates:
-        total = 0
-        seen: set[tuple[int, int]] = set()
-        for dirpath, _dirnames, filenames in os.walk(candidate,
-                                                    followlinks=False):
-            for name in filenames:
-                try:
-                    st_info = os.lstat(os.path.join(dirpath, name))
-                except OSError:
-                    continue  # raced with a worker deleting a build artifact
-                key = (st_info.st_dev, st_info.st_ino)
-                if key in seen:
-                    continue
-                seen.add(key)
-                total += (st_info.st_blocks * 512) // max(st_info.st_nlink, 1)
-        largest = max(largest, total)
-    _WORKTREE_SIZE_CACHE[cache_key] = largest
-    return largest
-
-
-def _disk_required_bytes(leerie_dir: Path, caps: dict) -> int | None:
-    """Free bytes this run needs to finish its next wave, or None if not yet
-    measurable (N30).
-
-    **Scaled by `max_parallel`, NOT by remaining subtasks.** That is a direct
-    consequence of the N31 prune landing: `phase_execute` removes each
-    subtask's worktree as soon as `integrate_wave` reports it merged, so the
-    number of worktrees on disk at once is bounded by the wave's concurrency
-    plus staging — not by how much work is left. Sizing against remaining
-    subtasks would over-demand by an order of magnitude on a long run and
-    pause a run that was never going to fill the disk.
-
-    The per-worktree figure is the MARGINAL cost of one more tree, measured
-    by `_measure_worktree_bytes` rather than assumed, because it varies by
-    ~20x with something leerie does not control: whether the package-manager
-    store can hardlink into the worktree. leerie bind-mounts the pnpm store
-    (`leerie:6779`) and the state dir (`leerie:8307`) as SEPARATE mounts, and
-    Linux refuses `link()` across different mounts even when both resolve to
-    one filesystem (`do_linkat`'s `old_path.mnt != new_path.mnt` check,
-    EXDEV), so pnpm falls back to copying and each worktree pays full
-    freight. Where the store and the tree DO share a mount, 95.4% of
-    node_modules bytes are hardlinked and a second checkout costs 65 MiB
-    instead of 1.37 GiB. Charging per `st_nlink` makes the measurement
-    answer that question by itself — see `_measure_worktree_bytes`.
-
-    Multiplied by `max_parallel` alone, not `+ 1`: the measured tree and
-    staging both already exist on disk at the moment of the check, so their
-    bytes are already absent from `disk_usage().free` and counting them
-    again would double-charge. What the next wave actually adds is up to
-    `max_parallel` fresh worktrees.
-    """
-    per_worktree = _measure_worktree_bytes(leerie_dir)
-    if not per_worktree:
-        return None
-    max_parallel = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
-    return int(per_worktree * max_parallel * _DISK_HEADROOM_SAFETY)
-
-
 def _disk_headroom_message(path: Path, ratio: float) -> str:
     p = path
     while not p.exists():
@@ -6604,9 +6527,9 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     if ratio < DISK_MIN_FREE_RATIO:
         die(f"insufficient disk space to start a run: "
             f"{_disk_headroom_message(leerie_dir, ratio)}. "
-            "Free up space (see CLAUDE.md's retention guidance / "
-            "`leerie list` + manual pruning of old runs under the state "
-            "root) and retry.")
+            "Free up space (`leerie list` to see past runs, then prune old "
+            "ones under the state root by hand — nothing reaps them "
+            "automatically) and retry.")
 
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
@@ -7264,7 +7187,7 @@ async def _label_migration_chunks(
             crit = (child.get("success_criteria_seed") or "").strip()
             if cid in labels and title and crit:
                 labels[cid] = (title, crit)
-    except WorkerError:
+    except (WorkerError, subprocess.TimeoutExpired):
         # Worker crashed — keep the distinct deterministic labels (§12: a
         # split must never silently produce identical children).
         log(f"_recursive_decompose: label-only splitter failed for "
@@ -7563,7 +7486,7 @@ async def _recursive_decompose(
             effort=efforts.get("fit_judge"),
             sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
         )
-    except WorkerError:
+    except (WorkerError, subprocess.TimeoutExpired):
         # Worker crashed mid-judgment (auth failure, killed session, PID
         # exhaustion) — degrade to leaf, the same disposition the depth cap
         # and no-progress guard below already reach when they cannot
@@ -7679,7 +7602,7 @@ async def _recursive_decompose(
                 effort=efforts.get("splitter"),
                 sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
             )
-        except WorkerError:
+        except (WorkerError, subprocess.TimeoutExpired):
             # Worker crashed mid-split (auth failure, killed session, PID
             # exhaustion) — degrade to leaf, the same disposition the depth
             # cap and no-progress guard above already reach when they cannot
@@ -10248,13 +10171,14 @@ async def _filter_satisfied_subtasks(
                     effort=efforts["satisfied_probe"],
                     sid=f"satisfied_probe-{sid}",
                 )
-            except WorkerError as e:
+            except (WorkerError, subprocess.TimeoutExpired) as e:
                 # A probe crash (e.g. claude_p schema failure twice) must
                 # NOT drop the subtask — fail safe toward keeping the work.
                 # Log and let the subtask survive. Deliberately NOT cached:
                 # no verdict was actually reached, so caching this would
                 # wrongly skip re-probing a subtask that was never judged.
-                log(f"  satisfied-probe {sid}: crashed ({e}); keeping "
+                log(f"  satisfied-probe {sid}: crashed "
+                    f"({_brief_worker_exc(e)}); keeping "
                     "subtask (fail-safe — no drop on probe failure)")
                 return
         # Persist the verdict as soon as it returns — for BOTH satisfied
@@ -10404,10 +10328,11 @@ async def _probe_criteria_satisfied_on_head(
             effort=efforts["satisfied_probe"],
             sid=f"satisfied_probe-head-{sid}",
         )
-    except WorkerError as e:
+    except (WorkerError, subprocess.TimeoutExpired) as e:
         # A probe crash must NOT rescue the subtask — fail safe toward the
         # existing retryable no-op path.
-        log(f"  satisfied-probe (HEAD) {sid}: crashed ({e}); not rescuing "
+        log(f"  satisfied-probe (HEAD) {sid}: crashed "
+            f"({_brief_worker_exc(e)}); not rescuing "
             "(fail-safe — no-op stays retryable)")
         return None
     if out.get("satisfied") is True:
@@ -11339,6 +11264,13 @@ def run_recapture_deps(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
+    # Same reason resolve_models/_efforts are called here: these
+    # entrypoints have no CLI, but env and leerie.toml must still
+    # be honoured. Without this the per-worker table pins them
+    # (rebaser 1371s, dep_capture 600s) with no way to raise it.
+    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+        repo_root)
 
     if run_id is not None:
         target_run_dir = leerie_root / "runs" / run_id
@@ -11460,6 +11392,13 @@ def run_rebaser(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
+    # Same reason resolve_models/_efforts are called here: this
+    # entrypoint has no CLI, but env and leerie.toml must still be
+    # honoured. Without it the per-worker table pins the rebaser at
+    # 1371s with no way to raise it.
+    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+        repo_root)
 
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
@@ -12417,6 +12356,25 @@ class WorkerError(RuntimeError):
     pass
 
 
+def _brief_worker_exc(exc: BaseException) -> str:
+    """Render a worker-spawn failure for a log line, WITHOUT the argv.
+
+    `str(subprocess.TimeoutExpired)` interpolates `cmd` — for leerie that is
+    the entire `claude -p` command line, which on the inline-system-prompt
+    path carries a whole system prompt. `_run_implementer`'s own handler
+    documents the result as a 50 KB traceback dumped to the operator's
+    terminal, and avoids it by never binding the exception at all.
+
+    Every site that catches TimeoutExpired alongside WorkerError and wants to
+    say something about it goes through here instead. `exc.timeout` is the
+    ceiling that actually applied, so the message stays specific without the
+    payload.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"killed at its {exc.timeout}s wall-clock ceiling"
+    return str(exc)
+
+
 class DecompositionBudgetExceeded(WorkerError):
     """Recursive decomposition (fit_judge/splitter) has spent its share of
     the worker budget (N3+N4, DEFAULT_CAPS["decompose_budget_share"]).
@@ -13258,7 +13216,15 @@ class _StrictOutputProxy:
     _UPSTREAM = "https://api.anthropic.com"
 
     def __init__(self, max_parallel: int,
-                 verbosity: str = VERBOSITY_DEFAULT) -> None:
+                 verbosity: str = VERBOSITY_DEFAULT,
+                 upstream_timeout_sec: int = _STRICT_PROXY_TIMEOUT_SEC) -> None:
+        # Tracks the RESOLVED worker ceiling, not the frozen default. The
+        # module constant is `DEFAULT_CAPS["worker_timeout_sec"]` evaluated at
+        # import, so once `--worker-timeout` could raise the cap above it the
+        # proxy became able to give up first — the exact outcome the
+        # constant's own comment says it exists to prevent.
+        self._upstream_timeout = max(upstream_timeout_sec,
+                                     _STRICT_PROXY_TIMEOUT_SEC)
         self._server: asyncio.base_events.Server | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         # +8 so the pool is never the ceiling: a wave's workers plus the
@@ -13355,7 +13321,7 @@ class _StrictOutputProxy:
                                      data=body if body else None,
                                      headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=_STRICT_PROXY_TIMEOUT_SEC) as r:
+            with urllib.request.urlopen(req, timeout=self._upstream_timeout) as r:
                 return r.status, list(r.headers.items()), r.read()
         except urllib.error.HTTPError as e:
             return e.code, list(e.headers.items()), e.read()
@@ -14811,9 +14777,25 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # child inherits a dup of this descriptor, so closing ours in the
             # `finally` does not disturb a still-running worker.
             stdin_file = open(stdin_path, "rb")
-        except BaseException:
+        except BaseException as exc:
             with contextlib.suppress(OSError):
                 os.unlink(stdin_path)
+            # ENOSPC becomes DiskLowSpace, matching `State.save()`. Without
+            # this, the single largest disk write leerie makes per worker
+            # invocation (~150KB, once per attempt) was the one place that
+            # still surfaced N30's filed symptom verbatim — a raw
+            # `OSError: [Errno 28]` — because nothing upstream converts it:
+            # `claude_p`'s try catches only RateLimitedExit, so it reached
+            # main()'s terminal handler as an unhandled crash. The
+            # proactive ratio check runs once per WAVE and cannot see a disk
+            # that crosses zero mid-wave, which is exactly when this fires.
+            # Converting it routes the failure into the same resumable
+            # EXIT_LOCKED pause every other disk-exhaustion path uses.
+            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                raise DiskLowSpace(
+                    f"staging the worker prompt failed: no space left on "
+                    f"device writing {stdin_path}"
+                ) from exc
             raise
 
     # The spawn is guarded because the staged file is created BEFORE the
@@ -16342,6 +16324,14 @@ async def _replay_capture(record: dict, *,
 
         replay_st = _ReplayState(tmp_run_dir, tmp_state_path)
         caps = dict(DEFAULT_CAPS)
+        # Honour the operator's global ceiling here too, for the same reason
+        # the two host-side entrypoints do: a replay has no CLI, but env and
+        # leerie.toml are still theirs to set. `repo_root` is not a parameter
+        # of this function, so use the same cwd the replayed call runs in.
+        _replay_root = Path(cwd or os.getcwd())
+        caps["worker_timeout_sec"] = resolve_worker_timeout_sec(_replay_root)
+        caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
+            _replay_root)
 
         # Replay deliberately omits `effort=`: captured records don't
         # store the original `--effort` level, so a faithful replay
@@ -23534,10 +23524,11 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             sid="task_coverage_judge",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
-    except (WorkerError, OSError) as exc:
+    except (WorkerError, OSError, subprocess.TimeoutExpired) as exc:
         # This gate never terminates a run (see the docstring), so an
-        # infrastructure failure degrades: WorkerError, or an OSError from
-        # process spawn (a missing/unexecutable `claude`).
+        # infrastructure failure degrades: WorkerError, an OSError from
+        # process spawn (a missing/unexecutable `claude`), or a
+        # TimeoutExpired from the worker hitting its wall-clock ceiling.
         #
         # A programming error (TypeError, AttributeError, NameError, ...) is
         # NOT one of those and must propagate — swallowing it is what hid the
@@ -26038,9 +26029,11 @@ async def _run_checked_loop(
     for rnd in range(max_rounds):
         try:
             last_res = await invoke()
-        except WorkerError as exc:
-            # Infrastructure failure (PID exhaustion, OOM, a killed session),
-            # not a judgment about the work — so spend a round on a fresh
+        except (WorkerError, subprocess.TimeoutExpired) as exc:
+            # Infrastructure failure (PID exhaustion, OOM, a killed session,
+            # or a worker killed at its wall-clock ceiling — `_invoke` raises
+            # TimeoutExpired, which is NOT a WorkerError), not a judgment
+            # about the work — so spend a round on a fresh
             # `claude -p` session rather than abandoning the loop. This is
             # the "infrastructure-crash retry" the docstring above
             # distinguishes from a found-issue retry — it fires regardless
@@ -26054,7 +26047,13 @@ async def _run_checked_loop(
             # makes `_read_stream`'s own PID-cap message honest — it promises
             # "a fresh worker retries with a clean PID table", which was true
             # for implementers and false here.
-            warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
+            #
+            # `_brief_worker_exc` rather than `{exc}`: str() on a
+            # TimeoutExpired renders the whole `claude -p` argv (see its
+            # docstring).
+            warnings.append(
+                f"{name} round {rnd}: worker crashed: "
+                f"{_brief_worker_exc(exc)}")
             last_res = None
             continue
         except Exception as exc:
@@ -26708,7 +26707,8 @@ async def _capture_conformance_baseline(
     log("phase 4: capturing base-tree health baseline on staging")
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     log_path = st.run_dir / "logs" / "base-baseline.log"
-    timeout = float(caps.get("worker_timeout_sec") or 5400)
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
 
     # Install the provision recipe into staging so the suite can run.
     # Deps live only in worktrees (§6½); staging starts bare. Failure to
@@ -28145,38 +28145,6 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                 f"before wave {wi + 1} of {len(waves)}: "
                 f"{_disk_headroom_message(leerie_dir, ratio)}")
 
-        # Measured bound on top of the proportional floor: once a worktree
-        # has been measured we know what one more actually costs on THIS
-        # repo and host, so the check stops being a guess. Scaled by wave
-        # concurrency rather than remaining subtasks — the N31 prune below
-        # bounds how many worktrees coexist. Never lowers the floor.
-        #
-        # The measurement itself is seeded AFTER the wave completes and
-        # before the prune (see below), because that is the only moment a
-        # fully-populated subtask worktree exists: at wave entry the
-        # previous wave's trees have been pruned, and a wave cannot even be
-        # reached with un-integrated trees left over (the `blocked` guard
-        # die()s first). So wave 1 falls back to the ratio floor and waves
-        # 2+ consult the cached measurement — `to_thread` because the walk
-        # spans tens of thousands of files (2.1 s warm, measured) and this
-        # runs on the orchestrator's event loop.
-        required = await asyncio.to_thread(_disk_required_bytes, leerie_dir, caps)
-        if required is not None:
-            free = shutil.disk_usage(leerie_dir).free
-            if free < required:
-                per_worktree = await asyncio.to_thread(
-                    _measure_worktree_bytes, leerie_dir)
-                # Quote the same max_parallel the arithmetic used, not a
-                # second read that could disagree with it.
-                sized_for = caps.get("max_parallel") or DEFAULT_CAPS["max_parallel"]
-                raise DiskLowSpace(
-                    f"before wave {wi + 1} of {len(waves)}: "
-                    f"{free / (1024 ** 3):.1f} GB free, but this wave needs "
-                    f"~{required / (1024 ** 3):.1f} GB "
-                    f"({per_worktree / (1024 ** 3):.2f} GB per additional "
-                    f"worktree x {sized_for} parallel, measured on this "
-                    "repo). Free space and resume, or lower --max-parallel.")
-
         # Memory-admission gate (M9+M3 DECISION 2026-08-09): degrade this
         # wave's concurrency once, at wave entry, rather than blocking each
         # individual spawn (the retired _await_worker_memory_admission poll
@@ -28267,25 +28235,6 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # visible signature of a silent integration skip.
         log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
             f"{expected} completed subtask(s)")
-
-        # N30: seed the per-worktree measurement BEFORE the prune below.
-        # This is the only moment in a run when a fully-populated subtask
-        # worktree exists to measure: dependencies are installed by the
-        # worker itself mid-subtask (DESIGN §6½ *Worker-driven install*), so
-        # a freshly-created tree is source-only, and the prune removes every
-        # populated one seconds from now. Measuring at wave entry instead —
-        # which is where the check runs — always found an empty
-        # `worktrees/` and silently disabled the whole bound.
-        #
-        # Cached per run dir, so the wave-entry check on every subsequent
-        # wave consults this value. Best-effort: a measurement failure must
-        # not cost a wave that has already been paid for.
-        try:
-            await asyncio.to_thread(_measure_worktree_bytes, leerie_dir)
-        except OSError as e:
-            log(f"  disk: could not measure worktree size "
-                f"({type(e).__name__}: {e}); headroom check falls back to "
-                "the free-space ratio")
 
         # N31: the worktree (including node_modules) is dead weight once
         # its branch is merged into staging — pruning it here, instead of
@@ -29064,7 +29013,10 @@ async def _orchestrate(args, caps: dict, leerie_dir: Path, st: State,
     # the tasks above so a crash, SIGINT or SIGTERM cannot leave the port held.
     global _STRICT_PROXY
     if caps.get("force_strict_output"):
-        _STRICT_PROXY = _StrictOutputProxy(caps["max_parallel"], verbosity)
+        _STRICT_PROXY = _StrictOutputProxy(
+            caps["max_parallel"], verbosity,
+            caps.get("worker_timeout_sec",
+                     DEFAULT_CAPS["worker_timeout_sec"]))
         try:
             port = await _STRICT_PROXY.start()
         except OSError as e:
@@ -29986,7 +29938,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "(TIMEOUT_DEFAULT_PER_WORKER), which otherwise "
                          "lowers the ceiling for fast worker types — raise "
                          "it when a worker is being killed at a table "
-                         "ceiling derived on a faster host. "
+                         "ceiling derived on a faster host. Passing the "
+                         "default explicitly still counts as setting it. "
                          f"Also {WORKER_TIMEOUT_ENV} env var or "
                          "worker_timeout_sec in leerie.toml")
     ap.add_argument("--worker-pids-max", type=_positive_int, metavar="N",
@@ -30309,6 +30262,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # at every claude_p spawn; an explicit value there bypasses the measured
     # per-worker table (N25).
     caps["worker_timeout_sec"] = resolve_worker_timeout_sec(
+        Path(os.getcwd()), args.worker_timeout)
+    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
         Path(os.getcwd()), args.worker_timeout)
     caps["strict_conformer"] = args.strict_conformer
 
@@ -30734,19 +30689,36 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_code = EXIT_LOCKED
 
     except DiskLowSpace as e:
-        # N30: the periodic mid-run headroom check in phase_execute found
-        # free space on the state-dir filesystem below DISK_MIN_FREE_RATIO.
-        # Resumable, not fatal — the remedy is an operator freeing space,
+        # N30. TWO raise sites reach this arm, and they differ in a way that
+        # dictates the order of the statements below:
+        #   - phase_execute's periodic headroom check, which fires at
+        #     DISK_MIN_FREE_RATIO (5% free) — the disk still has room; and
+        #   - State.save()'s errno.ENOSPC conversion — the disk is at zero.
+        # Resumable in both cases: the remedy is an operator freeing space,
         # after which the run's on-disk state (worktrees, branches,
         # state.json) is untouched and `leerie resume` picks it back up.
-        # Mirrors the ContextOverflow arm just above.
+        #
+        # `abnormal` and `exit_code` are therefore set BEFORE any save, and
+        # the save is guarded. On the ENOSPC path an unguarded st.save() here
+        # re-enters the very call that just failed and raises DiskLowSpace a
+        # second time from inside this handler — which no sibling arm catches,
+        # so it escapes main() and skips the cleanup, the dep capture and the
+        # EXIT_LOCKED assignment, turning a resumable pause into an exit-1
+        # traceback. That is the same hazard the dep_capture guard below
+        # documents; this call is the likelier one to hit it.
         full_purge = False
-        st.save()
+        abnormal = False
+        exit_code = EXIT_LOCKED
+        try:
+            st.save()
+        except DiskLowSpace:
+            # Nothing left to persist to: the on-disk state.json is already
+            # the last successfully written one, which is what resume reads.
+            pass
         log(f"disk headroom low — {e.raw_message}")
         log("  Free up space on the state-dir filesystem "
             "(old runs under the state root are the usual culprit), "
             f"then resume with: leerie resume {st.run_id}")
-        abnormal = False
         try:
             _cleanup_on_abnormal_exit(st, full_purge=False)
         except Exception:
@@ -30765,7 +30737,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
-        exit_code = EXIT_LOCKED
+        # `exit_code` / `abnormal` are deliberately NOT set here — they are
+        # set at the top of this arm, before the guarded save, so that every
+        # statement below them is best-effort.
 
     except TerminalAuthFailure as e:
         # Expired/absent OAuth session (`claude /login` required) —

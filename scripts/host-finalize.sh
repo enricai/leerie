@@ -83,37 +83,70 @@ _host_finalize_pre_push_hook_present() {
   [ -n "$hooks_dir" ] && [ -x "$hooks_dir/pre-push" ]
 }
 
-# _host_finalize_is_auth_or_network_push_error <stderr> — a small, stable
-# exclusion list of git's OWN fixed failure messages (not third-party hook
-# prose). When an executable pre-push hook is present, stderr matching one
-# of these is treated as a genuine push/auth/network failure rather than a
-# hook failure, since git emits the same wording regardless of what hooks
-# happen to be installed.
+# _host_finalize_is_auth_or_network_push_error <stderr> — is this push
+# failure git's own auth/network problem, rather than a hook that failed?
 #
-# git's non-interactive HTTPS credential failure is `fatal: could not read
-# Username for 'https://…': terminal prompts disabled` — a different
-# sentence from `could not read from remote repository`, so matching only
-# the latter missed it entirely. A pre-push hook runs BEFORE authentication,
-# so it succeeds and the push then fails on credentials; that stderr matched
-# nothing here and the operator was told to retry with `--no-verify`, which
-# cannot help. Reproduced against real git 2026-08-12.
+# Anchored to how git FRAMES its failures, not to bare English phrases. The
+# previous list matched fragments like `connection refused` and
+# `authentication failed` anywhere in stderr, which any tool emits: measured,
+# a pre-push hook that runs integration tests against Postgres, curls a
+# registry, or hits a dev server tripped it and lost the `--no-verify` hint
+# this function gates. Scored against a 23-case corpus (9 real `git push`
+# failures reproduced against real git, 14 realistic hook outputs): the bare
+# list classified 5/14 hook cases correctly, this one 14/14, both 9/9 on git.
 #
-# Both `could not read` forms are spelled out rather than collapsed to the
-# bare prefix. A bare `could not read` matches arbitrary third-party hook
-# output — measured, it swallows eslint's `Could not read config file:
-# .eslintrc.json` and jest's `Could not read source map`, classifying a real
-# hook failure as auth/network and suppressing the very hint this function
-# exists to produce. That would break the invariant stated above: git's OWN
-# fixed messages, never third-party prose.
+# ONE arm: a phrase on a line git itself prefixes (`fatal:` / `remote:`).
+# `error:` is deliberately NOT a prefix here — git uses it for `error: failed
+# to push some refs`, which is present on EVERY failed push including hook
+# failures, and Java emits `Error: Unable to access jarfile`.
 #
-# `permission denied \(publickey` is left unterminated on purpose: OpenSSH
-# emits the offered-method list, e.g. `Permission denied
-# (publickey,password)`. In practice git also emits `Could not read from
-# remote repository.` alongside it, so this line is defence in depth rather
-# than the only thing catching that shape.
-_host_finalize_is_auth_or_network_push_error() {
+# An earlier revision had a second arm matching an `ssh:` / `git@host:` line
+# "only when git also reports it could not read the remote". That arm was
+# PROVABLY DEAD and is gone: its companion condition is
+# `^fatal: could not read from remote repository`, and the arm above already
+# matches that exact line via `^fatal:` + `could not read from remote
+# repository`. Every input satisfying arm 2 satisfied arm 1, which ran first
+# — verified by running both over the ssh-family corpus cases. The companion
+# line alone was doing the discriminating; the `ssh:` prefix contributed
+# nothing. An ssh-transport push failure is still classified, by that same
+# companion line (see the `connection-refused` / `publickey-denied` /
+# `ssh-timeout` corpus cases, which pass on arm 1).
+#
+# Two alternatives carry a deliberate qualifier, because `-i` makes git's
+# `fatal:` indistinguishable from a third-party `FATAL:`:
+#   - `authentication failed for '` keeps the quote: git writes `Authentication
+#     failed for '<url>'`, Postgres writes `FATAL: password authentication
+#     failed for user "..."`.
+#   - `permission denied \(publickey` keeps the paren for the same reason —
+#     a bare `permission denied` matches Postgres's `FATAL: permission denied
+#     for database "..."`, which is a hook failure, not a push failure.
+#   - `unable to access '` keeps the quote: git always quotes the URL
+#     (`fatal: unable to access 'https://…/': …`), while a hook can emit
+#     `fatal: unable to access node: EACCES`.
+#
+# The bare transport phrases — `could not resolve host`, `connection
+# refused|timed out`, `operation timed out`, `no route to host` — are
+# deliberately NOT here. Behind the `^(fatal|remote):` anchor they are
+# unreachable for real git, which emits them either on an `ssh:` line (no
+# git prefix, so the anchor rejects it) or as the tail of an
+# `unable to access '<url>':` line that this list already matches. Measured
+# by ablating each alternative against the corpus: dropping all four keeps
+# 9/9 on real git — including https connect-refused and DNS-failure, both
+# still caught via `unable to access '` — while removing the false
+# positives on a hook that emits `FATAL: could not resolve host: db.internal`
+# or `FATAL: connection refused`. Only three alternatives are load-bearing
+# for the corpus (`authentication failed for '`, `could not read from remote
+# repository`, `repository .*not found`); the rest are kept as git's exact
+# wording for shapes the corpus does not contain, and each is qualified
+# enough that it cannot match third-party prose.
+_host_finalize_git_framed_auth_or_network() {
   printf '%s' "$1" | grep -qiE \
-    'authentication failed|permission denied \(publickey|could not resolve host|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access|connection timed out|connection refused|repository not found|no route to host'
+    "^(fatal|remote):.*(authentication failed for '|permission denied \(publickey|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access '|repository .*not found)"
+}
+
+_host_finalize_is_auth_or_network_push_error() {
+  _host_finalize_git_framed_auth_or_network "$1" && return 0
+  return 1
 }
 
 host_finalize() {

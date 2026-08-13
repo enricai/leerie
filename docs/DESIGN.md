@@ -2717,9 +2717,13 @@ constrained decoding*).
 **Worktrees are also pruned mid-run, not only at cleanup.** Once
 `integrate_wave` reports a subtask's branch merged into staging, that
 subtask's worktree is dead weight — the commits live in the branch, which
-survives worktree removal — so `phase_execute` removes it immediately
-rather than waiting for run end. Without this, every worktree a run ever
-created persisted until the run finished: at 30–87 subtasks against a
+survives worktree removal — so `phase_execute` removes it at the end of
+that wave rather than waiting for run end. Note the granularity: the prune
+runs **once per wave**, after every subtask in it has been integrated, not
+as each one finishes. So peak worktree coexistence is the size of a wave,
+which is what any per-worktree sizing would have to account for.
+Without this, every worktree a run ever created persisted until the
+run finished: at 30–87 subtasks against a
 repo whose `node_modules` is ~1.4 GB, that is the measured 51 GB that
 killed two runs with an unhandled `ENOSPC`.
 
@@ -2730,21 +2734,34 @@ operator inspects by hand before settling it with `accept-blocked` or
 evidence those verbs exist to act on.
 
 **Why a worktree costs what it does.** The per-worktree figure varies by
-roughly 20x with something leerie does not control, which is why the disk
-check measures it rather than assuming it. Package managers like pnpm are
-content-addressed and normally *hardlink* from a shared store into each
-`node_modules`, so a second checkout of the same dependency set costs
+roughly 20x with something leerie does not control — which is why leerie
+does *not* try to predict it, and the disk guardrail is a proportional
+free-space floor rather than a per-worktree byte budget. Package
+managers like pnpm are content-addressed and normally *hardlink* from a
+shared store into each `node_modules`, so a second checkout of the same
+dependency set costs
 almost nothing — measured on a host where the store and the tree share a
-mount, 95.4% of `node_modules` bytes are hardlinked and the private
-remainder is 65 MiB against a 1.37 GiB tree. But leerie bind-mounts the
+mount, 95.18% of `node_modules` bytes are hardlinked and the private
+remainder is 65 MiB against a 1.37 GiB tree. Those three figures are not
+prose: they are reproduced by `scripts/measure/worktree_bytes.py` and
+committed as `tests/fixtures/worktree_bytes/summary.json`, with a test
+asserting this paragraph still matches the artifact. But leerie bind-mounts the
 package-manager store and the state directory as *separate* mounts, and
 Linux refuses `link()` across different mounts even when both resolve to
 the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
 new_path.mnt` check returns `EXDEV`). The store therefore cannot hardlink
 into a worktree, pnpm falls back to copying, and each worktree pays full
-freight. That is the second, independent multiplier behind the 51 GB —
-the mid-run prune bounds how many such trees coexist, and the disk check
-sizes against a measured one rather than a guessed constant.
+freight. That is the second, independent multiplier behind the 51 GB, and
+the mid-run prune bounds coexistence to one wave's worth of trees.
+
+This explains *why* worktrees are expensive; it deliberately does not drive
+a gate. A per-worktree measured bound was built on this reasoning and
+withdrawn after four failed revisions — the marginal cost of a
+not-yet-created worktree depends on a mount topology leerie does not
+control, on how many siblings exist when it is measured, and on a peak count
+that depends on scheduling. The disk guardrail is the proportional free-space
+floor plus a resumable pause; see IMPLEMENTATION.md's "Disk headroom (N30)"
+for what was tried.
 
 Colocating the store with the worktrees on one mount would collapse the
 per-worktree cost by that same ~20x and is the more fundamental fix, but
@@ -6646,13 +6663,26 @@ progress — without depending on a channel that does not exist:
    each worker's slowest *observed* call, not merely its p99: a rule
    anchored only to a percentile can sit under the tail it was derived
    from, which for the planner it demonstrably did. Workers whose derived
-   ceiling reaches the global cap are simply left at it.
+   ceiling reaches the global cap are simply left at it, as are workers the
+   corpus never observed at all — an unmeasured worker gets no invented
+   number.
 
    Because that distribution comes from one host, an operator can bypass
-   the whole table with an explicit global override — necessarily a bypass
-   rather than a bound, since the operator who needs it is the one whose
-   worker is being killed at a ceiling measured on a faster machine. The successor is spawned
-   exactly as for a voluntary handoff and validates whatever partial
+   the whole table with an explicit global override — `caps["worker_timeout_sec"]`
+   (default 5400 s / 90 min, overridable per-repo via `--worker-timeout` /
+   `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec` in leerie.toml).
+   Necessarily a bypass rather than a bound: the operator who needs it is
+   the one whose worker is being killed at a ceiling measured on a faster
+   machine, so a `min()` against the table would leave them no way up.
+
+   The bypass keys on **whether the operator set anything**, not on whether
+   the resolved number differs from the default. Comparing values made
+   explicitly passing the default — the first thing someone debugging a
+   timeout tries — indistinguishable from passing nothing, silently leaving
+   every listed worker on its table ceiling.
+
+   When a worker is killed at whichever ceiling applied, the successor is
+   spawned exactly as for a voluntary handoff and validates whatever partial
    checkpoint exists. If no checkpoint was written, the missing-checkpoint
    case routes through the corrective-retry path (see §13 caps) and is
    bounded by the `failed_retries` cap rather than the handoff-chain cap.

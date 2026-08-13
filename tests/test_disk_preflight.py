@@ -13,13 +13,9 @@ A healthy disk is a no-op at both checkpoints.
 """
 import asyncio
 import shutil
-import os
-import shutil
 import sys
 from pathlib import Path
 from unittest import mock
-
-import os
 
 import pytest
 
@@ -208,6 +204,69 @@ class TestMainHandlesDiskLowSpace:
         arm = self._arm()
         assert "st.save()" in arm
 
+    def test_survives_a_save_that_is_still_failing(self):
+        """The save-origin path must SURVIVE this arm, not merely reach it.
+
+        This replaces a test that asserted only
+        `issubclass(DiskLowSpace, BaseException)` — already asserted at the
+        top of this file — and concluded from it that "no separate
+        save()-specific handler is required". That inference is what let the
+        defect ship: reaching the arm was never in doubt; surviving it was.
+
+        `State.save()` converts ENOSPC into DiskLowSpace, so on that path the
+        disk is at zero and the arm's own `st.save()` re-enters the call that
+        just failed, raising DiskLowSpace a SECOND time from inside the
+        handler. A sibling `except` of the same `try` does not see an
+        exception raised in another arm's body, so it escapes `main()`,
+        skipping the cleanup, the dep capture and the EXIT_LOCKED assignment
+        — an exit-1 traceback instead of a resumable pause.
+
+        Two properties, both checkable in the source: every `st.save()` in
+        this arm is guarded against DiskLowSpace, and `exit_code` is assigned
+        before the first of them, so nothing below it can cost the run its
+        disposition.
+        """
+        import ast
+        import textwrap
+        tree = ast.parse(textwrap.dedent(self._arm()))
+
+        def saves_in(node) -> list[ast.Call]:
+            return [n for n in ast.walk(node)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "save"]
+
+        all_saves = saves_in(tree)
+        assert all_saves, "the arm no longer saves at all"
+
+        guarded: list[ast.Call] = []
+        for t in [n for n in ast.walk(tree) if isinstance(n, ast.Try)]:
+            catches = {
+                nm.id
+                for h in t.handlers if h.type is not None
+                for nm in ast.walk(h.type) if isinstance(nm, ast.Name)
+            }
+            if "DiskLowSpace" in catches:
+                for stmt in t.body:
+                    guarded += saves_in(stmt)
+
+        assert len(guarded) == len(all_saves), (
+            f"{len(all_saves) - len(guarded)} st.save() call(s) in the "
+            "DiskLowSpace arm are not guarded against DiskLowSpace. On the "
+            "ENOSPC path such a call raises again from inside the handler "
+            "and the run exits 1 instead of pausing resumably")
+
+        exit_assign = min(
+            (n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "exit_code"
+                     for t in n.targets)),
+            default=None)
+        assert exit_assign is not None, "the arm never assigns exit_code"
+        assert exit_assign < min(n.lineno for n in all_saves), (
+            "`exit_code` is assigned after the save — if the save raises, "
+            "the run loses its EXIT_LOCKED disposition")
+
     def test_does_not_re_raise(self):
         # The generic `except BaseException as e:` arm above re-raises
         # (crashing the process with a traceback) — DiskLowSpace's own arm
@@ -234,7 +293,7 @@ class TestMainHandlesDiskLowSpace:
 class TestStateSaveCatchesENOSPC:
     """N30's mitigation is not exclusively the proactive `_disk_free_ratio`
     checks in `preflight()`/`phase_execute` (covered above) — `State.save()`
-    itself also wraps its `tmp.write_text()`/`tmp.replace()` pair, since a
+    itself also wraps its `tmp.write_text()`/`os.replace()` pair, since a
     disk can cross zero between one periodic check and the next write. An
     `OSError(errno.ENOSPC, ...)` from either half is reraised as
     `DiskLowSpace`, the same exception class/pause path the proactive
@@ -304,15 +363,6 @@ class TestStateSaveCatchesENOSPC:
         finally:
             st.release_lock()
 
-    def test_disklowspace_from_save_still_reaches_mains_handler(self):
-        # DiskLowSpace is a BaseException regardless of which of the three
-        # raise sites (preflight, phase_execute, or now State.save())
-        # produced it, so it is caught by the identical `except
-        # DiskLowSpace as e:` arm in main() pinned in
-        # TestMainHandlesDiskLowSpace — no separate save()-specific handler
-        # is required.
-        assert issubclass(leerie.DiskLowSpace, BaseException)
-
     def test_pre_fix_shape_is_documented(self):
         # Regression guard for the historical gap this test class replaced:
         # State.save() must now actually reference DiskLowSpace/ENOSPC —
@@ -360,160 +410,30 @@ class TestDiskCheckThresholdIsProportionalNotAFixedByteCount:
         assert "DISK_MIN_FREE_RATIO" in preflight_src
         assert "DISK_MIN_FREE_RATIO" in execute_src
 
-    def test_ratio_is_a_floor_with_a_measured_bound_on_top(self):
-        """The ratio alone was never the whole rule it was documented as.
+    def test_the_ratio_is_the_whole_rule(self):
+        """The proportional floor is the only disk rule, by decision.
 
-        This test used to assert only that two phrases appeared in a source
-        comment -- it pinned the *prose*, so the threshold could be anything
-        at all and it still passed. It now pins the mechanism: a measured,
-        worktree-sized requirement sits above the proportional floor.
+        A per-worktree measured bound sat on top of this and was wrong four
+        separate ways before being withdrawn: it was unreachable dead code,
+        then measured the wrong quantity (total rather than marginal), then
+        scaled by the wrong count twice over, then broke its own
+        "nothing to measure" sentinel by counting directory blocks. See
+        IMPLEMENTATION.md's "Disk headroom (N30)" section.
+
+        This asserts the withdrawal held, so a fifth attempt has to be a
+        deliberate act that fails here first rather than an accretion.
         """
         import inspect
         src = inspect.getsource(leerie.phase_execute)
-        assert "_disk_required_bytes" in src, (
-            "the mid-run check no longer consults the measured per-worktree "
-            "requirement -- it is back to a bare proportional ratio")
         assert "DISK_MIN_FREE_RATIO" in src, "the proportional floor was dropped"
-
-
-@pytest.fixture(autouse=True)
-def _clear_worktree_size_cache():
-    """`_WORKTREE_SIZE_CACHE` is module-level and conftest's `leerie` fixture
-    is session-scoped — the same shape as `_active_admissions`, which this
-    repo already learned to reset with an autouse fixture
-    (`tests/test_memory_admission_degrade.py`). Clearing before AND after
-    matters: hand-written `.clear()` calls at the top of each test leave the
-    last test's entries behind for whatever runs next in the session."""
-    leerie._WORKTREE_SIZE_CACHE.clear()
-    yield
-    leerie._WORKTREE_SIZE_CACHE.clear()
-
-
-class TestMeasuredWorktreeSizing:
-    """`_disk_required_bytes` (N30). The per-worktree cost is measured on the
-    running repo rather than assumed, because it varies by ~20x with whether
-    the package-manager store can hardlink into the worktree -- which leerie
-    does not control (separate bind mounts => EXDEV => pnpm copies)."""
-
-    def _worktree(self, tmp_path: Path, sid: str, nbytes: int) -> Path:
-        wt = tmp_path / "worktrees" / sid
-        wt.mkdir(parents=True)
-        (wt / "blob.bin").write_bytes(b"x" * nbytes)
-        return wt
-
-    def test_returns_none_before_any_worktree_exists(self, tmp_path):
-        assert leerie._measure_worktree_bytes(tmp_path) is None
-        assert leerie._disk_required_bytes(tmp_path, dict(leerie.DEFAULT_CAPS)) is None
-
-    def test_staging_is_not_treated_as_a_subtask_worktree(self, tmp_path):
-        self._worktree(tmp_path, "staging", 4096)
-        assert leerie._measure_worktree_bytes(tmp_path) is None, (
-            "staging is one long-lived tree, not a per-subtask cost, and "
-            "measuring it as one would scale the whole requirement off it")
-
-    def test_measures_an_existing_worktree(self, tmp_path):
-        self._worktree(tmp_path, "feat-001", 200_000)
-        measured = leerie._measure_worktree_bytes(tmp_path)
-        assert measured is not None and measured >= 200_000
-
-    def test_store_hardlinked_bytes_are_charged_marginally(self, tmp_path):
-        """THE invariant the measurement exists for, and the one an earlier
-        revision got backwards.
-
-        The question is not "how big is this tree" but "what does ONE MORE
-        tree cost". A file the package manager hardlinked in from its
-        content-addressed store already occupies its blocks; another
-        worktree does not spend them again. Charging `st_blocks / st_nlink`
-        answers that by construction, with no need to detect the host's
-        mount topology.
-
-        Measured on a real 1.37 GiB node_modules: inode-deduped total
-        1.31 GiB vs 65 MiB genuinely private -- a 20.7x gap. The previous
-        version of this test linked files *inside* the same tree and
-        asserted the total did not move, which pins intra-tree dedup: a real
-        property, but not this one, and it passed against a measurement that
-        would have over-demanded ~20x on any store-sharing host.
-        """
-        wt = self._worktree(tmp_path, "feat-001", 400_000)
-        copied = leerie._measure_worktree_bytes(tmp_path)
-
-        # Now link the same content from OUTSIDE the tree, exactly as a
-        # package-manager store does. The blocks are unchanged; what changes
-        # is that they are now shared, so one more worktree costs less.
-        store = tmp_path / "store"
-        store.mkdir()
-        os.link(wt / "blob.bin", store / "cafebabe")
-        # The cache is per run dir and deliberately has no invalidation, so
-        # re-measuring the same dir needs an explicit drop. The autouse
-        # fixture only brackets the test.
-        leerie._WORKTREE_SIZE_CACHE.clear()
-        shared = leerie._measure_worktree_bytes(tmp_path)
-
-        assert shared < copied, (
-            f"a file hardlinked from an out-of-tree store measured the same "
-            f"as a copied one ({copied} -> {shared}); the requirement would "
-            "over-demand ~20x on every host where the store shares a mount")
-        assert shared == pytest.approx(copied / 2, rel=0.05), (
-            "with exactly two links the marginal charge should be about half")
-
-    def test_intra_tree_duplicate_inodes_are_still_counted_once(self, tmp_path):
-        """Kept from the previous version, narrowed to what it actually
-        proves: walking must not charge the same inode twice for two names
-        inside one tree."""
-        wt = self._worktree(tmp_path, "feat-001", 400_000)
-        os.link(wt / "blob.bin", wt / "second-name.bin")
-        two_names = leerie._measure_worktree_bytes(tmp_path)
-
-        other = tmp_path / "worktrees" / "feat-002"
-        other.mkdir(parents=True)
-        (other / "blob.bin").write_bytes(b"x" * 400_000)
-        leerie._WORKTREE_SIZE_CACHE.clear()
-        # feat-002 is a single-link copy of the same size; the two-name tree
-        # must not measure larger than it purely from the extra name.
-        assert two_names <= leerie._measure_worktree_bytes(tmp_path)
-
-    def test_largest_candidate_wins_not_an_arbitrary_one(self, tmp_path):
-        """`iterdir()` yields raw readdir order -- neither sorted nor stable
-        across hosts. Picking `[0]` could size the wave off a stale or
-        half-built tree; worst-case is the conservative direction for a
-        headroom check."""
-        self._worktree(tmp_path, "feat-001", 20_000)
-        self._worktree(tmp_path, "feat-002", 900_000)
-        self._worktree(tmp_path, "feat-003", 50_000)
-        measured = leerie._measure_worktree_bytes(tmp_path)
-        assert measured >= 900_000, (
-            f"measured {measured}, which is not the largest candidate -- "
-            "selection is order-dependent")
-
-    def test_requirement_scales_with_max_parallel_not_remaining_subtasks(self, tmp_path):
-        """Load-bearing consequence of the N31 prune.
-
-        Worktrees are removed as each subtask integrates, so the number
-        coexisting is bounded by wave concurrency. Scaling by remaining
-        subtasks instead would over-demand by an order of magnitude on a
-        long run and pause runs that were never going to fill the disk.
-        """
-        self._worktree(tmp_path, "feat-001", 1_000_000)
-
-        low = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=2))
-        high = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=8))
-
-        assert low is not None and high is not None
-        assert high > low, "the requirement does not respond to --max-parallel"
-        # The measured tree and staging already exist on disk, so only the
-        # NEW worktrees are charged: 8 slots vs 2, not 9 vs 3.
-        assert high == pytest.approx(low * 4, rel=0.01)
-
-    def test_measurement_is_cached_per_run_dir(self, tmp_path):
-        """The walk is O(files in node_modules); re-running it every wave on
-        a 58k-file tree is a real cost for an answer that does not move."""
-        self._worktree(tmp_path, "feat-001", 100_000)
-        first = leerie._measure_worktree_bytes(tmp_path)
-        assert str(tmp_path) in leerie._WORKTREE_SIZE_CACHE
-        (tmp_path / "worktrees" / "feat-001" / "extra.bin").write_bytes(b"y" * 500_000)
-        assert leerie._measure_worktree_bytes(tmp_path) == first
+        for gone in ("_disk_required_bytes", "_measure_worktree_bytes"):
+            assert gone not in src, (
+                f"{gone} is back in phase_execute. It was withdrawn after four "
+                "failed revisions; reintroducing it needs the measurement the "
+                "work order asked for (a df delta against a real second "
+                "checkout), not another st_blocks predicate.")
+        assert not hasattr(leerie, "_measure_worktree_bytes")
+        assert not hasattr(leerie, "_disk_required_bytes")
 
 
 class TestDepCaptureGuardsIncludeDiskLowSpace:
@@ -534,136 +454,3 @@ class TestDepCaptureGuardsIncludeDiskLowSpace:
         assert "ContextOverflow, DiskLowSpace)" in src
 
 
-class TestMeasurementIsSeededWhereWorktreesExist:
-    """The wiring, which is what made the whole bound dead code once.
-
-    The check runs at wave ENTRY. The N31 prune removes every integrated
-    worktree at wave END, and a wave cannot be reached with un-integrated
-    trees left over (`if blocked: … die()`). `_cleanup_on_abnormal_exit`
-    removes them on every handled exit too. So at wave entry `worktrees/`
-    holds only `staging` — which `_measure_worktree_bytes` excludes by
-    design — and it returned `None` on every invocation in every normal run.
-
-    The fix seeds the measurement immediately BEFORE the prune, the one
-    moment a fully-populated tree exists. These are source-coupled because
-    driving `phase_execute` end to end spawns real workers; the behavioural
-    half is `test_seeded_measurement_is_what_the_next_wave_consumes` below,
-    which exercises the real cache across the real functions.
-    """
-
-    @staticmethod
-    def _phase_execute_ast():
-        import ast
-        import inspect
-        import textwrap
-        return ast.parse(textwrap.dedent(inspect.getsource(leerie.phase_execute)))
-
-    @staticmethod
-    def _measure_calls(tree):
-        """Every call to `_measure_worktree_bytes`, tagged with whether it is
-        wrapped in `asyncio.to_thread`.
-
-        AST, not a source `index()`: `_measure_worktree_bytes` appears twice
-        in `phase_execute` — once as the pre-prune seed and once inside the
-        wave-entry error message. A textual "is it before the prune" check
-        finds the *error-branch* occurrence, which is also before the prune,
-        so it passes with the seed deleted. Both of these tests were written
-        that way first and were verified vacuous against the mutation.
-        """
-        import ast
-        out = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            wrapped = (isinstance(fn, ast.Attribute) and fn.attr == "to_thread"
-                       and node.args
-                       and isinstance(node.args[0], ast.Name)
-                       and node.args[0].id == "_measure_worktree_bytes")
-            direct = (isinstance(fn, ast.Name)
-                      and fn.id == "_measure_worktree_bytes")
-            if wrapped or direct:
-                out.append((node.lineno, "to_thread" if wrapped else "direct"))
-        return sorted(out)
-
-    def _prune_loop_lineno(self, tree):
-        import ast
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.For) and isinstance(node.iter, ast.Name)
-                    and node.iter.id == "integrated"):
-                return node.lineno
-        raise AssertionError("the N31 prune loop is gone from phase_execute")
-
-    def test_measurement_is_seeded_before_the_prune_loop(self):
-        tree = self._phase_execute_ast()
-        calls = self._measure_calls(tree)
-        prune = self._prune_loop_lineno(tree)
-
-        assert calls, "phase_execute never measures a worktree at all"
-        before = [ln for ln, _ in calls if ln < prune]
-        # The error-branch occurrence is also before the prune, so counting
-        # "any call before the prune" proves nothing. The seed is the call
-        # that is NOT inside the wave-entry check's raise path, i.e. there
-        # must be at least TWO measure calls before the prune line.
-        assert len(before) >= 2, (
-            "only one _measure_worktree_bytes call precedes the prune, and "
-            "that is the error-message one — the pre-prune SEED is missing, "
-            "so every populated worktree is removed before anything measures "
-            "it and the bound is dead code again")
-
-    def test_every_measure_call_is_off_the_event_loop(self):
-        """`os.walk` over a real node_modules is 2.1 s warm (58,172 files).
-        This repo's worst recent bug (#198/#200, 218 workers lost, 12.4% of
-        invocations) was a blocked orchestrator loop, and #200's fix was
-        `to_thread` for exactly this shape."""
-        calls = self._measure_calls(self._phase_execute_ast())
-        assert calls, "phase_execute never measures a worktree at all"
-        direct = [ln for ln, kind in calls if kind == "direct"]
-        assert not direct, (
-            f"_measure_worktree_bytes is called synchronously from the event "
-            f"loop at line(s) {direct} of phase_execute")
-
-    def test_required_bytes_is_also_off_the_event_loop(self):
-        import ast
-        tree = self._phase_execute_ast()
-        direct = [
-            n.lineno for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id == "_disk_required_bytes"
-        ]
-        assert not direct, (
-            f"_disk_required_bytes (which walks a worktree) is called "
-            f"synchronously from the event loop at line(s) {direct}")
-
-    def test_seeded_measurement_is_what_the_next_wave_consumes(self, tmp_path):
-        """Behavioural: seed while a worktree exists, prune it, and confirm
-        the requirement is still computable — i.e. the cache is what carries
-        the value across the wave boundary."""
-        wt = tmp_path / "worktrees" / "feat-001"
-        wt.mkdir(parents=True)
-        (wt / "blob.bin").write_bytes(b"x" * 800_000)
-        (tmp_path / "worktrees" / "staging").mkdir()
-
-        # Wave N end: seed while the tree is populated.
-        seeded = leerie._measure_worktree_bytes(tmp_path)
-        assert seeded and seeded >= 800_000
-
-        # The prune then removes it, exactly as phase_execute does.
-        shutil.rmtree(wt)
-        assert not wt.exists()
-
-        # Wave N+1 entry: the requirement must still be computable.
-        required = leerie._disk_required_bytes(
-            tmp_path, dict(leerie.DEFAULT_CAPS, max_parallel=4))
-        assert required is not None, (
-            "after the prune the requirement went unmeasurable — the cached "
-            "seed is not carrying across the wave boundary, which is the "
-            "exact failure that made this check dead code")
-        assert required >= seeded * 4
-
-    def test_without_a_seed_the_check_degrades_to_the_ratio_floor(self, tmp_path):
-        """Anti-vacuity partner: wave 1 legitimately has nothing to measure,
-        and must fall through rather than invent a number."""
-        (tmp_path / "worktrees" / "staging").mkdir(parents=True)
-        assert leerie._measure_worktree_bytes(tmp_path) is None
-        assert leerie._disk_required_bytes(tmp_path, dict(leerie.DEFAULT_CAPS)) is None

@@ -196,9 +196,33 @@ def test_no_prompt_documents_a_field_the_schemas_removed(leerie):
         + "\n  ".join(offenders))
 
 
+def test_allowlist_is_empty_and_stays_deliberate(leerie):
+    """The allowlist is empty, and that is the state worth pinning.
+
+    Every required field on every worker is currently documented, so no
+    exemption is needed. Asserting the emptiness makes adding a row a
+    deliberate, reviewed act that fails this test first — rather than a
+    silent widening nobody sees.
+
+    Written as an explicit assertion because the loop below is vacuous while
+    the dict is empty: `for ... in {}` never executes, so a body-only test
+    passes unconditionally and cannot be falsified by any product change.
+    """
+    assert ALLOWLIST == {}, (
+        "an exemption was added to the prompt/schema parity allowlist. That "
+        "is allowed, but it must be justified here: prefer documenting the "
+        "field in its prompt over exempting it, since the exemption applies "
+        "forever and silently.")
+
+
 def test_allowlist_entries_are_real_fields(leerie):
-    """An allowlist row naming a field that no longer exists silently widens
-    the exemption to nothing, hiding a real omission behind stale config."""
+    """If the allowlist is ever populated, a row naming a field that no
+    longer exists silently widens the exemption to nothing, hiding a real
+    omission behind stale config.
+
+    Vacuous by construction while ALLOWLIST is empty — which is why the test
+    above pins the emptiness separately rather than relying on this one.
+    """
     for worker, fields in ALLOWLIST.items():
         assert worker in leerie.SCHEMAS, f"allowlist names unknown worker {worker!r}"
         required = set(leerie.SCHEMAS[worker].get("required") or [])

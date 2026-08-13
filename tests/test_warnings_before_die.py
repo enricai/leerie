@@ -21,6 +21,7 @@ the ordering is only observable by inspection, since die() exits.
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -60,16 +61,33 @@ def test_run_checked_loop_still_records_the_exception_text(leerie):
     **both** of its crash arms.
 
     A bare `"worker crashed: {exc}" in src` is not enough any more. The loop
-    now has two crash arms — `except WorkerError` (retries; infrastructure)
-    and `except Exception` (breaks; a leerie bug) — so a substring check
-    matches whichever one it finds first and would keep passing if the other
-    lost its cause. Count both."""
+    now has two crash arms — the retry arm (infrastructure: `WorkerError`,
+    and `subprocess.TimeoutExpired` since the per-worker ceilings landed) and
+    `except Exception` (breaks; a leerie bug) — so a substring check matches
+    whichever one it finds first and would keep passing if the other lost its
+    cause. Check both.
+
+    Asserting `{exc}` LITERALLY twice was the previous form, and it broke for
+    a good reason: the retry arm now renders `{_brief_worker_exc(exc)}`,
+    because `str()` on a TimeoutExpired interpolates the whole `claude -p`
+    argv (a 50 KB terminal dump — see `_run_implementer`'s handler). That is
+    still the cause, just without the payload. So the property to pin is
+    "each arm's warning derives from `exc`", not the spelling — while still
+    failing if an arm drops the cause entirely.
+    """
     src = inspect.getsource(leerie._run_checked_loop)
-    assert src.count("worker crashed: {exc}") == 2, (
-        "both crash arms of _run_checked_loop must record the exception "
-        "text: the WorkerError arm (which retries) and the catch-all arm "
-        "(which breaks). Found "
-        f"{src.count('worker crashed: {exc}')}")
+    arms = re.split(r"\n        except ", src)[1:]
+    crash_arms = [a for a in arms if "worker crashed" in a]
+    assert len(crash_arms) == 2, (
+        "expected exactly two crash arms in _run_checked_loop (the "
+        f"infrastructure retry and the catch-all break); found {len(crash_arms)}")
+    for arm in crash_arms:
+        head = arm.split("\n", 1)[0]
+        appended = arm[arm.index("worker crashed"):]
+        assert re.search(r"\{[^}]*\bexc\b[^}]*\}", appended), (
+            f"the `except {head}` arm records 'worker crashed' without "
+            "interpolating anything derived from `exc`, so the warning is "
+            "printed with no cause attached")
 
 
 def test_integrate_wave_logs_warnings_before_die(leerie):
