@@ -603,12 +603,17 @@ def test_no_recipe_timeout_consumer_bypasses_the_guard(leerie):
 
     src = pathlib.Path(inspect.getfile(leerie)).read_text()
     tree = ast.parse(src)
+    # Split ONCE and slice by line span. `ast.get_source_segment` re-splits the
+    # whole source on every call, which over this module's 559 functions and
+    # ~32k lines cost 16.6s for this one test — half its file's runtime, and
+    # enough to matter against CI's 10-minute job cap. Same work, ~0.2s.
+    lines = src.splitlines(keepends=True)
 
     readers, callers = [], []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        body = ast.get_source_segment(src, node) or ""
+        body = "".join(lines[node.lineno - 1:node.end_lineno])
         if 'get("timeout_s")' in body:
             readers.append(node.name)
         if "_recipe_timeout_s(" in body and node.name != "_recipe_timeout_s":

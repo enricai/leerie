@@ -22,17 +22,33 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_sem(leerie):
-    """`_BLT_SEM` is module-level and conftest's `leerie` fixture is
-    session-scoped, so a cap from one test would otherwise size the gate for
-    every later one — the same leak `_active_admissions` documents."""
-    leerie._BLT_SEM = None
-    leerie._BLT_SEM_LIMIT = None
+    """Clear the per-loop gate cache around every test.
+
+    It is keyed by running loop in a WeakKeyDictionary, so entries for finished
+    loops drop on their own — but conftest's `leerie` fixture is session-scoped
+    and a cap from one test would otherwise size the gate for any test that
+    happens to share a loop. Same leak `_active_admissions` documents."""
+    leerie._BLT_SEMS.clear()
     yield
-    leerie._BLT_SEM = None
-    leerie._BLT_SEM_LIMIT = None
+    leerie._BLT_SEMS.clear()
 
 
-def _repo(tmp_path, name):
+def _tree(tmp_path, name):
+    """A plain directory, deliberately NOT a git repo.
+
+    `_worktree_tree_sha` then returns None, the memo is off, and every call
+    actually measures — which is exactly what a concurrency test wants. Using
+    real repos here cost ~18 `git init` + `commit` pairs for nothing the
+    assertions depend on, against a CI job capped at 10 minutes.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    return d
+
+
+def _git_repo(tmp_path, name):
+    """A real repo — needed ONLY where the memo must actually hit, since the
+    key is `git rev-parse HEAD^{tree}`."""
     d = tmp_path / name
     d.mkdir()
     for a in (["init", "-q"], ["config", "user.email", "t@e.com"],
@@ -61,7 +77,7 @@ def _peak_under(leerie, monkeypatch, tmp_path, cap, n=6, tag=""):
     leerie._DEPS_INSTALLED.clear()
 
     async def _go():
-        trees = [_repo(tmp_path, f"wt{tag}{i}") for i in range(n)]
+        trees = [_tree(tmp_path, f"wt{tag}{i}") for i in range(n)]
         sts = [types.SimpleNamespace(data={"provision": {"recipe": []}},
                                      save=lambda: None) for _ in trees]
         await asyncio.gather(*[
@@ -101,7 +117,7 @@ def test_a_memo_hit_does_not_take_the_gate(leerie, monkeypatch, tmp_path):
 
     monkeypatch.setattr(leerie, "_run_streaming", _fake)
     leerie._DEPS_INSTALLED.clear()
-    d = _repo(tmp_path, "wt")
+    d = _git_repo(tmp_path, "wt")
     st = types.SimpleNamespace(data={"provision": {"recipe": []}},
                                save=lambda: None)
 
@@ -122,16 +138,50 @@ def test_a_memo_hit_does_not_take_the_gate(leerie, monkeypatch, tmp_path):
 
 def test_the_cap_has_a_default_and_a_floor(leerie):
     assert leerie.DEFAULT_CAPS["blt_parallel"] == 2
-    # A caps dict missing the key, or carrying 0, must not deadlock.
-    assert leerie._blt_semaphore({})._value >= 1
-    leerie._BLT_SEM = None
-    assert leerie._blt_semaphore({"blt_parallel": 0})._value >= 1
+
+    async def _go():
+        # A caps dict missing the key, or carrying 0, must not deadlock.
+        assert leerie._blt_semaphore({})._value >= 1
+        leerie._BLT_SEMS.clear()
+        assert leerie._blt_semaphore({"blt_parallel": 0})._value >= 1
+
+    asyncio.run(_go())
 
 
 def test_the_gate_is_resized_when_the_cap_changes(leerie):
     """A stale semaphore from an earlier cap would silently ignore the new
     one — the same class as a memo keyed on the wrong thing."""
-    a = leerie._blt_semaphore({"blt_parallel": 2})
-    b = leerie._blt_semaphore({"blt_parallel": 5})
-    assert a is not b
-    assert b._value == 5
+    async def _go():
+        a = leerie._blt_semaphore({"blt_parallel": 2})
+        b = leerie._blt_semaphore({"blt_parallel": 5})
+        assert a is not b
+        assert b._value == 5
+
+    asyncio.run(_go())
+
+
+def test_the_gate_is_never_shared_across_event_loops(leerie):
+    """REGRESSION PIN for the CI failure this file's own tests caused.
+
+    A module-level cached `asyncio.Semaphore` outlives the loop it was created
+    on. On Python <= 3.11 `_LoopBoundMixin._get_loop()` is consulted only on
+    the contended path, so cross-loop reuse is silent while uncontended and
+    blocks the moment two callers queue — green on 3.12, hung on 3.10/3.11.
+    Keying on the running loop makes that unrepresentable.
+    """
+    seen = []
+
+    async def _go():
+        seen.append(leerie._blt_semaphore({"blt_parallel": 2}))
+
+    asyncio.run(_go())          # loop A
+    asyncio.run(_go())          # loop B
+    assert seen[0] is not seen[1], (
+        "the same Semaphore was handed to two different event loops")
+
+
+def test_calling_outside_a_loop_is_refused(leerie):
+    """Fails loudly rather than minting a loop-less semaphore that would
+    later be reused across loops."""
+    with pytest.raises(RuntimeError):
+        leerie._blt_semaphore({"blt_parallel": 2})

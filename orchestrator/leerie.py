@@ -44,6 +44,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -27228,23 +27229,37 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                 f"({type(ex).__name__}): {' '.join(e['command'])}")
 
 
-# Bounds concurrent orchestrator-run BLT commands. Created lazily on the
-# running loop rather than at import: a module-level `asyncio.Semaphore()`
-# binds to whatever loop is current at import time, which under pytest is not
-# the loop `asyncio.run()` later creates.
-_BLT_SEM: asyncio.Semaphore | None = None
-_BLT_SEM_LIMIT: int | None = None
+# Bounds concurrent orchestrator-run BLT commands, keyed by (running loop,
+# limit).
+#
+# Both halves of that key are load-bearing. Creating the semaphore lazily on
+# the running loop avoids binding it to whatever loop happens to be current at
+# import. But caching one at module scope reintroduces the same hazard a step
+# later: a semaphore outlives the loop it was made on, and the next
+# `asyncio.run()` gets a fresh loop with the stale object still cached. On
+# Python <= 3.11 `asyncio.Semaphore` carries `_LoopBoundMixin`, whose
+# `_get_loop()` is consulted on the *contended* path only — so a cross-loop
+# reuse is silent while uncontended and blows up or blocks the moment two
+# callers actually queue. 3.12 dropped that binding, which is precisely why a
+# CI matrix can be green on 3.12 and hang on 3.10/3.11.
+#
+# The loop is a weak key: entries for finished loops must not pin them (a run
+# creates one loop, but the test suite creates hundreds).
+_BLT_SEMS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary())
 
 
 def _blt_semaphore(caps: dict) -> asyncio.Semaphore:
-    """The run's BLT concurrency gate, sized from `caps["blt_parallel"]`."""
-    global _BLT_SEM, _BLT_SEM_LIMIT
+    """The BLT concurrency gate for the *running* loop, sized from
+    `caps["blt_parallel"]`. Must be called from inside a coroutine."""
     limit = max(1, int(caps.get("blt_parallel")
                        or DEFAULT_CAPS["blt_parallel"]))
-    if _BLT_SEM is None or _BLT_SEM_LIMIT != limit:
-        _BLT_SEM = asyncio.Semaphore(limit)
-        _BLT_SEM_LIMIT = limit
-    return _BLT_SEM
+    loop = asyncio.get_running_loop()
+    cached = _BLT_SEMS.get(loop)
+    if cached is None or cached[0] != limit:
+        cached = (limit, asyncio.Semaphore(limit))
+        _BLT_SEMS[loop] = cached
+    return cached[1]
 
 
 async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
