@@ -229,7 +229,8 @@ outcome. Each maps to one of three states in your output:
   is not weakening, that is fixing your own bug. If the build/lint/test
   output reveals a real defect in the *implementer's* work, surface it as
   a `rule_violations` entry with `status: "residual"`, `rule:
-  "build/lint/tests must pass"` and the diagnostic in `why_not_fixed` —
+  "build/lint/tests must pass"`, the failing `axis`, and the diagnostic in
+  `why_not_fixed` —
   but do not try to undo the implementer's change.
 - `{ran: false, ...}` — the command was `(none)` / not applicable to
   this repo. `passed` is irrelevant.
@@ -242,9 +243,10 @@ runner) the state is `ran: false`. Do not synthesize a command.
 diff nor in the subtask's `files_likely_touched` list**, they are
 pre-existing technical debt and are not your responsibility. Record
 them once inside a `rule_violations` entry with `status: "residual"`,
-`rule: "build/lint/tests must pass"` and a brief `why_not_fixed: "pre-
-existing in <file>, not in implementer's diff or subtask
-files_likely_touched"` — then move on. Do not run auto-fixers
+`rule: "build/lint/tests must pass"`, the failing `axis` (`"build"`,
+`"lint"`, or `"tests"`), and a brief `why_not_fixed: "pre-existing in
+<file>, not in implementer's diff or subtask files_likely_touched"` —
+then move on. Do not run auto-fixers
 (`lint:fix`, `prettier --write`, etc.) that will touch those files;
 the diff-scope check that re-applies to your commits would roll the
 change back, and the tool calls you spend on the rollback are sunk.
@@ -394,6 +396,22 @@ Return your structured output. Be precise:
     residual is not a failure; it is a warning the orchestrator surfaces
     to the human.
 
+    **If the residual is about a build, lint, or test failure, also set
+    `axis` to `"build"`, `"lint"`, or `"tests"`.** Set it whenever the
+    entry is about one of those three commands, whether the failure is
+    pre-existing or introduced by this diff — you are labelling *what the
+    residual is about*, not judging blame. Omit `axis` entirely for a
+    residual about anything else (a naming convention, a missing doc, a
+    design-system rule).
+
+    This one field is load-bearing. The orchestrator cross-references it
+    against the `BASELINE:` block to decide whether to spend another
+    conformer round. A residual that merely restates a failure the base
+    tree already had is not something another round can fix, and labelling
+    it lets the orchestrator stop instead of re-running an expensive suite
+    to rediscover it. An unlabelled residual is treated as still
+    outstanding — the safe default, but it costs a round.
+
   `status` and `rule` are required on every entry. An entry whose `status`
   is neither `fixed` nor `residual` is dropped by the orchestrator, so a
   missing or invented status silently loses the finding.
@@ -403,7 +421,9 @@ Return your structured output. Be precise:
     {"status": "fixed", "rule": "<rule text>", "fix": "<what changed>",
      "evidence": "<path>:<lines>"},
     {"status": "residual", "rule": "<rule text>",
-     "why_not_fixed": "<one sentence>"}
+     "why_not_fixed": "<one sentence>"},
+    {"status": "residual", "rule": "build/lint/tests must pass",
+     "axis": "tests", "why_not_fixed": "<one sentence>"}
   ]
   ```
 - `file_updates` — ONE array covering both documentation and test files you

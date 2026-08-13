@@ -6539,6 +6539,71 @@ catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
 
+**The signal that continues the loop is a delta, not a verdict.** The round
+cap above bounds the loop; what *ends* it early is the orchestrator's judgment
+that the conformer has nothing left to do. That judgment must be relative to
+the base tree, or the loop becomes unsatisfiable on any repo whose base is not
+already green — and then every subtask spends its entire round budget
+rediscovering debt it did not create.
+
+That is not hypothetical. Measured on a 91-subtask run whose base tree was RED
+on tests, **only 6 of 79 subtasks were clean at round 1**, and **57 ran exactly
+3 rounds** — the cap, precisely. Each of those rounds ran the repo's full test
+suite, at ~8 minutes a time, to re-observe a failure the orchestrator had
+already recorded in the baseline before the first wave started.
+
+The pre-existing failure reaches the loop through *two* channels, and both must
+be closed or the fix is half a fix:
+
+- the **axis** channel — an axis reporting `ran && !passed`;
+- the **residual** channel — a `rule_violations_residual` entry. Measured, 125
+  of 139 residuals in that run carried the single rule `build/lint/tests must
+  pass`, with a `why_not_fixed` that explicitly cited the baseline: *"consistent
+  with the orchestrator-supplied BASELINE which recorded the base tree already
+  RED on tests … pre-existing and out of this diff's scope."* The conformer
+  read the baseline, obeyed it, and reported honestly; the orchestrator then
+  re-spawned it to rediscover the same thing.
+
+So the loop-continuation predicate consults the baseline directly. An axis that
+was red on the base tree is not a reason to spend another round, and neither is
+a residual that labels itself as being about such an axis. Anything else is
+unchanged: a residual about something other than build/lint/test, an unlabelled
+one, a *newly* introduced one, or a failure on an axis that was **green** at
+baseline all continue the loop exactly as before — those are regressions this
+change must stay able to see.
+
+This is the same principle as the baseline itself (*Base-tree health baseline*
+below), applied one layer down. The baseline was already being handed to the
+*worker* as prose in a `BASELINE:` block, asking it to scope its judgment to the
+delta. But the orchestrator's own predicate never read it — the guarantee lived
+in a prompt while the code that could enforce it looked away. §12 says that is
+backwards.
+
+Which axis a residual is about is read from a **schema field the conformer
+fills** (`axis`, one of `build`/`lint`/`tests`), never inferred from the `rule`
+or `why_not_fixed` prose. Inferring it would be regex over an LLM's response,
+which *Language-to-JSON: natural-language interpretation is never regex*
+forbids — and the prose is not stable enough to compare anyway: measured, only
+21% of consecutive round transitions repeat a byte-identical residual set. Where
+a check needs a fact that lives in natural language, the owning worker surfaces
+it as a field; that is the rule, and this is an ordinary application of it.
+
+The field is **optional in the schema and gating on absence**, and that is one
+decision rather than two. Requiring it would cost the entire submission rather
+than the single field — the same trade already measured on `plan_overlap_judge`,
+where one required field held valid output to 40.9% — while treating an
+unlabelled residual as excusable would let a worker silently switch the loop
+off. So an unlabelled residual blocks: the conservative direction, matching
+*Findings carry a severity* in §8.
+
+This splits the fix's guarantee in two, and the halves are worth distinguishing.
+The axis channel is pure code enforcement — the orchestrator measured the
+baseline itself and compares its own record, with no worker cooperation
+involved. The residual channel depends on the conformer labelling its output.
+Replaying the motivating run's real round-1 output through the shipped
+predicate: **6 of 79 subtasks clean today, 37 on the axis channel alone, 53 once
+residuals carry a label.** The floor is code; the rest is the prompt earning it.
+
 **Opt-in strict mode.** `--strict-conformer` (also `LEERIE_STRICT_CONFORMER`
 env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing
 with a blocking one: when conformer residuals remain after the round cap is

@@ -2011,6 +2011,10 @@ SCHEMAS: dict[str, dict] = {
                         "fix": {"type": "string"},
                         "evidence": {"type": "string"},
                         "why_not_fixed": {"type": "string"},
+                        # Optional, gating on absence; see
+                        # `_conformance_clean`. (Literal is size-budgeted.)
+                        "axis": {"type": "string",
+                                 "enum": ["build", "lint", "tests"]},
                     },
                 },
             },
@@ -8075,6 +8079,13 @@ def _expand_reconciler_output(out: dict) -> dict:
     return expanded
 
 
+# The three build/lint/test axis names, in the spelling the conformer's
+# structured output and the base-health baseline both use ("tests", plural).
+# `resolve_blt` keys the test axis "test" (singular); `_AXIS_CMD_KEY` bridges
+# the two and is the only place that mapping should live.
+_BLT_AXES: frozenset[str] = frozenset({"build", "lint", "tests"})
+
+
 def _expand_conformer_output(out: dict) -> dict:
     """Fan the flattened conformer wire output back into the four arrays
     every consumer (`_validate_conformance_result`, `_summarize_residuals`,
@@ -8105,8 +8116,19 @@ def _expand_conformer_output(out: dict) -> dict:
                           "fix": item.get("fix", ""),
                           "evidence": item.get("evidence", "")})
         elif status == "residual":
-            residual.append({"rule": item.get("rule", ""),
-                             "why_not_fixed": item.get("why_not_fixed", "")})
+            row = {"rule": item.get("rule", ""),
+                   "why_not_fixed": item.get("why_not_fixed", "")}
+            # `axis` is carried through only when the worker supplied a
+            # valid enum value. This rebuild is by-key, so a field omitted
+            # here is silently dropped no matter what the schema declares —
+            # which is how a declared-but-dead field ships (CLAUDE.md: the
+            # conformer's evidence copy "must be READ, not merely
+            # declared"). Normalising here rather than at the read site
+            # keeps `_conformance_clean` a pure set comparison.
+            axis = str(item.get("axis", "")).strip().lower()
+            if axis in _BLT_AXES:
+                row["axis"] = axis
+            residual.append(row)
     expanded["rule_violations_fixed"] = fixed
     expanded["rule_violations_residual"] = residual
 
@@ -26260,15 +26282,72 @@ async def _run_checked_loop(
     return last_res, warnings
 
 
-def _conformance_clean(conf_res: dict) -> bool:
-    """True when the conformer reports no residuals and every axis is
-    either passed or not applicable. Used to short-circuit the
-    orchestrator-level conformer loop."""
-    if conf_res.get("rule_violations_residual"):
+def _baseline_red_axes(baseline: dict | None) -> set[str]:
+    """The build/lint/test axes that were already failing on the unmodified
+    base tree, as a set. Empty when there is no baseline (skipped via
+    `--skip-base-baseline`, or not yet captured), which makes every caller
+    degrade to the pre-baseline behaviour rather than to a permissive one.
+
+    Only axes the baseline actually *measured* reach this function, but that
+    is `_capture_conformance_baseline`'s doing, not this one's: it builds
+    `red_axes` from `ran and measured and not passed`, so a `_runner_missing`
+    axis is already excluded upstream. Worth stating because the distinction
+    is load-bearing — treating "could not measure" as "already red" would
+    excuse a genuine regression — and this function would not catch it if
+    that upstream filter were ever relaxed."""
+    if not isinstance(baseline, dict):
+        return set()
+    red = baseline.get("red_axes")
+    if not isinstance(red, list):
+        return set()
+    return {a for a in red if a in _BLT_AXES}
+
+
+def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
+    """True when nothing is left that *this subtask* is responsible for.
+    Used to short-circuit the orchestrator-level conformer loop.
+
+    Judged against the base tree, not in absolute terms (DESIGN §9 *The
+    signal that continues the loop is a delta, not a verdict*). An absolute
+    verdict makes the loop unsatisfiable on any repo whose base is not
+    already green: measured on a 91-subtask run with a RED base, only 6 of
+    79 subtasks were clean at round 1 and 57 ran exactly the 3-round cap,
+    each round re-running an ~8-minute suite to re-observe a failure the
+    baseline had already recorded before the first wave.
+
+    A pre-existing failure reaches this predicate through two channels and
+    both are excluded, or the fix is half a fix:
+
+    - the **axis** channel — an axis reporting `ran && !passed`;
+    - the **residual** channel — measured, 125 of 139 residuals on that run
+      restated the same baseline-red suite under the rule `build/lint/tests
+      must pass`, citing the orchestrator's own `BASELINE:` block as the
+      reason they were not fixed.
+
+    Exclusion is by `axis`, a schema field the worker fills, never by
+    reading the `rule` / `why_not_fixed` prose — that would be regex on an
+    LLM's response (CLAUDE.md *Language-to-JSON*), and `why_not_fixed` is
+    not stable enough to compare anyway (only 21% of round transitions
+    repeat a byte-identical residual set, while `rule` holds steady). A
+    residual with no `axis` blocks, the conservative direction.
+
+    Everything else is unchanged: a residual under any other rule, a newly
+    introduced residual, and a failure on an axis that was *green* at
+    baseline all still return False. Those are regressions, and continuing
+    to see them is the point of keeping the loop at all. `baseline=None`
+    reproduces the pre-change behaviour exactly."""
+    red = _baseline_red_axes(baseline)
+    for item in conf_res.get("rule_violations_residual") or []:
+        if not isinstance(item, dict):
+            return False
+        # `_expand_conformer_output` has already normalised/validated this,
+        # so membership in `red` is a plain set test on structured data.
+        if item.get("axis") in red:
+            continue
         return False
     for axis in ("build", "lint", "tests"):
         a = conf_res.get(axis) or {}
-        if a.get("ran") and not a.get("passed"):
+        if a.get("ran") and not a.get("passed") and axis not in red:
             return False
     return True
 
@@ -26533,6 +26612,13 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     run_branch = _compute_run_branch(st.run_id)
     last_res: dict | None = None
     blt_feedback: str | None = None
+    # Read once, not per-round: the baseline is captured before the first
+    # wave and never changes during a run. Passed to `_conformance_clean`
+    # so the loop stops re-spending on failures the base tree already had
+    # (DESIGN §9 *The signal that continues the loop is a delta, not a
+    # verdict*). `None` when the baseline was skipped or not captured,
+    # which restores the pre-change absolute-verdict behaviour.
+    baseline = (st.data.get("conformance") or {}).get("_baseline")
     # Snapshot the implementer's committed HEAD ONCE, before any conformer
     # round runs, for the clobber-survival check (DESIGN §9 *No clobbering
     # the implementer's work*). Must be captured here, not per-round: a
@@ -26661,7 +26747,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                                    caps["conformance_rounds"])
             if bg_retry_warnings else None)
 
-        if _conformance_clean(last_res):
+        if _conformance_clean(last_res, baseline):
             break
 
     if last_res is not None:
@@ -26676,7 +26762,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             blocked_reason = (
                 "strict-conformer: conformer reverted/deleted "
                 f"implementer-owned file(s): {clobbered_files}")
-        elif last_res is not None and not _conformance_clean(last_res):
+        elif last_res is not None and not _conformance_clean(last_res, baseline):
             residuals = _summarize_residuals(last_res)
             blocked_reason = (
                 "strict-conformer: " + "; ".join(residuals[:3])
@@ -26992,6 +27078,11 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     warnings: list[str] = []
     last_res: dict | None = None
     blt_feedback: str | None = None
+    # Same delta-scoping as the per-subtask loop (DESIGN §9). The final pass
+    # reviews the integrated tree, but a base-tree failure is no more this
+    # run's doing here than it was per-subtask, so it must not consume the
+    # round budget either.
+    baseline = (st.data.get("conformance") or {}).get("_baseline")
 
     sys_prompt = _load_prompt("conformer")
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
@@ -27166,7 +27257,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                    caps["conformance_rounds"])
             if bg_retry_warnings else None)
 
-        if _conformance_clean(res):
+        if _conformance_clean(res, baseline):
             break
 
     if last_res is not None:
@@ -27192,7 +27283,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     final_blocked = bool(
         caps.get("strict_conformer")
         and (clobbered_files
-             or (last_res is not None and not _conformance_clean(last_res))))
+             or (last_res is not None
+                 and not _conformance_clean(last_res, baseline))))
 
     st.data.setdefault("conformance", {})["_final"] = {
         "result": last_res,
