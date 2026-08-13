@@ -24,9 +24,9 @@ import os
 import re
 import subprocess
 import tempfile
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
@@ -381,6 +381,55 @@ def test_large_stderr_still_classifies():
         "✖ typecheck failed: 3 errors\n" + filler
         + "\nerror: failed to push some refs to 'origin'") is False, (
         "large ordinary hook output classified as auth/network")
+
+
+def test_classifier_needs_no_writable_tmpdir():
+    """The second transport defect, which the first fix introduced.
+
+    `printf | grep -q` was replaced by a herestring — and bash backs a
+    herestring larger than a pipe buffer with a **temp file**. Measured: 32
+    KiB is a pipe, 64 KiB is `/tmp/sh-thd.XXXXXX`, i.e. the same input range
+    the SIGPIPE bug covered. When that file cannot be created the redirection
+    fails and the command returns 1, which at the call site is
+    indistinguishable from "grep did not match" — the identical
+    misclassification, now keyed on disk instead of size. Reproduced with
+    `/tmp` as a full 256 KiB tmpfs; it matters because on macOS `/tmp` shares
+    the APFS container with `$HOME`, so N30's disk-full case implies it.
+
+    Process substitution needs no temp file at any size.
+
+    The BEHAVIOURAL half already exists as `test_large_stderr_still_classifies`
+    — it covers both directions at 1.19 MB and would still pass on a
+    herestring (which is correct whenever /tmp works). So the two are
+    complementary, not duplicates: that one pins the answer, this one pins
+    the transport that makes the answer independent of /tmp.
+
+    Structural, and deliberately so. The first version of this test asserted
+    that no file was left behind in a probe `TMPDIR`, and it was **vacuous**:
+    bash creates the temp file and unlinks it immediately (`readlink` on the
+    fd shows `/tmp/sh-thd.XXXXXX (deleted)`), so nothing is observable after
+    the process exits — restoring the herestring left the test passing. The
+    behavioural evidence is the full-`/tmp` container reproduction recorded in
+    `scripts/host-finalize.sh`; a test cannot fill a filesystem in CI, so what
+    it can own is the transport itself.
+    """
+    src = HOST_FINALIZE_SH.read_text()
+    body = src.split("_host_finalize_git_framed_auth_or_network() {", 1)[1]
+    body = body.split("\n}", 1)[0]
+
+    assert "< <(" in body, (
+        "the classifier no longer reads via process substitution; both other "
+        "transports have shipped a misclassification (a pipe via SIGPIPE "
+        "under pipefail, a herestring via its /tmp temp file)")
+    assert "<<<" not in body, (
+        "the classifier is back on a herestring, which needs a temp file in "
+        "/tmp for payloads over ~64 KiB — the same input range as the SIGPIPE "
+        "bug, and on macOS /tmp shares a container with $HOME so a full disk "
+        "implies a full /tmp")
+    assert "| grep" not in body and "|grep" not in body, (
+        "the classifier is back on a pipe: grep -q closes it at the first "
+        "match, the writer takes SIGPIPE, and pipefail reports 141 even "
+        "though grep matched")
 
 
 def test_documented_load_bearing_count_matches_the_measurement():

@@ -504,6 +504,15 @@ def test_mkstemp_itself_failing_is_converted(leerie, leerie_dir, monkeypatch,
     assert label in excinfo.value.raw_message.lower(), (
         f"the message should name the real condition; got "
         f"{excinfo.value.raw_message!r}")
+    # …and it must name a LOCATION. `stdin_path` is unset when mkstemp itself
+    # fails, so the first version of this conversion rendered "writing None".
+    # The substring check above passed on it, which is why this is separate.
+    assert "None" not in excinfo.value.raw_message, (
+        f"the message interpolates an unset path: "
+        f"{excinfo.value.raw_message!r}")
+    assert tempfile.gettempdir() in excinfo.value.raw_message, (
+        "the message should name where staging was attempted — $TMPDIR is "
+        "not necessarily the state-dir filesystem the resume hint names")
 
 
 def test_staging_failure_that_is_not_enospc_propagates_unchanged(

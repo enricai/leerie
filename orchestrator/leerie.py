@@ -2719,9 +2719,42 @@ def now() -> str:
 
 
 def log(msg: str) -> None:
-    repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
-    ts = datetime.now().astimezone().isoformat(timespec="seconds")
-    print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
+    """Emit one orchestrator line. **Never raises.**
+
+    A logging call must not be able to kill a run, and here it could. On the
+    remote runtime `sys.stdout` IS `<run_dir>/orchestrator.log` — the launcher
+    redirects fd1 there and `_install_run_log_tee` deliberately skips
+    installing its guarded tee in that case — so `print(flush=True)` performs a
+    real write to the state filesystem. When that filesystem is full the write
+    raises `OSError(ENOSPC)`, and five of `main()`'s terminating arms log
+    before assigning `exit_code`: measured, `ContextOverflow` 6 calls,
+    `TerminalAuthFailure` 4, `RateLimitedExit` 5, `KeyboardInterrupt` 2,
+    `InterruptedBySignal` 2 — each would lose its disposition to a failed
+    *message*. (The `DiskLowSpace` arm is the exception, and deliberately so:
+    it assigns `exit_code` first. That is the shape the others still lack.) `_save_state_best_effort` had the same hole — its own warning
+    was the unguarded half of a helper whose entire contract is that it cannot
+    raise.
+
+    `OSError`/`ValueError` only, not `BaseException`: a `KeyboardInterrupt`
+    arriving during the write must still propagate. This mirrors the
+    discipline already in `_TeeStream`, whose log-copy guard carries the same
+    two exceptions and the comment "never let persistence break the real
+    stream" — this extends it to the real stream, and so also covers
+    `_TeeStream`'s own unguarded `_orig.write`/`_orig.flush`.
+
+    The trade is deliberate: a swallowed write loses output. The alternative
+    loses the run.
+    """
+    # The WHOLE body is guarded, not just the write. `os.getcwd()` raises
+    # FileNotFoundError when the cwd has been unlinked — which this codebase
+    # does routinely (the N31 mid-run worktree prune, and cleanup on every
+    # abnormal exit) — and `USER_REPO` masks it only on the injected
+    # runtimes. A first version wrapped `print` alone and its docstring still
+    # claimed "never raises"; verified false by removing the cwd.
+    with contextlib.suppress(OSError, ValueError):
+        repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
 
 
 # Module-level run id, set once `State.__init__` has assigned a run
@@ -2741,9 +2774,14 @@ def _set_current_run_id(run_id: str) -> None:
 
 
 def die(msg: str, code: int = 1):
+    # Guarded for the reason `log` documents, with one extra consequence: the
+    # exit CODE is the load-bearing part here. An unwritable stderr must not
+    # turn a deliberate, coded exit into an unhandled OSError that the
+    # launcher's teardown then classifies as a crash.
     if _CURRENT_RUN_ID:
         msg = f"{msg} (run {_CURRENT_RUN_ID})"
-    print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
+    with contextlib.suppress(OSError, ValueError):
+        print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
@@ -12400,10 +12438,22 @@ def _save_state_best_effort(st: "State", where: str) -> None:
     `state.json` is still the last good one, so the run stays resumable, but
     an operator who is about to be told "resume when you have freed space"
     deserves to know the pause itself could not be recorded.
+
+    The caught set is this file's existing "everything that is not a real
+    interrupt" tuple, used at ten other sites — NOT a bare `BaseException`.
+    `except Exception` alone would not do, because `DiskLowSpace` and its
+    siblings deliberately subclass `BaseException` to survive broad handlers.
+    But `KeyboardInterrupt` must still propagate: in `main()`'s own
+    `except KeyboardInterrupt` arm a second Ctrl-C during this save would
+    otherwise be absorbed, and the handler would carry on into cleanup and a
+    fresh `asyncio.run(capture_repo_deps(...))` — the long operation the
+    operator was trying to escape. Protecting a best-effort write at the cost
+    of an interrupt inverts the priority.
     """
     try:
         st.save()
-    except BaseException as exc:   # noqa: BLE001 - deliberately total
+    except (Exception, TerminalAuthFailure, RateLimitedExit,
+            ContextOverflow, DiskLowSpace) as exc:
         log(f"warning: could not persist state at {where} "
             f"({type(exc).__name__}: {exc}); the last saved state.json "
             "stands and `leerie resume` still works from it")
@@ -14851,9 +14901,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # exactly when this fires. Converting routes it into the same
             # resumable EXIT_LOCKED pause every other exhaustion path uses.
             if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
+                # `stdin_path` is unset when `mkstemp` ITSELF failed — the
+                # inode-exhaustion case the call was moved inside this guard
+                # to cover — so name the directory instead of interpolating
+                # None. The location is the actionable half: staging goes to
+                # $TMPDIR, which is not necessarily the state-dir filesystem
+                # the resume hint tells the operator to free.
+                _where = stdin_path or f"a new file under {tempfile.gettempdir()}"
                 raise DiskLowSpace(
                     f"staging the worker prompt failed: "
-                    f"{os.strerror(exc.errno)} writing {stdin_path}"
+                    f"{os.strerror(exc.errno)} writing {_where}"
                 ) from exc
             raise
 
@@ -16593,7 +16650,10 @@ class State:
         write or the atomic rename) is reraised as `DiskLowSpace` so the
         caller pauses resumably (EXIT_LOCKED) via the same N30 path as the
         proactive `_disk_free_ratio` checks, instead of crashing with an
-        unhandled `OSError: [Errno 28] No space left on device`.
+        unhandled `OSError: [Errno 28] No space left on device`. Any errno in
+        `_OUT_OF_SPACE_ERRNOS` converts — ENOSPC and EDQUOT, since a
+        quota'd or NFS state root reports the latter for the same
+        condition.
 
         Uses `os.replace()` rather than `Path.replace()` deliberately: on
         Python 3.10, `pathlib`'s accessor captures a direct reference to

@@ -2734,28 +2734,36 @@ operator inspects by hand before settling it with `accept-blocked` or
 evidence those verbs exist to act on.
 
 **Why a worktree costs what it does.** The per-worktree figure varies by
-roughly 13x with something leerie does not control — which is why leerie
+roughly 13x with something leerie does not control (that multiple is derived from the unreproduced figures below — see the caveat) — which is why leerie
 does *not* try to predict it, and the disk guardrail is a proportional
 free-space floor rather than a per-worktree byte budget. Package
 managers like pnpm are content-addressed and normally *hardlink* from a
 shared store into each `node_modules`, so a second checkout of the same
 dependency set costs
 almost nothing — measured on a host where the store and the tree share a
-mount, 92.60% of `node_modules` bytes are shared with that store and the
-private remainder is 102 MiB against a 1.35 GiB tree. Those figures are not
-prose: they are reproduced by `scripts/measure/worktree_bytes.py` and
-committed as `tests/fixtures/worktree_bytes/summary.json`, with tests
-asserting this paragraph still matches the artifact.
+mount, 92.60% of `node_modules` bytes were shared with that store and the
+private remainder was 102 MiB against a 1.35 GiB tree, of which roughly
+37 MiB was the directories.
 
-Two details in that measurement are load-bearing, and getting either wrong
-inflates the shared share. "Shared" means *every* link to the inode lives
-outside the walked tree — **not** `st_nlink > 1`, which counts in-tree names
-too and is the discredited predicate from N30's third attempt. And
-directories are always charged: a directory's link count is `.` plus its
-parent's entry plus one `..` per subdirectory, an artefact of the tree
-rather than evidence of an outside store, and a second worktree has to
-create every one of them. On this corpus the directories alone are 37 MiB
-of the 102. But leerie bind-mounts the
+**These four figures are a single measurement on one host, taken once, and
+they are NOT reproducible from this repository.** A script and fixture that
+computed them were committed and then withdrawn, because the measurement
+itself produced defects in two consecutive reviews — first the wrong
+shared/private predicate (`st_nlink > 1` counts in-tree names, so it
+over-reports sharing) and omitted directory blocks, then an omitted walk
+root and a directory split that was quoted here but absent from the
+artifact. Treat the numbers as illustrating the *regime* — near-free with a
+shared store, full price without — and not as verified quantities. Anyone
+rebuilding this should measure a `df` delta across a real second checkout in
+a real container, which is the thing neither attempt did.
+
+Two details are what make the regime real, and getting either wrong inflates
+the shared share. "Shared" means *every* link to the inode lives outside the
+walked tree — **not** `st_nlink > 1`, which counts in-tree names too. And
+directories always cost: a directory's link count is `.` plus its parent's
+entry plus one `..` per subdirectory, an artefact of the tree rather than
+evidence of an outside store, and a second worktree has to create every one
+of them. But leerie bind-mounts the
 package-manager store and the state directory as *separate* mounts, and
 Linux refuses `link()` across different mounts even when both resolve to
 the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
@@ -2774,7 +2782,7 @@ floor plus a resumable pause; see IMPLEMENTATION.md's "Disk headroom (N30)"
 for what was tried.
 
 Colocating the store with the worktrees on one mount would collapse the
-per-worktree cost by that same ~13x and is the more fundamental fix, but
+per-worktree cost by that same ~13x — the unreproduced multiple above — and is the more fundamental fix, but
 it changes runtime behaviour across the local, Fly and EC2 runtimes and
 both privilege models, so it is deliberately held as a separate change
 rather than folded into the guardrail.
@@ -7416,13 +7424,17 @@ back. Each is here because the underlying bug shipped once and was expensive
 to diagnose from first principles the second time; none of them is a gate,
 and none can be turned into one — they are things to recognise in a log.
 
-- **`fit_judge crashed; accepting as leaf`** is the stdin-race's downstream
-  symptom. The crash-to-leaf degrade is deliberately silent — it is the
-  correct fail-safe — so this line is the *only* visible trace. If it
-  reappears, the prompt-transport race (#198) has regressed.
-- **A worker rejected with "exceeds maximum allowed tokens"** means the
-  context-budget fix (#194) has regressed. It stopped being possible when the
-  payload moved off the argv, so its return indicates the transport changed.
+- **`fit_judge crashed for`** … `; accepting as leaf` (leerie's own log line —
+  the subtask id sits between the two halves, so grep the first fragment) is
+  the stdin-race's downstream symptom. The crash-to-leaf degrade is
+  deliberately silent — it is the correct fail-safe — so this line is the
+  *only* visible trace. If it reappears, the prompt-transport race (#198) has
+  regressed.
+- **A worker rejected with "exceeds maximum allowed tokens"** (an *upstream*
+  API message, not a leerie string — it will never appear in this source
+  tree) means the context-budget fix (#194) has regressed. It stopped being
+  possible when the payload moved off the argv, so its return indicates the
+  transport changed.
 - **A finalize outcome judged before the container has exited** is a
   measurement error, not a leerie failure. Never conclude anything about a
   push until the container is gone AND `run.json` has stopped changing, and

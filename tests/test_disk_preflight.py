@@ -306,8 +306,10 @@ class TestSaveBestEffortHelper:
     def test_swallows_disklowspace(self, capsys):
         st = self._failing_state(leerie.DiskLowSpace("no space"))
         leerie._save_state_best_effort(st, "unit")   # must not raise
-        assert "could not persist state" in (capsys.readouterr().out
-                                             + capsys.readouterr().err)
+        # ONE readouterr() call: it resets the capture, so a second one
+        # returns empty and any assertion against it is vacuous.
+        captured = capsys.readouterr()
+        assert "could not persist state" in (captured.out + captured.err)
 
     def test_swallows_a_permission_error(self):
         """Not every save failure is a disk failure — a read-only run dir
@@ -316,11 +318,39 @@ class TestSaveBestEffortHelper:
         st = self._failing_state(PermissionError(13, "Permission denied"))
         leerie._save_state_best_effort(st, "unit")
 
-    def test_swallows_a_baseexception(self):
-        """The catch-all arm must survive anything, including the
-        BaseException family that an `except Exception` guard misses."""
+    def test_swallows_the_exit_signal_family(self):
+        """The signal classes deliberately subclass `BaseException` so they
+        survive broad handlers — so `except Exception` alone would let them
+        escape this helper, which is the whole failure it exists to prevent."""
+        for exc in (leerie.DiskLowSpace("no space"),
+                    leerie.ContextOverflow("too long"),
+                    # RateLimitedExit alone takes a reset time first.
+                    leerie.RateLimitedExit(None, "limited"),
+                    leerie.TerminalAuthFailure("expired")):
+            st = self._failing_state(exc)
+            leerie._save_state_best_effort(st, "unit")   # must not raise
+
+    def test_a_keyboardinterrupt_from_save_still_propagates(self):
+        """The bound on "deliberately total", and it is not a detail.
+
+        The helper caught a bare `BaseException` at first, which swallows
+        Ctrl-C. In `main()`'s own `except KeyboardInterrupt` arm that means a
+        second Ctrl-C during this save is absorbed and the handler carries on
+        into cleanup and a fresh `asyncio.run(capture_repo_deps(...))` — the
+        long operation the operator was trying to escape. Protecting a
+        best-effort write at the cost of an interrupt inverts the priority,
+        so the caught set is this file's existing exit-signal-family tuple
+        rather than everything.
+        """
         st = self._failing_state(KeyboardInterrupt())
-        leerie._save_state_best_effort(st, "unit")
+        with pytest.raises(KeyboardInterrupt):
+            leerie._save_state_best_effort(st, "unit")
+
+    def test_a_systemexit_from_save_still_propagates(self):
+        """Same reasoning: `die()` inside a save path must still exit."""
+        st = self._failing_state(SystemExit(3))
+        with pytest.raises(SystemExit):
+            leerie._save_state_best_effort(st, "unit")
 
     def test_a_healthy_save_is_not_swallowed_silently(self, capsys):
         st = mock.Mock()
@@ -330,6 +360,62 @@ class TestSaveBestEffortHelper:
         out = capsys.readouterr()
         assert "could not persist" not in (out.out + out.err), (
             "a successful save must not warn")
+
+    def test_a_raising_log_cannot_make_the_helper_raise(self, monkeypatch):
+        """The half of "never raises" that #204 left unguarded.
+
+        The helper's own warning is emitted with `log()`, and `log()` is
+        `print(flush=True)`. On the remote runtime stdout IS
+        `<run_dir>/orchestrator.log`, so on a full disk that write raises and
+        the helper propagated it — defeating its entire contract at exactly
+        the moment it matters. Proven before the fix: stubbing `log` to raise
+        `OSError(ENOSPC)` gave `helper RAISED OSError: [Errno 28]`.
+
+        The failure is injected at `print`, NOT at `log`. That distinction IS
+        the fix's design — the guard lives in `log` so all ~350 callers
+        inherit it, rather than in this helper. The first version of this test
+        stubbed `log` itself, which asserts a property the fix deliberately
+        does not provide, and it failed against correct code: a test and its
+        fix have to agree on where the boundary sits.
+        """
+        def exploding_print(*a, **k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("builtins.print", exploding_print)
+        st = mock.Mock()
+        st.save = mock.Mock(side_effect=leerie.DiskLowSpace("no space"))
+        leerie._save_state_best_effort(st, "unit")   # must not raise
+
+    def test_log_itself_never_raises_on_an_unwritable_stream(self, monkeypatch):
+        """The fix lives in `log`, not in each of its ~350 callers."""
+        def exploding_print(*a, **k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("builtins.print", exploding_print)
+        leerie.log("anything")          # must not raise
+
+    def test_log_still_propagates_a_keyboardinterrupt(self, monkeypatch):
+        """`OSError`/`ValueError` only. Swallowing the BaseException family
+        would make Ctrl-C during a write silently ineffective."""
+        def interrupting_print(*a, **k):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr("builtins.print", interrupting_print)
+        with pytest.raises(KeyboardInterrupt):
+            leerie.log("anything")
+
+    def test_die_still_exits_with_its_code_when_stderr_is_unwritable(
+            self, monkeypatch):
+        """The exit code is the load-bearing part: an unwritable stderr must
+        not turn a coded exit into an unhandled OSError that the launcher's
+        teardown would classify as a crash."""
+        def exploding_print(*a, **k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("builtins.print", exploding_print)
+        with pytest.raises(SystemExit) as exc:
+            leerie.die("boom", code=leerie.EXIT_LOCKED)
+        assert exc.value.code == leerie.EXIT_LOCKED
 
     def test_every_main_handler_uses_the_helper(self):
         """No terminating arm may reintroduce a bare `st.save()`.
@@ -363,7 +449,7 @@ class TestSaveBestEffortHelper:
         saves at all, so require the helper to be present in quantity."""
         import inspect
         src = inspect.getsource(leerie.main)
-        assert src.count("_save_state_best_effort(") >= 7, (
+        assert src.count("_save_state_best_effort(") >= 9, (
             "main() has far fewer best-effort saves than it has terminating "
             "arms — the sweep above may be passing because the saves were "
             "removed rather than guarded")
