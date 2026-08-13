@@ -531,6 +531,26 @@ export LEERIE_WORKER_TIMEOUT=9000
 # leerie.toml:
 ./leerie "task" --strict-conformer
 
+# How much of the repo's suite each per-subtask conformance round measures
+# (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*). The
+# orchestrator — not the conformer — runs build/lint/test, before and after
+# every round.
+#   scoped  (default) a diff-scoped proxy where one resolves, canonical
+#           otherwise. Declare `test_scoped` / `build_scoped` in
+#           .leerie/config.toml, else two narrow inferences apply
+#           (vitest `related`, jest `--findRelatedTests`, `tsc --noEmit`).
+#           An axis with no proxy falls back to the canonical command; it is
+#           never silently skipped.
+#   full    always the canonical command. Note this restores concurrent
+#           full-suite runs under --max-parallel, which is what the scoped
+#           default exists to avoid.
+#   off     measure nothing per subtask.
+# The canonical command always runs at the base-health baseline and on the
+# final integrated tree regardless of this setting — those two are where a
+# whole-suite answer is meaningful. Also LEERIE_SUBTASK_TESTS or
+# `subtask_tests` in leerie.toml:
+./leerie "task" --subtask-tests full
+
 # Disable finalize-time dependency capture (DESIGN §6½). Default: enabled.
 # Also `capture_deps = false` in .leerie/config.toml (no leerie.toml tier):
 export LEERIE_CAPTURE_DEPS=0
@@ -724,6 +744,21 @@ and the individual tests pass in isolation — e.g.
 gathered under concurrent load as unusable, and re-run alone before believing
 it. `-n 4` (xdist) is fine on an otherwise-idle host and matches the serial
 totals exactly; what breaks is *two suites at once*, not parallelism itself.
+
+**Do not edit `orchestrator/leerie.py` (or any file under test) while the
+suite is running.** A great many guards here assert via
+`inspect.getsource` / `ast.parse` on the module read from disk, and Python's
+`linecache` re-reads a file whose mtime changed — so an edit mid-run makes
+those guards see shifted or half-written source and fail en masse for reasons
+that have nothing to do with the change. Measured once during the BLT work: a
+single-line docstring edit ~3 minutes into a run produced **38 spurious
+failures** (`test_subreaper`, `test_warnings_before_die`,
+`test_wave_integration_instrumentation`, every `test_terminal_auth_routing`
+handler pin, …), all of which passed 70/70 when re-run against a frozen tree.
+This is a *separate* hazard from the concurrency one above and has the same
+tell: a failure list dominated by source-coupling tests. Treat any such list
+gathered while the tree was moving as unusable, exactly as with a list
+gathered under concurrent load.
 
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,

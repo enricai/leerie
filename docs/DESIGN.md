@@ -1947,6 +1947,17 @@ in the PR body, where a human and CI can act on them. The pass is
 bounded by the same `conformance_rounds` cap and the same per-run
 worker budget; its `claude -p` invocation has no special standing.
 
+This pass always measures the repo's **canonical** build/lint/test
+commands, never a delta proxy — and that is what distinguishes it
+from the per-subtask phase, which may run a diff-scoped proxy
+instead (§9 *Per-subtask scope: a delta proxy, not the suite*).
+The three failures listed above are precisely the ones no
+diff-scoped selection can see: each arises from subtasks
+co-existing, not from any one subtask's diff, so a selection
+computed per subtask would exclude them by construction. Together
+with the base-health baseline these are the only two places a run
+executes the whole suite.
+
 ### When integration cannot succeed
 
 Two outcomes are not failures of the integrator but facts about the work:
@@ -4719,8 +4730,30 @@ empty. The orchestrator handles this in two layers: runtime
 versions and the optional setup hook are pre-installed *in* the
 container before any worker runs, because they're cross-cutting
 state every worker shares; dependency installs (pnpm, pip, cargo,
-etc.) are deferred to each worker, which runs the install in its
-own worktree against shared package-manager caches.
+etc.) happen per worktree, against shared package-manager caches.
+
+**Who runs that install.** Both the orchestrator and the workers do,
+for different trees and at different moments. Since the orchestrator
+took over build/lint/test execution (§9), it needs deps present in a
+worktree before it can measure anything there, so it applies the
+recipe itself — **lazily, on the first axis it actually measures for
+that worktree, and at most once per worktree per process**. Workers
+still install for their own targeted work, and the recipe stays in
+their prompt for that reason.
+
+Lazy rather than eager at worktree creation, and the distinction is
+not cosmetic: a config-only or docs-only subtask correctly skips the
+install today, and pre-installing for every worktree would hand that
+cost back. Measured on the run that motivated this work, 44 of 91
+subtasks touched zero source files. What the ownership removes is the
+*repeat*: 263 installs ran across 161 worker logs — roughly 2.8 per
+worktree, since a subtask's implementer and conformer share one — to
+converge on the same state each time.
+
+The memo is keyed on the resolved absolute worktree path and lives in
+the process, not in run state: it records a filesystem fact, and
+re-installing once after a `resume` is correct, because a fresh
+container starts with an empty worktree.
 
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
@@ -6538,6 +6571,169 @@ with the rest of §12: what cannot be guaranteed in code (a model genuinely
 catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
+
+**Orchestrator-run build/lint/test is bounded, not contained.** A BLT command
+the orchestrator starts is not a worker. It does not pass through the
+memory-admission gate and it is not enrolled in a cgroup, so unlike a worker it
+has no `memory.max` and no `pids.max` of its own — §6 *Memory containment*
+covers the worker path only. That gap predates the handover (the base-health
+baseline always ran this way), but the handover multiplies it: what was one
+serial pre-wave run becomes one per subtask per round.
+
+Two things bound it. The default `scoped` mode keeps each measurement small —
+a couple of test files, seconds — so the uncontained footprint is negligible.
+And `blt_parallel` (default 2) caps how many run at once, which matters most
+under `--subtask-tests full`, where a whole suite sits behind every subtask and
+`max_parallel` of them at once is the shape that once saturated a worker's
+cgroup badly enough to raise `worker_pids_max` to 2048. Reaping is already
+handled: these run in their own session and are torn down as a process tree on
+timeout or exception.
+
+Enrolling them in a cgroup is the architecturally consistent answer and is not
+done yet; it would have to go through the broker, whose wire contract drifts
+silently enough to warrant its own guard.
+
+**The signal that continues the loop is a delta, not a verdict.** The round
+cap above bounds the loop; what *ends* it early is the orchestrator's judgment
+that the conformer has nothing left to do. That judgment must be relative to
+the base tree, or the loop becomes unsatisfiable on any repo whose base is not
+already green — and then every subtask spends its entire round budget
+rediscovering debt it did not create.
+
+That is not hypothetical. Measured on a 91-subtask run whose base tree was RED
+on tests, **only 6 of 79 subtasks were clean at round 1**, and **57 ran exactly
+3 rounds** — the cap, precisely. Each of those rounds ran the repo's full test
+suite, at ~8 minutes a time, to re-observe a failure the orchestrator had
+already recorded in the baseline before the first wave started.
+
+The pre-existing failure reaches the loop through *two* channels, and both must
+be closed or the fix is half a fix:
+
+- the **axis** channel — an axis reporting `ran && !passed`;
+- the **residual** channel — a `rule_violations_residual` entry. Measured, 125
+  of 139 residuals in that run carried the single rule `build/lint/tests must
+  pass`, with a `why_not_fixed` that explicitly cited the baseline: *"consistent
+  with the orchestrator-supplied BASELINE which recorded the base tree already
+  RED on tests … pre-existing and out of this diff's scope."* The conformer
+  read the baseline, obeyed it, and reported honestly; the orchestrator then
+  re-spawned it to rediscover the same thing.
+
+So the loop-continuation predicate consults the baseline directly. An axis that
+was red on the base tree is not a reason to spend another round, and neither is
+a residual that labels itself as being about such an axis. Anything else is
+unchanged: a residual about something other than build/lint/test, an unlabelled
+one, a *newly* introduced one, or a failure on an axis that was **green** at
+baseline all continue the loop exactly as before — those are regressions this
+change must stay able to see.
+
+This is the same principle as the baseline itself (*Base-tree health baseline*
+below), applied one layer down. The baseline was already being handed to the
+*worker* as prose in a `BASELINE:` block, asking it to scope its judgment to the
+delta. But the orchestrator's own predicate never read it — the guarantee lived
+in a prompt while the code that could enforce it looked away. §12 says that is
+backwards.
+
+Which axis a residual is about is read from a **schema field the conformer
+fills** (`axis`, one of `build`/`lint`/`tests`), never inferred from the `rule`
+or `why_not_fixed` prose. Inferring it would be regex over an LLM's response,
+which *Language-to-JSON: natural-language interpretation is never regex*
+forbids — and the prose is not stable enough to compare anyway: measured, only
+21% of consecutive round transitions repeat a byte-identical residual set. Where
+a check needs a fact that lives in natural language, the owning worker surfaces
+it as a field; that is the rule, and this is an ordinary application of it.
+
+The field is **optional in the schema and gating on absence**, and that is one
+decision rather than two. Requiring it would cost the entire submission rather
+than the single field — the same trade already measured on `plan_overlap_judge`,
+where one required field held valid output to 40.9% — while treating an
+unlabelled residual as excusable would let a worker silently switch the loop
+off. So an unlabelled residual blocks: the conservative direction, matching
+*Findings carry a severity* in §8.
+
+This splits the fix's guarantee in two, and the halves are worth distinguishing.
+The axis channel is pure code enforcement — the orchestrator measured the
+baseline itself and compares its own record, with no worker cooperation
+involved. The residual channel depends on the conformer labelling its output.
+Replaying the motivating run's real round-1 output through the shipped
+predicate: **6 of 79 subtasks clean today, 37 on the axis channel alone, 53 once
+residuals carry a label.** The floor is code; the rest is the prompt earning it.
+
+**The orchestrator measures; the conformer consumes.** Build, lint and test
+are executed by the orchestrator, not by the conformer. The worker receives
+*results* — the exact command, the exit-code verdict, and an output tail — in a
+`BLT_RESULTS:` block, and is told it did not run them and must not re-run a
+full axis.
+
+This is §12 applied to the axis that was costing the most. Whether a suite ran,
+with what command, in which tree, at what scope, is mechanically knowable, so
+it belongs in `leerie.py`; whether a resulting failure is worth fixing is
+judgment, so it stays with the worker.
+
+Two things make it a real transfer rather than a request. The command strings
+are no longer injected, so running a full axis now requires the worker to
+synthesise one. And the orchestrator's measurement **overwrites** the
+conformer's self-reported `build`/`lint`/`tests` before any consumer reads
+them — the loop-continuation predicate, the residual summary, and the persisted
+`conformance` entry all see what was measured, never what was claimed. The
+worker's own report survives only as telemetry.
+
+"Before any consumer" is not free: it takes **two** applications per round, and
+the pairing is deliberate rather than defensive. One at the tail covers the
+ordinary case. One immediately after the worker returns covers the three gates
+that abandon a round early — a malformed result, a protected-path violation, a
+strict-mode clobber — because each of those `break`s past the tail while still
+handing `last_res` to a consumer. The early one uses the *pre*-round
+measurement, which is also the accurate answer there: two of those three exits
+roll the worktree back toward the state that measurement describes.
+
+Worth being precise about what this does *not* fix. Conformers were not
+over-firing: measured, 219 full-suite runs across 229 conformer calls, almost
+exactly the one-per-round the prompt asked for, and implementers ran the full
+suite zero times. The prompts were being followed. Moving execution into the
+orchestrator therefore saves little by itself — it is what makes the next two
+paragraphs possible.
+
+The conformer keeps **targeted falsifiers**, and they are promoted from
+exception to primary tool: `production_evidence` (§9) requires exercising the
+path the diff actually changed against the repo as it is, which is scoped work
+by construction and is not a suite run.
+
+**Per-subtask scope: a delta proxy, not the suite.** A subtask's conformer does
+not need to know whether the repo's whole suite is green. The whole-tree pass
+(§6) is where that question is asked, and it is the only place it can be
+answered about cross-subtask interaction. What the per-subtask pass needs is
+whether *this diff* broke something.
+
+So the per-subtask axes may run a **delta proxy** — a cheaper command scoped to
+the changed files — while the canonical command runs exactly twice per run:
+once at the base-health baseline and once (per round) on the integrated tree.
+The proportions that motivate this: the median subtask in the measured run
+touched **one** source file, yet every conformer round ran all 990 test files
+at ~499 s a time, against ~23 s for a scoped run of the same repo.
+
+A proxy is repo-declared (`test_scoped` / `build_scoped` in
+`.leerie/config.toml`) or inferred from two narrow signals, and is rendered
+from a template with `{files}` and `{base}`. It is **not a subset** of the
+canonical command and is not expected to be — `tsc --noEmit` catches a
+different set than `next build`. It is a cheap falsifier run once per subtask,
+backed by an expensive oracle run twice.
+
+Absence is the default in both directions: an axis with no resolvable proxy
+falls back to the canonical command rather than being skipped, and a changed
+file set that is empty skips the axis rather than rendering a bare runner —
+which would run everything, the exact inversion of the feature.
+`--subtask-tests full|scoped|off` lets an operator force either end.
+
+**The round signal is a regression, not a verdict.** Because a scoped result
+and a full baseline are not comparable, the base-health baseline cannot
+attribute a scoped failure to a subtask. Nor should it: the question is
+narrower. The orchestrator measures each axis immediately **before** a
+conformer round and again **after** it, with the identical command and scope,
+and compares those two. An axis green before and red after is a regression the
+conformer just introduced — attributable, with no output parsing and no
+framework knowledge. That is what continues the loop on a build/lint/test
+signal. Differing command strings are never compared, which is what stops a
+scoped `pre` being weighed against a canonical `post`.
 
 **Opt-in strict mode.** `--strict-conformer` (also `LEERIE_STRICT_CONFORMER`
 env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing

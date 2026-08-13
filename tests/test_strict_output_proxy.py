@@ -581,15 +581,52 @@ def test_recipe_timeout_rejects_a_negative_but_keeps_a_sane_value(leerie):
     assert leerie._recipe_timeout_s({"timeout_s": 3000, "command": ["x"]}, 100) == default
 
 
-def test_both_recipe_timeout_consumers_go_through_the_guard(leerie):
-    """The guard is worthless if either consumer still reads the raw field."""
+def test_no_recipe_timeout_consumer_bypasses_the_guard(leerie):
+    """The guard is worthless if any consumer still reads the raw field.
+
+    DERIVED, not enumerated. This previously named its two consumers
+    explicitly, and when `_capture_conformance_baseline`'s recipe loop was
+    extracted into `_ensure_worktree_deps` the named site stopped containing
+    the call — the guard failed loudly, which was lucky; had the extraction
+    kept a bypassing read behind it, an enumeration would simply have stopped
+    covering the moved code. Same lesson the launcher-block and state-walk
+    guards record: a list of names goes stale, a rule does not.
+
+    The invariant is that `entry.get("timeout_s")` is read in exactly one
+    place — inside `_recipe_timeout_s`, which bounds it — because grammar
+    compilation strips the schema's `minimum` and a negative value reaching
+    `wait_for(timeout=...)` fires immediately.
+    """
+    import ast
     import inspect
-    for fn in (leerie._format_provision_recipe_section,
-               leerie._capture_conformance_baseline):
-        src = inspect.getsource(fn)
-        assert "_recipe_timeout_s(" in src, f"{fn.__name__} bypasses the guard"
-        assert 'get("timeout_s")' not in src, (
-            f"{fn.__name__} still reads timeout_s directly")
+    import pathlib
+
+    src = pathlib.Path(inspect.getfile(leerie)).read_text()
+    tree = ast.parse(src)
+    # Split ONCE and slice by line span. `ast.get_source_segment` re-splits the
+    # whole source on every call, which over this module's 559 functions and
+    # ~32k lines cost 16.6s for this one test — half its file's runtime, and
+    # enough to matter against CI's 10-minute job cap. Same work, ~0.2s.
+    lines = src.splitlines(keepends=True)
+
+    readers, callers = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = "".join(lines[node.lineno - 1:node.end_lineno])
+        if 'get("timeout_s")' in body:
+            readers.append(node.name)
+        if "_recipe_timeout_s(" in body and node.name != "_recipe_timeout_s":
+            callers.append(node.name)
+
+    assert readers == ["_recipe_timeout_s"], (
+        "entry.get(\"timeout_s\") must be read only inside _recipe_timeout_s, "
+        f"which bounds it; these also read it raw: {readers}")
+
+    # Anti-vacuity: a scan that finds nothing would certify this forever.
+    assert len(callers) >= 2, (
+        "expected at least two recipe-executing sites to route through "
+        f"_recipe_timeout_s; found {callers}")
 
 
 def test_worker_env_gets_the_base_url_only_when_the_proxy_is_running(leerie):

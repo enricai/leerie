@@ -24,17 +24,28 @@ import types
 # --- source-coupling: the call site itself -------------------------------
 
 def test_capture_baseline_uses_non_login_shell(leerie):
-    src = inspect.getsource(leerie._capture_conformance_baseline)
+    # The baseline's BLT execution moved into `_measure_blt` when it was
+    # extracted so every measurement site shares one implementation; the
+    # argv contract moved with it. Both halves are still pinned: the shell
+    # invocation itself here, and — below — that the baseline no longer
+    # builds an argv of its own, so a second (possibly `-lc`) invocation
+    # cannot be re-inlined beside the call.
+    src = inspect.getsource(leerie._measure_blt)
     assert '"-lc"' not in src, (
-        "_capture_conformance_baseline must not invoke commands via a "
+        "_measure_blt must not invoke commands via a "
         "login shell (bash -lc) — a login shell sources ~/.bash_profile / "
         "/etc/profile, which discards the Docker-image-ENV PATH mise "
         "needs to stay resolvable."
     )
     assert '["bash", "-c", cmd]' in src, (
-        "_capture_conformance_baseline must invoke commands via "
+        "_measure_blt must invoke commands via "
         '["bash", "-c", cmd], matching every other command path in the '
         "module."
+    )
+    cap = inspect.getsource(leerie._capture_conformance_baseline)
+    assert '"bash"' not in cap, (
+        "_capture_conformance_baseline must delegate BLT execution to "
+        "_measure_blt rather than building its own shell argv."
     )
 
 

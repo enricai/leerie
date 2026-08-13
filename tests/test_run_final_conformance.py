@@ -154,6 +154,21 @@ def _stub_claude_p(leerie_mod, queue, *, commits=None):
 
 # --- skip conditions ------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _restore_measure_axes(leerie):
+    """Snapshot `leerie._measure_axes` before each test and restore after.
+
+    Same hazard, same fix as `_restore_run_conformer` above: `_stub_measure_axes`
+    rebinds the module attribute directly rather than via monkeypatch, so
+    without this the stub leaks into the session-scoped `leerie` fixture and
+    every later test in the run measures whatever the last stub returned.
+    Caught by `test_clean_result_exits_after_one_round` passing in isolation
+    and failing under batch collection — the classic tell.
+    """
+    original = leerie._measure_axes
+    yield
+    leerie._measure_axes = original
+
 def test_skipped_when_staging_worktree_absent(env):
     c = env["leerie"]
     # Remove the staging worktree to trigger the skip branch.
@@ -340,6 +355,27 @@ def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
 
 
+def _stub_measure_axes(leerie_mod, seq):
+    """Drive the orchestrator's own BLT measurement, which since the handover
+    (DESIGN §9) OVERWRITES whatever the conformer self-reported. A test that
+    needs a failing axis must fail it here — setting it on the worker's result
+    no longer reaches any consumer. Call order is pre0, post0, pre1, post1...
+    """
+    calls = {"n": 0}
+
+    async def _stub(tree, axes_map, st, caps, **kw):
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return dict(seq[i])
+    leerie_mod._measure_axes = _stub
+    return calls
+
+
+def _failing_axis(axis="build", command="npm run build", summary="fail"):
+    return {axis: {"ran": True, "measured": True, "passed": False,
+                   "command": command, "summary": summary}}
+
+
 def test_within_round_repetition_injects_feedback_into_next_round(env):
     """When _emit_bash_axis_warnings detects a within-round repetition
     (e.g. TEST_CMD run twice in one round — Pattern A) at the final,
@@ -369,15 +405,20 @@ def test_within_round_repetition_injects_feedback_into_next_round(env):
         return _clean_result()
 
     c.claude_p = _stub
+    # Round 0 must be non-clean for a round 1 to happen at all, and since the
+    # handover that has to come from the ORCHESTRATOR's measurement — the
+    # worker's own `dirty` build above is overwritten before any consumer
+    # reads it. Order is pre0, post0, pre1, post1.
+    _stub_measure_axes(c, [_failing_axis(), _failing_axis(), {}, {}])
 
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],
         env["efforts"]))
 
     assert len(prompts) >= 2, "expected at least 2 final-conformer rounds"
-    assert not any("times in one round" in p for p in prompts[:1]), \
+    assert not any("ran the full" in p for p in prompts[:1]), \
         "round 0's own prompt should carry no prior-round feedback"
-    assert any("times in one round" in p for p in prompts[1:]), \
+    assert any("ran the full" in p for p in prompts[1:]), \
         f"round 1's prompt should carry the repetition feedback; " \
         f"prompts={prompts!r}"
 
@@ -392,6 +433,8 @@ def test_failing_axis_summarized_into_warnings(env):
                "summary": "compile error in src.py"},
     )
     _stub_claude_p(c, [failing] * env["caps"]["conformance_rounds"])
+    _stub_measure_axes(c, [_failing_axis(command="make", summary=
+                                         "compile error in src.py")])
 
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"],

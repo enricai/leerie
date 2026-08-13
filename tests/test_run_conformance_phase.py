@@ -19,6 +19,32 @@ import subprocess
 from pathlib import Path
 
 
+def _stub_measure_axes(leerie_mod, axes):
+    """Make the orchestrator's own BLT measurement return `axes`.
+
+    Since the handover (DESIGN §9) the orchestrator measures build/lint/test
+    itself and OVERWRITES whatever the conformer self-reported, so a test that
+    wants a failing axis has to fail it here — setting it on the worker's
+    result no longer reaches any consumer, which is the point of the change.
+    """
+    seq = axes if isinstance(axes, list) else None
+    calls = {"n": 0}
+
+    async def _stub(tree, axes_map, st, caps, **kw):
+        if seq is None:
+            return dict(axes)
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return dict(seq[i])
+    leerie_mod._measure_axes = _stub
+    return calls
+
+
+def _failing_axis(axis="build", command="make", summary="oops"):
+    return {axis: {"ran": True, "measured": True, "passed": False,
+                   "command": command, "summary": summary}}
+
+
 def _write_log(path, events):
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
 
@@ -53,6 +79,22 @@ def _restore_run_conformer(leerie):
     original = leerie._run_conformer
     yield
     leerie._run_conformer = original
+
+
+@pytest.fixture(autouse=True)
+def _restore_measure_axes(leerie):
+    """Snapshot `leerie._measure_axes` before each test and restore after.
+
+    Same hazard, same fix as `_restore_run_conformer` above: `_stub_measure_axes`
+    rebinds the module attribute directly rather than via monkeypatch, so
+    without this the stub leaks into the session-scoped `leerie` fixture and
+    every later test in the run measures whatever the last stub returned.
+    Caught by `test_clean_result_exits_after_one_round` passing in isolation
+    and failing under batch collection — the classic tell.
+    """
+    original = leerie._measure_axes
+    yield
+    leerie._measure_axes = original
 
 
 def _run(cmd, cwd, check=True):
@@ -135,8 +177,8 @@ def _stub_run_conformer(leerie_mod, results_queue, *, commits=None):
     state = {"i": 0, "feedbacks": []}
 
     async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
-                    *, rules_files, blt_commands, diff_base,
-                    extra_feedback=None):
+                    *, rules_files, diff_base,
+                    extra_feedback=None, **_kw):
         i = state["i"]
         state["i"] += 1
         state["feedbacks"].append(extra_feedback)
@@ -197,8 +239,19 @@ def test_malformed_result_breaks_loop_with_warning(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == 1  # loop did not retry on malformed output
-    assert res == bad
     assert any("malformed" in w for w in warnings)
+    # Everything except the build/lint/test axes is the worker's payload
+    # verbatim — the malformed result is still what gets surfaced.
+    assert {k: v for k, v in res.items() if k not in ("build", "lint", "tests")} \
+        == {k: v for k, v in bad.items() if k not in ("build", "lint", "tests")}
+    # The axes, however, are the ORCHESTRATOR's measurement, not the worker's
+    # claim — this path `break`s before the tail apply, so it used to carry
+    # self-reported axes into _summarize_residuals, the persisted entry, and
+    # strict-mode _conformance_clean.
+    for axis in ("build", "lint", "tests"):
+        assert "measured" in res[axis], (
+            f"{axis} still carries the worker's self-report on the "
+            "malformed-result break path")
 
 
 # --- crash (None): surfaced as warning, loop breaks -----------------------
@@ -223,8 +276,8 @@ def test_pid_exhaustion_attaches_pids_stat_to_warnings(env):
     c = env["leerie"]
 
     async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
-                    *, rules_files, blt_commands, diff_base,
-                    extra_feedback=None):
+                    *, rules_files, diff_base,
+                    extra_feedback=None, **_kw):
         raise c.PidExhaustedError(
             "worker t1-conformer exhausted its PID cgroup "
             "(pids.current=2048/2048, fork denials=7); every "
@@ -262,7 +315,7 @@ def test_run_conformer_reraises_pid_exhausted_error(env, monkeypatch):
         asyncio.run(c._run_conformer(
             env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
             env["st"], env["models"], {"conformer": None}, rules_files=[],
-            blt_commands={"build": "", "lint": "", "test": ""},
+            blt_results={}, blt_scope="off",
             diff_base=env["run_branch"]))
 
 
@@ -362,6 +415,9 @@ def test_rounds_cap_respected_with_residuals(env):
                "summary": "oops"},
     )
     state = _stub_run_conformer(c, [failing, failing, failing, failing])
+    # The failing axis must come from the ORCHESTRATOR now — a self-reported
+    # one is overwritten before any consumer sees it.
+    _stub_measure_axes(c, _failing_axis())
 
     res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
@@ -472,7 +528,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     result = asyncio.run(c._run_conformer(
         env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
         env["st"], env["models"], env["efforts"],
-        rules_files=[], blt_commands={"build": "", "lint": "", "test": ""},
+        rules_files=[], blt_results={}, blt_scope="off",
         diff_base="dummy"))
     assert result is None, "budget-exhausted conformer must return None"
 
@@ -646,6 +702,13 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
         build={"ran": True, "passed": False, "command": "npm run build",
                "summary": "fail"})
     state = _stub_run_conformer(c, [dirty, _clean_result()])
+    # Round 0 must stay non-clean so a round 1 happens at all; since
+    # the handover that has to be a measured failure, not a claimed one.
+    # measurement order is pre0, post0, pre1, post1 — fail the first two so
+    # round 0 is non-clean, then go green so round 1 exits.
+    _stub_measure_axes(c, [_failing_axis(command="npm run build"),
+                           _failing_axis(command="npm run build"),
+                           {}, {}])
 
     # Write a log that triggers the Pattern B warning: a Bash command
     # auto-backgrounded, then immediately retried with a fresh Bash.
@@ -672,16 +735,28 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
 
 
 def test_pattern_a_multi_invocation_now_injects_feedback(env):
-    """When the conformer runs the same axis multiple times in one round
-    (Pattern A: repetition), that warning is now threaded into the next
-    round's feedback too, exactly like the auto-backgrounded (Pattern B)
-    class — closing the gap where leerie detected the repetition but
-    never told the worker."""
+    """A full-axis run the conformer made itself is threaded into the next
+    round's feedback, exactly like the auto-backgrounded (Pattern B) class.
+
+    This was originally about *repetition* — the old contract allowed one
+    invocation per axis per round and only warned above that. Since the
+    handover (DESIGN §9) the orchestrator measures the axes and the conformer
+    is asked not to run a full one at all, so the threshold is one and this
+    covers "ran it despite the results being supplied" rather than "ran it
+    twice". The log below has two, which trips either reading.
+    """
     c = env["leerie"]
     dirty = _clean_result(
         build={"ran": True, "passed": False, "command": "npm run build",
                "summary": "fail"})
     state = _stub_run_conformer(c, [dirty, _clean_result()])
+    # Round 0 must stay non-clean so a round 1 happens at all; since
+    # the handover that has to be a measured failure, not a claimed one.
+    # measurement order is pre0, post0, pre1, post1 — fail the first two so
+    # round 0 is non-clean, then go green so round 1 exits.
+    _stub_measure_axes(c, [_failing_axis(command="npm run build"),
+                           _failing_axis(command="npm run build"),
+                           {}, {}])
 
     # Write a log that triggers Pattern A only (multiple invocations,
     # no auto-backgrounding).
@@ -701,7 +776,9 @@ def test_pattern_a_multi_invocation_now_injects_feedback(env):
     assert state["feedbacks"][0] is None
     assert state["feedbacks"][1] is not None, \
         "Pattern A (within-round repetition) should now inject feedback"
-    assert "times in one round" in state["feedbacks"][1]
+    # Wording follows `_BLT_FEEDBACK_MARKERS`; the threshold is now one
+    # un-scoped run, not two of any kind (see _emit_bash_axis_warnings).
+    assert "ran the full" in state["feedbacks"][1]
 
 
 # --- strict-conformer mode -------------------------------------------------
@@ -754,3 +831,112 @@ def test_advisory_mode_never_blocks(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert blocked is None
+
+
+# --------------------------------------------------------------------------
+# The measurement overwrite survives every early exit (regression: D1)
+#
+# `_apply_measured_axes` used to run only at the TAIL of the round loop, so
+# three gates — malformed result, protected-path violation, strict-mode
+# clobber — `break` past it and carried the conformer's SELF-REPORTED
+# build/lint/tests into `_summarize_residuals`, the persisted `conformance`
+# entry, and (strict mode) the post-loop `_conformance_clean`. That last one
+# is the sharp end: it meant strict mode could gate on a worker's claim about
+# a suite the orchestrator had actually measured itself.
+#
+# The guard that was supposed to cover this compared source INDEXES, which a
+# `break` jumps straight over. These drive the paths instead.
+# --------------------------------------------------------------------------
+
+_CLAIMED_GREEN = {"ran": True, "measured": True, "passed": True,
+                  "command": "npm test", "summary": "worker says green"}
+_MEASURED_RED = {"tests": {"ran": True, "measured": True, "passed": False,
+                           "command": "npm test", "summary": "2 failed"}}
+
+
+def test_malformed_result_path_still_reports_measured_axes(env):
+    c = env["leerie"]
+    bad = _clean_result(rule_violations_residual=[{"rule": "x",
+                                                   "why_not_fixed": "y"}],
+                        tests=dict(_CLAIMED_GREEN))
+    _stub_run_conformer(c, [bad])
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is False, (
+        "the malformed-result break carried the worker's claimed axes out")
+    assert any("tests-failed" in w for w in warnings), (
+        "the residual summary must describe what was measured")
+
+
+def test_protected_path_break_still_reports_measured_axes(env):
+    c = env["leerie"]
+
+    def _bad_commit(wt: Path):
+        (wt / ".claude").mkdir(exist_ok=True)
+        (wt / ".claude" / "x").write_text("bad\n")
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: BAD"], cwd=wt)
+
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))],
+                        commits={0: _bad_commit})
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert any("protected-path" in w for w in warnings)
+    assert res["tests"]["passed"] is False, (
+        "the protected-path break carried the worker's claimed axes out")
+
+
+def test_strict_clobber_break_still_reports_measured_axes(env):
+    """The sharp case: under --strict-conformer the post-loop
+    `_conformance_clean` decides whether the subtask blocks, so a claimed
+    axis here would gate the run on a self-report."""
+    c = env["leerie"]
+    caps = dict(env["caps"]); caps["strict_conformer"] = True
+
+    def _clobber(wt: Path):
+        # Delete an implementer-owned file. A deletion is what
+        # `_clobbered_owned_files` flags; merely emptying it is not a
+        # revert-to-base, since the base tree had no src.py at all.
+        (wt / "src.py").unlink()
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: clobber"], cwd=wt)
+
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))],
+                        commits={0: _clobber})
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, _warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        caps, env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is False, (
+        "a strict-mode break carried the worker's claimed axes into the "
+        "blocking decision")
+
+
+def test_a_completed_round_reports_the_post_measurement(env):
+    """CONTROL. The tail apply must still win on rounds that run to
+    completion — otherwise the fix above could be 'apply pre and never
+    refresh', which would report a stale verdict for every clean round."""
+    c = env["leerie"]
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))])
+    # pre is red, post is green: only the tail apply can produce green.
+    _stub_measure_axes(c, [_MEASURED_RED,
+                           {"tests": {"ran": True, "measured": True,
+                                      "passed": True, "command": "npm test",
+                                      "summary": ""}}])
+
+    res, _warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is True, (
+        "the tail apply no longer refreshes the axes after the round")
