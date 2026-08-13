@@ -1947,6 +1947,17 @@ in the PR body, where a human and CI can act on them. The pass is
 bounded by the same `conformance_rounds` cap and the same per-run
 worker budget; its `claude -p` invocation has no special standing.
 
+This pass always measures the repo's **canonical** build/lint/test
+commands, never a delta proxy — and that is what distinguishes it
+from the per-subtask phase, which may run a diff-scoped proxy
+instead (§9 *Per-subtask scope: a delta proxy, not the suite*).
+The three failures listed above are precisely the ones no
+diff-scoped selection can see: each arises from subtasks
+co-existing, not from any one subtask's diff, so a selection
+computed per subtask would exclude them by construction. Together
+with the base-health baseline these are the only two places a run
+executes the whole suite.
+
 ### When integration cannot succeed
 
 Two outcomes are not failures of the integrator but facts about the work:

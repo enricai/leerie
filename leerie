@@ -1247,6 +1247,22 @@ test = "$_test_val"
 # Space- or comma-separated apt package names to install at the system level.
 # Uncomment and fill in if your project needs system libraries.
 # setup_packages = "libvips-dev fonts-noto"
+
+# Delta proxies: cheaper, diff-scoped stand-ins leerie runs for a SINGLE
+# subtask instead of the canonical commands above. The canonical commands
+# still run on the base tree and on the final integrated tree, which is where
+# a whole-suite answer means something. A proxy is not a subset of its
+# canonical command and does not need to be.
+#
+# {files} expands to the subtask's changed paths (shell-quoted); {base}
+# expands to the git ref it branched from. A proxy naming {files} is skipped
+# when the subtask changed nothing, and any axis without a proxy falls back
+# to its canonical command — an axis is never silently skipped.
+#
+# leerie infers vitest, jest and tsc automatically, so uncomment these only
+# to override or to cover a runner it does not know:
+# test_scoped = "npx vitest related --run {files} --passWithNoTests"
+# build_scoped = "npx tsc --noEmit"
 TOML
         echo "Created $config_path"
         echo "  Suggested next step: git add .leerie/ && git commit -m 'chore: add leerie config'"
@@ -1314,7 +1330,31 @@ PY
         for axis in build lint test; do
           val="$(_infer_axis "$axis")"
           src="$(_axis_source "$axis")"
-          printf '  %-8s = %-40s  [%s]\n' "$axis" "${val:-(not set)}" "$src"
+          printf '  %-13s = %-40s  [%s]\n' "$axis" "${val:-(not set)}" "$src"
+        done
+        # Delta proxies (DESIGN §9): what a per-subtask conformance round
+        # measures instead of the canonical command above. Config-declared
+        # only here — the orchestrator's two inferences (vitest/jest/tsc)
+        # live in resolve_blt_scoped and are deliberately not mirrored in
+        # bash, so this prints "(not set)" for a repo relying on them rather
+        # than guessing a second time and risking drift.
+        for axis in build_scoped test_scoped; do
+          val=""
+          if [ -f "$_user_repo/.leerie/config.toml" ]; then
+            # `|| true`: the launcher runs under `set -o pipefail`, so a
+            # non-matching grep would abort the whole arm rather than yield
+            # the empty string this loop treats as "not declared".
+            val="$(grep -E "^[[:space:]]*${axis}[[:space:]]*=" \
+                     "$_user_repo/.leerie/config.toml" 2>/dev/null \
+                   | head -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//' \
+                   || true)"
+          fi
+          if [ -n "$val" ]; then
+            printf '  %-13s = %-40s  [config]\n' "$axis" "$val"
+          else
+            printf '  %-13s = %-40s  [%s]\n' "$axis" "(not set)" \
+              "inferred at runtime"
+          fi
         done
         leerie_toml="$_user_repo/leerie.toml"
         if [ -f "$leerie_toml" ]; then

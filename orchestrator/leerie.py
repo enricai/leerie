@@ -25580,9 +25580,12 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
     """Read BLT-related keys from .leerie/config.toml.
 
     Returns None when the file does not exist. Otherwise returns a dict
-    containing only the keys that are present in the file (build, lint,
-    test, setup_packages). Missing keys are not defaulted — the caller
-    (resolve_blt) decides what to do with absent axes.
+    containing only the keys that are present in the file: the canonical
+    axes (build, lint, test), setup_packages, and the delta-proxy templates
+    (build_scoped, test_scoped — read by `resolve_blt_scoped`, DESIGN §9).
+    Missing keys are not defaulted — the caller (`resolve_blt` for the
+    canonical axes, `resolve_blt_scoped` for the proxies) decides what to do
+    with an absent one.
 
     Uses _read_toml_key for each key so the flat-parser semantics
     (first-match-wins, stripped quotes, skip comments/blanks) are shared."""
@@ -26932,6 +26935,26 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             "phase surfaced as advisory")
             break
 
+        # Overwrite the worker's self-reported axes as soon as there is a dict
+        # to overwrite — BEFORE the gates below, every one of which can `break`
+        # out of the round. Without this the malformed-result, protected-path
+        # and clobber exits carry the conformer's *claims* about build/lint/
+        # tests into `_summarize_residuals`, into the persisted `conformance`
+        # entry, and (under --strict-conformer) into the post-loop
+        # `_conformance_clean` — which would be gating on a self-report, the
+        # exact thing this phase stopped doing.
+        #
+        # `pre` rather than a fresh measurement, and that is the accurate
+        # choice on the paths that matter: the protected-path and clobber
+        # exits both roll the worktree back toward its pre-round state, so the
+        # pre-round measurement describes the tree those paths leave behind.
+        # The tail re-applies `post` for rounds that run to completion.
+        #
+        # Safe before validation: `_validate_conformance_result` inspects
+        # `rules_files_read`, `rule_violations_*` and the update paths, never
+        # the axes, so nothing here can launder a schema defect past it.
+        last_res = _apply_measured_axes(last_res, pre)
+
         err = _validate_conformance_result(last_res, worktree)
         if err:
             warnings.append(f"conformer round {c_round}: malformed result: {err}")
@@ -27631,6 +27654,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             break
 
         res = _expand_conformer_output(res)
+        # Same reason as the per-subtask phase: overwrite the worker's
+        # self-reported axes before the gates below, each of which can `break`
+        # past the tail apply and leave claimed build/lint/tests in
+        # `_summarize_residuals`, the persisted `_final` entry, and the strict
+        # `final_blocked` check. `pre` describes the tree the rollback paths
+        # leave behind; the tail re-applies `post` on completed rounds.
+        res = _apply_measured_axes(res, pre)
         last_res = res
         # _validate_conformance_result enforces shape rules
         # (residuals-imply-rules-files-read, every fixed violation

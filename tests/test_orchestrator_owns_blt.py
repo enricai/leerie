@@ -98,11 +98,38 @@ def test_the_overwrite_does_not_mutate_the_raw_worker_output(leerie):
     assert claimed["tests"]["passed"] is True
 
 
-def test_the_overwrite_precedes_every_consumer(leerie):
-    """`_conformance_clean` / `_summarize_residuals` / the persisted entry
-    must all read the measured value, so the apply has to come first."""
-    src = _strip_comments(inspect.getsource(leerie._run_conformance_phase))
-    assert src.index("_apply_measured_axes") < src.index("_conformance_clean")
+def test_the_overwrite_runs_before_any_gate_that_can_break(leerie):
+    """The apply must precede the gate section, not merely `_conformance_clean`.
+
+    This replaces a source-INDEX comparison
+    (`src.index("_apply_measured_axes") < src.index("_conformance_clean")`)
+    that could not fail: the tail apply satisfied it while three gates —
+    malformed result, protected-path violation, strict-mode clobber — `break`
+    out of the round *before* reaching it, carrying the worker's self-reported
+    axes into `_summarize_residuals`, the persisted `conformance` entry, and
+    the strict post-loop `_conformance_clean`. A position check cannot see a
+    path that jumps over the position. The behavioural proof lives in
+    `tests/test_run_conformance_phase.py`; this pins the structure.
+    """
+    for fn in (leerie._run_conformance_phase, leerie._run_final_conformance):
+        src = _strip_comments(inspect.getsource(fn))
+        first_apply = src.index("_apply_measured_axes")
+        for gate in ("_validate_conformance_result", "check_diff_scope",
+                     "_clobbered_owned_files"):
+            if gate in src:
+                assert first_apply < src.index(gate), (
+                    f"{fn.__name__}: {gate} can break out of the round before "
+                    "the measurement overwrites the worker's axes")
+
+
+def test_the_overwrite_is_applied_twice_per_round(leerie):
+    """Once before the gates (from `pre`, which describes the tree a rollback
+    path leaves behind) and once at the tail (from `post`). Dropping either
+    re-opens a path on which claimed axes reach a consumer."""
+    for fn in (leerie._run_conformance_phase, leerie._run_final_conformance):
+        src = _strip_comments(inspect.getsource(fn))
+        assert src.count("_apply_measured_axes") == 2, (
+            f"{fn.__name__} should apply the measurement twice per round")
 
 
 def test_an_empty_measurement_leaves_the_result_alone(leerie):

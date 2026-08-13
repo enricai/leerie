@@ -223,8 +223,19 @@ def test_malformed_result_breaks_loop_with_warning(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == 1  # loop did not retry on malformed output
-    assert res == bad
     assert any("malformed" in w for w in warnings)
+    # Everything except the build/lint/test axes is the worker's payload
+    # verbatim — the malformed result is still what gets surfaced.
+    assert {k: v for k, v in res.items() if k not in ("build", "lint", "tests")} \
+        == {k: v for k, v in bad.items() if k not in ("build", "lint", "tests")}
+    # The axes, however, are the ORCHESTRATOR's measurement, not the worker's
+    # claim — this path `break`s before the tail apply, so it used to carry
+    # self-reported axes into _summarize_residuals, the persisted entry, and
+    # strict-mode _conformance_clean.
+    for axis in ("build", "lint", "tests"):
+        assert "measured" in res[axis], (
+            f"{axis} still carries the worker's self-report on the "
+            "malformed-result break path")
 
 
 # --- crash (None): surfaced as warning, loop breaks -----------------------
@@ -797,3 +808,112 @@ def test_advisory_mode_never_blocks(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert blocked is None
+
+
+# --------------------------------------------------------------------------
+# The measurement overwrite survives every early exit (regression: D1)
+#
+# `_apply_measured_axes` used to run only at the TAIL of the round loop, so
+# three gates — malformed result, protected-path violation, strict-mode
+# clobber — `break` past it and carried the conformer's SELF-REPORTED
+# build/lint/tests into `_summarize_residuals`, the persisted `conformance`
+# entry, and (strict mode) the post-loop `_conformance_clean`. That last one
+# is the sharp end: it meant strict mode could gate on a worker's claim about
+# a suite the orchestrator had actually measured itself.
+#
+# The guard that was supposed to cover this compared source INDEXES, which a
+# `break` jumps straight over. These drive the paths instead.
+# --------------------------------------------------------------------------
+
+_CLAIMED_GREEN = {"ran": True, "measured": True, "passed": True,
+                  "command": "npm test", "summary": "worker says green"}
+_MEASURED_RED = {"tests": {"ran": True, "measured": True, "passed": False,
+                           "command": "npm test", "summary": "2 failed"}}
+
+
+def test_malformed_result_path_still_reports_measured_axes(env):
+    c = env["leerie"]
+    bad = _clean_result(rule_violations_residual=[{"rule": "x",
+                                                   "why_not_fixed": "y"}],
+                        tests=dict(_CLAIMED_GREEN))
+    _stub_run_conformer(c, [bad])
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is False, (
+        "the malformed-result break carried the worker's claimed axes out")
+    assert any("tests-failed" in w for w in warnings), (
+        "the residual summary must describe what was measured")
+
+
+def test_protected_path_break_still_reports_measured_axes(env):
+    c = env["leerie"]
+
+    def _bad_commit(wt: Path):
+        (wt / ".claude").mkdir(exist_ok=True)
+        (wt / ".claude" / "x").write_text("bad\n")
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: BAD"], cwd=wt)
+
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))],
+                        commits={0: _bad_commit})
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert any("protected-path" in w for w in warnings)
+    assert res["tests"]["passed"] is False, (
+        "the protected-path break carried the worker's claimed axes out")
+
+
+def test_strict_clobber_break_still_reports_measured_axes(env):
+    """The sharp case: under --strict-conformer the post-loop
+    `_conformance_clean` decides whether the subtask blocks, so a claimed
+    axis here would gate the run on a self-report."""
+    c = env["leerie"]
+    caps = dict(env["caps"]); caps["strict_conformer"] = True
+
+    def _clobber(wt: Path):
+        # Delete an implementer-owned file. A deletion is what
+        # `_clobbered_owned_files` flags; merely emptying it is not a
+        # revert-to-base, since the base tree had no src.py at all.
+        (wt / "src.py").unlink()
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: clobber"], cwd=wt)
+
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))],
+                        commits={0: _clobber})
+    _stub_measure_axes(c, _MEASURED_RED)
+
+    res, _warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        caps, env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is False, (
+        "a strict-mode break carried the worker's claimed axes into the "
+        "blocking decision")
+
+
+def test_a_completed_round_reports_the_post_measurement(env):
+    """CONTROL. The tail apply must still win on rounds that run to
+    completion — otherwise the fix above could be 'apply pre and never
+    refresh', which would report a stale verdict for every clean round."""
+    c = env["leerie"]
+    _stub_run_conformer(c, [_clean_result(tests=dict(_CLAIMED_GREEN))])
+    # pre is red, post is green: only the tail apply can produce green.
+    _stub_measure_axes(c, [_MEASURED_RED,
+                           {"tests": {"ran": True, "measured": True,
+                                      "passed": True, "command": "npm test",
+                                      "summary": ""}}])
+
+    res, _warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert res["tests"]["passed"] is True, (
+        "the tail apply no longer refreshes the axes after the round")
