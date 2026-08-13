@@ -453,6 +453,59 @@ def test_staged_file_is_reaped_when_staging_itself_fails(leerie, leerie_dir,
     assert not leaked, f"staging failure leaked {[p.name for p in leaked]}"
 
 
+@pytest.mark.parametrize("err,label", [
+    (errno.ENOSPC, "no space left on device"),
+    (errno.EDQUOT, "disk quota exceeded"),
+])
+def test_mkstemp_itself_failing_is_converted(leerie, leerie_dir, monkeypatch,
+                                             err, label):
+    """The CREATE, not just the write, must be inside the guard.
+
+    Measured against a real loop-mounted ext4 filled two ways:
+
+      blocks exhausted -> mkstemp SUCCEEDS (an empty file needs no data
+                          blocks) and the WRITE fails — the case the
+                          pre-existing test covers by patching os.fdopen.
+      inodes exhausted -> mkstemp itself raises ENOSPC.
+
+    So the create-side failure is a distinct condition, not a variant of the
+    write-side one, and it was outside the try: it escaped as a bare OSError
+    to main()'s terminal handler. No test could see it, because the only
+    injection point used was strictly inside the try.
+
+    EDQUOT is parametrized alongside ENOSPC because a state root on a quota'd
+    home or an NFS mount reports it where a local disk reports ENOSPC — same
+    condition to the operator, and a site that converts one must convert both.
+    """
+    import tempfile as _tempfile
+    calls = []
+
+    def exploding_mkstemp(*a, **k):
+        calls.append(1)
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(_tempfile, "mkstemp", exploding_mkstemp)
+
+    async def fake(*cmd, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("spawn reached despite a staging failure")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
+
+    with pytest.raises(leerie.DiskLowSpace) as excinfo:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="t-mkstemp", leerie_dir=leerie_dir,
+            verbosity="quiet", stdin_data="hello"))
+
+    assert calls, "mkstemp was never reached; the test proves nothing"
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, OSError) and cause.errno == err, (
+        "the original errno must survive as __cause__")
+    assert label in excinfo.value.raw_message.lower(), (
+        f"the message should name the real condition; got "
+        f"{excinfo.value.raw_message!r}")
+
+
 def test_staging_failure_that_is_not_enospc_propagates_unchanged(
         leerie, leerie_dir, monkeypatch, tmp_path):
     """The ENOSPC conversion must stay narrow.

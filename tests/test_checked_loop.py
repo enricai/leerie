@@ -198,6 +198,82 @@ def test_loop_timeout_retries_like_a_worker_error(leerie):
     assert len(calls) == 2, f"expected a retry after the timeout; got {calls}"
 
 
+def test_terminal_handler_never_logs_the_argv(leerie):
+    """The last line of defence for the spawn sites that do NOT catch a
+    timeout — the `--phase heal` trio (`_replay_capture`, `_judge_capture`,
+    `_request_patch`) reaches `main()`'s catch-all directly.
+
+    Source-coupled because `main()` cannot be driven to a real exit here.
+    Fixing it at the single reporting boundary covers those three and
+    anything added later, instead of inventing a degrade disposition per
+    call site.
+    """
+    import inspect
+    src = inspect.getsource(leerie.main)
+    arm = src.split("\n    except BaseException as e:", 1)[1]
+    marker = 'log(f"unhandled exception: '
+    assert marker in arm, "the catch-all no longer logs the exception"
+    # The call spans two source lines; take enough of them to cover it.
+    start = arm.index(marker)
+    logged = "".join(arm[start:].split("\n")[:3])
+    assert "_brief_worker_exc(e)" in logged, (
+        "the catch-all interpolates the raw exception; str() on a "
+        "TimeoutExpired renders the whole claude -p argv, which is the "
+        "50 KB terminal dump _run_implementer's handler exists to prevent")
+    assert "{e}" not in logged.replace("{_brief_worker_exc(e)}", ""), (
+        "a bare {e} survives in the catch-all's log line")
+
+
+def test_loop_timeout_retry_is_bounded_to_one(leerie):
+    """A timeout gets ONE retry, not `max_rounds` of them.
+
+    A crash is observed immediately; a timeout has already spent its whole
+    ceiling, so N retries cost N ceilings. Measured worst case: `planner` is
+    absent from TIMEOUT_DEFAULT_PER_WORKER (its derived ceiling reaches the
+    global cap), so it runs at 5400 s with `planner_check_rounds = 3` — and
+    it has the tightest headroom of any worker at 1.03x its slowest observed
+    call, i.e. it is simultaneously the likeliest to time out and the most
+    expensive to retry. Three rounds is 4.5 h of a stalled run.
+    """
+    import subprocess
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=5400)
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="planner", max_rounds=3))
+
+    assert result is None
+    assert len(calls) == leerie._TIMEOUT_RETRY_MAX + 1, (
+        f"expected {leerie._TIMEOUT_RETRY_MAX + 1} attempts (the first plus "
+        f"_TIMEOUT_RETRY_MAX retries); got {len(calls)} — a timeout must not "
+        "consume the full max_rounds budget at a full ceiling each")
+    assert any("abandoning the loop" in w for w in warnings), (
+        "the operator must be told why the loop stopped early")
+
+
+def test_loop_crash_retry_is_still_bounded_only_by_max_rounds(leerie):
+    """The timeout bound must not narrow the ordinary crash retry.
+
+    A WorkerError is cheap to re-attempt — a PID-exhausted or OOM-killed
+    worker dies fast — so it keeps the full round budget. Pinning this
+    separately because the obvious implementation of the timeout bound (a
+    single shared counter) would silently halve the crash retry too.
+    """
+    calls = []
+
+    async def invoke():
+        calls.append(1)
+        raise leerie.WorkerError("worker x exhausted its PID cgroup")
+
+    _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="test", max_rounds=3))
+    assert len(calls) == 3, (
+        f"a WorkerError must still use the whole round budget; got {len(calls)}")
+
+
 def test_loop_timeout_warning_never_contains_the_argv(leerie):
     """`str(TimeoutExpired)` renders `cmd` — for leerie the entire
     `claude -p` command line, including an inlined system prompt on the

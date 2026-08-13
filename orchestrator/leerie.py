@@ -1234,6 +1234,16 @@ EFFORT_ENV = "LEERIE_EFFORT"
 # `conformer`, `implementer` and `planner` land at the global cap under the
 # rule and are therefore omitted rather than listed redundantly at 5400.
 _WORKER_TIMEOUT_FLOOR_SEC = 600
+
+# How many times `_run_checked_loop` re-attempts a worker that was KILLED at
+# its wall-clock ceiling, as opposed to one that crashed. Deliberately not
+# `judgment_check_rounds`: a crash is observed immediately, while a timeout
+# has already spent its entire ceiling, so N retries cost N ceilings. At
+# `planner`'s 5400 s that is the difference between 3 h and 4.5 h on a run
+# that is already stuck. One retry buys the fresh-process recovery an
+# unattended run wants; more just extends the stall.
+_TIMEOUT_RETRY_MAX = 1
+
 TIMEOUT_DEFAULT_PER_WORKER: dict[str, int] = {
     "fit_judge": 1875,             # p99 624.8
     "satisfied_probe": 1854,       # p99 617.9
@@ -2901,9 +2911,22 @@ class ContextOverflow(BaseException):
         self.raw_message = raw_message
 
 
+# The errnos that all mean "you cannot write any more here" to an operator.
+# EDQUOT is not a rarity to be tidy about: a state root on a quota'd home or
+# an NFS mount reports it where a local disk reports ENOSPC, and every site
+# that converts one must convert the other or the same exhaustion surfaces as
+# a bare OSError on exactly those hosts.
+_OUT_OF_SPACE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
+
+
 class DiskLowSpace(BaseException):
-    """Raised when the periodic mid-run headroom check (N30) finds free
-    space on the state-dir filesystem below `DISK_MIN_FREE_RATIO`.
+    """Raised when leerie cannot write to the state-dir filesystem.
+
+    Three raise sites, and only the first consults a ratio: the periodic
+    mid-run headroom check (N30) when free space falls below
+    `DISK_MIN_FREE_RATIO`, and two reactive conversions — `State.save()` and
+    `_invoke`'s prompt staging — which fire on an out-of-space errno
+    regardless of how much space the last check saw.
 
     Unlike the preflight check in `preflight()` (which die()s outright —
     no worker has spawned yet, so there is nothing to preserve), a mid-run
@@ -12356,6 +12379,36 @@ class WorkerError(RuntimeError):
     pass
 
 
+def _save_state_best_effort(st: "State", where: str) -> None:
+    """Persist run state from inside an exception handler, never raising.
+
+    Every terminating arm in `main()` opens by saving so the run stays
+    resumable — and an unguarded `st.save()` there is a trap, because a raise
+    from inside an `except` block is caught by no sibling arm of the same
+    `try`. It escapes `main()` entirely, skipping the cleanup, the dep
+    capture, and the `exit_code` assignment: a resumable pause becomes an
+    exit-1 traceback. In the catch-all `except BaseException` arm it is worse
+    still — the new exception REPLACES the unhandled one, leaving the real
+    bug reachable only as `__context__`, which nothing prints.
+
+    Both failure modes are real, not theoretical. `State.save()` converts an
+    out-of-space errno to `DiskLowSpace`, so on a full disk it re-raises
+    exactly where these arms fire; and on a read-only run dir it raises
+    `PermissionError` (measured), which no conversion touches.
+
+    The failure is logged rather than swallowed: the previous on-disk
+    `state.json` is still the last good one, so the run stays resumable, but
+    an operator who is about to be told "resume when you have freed space"
+    deserves to know the pause itself could not be recorded.
+    """
+    try:
+        st.save()
+    except BaseException as exc:   # noqa: BLE001 - deliberately total
+        log(f"warning: could not persist state at {where} "
+            f"({type(exc).__name__}: {exc}); the last saved state.json "
+            "stands and `leerie resume` still works from it")
+
+
 def _brief_worker_exc(exc: BaseException) -> str:
     """Render a worker-spawn failure for a log line, WITHOUT the argv.
 
@@ -14749,22 +14802,29 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     stdin_path = None
     if stdin_data is not None:
         import tempfile  # noqa: PLC0415
-        stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-")
-        # The staging itself is guarded, not just the spawn below. `mkstemp`
-        # has already created the file by this point, so a failure in the
-        # write or the reopen strands it — and the failure most likely to
-        # occur here is ENOSPC, i.e. exactly the disk-exhaustion condition
-        # (N30) that a leaked ~150KB file per retry makes worse. Reap it,
-        # then re-raise unchanged so the real cause is never masked.
+        stdin_fd = None
+        # `mkstemp` is INSIDE the guard, not above it. Measured against a real
+        # loop-mounted ext4 filled two different ways:
         #
-        # Scope: this reaps the PATH. The realistic failure — ENOSPC from
-        # `staged.write()` — happens inside the `with`, which closes the
-        # descriptor on its way out. `os.fdopen` itself raising would leak
-        # the raw fd (verified: CPython does not close it on a failed
-        # construction), but that path needs an invalid mode on a
+        #   blocks exhausted  -> mkstemp SUCCEEDS (an empty file needs no data
+        #                        blocks); the write then fails, which the guard
+        #                        below already caught.
+        #   inodes exhausted  -> mkstemp itself raises ENOSPC.
+        #
+        # …and even on block exhaustion, creation fails once the directory
+        # must grow by a block (observed: a create loop stopped with ENOSPC
+        # at 1,358 files while 6,821 inodes remained). So the common
+        # disk-full case is not what reaches this line — which is why the
+        # earlier framing of "the last raw-OSError site" was wrong — but two
+        # real conditions do, and both used to escape as a bare OSError.
+        #
+        # Scope: this reaps the PATH once one exists. `os.fdopen` raising
+        # would leak the raw fd (verified: CPython does not close it on a
+        # failed construction), but that needs an invalid mode on a
         # just-returned mkstemp fd, i.e. a programming error rather than a
         # runtime condition.
         try:
+            stdin_fd, stdin_path = tempfile.mkstemp(prefix="leerie-prompt-")
             # fdopen rather than a bare os.write: os.write returns a count and
             # is permitted to short-write, so writing a 150KB prompt with it
             # would deliver a TRUNCATED payload on the day it ever did — the
@@ -14778,23 +14838,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # `finally` does not disturb a still-running worker.
             stdin_file = open(stdin_path, "rb")
         except BaseException as exc:
-            with contextlib.suppress(OSError):
-                os.unlink(stdin_path)
-            # ENOSPC becomes DiskLowSpace, matching `State.save()`. Without
-            # this, the single largest disk write leerie makes per worker
-            # invocation (~150KB, once per attempt) was the one place that
-            # still surfaced N30's filed symptom verbatim — a raw
-            # `OSError: [Errno 28]` — because nothing upstream converts it:
-            # `claude_p`'s try catches only RateLimitedExit, so it reached
-            # main()'s terminal handler as an unhandled crash. The
-            # proactive ratio check runs once per WAVE and cannot see a disk
-            # that crosses zero mid-wave, which is exactly when this fires.
-            # Converting it routes the failure into the same resumable
-            # EXIT_LOCKED pause every other disk-exhaustion path uses.
-            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            if stdin_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(stdin_path)
+            # An out-of-space failure becomes DiskLowSpace, matching
+            # `State.save()`. This is the single largest disk write leerie
+            # makes per worker invocation (~150 KB, once per attempt), and
+            # nothing upstream converts it — `claude_p`'s try catches only
+            # RateLimitedExit — so it used to reach main()'s terminal handler
+            # as an unhandled crash. The proactive ratio check runs once per
+            # WAVE and cannot see a disk that crosses zero mid-wave, which is
+            # exactly when this fires. Converting routes it into the same
+            # resumable EXIT_LOCKED pause every other exhaustion path uses.
+            if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
                 raise DiskLowSpace(
-                    f"staging the worker prompt failed: no space left on "
-                    f"device writing {stdin_path}"
+                    f"staging the worker prompt failed: "
+                    f"{os.strerror(exc.errno)} writing {stdin_path}"
                 ) from exc
             raise
 
@@ -16548,9 +16607,9 @@ class State:
             tmp.write_text(json.dumps(self.data, indent=2))
             os.replace(tmp, self.path)   # atomic on POSIX; best-effort on Windows
         except OSError as e:
-            if e.errno == errno.ENOSPC:
+            if e.errno in _OUT_OF_SPACE_ERRNOS:
                 raise DiskLowSpace(
-                    f"State.save() failed: no space left on device writing "
+                    f"State.save() failed: {os.strerror(e.errno)} writing "
                     f"{self.path}"
                 ) from e
             raise
@@ -26025,11 +26084,33 @@ async def _run_checked_loop(
     warnings: list[str] = []
     last_res: dict | None = None
     seen_issue_sets: list[frozenset[str]] = []
+    # A timeout gets ONE retry, not `max_rounds` of them. The other
+    # infrastructure failures are cheap to re-attempt — a PID-exhausted or
+    # OOM-killed worker dies fast — but a timeout costs its whole ceiling
+    # before it is even observed, so retrying it up to `max_rounds` times
+    # multiplies wall-clock by that factor. Measured against the committed
+    # duration corpus, that lands worst exactly where it is likeliest:
+    # `planner` is deliberately absent from TIMEOUT_DEFAULT_PER_WORKER (its
+    # derived ceiling reaches the global cap), so it runs at 5400 s with
+    # `planner_check_rounds = 3` — 4.5 h — and it has the tightest headroom
+    # of any worker, 1.03x its slowest observed call. One retry keeps the
+    # recovery value a fresh process buys on an unattended run; three turns a
+    # hung worker into most of a night.
+    timeouts_retried = 0
 
     for rnd in range(max_rounds):
         try:
             last_res = await invoke()
         except (WorkerError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                timeouts_retried += 1
+                if timeouts_retried > _TIMEOUT_RETRY_MAX:
+                    warnings.append(
+                        f"{name} round {rnd}: worker exceeded its wall-clock "
+                        f"ceiling {timeouts_retried} times; abandoning the "
+                        "loop rather than spending another full ceiling")
+                    last_res = None
+                    break
             # Infrastructure failure (PID exhaustion, OOM, a killed session,
             # or a worker killed at its wall-clock ceiling — `_invoke` raises
             # TimeoutExpired, which is NOT a WorkerError), not a judgment
@@ -30640,7 +30721,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     except WorkerError as e:
         abnormal = True
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "WorkerError exit")
         exit_message = str(e)
         exit_code = 1
     except ContextOverflow as e:
@@ -30652,7 +30733,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # override makes the CLI treat the session as gateway-routed and
         # apply a conservative ceiling instead of the model's real window.
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "ContextOverflow exit")
         log(f"context window exceeded — {e.raw_message}")
         log("  Claude Code refused this prompt itself; no request was sent, "
             "so a retry would fail identically.")
@@ -30689,32 +30770,31 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_code = EXIT_LOCKED
 
     except DiskLowSpace as e:
-        # N30. TWO raise sites reach this arm, and they differ in a way that
-        # dictates the order of the statements below:
+        # N30. THREE raise sites reach this arm, and they differ in a way
+        # that dictates the order of the statements below:
         #   - phase_execute's periodic headroom check, which fires at
-        #     DISK_MIN_FREE_RATIO (5% free) — the disk still has room; and
-        #   - State.save()'s errno.ENOSPC conversion — the disk is at zero.
-        # Resumable in both cases: the remedy is an operator freeing space,
-        # after which the run's on-disk state (worktrees, branches,
-        # state.json) is untouched and `leerie resume` picks it back up.
+        #     DISK_MIN_FREE_RATIO (5% free) — the disk still has room;
+        #   - State.save()'s out-of-space conversion; and
+        #   - _invoke's prompt-staging conversion.
+        # Only the first consults a ratio; the other two fire on an errno,
+        # with the filesystem already refusing writes. Resumable in every
+        # case: the remedy is an operator freeing space, after which the
+        # run's on-disk state is untouched and `leerie resume` picks it up.
         #
         # `abnormal` and `exit_code` are therefore set BEFORE any save, and
-        # the save is guarded. On the ENOSPC path an unguarded st.save() here
-        # re-enters the very call that just failed and raises DiskLowSpace a
-        # second time from inside this handler — which no sibling arm catches,
-        # so it escapes main() and skips the cleanup, the dep capture and the
-        # EXIT_LOCKED assignment, turning a resumable pause into an exit-1
-        # traceback. That is the same hazard the dep_capture guard below
-        # documents; this call is the likelier one to hit it.
+        # the save goes through `_save_state_best_effort`. On the two errno
+        # paths a bare st.save() here re-enters the very call that just
+        # failed and raises from inside this handler — which no sibling arm
+        # catches, so it escapes main() and skips the cleanup, the dep
+        # capture and the EXIT_LOCKED assignment, turning a resumable pause
+        # into an exit-1 traceback. The helper is used by every terminating
+        # arm for that reason, and it is deliberately broader than
+        # `except DiskLowSpace`: a read-only run dir raises PermissionError,
+        # which no conversion touches and which escaped a narrower guard.
         full_purge = False
         abnormal = False
         exit_code = EXIT_LOCKED
-        try:
-            st.save()
-        except DiskLowSpace:
-            # Nothing left to persist to: the on-disk state.json is already
-            # the last successfully written one, which is what resume reads.
-            pass
+        _save_state_best_effort(st, "disk-low pause")
         log(f"disk headroom low — {e.raw_message}")
         log("  Free up space on the state-dir filesystem "
             "(old runs under the state root are the usual culprit), "
@@ -30751,7 +30831,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # (state + run branch preserved), a resume hint, and
         # EXIT_LOCKED — the launcher's preserve-state pause pivot.
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "TerminalAuthFailure exit")
         log(f"auth session locked — {e.raw_message}")
         log(f"  run `claude /login` (or refresh CLAUDE_CODE_OAUTH_TOKEN), "
             f"then resume with: leerie resume {st.run_id}")
@@ -30805,7 +30885,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # BaseException guard kills the rate-limited claude -p child; sibling
         # wave-tasks cancel through gather.
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "RateLimitedExit exit")
         if e.out_of_credits:
             # Pause-and-surface. Run worktree-only cleanup directly here (state
             # + run branch preserved), then leave abnormal=False so the finally
@@ -30868,7 +30948,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # in-flight child processes (DESIGN §6).
         abnormal = True
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "KeyboardInterrupt exit")
         log("interrupted by user (SIGINT) — worktree cleanup; "
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
@@ -30893,7 +30973,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # state and run branch for resume.
         abnormal = True
         full_purge = False
-        st.save()
+        _save_state_best_effort(st, "InterruptedBySignal exit")
         log(f"interrupted by signal ({e}) — worktree cleanup; "
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
@@ -30940,7 +31020,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 # file and blocks subsequent resumes with "no usable
                 # task" instead of the clearer "no state.json".
                 if st.data.get("task"):
-                    st.save()
+                    # Helper rather than a bare save: the enclosing
+                    # `except Exception` below cannot catch a DiskLowSpace
+                    # from inside save(), since that is a BaseException.
+                    _save_state_best_effort(st, "SystemExit exit")
                 _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
                 (st.run_dir / "orchestrator.exit_code").write_text(
@@ -30955,8 +31038,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # sees the traceback.
         abnormal = True
         full_purge = False
-        st.save()
-        log(f"unhandled exception: {type(e).__name__}: {e}")
+        _save_state_best_effort(st, "BaseException exit")
+        # `_brief_worker_exc` rather than `{e}`: str() on a
+        # subprocess.TimeoutExpired renders `cmd`, i.e. the entire `claude -p`
+        # argv including an inlined system prompt — the 50 KB terminal dump
+        # `_run_implementer`'s own handler documents. Several worker spawns
+        # (the `--phase heal` trio in particular) deliberately do not catch
+        # TimeoutExpired, so they arrive here; fixing it at this single
+        # reporting boundary covers them and anything added later, without
+        # inventing a degrade disposition for each call site.
+        log(f"unhandled exception: {type(e).__name__}: "
+            f"{_brief_worker_exc(e)}")
         raise
     finally:
         if abnormal:

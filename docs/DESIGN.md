@@ -2734,18 +2734,28 @@ operator inspects by hand before settling it with `accept-blocked` or
 evidence those verbs exist to act on.
 
 **Why a worktree costs what it does.** The per-worktree figure varies by
-roughly 20x with something leerie does not control — which is why leerie
+roughly 13x with something leerie does not control — which is why leerie
 does *not* try to predict it, and the disk guardrail is a proportional
 free-space floor rather than a per-worktree byte budget. Package
 managers like pnpm are content-addressed and normally *hardlink* from a
 shared store into each `node_modules`, so a second checkout of the same
 dependency set costs
 almost nothing — measured on a host where the store and the tree share a
-mount, 95.18% of `node_modules` bytes are hardlinked and the private
-remainder is 65 MiB against a 1.37 GiB tree. Those three figures are not
+mount, 92.60% of `node_modules` bytes are shared with that store and the
+private remainder is 102 MiB against a 1.35 GiB tree. Those figures are not
 prose: they are reproduced by `scripts/measure/worktree_bytes.py` and
-committed as `tests/fixtures/worktree_bytes/summary.json`, with a test
-asserting this paragraph still matches the artifact. But leerie bind-mounts the
+committed as `tests/fixtures/worktree_bytes/summary.json`, with tests
+asserting this paragraph still matches the artifact.
+
+Two details in that measurement are load-bearing, and getting either wrong
+inflates the shared share. "Shared" means *every* link to the inode lives
+outside the walked tree — **not** `st_nlink > 1`, which counts in-tree names
+too and is the discredited predicate from N30's third attempt. And
+directories are always charged: a directory's link count is `.` plus its
+parent's entry plus one `..` per subdirectory, an artefact of the tree
+rather than evidence of an outside store, and a second worktree has to
+create every one of them. On this corpus the directories alone are 37 MiB
+of the 102. But leerie bind-mounts the
 package-manager store and the state directory as *separate* mounts, and
 Linux refuses `link()` across different mounts even when both resolve to
 the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
@@ -2764,7 +2774,7 @@ floor plus a resumable pause; see IMPLEMENTATION.md's "Disk headroom (N30)"
 for what was tried.
 
 Colocating the store with the worktrees on one mount would collapse the
-per-worktree cost by that same ~20x and is the more fundamental fix, but
+per-worktree cost by that same ~13x and is the more fundamental fix, but
 it changes runtime behaviour across the local, Fly and EC2 runtimes and
 both privilege models, so it is deliberately held as a separate change
 rather than folded into the guardrail.
@@ -7398,6 +7408,31 @@ iteration — the number of rounds, the success threshold, and the plateau
 detection window are all configured, not left open-ended.
 
 ---
+
+## 14½. Regression tripwires
+
+Signals whose *reappearance* means a specific, already-fixed defect has come
+back. Each is here because the underlying bug shipped once and was expensive
+to diagnose from first principles the second time; none of them is a gate,
+and none can be turned into one — they are things to recognise in a log.
+
+- **`fit_judge crashed; accepting as leaf`** is the stdin-race's downstream
+  symptom. The crash-to-leaf degrade is deliberately silent — it is the
+  correct fail-safe — so this line is the *only* visible trace. If it
+  reappears, the prompt-transport race (#198) has regressed.
+- **A worker rejected with "exceeds maximum allowed tokens"** means the
+  context-budget fix (#194) has regressed. It stopped being possible when the
+  payload moved off the argv, so its return indicates the transport changed.
+- **A finalize outcome judged before the container has exited** is a
+  measurement error, not a leerie failure. Never conclude anything about a
+  push until the container is gone AND `run.json` has stopped changing, and
+  read `push_error` from `run.json` rather than inspecting the remote — the
+  remote lags, and a run that is still finalising looks identical to one that
+  failed.
+- **A work order launched from its appendix rather than its work-order
+  section** produces a plan against the wrong text. The appendix is
+  discussion; the work-order section is the specification. When handing
+  leerie a long document, pass the section, not the file.
 
 ## 15. Known limitations
 

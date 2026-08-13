@@ -1,10 +1,10 @@
 {
-  "_comment": "Marginal on-disk cost of one more worktree of a dependency tree, de-duplicated by inode. Regenerate with scripts/measure/worktree_bytes.py <tree>. Only the basename is recorded: the absolute path is a local detail, and the figure that travels is the hardlinked share, not the machine.",
+  "_comment": "Marginal on-disk cost of one more worktree of a dependency tree: files AND directories, de-duplicated by (st_dev, st_ino). 'shared' means EVERY link to the inode lives outside the walked tree \u2014 NOT st_nlink > 1, which counts in-tree names too and is the discredited predicate from N30's attempt 3. Regenerate with scripts/measure/worktree_bytes.py <tree>. Only the basename is recorded: the absolute path is a local detail, and the figure that travels is the shared share, not the machine.",
   "tree": "node_modules",
   "unique_inodes": 51349,
   "directories": 10916,
-  "total_bytes": 1409032192,
-  "hardlinked_bytes": 1341079552,
-  "private_bytes": 67952640,
-  "hardlinked_share": 0.951773536200371
+  "total_bytes": 1448259584,
+  "shared_bytes": 1341079552,
+  "private_bytes": 107180032,
+  "shared_share": 0.9259939080092426
 }
