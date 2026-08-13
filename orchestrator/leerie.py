@@ -163,6 +163,19 @@ DEFAULT_CAPS = {
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
     "conformance_rounds": 3,
+    # Concurrent orchestrator-run build/lint/test measurements (DESIGN §6
+    # *Memory containment*). Distinct from `max_parallel`, which bounds
+    # WORKERS: a worker is spawned through `_await_worker_memory_admission`
+    # and enrolled in a cgroup, while a BLT command `_run_streaming` starts is
+    # neither — it is an orchestrator child with no `memory.max` and no
+    # `pids.max` of its own. `scoped` mode makes each measurement small
+    # (~seconds, a couple of test files), but `--subtask-tests full` puts a
+    # whole suite behind every subtask, and `max_parallel` of those at once is
+    # the shape that saturated a worker cgroup badly enough to raise
+    # `worker_pids_max` to 2048. 2 is a deliberate floor rather than a
+    # measured optimum: enough to overlap a slow axis with a fast one, low
+    # enough that the uncontained case cannot multiply.
+    "blt_parallel": 2,
     # Implementer completeness re-drives per subtask (DESIGN §9 *The one
     # gating axis: solution completeness*). Bounds the loop in
     # `_settle_subtask` that re-drives the implementer when the conformer's
@@ -26694,17 +26707,69 @@ def _iter_log_tool_use(
         yield kind, inp, results.get(tid, "")
 
 
+# Shell separators, and a leading prefix that does not change what a segment
+# invokes (`cd x && …`, `timeout 90 …`, `NODE_ENV=test …`). Split BEFORE
+# tokenising, for the same reason `_SEG_RE` does: a separator written without
+# surrounding spaces (`build&&node`) is one whitespace-token and a per-token
+# comparison cannot see it.
+_BLT_SEG_RE = re.compile(r"\|\||&&|\||;|\n")
+_BLT_SEG_LEAD_RE = re.compile(
+    r"^\s*(?:timeout\s+\d+\s+|(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)|cd\s+\S+\s+)*")
+# A redirection or a flag is not a test selector; a bare path is.
+_BLT_REDIR_RE = re.compile(r"\d?>{1,2}&?\S*")
+
+
+def _is_full_axis_invocation(command: str, axis_re: re.Pattern[str]) -> bool:
+    """True when `command` runs an axis over the WHOLE repo rather than a
+    scoped selection.
+
+    The distinction is the contract now (`prompts/conformer.md` §4): the
+    orchestrator measures the axes, the conformer runs only targeted
+    falsifiers. A full run is a violation; a scoped one is the encouraged
+    primary mode. `axis_re` alone cannot tell them apart — it matches
+    `pnpm test` and `pnpm test src/a.test.ts` identically — so counting
+    matches would flag every legitimate falsifier.
+
+    A segment is a full run when the axis matches at its head and no
+    positional argument follows: flags and redirections are not selectors, a
+    bare path is. Segments are split first so a matching mention inside a
+    text tool (`ps -ef | grep vitest`, `pnpm test 2>&1 | tail -80` — where
+    the *head* is still the runner) is judged on the segment that actually
+    invokes it.
+    """
+    for raw in _BLT_SEG_RE.split(command or ""):
+        seg = _BLT_SEG_LEAD_RE.sub("", raw.strip())
+        if not seg or seg.startswith("#"):
+            continue
+        m = axis_re.search(seg)
+        if not m or m.start() != 0:
+            continue                      # not the head of this segment
+        rest = _BLT_REDIR_RE.sub("", seg[m.end():])
+        if not [t for t in rest.split()
+                if t and not t.startswith("-") and t not in ("run", "--")]:
+            return True
+    return False
+
+
 def _count_bash_axis_invocations(log_path: Path,
-                                 axis_re: re.Pattern[str]) -> int:
+                                 axis_re: re.Pattern[str],
+                                 *, full_only: bool = False) -> int:
     """Count distinct Bash `tool_use` invocations in `log_path` whose
     command matches `axis_re`. Returns 0 when the log is missing or
-    contains no matching invocations. Tolerates malformed log lines."""
+    contains no matching invocations. Tolerates malformed log lines.
+
+    With `full_only`, counts only un-scoped (whole-repo) invocations — see
+    `_is_full_axis_invocation`."""
     n = 0
     for kind, inp, _result in _iter_log_tool_use(log_path):
         if kind != "Bash":
             continue
-        if axis_re.search(inp.get("command", "")):
-            n += 1
+        cmd = inp.get("command", "")
+        if not axis_re.search(cmd):
+            continue
+        if full_only and not _is_full_axis_invocation(cmd, axis_re):
+            continue
+        n += 1
     return n
 
 
@@ -26814,22 +26879,48 @@ def _detect_malformed_tool_envelope(log_path: Path) -> bool:
     return False
 
 
+# Substrings identifying the two `_emit_bash_axis_warnings` classes that are
+# fed back to the next conformer round. ONE owner, consumed by the emitter and
+# by both phases' feedback filters: those filters used to hard-code the prose
+# ("times in one round"), and rewording the warning silently stopped the
+# feedback from being injected at all — the emitter kept warning, the filter
+# kept matching nothing, and no test noticed because each side was correct on
+# its own.
+_BLT_FEEDBACK_MARKERS = ("auto-backgrounded", "ran the full")
+
+
+def _is_blt_feedback_warning(w: str) -> bool:
+    """True for a warning `_emit_bash_axis_warnings` produced, i.e. one worth
+    injecting into the next round as CRITIC-pattern feedback."""
+    return any(m in w for m in _BLT_FEEDBACK_MARKERS)
+
+
 def _emit_bash_axis_warnings(log_path: Path, round_label: str,
                              warnings: list[str]) -> None:
-    """Helper called once per conformer round: append advisory warnings
-    to `warnings` for axes that were invoked more than once in the
-    round, or whose auto-backgrounded invocations were followed by a
-    retry instead of a temp-file read or `BashOutput` poll (see
-    conformer.md §4 for the discipline)."""
+    """Helper called once per conformer round: append advisory warnings for
+    a worker that ran a **whole-repo** build/lint/test axis itself, or whose
+    auto-backgrounded invocation was followed by a retry instead of a
+    temp-file read or `BashOutput` poll (see conformer.md §4).
+
+    The threshold is one, not two. It used to be "more than once per round",
+    matching a prompt rule that asked for exactly one invocation per axis —
+    but the orchestrator now measures the axes itself and §4 tells the worker
+    not to run a full one at all, so a single un-scoped run is already the
+    violation. Counting *scoped* commands would be wrong in the other
+    direction: targeted falsifiers are the encouraged primary mode now, which
+    is why this counts only what `_is_full_axis_invocation` classifies as
+    whole-repo rather than everything `_BLT_AXIS_RES` matches."""
     if not log_path.is_file():
         return
     for axis, axis_re in _BLT_AXIS_RES.items():
-        n = _count_bash_axis_invocations(log_path, axis_re)
-        if n > 1:
+        n = _count_bash_axis_invocations(log_path, axis_re, full_only=True)
+        if n:
             warnings.append(
-                f"{round_label}: ran {axis.upper()}_CMD {n} times in one "
-                f"round (see {log_path}) — `run each axis exactly once "
-                "per round` per conformer.md §4; surfaced as advisory.")
+                f"{round_label}: ran the full {axis.upper()} axis "
+                f"{n} time(s) (see {log_path}) — the orchestrator measures "
+                "build/lint/tests and supplies the result in `BLT_RESULTS:`; "
+                "conformer.md §4 asks for targeted falsifiers only. "
+                "Surfaced as advisory.")
         for bg_id in _count_orphaned_bg_axis(log_path, axis_re):
             warnings.append(
                 f"{round_label}: {axis.upper()}_CMD auto-backgrounded "
@@ -27047,7 +27138,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"conformer round {c_round}:")
-            and ("auto-backgrounded" in w or "times in one round" in w)]
+            and _is_blt_feedback_warning(w)]
         feedback_items = bg_retry_warnings + regressions
         blt_feedback = (
             _format_check_feedback(feedback_items, c_round,
@@ -27135,6 +27226,25 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
         except Exception as ex:  # non-fatal: BLT below will show the effect
             log(f"  {log_prefix}: install error "
                 f"({type(ex).__name__}): {' '.join(e['command'])}")
+
+
+# Bounds concurrent orchestrator-run BLT commands. Created lazily on the
+# running loop rather than at import: a module-level `asyncio.Semaphore()`
+# binds to whatever loop is current at import time, which under pytest is not
+# the loop `asyncio.run()` later creates.
+_BLT_SEM: asyncio.Semaphore | None = None
+_BLT_SEM_LIMIT: int | None = None
+
+
+def _blt_semaphore(caps: dict) -> asyncio.Semaphore:
+    """The run's BLT concurrency gate, sized from `caps["blt_parallel"]`."""
+    global _BLT_SEM, _BLT_SEM_LIMIT
+    limit = max(1, int(caps.get("blt_parallel")
+                       or DEFAULT_CAPS["blt_parallel"]))
+    if _BLT_SEM is None or _BLT_SEM_LIMIT != limit:
+        _BLT_SEM = asyncio.Semaphore(limit)
+        _BLT_SEM_LIMIT = limit
+    return _BLT_SEM
 
 
 async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
@@ -27287,12 +27397,16 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                 if tree_sha is None:
                     dirty = True
 
-        res = await _measure_blt(
-            axis, cmd, tree,
-            timeout=float(caps.get("worker_timeout_sec")
-                          or DEFAULT_CAPS["worker_timeout_sec"]),
-            log_path=log_path, verbosity=verbosity,
-            label_prefix=label_prefix)
+        # The gate is held only around the command itself, never around the
+        # memo lookup or the install: a hit must stay free, and serialising
+        # installs would throttle the very worktrees waiting to be measured.
+        async with _blt_semaphore(caps):
+            res = await _measure_blt(
+                axis, cmd, tree,
+                timeout=float(caps.get("worker_timeout_sec")
+                              or DEFAULT_CAPS["worker_timeout_sec"]),
+                log_path=log_path, verbosity=verbosity,
+                label_prefix=label_prefix)
         results[axis] = res
 
         if not (memo and tree_sha):
@@ -27766,7 +27880,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         bg_retry_warnings = [
             w for w in warnings
             if w.startswith(f"final conformer round {c_round}:")
-            and ("auto-backgrounded" in w or "times in one round" in w)]
+            and _is_blt_feedback_warning(w)]
         feedback_items = bg_retry_warnings + regressions
         blt_feedback = (
             _format_check_feedback(feedback_items, c_round,
@@ -30793,6 +30907,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "measures nothing per subtask. The canonical "
                          "command always runs at the base-health baseline "
                          "and on the final integrated tree regardless. "
+                         "Note 'full' puts a whole suite behind every "
+                         "subtask; those stay bounded by blt_parallel but "
+                         "are not cgroup-contained (DESIGN §6). "
                          f"Also {SUBTASK_TESTS_ENV} env or subtask_tests "
                          "in leerie.toml.")
     ap.add_argument("--skip-base-baseline", action="store_true",

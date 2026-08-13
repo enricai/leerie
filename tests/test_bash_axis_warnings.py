@@ -281,8 +281,33 @@ def test_unrelated_bash_between_bg_and_recovery_doesnt_break_recovery(
 # ---------------------------------------------------------------------------
 
 def test_emit_no_warnings_on_well_behaved_round(leerie, tmp_path):
-    """A round where TEST_CMD ran exactly once and didn't background
-    emits zero warnings."""
+    """A well-behaved round is now one where the conformer ran only TARGETED
+    commands.
+
+    The premise changed with the handover (DESIGN §9): the orchestrator
+    measures the axes and supplies `BLT_RESULTS:`, so a bare `npm test` is a
+    violation rather than the once-per-round allowance it used to be. Targeted
+    falsifiers are the encouraged primary mode and must stay silent — this is
+    the control that stops the retuned threshold from firing on every
+    legitimate command.
+    """
+    log = tmp_path / "w-conformer.log"
+    _write_log(log, [
+        _bash_event("a", "npm test src/a.test.ts 2>&1", timeout=600000),
+        _result_event("a", "Tests passed"),
+    ])
+    warnings: list[str] = []
+    leerie._emit_bash_axis_warnings(log, "conformer round 0", warnings)
+    assert warnings == []
+
+
+def test_emit_warns_on_a_single_full_axis_run(leerie, tmp_path):
+    """One un-scoped run is already the violation.
+
+    The threshold used to be >1, matching a prompt rule ("run each axis
+    exactly once per round") that no longer exists — so a worker running the
+    full suite once, now forbidden, produced no warning at all.
+    """
     log = tmp_path / "w-conformer.log"
     _write_log(log, [
         _bash_event("a", "npm test 2>&1", timeout=600000),
@@ -290,7 +315,30 @@ def test_emit_no_warnings_on_well_behaved_round(leerie, tmp_path):
     ])
     warnings: list[str] = []
     leerie._emit_bash_axis_warnings(log, "conformer round 0", warnings)
-    assert warnings == []
+    assert any("ran the full TEST axis" in w for w in warnings), warnings
+
+
+@pytest.mark.parametrize("cmd,is_full", [
+    ("pnpm run test", True),
+    ("pnpm test", True),
+    ("npm test 2>&1 | tail -80", True),      # head of the pipeline still runs it
+    ("timeout 90 pnpm test", True),          # prefix does not scope it
+    ("NODE_ENV=test pnpm test", True),       # nor does an env assignment
+    ("cd web && pnpm test", True),
+    ("pnpm test src/a.test.ts", False),
+    ("pnpm run test src/a.test.ts src/b.test.ts", False),
+    ('pnpm test "src/app/[locale]/(app)/p.test.tsx"', False),
+    ("npx vitest run --reporter=verbose", True),   # flags are not selectors
+    ("npx vitest related --run src/a.ts", False),
+    ("ps -ef | grep -i vitest | grep -v grep", False),   # never invokes it
+    ("pkill -f vitest", False),
+])
+def test_full_vs_scoped_discrimination(leerie, cmd, is_full):
+    """`_BLT_AXIS_RES` matches a scoped falsifier and a full run identically,
+    so the discrimination lives in `_is_full_axis_invocation`. These rows are
+    the shapes measured in real conformer logs."""
+    assert leerie._is_full_axis_invocation(
+        cmd, leerie._BLT_AXIS_RES["test"]) is is_full, cmd
 
 
 def test_emit_warns_on_multi_invocation_in_one_round(leerie, tmp_path):
@@ -306,7 +354,7 @@ def test_emit_warns_on_multi_invocation_in_one_round(leerie, tmp_path):
     warnings: list[str] = []
     leerie._emit_bash_axis_warnings(log, "conformer round 0", warnings)
     assert any(
-        "ran TEST_CMD 3 times in one round" in w
+        "ran the full TEST axis 3 time(s)" in w
         and "conformer round 0" in w
         and "conformer.md §4" in w
         for w in warnings), warnings

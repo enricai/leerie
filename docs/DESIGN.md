@@ -6572,6 +6572,27 @@ catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
 
+**Orchestrator-run build/lint/test is bounded, not contained.** A BLT command
+the orchestrator starts is not a worker. It does not pass through the
+memory-admission gate and it is not enrolled in a cgroup, so unlike a worker it
+has no `memory.max` and no `pids.max` of its own — §6 *Memory containment*
+covers the worker path only. That gap predates the handover (the base-health
+baseline always ran this way), but the handover multiplies it: what was one
+serial pre-wave run becomes one per subtask per round.
+
+Two things bound it. The default `scoped` mode keeps each measurement small —
+a couple of test files, seconds — so the uncontained footprint is negligible.
+And `blt_parallel` (default 2) caps how many run at once, which matters most
+under `--subtask-tests full`, where a whole suite sits behind every subtask and
+`max_parallel` of them at once is the shape that once saturated a worker's
+cgroup badly enough to raise `worker_pids_max` to 2048. Reaping is already
+handled: these run in their own session and are torn down as a process tree on
+timeout or exception.
+
+Enrolling them in a cgroup is the architecturally consistent answer and is not
+done yet; it would have to go through the broker, whose wire contract drifts
+silently enough to warrant its own guard.
+
 **The signal that continues the loop is a delta, not a verdict.** The round
 cap above bounds the loop; what *ends* it early is the orchestrator's judgment
 that the conformer has nothing left to do. That judgment must be relative to
@@ -6655,6 +6676,15 @@ conformer's self-reported `build`/`lint`/`tests` before any consumer reads
 them — the loop-continuation predicate, the residual summary, and the persisted
 `conformance` entry all see what was measured, never what was claimed. The
 worker's own report survives only as telemetry.
+
+"Before any consumer" is not free: it takes **two** applications per round, and
+the pairing is deliberate rather than defensive. One at the tail covers the
+ordinary case. One immediately after the worker returns covers the three gates
+that abandon a round early — a malformed result, a protected-path violation, a
+strict-mode clobber — because each of those `break`s past the tail while still
+handing `last_res` to a consumer. The early one uses the *pre*-round
+measurement, which is also the accurate answer there: two of those three exits
+roll the worktree back toward the state that measurement describes.
 
 Worth being precise about what this does *not* fix. Conformers were not
 over-firing: measured, 219 full-suite runs across 229 conformer calls, almost

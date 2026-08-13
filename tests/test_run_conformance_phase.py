@@ -81,6 +81,22 @@ def _restore_run_conformer(leerie):
     leerie._run_conformer = original
 
 
+@pytest.fixture(autouse=True)
+def _restore_measure_axes(leerie):
+    """Snapshot `leerie._measure_axes` before each test and restore after.
+
+    Same hazard, same fix as `_restore_run_conformer` above: `_stub_measure_axes`
+    rebinds the module attribute directly rather than via monkeypatch, so
+    without this the stub leaks into the session-scoped `leerie` fixture and
+    every later test in the run measures whatever the last stub returned.
+    Caught by `test_clean_result_exits_after_one_round` passing in isolation
+    and failing under batch collection — the classic tell.
+    """
+    original = leerie._measure_axes
+    yield
+    leerie._measure_axes = original
+
+
 def _run(cmd, cwd, check=True):
     """Run a git command, asserting success unless check=False."""
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -719,11 +735,16 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
 
 
 def test_pattern_a_multi_invocation_now_injects_feedback(env):
-    """When the conformer runs the same axis multiple times in one round
-    (Pattern A: repetition), that warning is now threaded into the next
-    round's feedback too, exactly like the auto-backgrounded (Pattern B)
-    class — closing the gap where leerie detected the repetition but
-    never told the worker."""
+    """A full-axis run the conformer made itself is threaded into the next
+    round's feedback, exactly like the auto-backgrounded (Pattern B) class.
+
+    This was originally about *repetition* — the old contract allowed one
+    invocation per axis per round and only warned above that. Since the
+    handover (DESIGN §9) the orchestrator measures the axes and the conformer
+    is asked not to run a full one at all, so the threshold is one and this
+    covers "ran it despite the results being supplied" rather than "ran it
+    twice". The log below has two, which trips either reading.
+    """
     c = env["leerie"]
     dirty = _clean_result(
         build={"ran": True, "passed": False, "command": "npm run build",
@@ -755,7 +776,9 @@ def test_pattern_a_multi_invocation_now_injects_feedback(env):
     assert state["feedbacks"][0] is None
     assert state["feedbacks"][1] is not None, \
         "Pattern A (within-round repetition) should now inject feedback"
-    assert "times in one round" in state["feedbacks"][1]
+    # Wording follows `_BLT_FEEDBACK_MARKERS`; the threshold is now one
+    # un-scoped run, not two of any kind (see _emit_bash_axis_warnings).
+    assert "ran the full" in state["feedbacks"][1]
 
 
 # --- strict-conformer mode -------------------------------------------------
