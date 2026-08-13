@@ -146,23 +146,43 @@ _host_finalize_pre_push_hook_present() {
 # claim said "three" for one release because it was written from an ablation
 # run against the PREVIOUS, wider alternative list and never re-run.
 #
-# A HERESTRING, not `printf | grep`: `grep -q` exits at its first match and
-# closes the pipe, so with more than a pipe buffer (64 KiB) still unread the
-# writer dies of SIGPIPE and — under the `set -o pipefail` every caller of
-# this file sets — the pipeline reports 141 even though grep MATCHED.
-# Measured: a 1.19 MB stderr whose first line is a real credential failure
-# classified as a hook failure, and the operator was told to retry with
-# `--no-verify`, which cannot fix credentials. A pre-push hook running a test
-# suite reaches that size easily.
+# PROCESS SUBSTITUTION, and both of the things it is not are deliberate.
+#
+# Not `printf … | grep -q`: `grep -q` exits at its first match and closes the
+# pipe, so with more than a pipe buffer (64 KiB) still unread the writer dies
+# of SIGPIPE and — under the `set -o pipefail` every caller of this file sets
+# — the pipeline reports 141 even though grep MATCHED. Measured: a 1.19 MB
+# stderr whose first line is a real credential failure classified as a hook
+# failure, and the operator told to retry with `--no-verify`, which cannot fix
+# credentials. A pre-push hook running a test suite reaches that size easily.
+#
+# Not a herestring either, which is what replaced the pipe first and moved the
+# failure rather than removing it: bash backs a herestring larger than a pipe
+# buffer with a temp file (measured — 32 KiB is a pipe, 64 KiB is
+# sh-thd.XXXXXX, i.e. the SAME input range). It honours $TMPDIR and falls
+# back to /tmp when that is unusable, so the dependency is on *some* writable
+# temp dir. When the file cannot be created the redirection fails and the
+# command returns 1, indistinguishable here from "grep did not match".
+# Reproduced with /tmp as a full 256 KiB tmpfs: identical misclassification.
+# That matters because on macOS /tmp shares the APFS container with $HOME, so
+# the disk-full case N30 exists for IMPLIES a full /tmp.
+#
+# Process substitution needs no temp file, and `pipefail` never sees the
+# writer because it is not part of a pipeline — so neither failure mode is
+# reachable. Verified in the same full-/tmp container: large auth -> AUTH,
+# small auth -> AUTH, large hook -> HOOK.
 _host_finalize_git_framed_auth_or_network() {
   grep -qiE \
     "^(fatal|remote):.*(authentication failed for '|permission denied \(publickey|could not read (username|password) for|could not read from remote repository|terminal prompts disabled|unable to access '|repository .*not found)" \
-    <<<"$1"
+    < <(printf '%s\n' "$1")
 }
 
+# Kept as a named wrapper even though it is now a pure pass-through: it is the
+# name `host_finalize` calls, the name both docs describe, and the seam a
+# second classification arm would return to. Collapsing it would rename a
+# documented function to save one line.
 _host_finalize_is_auth_or_network_push_error() {
-  _host_finalize_git_framed_auth_or_network "$1" && return 0
-  return 1
+  _host_finalize_git_framed_auth_or_network "$1"
 }
 
 host_finalize() {

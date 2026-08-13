@@ -19,7 +19,8 @@ import pathlib
 
 import pytest
 
-DESIGN = pathlib.Path(__file__).resolve().parent.parent / "docs" / "DESIGN.md"
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+DESIGN = REPO_ROOT / "docs" / "DESIGN.md"
 SECTION_HEADING = "## 14½. Regression tripwires"
 
 
@@ -43,20 +44,71 @@ def test_section_is_not_empty(section):
         "assertions below would pass while carrying no content")
 
 
-@pytest.mark.parametrize("signal,why", [
-    ("fit_judge crashed; accepting as leaf",
+# (signal, emitted_by_leerie, why it is here)
+#
+# The split is load-bearing, and getting it wrong is how this guard would
+# have been deleted rather than fixed. A signal leerie EMITS can be checked
+# against the source — that is the half that catches a tripwire quoting a
+# string the code does not print, which is exactly the defect that shipped.
+# A signal leerie only OBSERVES (an upstream API message) has zero hits here
+# by definition, so requiring it in the source would fail on correct code.
+_TRIPWIRES = [
+    ("fit_judge crashed for", True,
      "the stdin-race (#198) downstream symptom — the crash-to-leaf degrade is "
      "silent, so this log line is its only visible trace"),
-    ("exceeds maximum allowed tokens",
-     "the context-budget fix (#194); it became impossible once the payload "
-     "moved off argv, so its return means the transport changed"),
-    ("push_error",
-     "never judge a finalize outcome from the remote — read run.json"),
-])
-def test_tripwire_names_its_signal(section, signal, why):
+    # DESIGN quotes this signal as TWO fragments (the subtask id sits between
+    # them), so both need checking. Guarding only the first left the exact
+    # defect this file exists to catch — DESIGN quoting a string the code does
+    # not print — live for the other half.
+    ("; accepting as leaf", True,
+     "the second half of the same fit_judge signal"),
+    ("exceeds maximum allowed tokens", False,
+     "the context-budget fix (#194); an UPSTREAM API rejection, never a "
+     "leerie string"),
+    ("push_error", True,
+     "never judge a finalize outcome from the remote — read this run.json "
+     "field instead"),
+]
+
+SOURCES = [
+    REPO_ROOT / "orchestrator" / "leerie.py",
+    REPO_ROOT / "scripts" / "host-finalize.sh",
+]
+
+
+@pytest.mark.parametrize("signal,emitted,why", _TRIPWIRES,
+                         ids=[t[0][:24] for t in _TRIPWIRES])
+def test_tripwire_names_its_signal(section, signal, emitted, why):
     assert signal in section, (
         f"the tripwire for {why!r} no longer names the signal {signal!r} an "
         "operator would actually grep for")
+
+
+@pytest.mark.parametrize("signal,emitted,why", _TRIPWIRES,
+                         ids=[t[0][:24] for t in _TRIPWIRES])
+def test_emitted_signals_actually_exist_in_the_source(signal, emitted, why):
+    """The half that would have caught the defect this file shipped with.
+
+    DESIGN quoted `fit_judge crashed; accepting as leaf`, but the code emits
+    `fit_judge crashed for {sid}; accepting as leaf` — the id sits between the
+    halves, so the quoted string is not a substring and an operator grepping
+    it verbatim gets nothing. The original guard asserted the wrong literal
+    was present *in DESIGN* and never compared it to the source, so it pinned
+    the error instead of catching it.
+    """
+    if not emitted:
+        pytest.skip(f"{signal!r} is an upstream string leerie never emits")
+    found = any(signal in p.read_text() for p in SOURCES)
+    assert found, (
+        f"DESIGN's tripwire quotes {signal!r} as a signal leerie emits, but "
+        f"it appears in none of {[p.name for p in SOURCES]}. An operator "
+        "grepping for it would get zero hits.")
+
+
+def test_at_least_two_signals_are_source_checked():
+    """Anti-vacuity: if every tripwire were marked 'observed', the check above
+    would skip its way to green."""
+    assert sum(1 for _, emitted, _ in _TRIPWIRES if emitted) >= 2
 
 
 def test_work_order_launch_tripwire_survives(section):

@@ -3593,7 +3593,7 @@ the arm's own comment already documented this hazard for the
 re-raiser went unguarded because the comment named only one of the raise
 sites, which is why `test_survives_a_save_that_is_still_failing`
 in `tests/test_disk_preflight.py` asserts against *every* save in the arm
-rather than pinning one call. Third, **fixing one arm was not the fix**:
+rather than pinning one call. Second, **fixing one arm was not the fix**:
 eight other handlers in `main()` carried the identical bare `st.save()`,
 including the catch-all `except BaseException`, where a raise REPLACES the
 unhandled exception and leaves the real bug reachable only as
@@ -3601,7 +3601,7 @@ unhandled exception and leaves the real bug reachable only as
 `_save_state_best_effort`, which logs and never raises — deliberately
 broader than `except DiskLowSpace`, because a read-only run dir raises
 `PermissionError` (measured) and no conversion touches it.
-Second, the test it replaced asserted only
+Third, the test it replaced asserted only
 `issubclass(DiskLowSpace, BaseException)` and concluded "no separate
 save()-specific handler is required" — a tautology that *reasoned* its
 way to a false conclusion. Reaching a handler was never the question.

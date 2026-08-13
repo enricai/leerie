@@ -849,7 +849,11 @@ class TestDismissalIsVisible:
                     "tag_or_dep": "shared", "concrete_reason": ""}]
         _, unrepaired = leerie._repair_missing_requires(plans, defects)
         assert unrepaired == []
-        out = capsys.readouterr().out + capsys.readouterr().err
+        # ONE readouterr() call: it resets the capture, so a second returns
+        # empty and the `.err` term was dead. Same fix as
+        # tests/test_disk_preflight.py's helper tests.
+        _captured = capsys.readouterr()
+        out = _captured.out + _captured.err
         assert "already ordered behind" in out, (
             "the dismissal must be logged, naming the edges responsible")
         # every producer that justified the dismissal is named, not just one —
