@@ -1,6 +1,12 @@
-# Fast-feedback AST parse of the orchestrator and the test suite.
-# Runs the exact check from CLAUDE.md's task-completion checklist
-# without waiting for the full pytest matrix.
+# Fast-feedback AST parse of the orchestrator and the test suite, plus the
+# undefined-name scan. Runs the exact checks from CLAUDE.md's task-completion
+# checklist without waiting for the full pytest matrix.
+#
+# The two checks answer different questions and neither subsumes the other:
+# ast.parse catches a file that cannot be parsed; the symtable scan catches a
+# name that parses perfectly and raises NameError when its line runs. v0.20.0
+# shipped exactly that (`repo_root` in the fresh-run branch of _run_phases) —
+# green ast.parse, green 6751-test suite, dead on every fresh run.
 name: syntax
 
 on:
@@ -39,3 +45,14 @@ jobs:
           for p in pathlib.Path('tests').rglob('*.py'):
               ast.parse(p.read_text(), filename=str(p))
           "
+
+      # Runs the test file rather than reimplementing the scan here: one
+      # implementation, per this repo's standing rule against a second copy
+      # of a rule (tests/launcher_blocks.py, test_no_duplicate_*). pytest is
+      # the only install this job needs — the scan itself is stdlib symtable,
+      # deliberately not ruff/pyflakes (CLAUDE.md: pytest is the sole dev
+      # dependency).
+      - name: Undefined-name scan (ast.parse cannot see this class)
+        run: |
+          pip install pytest
+          python -m pytest tests/test_no_undefined_names.py -q

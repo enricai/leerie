@@ -187,6 +187,14 @@ def test_subtask_tests_is_seeded_on_both_run_init_branches(leerie):
     a sharper reason than tidiness: a drifted second copy under-reports the
     resume branch, which makes the symmetry guard pass *vacuously* instead of
     failing.
+
+    **This proves presence, not evaluation, and cannot be made to.** It
+    passed against the v0.20.0 build whose fresh-branch value expression was
+    `resolve_subtask_tests(repo_root, ...)` with `repo_root` bound nowhere —
+    the key was in the literal; reading it raised `NameError` and killed
+    every fresh run. Execution coverage for that branch lives in
+    `tests/test_run_phases_fresh_init.py`; the whole-module generalisation is
+    `tests/test_no_undefined_names.py`.
     """
     from tests.test_state_fields import _state_init_branch_keys
     resume_keys, fresh_keys = _state_init_branch_keys(leerie)

@@ -30166,8 +30166,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
+                   # `st.repo_root`, not a bare `repo_root`: this function
+                   # takes no such parameter and there is no module global of
+                   # that name, so the bare form raised NameError on every
+                   # fresh run (v0.20.0). It is the same value either way —
+                   # `main()` derives `repo_root = Path(os.getcwd())` and
+                   # hands it to `State(..., repo_root=repo_root)`.
                    "subtask_tests": resolve_subtask_tests(
-                       repo_root,
+                       st.repo_root,
                        getattr(args, "subtask_tests", None)),
                    "skip_base_baseline": bool(args.skip_base_baseline),
                    "skip_repo_map": bool(args.skip_repo_map),

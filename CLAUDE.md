@@ -3078,6 +3078,40 @@ walks the AST of `_run_phases`, because the obvious
 `"args.task" not in getsource(main)` passes trivially (the reads are in
 `_run_phases`, not `main`) and proved nothing.
 
+**The fresh-run branch of `_run_phases` had no execution coverage at all**
+until `tests/test_run_phases_fresh_init.py`, and v0.20.0 shipped a
+`NameError` in it that killed every non-resume run. Two structural reasons,
+both worth remembering when adding a guard here. First, only
+`test_resume_planning_reentry.py` and `test_resume_planning_regression.py`
+execute `_run_phases`, and **both hardcode `resume=True`** — `resume=False`
+appeared nowhere under `tests/`, and no test executes `_orchestrate` either,
+so the branch that every real run takes was never run. Note
+`test_wiring_gate_resume.py::test_fresh_run_invokes_the_gate` reuses that same
+`_args()`: "fresh" there means fresh *state*, not a fresh run, which is how
+the gap reads as covered. Second, the guard that did exist —
+`test_orchestrator_owns_blt.py::test_subtask_tests_is_seeded_on_both_run_init_branches`
+— is a key-presence AST walk, and **it passed against the broken code**: the
+key was in the dict literal, only its value expression was unevaluatable.
+Presence is not evaluation, and no AST walk of a literal can be. The new file
+executes the branch, stopping at a sentinel on
+`_enforce_and_record_cgroup_containment` (the first call after the seed's
+`st.save()`, so no other stub is needed), and carries the guard-the-guard test
+that the resume branch would `die()` here — without it the file could silently
+drift onto the path it exists to avoid.
+`tests/test_no_undefined_names.py` is the whole-module generalisation: stdlib
+`symtable` over `orchestrator/`, `chain/`, `scripts/` and `tests/`, flagging
+any name that is referenced, resolves to global scope, and is bound in neither
+module scope nor `builtins` — ruff's F821 rule without the dependency, since
+pytest is the sole dev dependency here. Two traps are pinned by its own
+parametrized false-positive table, both of which a naive scan gets wrong: a
+`global X` + assignment **inside a function** binds the module name even when
+`X` never appears at module scope (leerie.py does this for `_STRICT_PROXY` and
+`_last_parse_error`), so the collector needs a pre-pass over every scope; and
+`__file__`/`__name__` are interpreter-injected, never assigned in source. The
+positive control beside that table is mandatory — a scan returning `[]`
+unconditionally passes every negative case. Anti-vacuity is a canary injected
+into the **real** module rather than a synthetic snippet, so a refactor that
+quietly stops analysing `leerie.py` fails.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
@@ -3724,6 +3758,12 @@ Before marking a change complete:
 - [ ] `pytest tests/` — all pass.
 - [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"`
       as a static check.
+- [ ] `pytest tests/test_no_undefined_names.py` — the undefined-name scan.
+      **`ast.parse` does not subsume this**: an undefined name parses
+      perfectly and raises `NameError` only when its line executes. v0.20.0
+      shipped one (`repo_root` in `_run_phases`' fresh-run branch) past a
+      green `ast.parse` and a green 6751-test suite, and it killed every
+      fresh run.
 - [ ] `grep -rn <removed-string> .` — confirm no stragglers if the change
       renamed or removed a string used elsewhere.
 - [ ] `git diff --stat` — confirm the diff is scoped to what the change
