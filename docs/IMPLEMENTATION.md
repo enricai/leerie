@@ -8673,6 +8673,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
+| `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... state.json", and the mutation used to set `complete`, pop the `blocked` registry and write nothing else -- leaving a waived subtask byte-indistinguishable from one that genuinely succeeded, with the blocker it was waived for deleted (docs/POSTMORTEM-2026-08-14.md, F16). `accept-integration` records the same way, on its own `integration_gate` entry (`accepted_at`, `accepted_defects`). |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
 | `worker_count` | int | running total of `claude -p` invocations against `max_total_workers` |
 | `decompose_worker_count` | int | running total of `claude -p` invocations spent inside `_recursive_decompose` (fit_judge + splitter, including the label-only migration splitter), against `decompose_budget_share * max_total_workers`. Bumped by `_bump_decompose_workers` alongside `worker_count` (which it also bumps). N3+N4: decomposition is a subset of the total worker budget, so this field never exceeds `worker_count` |

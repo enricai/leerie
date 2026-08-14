@@ -1706,7 +1706,7 @@ PY
     # rely on the process exit code surviving flyctl's rc-flattening) can
     # grep the outcome. Exit code is still set for the local path.
     _ab_mutate='
-import json, os, sys, tempfile
+import datetime, json, os, sys, tempfile
 path, sid = sys.argv[1], sys.argv[2]
 force = len(sys.argv) > 3 and sys.argv[3] == "--force"
 try:
@@ -1749,17 +1749,43 @@ if cur == "complete":
 if not force and not in_registry and cur not in ("blocked", "failed"):
     print(f"ERROR: subtask {sid!r} has status {cur!r} (expected blocked or failed)", file=sys.stderr)
     sys.exit(1)
+# Record the acceptance BEFORE erasing what it accepted. The die() that sends
+# an operator here says "See ... state.json", and this mutation used to set
+# complete, pop the blocked registry and write nothing else -- so afterwards a
+# waived subtask was byte-indistinguishable from one that genuinely succeeded,
+# and the blocker it was waived for had been deleted. Following the advice of
+# the tool destroyed the evidence that advice pointed at
+# (docs/POSTMORTEM-2026-08-14.md, F16).
+_blocker = bl.get(sid) if isinstance(bl, dict) else None
+st.setdefault("accepted_blocked", {})[sid] = {
+    "at": datetime.datetime.now(datetime.timezone.utc)
+          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "previous_status": cur,
+    "blocker": _blocker,
+    "forced": bool(force),
+}
 ss[sid] = "complete"
 if isinstance(bl, dict):
     bl.pop(sid, None)
     if not bl:
         st.pop("blocked", None)
+# Preserve the file mode. NamedTemporaryFile creates 0600 and os.replace keeps
+# the mode of the SOURCE, so writing this way silently tightened state.json
+# from 0644 to 0600 -- a change nobody asked for, and one that differs from how
+# the orchestrator writes the same file.
+try:
+    _mode = os.stat(path).st_mode & 0o777
+except OSError:
+    _mode = None
 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
     json.dump(st, tmp, indent=2)
     tmp.write("\n")
     tmp_path = tmp.name
+if _mode is not None:
+    os.chmod(tmp_path, _mode)
 os.replace(tmp_path, path)
-print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
+print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
+      f"(recorded under accepted_blocked)")
 '
     if [ "$_ab_runtime" = "ec2" ]; then
       # EC2 counterpart of the Fly branch below: wake the instance if it
@@ -2020,7 +2046,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # NOOP: / ERROR:) so both the local exit code and the Fly/EC2
     # grep-the-output path can tell the outcome apart.
     _ai_mutate='
-import json, os, sys, tempfile
+import datetime, json, os, sys, tempfile
 path, sid = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
@@ -2038,14 +2064,30 @@ if entry.get("accepted"):
     sys.exit(0)
 entry["accepted"] = True
 defects = st.get("integration_defects", {})
+# Keep what was accepted, on the entry itself, before dropping it from the
+# live registry. Same rule as accept-blocked: a waiver that deletes the finding
+# it waived leaves nobody able to say what was waived
+# (docs/POSTMORTEM-2026-08-14.md, F16).
+entry["accepted_at"] = (datetime.datetime.now(datetime.timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"))
+if isinstance(defects, dict) and defects.get(sid) is not None:
+    entry["accepted_defects"] = defects.get(sid)
 if isinstance(defects, dict):
     defects.pop(sid, None)
     if not defects:
         st.pop("integration_defects", None)
+# Preserve the file mode -- NamedTemporaryFile creates 0600 and os.replace
+# keeps the mode of the source, silently tightening state.json.
+try:
+    _mode = os.stat(path).st_mode & 0o777
+except OSError:
+    _mode = None
 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
     json.dump(st, tmp, indent=2)
     tmp.write("\n")
     tmp_path = tmp.name
+if _mode is not None:
+    os.chmod(tmp_path, _mode)
 os.replace(tmp_path, path)
 print(f"ACCEPTED: {sid!r} integration finding accepted")
 '

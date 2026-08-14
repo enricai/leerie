@@ -380,6 +380,10 @@ DEFAULT_CAPS = {
 STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
+    # Written by the LAUNCHER's `accept-blocked` mutator, not by this
+    # module -- declared here because it is a state.json field and
+    # STATE_FIELDS is the file's inventory.
+    "accepted_blocked",
     "plan_snapshot",
     "decompose_snapshot",
     "blocked",
