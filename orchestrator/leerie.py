@@ -6837,7 +6837,6 @@ async def _preflight_repo() -> None:
             "  git branch -D leerie               # delete (if fully merged)")
 
 
-
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
@@ -8744,31 +8743,6 @@ def check_integrator_output(result: dict) -> list[str]:
     return []
 
 
-def _criterion_is_conformance_owned(criterion: str | None,
-                                    blt_commands: tuple[str, ...]) -> bool:
-    """True when a success criterion names a command the conformer runs.
-
-    `prompts/implementer.md` tells the implementer not to run the build — the
-    conformance phase owns that measurement, and a build in a worker's turn
-    budget can OOM the container and get it reaped mid-turn. So a criterion
-    like "`pnpm run build` passes" is not the implementer's to satisfy.
-
-    Matching is a plain substring test against the repo's own RESOLVED
-    build/lint/test command strings, which are mechanical config values, not
-    worker prose — so this is not the *Language-to-JSON* rule's regex-on-an-LLM
-    case. It is deliberately narrow: only a criterion that literally quotes one
-    of those commands is exempted, so "the new endpoint builds a valid payload"
-    is untouched.
-
-    Empty `blt_commands` (a repo with no resolved BLT surface) exempts nothing,
-    which preserves the pre-existing behaviour rather than degrading to
-    permissive."""
-    if not criterion or not blt_commands:
-        return False
-    low = criterion.lower()
-    return any(cmd and cmd.lower() in low for cmd in blt_commands)
-
-
 # Mechanical-check labels that are reported but must NOT drive a re-drive.
 # Matching leerie's OWN label prefixes is set membership over strings this
 # module authored, not interpretation of a worker response, so it sits outside
@@ -8784,7 +8758,6 @@ def _gating_issues(issues: list[str]) -> list[str]:
 
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
-    blt_commands: tuple[str, ...] = (),
 ) -> list[str]:
     """Mechanical checks on an implementer's complete result.
 
@@ -8828,20 +8801,25 @@ def check_implementer_output(
     if result.get("status") == "complete":
         for cr in result.get("criteria_results", []) or []:
             # A criterion the implementer was never responsible for is not an
-            # unmet one. Two channels, and the second is the load-bearing half:
+            # unmet one, and the worker declares that in `not_applicable` —
+            # the structured channel the schema previously lacked.
             #
-            #   1. the worker says so (`not_applicable`), the explicit state the
-            #      schema previously lacked;
-            #   2. the criterion names a command the CONFORMER owns. Prompts
-            #      drift and workers forget, so the guarantee cannot rest on (1)
-            #      alone — DESIGN §12 again. `check_implementer_output`'s caller
-            #      passes the repo's resolved build/lint/test commands and any
-            #      criterion quoting one of them is the conformance phase's to
-            #      judge, whatever the worker recorded.
+            # There was briefly a second channel here: substring-matching the
+            # repo's resolved build/lint/test commands inside the criterion
+            # text, as a backstop for a worker that forgot the flag. It is
+            # gone. `criterion` is planner-authored prose, and the
+            # *Language-to-JSON* rule is that Python never reads meaning out of
+            # prose — its prescribed remedy being exactly "the owning worker
+            # must surface it as a JSON field", which `not_applicable` is. A
+            # spec sentence had been written asserting the match was "against
+            # resolved config values, not worker prose"; the needle was config,
+            # the haystack was prose, and the sentence authorised the code
+            # rather than deriving from it.
+            #
+            # The residual risk is one re-drive when a worker omits the flag —
+            # the behaviour before any of this existed, so not a regression.
+            # `prompts/implementer.md` states the requirement plainly instead.
             if cr.get("not_applicable") is True:
-                continue
-            if _criterion_is_conformance_owned(cr.get("criterion"),
-                                               blt_commands):
                 continue
             if cr.get("met") is False:
                 issues.append(
@@ -28763,10 +28741,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
             impl_issues = check_implementer_output(
-                res, subtask, actual_files,
-                blt_commands=tuple(
-                    c for c in (resolve_blt(st.repo_root) or {}).values()
-                    if isinstance(c, str) and c.strip()))
+                res, subtask, actual_files)
             # Advisories are surfaced but never re-drive (see _ADVISORY_ISSUES).
             _gating = _gating_issues(impl_issues)
             for _adv in impl_issues:

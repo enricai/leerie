@@ -846,6 +846,21 @@ block). A `for` loop over `compgen -v | grep '^LEERIE_'` appends a bare
 `-e "$name"` (host value passed through) for each non-deny-listed var with a
 non-empty value. Empty/unset vars are skipped.
 
+**`LEERIE_STATE_HOST_DIR_DISPLAY` — a deliberate, narrow exception.** The
+orchestrator sees the state root bind-mounted at `/leerie-state`, so a `die()`
+naming `<state-root>/runs/<id>/state.json` printed a path the operator cannot
+open on the host (docs/POSTMORTEM-2026-08-14.md, F17). The launcher therefore
+forwards the *host* side of that mount explicitly, as
+`-e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"`, and
+`_operator_path()` uses it to rewrite the prefix in operator-facing text.
+
+The `_DISPLAY` suffix is load-bearing. `LEERIE_STATE_HOST_DIR` itself stays on
+the deny-list, and must: a host path is meaningless *as a path* inside the
+container, and nothing may open this value. It may only be printed. The
+separate name is what keeps that restriction legible at the use site, and
+`tests/test_operator_path_translation.py` pins both halves — that the launcher
+forwards the display copy, and that the un-suffixed original remains denied.
+
 Deny-list = forward-all-minus-known-host-only, not an allow-list, so the
 dynamic per-worker names (`LEERIE_MODEL_<WORKER>`, `LEERIE_EFFORT_<WORKER>`,
 built at runtime from `f"{MODEL_ENV}_{worker.upper()}"`) forward automatically
@@ -1278,6 +1293,9 @@ leerie/
 ├── scripts/
 │   ├── setup-run.sh               create per-run branch + worktree (idempotent)
 │   ├── new-worktree.sh            create/reuse a per-subtask worktree (per-run scoped)
+│   ├── worktree-lib.sh            prune_leerie_worktrees(): a SCOPED replacement for
+│   │                              `git worktree prune`, sourced by setup-run.sh,
+│   │                              new-worktree.sh and cleanup.sh
 │   ├── integrate.sh               merge a subtask branch into the per-run branch
 │   ├── finalize.sh                verify the run branch exists and is non-empty; ready for push
 │   ├── host-finalize.sh           host-side push + PR creation block; sourced by
@@ -3557,6 +3575,29 @@ shape*). The following are explicitly unchanged:
 - `_filter_offtree_subtasks` (DESIGN.md §12) — the existing guard
   enforces write-confinement for siblings seeded as inspect-dirs,
   unchanged.
+
+**`scripts/worktree-lib.sh` — scoped worktree pruning.** Exports
+`prune_leerie_worktrees <leerie-root>`, sourced by `setup-run.sh`,
+`new-worktree.sh` and `cleanup.sh`, which previously each ran a bare
+`git worktree prune`.
+
+The repo is bind-mounted whole into every container, so `.git` is SHARED with
+the host and with any other container. A bare prune is repository-global and
+has **no grace period** — the 3-month `gc.worktreePruneExpire` applies to
+`git gc`, not to an explicit `prune` — so it drops the registration of any
+worktree whose path is absent from the pruning process's namespace. That
+includes every host-side `/tmp/tmp.*/rebase-<run-id>` worktree the finalize
+rebase creates, which no container can see (docs/POSTMORTEM-2026-08-14.md,
+F19).
+
+The replacement asks git what it would prune (`git worktree prune -n -v`,
+whose output is on **stderr**), maps each reported admin name back to its path
+via `$GIT_DIR/worktrees/<name>/gitdir`, and prunes only those under the run's
+own `<leerie-root>`. Registrations belonging to the host, or to another run,
+are left alone. Removing the prune entirely is not an option — it is what
+clears the stale `.git/worktrees/` metadata a SIGKILLed run leaves behind, the
+failure `new-worktree.sh` documents.
+
 - Branch helpers (`new-worktree.sh`, `setup-run.sh`, `integrate.sh`,
   `finalize.sh`, `host-finalize.sh`) — each member's finalize runs
   its own existing `host_finalize` against its own repo.
@@ -4934,7 +4975,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
 | Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` is snapshotted **once before the round loop** (a per-round HEAD would fold in prior conformer commits and miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; for each owned file, a clobber is a deletion at HEAD or a blob reverted to the base version (three-way blob compare via `_blob_sha`, which uses `git rev-parse --verify -q` to avoid the bare-`rev-parse` missing-path footgun) while a legit conformer edit leaves a distinct third blob and is not flagged. Warns **always**; under `--strict-conformer` also `_rollback_conformer_commits()` to the implementer HEAD **and blocks** — a `clobbered_files` flag threaded to the post-loop `blocked_reason` (per-subtask) / `final_blocked` (final) sets a block even when `_conformance_clean(last_res)` is True, so a clobber is never silently completed. Not auto-rolled-back in advisory mode — a legitimate revert-to-base is git-indistinguishable from a clobber. The final-tree pass applies the same guard with `base=` **a snapshot SHA** — `_merge_base_sha(staging, working_branch, staging_before_sha)`, the point the run branch forked from the working branch — and `impl_head=staging HEAD snapshotted before that pass`. **It must not be `run_branch`.** The staging worktree has the run branch checked out (`setup-run.sh`: `git worktree add "${STAGING_WT}" "${BRANCH}"`), so passing that branch name makes `_blob_sha(base_ref, f)` and `_blob_sha("HEAD", f)` resolve the same ref, `b_head == b_base` is unconditionally true, and **every** file the final conformer edits is reported `(reverted-to-base)` — measured on three real runs, where the flagged set was exactly the file list of the conformer's own tip commit and none of those files was reverted, with the two runs whose conformer committed nothing as the control (docs/POSTMORTEM-2026-08-14.md, F2). Under `--strict-conformer` the same false positive drives `_rollback_conformer_commits`, i.e. it would `git reset --hard` away every legitimate final-conformer fix on every run. The per-subtask call site is correct with `base=run_branch` for a reason worth stating rather than leaving implicit: a subtask worktree sits on `leerie/subtasks/<run-id>/<sid>`, which is a genuinely different ref from the run branch, so the two blob lookups do not collapse. |
 | Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| Loop-continuation predicate | `_conformance_clean(conf_res, baseline)` + `_baseline_red_axes(baseline)` | DESIGN §9 *The signal that continues the loop is a delta, not a verdict*. Returns True (ends the loop) when nothing is left that this subtask is responsible for. `baseline` is `st.data["conformance"]["_baseline"]` or `None`, read once per phase by the caller so the predicate stays a pure function of its arguments. Two exclusions, both keyed on the `_baseline_red_axes()` set (which admits only names in `_BLT_AXES`, so a junk entry cannot widen it): (1) an axis with `ran && !passed` whose name is red at baseline does not block; (2) a `rule_violations_residual` entry whose **`axis` field** is red at baseline does not block. Everything else blocks exactly as before — a residual under any other rule, an *unlabelled* residual, and a failure on an axis that was *green* at baseline (a real regression). The axis is read from the schema field, never inferred from the `rule`/`why_not_fixed` prose: that would be regex on an LLM's response (*Language-to-JSON*), and `why_not_fixed` is not stable enough to compare anyway — measured, only 21% of consecutive round transitions repeat a byte-identical residual set. `axis` is optional on the schema and gating on absence (one decision, not two — see the schema comment and `check_production_evidence`'s precedent), normalised in `_expand_conformer_output` so this stays a plain set test. `baseline=None` (skipped via `--skip-base-baseline`, not yet captured, or malformed) reproduces the pre-change absolute-verdict behaviour byte-for-byte. Measured by replaying the motivating run's real round-1 output through the shipped predicate: subtasks clean at round 1 go 6/79 → 37/79 on the axis channel alone → 53/79 once the worker labels BLT residuals. |
+| Loop-continuation predicate | `_conformance_clean(conf_res, baseline)` + `_baseline_red_axes(baseline)` | DESIGN §9 *The signal that continues the loop is a delta, not a verdict*. Returns True (ends the loop) when nothing is left that this subtask is responsible for. `baseline` is `st.data["conformance"]["_baseline"]` or `None`, read once per phase by the caller so the predicate stays a pure function of its arguments. **Checked first, ahead of both exclusions below: an axis with `ran && !measured` returns False.** A command that produced no verdict at all — the runner is absent, or the process died to resource exhaustion (`_axis_unmeasurable` = `_runner_missing` OR `_is_fork_exhaustion`) — is a third state, not a pass. Treating it as clean is what let a PR ship with a test axis that never ran (docs/POSTMORTEM-2026-08-14.md, F5). It is ordered first because the red-axis exclusions below would otherwise absorb it: an unmeasurable axis is not "red at baseline and therefore not ours", it is unknown. Then two exclusions, both keyed on the `_baseline_red_axes()` set (which admits only names in `_BLT_AXES`, so a junk entry cannot widen it): (1) an axis with `ran && !passed` whose name is red at baseline does not block; (2) a `rule_violations_residual` entry whose **`axis` field** is red at baseline does not block. Everything else blocks exactly as before — a residual under any other rule, an *unlabelled* residual, and a failure on an axis that was *green* at baseline (a real regression). The axis is read from the schema field, never inferred from the `rule`/`why_not_fixed` prose: that would be regex on an LLM's response (*Language-to-JSON*), and `why_not_fixed` is not stable enough to compare anyway — measured, only 21% of consecutive round transitions repeat a byte-identical residual set. `axis` is optional on the schema and gating on absence (one decision, not two — see the schema comment and `check_production_evidence`'s precedent), normalised in `_expand_conformer_output` so this stays a plain set test. `baseline=None` (skipped via `--skip-base-baseline`, not yet captured, or malformed) reproduces the pre-change absolute-verdict behaviour byte-for-byte. Measured by replaying the motivating run's real round-1 output through the shipped predicate: subtasks clean at round 1 go 6/79 → 37/79 on the axis channel alone → 53/79 once the worker labels BLT residuals. |
 | Axis selection | `resolve_blt_scoped(repo_root)` + `_changed_files(worktree, run_branch)` + `_select_subtask_axes(blt, scoped, files, base_ref, mode)` | DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*. Resolved ONCE per subtask, before the round loop — the changed-file set is the implementer's diff, and a conformer's own commits do not widen what the subtask is responsible for. `mode` is `st.data["subtask_tests"]`. `resolve_blt_scoped` reads `test_scoped`/`build_scoped` from `.leerie/config.toml` (added to `_load_blt_config`'s key tuple), else infers exactly two: `npx vitest related --run {files} --passWithNoTests` when a `vitest.config.*`/`vitest.workspace.*` exists, `npx jest --findRelatedTests {files} --passWithNoTests` for `jest.config.*`, and `npx tsc --noEmit` as `build_scoped` when a `tsconfig.json` exists and the canonical build is not already `tsc`-shaped. Kept in a SEPARATE function from `_infer_build_lint_test` so the launcher's mirrored bash inference and its parity guard (`tests/test_config_verb.py`) stay untouched. No pytest inference (a `{files}` render of a changed `orchestrator/leerie.py` collects nothing) and no lint tier (lint measured at 0.4 h across a 51 h run). `_changed_files` uses `git diff -z --name-only <base>..HEAD`: `-z` because git C-quotes paths containing spaces or non-ASCII, so `splitlines()` returns a literal that does not exist on disk. `_render_scoped` `shlex.quote`s each path and returns None when a `{files}` template has no files — rendering the bare runner would run EVERYTHING. Any axis whose proxy does not resolve falls back to the canonical command; the returned scope label is `scoped` only if at least one axis actually used a proxy |
 | Measure (pre / post) | `_measure_axes(worktree, axes, st, caps, ...)` | Run immediately before the conformer round (its results become the prompt's `BLT_RESULTS:` block) and again immediately after (its results overwrite the worker's self-report). Memoised via `blt_results`, so the post measurement is free whenever the round committed nothing — measured, 182 of 224 rounds. `--subtask-tests off` yields `{}` and skips both. Each axis command is bounded by `caps["worker_timeout_sec"]` (5400 s default) — there is no tighter per-axis ceiling, so a hung command blocks the subtask for that long; previously the conformer's own worker timeout bounded it |
 | Worktree deps | `_ensure_worktree_deps(tree, st, caps, ...)`, called from inside `_measure_axes` | DESIGN §6½ *Who runs that install*. Applies the provision recipe's `install`/`build` entries on the FIRST axis actually measured for a worktree — not at worktree creation. Lazy on purpose: `_run_implementer:25018-25021` declines to pre-install because a config-only / docs-only subtask correctly skips it (44 of 91 subtasks in the motivating run touched zero source files), and an eager install would hand that cost back. A memo hit and an absent command both skip it, since neither needs deps. Memoised on the resolved absolute path in the module-level `_DEPS_INSTALLED` — a per-process filesystem fact, not run state. Non-fatal: a failed install surfaces as whatever the subsequent BLT command reports, which `_runner_missing` already classifies. Removes the repeat, not the install: 263 installs across 161 worker logs (~2.8 per worktree, since a subtask's implementer and conformer share one) become one |
@@ -5462,9 +5503,38 @@ resolved from the issue code per the table above, not from the check function.
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` | `judgment_check_rounds` (3) |
 | Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (3) |
-| Implementer | `check_implementer_output(result, subtask, actual_files, blt_commands)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) | **`UNMET_CRITERION` must not fire on a criterion the implementer was never responsible for**, and both halves of that contract live here rather than only in the prompt. `prompts/implementer.md` tells the worker that a criterion naming the build is a *conformance-phase* signal — the conformer runs the build, and a build inside a worker's turn budget can OOM the container and get it reaped mid-turn. With only `{criterion, met, evidence}` on the schema, an obedient implementer had no way to say so and every such report became a re-drive: measured, `bugfix-008` took 3 drives ($1.96) and `feat-003` took 3 ($3.00), one worker narrating the contradiction before being re-driven for it (docs/POSTMORTEM-2026-08-14.md, F3). So: the schema carries an optional `not_applicable` bool the worker sets, AND the check independently exempts any criterion quoting one of the repo's resolved build/lint/test commands via `_criterion_is_conformance_owned`. The second is the load-bearing half — prompts drift and workers forget, so the guarantee cannot rest on the worker's cooperation (DESIGN §12). The match is a plain substring test against resolved *config* values, not worker prose, so it is outside the *Language-to-JSON* regex prohibition; it is deliberately narrow, exempting only a criterion that literally quotes a command, and an empty command set exempts nothing. |
+| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED` (advisory — reported but excluded from the retry decision by `_gating_issues`), `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
 | Integrator | `check_integrator_output(result)` | — | `judgment_check_rounds` (3) |
 | Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
+
+**`UNMET_CRITERION` must not fire on a criterion the implementer was never
+responsible for.** `prompts/implementer.md` tells the worker that a criterion
+naming the build is a *conformance-phase* signal — the conformer runs the build,
+and a build inside a worker's turn budget can OOM the container and get it reaped
+mid-turn. With only `{criterion, met, evidence}` on the schema, an obedient
+implementer had no way to say so and every such report became a re-drive:
+measured, `bugfix-008` took 3 drives ($1.96) and `feat-003` took 3 ($3.00), one
+worker narrating the contradiction before being re-driven for it
+(docs/POSTMORTEM-2026-08-14.md, F3).
+
+`SCHEMAS["implementer"]`'s `criteria_results` items therefore carry an optional
+`not_applicable` bool, and `check_implementer_output` skips any criterion where
+it `is True` (identity, not truthiness) before testing `met`.
+
+**One channel, deliberately.** A second briefly existed —
+`_criterion_is_conformance_owned`, substring-matching the repo's resolved
+build/lint/test commands inside the criterion text — as a backstop for a worker
+that forgot the flag. It is deleted, along with `check_implementer_output`'s
+`blt_commands` parameter. `criterion` is planner-authored prose, and the
+*Language-to-JSON* rule forbids Python reading meaning out of prose; its
+prescribed remedy is that "the owning worker must surface it as a JSON field",
+which `not_applicable` is. The sentence that stood here — asserting the match was
+"against resolved *config* values, not worker prose" — was written to authorise
+the code rather than derived from the spec, and misdescribed which side was
+prose: the needle was config, the haystack was not. The residual risk is one
+re-drive when a worker omits the flag, which is the behaviour that predates all
+of this, so nothing regressed. The prompt states the requirement plainly instead.
+
 
 `check_production_evidence(result) -> list[str]` (DESIGN §9 *Evidence must be
 production-grounded*) reads the `production_evidence` object that
@@ -5496,7 +5566,7 @@ site matters disproportionately: it is the last gate before a run is declared
 done, and on run `fa979580` it certified four inert fixes with
 `solution_defects: []` at confidence 8.5.
 
-`check_symptom_evidence(result, sid) -> list[str]` (DESIGN §9 *A stale
+`check_symptom_evidence(result, sid, fixes_reported_symptom) -> list[str]` (DESIGN §9 *A stale
 finding is not a bug*) is its sibling for `bugfix-` subtasks, reading a
 `symptom_evidence` object of the same flat shape on the **implementer** schema
 only — the conformer neither wrote the fix nor has a base tree to reproduce
@@ -8132,6 +8202,43 @@ never carries `completed_waves`/`waves`):
   alone would still let a stray `finalize` push a partial branch (the
   PR-#22 incident).
 
+#### Prune verb (`leerie prune`)
+
+Reclaims state that nothing else reaps. Measured on one repo after three weeks:
+**1.5 GB** across 71 run directories and 23,158 repo-map-cache entries, plus 64
+stale `leerie/subtasks/*` branches left in the user's checkout — while
+`preflight()` already refuses to start a run on low disk headroom and tells the
+operator to prune by hand (docs/POSTMORTEM-2026-08-14.md, F22).
+
+Host-only (no container). `leerie prune [--older-than DAYS] [--apply]`;
+`--older-than` accepts both the space-separated and `=` forms and defaults to
+**14**. **Dry-run is the default** and `--apply` is required to delete anything:
+this removes directories that may hold the only record of a paid-for run, so the
+safe mode is the one you get without asking.
+
+Three categories, all subject to the age cutoff:
+
+- **terminal run directories** — only those whose `run.json` carries
+  `finished_at` or `killed_at`. A paused or in-flight run is resumable and
+  survives regardless of age.
+- **repo-map cache entries** under `<state-root>/repo-map-cache/` — regenerated
+  on demand.
+- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run
+  directory is absent from `<state-root>/runs/`. Scoped to that namespace, so a
+  user branch is never in scope.
+
+**Branch reaping fails closed.** The live-run set is populated only by the walk
+over `<state-root>/runs`, so without that directory it is empty and every
+`leerie/subtasks/*` ref reads as orphaned — `git branch -D` on all of them,
+force-deleting unmerged work belonging to runs that may be executing right now.
+Reached by a mistyped or unset `LEERIE_STATE_DIR`, a renamed state root, or a
+fresh install. A state root with no `runs/` therefore reaps **no** branches and
+logs why; run directories and cache entries are unaffected.
+
+`prune` is a launcher-only verb and appears in the `REWRITTEN_ARGS` guard arm,
+so a misplaced `leerie <task> prune` errors rather than reaching the
+orchestrator's argparse.
+
 #### Accept-blocked verb (`leerie accept-blocked`)
 
 When a subtask returns `status: blocked` due to unsatisfied `extent:
@@ -8713,7 +8820,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). Keys are subtask ids *or* the literal `_final` sentinel; values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. The `_final` entry holds the post-integration whole-tree conformer pass's output (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph); the leading-underscore convention guarantees no collision with subtask ids, which always start with a `<verb>-` prefix per `_ID_PREFIXES`. The per-subtask entries are populated only on subtasks whose implementer reached `status: "complete"`; the `_final` entry is populated whenever `_run_final_conformance` ran (skipped only when the staging worktree or `working_branch` is absent, or on `resume` after the pass already recorded a result). See DESIGN §9 *Post-work conformance* |
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). Key: `_blt_memo_key(axis, cmd, tree_sha)` = `sha256(axis \| cmd \| tree_sha)[:32]`, where `tree_sha` is `git rev-parse HEAD^{tree}` of the measured worktree — content-addressed, so an empty conformer commit, a rebase, or two worktrees that converge all hit. Value: the axis dict `{ran, measured, passed, command, summary}`. Deliberately carries **no** dependency fingerprint: lockfiles are tracked files and already inside `tree_sha`, and the provision recipe and image are constant within a run. An entry is written only when it describes a reproducible fact — never for a dirty worktree (`_worktree_tree_sha` returns None, meaning neither serve nor store, since `HEAD^{tree}` cannot see uncommitted changes and the conformance phase tolerates them), and never for a crash, a timeout, or a `measured: False` runner-missing result, mirroring `satisfied_probe_cache`'s refusal to cache a crashed probe. Exists because measuring an axis before and after a conformer round would otherwise double the cost: measured, 182 of 224 conformer rounds (81%) committed nothing, so the post-round tree is usually identical to the pre-round one. No eviction: the dict grows one entry per (axis, command, tree sha) for the life of the run, each carrying a ≤400-char summary — a 91-subtask run accumulates a few hundred (~100 KB), re-serialised on every `State.save()`. Bounded in practice by the number of distinct trees a run produces; if that ever stops holding, cap it rather than widening the key |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. Written beside the `conformance` entry, which also gains a `reviewed` bool. Recorded rather than promoted to a blocking status: the phase is advisory by design (DESIGN §9) and its measured yield when it does run is 3.3% (17 of 510 invocations across every run on one host), so an unreviewed subtask is usually fine — what it must not be is invisible. Measured 170 of 680 attempts (25%) produce no result; run `fa979580` shipped two such subtasks as `complete`. See DESIGN §9 *Post-work conformance* |
-| `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for `bugfix-` subtasks only (DESIGN §9 *A stale finding is not a bug*). Written on the success path beside `unreviewed_subtasks`, and cleared for a sid whose later attempt reports cleanly, so a re-driven subtask does not carry a stale entry. Persisted rather than left on the result because `phase_execute` keeps results in memory and writes only `blocked` reasons out of them — and `SYMPTOM_DID_NOT_REPRODUCE` ("this bugfix may be re-fixing something an earlier change already fixed") is precisely what belongs in the run record rather than in a 600 KB log. `phase_finalize` surfaces only that finding, not `NO_SYMPTOM_EVIDENCE`, which is worker hygiene and would fire on most runs until the field is adopted. |
+| `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists — 10 of 10 corpus findings under the old prefix scoping were false positives) (DESIGN §9 *A stale finding is not a bug*). Written on the success path beside `unreviewed_subtasks`, and cleared for a sid whose later attempt reports cleanly, so a re-driven subtask does not carry a stale entry. Persisted rather than left on the result because `phase_execute` keeps results in memory and writes only `blocked` reasons out of them — and `SYMPTOM_DID_NOT_REPRODUCE` ("this bugfix may be re-fixing something an earlier change already fixed") is precisely what belongs in the run record rather than in a 600 KB log. `phase_finalize` surfaces only that finding, not `NO_SYMPTOM_EVIDENCE`, which is worker hygiene and would fire on most runs until the field is adopted. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `_run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. Read by `_write_plan()` and persisted as the `preconditions` section of `plan.json`. Empty list when no planner declared any external requirement (the common case). |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. Two producers, distinguished by shape: `_filter_offtree_subtasks()` drops subtasks whose `files_likely_touched` resolved outside the run's repo root (value `{reasons: [str], files: [str]}`); `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) drops subtasks the `satisfied_probe` judged already met on the base tree (value `{reason: "already_satisfied", evidence: str, checked: [str]}`); and the post-execution no-commits re-probe in `_settle_subtask` records a subtask whose criteria are already met on the run-branch HEAD (value `{reason: "already_satisfied_mid_run", evidence: str, checked: [str]}` — same shape, judged against the run-branch HEAD instead of the base tree; DESIGN §8 *The mid-run sibling case*). The `mid_run` label names the moment the rescue fires (post-execution, this run), not the provenance: it covers both a sibling committing the deliverable this run and a subtask already satisfied on the base tree (DESIGN §8 *Scope*). A fourth producer, `_settle_subtask`'s **pre-spawn** probe of a `provider_subset_sids`-flagged subtask, records the same shape with `reason: "already_satisfied_pre_spawn"` (DESIGN §8 *Probing a flagged subtask before it spends*) — same verdict as the mid-run rescue, reached before any implementer ran, and kept distinct so the audit shows which settlements cost a probe and which cost a worker first. Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
@@ -9069,7 +9176,7 @@ post-run operation performed by the judge and heal skills.
 | `user_content` | str | the user-turn content passed to the worker |
 | `response_content` | str | the worker's raw text response (before schema parsing) |
 | `parsed_ok` | bool | whether `structured_output` was present and schema-valid |
-| `input_tokens` | int | `usage.input_tokens` from the CLI envelope |
+| `input_tokens` | int | TOTAL input for the call via `_usage_input_tokens(usage)` — `input_tokens` **plus** `cache_creation_input_tokens` **plus** `cache_read_input_tokens`. The API's `input_tokens` counts only the uncached remainder, and every leerie worker runs with prompt caching, so reading it alone understated run weights by orders of magnitude (docs/POSTMORTEM-2026-08-14.md, F21) |
 | `output_tokens` | int | `usage.output_tokens` from the CLI envelope |
 | `latency_ms` | int | wall-clock milliseconds from subprocess start to return |
 | `success` | bool | whether the call produced a schema-valid result (false on WorkerError or schema retry exhaustion) |

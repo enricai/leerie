@@ -30,7 +30,8 @@ from pathlib import Path
 
 import pytest
 
-_ORCH = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_ORCH = REPO_ROOT / "orchestrator" / "leerie.py"
 
 # Every abbreviation CATEGORY_ABBREV can put in front of a subtask id.
 _DOMAINS = ("feat|bugfix|refactor|perf|test|deps|config|infra|docs")
@@ -170,3 +171,36 @@ def test_sid_domain_map_is_invariant_under_a_merge(leerie):
 def test_sid_domain_map_tolerates_degenerate_plans(leerie, bad_plan):
     """It feeds advisory checks, so it must never raise on a malformed plan."""
     assert isinstance(leerie._sid_domain_map([bad_plan]), dict)
+
+
+def test_the_planner_prompt_asks_for_the_declaration():
+    """The advisory half of the §12 split.
+
+    `check_symptom_evidence` is scoped entirely by `fixes_reported_symptom`,
+    which only a planner can set. Code honours the field; the PROMPT is the
+    only thing that gets it filled in. Drop that instruction and the check goes
+    silently inert on every run, with no test failing and no log line — the
+    same class as `artifact_paths`, where a pathless collision silently
+    disabled a check for months.
+    """
+    src = (REPO_ROOT / "prompts" / "planner.md").read_text()
+    assert "fixes_reported_symptom" in src, (
+        "the planner must be told to set this; nothing else can")
+    assert "Do not infer this from the subtask id" in src, (
+        "the instruction must also say the id is not evidence — re-homed ids "
+        "are what produced 10 of 10 false positives under the old scoping")
+
+
+def test_the_implementer_prompt_reads_the_same_field():
+    """The implementer's reproduce-the-symptom step keys on the same
+    declaration, and the field reaches it: `_write_plan` passes the whole
+    subtask dict through to `subtasks/<sid>.json`."""
+    src = (REPO_ROOT / "prompts" / "implementer.md").read_text()
+    assert "fixes_reported_symptom" in src
+
+
+def test_the_field_is_on_the_subtask_schema(leerie):
+    """Without this the planner cannot emit it however hard the prompt asks."""
+    props = (leerie.SCHEMAS["planner"]["properties"]["subtasks"]["items"]
+             ["properties"])
+    assert props["fixes_reported_symptom"]["type"] == "boolean"

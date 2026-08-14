@@ -1888,6 +1888,39 @@ deferred — once `orchestrator.pid` is no longer authoritative,
 the launcher's `decide_teardown` arms can no longer be misrouted
 by the stale-pid path.
 
+### One task, one run
+
+The flock above makes a *run directory* single-owner. It says nothing about two
+runs working the same **task**, because `run_id` is the container id — two
+launches of byte-identical task text are, to each other, invisible.
+
+Measured: one brief ran twice three minutes apart, for **$72.21** across 173
+worker calls, and produced two architecturally incompatible branches — one
+dynamic test route against two static ones, no persistence against a Prisma
+migration — with 14 files in collision and two PRs whose merge order decides
+which design survives. Neither run was wrong. Nothing told either one that the
+other existed (docs/POSTMORTEM-2026-08-14.md, F10).
+
+So a run records a fingerprint of its task text (`task_sha256` on `run.json`)
+and, before spawning its first worker, refuses to start when another **live**
+run carries the same one. "Live" means started and not finished, killed or
+paused: a completed run sharing a fingerprint is an ordinary re-run and says
+nothing. The check is deliberately placed at the last cheap moment — after
+state exists, before any spend — and the refusal names the other run and the
+two commands that resolve it (`leerie attach`, `leerie kill`).
+
+Running the same brief twice on purpose is a real thing to want, so there is an
+escape hatch, `LEERIE_ALLOW_DUPLICATE_TASK`. It is an environment variable
+rather than a CLI flag because it should be *stated* rather than discovered
+mid-argument-list, and with it set the duplicate is still announced — the run
+proceeds, it is not silenced.
+
+Fingerprinting the text rather than the resolved plan is the conservative
+choice in both directions: two different briefs that would produce the same
+plan are not caught (they are also not obviously wrong to run together), and
+two identical briefs are caught before the planner has been paid for.
+
+
 ### Why merge, not cherry-pick
 
 Subtask branches are integrated into the run branch by merging, not by cherry-picking.
@@ -6873,10 +6906,9 @@ judgment into the workers, which adjudicated it in prose: measured across a
 run corpus, **37 worker calls** reasoned about `OS can't spawn worker
 thread: Resource temporarily unavailable (os error 11)` and decided for
 themselves that it was environmental. §12 says that decision belongs in
-code (docs/POSTMORTEM-2026-08-14.md, F5). A
+code (docs/POSTMORTEM-2026-08-14.md, F5).
 
-
-RED base is surfaced **loudly** (a `log()` warning plus a
+A RED base is surfaced **loudly** (a `log()` warning plus a
 `run.json.health.base_suite` record) rather than silently absorbed,
 because it usually means *leerie could not make this repo green before
 starting* — the operator's signal to suspect provisioning, memory

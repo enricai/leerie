@@ -11,19 +11,27 @@ and re-drove the worker. With only `{criterion, met, evidence}` on the schema,
 ($1.96) and `feat-003` took 3 ($3.00), one worker narrating the contradiction
 verbatim before being re-driven for it.
 
-Two channels close it, and the second is the load-bearing one: the worker can
-say so (`not_applicable`), and the check independently exempts a criterion that
-quotes one of the repo's resolved build/lint/test commands. Prompts drift and
-workers forget, so the guarantee cannot rest on the worker's cooperation
-(DESIGN §12).
+The schema gained a third state, `not_applicable`, and the check honours it.
+
+**One channel, deliberately.** A second briefly existed: substring-matching the
+repo's resolved build/lint/test commands inside the criterion text, as a
+backstop for a worker that forgot the flag. It was deleted. `criterion` is
+planner-authored prose, and CLAUDE.md's *Language-to-JSON* rule forbids Python
+reading meaning out of prose — prescribing instead that "the owning worker must
+surface it as a JSON field", which is what `not_applicable` is. The residual
+risk is one re-drive when a worker omits the flag: the behaviour before any of
+this existed, so not a regression.
 
 See docs/POSTMORTEM-2026-08-14.md, F3.
 """
 from __future__ import annotations
 
+import inspect
+from pathlib import Path
+
 import pytest
 
-_BLT = ("pnpm run build", "pnpm run lint", "pnpm test")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _result(**over):
@@ -40,119 +48,91 @@ def _subtask():
     return {"id": "feat-001", "files_likely_touched": []}
 
 
-def _unmet(leerie, result, blt=_BLT):
-    issues = leerie.check_implementer_output(
-        result, _subtask(), set(), blt_commands=blt)
+def _unmet(leerie, result):
+    issues = leerie.check_implementer_output(result, _subtask(), set())
     return [i for i in issues if i.startswith("UNMET_CRITERION")]
 
 
-def test_the_incident_shape_no_longer_re_drives(leerie):
-    """The exact report the prompt asks for, with no flag set.
-
-    This is the shape that cost 6 implementer drives across two subtasks.
-    """
-    res = _result(criteria_results=[{
+def test_the_declared_flag_exempts(leerie):
+    """The incident shape, reported the way the prompt now asks for it."""
+    assert not _unmet(leerie, _result(criteria_results=[{
         "criterion": "`pnpm run build` passes",
         "met": False,
-        "evidence": "not run — conformance phase owns this",
-    }])
-    assert _unmet(leerie, res) == []
-
-
-def test_the_explicit_flag_also_exempts(leerie):
-    """The channel the schema previously lacked, for a paraphrased criterion.
-
-    The command-matching half cannot see a criterion that describes the command
-    instead of quoting it, which is why the worker-set flag still matters.
-    """
-    res = _result(criteria_results=[{
-        "criterion": "the production build completes without type errors",
-        "met": False,
         "not_applicable": True,
-        "evidence": "conformance phase owns this",
-    }])
-    assert _unmet(leerie, res) == []
+        "evidence": "not run — conformance phase owns this",
+    }]))
 
 
 def test_a_genuinely_unmet_criterion_still_fires(leerie):
-    """Anti-vacuity: the check must not be disabled wholesale."""
-    res = _result(criteria_results=[{
-        "criterion": "the /volumes endpoint returns 201 on success",
+    """Anti-vacuity: the exemption must not swallow real failures."""
+    assert _unmet(leerie, _result(criteria_results=[{
+        "criterion": "the endpoint returns 201 on success",
         "met": False,
-        "evidence": "not implemented yet",
-    }])
-    assert len(_unmet(leerie, res)) == 1
+        "evidence": "not implemented",
+    }]))
 
 
-def test_a_paraphrase_without_the_flag_still_fires(leerie):
-    """The command match is deliberately narrow, and that is a trade-off.
+def test_a_build_criterion_without_the_flag_still_fires(leerie):
+    """The deliberate cost of deleting the prose fallback, pinned rather than
+    left as a surprise.
 
-    Exempting anything that merely *sounds* build-related would swallow real
-    unmet criteria. A worker that neither quotes the command nor sets the flag
-    is still re-driven — which is why the prompt asks for the flag.
+    A worker that names the build but omits `not_applicable` IS re-driven. That
+    was the behaviour before this work, the flag is what fixes it, and the
+    alternative — inferring the exemption from the criterion's wording — is a
+    *Language-to-JSON* violation that no amount of convenience justifies.
     """
-    res = _result(criteria_results=[{
-        "criterion": "the project builds cleanly",
+    assert _unmet(leerie, _result(criteria_results=[{
+        "criterion": "`pnpm run build` passes",
         "met": False,
-        "evidence": "not run — conformance owns it",
-    }])
-    assert len(_unmet(leerie, res)) == 1
-
-
-@pytest.mark.parametrize("criterion", [
-    "`pnpm run build` passes",
-    "pnpm run lint reports no errors",
-    "pnpm test is green for the touched files",
-])
-def test_each_resolved_command_is_exempt(leerie, criterion):
-    res = _result(criteria_results=[
-        {"criterion": criterion, "met": False, "evidence": "conformance owns"}])
-    assert _unmet(leerie, res) == []
-
-
-def test_no_blt_surface_exempts_nothing(leerie):
-    """Degrade to the previous behaviour, not to a permissive one."""
-    res = _result(criteria_results=[{
-        "criterion": "`pnpm run build` passes", "met": False, "evidence": "x"}])
-    assert len(_unmet(leerie, res, blt=())) == 1
+        "evidence": "not run — conformance phase owns this",
+    }]))
 
 
 def test_met_true_is_never_flagged(leerie):
-    res = _result(criteria_results=[{
-        "criterion": "`pnpm run build` passes", "met": True, "evidence": "ran"}])
-    assert _unmet(leerie, res) == []
+    assert not _unmet(leerie, _result(criteria_results=[{
+        "criterion": "`pnpm run build` passes", "met": True, "evidence": "ran"}]))
 
 
-class TestCriterionPredicate:
-    def test_matches_case_insensitively(self, leerie):
-        assert leerie._criterion_is_conformance_owned(
-            "`PNPM RUN BUILD` passes", _BLT) is True
+@pytest.mark.parametrize("flag", [False, None, "yes", 1])
+def test_only_a_real_true_exempts(leerie, flag):
+    """`is True`, not truthiness: a worker returning the string "yes" or a
+    stray `1` has not made the declaration the schema asks for."""
+    cr = {"criterion": "x", "met": False, "evidence": "e"}
+    if flag is not None:
+        cr["not_applicable"] = flag
+    assert _unmet(leerie, _result(criteria_results=[cr]))
 
-    def test_unrelated_criterion_is_not_exempt(self, leerie):
-        assert leerie._criterion_is_conformance_owned(
-            "the endpoint builds a valid payload", _BLT) is False
 
-    @pytest.mark.parametrize("bad", [None, ""])
-    def test_missing_criterion_is_not_exempt(self, leerie, bad):
-        assert leerie._criterion_is_conformance_owned(bad, _BLT) is False
+class TestTheProseFallbackIsGone:
+    """Absence pins. A deleted inference that quietly returns is worse than one
+    that was never written, because the docs now say it does not exist."""
 
-    def test_empty_command_set_is_not_exempt(self, leerie):
-        assert leerie._criterion_is_conformance_owned(
-            "`pnpm run build` passes", ()) is False
+    def test_the_predicate_no_longer_exists(self, leerie):
+        assert not hasattr(leerie, "_criterion_is_conformance_owned")
+
+    def test_the_check_takes_no_command_list(self, leerie):
+        params = inspect.signature(leerie.check_implementer_output).parameters
+        assert "blt_commands" not in params, (
+            "the parameter fed the deleted prose match; leaving it accepts an "
+            "argument nothing reads")
+
+    def test_no_caller_still_passes_one(self, leerie):
+        src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
+        code = "\n".join(l for l in src.splitlines()
+                         if not l.lstrip().startswith("#"))
+        assert "blt_commands" not in code
 
 
 def test_schema_carries_the_third_state(leerie):
     props = (leerie.SCHEMAS["implementer"]["properties"]["criteria_results"]
              ["items"]["properties"])
-    assert "not_applicable" in props
     assert props["not_applicable"]["type"] == "boolean"
 
 
 def test_the_prompt_asks_for_the_flag(leerie):
-    """The two halves of one contract must not drift apart again."""
-    from pathlib import Path
-    prompt = (Path(__file__).resolve().parent.parent
-              / "prompts" / "implementer.md").read_text()
-    assert "not_applicable" in prompt, (
-        "the prompt tells the implementer to record a conformance-owned "
-        "criterion; it must name the field that makes that reportable")
+    """The advisory half of the §12 split: code honours the field, the prompt
+    is what gets it filled in. With the fallback gone this is the ONLY way a
+    build criterion is exempted, so a prompt that stops asking silently
+    reinstates the re-drive loop."""
+    src = (REPO_ROOT / "prompts" / "implementer.md").read_text()
+    assert "not_applicable" in src

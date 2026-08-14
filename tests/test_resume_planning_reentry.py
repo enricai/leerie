@@ -125,6 +125,18 @@ def _stub_common(leerie, monkeypatch, calls: dict):
         lambda args, st, leerie_dir: calls.__setitem__(
             "_absorb_supplied_answers", calls.get("_absorb_supplied_answers", 0) + 1))
 
+    async def _preflight(*a, **kw):
+        calls["_preflight_repo"] = calls.get("_preflight_repo", 0) + 1
+
+    # The never-started demotion runs the repo preflight, because that path is
+    # a fresh START and `main()`'s `if not args.resume:` gate was passed long
+    # before the demotion happens. Stubbed here because `_preflight_repo`
+    # inspects the PROCESS cwd — the leerie checkout — so on any working tree
+    # with uncommitted changes it dies, which says nothing about resume
+    # re-entry. That it is called at all is pinned in
+    # tests/test_irreversible_before_valid.py, which owns that contract.
+    monkeypatch.setattr(leerie, "_preflight_repo", _preflight)
+
     async def _backstop(*a, **kw):
         calls["_backstop_capture_prior_runs"] = calls.get(
             "_backstop_capture_prior_runs", 0) + 1
@@ -755,6 +767,12 @@ def test_no_progress_but_a_recorded_task_restarts_rather_than_dying(
             args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
     assert calls.get("phase_classify"), (
         "a run with a recorded task and no progress must START, not die")
+    assert calls.get("_preflight_repo"), (
+        "this is a fresh START, so it must get the repo preflight — "
+        "`main()` skipped it on the strength of `args.resume`, which the "
+        "demotion has since flipped. Without this the run proceeds with no "
+        "git-identity, dirty-tree or branch-collision check, where every "
+        "other fresh run gets all three")
 
 
 def test_genuinely_no_progress_and_no_task_still_dies(

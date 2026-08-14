@@ -15,7 +15,7 @@ because the wrong versions are the ones a reader is most likely to re-invent.
 ## Corpus
 
 Thirteen launches, eight of them concurrent against a single checkout.
-Eight substantive runs: **$226.33, ~2.8 h elapsed** (16.4 h of run wall-clock
+Eight substantive runs: **$226.34, ~2.8 h elapsed** (16.4 h of run wall-clock
 summed across runs that overlapped).
 
 | run | task | end phase | exit | calls | cost |
@@ -125,8 +125,17 @@ the contradiction verbatim before being re-driven for it. → **R7**
 The expand/dismiss/repair handlers each early-out on `kind != "missing_requires"`,
 and `_filter_provably_false_wiring_defects` is scoped to `broken_by_*`. Census
 across all runs: **57 defects — 44 `missing_requires`, 6 `broken_by_drop`, 4
-`broken_by_merge`, 3 `missing_provides`**, so **13 (23%) were in the die()-only
-class**. This killed `3bc46e7d` — $20.32, 71 workers, 38 minutes, no branch, no
+`broken_by_merge`, 3 `missing_provides`**.
+
+**Corrected 2026-08-14** (this draft first said "13 (23%) were in the die()-only
+class", and the commit that fixed the code repeated it). By this section's own
+definition the die()-only class is the kinds that matched NO predicate anywhere:
+`_filter_provably_false_wiring_defects` was scoped to `broken_by_*`, so the 6
+`broken_by_drop` and 4 `broken_by_merge` were dismissible and only
+`missing_provides` and `orphaned_dependent` were not. That is **3 of 57
+(5.3%)**, not 13. The 13 counts every kind outside `missing_requires`, which is
+the repair channel's scope, not the dismissal channel's. The heading's "four of
+five kinds" refers to the *repair* handlers and is correct as written. This killed `3bc46e7d` — $20.32, 71 workers, 38 minutes, no branch, no
 `plan.json` — over an edge test-009 **had already declared**; the idempotence
 guard sat *after* the kind dispatch and was structurally unreachable. The `die()`
 named three causes, none of which applied, and prescribed editing a `plan.json`

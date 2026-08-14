@@ -294,6 +294,19 @@ tests/                      pytest suite
 # after full planning + implementation spend:
 ./leerie accept-integration <run-id> <subtask-id>
 
+# Reclaim disk. Nothing reaps run state automatically, while preflight refuses
+# to start a run on low headroom (measured: 1.5 GB, 71 run dirs, 23,158 cache
+# entries, 64 stale leerie/subtasks/* branches after three weeks on one repo).
+# Dry-run by DEFAULT — this deletes directories that may hold the only record
+# of a paid-for run. Removes terminal run dirs (finished_at/killed_at only —
+# a paused or in-flight run survives regardless of age), repo-map cache
+# entries, and orphaned leerie/subtasks/<run-id>/* branches. Host-only.
+# Branch reaping FAILS CLOSED: a state root with no runs/ cannot say which
+# runs are live, so it reaps no branches at all.
+./leerie prune                        # show what would go
+./leerie prune --apply
+./leerie prune --older-than 30 --apply   # default cutoff is 14 days
+
 # Generate .leerie/config.toml with auto-detected BLT commands (host-only, no container):
 ./leerie config --init
 
@@ -461,6 +474,15 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # Positive integer seconds; same precedence: CLI > env > leerie.toml.
 export LEERIE_WORKER_TIMEOUT=9000
 ./leerie "task" --worker-timeout 9000
+
+# Allow a second run on task text a live run is already working. leerie
+# fingerprints the task (`task_sha256` in run.json) and refuses to start when
+# another started-and-unfinished run carries the same one — measured, one brief
+# ran twice for $72.21 and produced two incompatible branches with 14 files in
+# collision. A finished run sharing the text is an ordinary re-run and never
+# blocks. With the hatch set the duplicate still gets announced:
+export LEERIE_ALLOW_DUPLICATE_TASK=1
+./leerie "task"
 
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
