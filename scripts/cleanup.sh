@@ -25,6 +25,9 @@
 #     (most recent without finished_at), prompts y/N, cleans only that run.
 set -euo pipefail
 
+# shellcheck source=scripts/worktree-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+
 # Honor LEERIE_STATE_DIR — matches setup-run.sh:25 and finalize.sh.
 # Without this, in-container invocations (LEERIE_STATE_DIR=/leerie-state)
 # silently scan /work/.leerie/runs/ instead of /leerie-state/runs/,
@@ -71,7 +74,12 @@ clean_one_run() {
     # something stayed behind (rmdir refuses non-empty).
     rmdir "${run_dir}/worktrees" 2>/dev/null || true
   fi
-  git worktree prune
+  # Scoped prune: leerie's OWN registrations only. A bare
+  # `git worktree prune` is repository-global with no grace period, so
+  # inside a container sharing the host's .git it destroys host-side
+  # worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
+  # docs/POSTMORTEM-2026-08-14.md, F19).
+  prune_leerie_worktrees "${LEERIE_ROOT}"
 
   # Per-run branches live under two disjoint namespaces:
   #   leerie/runs/<run-id>           (the run branch itself)

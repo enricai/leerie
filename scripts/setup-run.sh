@@ -21,6 +21,9 @@
 # integration buffer") for the loose-ref-store collision being avoided.
 set -euo pipefail
 
+# shellcheck source=scripts/worktree-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+
 RUN_ID="${1:?usage: setup-run.sh <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
@@ -87,7 +90,12 @@ if ! git worktree list --porcelain | grep -qxF "worktree $STAGING_WT" && [ -d "$
 fi
 # Clear stale admin entries whose directory is gone, so the reuse check below
 # sees post-cleanup truth.
-git worktree prune
+# Scoped prune: leerie's OWN registrations only. A bare
+# `git worktree prune` is repository-global with no grace period, so
+# inside a container sharing the host's .git it destroys host-side
+# worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
+# docs/POSTMORTEM-2026-08-14.md, F19).
+prune_leerie_worktrees "${LEERIE_ROOT}"
 
 # Add the run-branch worktree if it is not already present. The check must use
 # -xF (fixed-string, whole-line): the old `grep -q "worktree .*/${STAGING_WT}$"`

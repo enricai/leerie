@@ -13,6 +13,9 @@
 # other in git's loose ref store (see DESIGN.md §3).
 set -euo pipefail
 
+# shellcheck source=scripts/worktree-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
+
 ID="${1:?usage: new-worktree.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: new-worktree.sh <subtask-id> <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
@@ -61,7 +64,12 @@ flock 200
 # "fatal: '<path>' already exists" — the wave then refused to close with 25 of
 # 26 subtasks complete. Under `--max-parallel` a *sibling's* concurrent prune
 # can drop a live registration the same way, which is the likelier trigger.
-git worktree prune
+# Scoped prune: leerie's OWN registrations only. A bare
+# `git worktree prune` is repository-global with no grace period, so
+# inside a container sharing the host's .git it destroys host-side
+# worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
+# docs/POSTMORTEM-2026-08-14.md, F19).
+prune_leerie_worktrees "${LEERIE_ROOT}"
 
 # Drop an orphaned worktree directory that git no longer knows about.
 # `_cleanup_on_abnormal_exit` deregisters and removes worktrees, but a
@@ -156,7 +164,12 @@ _add_with_repair() {
       && [ -d "$WT" ]; then
     rm -rf "$WT"
   fi
-  git worktree prune
+  # Scoped prune: leerie's OWN registrations only. A bare
+  # `git worktree prune` is repository-global with no grace period, so
+  # inside a container sharing the host's .git it destroys host-side
+  # worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
+  # docs/POSTMORTEM-2026-08-14.md, F19).
+  prune_leerie_worktrees "${LEERIE_ROOT}"
   if err="$(_create_worktree 2>&1)"; then
     return 0
   fi

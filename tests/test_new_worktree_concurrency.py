@@ -114,6 +114,15 @@ def _instrumented_script(tmp_path: Path, name: str, log: Path,
     script = tmp_path / name
     script.write_text(text)
     script.chmod(0o755)
+    # The script sources scripts/worktree-lib.sh relative to its own location,
+    # so a harness that COPIES the script must copy that dependency too --
+    # otherwise the copy dies on `prune_leerie_worktrees: command not found`
+    # and the instrumentation log stays empty, which surfaces as the
+    # deliberately-loud "harness bug: no instrumentation events recorded".
+    lib = tmp_path / "worktree-lib.sh"
+    if not lib.exists():
+        lib.write_text((REPO_ROOT / "scripts" / "worktree-lib.sh").read_text())
+        lib.chmod(0o755)
     return script
 
 

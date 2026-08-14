@@ -230,8 +230,12 @@ def test_prune_precedes_the_orphan_guard_in_source(tmp_path: Path) -> None:
            / "scripts" / "new-worktree.sh").read_text()
     code = "\n".join(l for l in src.splitlines()
                      if not l.strip().startswith("#"))
-    assert code.index("git worktree prune") < code.index('rm -rf "$WT"'), (
-        "`git worktree prune` must precede the orphan-directory removal — "
+    # The prune is now scoped to leerie's own registrations
+    # (prune_leerie_worktrees), because a repository-global prune destroys
+    # host-side worktrees the container cannot see. The ORDERING invariant this
+    # test pins is unchanged.
+    assert code.index("prune_leerie_worktrees") < code.index('rm -rf "$WT"'), (
+        "the prune must precede the orphan-directory removal — "
         "prune is what creates the orphan the removal repairs")
     assert code.index('rm -rf "$WT"') < code.index("git worktree add"), (
         "the orphan removal must precede `worktree add`")
