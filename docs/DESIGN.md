@@ -6636,6 +6636,21 @@ one, a *newly* introduced one, or a failure on an axis that was **green** at
 baseline all continue the loop exactly as before — those are regressions this
 change must stay able to see.
 
+**An axis that could not be measured is a third state, and it is not clean.**
+The baseline already distinguishes it: an axis whose command never produced a
+verdict is recorded `measured: False` and excluded from `red_axes`, because
+"could not measure" is not "RED". But that distinction was defined only for the
+*baseline*, and every later measurement can hit the same condition — a command
+whose runner is missing on this tree, or one the container's resource limits
+killed before it could report. When it does, the loop predicate must treat it as
+unresolved rather than silently clean: no evidence is not evidence of green.
+Reading the axis as clean is how a run shipped a PR whose entire test axis never
+ran, because the axis was also in `red_axes` from the baseline and the
+exclusion swallowed a *second*, different unmeasurability
+(docs/POSTMORTEM-2026-08-14.md, F6). This is rare by construction — measured, 1
+of 46 final axes that ran — so treating it as unresolved costs almost nothing
+and buys the guarantee that a green verdict means something was actually run.
+
 This is the same principle as the baseline itself (*Base-tree health baseline*
 below), applied one layer down. The baseline was already being handed to the
 *worker* as prose in a `BASELINE:` block, asking it to scope its judgment to the
@@ -6818,7 +6833,23 @@ staging worktree — unmodified at this point — is the earliest tree
 where an accurate baseline can be taken. The verdict is **exit-code
 based** (a non-zero exit is RED, zero is GREEN): this is 100% reliable
 and needs no per-framework output parsing, which is deliberate — the
-suite's own summary format varies by tool and cannot be relied on. A
+suite's own summary format varies by tool and cannot be relied on.
+
+The one thing an exit code cannot distinguish is *the command never got to
+run*, so that case is classified separately and recorded `measured: False`.
+It has two causes and both must be covered, because leerie owns the
+environment in which the command runs and is therefore the author of both:
+the runner is absent from this tree (the recipe's install failed, so the
+test binary is missing), **or** the container's own limits killed it — a
+build that cannot spawn a worker thread against `pids.max` reports failure
+without having measured anything. Leaving the second uncovered pushed the
+judgment into the workers, which adjudicated it in prose: measured across a
+run corpus, **37 worker calls** reasoned about `OS can't spawn worker
+thread: Resource temporarily unavailable (os error 11)` and decided for
+themselves that it was environmental. §12 says that decision belongs in
+code (docs/POSTMORTEM-2026-08-14.md, F5). A
+
+
 RED base is surfaced **loudly** (a `log()` warning plus a
 `run.json.health.base_suite` record) rather than silently absorbed,
 because it usually means *leerie could not make this repo green before

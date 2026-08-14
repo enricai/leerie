@@ -26765,6 +26765,17 @@ def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
         return False
     for axis in ("build", "lint", "tests"):
         a = conf_res.get(axis) or {}
+        # An axis that RAN but could not be MEASURED is a third state, and it
+        # is not clean. No evidence is not evidence of green, and the
+        # baseline-red exclusion below must not swallow it: a run shipped a PR
+        # whose entire test axis never executed (its command did not exist on
+        # that tree) because `tests` was independently in `red` from the
+        # baseline, so this predicate returned clean without ever looking at
+        # `measured` (docs/POSTMORTEM-2026-08-14.md, F6). Checked BEFORE the
+        # red-axis exclusion for exactly that reason. Rare by construction —
+        # measured, 1 of 46 final axes that ran — so this blocks almost never.
+        if a.get("ran") and not a.get("measured"):
+            return False
         if a.get("ran") and not a.get("passed") and axis not in red:
             return False
     return True
@@ -27445,16 +27456,23 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
             ["bash", "-c", cmd], cwd=str(tree), timeout=timeout,
             log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
             verbosity=verbosity)
-        summary = (tail or "").strip()[-400:]
-        if rc != 0 and _runner_missing(summary):
-            # The command didn't run — its runner isn't on PATH (e.g.
-            # the recipe's `pip install` failed, so pytest is absent).
-            # This is "could not measure," NOT "RED": recording it as
-            # red-with-`command not found` gives the conformer a
-            # useless delta and provokes it to re-derive the baseline
-            # destructively (git stash / checkout <base> -- .). Mark it
-            # unmeasurable so red-axis logic and the conformer prompt
-            # both skip it.
+        full = (tail or "").strip()
+        summary = full[-400:]
+        # Classification reads the FULL output; only the display summary is
+        # truncated. A resource kill can be reported well before the last 400
+        # characters — a build that dies spawning a thread still prints its
+        # own epilogue afterwards — so classifying on `summary` would miss it
+        # exactly when the output is long.
+        if rc != 0 and _axis_unmeasurable(full):
+            # The command didn't produce a verdict. Two causes, and leerie
+            # authored the environment for both: its runner isn't on PATH
+            # (the recipe's `pip install` failed, so pytest is absent), or
+            # the container's own limits killed it before it could measure
+            # anything. This is "could not measure," NOT "RED": recording it
+            # as red gives the conformer a useless delta and provokes it to
+            # re-derive the baseline destructively (git stash / checkout
+            # <base> -- .). Mark it unmeasurable so red-axis logic and the
+            # conformer prompt both skip it.
             return {"ran": True, "measured": False, "passed": None,
                     "command": cmd, "summary": summary}
         return {
@@ -27587,6 +27605,33 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         st.save()
 
     return results
+
+
+def _axis_unmeasurable(output: str) -> bool:
+    """True when a failed BLT command produced no verdict at all.
+
+    The single predicate for "could not measure", as distinct from "measured
+    and RED". An exit code cannot tell those apart, and both of its causes are
+    authored by leerie's own environment rather than by the diff:
+
+      * the runner is absent from this tree (`_runner_missing`);
+      * the container's limits killed the command (`_is_fork_exhaustion`) — a
+        build that cannot spawn a worker thread against `pids.max` exits
+        non-zero having measured nothing.
+
+    The second was previously left to the workers, which adjudicated it in
+    prose: measured across a run corpus, 37 worker calls reasoned about
+    `OS can't spawn worker thread: Resource temporarily unavailable (os error
+    11)` and each decided for itself that it was environmental. DESIGN §12 puts
+    that decision in code (docs/POSTMORTEM-2026-08-14.md, F5).
+
+    Note what this deliberately does NOT catch. A vitest pool reporting
+    `Worker forks emitted error` / `Worker exited unexpectedly`, or a Next.js
+    build worker exiting on SIGABRT, are downstream symptoms of a genuine
+    out-of-memory in the repo's own code — a real red result that must stay
+    red. The distinction is not cosmetic: reading those as unmeasurable would
+    hide exactly the failures the baseline exists to surface."""
+    return _runner_missing(output) or _is_fork_exhaustion(output)
 
 
 def _runner_missing(summary: str) -> bool:

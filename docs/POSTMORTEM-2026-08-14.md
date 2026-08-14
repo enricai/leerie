@@ -140,9 +140,17 @@ temporarily unavailable (os error 11)` during builds, and in every case the
 *worker* decides it is environmental (*"a container thread-limit resource issue
 unrelated to the diff"*) — a judgment DESIGN §12 says must be code.
 `_is_fork_exhaustion` exists but is consulted only in a stream relabel, never on
-BLT output, and its marker list contains none of these signatures. The only
-"could not measure" classifier for a BLT axis recognises two strings.
+BLT output. The only "could not measure" classifier for a BLT axis is
+`_runner_missing`, which recognises two strings, neither of them this one.
 **Not** the cause of any red base in this corpus (see ⛔R3). → **R5**
+
+*Corrected while fixing this (2026-08-14): an earlier draft of this finding
+claimed `_FORK_EAGAIN_MARKERS` "contains none of these signatures". It does
+contain one — `resource temporarily unavailable` — and `_is_fork_exhaustion`
+therefore already matches `os error 11` correctly, as does its non-matching of
+the vitest/Next OOM signatures per ⛔R3. The marker list needed no change; the
+whole gap was that nothing consulted the detector on BLT output. Verified by
+running both predicates against all five real signatures.*
 
 ### F6 — a later unmeasurable axis has no equivalent of `measured`
 `673a6dc6` merged PR #204 with `tests: {ran: True, measured: False, passed: None,
