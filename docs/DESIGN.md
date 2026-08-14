@@ -5889,6 +5889,32 @@ has no commits to make either way. The mid-run *sibling* case is the one that
 motivated the fix; the base-satisfied case is the same code path with the same
 correct outcome.
 
+**Probing a flagged subtask before it spends.** The rescue above is correct
+but its *ordering* is wasteful. The redundancy it settles is, for a whole class
+of subtasks, predictable one phase earlier: `_warn_provider_subset_subtasks`
+(§5 *Provider-subset subtasks*) already flags, at plan time, every subtask
+whose entire `files_likely_touched` surface belongs to an ordered predecessor.
+That advisory was *right and inert* — measured across the corpus, all three of
+one run's flagged subtasks ran a full implementer and committed nothing, and
+twelve subtasks corpus-wide reached this rescue only after their whole spend.
+
+So the flagged sids are persisted (`provider_subset_sids`) and `_settle_subtask`
+runs the **same** HEAD probe against the staging worktree *before* spawning the
+implementer. Staging sits at the run-branch HEAD, and a provider-subset
+predecessor is by construction in an earlier wave and therefore already merged
+there, so the reference is exactly the one the post-hoc rescue would use. A hit
+settles the subtask on one read-only probe instead of a full implementer — that
+run's three cost ≈18 worker-minutes and ≈$2.6 between them. A miss costs one
+probe and the subtask proceeds untouched.
+
+This deliberately does **not** become a drop. The plan-time signal alone stays
+advisory for the reason it always was — a subtask may make a genuinely distinct
+edit to a shared file — and the decision is still the probe's, judged against a
+real tree. What changes is only *when* the probe is asked. The post-execution
+rescue is unchanged and remains the backstop for every subtask the plan-time
+flag does not cover (the transitive case it deliberately excludes, and any
+sibling overlap the file surfaces never predicted).
+
 **The sibling-invalidation case (why a pre-schedule drop must weigh
 survivors).** The two sibling cases above both concern a sibling that
 *satisfies* a subtask. There is a third, opposite hazard the pre-schedule probe

@@ -464,6 +464,14 @@ STATE_FIELDS = (
     # [str]}. Empty/absent when no drop fired. Audit trail only — the
     # run proceeds with the surviving subtasks.
     "dropped_subtasks",
+    # provider_subset_sids: sids flagged at plan time by
+    # _warn_provider_subset_subtasks — every file the subtask expects to
+    # touch is already owned by an ordered predecessor. Advisory, never a
+    # drop, but read by _settle_subtask to probe the run branch BEFORE
+    # spawning the implementer, since the redundancy usually only becomes
+    # real once the predecessor commits. List of sid; empty when nothing
+    # was flagged.
+    "provider_subset_sids",
     # conditional_drops: planner-emitted consumer subtasks dropped by the
     # reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e.
     # the planner authored the subtask as "no-op if X" and X turned out
@@ -9885,7 +9893,7 @@ def _warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
-def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
+def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
     `files_likely_touched` surface is owned by an ordered predecessor it
     depends on (via `depends_on` or a `requires`→`provides` tag match).
@@ -9899,6 +9907,13 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
     rescue (DESIGN §8 *The mid-run sibling case*); this warning surfaces the
     same redundancy one phase earlier so the operator can re-frame the plan
     before workers run.
+
+    Returns the flagged sids so `_settle_subtask` can re-probe those subtasks
+    against the run branch BEFORE spawning their implementer, rather than
+    only after one has run and produced nothing (DESIGN §8 *Probing a
+    flagged subtask before it spends*). The rescue's own ordering is the
+    waste: measured across the corpus, every one of run `1b9b52f5`'s three
+    flagged subtasks ran a full implementer and committed nothing.
 
     Warning only, never a drop — a subtask may make a genuinely distinct edit
     to a shared file, and dropping it would silently delete real work (the
@@ -9920,7 +9935,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
             if sid:
                 subtasks[sid] = s
     if not subtasks:
-        return
+        return []
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 
     flagged: list[tuple[str, list[str], list[str]]] = []
@@ -9939,7 +9954,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
             flagged.append((sid, sorted(pred_ids), sorted(own_files)))
 
     if not flagged:
-        return
+        return []
     log(f"⚠  provider-subset subtask(s): {len(flagged)} subtask(s) whose "
         "entire file surface is already owned by a predecessor they depend "
         "on. If the predecessor commits the shared files, the dependent "
@@ -9950,6 +9965,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
         files_str = ", ".join(files)
         log(f"     {sid}: files [{files_str}] ⊆ predecessor(s) "
             f"[{preds_str}]")
+    return sorted(sid for sid, _preds, _files in flagged)
 
 
 def _sid_domain_map(plans: list[dict]) -> dict[str, str]:
@@ -10703,6 +10719,7 @@ async def _filter_satisfied_subtasks(
 async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
+    label: str = "head",
 ) -> dict | None:
     """Post-execution analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe (DESIGN §8 *The mid-run sibling case*). Runs one read-only
@@ -10760,7 +10777,12 @@ async def _probe_criteria_satisfied_on_head(
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
             effort=efforts["satisfied_probe"],
-            sid=f"satisfied_probe-head-{sid}",
+            # `label` distinguishes the two call sites' worker logs. Both can
+            # fire for one subtask in a single run — the pre-spawn probe
+            # declines, the implementer commits nothing, the post-execution
+            # rescue probes again — and a shared name would leave the second
+            # overwriting the first's log, losing the reason for the decline.
+            sid=f"satisfied_probe-{label}-{sid}",
         )
     except (WorkerError, subprocess.TimeoutExpired) as e:
         # A probe crash must NOT rescue the subtask — fail safe toward the
@@ -28414,6 +28436,48 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             "run blocked. Fix and resume.")
 
 
+def _settle_already_satisfied(sid: str, drop: dict, st: State, *,
+                              summary: str | None = None,
+                              criteria_results: list | None = None) -> dict:
+    """Record a subtask whose success criteria a `satisfied_probe` judged
+    already met on the run branch, and return its terminal `complete` result.
+
+    Two callers reach this with the same fact and must record it identically:
+    the pre-spawn probe of a plan-time-flagged provider-subset subtask (DESIGN
+    §8 *Probing a flagged subtask before it spends*) and the post-execution
+    no-commits rescue (§8 *The mid-run sibling case*). The state writes below
+    are load-bearing rather than bookkeeping — a missing conformance sentinel
+    leaves `_get_progress` counting the subtask `in_conformer` forever — so
+    they live in one place rather than being copied to the second site."""
+    st.data.setdefault("dropped_subtasks", {})[sid] = drop
+    st.data.setdefault("subtask_status", {})[sid] = "complete"
+    st.data.get("blocked", {}).pop(sid, None)
+    # Write a conformance sentinel so `_get_progress` counts this subtask as
+    # `done`, not perpetually `in_conformer` (that classifier keys on a
+    # missing `conformance[sid]`). The real conformer is correctly skipped —
+    # a zero-commit subtask has no diff to conform.
+    st.data.setdefault("conformance", {})[sid] = {
+        "result": None,
+        "warnings": ["settled complete via satisfied rescue; "
+                     "no diff to conform"],
+        # Deliberately NOT added to `unreviewed_subtasks`. `reviewed: False`
+        # is literally true — no conformer ran — but this is a review that was
+        # never *needed* (zero commits, no diff to attack), not one that was
+        # attempted and died. Conflating the two would put a
+        # correctly-skipped subtask in the operator-facing warning and train
+        # them to ignore it.
+        "reviewed": False,
+    }
+    st.save()
+    return {"subtask_id": sid, "status": "complete",
+            "summary": (summary
+                        or "success criteria already satisfied on the run "
+                        "branch (deliverable already present — a sibling "
+                        "subtask committed it this run, or it was already on "
+                        "the base tree); no new commits required"),
+            "criteria_results": criteria_results or []}
+
+
 async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict:
@@ -28484,6 +28548,40 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             continuation = False
             note = f"Previous attempt failed: {reason}"
         return None
+
+    # DESIGN §8 *Probing a flagged subtask before it spends*. A subtask the
+    # plan-time provider-subset advisory flagged has no file surface of its
+    # own — every file it expects to touch belongs to an ordered predecessor,
+    # which is by construction in an earlier wave and therefore already merged
+    # into staging. If that predecessor committed the shared deliverable, this
+    # subtask's implementer will produce nothing and be settled by the
+    # post-execution rescue below, having spent a full worker to learn it.
+    # Ask the same probe first. Probed against the STAGING worktree because
+    # this subtask's own worktree does not exist yet — `new-worktree.sh` runs
+    # inside `_run_implementer` — and staging sits at the run-branch HEAD,
+    # which is the ref the rescue would measure against anyway.
+    #
+    # Advisory in, probe decides: the flag alone never settles anything (a
+    # subtask may make a genuinely distinct edit to a shared file), and the
+    # probe fails safe to None, so anything short of a confident `satisfied`
+    # falls through to the implementer untouched.
+    if sid in (st.data.get("provider_subset_sids") or []):
+        staging = leerie_dir / "worktrees" / "staging"
+        if staging.is_dir():
+            pre_drop = await _probe_criteria_satisfied_on_head(
+                subtask, str(staging), st, caps, models, efforts,
+                label="pre")
+            if pre_drop is not None:
+                # Distinct reason from the post-execution rescue's
+                # `already_satisfied_mid_run`: same verdict, different moment,
+                # and the audit is worth being able to tell apart — one cost a
+                # probe, the other cost an implementer first.
+                pre_drop["reason"] = "already_satisfied_pre_spawn"
+                log(f"  {sid}: flagged at plan time as provider-subset, and "
+                    "its success criteria are already met on the run branch — "
+                    "settling complete without spawning an implementer. "
+                    f"{pre_drop['evidence'][:160]}")
+                return _settle_already_satisfied(sid, pre_drop, st)
 
     while True:
         try:
@@ -28716,37 +28814,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                         "present — committed by a sibling subtask this run, "
                         "or already on the base tree) — settling complete "
                         f"instead of failing. {drop['evidence'][:160]}")
-                    st.data.setdefault("dropped_subtasks", {})[sid] = drop
-                    st.data.setdefault("subtask_status", {})[sid] = "complete"
-                    st.data.get("blocked", {}).pop(sid, None)
-                    # Write a conformance sentinel so `_get_progress` counts
-                    # this subtask as `done`, not perpetually `in_conformer`
-                    # (that classifier keys on a missing `conformance[sid]`).
-                    # The real conformer is correctly skipped — a zero-commit
-                    # subtask has no diff to conform.
-                    st.data.setdefault("conformance", {})[sid] = {
-                        "result": None,
-                        "warnings": ["settled complete via mid-run satisfied "
-                                     "rescue; no diff to conform"],
-                        # Deliberately NOT added to `unreviewed_subtasks`.
-                        # `reviewed: False` is literally true — no conformer
-                        # ran — but this is a review that was never *needed*
-                        # (zero commits, no diff to attack), not one that was
-                        # attempted and died. Conflating the two would put a
-                        # correctly-skipped subtask in the operator-facing
-                        # warning and train them to ignore it.
-                        "reviewed": False,
-                    }
-                    st.save()
-                    return {"subtask_id": sid, "status": "complete",
-                            "summary": (res.get("summary")
-                                        or "success criteria already satisfied "
-                                        "on the run branch (deliverable already "
-                                        "present — a sibling subtask committed "
-                                        "it this run, or it was already on the "
-                                        "base tree); no new commits required"),
-                            "criteria_results": res.get("criteria_results")
-                            or []}
+                    return _settle_already_satisfied(
+                        sid, drop, st, summary=res.get("summary"),
+                        criteria_results=res.get("criteria_results"))
                 log(f"  branch check failed for {sid}: {message}")
                 done = await fail(kind, message)
                 if done is not None:
@@ -30995,8 +31065,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # if the predecessor commits the shared deliverable (DESIGN
             # §5, §8 *The mid-run sibling case*). Warning only; the
             # mid-run satisfied rescue in _settle_subtask is the actual
-            # safety net.
-            _warn_provider_subset_subtasks(plans)
+            # safety net. Persisted (not merely logged) so that rescue can
+            # run its probe BEFORE the implementer spends rather than after
+            # it returns empty-handed.
+            st.data["provider_subset_sids"] = (
+                _warn_provider_subset_subtasks(plans))
+            st.save()
             # Flag a test subtask that declares NO cross-subtask edge at all
             # while the plan has producing subtasks. Advisory, and narrow: the
             # commoner wiring-gate death is a subtask that declares several
