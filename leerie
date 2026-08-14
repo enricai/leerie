@@ -1375,6 +1375,129 @@ PY
         ;;
     esac
     ;;
+  prune)
+    shift
+    # Reclaim state that nothing else reaps. Measured on one repo after three
+    # weeks: 1.5 GB across 71 run dirs and 23,158 repo-map-cache entries, plus
+    # 64 stale leerie/subtasks/* branches left in the user checkout -- while
+    # leerie preflight itself dies on low disk headroom and tells the operator
+    # to prune by hand (docs/POSTMORTEM-2026-08-14.md, F22).
+    #
+    # Dry-run by DEFAULT. This deletes run directories that may hold the only
+    # record of a paid-for run, so the safe mode is the one you get without
+    # asking.
+    _prune_days=14
+    _prune_apply=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --older-than) _prune_days="${2:?--older-than needs a number of days}"; shift 2 ;;
+        --older-than=*) _prune_days="${1#*=}"; shift ;;
+        --apply) _prune_apply=true; shift ;;
+        -h|--help)
+          echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
+          echo "  Removes terminal run dirs and stale repo-map cache entries" >&2
+          echo "  older than DAYS (default 14), and subtask branches whose run" >&2
+          echo "  dir is gone. Dry-run unless --apply is given." >&2
+          exit 0 ;;
+        *) echo "leerie prune: unknown option '$1'" >&2; exit 1 ;;
+      esac
+    done
+    case "$_prune_days" in
+      ''|*[!0-9]*) echo "leerie prune: --older-than needs a whole number of days" >&2; exit 1 ;;
+    esac
+    LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
+      python3 - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
+import json, os, pathlib, shutil, subprocess, sys, time
+
+root = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2])
+days = int(os.environ.get("LEERIE_PRUNE_DAYS", "14"))
+apply = os.environ.get("LEERIE_PRUNE_APPLY") == "true"
+cutoff = time.time() - days * 86400
+freed = 0
+runs_removed = []
+
+def size_of(p):
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(p):
+        for f in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+runs = root / "runs"
+live = set()
+if runs.is_dir():
+    for d in sorted(runs.iterdir()):
+        if not d.is_dir():
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            data = {}
+        terminal = bool(data.get("finished_at") or data.get("killed_at"))
+        try:
+            mtime = d.stat().st_mtime
+        except OSError:
+            continue
+        # Only terminal runs, and only old ones. A paused or in-flight run is
+        # resumable and must survive regardless of age.
+        if terminal and mtime < cutoff:
+            freed += size_of(d)
+            runs_removed.append(d.name)
+            if apply:
+                shutil.rmtree(d, ignore_errors=True)
+        else:
+            live.add(d.name)
+
+cache = root / "repo-map-cache"
+cache_removed = 0
+if cache.is_dir():
+    for f in cache.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                freed += f.stat().st_size
+                cache_removed += 1
+                if apply:
+                    f.unlink()
+        except OSError:
+            pass
+
+# Subtask branches whose run dir is gone. Scoped to leerie/subtasks/<run-id>/*
+# so a user branch is never in scope.
+branches_removed = []
+try:
+    out = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)",
+         "refs/heads/leerie/subtasks"],
+        cwd=str(repo), capture_output=True, text=True, check=False).stdout
+except OSError:
+    out = ""
+for ref in out.splitlines():
+    parts = ref.split("/")
+    if len(parts) < 4:
+        continue
+    run_id = parts[2]
+    if run_id in live:
+        continue
+    branches_removed.append(ref)
+    if apply:
+        subprocess.run(["git", "branch", "-D", ref], cwd=str(repo),
+                       capture_output=True, check=False)
+
+verb = "removed" if apply else "would remove"
+print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
+print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
+print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
+print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
+print(f"  {verb} ~{freed / 1048576:.1f} MiB")
+if not apply:
+    print("  (dry-run — re-run with --apply to delete)")
+PY
+    exit 0
+    ;;
   list)
     # `list --runtime fly` is a runtime-aware view: query Fly directly
     # for every machine under FLY_APP, then best-effort cross-reference

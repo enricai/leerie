@@ -706,3 +706,30 @@ leerie kill <chain-id>
 
 `kill <chain-id>` iterates the chain's runs and invokes
 `leerie kill <run-id>` per run; already-killed runs are skipped.
+
+## Reclaiming disk: `leerie prune`
+
+Nothing reaps run state automatically. Measured on one repo after three weeks:
+**1.5 GB** across 71 run directories and 23,158 repo-map-cache entries, plus 64
+stale `leerie/subtasks/*` branches left in the checkout — while leerie's own
+preflight refuses to start a run on low disk headroom and tells you to prune by
+hand (`docs/POSTMORTEM-2026-08-14.md`, F22).
+
+```bash
+leerie prune                       # dry-run: shows what it would remove
+leerie prune --apply               # actually remove
+leerie prune --older-than 30 --apply
+```
+
+It removes three things, all older than `--older-than` (default 14 days):
+
+- **terminal run directories** — only runs with `finished_at` or `killed_at`. A
+  paused or in-flight run is resumable and survives regardless of age.
+- **repo-map cache entries** — regenerated on demand.
+- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run
+  directory is gone. Branches belonging to a live run, and any branch outside
+  that namespace, are never in scope.
+
+**Dry-run is the default and that is deliberate**: this deletes directories that
+may hold the only record of a paid-for run, so the safe mode is the one you get
+without asking for it.
