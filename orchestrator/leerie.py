@@ -8720,6 +8720,19 @@ def _criterion_is_conformance_owned(criterion: str | None,
     return any(cmd and cmd.lower() in low for cmd in blt_commands)
 
 
+# Mechanical-check labels that are reported but must NOT drive a re-drive.
+# Matching leerie's OWN label prefixes is set membership over strings this
+# module authored, not interpretation of a worker response, so it sits outside
+# the *Language-to-JSON* prohibition -- `phase_finalize` already partitions
+# `symptom_findings` the same way.
+_ADVISORY_ISSUES = ("NO_PLANNED_FILES_TOUCHED",)
+
+
+def _gating_issues(issues: list[str]) -> list[str]:
+    """The subset of `check_implementer_output` labels that justify a retry."""
+    return [i for i in issues if not i.startswith(_ADVISORY_ISSUES)]
+
+
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
     blt_commands: tuple[str, ...] = (),
@@ -8747,6 +8760,17 @@ def check_implementer_output(
 
     if planned and actual_files:
         if not (actual_files & planned):
+            # ADVISORY, not gating. `files_likely_touched` is a planner GUESS,
+            # and `_clobbered_owned_files` already documents it as "advisory
+            # and NOT used because the implementer may commit outside it" --
+            # which is exactly as true here. Re-driving on it asks a worker to
+            # match a prediction rather than to do the work: measured,
+            # 1b9b52f5/test-007 was re-driven into a pure-rename commit
+            # (+$0.49, 2.3 min) whose only content was moving a test from the
+            # repo convention to the planner path
+            # (docs/POSTMORTEM-2026-08-14.md, F23). The label is still emitted
+            # so the operator sees it; `_ADVISORY_ISSUES` keeps it out of the
+            # retry decision.
             issues.append(
                 f"NO_PLANNED_FILES_TOUCHED: none of the planned "
                 f"files were modified — planned: "
@@ -10231,8 +10255,15 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
     return issues
 
 
-_ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
-                               "credential"})
+# "credential" was removed 2026-08-14. This heuristic is about env-FILE
+# plumbing -- does anything update .env.example when a subtask provides an env
+# contract -- and "credential" matches the domain concept instead, which is a
+# different thing entirely. Measured, both of its firings in one run were false:
+# `credential-field-docurl-support` (adding a docUrl to a form field spec) and
+# `passare-credential-check-helper` (a client-side API ping), neither touching
+# env files or wanting to (docs/POSTMORTEM-2026-08-14.md, F23). The remaining
+# keywords name configuration plumbing rather than a subject area.
+_ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key"})
 
 
 def _warn_layer_gaps(plans: list[dict]) -> None:
@@ -25433,9 +25464,22 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     if region_section is not None:
         up.append(region_section)
     if continuation:
-        up.append(f"This is a CONTINUATION. Read the checkpoint at "
-                  f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "
-                  f"actual repo state, then continue.")
+        # Only mention the checkpoint when one exists. It is written solely on
+        # `incomplete-handoff` / `needs-clarification`, so most continuations
+        # have none — and the instruction sent every one of them to read a
+        # missing file: 11 wasted `tool-fail` reads across two runs, on the
+        # highest-stakes prompt in the system, the one that also carries the
+        # completeness gate's mandatory criteria
+        # (docs/POSTMORTEM-2026-08-14.md, F23). Opening a prompt with an
+        # instruction that fails teaches the worker to discount what follows.
+        _ckpt = Path(leerie_dir) / "checkpoints" / f"{sid}.md"
+        if _ckpt.is_file():
+            up.append(f"This is a CONTINUATION. Read the checkpoint at "
+                      f"{_ckpt}, validate it against the actual repo state, "
+                      f"then continue.")
+        else:
+            up.append("This is a CONTINUATION. There is no checkpoint file — "
+                      "read the repo state directly and continue.")
     if note:
         up.append(f"NOTE FROM ORCHESTRATOR: {note}")
 
@@ -28539,13 +28583,18 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 blt_commands=tuple(
                     c for c in (resolve_blt(st.repo_root) or {}).values()
                     if isinstance(c, str) and c.strip()))
-            if impl_issues and confidence_retries < caps.get(
+            # Advisories are surfaced but never re-drive (see _ADVISORY_ISSUES).
+            _gating = _gating_issues(impl_issues)
+            for _adv in impl_issues:
+                if _adv not in _gating:
+                    log(f"  {sid}: advisory: {_adv}")
+            if _gating and confidence_retries < caps.get(
                     "implementer_confidence_retries", 2):
-                log(f"  {sid}: mechanical check issues: {impl_issues}")
+                log(f"  {sid}: mechanical check issues: {_gating}")
                 confidence_retries += 1
                 continuation = True
                 note = _format_check_feedback(
-                    impl_issues, confidence_retries - 1,
+                    _gating, confidence_retries - 1,
                     caps.get("implementer_confidence_retries", 2))
                 # Record the in-flight attempt before looping. The status
                 # write below is unreachable from here, so a subtask that
