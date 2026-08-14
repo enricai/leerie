@@ -726,15 +726,47 @@ def test_worker_count_unchanged_across_satisfied_probe_cache_resume(
     )
 
 
-def test_genuinely_no_progress_still_dies(leerie, monkeypatch, run_dirs):
-    """No categories, no waves — the run never got past its first
-    st.save(), before phase_classify even started. This remains the one
-    case that must still die() (nothing to resume from)."""
+def test_no_progress_but_a_recorded_task_restarts_rather_than_dying(
+        leerie, monkeypatch, run_dirs):
+    """No categories, no waves, but the task text is intact.
+
+    This is the ORDINARY way to reach "no recorded progress": a Ctrl-C or a
+    preflight refusal before phase_classify ran. There is nothing to recover
+    and nothing to inspect — the run simply has to begin — so it restarts in
+    place rather than dying. Calling it "likely corrupt or hand-edited" sent an
+    operator hunting a data-integrity problem that did not exist
+    (docs/POSTMORTEM-2026-08-14.md, F15).
+
+    Restarting in place rather than requiring a fresh run is deliberate: the
+    run directory, its id and its flock already exist, and minting a second run
+    for the same task is what the duplicate-task guard exists to prevent.
+    """
     calls: dict = {}
     _stub_common(leerie, monkeypatch, calls)
     st = _make_state(leerie, run_dirs, {
         "task": "test task", "worker_count": 0,
     })
+    caps = _caps(leerie)
+    args = _args()
+    # Reaching the stubbed phase_execute IS the pass condition: the run got
+    # all the way through planning instead of dying at the resume gate.
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    assert calls.get("phase_classify"), (
+        "a run with a recorded task and no progress must START, not die")
+
+
+def test_genuinely_no_progress_and_no_task_still_dies(
+        leerie, monkeypatch, run_dirs):
+    """The one genuinely unusable state: neither progress nor a task.
+
+    Anti-vacuity partner to the test above — without it, the restart path could
+    swallow every malformed state.json.
+    """
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = _make_state(leerie, run_dirs, {"worker_count": 0})
     caps = _caps(leerie)
     args = _args()
     with pytest.raises(SystemExit):

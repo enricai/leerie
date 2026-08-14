@@ -6679,36 +6679,22 @@ def _disk_headroom_message(path: Path, ratio: float) -> str:
             f"{DISK_MIN_FREE_RATIO:.0%} minimum")
 
 
-async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
-                    skip_smoke: bool = False, no_push: bool = False) -> None:
-    """Hard checks before any LLM work. Fails fast rather than wasting workers."""
+async def preflight_repo() -> None:
+    """Repo-state checks that must run BEFORE any irreversible state exists.
 
-    # 0. subprocess machinery must be able to report exit statuses at all.
-    # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
-    # asyncio result is rc=255/empty — indistinguishable from a genuinely
-    # failed command, which makes every check below report a false negative.
-    # main() resets the disposition; this gate catches one set afterwards.
-    if _sigchld_is_ignored():
-        die("SIGCHLD is set to SIG_IGN, so the kernel auto-reaps this "
-            "process's children and their exit statuses are unreadable. "
-            "Every subprocess would report a bogus failure. This is an "
-            "environment problem, not a leerie configuration problem.")
+    Split out of `preflight()` because of WHEN they run, not what they check.
+    `main()` constructs `State(...)` -- which mints `<state-root>/runs/<run-id>/`,
+    takes its flock and writes `state.json` -- and only then calls `_run_phases`,
+    which calls `preflight()`. So a refusal here used to leave a permanent run
+    directory behind for a run that never started: four of them accumulated on
+    one host from a single afternoon's dirty-tree refusals
+    (docs/POSTMORTEM-2026-08-14.md, F14).
 
-    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
-    # worktrees continuously, and the first failing write under a full disk
-    # was previously an unhandled `OSError: [Errno 28] No space left on
-    # device` from whatever line happened to be writing. Checked on the
-    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
-    # before any worker spawns, so a disk that is already too full to
-    # safely run refuses cleanly instead of dying mid-run.
-    ratio = _disk_free_ratio(leerie_dir)
-    if ratio < DISK_MIN_FREE_RATIO:
-        die(f"insufficient disk space to start a run: "
-            f"{_disk_headroom_message(leerie_dir, ratio)}. "
-            "Free up space (`leerie list` to see past runs, then prune old "
-            "ones under the state root by hand — nothing reaps them "
-            "automatically) and retry.")
-
+    These three need nothing but the checkout, so they run first and the run
+    directory is only created once the repo is fit to run against. Everything
+    else in `preflight()` (subprocess machinery, disk headroom, CLI version,
+    the live smoke test) stays there.
+    """
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
         r = await run_proc(["git", "config", key])
@@ -6738,8 +6724,23 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     r = await run_proc(["git", "status", "--porcelain"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
+        # Name them. "2 modified/staged file(s)" sends the operator to
+        # `git status` to find out what leerie is objecting to, and in the
+        # measured case both files were leerie's OWN tracked config
+        # (`leerie.toml`, `.leerie/config.toml`) — so tuning leerie dirtied the
+        # tree leerie then refused to run in, with nothing in the message
+        # connecting the two (docs/POSTMORTEM-2026-08-14.md, F14).
+        _shown = [l[3:] for l in dirty[:10]]
+        _own = [f for f in _shown
+                if f == "leerie.toml" or f.startswith(".leerie/")]
         die(f"working tree has {len(dirty)} modified/staged file(s). "
-            "Commit or stash before running leerie.")
+            "Commit or stash before running leerie.\n  "
+            + "\n  ".join(_shown)
+            + ("" if len(dirty) <= 10 else
+               f"\n  … and {len(dirty) - 10} more")
+            + ("\n(" + ", ".join(_own) + " belong to leerie itself — editing "
+               "leerie's own config dirties the tree it refuses to run in.)"
+               if _own else ""))
 
     # 3. external 'leerie' branch — a bare branch named 'leerie' occupies
     #    the ref path that leerie's namespaced branches (leerie/runs/*,
@@ -6754,6 +6755,38 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "Rename or delete it:\n"
             "  git branch -m leerie leerie-old    # rename (preserves commits)\n"
             "  git branch -D leerie               # delete (if fully merged)")
+
+
+
+async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
+                    skip_smoke: bool = False, no_push: bool = False) -> None:
+    """Hard checks before any LLM work. Fails fast rather than wasting workers."""
+
+    # 0. subprocess machinery must be able to report exit statuses at all.
+    # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
+    # asyncio result is rc=255/empty — indistinguishable from a genuinely
+    # failed command, which makes every check below report a false negative.
+    # main() resets the disposition; this gate catches one set afterwards.
+    if _sigchld_is_ignored():
+        die("SIGCHLD is set to SIG_IGN, so the kernel auto-reaps this "
+            "process's children and their exit statuses are unreadable. "
+            "Every subprocess would report a bogus failure. This is an "
+            "environment problem, not a leerie configuration problem.")
+
+    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
+    # worktrees continuously, and the first failing write under a full disk
+    # was previously an unhandled `OSError: [Errno 28] No space left on
+    # device` from whatever line happened to be writing. Checked on the
+    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
+    # before any worker spawns, so a disk that is already too full to
+    # safely run refuses cleanly instead of dying mid-run.
+    ratio = _disk_free_ratio(leerie_dir)
+    if ratio < DISK_MIN_FREE_RATIO:
+        die(f"insufficient disk space to start a run: "
+            f"{_disk_headroom_message(leerie_dir, ratio)}. "
+            "Free up space (`leerie list` to see past runs, then prune old "
+            "ones under the state root by hand — nothing reaps them "
+            "automatically) and retry.")
 
     # 4. claude CLI version is recent enough for `--json-schema` in -p mode.
     #    Runs even when --skip-smoke is set: --skip-smoke is for skipping the
@@ -30078,8 +30111,8 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # subclasses that a
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
-    except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow, DiskLowSpace) as _cap_exc:
+    except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -30272,6 +30305,38 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # `st` is a parameter, already constructed by `main()`, so `st.run_id`
     # is valid before `st.load()`.
     log(f"run id: {st.run_id}")
+    # A `resume` of a run that never reached phase_classify is a START, not a
+    # resume, and it is demoted HERE — above the dispatch — so the fresh-run
+    # branch below does its normal state seeding. Flipping the flag inside the
+    # resume arm instead looks equivalent and is not: the `else:` has already
+    # been skipped, so `st.data` is never seeded and the run dies later on a
+    # missing `started_at`.
+    #
+    # Reaching this is mundane (Ctrl-C or a preflight refusal before the first
+    # phase) and the recorded `task` is intact, so there is nothing to recover
+    # — the run simply has to begin. It restarts in place rather than asking
+    # for a fresh run because the run directory, its id and its flock already
+    # exist, and minting a second run for the same task is what the
+    # duplicate-task guard exists to prevent (POSTMORTEM-2026-08-14, F15).
+    if args.resume and st.load():
+        # "Never started" must exclude runs that TERMINATED without waves:
+        # a completed run and a no-work run both reach the resume arm's own
+        # early returns below and must keep doing so. Demoting them would
+        # restart finished work — measured against the two guards in
+        # tests/test_resume_planning_regression.py, which is what caught it.
+        if ("waves" not in st.data and "categories" not in st.data
+                and not st.data.get("finished_at")
+                and not st.data.get("no_work_required")
+                and isinstance(st.data.get("task"), str)
+                and st.data["task"].strip()):
+            log("this run never reached phase_classify — starting it from its "
+                "recorded task rather than resuming")
+            # The fresh-run branch reads the task from argv, and a `resume`
+            # invocation carries none — so hand it the one state recorded.
+            # Without this the demotion trades one unhelpful die() for
+            # another ("a task description is required").
+            args.task = st.data["task"]
+            args.resume = False
     if args.resume:
         if not st.load():
             die(f"nothing to resume — no state.json at {st.path}")
@@ -30317,11 +30382,23 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # never got past its very first st.save(), before phase_classify
         # even started) is the only genuinely-unusable case left to reject.
         if "waves" not in st.data and "categories" not in st.data:
+            # "Never started" is a RESTARTABLE state, not a corrupt one. The
+            # ordinary way to reach it is mundane — Ctrl-C, or a preflight
+            # refusal, before `phase_classify` ran — and the recorded `task` is
+            # intact, so there is nothing to recover and nothing to inspect:
+            # the run simply has to begin. Calling it "likely corrupt or
+            # hand-edited" sent an operator hunting a data-integrity problem
+            # that did not exist (docs/POSTMORTEM-2026-08-14.md, F15).
+            #
+            # Restarting in place is deliberate over die()ing: the run
+            # directory, its id and its flock already exist, and minting a
+            # second run for the same task is what R15's duplicate guard
+            # exists to prevent.
             die(
-                "cannot resume — state.json has no recorded progress at "
-                "all (not even phase_classify started). This state.json "
-                "is likely corrupt or was hand-edited; inspect it under "
-                f"{st.run_dir} or re-run without resume."
+                "cannot resume — state.json records neither progress nor a "
+                "task, so there is nothing to start or continue. This is the "
+                "one genuinely unusable state: the run died before its very "
+                f"first save. Inspect {st.run_dir}, or start a fresh run."
             )
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
@@ -31473,6 +31550,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         run_id = args.run_id
     else:
         die("--run-id is required (the launcher passes the container/machine ID)")
+    # Repo-state checks BEFORE `State(...)`, which is the first irreversible
+    # step: it mints `<state-root>/runs/<run-id>/`, takes its flock and writes
+    # `state.json`. Refusing after that leaves a permanent run directory for a
+    # run that never started — four accumulated on one host from a single
+    # afternoon of dirty-tree refusals, indistinguishable in `leerie list` from
+    # runs that did work (docs/POSTMORTEM-2026-08-14.md, F14). Skipped on
+    # `resume`: a resumed run's directory already exists, so there is nothing
+    # left to protect, and re-checking would refuse a resume for a dirty tree
+    # the operator may be mid-way through fixing.
+    if not args.resume:
+        asyncio.run(preflight_repo())
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
     except StateLockedError as e:
@@ -31867,8 +31955,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during context-overflow pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -31917,8 +32013,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
         # `exit_code` / `abnormal` are deliberately NOT set here — they are
@@ -31958,8 +32062,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # `except Exception` cannot catch the re-raise: it would escape main()
         # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
         # crash the run with exit 1 — defeating this whole resumable-pause arm.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -32013,8 +32125,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # RateLimitedExit are BaseException subclasses a bare
             # `except Exception` misses, which would skip the `exit_code =
             # EXIT_LOCKED` below and crash the pause with exit 1.
-            except (Exception, TerminalAuthFailure, RateLimitedExit,
-                    ContextOverflow, DiskLowSpace) as _cap_exc:
+            except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                    RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -32066,8 +32178,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the cancel arm still reaches its `exit_code = 130`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -32091,8 +32211,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the signal arm still reaches its `exit_code = 128 + signum`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
