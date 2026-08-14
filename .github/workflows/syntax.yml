@@ -13,14 +13,24 @@ on:
   push:
     branches: [main]
     paths:
+      # chain/ and scripts/ are here because the undefined-name scan reads
+      # them; a filter narrower than the check it gates lets a PR touching
+      # only those paths skip the fast job (test.yml still runs the suite).
       - 'orchestrator/**/*.py'
       - 'tests/**/*.py'
+      - 'chain/**/*.py'
+      - 'scripts/**/*.py'
       - '.github/workflows/syntax.yml'
   pull_request:
     branches: [main]
     paths:
+      # chain/ and scripts/ are here because the undefined-name scan reads
+      # them; a filter narrower than the check it gates lets a PR touching
+      # only those paths skip the fast job (test.yml still runs the suite).
       - 'orchestrator/**/*.py'
       - 'tests/**/*.py'
+      - 'chain/**/*.py'
+      - 'scripts/**/*.py'
       - '.github/workflows/syntax.yml'
 
 concurrency:

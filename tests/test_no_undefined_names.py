@@ -40,8 +40,16 @@ _INTERPRETER_GLOBALS = frozenset({
 
 def undefined_names(source: str, filename: str) -> list[tuple[str, str]]:
     """Return `(scope_path, name)` for every name that would raise
-    `NameError` when its line executes."""
-    top = symtable.symtable(source, filename, "exec")
+    `NameError` when its line executes.
+
+    A file that does not parse is reported as a `<syntaxerror>` scope rather
+    than raising: this runs over every `.py` in the repo, and an escaping
+    `SyntaxError` fails the whole scan as a bare traceback that names no file.
+    """
+    try:
+        top = symtable.symtable(source, filename, "exec")
+    except SyntaxError as e:
+        return [("<syntaxerror>", f"{e.msg} (line {e.lineno})")]
 
     bound = set(dir(builtins)) | set(_INTERPRETER_GLOBALS)
     for sym in top.get_symbols():
@@ -51,10 +59,19 @@ def undefined_names(source: str, filename: str) -> list[tuple[str, str]]:
             bound.add(sym.get_name())
 
     # A `global X` + assignment inside any function binds the module-level
-    # name too, and X need not appear at module scope at all — leerie.py
-    # mutates module state this way (`_STRICT_PROXY`, `_last_parse_error`).
+    # name even when X appears at module scope nowhere else, so a scan that
+    # collects only module-scope bindings false-positives on every read of it.
     # Collected in a pre-pass because the binding scope can be walked after
     # the reading scope.
+    #
+    # PROVABLY INERT ON THIS TREE, and deliberately kept: run the scan with
+    # and without this pre-pass and the real module yields [] both ways. Every
+    # module global leerie.py mutates under `global` is ALSO bound at module
+    # scope (`_last_parse_error` at :9093, `_STRICT_PROXY` at :13070, both
+    # annotated assignments), which is the ordinary shape. The pattern this
+    # guards is real Python that this repo simply does not contain today —
+    # `test_no_false_positives[global declared then assigned]` is the only
+    # thing exercising it, and that case fails without the pre-pass.
     def collect_globals(table: symtable.SymbolTable) -> None:
         for sym in table.get_symbols():
             if sym.is_global() and sym.is_assigned():
@@ -167,3 +184,12 @@ def test_a_genuinely_undefined_name_is_reported():
     it, a scan that returns `[]` unconditionally passes all of them."""
     assert undefined_names(
         "def f():\n    return nope\n", "x.py") == [("f", "nope")]
+
+
+def test_an_unparseable_file_is_reported_not_raised():
+    """Guards the failure *message*, not coverage: `ast.parse` in the same
+    workflow already fails on such a file, but an escaping SyntaxError here
+    would take down the whole-repo scan without naming the file."""
+    found = undefined_names("def f(:\n", "broken.py")
+    assert len(found) == 1
+    assert found[0][0] == "<syntaxerror>"

@@ -3081,11 +3081,15 @@ walks the AST of `_run_phases`, because the obvious
 **The fresh-run branch of `_run_phases` had no execution coverage at all**
 until `tests/test_run_phases_fresh_init.py`, and v0.20.0 shipped a
 `NameError` in it that killed every non-resume run. Two structural reasons,
-both worth remembering when adding a guard here. First, only
+both worth remembering when adding a guard here. First, **every path that
+executed `_run_phases` did so with `resume=True`** — `resume=False` appeared
+nowhere under `tests/`, and no test executes `_orchestrate` either, so the
+branch that every real run takes was never run. Count the callers through the
+shared harness, not by grepping for the call: only
 `test_resume_planning_reentry.py` and `test_resume_planning_regression.py`
-execute `_run_phases`, and **both hardcode `resume=True`** — `resume=False`
-appeared nowhere under `tests/`, and no test executes `_orchestrate` either,
-so the branch that every real run takes was never run. Note
+contain one, but `test_checkpoint_aliasing.py` and `test_wiring_gate_resume.py`
+execute it too, via the `_drive` they import from the former — four files, one
+`resume` value. Note
 `test_wiring_gate_resume.py::test_fresh_run_invokes_the_gate` reuses that same
 `_args()`: "fresh" there means fresh *state*, not a fresh run, which is how
 the gap reads as covered. Second, the guard that did exist —
@@ -3105,9 +3109,16 @@ module scope nor `builtins` — ruff's F821 rule without the dependency, since
 pytest is the sole dev dependency here. Two traps are pinned by its own
 parametrized false-positive table, both of which a naive scan gets wrong: a
 `global X` + assignment **inside a function** binds the module name even when
-`X` never appears at module scope (leerie.py does this for `_STRICT_PROXY` and
-`_last_parse_error`), so the collector needs a pre-pass over every scope; and
-`__file__`/`__name__` are interpreter-injected, never assigned in source. The
+`X` appears at module scope nowhere else, so the collector needs a pre-pass
+over every scope; and `__file__`/`__name__` are interpreter-injected, never
+assigned in source. That pre-pass is **provably inert on this tree** — the scan
+returns `[]` with and without it — because every global leerie.py mutates under
+`global` is also bound at module scope (`_last_parse_error`, `_STRICT_PROXY`,
+both annotated assignments); it is kept because the rule must be right, and its
+own parametrized case is the only thing that fails without it. An earlier
+revision of this paragraph and of the file's own comment cited those two
+symbols as *evidence* the pre-pass was load-bearing, which is exactly
+backwards, and neither was re-derived before being written down. The
 positive control beside that table is mandatory — a scan returning `[]`
 unconditionally passes every negative case. Anti-vacuity is a canary injected
 into the **real** module rather than a synthetic snippet, so a refactor that
