@@ -1709,6 +1709,30 @@ SCHEMAS: dict[str, dict] = {
                         # most subtasks run no prescribed command.
                         "runs_commands": {
                             "type": "array", "items": {"type": "string"}},
+                        # Does this subtask fix a symptom the task REPORTED as
+                        # currently broken? `check_symptom_evidence` gates on
+                        # this, and on nothing else.
+                        #
+                        # It used to gate on `sid.startswith("bugfix-")`, which
+                        # is the *Language-to-JSON* rule violated on an id
+                        # rather than on prose: Python inferred the nature of
+                        # the work from an identifier string. Two mechanisms
+                        # mint that prefix onto work that fixes no symptom —
+                        # `_repair_prescribed_commands` synthesises
+                        # `{prefix}{900+n}` from the HOST subtask's domain, and
+                        # a duplicate-provider/overlap merge re-homes a `feat-`
+                        # subtask under a surviving `bugfix-` id. Measured
+                        # across the corpus, **10 of 10** findings were false
+                        # positives (POSTMORTEM-2026-08-14, F18), which is how a
+                        # warning stops being read.
+                        #
+                        # Deliberately OPTIONAL, and absence means "no" — the
+                        # check is advisory, so a silent check is strictly
+                        # better than one at a 100% false-positive rate, and
+                        # requiring the field would risk the validity-rate
+                        # collapse `severity` caused on `wiring_judge` (9 of 66
+                        # invalid, all on one required field).
+                        "fixes_reported_symptom": {"type": "boolean"},
                     },
                 },
             },
@@ -8634,8 +8658,9 @@ def check_implementer_output(
     return issues
 
 
-def check_symptom_evidence(result: dict, sid: str) -> list[str]:
-    """DESIGN §9 *A stale finding is not a bug* — advisory, `bugfix-` only.
+def check_symptom_evidence(result: dict, sid: str,
+                           fixes_reported_symptom: bool) -> list[str]:
+    """DESIGN §9 *A stale finding is not a bug* — advisory.
 
     Run `fa979580`'s N18 subtask "fixed" a leak that #190 had already fixed
     before the run began, and shipped an event-loop stall doing it. Nothing
@@ -8649,39 +8674,58 @@ def check_symptom_evidence(result: dict, sid: str) -> list[str]:
     production-evidence gate, which is the cost this repo has already
     measured once (`_confidence_schema`'s docstring).
 
-    Scoped by id prefix rather than by inspecting the task text, per
-    CLAUDE.md's *Language-to-JSON* rule — `_ID_PREFIXES` already makes the
-    prefix a structured fact.
+    **Scoped by the planner's declaration, not by the subtask id.** This used
+    to read `sid.startswith("bugfix-")`, which is *Language-to-JSON* violated
+    on an identifier rather than on prose — Python inferring the nature of the
+    work from a string. Two mechanisms mint that prefix onto work that fixes
+    no reported symptom: `_repair_prescribed_commands` synthesises
+    `{prefix}{900+n:03d}` from the HOST subtask's domain (hence `bugfix-901`,
+    a verification-only subtask), and a duplicate-provider / overlap merge
+    re-homes a `feat-` subtask under a surviving `bugfix-` id. Measured across
+    the run corpus, **10 of 10 findings were false positives** — every one of
+    them a test, coverage or verification subtask that never had a symptom
+    (docs/POSTMORTEM-2026-08-14.md, F18). A warning at that rate is one nobody
+    reads, which costs more than the check is worth.
+
+    `fixes_reported_symptom` is optional on the subtask schema and its absence
+    means "no", so a plan that never fills it makes this check silent. That is
+    the right trade for an ADVISORY check whose measured true-positive count is
+    zero: silence beats noise, and the signal returns as soon as planners fill
+    the field. Requiring it instead would risk the validity-rate collapse a
+    required `severity` caused on `wiring_judge`.
 
     Takes the **orchestrator's** `sid`, not the worker's echoed
     `result["subtask_id"]`, which nothing in this module ever cross-checks
-    against the real id: a worker that echoed `feat-001` while working on
-    `bugfix-005` would otherwise slip past the prefix scope entirely. It
-    also takes the one string it needs rather than the whole subtask dict,
-    which removes a `None`-dereference by construction instead of guarding
-    it — and the guard would have been the wrong fix anyway, since
-    `subtask or {}` yields an empty sid, which fails the prefix test and
-    silently disables this check.
+    against the real id. `sid` is now used only for message text; the scope
+    decision comes from the caller's structured field, which is why that field
+    is a required positional rather than something read off a subtask dict
+    this function would then have to guard against being `None`.
 
     Plain "the tests fail on base" is NOT this and is worthless: measured on
     that run, all four findings' new tests already failed on base (9 of 13
     for one), because a new test against code that does not exist yet
     trivially fails. The claim wanted here is behavioural.
     """
-    # No `sid or ""` coercion, deliberately. `sid` is a required positional
-    # on the only call site, so a non-string is a contract violation — and
-    # swallowing it would return `[]`, silently disabling this check. That is
-    # the same shape as the `subtask or {}` this function's sibling refuses
-    # (see `check_implementer_output`), and it would be inconsistent to
-    # condemn it there and practise it here.
-    if not sid.startswith("bugfix-"):
+    # No coercion on either argument, deliberately. Both are required
+    # positionals on the only call site, so a wrong type is a contract
+    # violation — and swallowing it would return `[]`, silently disabling this
+    # check. That is the same shape as the `subtask or {}` this function's
+    # sibling refuses (see `check_implementer_output`), and it would be
+    # inconsistent to condemn it there and practise it here.
+    if not isinstance(fixes_reported_symptom, bool):
+        raise TypeError(
+            "check_symptom_evidence requires an explicit bool for "
+            f"fixes_reported_symptom, got {type(fixes_reported_symptom).__name__}"
+        )
+    if not fixes_reported_symptom:
         return []
 
     ev = result.get("symptom_evidence")
     if not isinstance(ev, dict):
-        return ["NO_SYMPTOM_EVIDENCE: a bugfix subtask did not record whether "
-                "the reported symptom actually reproduces on the base tree — "
-                "a finding that no longer reproduces may already be fixed"]
+        return ["NO_SYMPTOM_EVIDENCE: a subtask declared as fixing a reported "
+                "symptom did not record whether that symptom actually "
+                "reproduces on the base tree — a finding that no longer "
+                "reproduces may already be fixed"]
 
     reproduced = ev.get("reproduced")
     if reproduced is False:
@@ -9721,6 +9765,27 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
             f"[{preds_str}]")
 
 
+def _sid_domain_map(plans: list[dict]) -> dict[str, str]:
+    """Map every subtask id to the domain of the plan that owns it.
+
+    The structured answer to "what kind of work is this subtask", replacing
+    `sid.startswith("<abbrev>-")`. An id prefix is set once, from
+    `CATEGORY_ABBREV`, and then survives operations that change what the
+    subtask IS: a duplicate-provider or overlap merge folds one subtask into
+    another and keeps the *survivor's* id, and `_repair_prescribed_commands`
+    mints its verification subtask's id from the HOST subtask's domain. Reading
+    the owning plan's domain is invariant under both
+    (docs/POSTMORTEM-2026-08-14.md, F18)."""
+    out: dict[str, str] = {}
+    for plan in plans:
+        domain = plan.get("domain") or ""
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if isinstance(sid, str) and sid:
+                out[sid] = domain
+    return out
+
+
 def _warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
     """Advisory plan-time warning (DESIGN §5): flag a `test-`-domain subtask
     that declares NO cross-subtask edge at all (`requires` and `depends_on`
@@ -9772,11 +9837,12 @@ def _warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
         return bool((s.get("provides") or []) or
                     (s.get("files_likely_touched") or []))
 
+    domains = _sid_domain_map(plans)
     flagged: list[str] = []
     for s in all_subtasks:
         sid = s.get("id", "?")
-        # Testing-domain subtasks carry the `test-` id prefix (CATEGORY_ABBREV).
-        if not sid.startswith("test-"):
+        # The owning plan's domain, not the id prefix — see `_sid_domain_map`.
+        if domains.get(sid) != "testing":
             continue
         has_edge = bool((s.get("requires") or []) or (s.get("depends_on") or []))
         if has_edge:
@@ -9958,7 +10024,14 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     return collisions
 
 
-_TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
+# Domains whose subtasks WRITE the code a test subtask would assert against.
+# Compared against each subtask's own plan domain, never against its id: ids are
+# re-homed when a duplicate-provider/overlap merge folds one subtask into
+# another, and `_repair_prescribed_commands` synthesises ids from a *host*
+# subtask's domain — so an id prefix is not evidence of what the work is
+# (docs/POSTMORTEM-2026-08-14.md, F18).
+_TEST_OWNERSHIP_CODE_DOMAINS = frozenset(
+    {"bug-fixing", "feature-implementation", "refactoring"})
 
 
 def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
@@ -10006,10 +10079,13 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
             if isinstance(f, str) and f.strip()
         }
 
-    test_sids = sorted(sid for sid in subtasks if sid.startswith("test-"))
+    # Domain, not id prefix — see `_sid_domain_map`.
+    domains = _sid_domain_map(plans)
+    test_sids = sorted(sid for sid in subtasks
+                       if domains.get(sid) == "testing")
     code_sids = sorted(
         sid for sid in subtasks
-        if sid.startswith(_TEST_OWNERSHIP_CODE_PREFIXES))
+        if domains.get(sid) in _TEST_OWNERSHIP_CODE_DOMAINS)
 
     issues: list[str] = []
     for test_sid in test_sids:
@@ -24700,6 +24776,14 @@ def _repair_prescribed_commands(plans: list[dict],
         "size": "small",
         "investigation_notes": "",
         "runs_commands": list(cmds),
+        # Explicit, though absence would already mean the same thing. This
+        # subtask is the canonical false positive the field exists to prevent:
+        # its id takes `prefix` from the HOST subtask's domain, so on a
+        # bug-fixing host it is named `bugfix-901` — and the old
+        # prefix-scoped `check_symptom_evidence` then demanded a symptom repro
+        # from a verification-only subtask that never had one. Stating it here
+        # keeps the answer with the code that mints the misleading id.
+        "fixes_reported_symptom": False,
     })
     return sid
 
@@ -28274,7 +28358,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # gate. Runs only on the success path: a blocked subtask has no claim
         # to substantiate.
         if status == "complete":
-            _sym_findings = check_symptom_evidence(res, sid)
+            _sym_findings = check_symptom_evidence(
+                res, sid, bool(subtask.get("fixes_reported_symptom")))
             for _sym in _sym_findings:
                 log(f"  {sid}: {_sym}")
                 res.setdefault("symptom_warnings", []).append(_sym)
@@ -29941,8 +30026,9 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         sid for sid, findings in (st.data.get("symptom_findings") or {}).items()
         if any(f.startswith("SYMPTOM_DID_NOT_REPRODUCE") for f in findings))
     if _stale:
-        log(f"note — {len(_stale)} bugfix subtask(s) could not reproduce the "
-            f"symptom they were written to fix, so the finding may already "
+        log(f"note — {len(_stale)} subtask(s) declared as fixing a reported "
+            f"symptom could not reproduce it, "
+            f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "

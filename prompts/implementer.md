@@ -322,7 +322,12 @@ warnings, not as gates here. If your work landed and your confidence
 is anchored, return `complete` even with a few `met: false` items —
 they will surface as warnings on the result.
 
-### 5a. If this is a `bugfix-` subtask, reproduce the symptom first
+### 5a. If your subtask fixes a REPORTED symptom, reproduce it first
+
+This applies when your subtask spec carries `"fixes_reported_symptom": true`
+— not merely when its id happens to begin `bugfix-`. Ids are re-homed by plan
+merges and are synthesised for verification-only work, so the id says nothing
+about whether a symptom exists to reproduce.
 
 Before implementing, reproduce the reported failure **on the base tree**, and
 say in your summary what you observed. If you cannot reproduce it, stop and

@@ -34,64 +34,79 @@ import pytest
 
 
 # ---- scoping --------------------------------------------------------------
+#
+# Scoping is by the planner's `fixes_reported_symptom` declaration, NOT by the
+# subtask id. The id-prefix version produced 10 of 10 false positives across the
+# run corpus, because two mechanisms mint a `bugfix-` id onto work that fixes no
+# symptom: `_repair_prescribed_commands` synthesises `{prefix}{900+n:03d}` from
+# the HOST subtask's domain, and a duplicate-provider/overlap merge re-homes a
+# `feat-` subtask under a surviving `bugfix-` id.
+# See docs/POSTMORTEM-2026-08-14.md, F18.
 
 @pytest.mark.parametrize("sid", ["feat-001", "test-003", "docs-002",
-                                 "refactor-001", "infra-004"])
-def test_non_bugfix_subtasks_are_silent(leerie, sid):
-    """A subtask that is not fixing a reported symptom has none to
-    reproduce. Demanding evidence there would fire on most of a plan."""
-    assert leerie.check_symptom_evidence({}, sid) == []
+                                 "refactor-001", "infra-004", "bugfix-007"])
+def test_undeclared_subtasks_are_silent_whatever_their_id(leerie, sid):
+    """No declaration means no symptom to reproduce — including for a
+    `bugfix-` id, which is the whole point of the change."""
+    assert leerie.check_symptom_evidence({}, sid, False) == []
 
 
-def test_scoping_uses_the_orchestrators_sid_not_the_workers_echo(leerie):
-    """The sid comes from the orchestrator, never from `result["subtask_id"]`.
+def test_the_synthesised_verification_subtask_is_silent(leerie):
+    """`bugfix-901`, the canonical false positive.
 
-    Nothing in the module cross-checks the worker's echoed `subtask_id`
-    against the real id, so scoping on it would let a worker that echoed
-    `feat-001` while working on `bugfix-005` slip past the prefix entirely.
-    Both assertions below would flip if the echo were trusted.
+    `_repair_prescribed_commands` names its verification-only subtask from the
+    host subtask's domain, so on a bug-fixing host it is `bugfix-901` — and the
+    old prefix scope demanded a symptom repro from it. It sets
+    `fixes_reported_symptom: False` explicitly.
     """
     assert leerie.check_symptom_evidence(
-        {"subtask_id": "feat-001"}, "bugfix-005") != []
+        {"symptom_evidence": {"reproduced": False}}, "bugfix-901", False) == []
+
+
+def test_a_declared_symptom_fixer_is_checked_whatever_its_id(leerie):
+    """The converse, and the reason the id was never the right signal.
+
+    A merge can re-home a genuine symptom fix under a `feat-` id. The
+    declaration follows the work; the id does not.
+    """
+    out = leerie.check_symptom_evidence({}, "feat-011", True)
+    assert len(out) == 1 and out[0].startswith("NO_SYMPTOM_EVIDENCE:")
+
+
+def test_scoping_ignores_the_workers_echoed_subtask_id(leerie):
+    """Nothing cross-checks `result["subtask_id"]` against the real id, so it
+    must not influence scoping. Both assertions flip if the echo is trusted."""
     assert leerie.check_symptom_evidence(
-        {"subtask_id": "bugfix-005"}, "feat-001") == []
+        {"subtask_id": "feat-001"}, "bugfix-005", True) != []
+    assert leerie.check_symptom_evidence(
+        {"subtask_id": "bugfix-005"}, "feat-001", False) == []
 
 
-@pytest.mark.parametrize("bad", [None, 3, ["bugfix-001"], {"id": "bugfix-001"}])
-def test_non_string_sid_raises_rather_than_silently_passing(leerie, bad):
-    """The sibling rule, applied to this function's own parameter.
+@pytest.mark.parametrize("bad", [None, 3, "true", ["x"], {"a": 1}])
+def test_non_bool_declaration_raises_rather_than_silently_passing(leerie, bad):
+    """The sibling rule, applied to the parameter that now decides scope.
 
     `check_implementer_output` refuses `subtask or {}` because an empty dict
-    makes `NO_PLANNED_FILES_TOUCHED` unable to fire. `str(sid or "")` here
-    was the identical shape: a non-string `sid` produced `""`, which fails
-    the `bugfix-` prefix, so the check returned `[]` and silently disabled
-    itself. Loud beats quiet for a contract violation, and the two sibling
-    checks should be pinned by the same rule rather than two different ones.
+    makes `NO_PLANNED_FILES_TOUCHED` unable to fire. A coerced declaration is
+    the identical shape: anything falsy silently disables this check. Loud
+    beats quiet for a contract violation.
     """
-    with pytest.raises((AttributeError, TypeError)):
+    with pytest.raises(TypeError):
         leerie.check_symptom_evidence(
-            {"symptom_evidence": {"reproduced": False}}, bad)
-
-
-def test_empty_sid_is_accepted_and_silent(leerie):
-    """Anti-vacuity partner: `""` is a *string*, so it is not a contract
-    violation — it is simply not a bugfix id, and must return `[]` rather
-    than raise. The guard must reject non-strings without rejecting this."""
-    assert leerie.check_symptom_evidence(
-        {"symptom_evidence": {"reproduced": False}}, "") == []
+            {"symptom_evidence": {"reproduced": False}}, "bugfix-001", bad)
 
 
 # ---- the four outcomes ----------------------------------------------------
 
 def test_absent_evidence_is_flagged(leerie):
-    out = leerie.check_symptom_evidence({}, "bugfix-001")
+    out = leerie.check_symptom_evidence({}, "bugfix-001", True)
     assert len(out) == 1 and out[0].startswith("NO_SYMPTOM_EVIDENCE:")
 
 
 def test_reproduced_symptom_is_silent(leerie):
     assert leerie.check_symptom_evidence(
         {"symptom_evidence": {"reproduced": True, "how": "git stash && ...",
-                              "observed": "leaked 3 dirs"}}, "bugfix-001") == []
+                              "observed": "leaked 3 dirs"}}, "bugfix-001", True) == []
 
 
 def test_unreproduced_symptom_is_surfaced(leerie):
@@ -103,7 +118,7 @@ def test_unreproduced_symptom_is_surfaced(leerie):
     """
     out = leerie.check_symptom_evidence(
         {"symptom_evidence": {"reproduced": False,
-                              "not_reproduced_reason": "fixed by #190"}}, "bugfix-001")
+                              "not_reproduced_reason": "fixed by #190"}}, "bugfix-001", True)
     assert len(out) == 1
     assert out[0].startswith("SYMPTOM_DID_NOT_REPRODUCE:")
     assert "fixed by #190" in out[0], "the worker's reason must survive"
@@ -112,7 +127,7 @@ def test_unreproduced_symptom_is_surfaced(leerie):
 
 def test_unreproduced_without_a_reason_still_surfaces(leerie):
     out = leerie.check_symptom_evidence(
-        {"symptom_evidence": {"reproduced": False}}, "bugfix-005")
+        {"symptom_evidence": {"reproduced": False}}, "bugfix-005", True)
     assert len(out) == 1 and out[0].startswith("SYMPTOM_DID_NOT_REPRODUCE:")
     assert not out[0].rstrip().endswith(":"), "dangling colon with no detail"
 
@@ -122,14 +137,14 @@ def test_non_boolean_reproduced_is_flagged(leerie, bad):
     """Keys on `is True` / `is False`, so a truthy string must not read as a
     reproduction."""
     out = leerie.check_symptom_evidence(
-        {"symptom_evidence": {"reproduced": bad}}, "bugfix-001")
+        {"symptom_evidence": {"reproduced": bad}}, "bugfix-001", True)
     assert len(out) == 1 and out[0].startswith("MALFORMED_SYMPTOM_EVIDENCE:")
 
 
 def test_non_dict_evidence_is_flagged(leerie):
     for bad in ("reproduced", ["reproduced"], 7):
         out = leerie.check_symptom_evidence(
-            {"symptom_evidence": bad}, "bugfix-001")
+            {"symptom_evidence": bad}, "bugfix-001", True)
         assert out and out[0].startswith("NO_SYMPTOM_EVIDENCE:")
 
 
@@ -172,7 +187,7 @@ def test_not_wired_into_the_gating_check(leerie):
 
 def test_wired_as_advisory_on_the_success_path(leerie):
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, sid)")
+    i = src.index("_sym_findings = check_symptom_evidence(")
     window = src[i - 400:i + 300]
     assert 'status == "complete"' in window, \
         "must run only on the success path — a blocked subtask has no claim"
@@ -197,7 +212,7 @@ def test_findings_are_persisted_not_just_logged(leerie):
     what belongs in the run record. Same argument, and same shape, as
     `unreviewed_subtasks`."""
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, sid)")
+    i = src.index("_sym_findings = check_symptom_evidence(")
     window = src[i:i + 1200]
     assert 'st.data.setdefault("symptom_findings", {})[sid]' in window
 
@@ -218,7 +233,7 @@ def test_a_clean_later_attempt_clears_a_stale_entry(leerie):
     later attempt no longer makes — the same staleness bug already fixed
     once for `unreviewed_subtasks`."""
     src = inspect.getsource(leerie)
-    i = src.index("check_symptom_evidence(res, sid)")
+    i = src.index("_sym_findings = check_symptom_evidence(")
     window = src[i:i + 1200]
     assert 'st.data.get("symptom_findings", {}).pop(sid, None)' in window
 

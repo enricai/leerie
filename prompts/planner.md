@@ -145,6 +145,16 @@ The orchestrator gives you, in your prompt:
    prose. Leave `runs_commands` empty (or omit it) for subtasks that
    invoke no prescribed command — most subtasks do not.
 
+   **Set `fixes_reported_symptom: true`** only on a subtask whose job is to
+   fix a failure the task text reports as *currently happening*. Leave it
+   false or absent for everything else — new features, refactors, subtasks
+   that add test coverage for work another subtask does, and any
+   verification-only subtask. The orchestrator asks those subtasks (and only
+   those) to prove the symptom still reproduces on the base tree before
+   implementing, which catches a finding an earlier change already fixed.
+   Do not infer this from the subtask id: ids are re-homed when plans merge,
+   so a `bugfix-` id is not evidence that a symptom exists.
+
 3. **Determine dependencies.**
    - Within your domain, set `depends_on` to the ids of subtasks that must
      finish first.
