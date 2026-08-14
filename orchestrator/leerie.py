@@ -2117,6 +2117,33 @@ SCHEMAS: dict[str, dict] = {
                     "required": ["kind", "concrete_case", "where",
                                  "why_ships_a_defect"],
                     "properties": {
+                        # Did the conformer FIX this defect, or is it left for
+                        # someone else? Mirrors `rule_violations.status` above,
+                        # which has carried exactly this distinction all along.
+                        #
+                        # Without it the conformer had one channel for two
+                        # different reports, and the completeness gate read
+                        # every entry as outstanding. A conformer that found a
+                        # gap, FIXED it and committed the fix still blocked the
+                        # run: measured, `1b9b52f5`'s bugfix-004 committed
+                        # "conformer: wire InvoiceCheckPaymentPanel into the
+                        # admin console", listing the created page in its own
+                        # `file_updates`, and was blocked for the defect it had
+                        # just repaired. Its branch was then never integrated,
+                        # so the run shipped the backend with no UI — precisely
+                        # the state the gate exists to prevent
+                        # (docs/POSTMORTEM-2026-08-14.md, F11).
+                        #
+                        # Optional, and absent means "residual", so a conformer
+                        # that never sets it behaves exactly as before.
+                        # Inferring this instead from an overlap between
+                        # `where` and `file_updates` was tried and REJECTED:
+                        # across the corpus that predicate fires on 2 of 152
+                        # defects and is wrong on one of them, suppressing a
+                        # genuine finding the conformer had deliberately left
+                        # alone (retraction R4 in the post-mortem).
+                        "status": {"type": "string",
+                                   "enum": ["fixed", "residual"]},
                         "kind": {"type": "string",
                                  "enum": ["unhandled_input", "unhandled_path",
                                           "missing_guard",
@@ -26129,12 +26156,23 @@ def _actionable_solution_defects(conf_res: dict | None) -> list[dict]:
     concrete_case AND a where. A defect missing either is dropped as
     non-actionable — the anti-gaming guard that keeps the gate keyed on an
     independently-constructed concrete input, never on vague prose. Returns
-    [] for a None/empty result (fail-open: nothing to attack)."""
+    [] for a None/empty result (fail-open: nothing to attack).
+
+    A defect the conformer FIXED (`status: "fixed"`, mirroring
+    `rule_violations.status`) is not actionable either: there is nothing left
+    to drive an implementer at. Reporting a repair and reporting an outstanding
+    gap shared one channel, so the gate read both as outstanding and blocked a
+    run on work its own conformer had already committed — after which that
+    subtask's branch was never integrated and the run shipped a backend with no
+    UI (docs/POSTMORTEM-2026-08-14.md, F11). Absent `status` means residual, so
+    a conformer that never sets it behaves exactly as before."""
     if not isinstance(conf_res, dict):
         return []
     out: list[dict] = []
     for d in conf_res.get("solution_defects") or []:
         if not isinstance(d, dict):
+            continue
+        if d.get("status") == "fixed":
             continue
         if (d.get("concrete_case") or "").strip() and \
                 (d.get("where") or "").strip():
