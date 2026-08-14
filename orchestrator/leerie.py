@@ -1886,6 +1886,22 @@ SCHEMAS: dict[str, dict] = {
                         "criterion": {"type": "string"},
                         "met": {"type": "boolean"},
                         "evidence": {"type": "string"},
+                        # The third state, and the reason it exists: some
+                        # criteria are not the implementer's to evaluate.
+                        # `prompts/implementer.md` tells the worker that a
+                        # criterion naming the build is a conformance-phase
+                        # signal and to record it `met: false` — and
+                        # `check_implementer_output` then turned any
+                        # `met: false` into UNMET_CRITERION and re-drove the
+                        # worker. With only two states an obedient implementer
+                        # COULD NOT PASS: measured, bugfix-008 took 3 drives
+                        # ($1.96) and feat-003 took 3 ($3.00), one of them
+                        # narrating the contradiction before being re-driven
+                        # for it (docs/POSTMORTEM-2026-08-14.md, F3).
+                        #
+                        # Optional, and absent means "this was mine to
+                        # evaluate", so nothing changes for the ordinary case.
+                        "not_applicable": {"type": "boolean"},
                     },
                 },
             },
@@ -8615,8 +8631,34 @@ def check_integrator_output(result: dict) -> list[str]:
     return []
 
 
+def _criterion_is_conformance_owned(criterion: str | None,
+                                    blt_commands: tuple[str, ...]) -> bool:
+    """True when a success criterion names a command the conformer runs.
+
+    `prompts/implementer.md` tells the implementer not to run the build — the
+    conformance phase owns that measurement, and a build in a worker's turn
+    budget can OOM the container and get it reaped mid-turn. So a criterion
+    like "`pnpm run build` passes" is not the implementer's to satisfy.
+
+    Matching is a plain substring test against the repo's own RESOLVED
+    build/lint/test command strings, which are mechanical config values, not
+    worker prose — so this is not the *Language-to-JSON* rule's regex-on-an-LLM
+    case. It is deliberately narrow: only a criterion that literally quotes one
+    of those commands is exempted, so "the new endpoint builds a valid payload"
+    is untouched.
+
+    Empty `blt_commands` (a repo with no resolved BLT surface) exempts nothing,
+    which preserves the pre-existing behaviour rather than degrading to
+    permissive."""
+    if not criterion or not blt_commands:
+        return False
+    low = criterion.lower()
+    return any(cmd and cmd.lower() in low for cmd in blt_commands)
+
+
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
+    blt_commands: tuple[str, ...] = (),
 ) -> list[str]:
     """Mechanical checks on an implementer's complete result.
 
@@ -8648,6 +8690,22 @@ def check_implementer_output(
 
     if result.get("status") == "complete":
         for cr in result.get("criteria_results", []) or []:
+            # A criterion the implementer was never responsible for is not an
+            # unmet one. Two channels, and the second is the load-bearing half:
+            #
+            #   1. the worker says so (`not_applicable`), the explicit state the
+            #      schema previously lacked;
+            #   2. the criterion names a command the CONFORMER owns. Prompts
+            #      drift and workers forget, so the guarantee cannot rest on (1)
+            #      alone — DESIGN §12 again. `check_implementer_output`'s caller
+            #      passes the repo's resolved build/lint/test commands and any
+            #      criterion quoting one of them is the conformance phase's to
+            #      judge, whatever the worker recorded.
+            if cr.get("not_applicable") is True:
+                continue
+            if _criterion_is_conformance_owned(cr.get("criterion"),
+                                               blt_commands):
+                continue
             if cr.get("met") is False:
                 issues.append(
                     f"UNMET_CRITERION: claims complete but "
@@ -28376,7 +28434,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 cwd=worktree)
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
-            impl_issues = check_implementer_output(res, subtask, actual_files)
+            impl_issues = check_implementer_output(
+                res, subtask, actual_files,
+                blt_commands=tuple(
+                    c for c in (resolve_blt(st.repo_root) or {}).values()
+                    if isinstance(c, str) and c.strip()))
             if impl_issues and confidence_retries < caps.get(
                     "implementer_confidence_retries", 2):
                 log(f"  {sid}: mechanical check issues: {impl_issues}")

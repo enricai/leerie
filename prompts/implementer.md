@@ -301,8 +301,14 @@ seconds) and is fine to run scoped or full.
 criterion like "`pnpm run build` passes"). That criterion is a
 *conformance-phase* signal — the conformer runs the build and records
 the result. It is **not** an instruction for you to run the build here.
-Record it as `met: false` (or "not run — conformance phase owns this")
-in `criteria_results` and move on; do not re-attempt a full build. A
+Record it as `"met": false, "not_applicable": true` with evidence
+"not run — conformance phase owns this", and move on; do not re-attempt a
+full build. The `not_applicable` flag is what stops the orchestrator
+re-driving you for it: a bare `met: false` reads as work you left undone.
+(The orchestrator also exempts any criterion that quotes one of the repo's
+resolved build/lint/test commands, so forgetting the flag is not fatal —
+but set it, because that exemption cannot see a criterion that paraphrases
+the command instead of quoting it.) A
 build that OOMs in this container will burn your entire turn budget and
 get you reaped mid-turn — and if that happens *after* you have committed
 your work, the orchestrator keeps the committed diff, but you will have
