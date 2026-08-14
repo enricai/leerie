@@ -4169,6 +4169,47 @@ def compose_pr_body(state: dict, run_id: str) -> str:
     return body
 
 
+def _task_fingerprint(task: str) -> str:
+    """Content hash of the resolved task text, for duplicate detection.
+
+    `run_id` is the container id, so two launches of byte-identical task text
+    are invisible to each other. Measured: one task ran twice, three minutes
+    apart, for $72.21 across 173 worker calls, producing two architecturally
+    incompatible branches with 14 files in collision and two PRs whose merge
+    order matters (docs/POSTMORTEM-2026-08-14.md, F10)."""
+    return hashlib.sha256((task or "").encode("utf-8")).hexdigest()
+
+
+def _live_duplicate_runs(leerie_root: Path, run_id: str,
+                         fingerprint: str) -> list[str]:
+    """Run ids, other than `run_id`, that are working on the same task text.
+
+    "Live" means started and not yet finished, killed or paused — a completed
+    run sharing a fingerprint is an ordinary re-run and says nothing. Never
+    raises: an unreadable sidecar is skipped, because a duplicate check must
+    not be able to stop a run by itself."""
+    out: list[str] = []
+    runs = leerie_root / "runs"
+    if not fingerprint or not runs.is_dir():
+        return out
+    for d in sorted(runs.iterdir()):
+        if not d.is_dir() or d.name == run_id:
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("task_sha256") != fingerprint:
+            continue
+        if data.get("finished_at") or data.get("killed_at") \
+                or data.get("paused_at"):
+            continue
+        out.append(d.name)
+    return out
+
+
 def _write_run_json(run_dir: Path, **fields) -> None:
     """Merge fields into the run.json sidecar at `run_dir/run.json`,
     validate the result, and write atomically.
@@ -30728,6 +30769,41 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
                 st.data["pr_base_branch"] = pr_base_branch
                 st.save()
+                # Refuse to duplicate a task another live run is already
+                # doing. `run_id` is the container id, so byte-identical task
+                # text launched twice is otherwise invisible: measured, one
+                # task ran twice three minutes apart for $72.21, producing two
+                # architecturally incompatible branches with 14 files in
+                # collision (docs/POSTMORTEM-2026-08-14.md, F10).
+                #
+                # Checked here, before the first worker, because this is the
+                # last cheap moment. The escape hatch is an env var rather than
+                # a CLI flag: deliberately running the same brief twice is a
+                # real thing to want, and it should be stated rather than
+                # discovered.
+                _fp = _task_fingerprint(task)
+                _dupes = _live_duplicate_runs(st.leerie_root, st.run_id, _fp)
+                if _dupes and os.environ.get(
+                        "LEERIE_ALLOW_DUPLICATE_TASK", "").strip() not in (
+                        "1", "true", "yes"):
+                    die("this task is already being worked on by "
+                        f"{'run' if len(_dupes) == 1 else 'runs'} "
+                        + ", ".join(_dupes)
+                        + " (identical task text, and that run has not "
+                        "finished, paused or been killed).\n"
+                        "Two runs on one task produce two branches that "
+                        "conflict on the same files and two PRs whose merge "
+                        "order matters.\n"
+                        "  • to watch the existing run:  leerie attach "
+                        f"{_dupes[0]}\n"
+                        "  • to stop it:                 leerie kill "
+                        f"{_dupes[0]}\n"
+                        "  • if you really want both:    "
+                        "LEERIE_ALLOW_DUPLICATE_TASK=1 leerie ...")
+                elif _dupes:
+                    log(f"⚠  duplicate task: {', '.join(_dupes)} "
+                        "already working on identical task text "
+                        "(LEERIE_ALLOW_DUPLICATE_TASK is set)")
                 _write_run_json(
                     st.run_dir,
                     run_id=st.run_id,
@@ -30736,6 +30812,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     pr_base_branch=pr_base_branch,
                     started_at=st.data["started_at"],
                     task=task,
+                    task_sha256=_task_fingerprint(task),
                     **({"group_id": args.group_id} if args.group_id else {}),
                 )
             await phase_classify(task, st, caps, args.clarify, models, efforts)
