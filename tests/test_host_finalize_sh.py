@@ -1021,6 +1021,11 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
     rebase_disposition_status marker — onto run.json, rather than
     discarding $_rebaser_json entirely.
 
+    The payload is written to the seam's VERDICT FILE (argv[9]), not stdout:
+    stdout belongs to the worker's log stream, and the two sharing a channel is
+    exactly what made this arm fire on 9 of 9 real runs. See
+    tests/test_host_finalize_rebaser_channel.py.
+
     Falsify by reverting the log/persist additions in the `*)` arm: the
     stderr assertions and the run.json field assertions below then fail."""
     run_dir = _make_run(
@@ -1034,9 +1039,23 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
     )
     r = _run_host_finalize(
         tmp_path, run_dir,
-        python3_body='echo "not json at all"; exit 0',
+        # ${10}, not ${9}: the stub stands in for `python3`, so $1 is the seam
+        # script itself and the seam's own argv[9] (the verdict file) lands one
+        # position later. The `echo` to stdout is deliberate and load-bearing —
+        # it stands in for the worker log stream, and the assertions below prove
+        # the log text is NOT what gets persisted.
+        python3_body='echo "log noise from the worker"; '
+                     'printf "not json at all" > "${10}"; exit 0',
         extra_env={
-            "LEERIE_REPO": str(REPO_ROOT),
+            # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
+            # exactly one thing on this path — building the
+            # "$LEERIE_REPO/orchestrator/leerie.py" argument — and the stubbed
+            # `python3` never reads it. Pointing it at the real checkout gives a
+            # stub that miscounts its argv a live path to the orchestrator
+            # source: an earlier revision of the stub below wrote to "${9}",
+            # which is that argument rather than the verdict file, and truncated
+            # the real orchestrator/leerie.py to 15 bytes.
+            "LEERIE_REPO": str(tmp_path / "not-a-real-leerie-checkout"),
             "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
         },
     )
@@ -1048,6 +1067,11 @@ def test_rebase_fallback_arm_logs_and_persists_disposition(tmp_path):
     assert after.get("rebase_disposition_status") == "unusable"
     assert after.get("rebase_disposition_jq_rc") not in (None, "0")
     assert after.get("rebase_disposition_raw_json") == "not json at all"
+    # The persisted payload is the verdict file, never the log stream — the
+    # distinction the channel split exists to make.
+    assert "log noise from the worker" not in (
+        after.get("rebase_disposition_raw_json") or ""
+    )
     # The rebase failure is best-effort and must never block finalize.
     assert after.get("pushed_at") is not None
 
@@ -1070,7 +1094,15 @@ def test_rebase_fallback_arm_persists_null_raw_json_when_payload_empty(tmp_path)
         tmp_path, run_dir,
         python3_body="exit 1",
         extra_env={
-            "LEERIE_REPO": str(REPO_ROOT),
+            # Deliberately NOT REPO_ROOT. host-finalize.sh uses LEERIE_REPO for
+            # exactly one thing on this path — building the
+            # "$LEERIE_REPO/orchestrator/leerie.py" argument — and the stubbed
+            # `python3` never reads it. Pointing it at the real checkout gives a
+            # stub that miscounts its argv a live path to the orchestrator
+            # source: an earlier revision of the stub below wrote to "${9}",
+            # which is that argument rather than the verdict file, and truncated
+            # the real orchestrator/leerie.py to 15 bytes.
+            "LEERIE_REPO": str(tmp_path / "not-a-real-leerie-checkout"),
             "LEERIE_STATE_HOST_DIR": str(tmp_path / "state"),
         },
     )

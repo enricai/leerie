@@ -374,22 +374,35 @@ host_finalize() {
     if git -C "$USER_REPO" worktree add "$_rebase_worktree" "$run_branch" \
          >/dev/null 2>&1; then
       echo "[leerie] finalize: attempting rebase of $run_branch onto $pr_base_branch" >&2
-      # Write the python3 seam to a script file rather than a heredoc nested
-      # inside command substitution — bash 3.2 (macOS's /bin/bash; see
-      # CLAUDE.md "must run on bash 3.2") fails to parse a `<<'PY' ... PY`
-      # heredoc when its closing redirection sits on the same line as a
-      # command-substitution close-paren (`)"`), which capturing this
-      # worker's JSON stdout requires. `./leerie config --recapture`'s
-      # heredoc avoids this because it never captures stdout.
+      # Write the python3 seam to a script file rather than a heredoc so the
+      # invocation below stays a plain command (no command substitution), which
+      # keeps it parseable under bash 3.2 (macOS's /bin/bash; see CLAUDE.md
+      # "must run on bash 3.2") regardless of how the redirections are laid out.
+      #
+      # THE VERDICT GETS ITS OWN CHANNEL — argv[9], a file — and is NEVER
+      # printed to stdout. `run_rebaser` calls `claude_p`, whose `log()` writes
+      # the worker's whole progress trace to **stdout** (orchestrator/leerie.py
+      # `log()` is a bare `print(..., flush=True)`). Capturing stdout here and
+      # feeding it to `jq` therefore fed `jq` a few hundred lines of log text
+      # followed by the JSON, so `jq` returned rc 5 and every run fell into the
+      # `*)` arm below: measured, `rebase_disposition_status` was `unusable` in
+      # 9 of 9 runs that ever reached the rebaser, i.e. the `rebased` and
+      # `irreconcilable|failed` arms had NEVER executed. A run whose rebaser
+      # returned a perfectly valid `{"status":"failed", ...}` with a full
+      # conflict diagnosis had that diagnosis silently dropped instead of folded
+      # into the PR body. Keeping the two on separate channels is the fix; the
+      # log stream now reaches the operator's terminal (via stderr) instead of
+      # being swallowed by a command substitution.
       local _rebaser_py="$_rebase_scratch/rebaser.py"
+      local _rebaser_out="$_rebase_scratch/rebaser.json"
       cat > "$_rebaser_py" <<'PY'
 import json, sys, importlib.util, pathlib
 
 leerie_root, repo_root, run_id, worktree, run_branch, working_branch, \
-    pr_base_branch, orch_path = (
+    pr_base_branch, orch_path, out_path = (
         pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3],
         pathlib.Path(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7],
-        pathlib.Path(sys.argv[8]),
+        pathlib.Path(sys.argv[8]), pathlib.Path(sys.argv[9]),
     )
 
 spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
@@ -398,13 +411,31 @@ spec.loader.exec_module(m)
 
 result = m.run_rebaser(leerie_root, repo_root, run_id, worktree,
                         run_branch, working_branch, pr_base_branch)
-print(json.dumps(result))
+# The verdict goes to its own file, never stdout: stdout carries the worker's
+# log stream (leerie's `log()` prints there), and mixing them is what made this
+# unparseable for every run before this fix.
+out_path.write_text(json.dumps(result))
 PY
-      local _rebaser_json _rebaser_rc=0
-      _rebaser_json="$(python3 "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
+      local _rebaser_json="" _rebaser_rc=0
+      # The worker's log stream goes to the operator's terminal (stderr) and the
+      # verdict is read back from its own file — but the invocation stays inside
+      # a SUBSHELL. That is load-bearing, not cosmetic: callers source this file
+      # under `set -euo pipefail`, and the old `$( … )` capture happened to
+      # contain any `set -u` abort (e.g. an unset LEERIE_STATE_HOST_DIR, which
+      # is genuinely unset on some paths) inside the substitution's subshell,
+      # where `|| _rebaser_rc=$?` absorbed it. Running the command directly in
+      # the current shell instead makes that same abort kill `host_finalize`
+      # outright — measured, it broke 20 of 32 tests in
+      # tests/test_host_finalize_sh.py, none of them about the rebase. `( … )`
+      # restores the containment without restoring the shared channel.
+      ( python3 "$_rebaser_py" "$LEERIE_STATE_HOST_DIR" \
           "$USER_REPO" "$run_id" "$_rebase_worktree" "$run_branch" \
           "$working_branch" "$pr_base_branch" \
-          "$LEERIE_REPO/orchestrator/leerie.py" 2>&1)" || _rebaser_rc=$?
+          "$LEERIE_REPO/orchestrator/leerie.py" "$_rebaser_out" \
+          >&2 ) || _rebaser_rc=$?
+      if [ -f "$_rebaser_out" ]; then
+        _rebaser_json="$(cat "$_rebaser_out" 2>/dev/null || true)"
+      fi
 
       local _rebaser_status=""
       if [ "$_rebaser_rc" -eq 0 ] && [ -n "$_rebaser_json" ]; then
@@ -469,9 +500,18 @@ $_diagnosis"
           # transcript on a crash) and record the jq parse status alongside
           # it, since a non-zero jq rc here means the JSON itself was
           # unparseable rather than merely missing `.status`.
+          #
+          # `tail`, not `head`: a JSON object's discriminating fields sit at
+          # its END as often as its start, and when this arm fires because the
+          # payload is malformed the tail is where the truncation/corruption
+          # shows. The previous `head -c 2000` preserved 2000 bytes of whatever
+          # came first and dropped the rest — which, while the verdict shared a
+          # channel with the log stream, meant it preserved 2000 bytes of pure
+          # log noise and discarded the JSON entirely, in all 9 runs that ever
+          # reached this arm.
           local _rebaser_json_trunc _rebaser_jq_rc=0
           printf '%s' "$_rebaser_json" | jq -e '.status // ""' >/dev/null 2>&1 || _rebaser_jq_rc=$?
-          _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | head -c 2000)"
+          _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | tail -c 2000)"
           echo "[leerie] finalize: rebaser returned no usable status; pushing $run_branch as-is" >&2
           echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $_rebaser_json_trunc" >&2
           _host_finalize_update_run_json "$run_json" \
