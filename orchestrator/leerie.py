@@ -26387,6 +26387,12 @@ async def _create_empty_subtask_branch(repo_root: str, run_id: str,
         return True
     r = await run_proc(["git", "branch", branch, _compute_run_branch(run_id)],
                        cwd=repo_root)
+    if r.returncode != 0:
+        # Named, not swallowed: the caller falls through to the implementer on
+        # False, and "could not be created" with no reason is a log line that
+        # cannot be acted on.
+        log(f"  {sid}: could not create {branch}: "
+            f"{(r.stderr or r.stdout or '').strip()[:200]}")
     return r.returncode == 0
 
 

@@ -49,6 +49,26 @@ def _claude_p_src(leerie) -> str:
     return "".join(out)
 
 
+
+def _logical_lines(src: str) -> list[str]:
+    """Physical lines joined while a bracket is open.
+
+    A comparison wrapped across lines is invisible to a per-line scan, and this
+    file's own style wraps at 79 columns — so `if (num_turns\n >= 0.8 *
+    max_turns):` would evade a guard that reads one line at a time.
+    """
+    out, buf, depth = [], "", 0
+    for line in src.splitlines():
+        buf = line if not buf else buf + " " + line.strip()
+        depth += line.count("(") - line.count(")")
+        if depth <= 0:
+            out.append(buf)
+            buf, depth = "", 0
+    if buf:
+        out.append(buf)
+    return out
+
+
 def _ratio_offenders(src: str) -> list[str]:
     """Lines comparing `num_turns` against `max_turns` in any spelling.
 
@@ -56,13 +76,24 @@ def _ratio_offenders(src: str) -> list[str]:
     `0.8 * float(max_turns) <= turns` and `turns / max_turns >= 0.8` — both
     reinstating the defect exactly — sailed past it.
     """
-    return [
-        line.strip() for line in src.splitlines()
-        if "max_turns" in line and re.search(
-            r"(0\.\d+\s*\*|/\s*(float\()?max_turns|>=|<=|[^<>=!]>[^=]|"
-            r"[^<>=!]<[^=])", line)
-        and re.search(r"\bturns\b", line.replace("max_turns", ""))
-    ]
+    out = []
+    for line in _logical_lines(src):
+        if "max_turns" not in line:
+            continue
+        if not re.search(
+                r"(0\.\d+\s*\*|/\s*(float\()?max_turns|>=|<=|[^<>=!]>[^=]|"
+                r"[^<>=!]<[^=])", line):
+            continue
+        # The COUNTER, in either spelling. `\bturns\b` alone cannot match
+        # `num_turns` — `_` is a word character, so there is no boundary
+        # between them — which left this scan blind to the very identifier the
+        # finding is about (POSTMORTEM F7 names `num_turns` throughout). It
+        # passed only because the local in `claude_p` happens to be `turns`.
+        if not re.search(r"(?:\bnum_turns\b|\bturns\b)",
+                         line.replace("max_turns", "")):
+            continue
+        out.append(line.strip())
+    return out
 
 
 def test_no_ratio_comparison_between_num_turns_and_max_turns(leerie):
@@ -109,6 +140,14 @@ def test_the_comment_records_why_the_proxy_was_deleted(leerie):
     "if 0.8 * float(max_turns) <= turns:",
     "if turns / max_turns >= 0.8:",
     "if turns > max_turns - 2:",
+    # The `num_turns` spelling — what the CLI actually reports, what F7 names,
+    # and what the previous regex could not see.
+    "if num_turns >= 0.8 * max_turns:",
+    'if envelope.get("num_turns", -1) >= 0.8 * max_turns:',
+    "if 0.8 * float(max_turns) <= num_turns:",
+    "ratio = num_turns / max_turns",
+    # Wrapped across lines, which a per-line scan misses.
+    "if (num_turns\n        >= 0.8 * max_turns):",
 ])
 def test_the_scan_fires_on_a_reinstated_comparison(canary):
     """Anti-vacuity, absent from the original.

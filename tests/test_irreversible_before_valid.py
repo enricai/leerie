@@ -140,7 +140,13 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
 
     def test_the_scan_finds_them(self, leerie):
         """Anti-vacuity: a scan matching nothing passes the next test."""
-        assert len(self._guarded_arms(leerie)) >= 4, self._guarded_arms(leerie)
+        # Raised from 4: the content-based selector finds 7, and a floor well
+        # below reality is a weak control. Note the selector keys on the try
+        # body calling `capture_repo_deps`, so a terminal arm doing some OTHER
+        # best-effort work is still invisible — narrower than "every terminal
+        # arm", which is why this stays a floor rather than an equality.
+        arms = self._guarded_arms(leerie)
+        assert len(arms) >= 7, arms
 
     def test_every_one_catches_KeyboardInterrupt(self, leerie):
         offenders = [n for n in self._guarded_arms(leerie)
@@ -201,9 +207,12 @@ class TestNeverStartedIsRestartable:
         that live ONLY in `_preflight_repo()` since the split, so the later
         `preflight()` does not cover them.
         """
+        # Structural slice, not a character count. This was `src[i:i + 900]`
+        # with the call sitting at 850 — fifty characters of headroom, so one
+        # more comment line in that block would have failed it on correct code.
         src = inspect.getsource(leerie._run_phases)
         i = src.index("args.resume = False")
-        window = src[i:i + 900]
+        window = src[i:src.index("\n    if args.resume:", i)]
         assert "await _preflight_repo()" in window, (
             "the demoted resume is a fresh start and must be preflighted "
             "like one")

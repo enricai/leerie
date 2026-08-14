@@ -45,6 +45,10 @@ _PREFIX_RE = re.compile(
     r'|\[\s*:\s*\d+\s*\]\s*==\s*["\'](?:' + _DOMAINS + r')-'
     r'|\.split\(["\']-["\']\)\s*\[\s*0\s*\]\s*==\s*["\'](?:' + _DOMAINS + r')'
     r'|re\.(?:match|fullmatch|search)\(\s*r?["\']\^?(?:' + _DOMAINS + r')-'
+    r'|\.partition\(["\']-["\']\)\s*\[\s*0\s*\]'
+    r'|\[\s*:\s*\d+\s*\]\s*(?:!=|==)\s*["\'](?:' + _DOMAINS + r')-'
+    r'|["\'](?:' + _DOMAINS + r')-["\']\s*(?:!=|==)\s*\w+\s*\['
+    r'|\bnot\s+in\s*\(\s*["\'](?:' + _DOMAINS + r')'
 )
 
 
@@ -100,6 +104,10 @@ def test_the_scan_would_catch_a_prefix_dispatch():
     assert _PREFIX_RE.search('if sid.split("-")[0] == "bugfix":')
     assert _PREFIX_RE.search('if re.match(r"^bugfix-", sid):')
     assert _PREFIX_RE.search('if re.search(r"bugfix-", sid):')
+    # Three more the widened version still let through until now.
+    assert _PREFIX_RE.search('if sid.partition("-")[0] == "bugfix":')
+    assert _PREFIX_RE.search('if sid.split("-")[0] not in ("bugfix",):')
+    assert _PREFIX_RE.search('if "bugfix-" != sid[:7]:')
     # and must not fire on unrelated string work
     assert not _PREFIX_RE.search('if path.startswith("src/"):')
     assert not _PREFIX_RE.search('if line.startswith("#"):')

@@ -77,13 +77,22 @@ def _raw_state_path_interpolations(src: str) -> list[str]:
 
     Occurrences already inside an `_operator_path(...)` call are the point of
     the helper and are skipped.
+
+    SCOPE: f-string interpolation only. `log("see " + str(st.path))` and
+    `log("see %s" % st.path)` are not caught. Verified against the current
+    module: no such use exists, so this is a boundary rather than a live gap —
+    but it is a boundary, and a future concatenation would slip past.
     """
     tree = ast.parse(src)
     translated: set[int] = set()
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "_operator_path"):
+        # Name OR Attribute: `leerie._operator_path(st.path)` is the same
+        # call, and flagging it would make the sweep reject its own remedy.
+        if isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name)
+                 and node.func.id == "_operator_path")
+                or (isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_operator_path")):
             for sub in ast.walk(node):
                 translated.add(id(sub))
 
@@ -133,6 +142,14 @@ def test_the_sweep_fires_on_an_injected_canary(canary):
     src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
     assert _raw_state_path_interpolations(src + "\n" + canary), (
         f"the sweep must flag {canary!r}")
+
+
+@pytest.mark.parametrize("call", [
+    'log(f"see {_operator_path(st.path)}")',
+    'log(f"see {leerie._operator_path(st.path)}")',
+])
+def test_a_translated_path_is_not_flagged_however_it_is_called(call):
+    assert not _raw_state_path_interpolations(call)
 
 
 def test_a_translated_path_is_not_flagged():

@@ -33,6 +33,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The marker every shell-hosted seam uses to load the orchestrator by path.
@@ -50,6 +52,60 @@ _PY3 = re.compile(r"(^|[^\w-])python3\b")
 
 def _is_comment(line: str) -> bool:
     return line.lstrip().startswith("#")
+
+
+
+
+# A sink consumes stdout without reading a value out of it. Redirecting to
+# stderr is the documented shape — the log stream reaches the operator and
+# nothing parses it.
+_SINKS = ("cat", "tee")
+
+
+def _captures_stdout(cmd: str) -> str:
+    """Why `cmd` consumes the seam's stdout as a value, or "" if it does not.
+
+    Three mechanisms, all of them F1:
+
+      * `VAR="$(python3 …)"` — command substitution;
+      * backticks, the same thing in older shell;
+      * `python3 … | jq …` — which is what F1 ACTUALLY did. The first version
+        of this predicate tested only for `$(` before `python3` on one line, so
+        the pipe form, and a `$(` on a preceding continuation line, both walked
+        past. The rule has always been "never captured FOR PARSING"; a pipe
+        into `jq` is that, verbatim.
+
+    Deliberately not a ban on redirection: `>&2` is the shape the fix uses.
+    """
+    # Command substitution anywhere in the logical command, including on a
+    # continuation line before the one carrying `python3`.
+    if re.search(r"\$\(\s*(\\\s*\n\s*)?[^)]*python3", cmd, re.S):
+        return "command substitution"
+    if "`" in cmd:
+        return "backtick substitution"
+    # A pipe out of the seam, unless it goes to a pure sink.
+    for seg in re.split(r"\|\|", cmd):          # `||` is control flow, not a pipe
+        m = re.search(r"\|\s*(?:\\\s*\n\s*)?([\w./-]+)", seg)
+        if m and m.group(1) not in _SINKS:
+            return f"piped into `{m.group(1)}`"
+    return ""
+
+
+def _logical_command(lines: list[str], idx: int) -> str:
+    """The whole shell command containing `lines[idx]`.
+
+    Backslash-continuations in both directions, so a capture prefix on an
+    earlier line and a `| jq` on a later one are both inside the returned text.
+    Resolving only the single line is how the first version of this guard
+    missed a newline-separated `VAR="$(` and a trailing pipe.
+    """
+    start = idx
+    while start > 0 and lines[start - 1].rstrip().endswith("\\"):
+        start -= 1
+    end = idx
+    while end < len(lines) - 1 and lines[end].rstrip().endswith("\\"):
+        end += 1
+    return "\n".join(lines[start:end + 1])
 
 
 def _seam_invocations() -> list[tuple[Path, int, str]]:
@@ -84,8 +140,8 @@ def _seam_invocations() -> list[tuple[Path, int, str]]:
             opener = next((j for j in range(i, -1, -1)
                            if "<<" in lines[j] and not _is_comment(lines[j])),
                           None)
-            assert opener is not None, (
-                f"{path}:{i+1} loads the orchestrator outside any heredoc")
+            if opener is None:
+                continue
             # The opener may be a backslash-continuation of the command that
             # actually runs python3 (`leerie`'s recapture seam spreads its
             # invocation over four lines and puts `<<'PY'` on the last). Walk
@@ -100,22 +156,23 @@ def _seam_invocations() -> list[tuple[Path, int, str]]:
                 # Report the logical line's FIRST line: a capture prefix
                 # (`VAR="$(`) sits there, not on the continuation carrying
                 # `python3`.
-                found.append((path, start + 1, logical if start != inv
-                              else lines[inv]))
+                found.append((path, start + 1, _logical_command(lines, inv)))
                 continue
-            # `cat > "$var" <<'PY'` — find the later line that runs "$var".
-            m = re.search(r">\s*\"?\$\{?(\w+)\}?\"?", lines[opener])
-            assert m, (
-                f"{path}:{opener+1} opens a heredoc that neither invokes "
-                f"python3 nor writes to a variable path: {lines[opener]!r}")
-            var = m.group(1)
+            # `cat > "$dest" <<'PY'` — the heredoc only WRITES the program;
+            # the invocation is below the terminator. `dest` may be a variable
+            # or a literal path, and the search is by basename so a refactor
+            # from `"$_rebaser_py"` to `"$scratch/rebaser.py"` still resolves.
+            m = re.search(r">\s*\"?([^\s\"'<>|]+)", lines[opener])
+            if m is None:
+                continue
+            dest = m.group(1)
+            key = dest.rsplit("/", 1)[-1].strip('"').lstrip("$").strip("{}")
             run = next((k for k in range(i, len(lines))
-                        if _PY3.search(lines[k]) and var in lines[k]
+                        if _PY3.search(lines[k]) and key in lines[k]
                         and not _is_comment(lines[k])), None)
-            assert run is not None, (
-                f"{path}:{i+1} writes a seam script to ${var} but nothing "
-                "below invokes it with python3")
-            found.append((path, run + 1, lines[run]))
+            if run is None:
+                continue
+            found.append((path, run + 1, _logical_command(lines, run)))
     return found
 
 
@@ -166,10 +223,9 @@ def test_no_seam_captures_the_orchestrator_stdout() -> None:
     """
     offenders = []
     for path, lineno, line in _seam_invocations():
-        # A capture puts `$(` before `python3` on the same logical line.
-        head = line.split("python3", 1)[0]
-        if "$(" in head or "`" in head:
-            offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        why = _captures_stdout(line)
+        if why:
+            offenders.append(f"{path.name}:{lineno}: [{why}] {line.strip()}")
     assert not offenders, (
         "these seams capture the orchestrator's stdout, which carries the log "
         "stream and not a return value — give the seam an explicit output-path "
@@ -181,10 +237,13 @@ def test_no_seam_captures_the_orchestrator_stdout() -> None:
 def test_the_scan_would_catch_a_capturing_seam(tmp_path: Path) -> None:
     """Falsification control for the rule above.
 
-    Without this, `test_no_seam_captures_the_orchestrator_stdout` passes on a
-    tree where the scan simply never matches a capture.
+    The version this replaces asserted nothing about the real code: it
+    re-implemented the old backwards walk inline and tested that copy, so
+    disabling the actual predicate left every test in the file green. It now
+    drives the REAL `_seam_invocations()` and the REAL `_captures_stdout()`,
+    against a fixture file placed on the scanned surface.
     """
-    fake = tmp_path / "bad.sh"
+    fake = REPO_ROOT / "scripts" / "zz-capture-canary.sh"
     fake.write_text(
         '#!/usr/bin/env bash\n'
         'out="$(python3 - "$repo" <<\'PY\'\n'
@@ -192,15 +251,45 @@ def test_the_scan_would_catch_a_capturing_seam(tmp_path: Path) -> None:
         'PY\n'
         ')"\n'
     )
-    lines = fake.read_text().splitlines()
-    marker_idx = next(i for i, l in enumerate(lines) if _SEAM_MARKER in l)
-    inv = next(lines[j] for j in range(marker_idx, -1, -1)
-               if re.search(r"(^|[^\w-])python3\b", lines[j]))
-    head = inv.split("python3", 1)[0]
-    assert "$(" in head, (
-        "the capture predicate must fire on a seam whose stdout is captured; "
-        f"it did not match {inv!r}"
-    )
+    try:
+        seams = {p.name: line for p, _, line in _seam_invocations()}
+        assert "zz-capture-canary.sh" in seams, (
+            "the resolver must find a planted seam; if it cannot, the rule "
+            "above is scanning nothing")
+        assert _captures_stdout(seams["zz-capture-canary.sh"]), (
+            "the real predicate must flag a captured seam")
+    finally:
+        fake.unlink()
+
+
+@pytest.mark.parametrize("shape,why", [
+    # F1 verbatim: the seam's stdout fed to `jq`. This is the one the previous
+    # predicate could not see at all.
+    ('  python3 "$_rebaser_py" "$X" | jq -r ".status"', "pipe"),
+    # F1's original form, and the same thing split across a continuation —
+    # also invisible before, because only one line was examined.
+    ('  _rebaser_json="$(python3 "$_rebaser_py" "$X")"', "same-line $("),
+    ('  _rebaser_json="$( \\\n    python3 "$_rebaser_py" "$X")"', "continued $("),
+    ('  out=`python3 "$_rebaser_py" "$X"`', "backticks"),
+])
+def test_the_predicate_sees_every_capture_mechanism(shape, why) -> None:
+    assert _captures_stdout(shape), f"{why}: {shape!r}"
+
+
+@pytest.mark.parametrize("shape", [
+    # The shipped form. stdout goes to the operator; the verdict travels in a
+    # file. Flagging this would forbid the fix.
+    '      ( python3 "$_rebaser_py" "$X" "$_rebaser_out" \\\n        >&2 ) || rc=$?',
+    # An env-var prefix computed by command substitution is not a capture OF
+    # THE SEAM — it captures `date`.
+    '  LEERIE_NOW="$(date -u +%s)" \\\n    python3 - "$repo" <<\'PY\'',
+    # Consuming only the exit code.
+    '  python3 "$_rebaser_py" "$X" || rc=$?',
+])
+def test_the_predicate_leaves_legitimate_shapes_alone(shape) -> None:
+    """The converse. An over-broad rule here fails a correct tree, which is how
+    a guard gets deleted rather than fixed."""
+    assert not _captures_stdout(shape), _captures_stdout(shape)
 
 
 def test_the_rebaser_seam_takes_an_explicit_output_path() -> None:

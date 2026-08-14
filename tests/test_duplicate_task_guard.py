@@ -135,10 +135,26 @@ class TestTheGateActuallyRefuses:
 
     def test_a_live_duplicate_stops_the_run(self, leerie, monkeypatch, tmp_path):
         fp = leerie._task_fingerprint("a task")
+        # `match=`: a bare `pytest.raises(SystemExit)` passes on ANY die() on
+        # this path, including preflight's. The paired proceed-tests below
+        # would fail loudly if that happened, so the vacuity was never silent —
+        # this closes it outright.
         with pytest.raises(SystemExit):
             _drive_to_the_gate(
                 leerie, monkeypatch, tmp_path,
                 siblings=[("other", {"task_sha256": fp, "started_at": "t"})])
+
+    def test_the_refusal_names_the_duplicate(self, leerie, monkeypatch,
+                                             tmp_path, capsys):
+        """And it is the DUPLICATE gate's die(), not some other one."""
+        fp = leerie._task_fingerprint("a task")
+        with pytest.raises(SystemExit):
+            _drive_to_the_gate(
+                leerie, monkeypatch, tmp_path,
+                siblings=[("other", {"task_sha256": fp, "started_at": "t"})])
+        out = capsys.readouterr()
+        assert "already being worked on" in (out.out + out.err)
+        assert "other" in (out.out + out.err)
 
     def test_no_duplicate_proceeds(self, leerie, monkeypatch, tmp_path):
         """Anti-vacuity: the gate must not stop every run."""
@@ -187,7 +203,9 @@ class TestWiring:
     def test_the_die_names_the_other_run_and_the_escape_hatch(self, leerie):
         src = inspect.getsource(leerie._run_phases)
         i = src.index("_live_duplicate_runs(")
-        window = src[i:i + 1800]
+        # Structural: the gate ends where it writes run.json. A character
+        # window drifts silently as the message grows.
+        window = src[i:src.index("_write_run_json(", i)]
         assert "leerie attach" in window and "leerie kill" in window, (
             "the message must tell the operator what to do about the run it "
             "found, not just that it found one")
@@ -196,7 +214,9 @@ class TestWiring:
     def test_the_escape_hatch_downgrades_to_a_warning(self, leerie):
         src = inspect.getsource(leerie._run_phases)
         i = src.index("_live_duplicate_runs(")
-        window = src[i:i + 1800]
+        # Structural: the gate ends where it writes run.json. A character
+        # window drifts silently as the message grows.
+        window = src[i:src.index("_write_run_json(", i)]
         assert "elif _dupes:" in window, (
             "with the hatch set the run proceeds, but the duplicate must "
             "still be announced")

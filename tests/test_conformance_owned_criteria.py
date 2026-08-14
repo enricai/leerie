@@ -26,12 +26,41 @@ See docs/POSTMORTEM-2026-08-14.md, F3.
 """
 from __future__ import annotations
 
+import ast
 import inspect
+import io
+import tokenize
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+
+def _code_only(src: str) -> str:
+    """Python source with comments and docstrings removed."""
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    text = "".join(out)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Module)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                text = text.replace(doc, "", 1)
+    return text
 
 
 def _result(**over):
@@ -117,10 +146,13 @@ class TestTheProseFallbackIsGone:
             "argument nothing reads")
 
     def test_no_caller_still_passes_one(self, leerie):
+        # Comments AND docstrings stripped via `tokenize`/`ast`, not a
+        # `#`-prefix line heuristic: the natural place to record why the
+        # parameter went is a comment or a docstring, and the heuristic made
+        # this pass or fail depending on whether that comment sat on its own
+        # line or at the end of one.
         src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
-        code = "\n".join(l for l in src.splitlines()
-                         if not l.lstrip().startswith("#"))
-        assert "blt_commands" not in code
+        assert "blt_commands" not in _code_only(src)
 
 
 def test_schema_carries_the_third_state(leerie):

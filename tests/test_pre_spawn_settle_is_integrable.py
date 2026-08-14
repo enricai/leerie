@@ -22,6 +22,7 @@ Source inspection cannot see a missing branch.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -138,14 +139,21 @@ class TestTheHelper:
             str(d), RUN_ID, "test-001")) is False
 
 
+def _pre_spawn_block(leerie) -> str:
+    """The pre-spawn block, sliced BY STRUCTURE — flag read to the implementer
+    loop. A fixed character window is the trap this repo has now hit three
+    times; the sibling file already resolves it this way."""
+    src = inspect.getsource(leerie._settle_subtask)
+    i = src.index('st.data.get("provider_subset_sids")')
+    return src[i:src.index("\n    while True:", i)]
+
+
+
 class TestTheCallerWiring:
     def test_the_settle_is_gated_on_the_branch(self, leerie):
         """Source-coupling, because the alternative — settling anyway — is the
         original defect. The behavioural half is the composition test above."""
-        import inspect
-        src = inspect.getsource(leerie._settle_subtask)
-        i = src.index('st.data.get("provider_subset_sids")')
-        window = src[i:i + 2200]
+        window = _pre_spawn_block(leerie)
         assert "_create_empty_subtask_branch(" in window
         create = window.index("_create_empty_subtask_branch(")
         settle = window.index("_settle_already_satisfied(")
@@ -154,10 +162,7 @@ class TestTheCallerWiring:
 
     def test_a_failed_branch_creation_falls_through_to_the_implementer(
             self, leerie):
-        import inspect
-        src = inspect.getsource(leerie._settle_subtask)
-        i = src.index('st.data.get("provider_subset_sids")')
-        window = src[i:i + 2200]
+        window = _pre_spawn_block(leerie)
         assert "if await _create_empty_subtask_branch(" in window, (
             "the settle must be conditional on branch creation succeeding — "
             "a settle integration cannot merge is worse than the spend")

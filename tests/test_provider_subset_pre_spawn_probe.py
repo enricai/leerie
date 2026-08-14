@@ -151,10 +151,15 @@ class TestTheProbeRunsBeforeTheSpend:
         assert 'sid=f"satisfied_probe-{label}-{sid}"' in probe_src
 
         src = self._src(leerie)
-        labels = re.findall(r'label=("(?:[^"]*)")', src)
         pre = self._block(leerie)
+        # POSITIONAL, not by value. Filtering `labels` for entries "not in
+        # pre_labels" compares strings, so setting the rescue site to
+        # `label="pre"` too made both entries match, left the filter empty, and
+        # fell through to the signature default — disjoint, green, collision
+        # restored. Excise the pre-block's SLICE instead.
+        rest = src.replace(pre, "", 1)
         pre_labels = re.findall(r'label=("(?:[^"]*)")', pre)
-        rescue_labels = [l for l in labels if l not in pre_labels] or [
+        rescue_labels = re.findall(r'label=("(?:[^"]*)")', rest) or [
             # the rescue site relies on the parameter default
             re.search(r'label: str = ("(?:[^"]*)")', probe_src).group(1)]
         assert pre_labels == ['"pre"'], pre_labels
