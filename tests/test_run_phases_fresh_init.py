@@ -34,47 +34,24 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+
+# The single owner of the args/caps harness, imported in the same form as
+# tests/test_checkpoint_aliasing.py and tests/test_wiring_gate_resume.py.
+# A local copy would be a third one, which is the duplication class this repo
+# has been bitten by repeatedly (see the launcher-block and state-walk guards).
+# `resume=False` is passed at each call site rather than defaulted here, so
+# the branch under test is stated where it is exercised. The keys this file's
+# path additionally reads (subtask_tests, skip_coverage_check,
+# skip_completeness_check, skip_integration_check) are all `getattr(...,
+# default)` reads and need no entry in the shared dict.
+from tests.test_resume_planning_reentry import _args, _caps
 
 
 class _ReachedCgroupGate(Exception):
     """Raised by the stubbed containment gate — the first call after the
     fresh-run state seed has been evaluated and saved."""
-
-
-def _args(**overrides) -> SimpleNamespace:
-    base = dict(
-        resume=False,
-        task="a trivial task",
-        answers=None,
-        clarify=False,
-        dangerously_skip_permissions=False,
-        skip_overlap_judge=False,
-        skip_adherence_check=False,
-        skip_satisfied_check=False,
-        skip_budget_check=True,
-        skip_coverage_check=False,
-        skip_completeness_check=False,
-        skip_integration_check=False,
-        strict_conformer=False,
-        skip_base_baseline=False,
-        skip_repo_map=False,
-        dangerously_allow_uncapped=True,
-        skip_smoke=True,
-        no_push=False,
-        pr_template=None,
-        host_no_push=None,
-        pr_base_branch=None,
-        group_id=None,
-        inspect_dirs=[],
-        no_verify=False,
-        subtask_tests=None,
-    )
-    base.update(overrides)
-    return SimpleNamespace(**base)
 
 
 @pytest.fixture
@@ -109,10 +86,12 @@ def _drive(leerie, monkeypatch, fresh_repo, **arg_overrides):
     monkeypatch.setattr(
         leerie, "_enforce_and_record_cgroup_containment", _boom)
 
+    args = _args(resume=False, task="a trivial task", **arg_overrides)
+
     reached = False
     try:
         asyncio.run(leerie._run_phases(
-            _args(**arg_overrides), dict(leerie.DEFAULT_CAPS), leerie_root,
+            args, _caps(leerie), leerie_root,
             st, "both", "quiet", {}, {}))
     except _ReachedCgroupGate:
         reached = True
@@ -192,5 +171,5 @@ def test_fresh_branch_is_actually_the_one_under_test(leerie, monkeypatch,
 
     with pytest.raises(SystemExit):
         asyncio.run(leerie._run_phases(
-            _args(resume=True), dict(leerie.DEFAULT_CAPS), leerie_root, st,
+            _args(resume=True), _caps(leerie), leerie_root, st,
             "both", "quiet", {}, {}))
