@@ -8382,6 +8382,18 @@ else
     # launcher-computed, not a user knob, and the forward only carries vars
     # that are exported.
     -e "LEERIE_COMMIT=${LEERIE_COMMIT:-}"
+    # The host path of the state root, for RENDERING OPERATOR TEXT ONLY --
+    # never for filesystem access, which is why it is deliberately NOT
+    # forwarded under its own name. LEERIE_STATE_HOST_DIR is on the deny-list
+    # above precisely because a host path is meaningless as a path inside the
+    # container, and that stays true; the _DISPLAY suffix is the signal that
+    # this value may only ever be printed.
+    #
+    # Without it, a die() naming <state-root>/runs/<id>/state.json prints
+    # /leerie-state/..., and `ls /leerie-state` fails on the operator machine
+    # (docs/POSTMORTEM-2026-08-14.md, F17). The bind-mount below already knows
+    # the answer; nothing carried it across.
+    -e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host

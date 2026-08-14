@@ -2884,6 +2884,28 @@ def _set_current_run_id(run_id: str) -> None:
     _CURRENT_RUN_ID = run_id
 
 
+def _operator_path(p: "str | Path") -> str:
+    """Render a container path the way the operator will see it on their host.
+
+    The orchestrator runs inside a container where the state root is mounted at
+    `/leerie-state`, so a message naming `<state-root>/runs/<id>/state.json`
+    prints a path that does not exist on the machine reading it: `ls
+    /leerie-state` fails on the host (docs/POSTMORTEM-2026-08-14.md, F17).
+
+    The launcher forwards the host side of that bind-mount as
+    `LEERIE_STATE_HOST_DIR_DISPLAY`. The `_DISPLAY` suffix is deliberate and
+    load-bearing: `LEERIE_STATE_HOST_DIR` is on the launcher's env deny-list
+    because a host path is meaningless AS A PATH inside the container, and this
+    value inherits that restriction — it may be printed and must never be
+    opened. Returns the input unchanged when the variable is absent (any
+    non-container invocation), so this is safe to apply anywhere."""
+    s = str(p)
+    host = os.environ.get("LEERIE_STATE_HOST_DIR_DISPLAY", "").strip()
+    if not host or not s.startswith("/leerie-state"):
+        return s
+    return host.rstrip("/") + s[len("/leerie-state"):]
+
+
 def die(msg: str, code: int = 1):
     # Guarded for the reason `log` documents, with one extra consequence: the
     # exit CODE is the load-bearing part here. An unwritable stderr must not
@@ -24688,7 +24710,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
             f"${tel.get('cost_usd', 0.0):,.2f}, "
             f"{tel.get('input_tokens', 0):,} in / "
             f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {st.path})")
+            f"(see {_operator_path(st.path)})")
 
 
 def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
@@ -29500,7 +29522,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                                   or results[s].get("summary") for s in blocked}
             st.save()
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {st.path}; resolve and re-run with resume.")
+                f"See {_operator_path(st.path)}; resolve and re-run with resume.")
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
@@ -30220,7 +30242,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             f"${tel.get('cost_usd', 0.0):,.2f}, "
             f"{tel.get('input_tokens', 0):,} in / "
             f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {st.path})")
+            f"(see {_operator_path(st.path)})")
 
 
 # =========================================================================
@@ -30384,7 +30406,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             args.resume = False
     if args.resume:
         if not st.load():
-            die(f"nothing to resume — no state.json at {st.path}")
+            die(f"nothing to resume — no state.json at {_operator_path(st.path)}")
         _validate_resume_state(st.data)
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
@@ -30443,7 +30465,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "cannot resume — state.json records neither progress nor a "
                 "task, so there is nothing to start or continue. This is the "
                 "one genuinely unusable state: the run died before its very "
-                f"first save. Inspect {st.run_dir}, or start a fresh run."
+                f"first save. Inspect {_operator_path(st.run_dir)}, or start a fresh run."
             )
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
