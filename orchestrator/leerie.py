@@ -16273,25 +16273,32 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
                 })
 
-            # surface non-clean exits — a worker that hit --max-turns exits 0 and
-            # can still produce structured_output, but stopped mid-work
+            # surface non-clean exits — a worker that hit its turn cap can still
+            # produce structured_output, but stopped mid-work. This is the ONLY
+            # trustworthy cap signal: the CLI reports it as
+            # terminal_reason/subtype `error_max_turns`, sourced from a
+            # `max_turns_reached` attachment.
             term = envelope.get("terminal_reason", "")
             turns = envelope.get("num_turns", -1)
             if term and term != "completed":
                 log(f"  ⚠  worker exited with terminal_reason='{term}' "
                     f"(num_turns={turns}) — output may be incomplete")
-            # Context-decay proxy: a worker that returned at or above 80% of its
-            # turn budget likely produced its final result against a degraded
-            # context window. The schema only checks structure, not the quality
-            # of reasoning underneath it. Surface the proxy so a 9.x confidence
-            # score from a near-cap worker is read with the right scepticism.
-            # `elif`: this branch only fires when the worker stopped cleanly —
-            # if terminal_reason was set, the warning above already named
-            # num_turns, so we avoid double-warning the same condition.
-            elif turns >= 0 and turns >= int(0.8 * max_turns):
-                log(f"  ⚠  worker returned at {turns}/{max_turns} turns "
-                    f"(≥80% of cap) — output may have been produced against a "
-                    "degraded context window")
+            # There was a second warning here — a "context-decay proxy" firing
+            # when `num_turns >= 0.8 * max_turns` — and it was measuring nothing.
+            # The CLI computes `num_turns` from two DIFFERENT counters: the
+            # cap-enforcement path reports the `max_turns_reached` attachment's
+            # own count, while the success path reports a separately maintained
+            # one. The proxy fired only on the success path (it was the `elif` to
+            # the branch above) and compared that number against the
+            # `--max-turns` bounding the other, so the two were never
+            # commensurable. Measured across a real corpus, 61 of these warnings
+            # fired and 11 were arithmetically impossible — 21/20, 26/20, 28/20,
+            # 31/30, and 62 through 72 out of 60 — across three different caps.
+            # It was deleted rather than re-based because the condition it
+            # claimed to detect is exactly what the branch above already reports,
+            # from the CLI's own terminal signal, and because its premise (that
+            # near-cap output is degraded) was never measured here.
+            # See docs/POSTMORTEM-2026-08-14.md, F7.
 
             return envelope
 
