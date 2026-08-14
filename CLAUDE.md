@@ -3097,7 +3097,9 @@ the gap reads as covered. Second, the guard that did exist —
 `test_orchestrator_owns_blt.py::test_subtask_tests_is_seeded_on_both_run_init_branches`
 — is a key-presence AST walk, and **it passed against the broken code**: the
 key was in the dict literal, only its value expression was unevaluatable.
-Presence is not evaluation, and no AST walk of a literal can be. The new file
+Presence is not evaluation: a walk that checks a key exists says nothing about
+whether that key's value resolves, which takes either execution or scope
+resolution (the symtable scan below does the latter statically). The new file
 executes the branch, stopping at a sentinel on
 `_enforce_and_record_cgroup_containment` (the first call after the seed's
 `st.save()`, so no other stub is needed), and carries the guard-the-guard test

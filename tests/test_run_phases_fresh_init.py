@@ -22,7 +22,11 @@ Nothing in the suite could see it, for two independent reasons:
    `test_orchestrator_owns_blt.py::test_subtask_tests_is_seeded_on_both_run_init_branches`
    asserts the *key* appears in both branches. It passed on the broken code:
    the key was there, only the expression was unevaluatable. Presence is not
-   evaluation, and no AST walk can be.
+   evaluation: a walk that checks a key exists says nothing about whether that
+   key's value resolves. Establishing *that* takes either execution — this
+   file — or scope resolution, which is what the companion below does
+   statically. A walk over the dict literal supplies neither, which is why it
+   passed while the branch it certified was dead.
 
 So this file exists to *run* the branch. The sentinel goes on
 `_enforce_and_record_cgroup_containment`, which is the first call after the
@@ -57,7 +61,8 @@ import pytest
 #
 # No key counts in either sentence on purpose: those are properties of the
 # current tree and rot silently, unlike a measurement of a past event. The
-# figures live in this change's commit message, where they describe a moment.
+# figures live in the commit that removed them (#209), where they describe a
+# moment rather than a claim about the tree you are reading.
 #
 # `resume=False` is passed at each call site rather than defaulted here, so
 # the branch under test is stated where it is exercised. The keys this file's

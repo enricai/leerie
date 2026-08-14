@@ -1,8 +1,9 @@
 """No name in this repo's Python may be undefined at the point it is read.
 
-`ast.parse` — CLAUDE.md's task-completion static check, and the whole of
+`ast.parse` — CLAUDE.md's task-completion static check, and the first step of
 `.github/workflows/syntax.yml` — cannot see this class: an undefined name is
-syntactically perfect and fails only when the line executes. v0.20.0 shipped
+syntactically perfect and fails only when the line executes. That workflow's
+second step is this file, for exactly that reason. v0.20.0 shipped
 `NameError: name 'repo_root' is not defined` in the fresh-run branch of
 `_run_phases`, which the suite could not catch either (no test executed that
 branch; see `tests/test_run_phases_fresh_init.py`), and which a one-second
