@@ -16431,7 +16431,11 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     "user_content": user_prompt + retry_note,
                     "response_content": str(envelope.get("result") or ""),
                     "parsed_ok": _parsed_ok,
-                    "input_tokens": int(_usage.get("input_tokens") or 0),
+                    # Cached input included — see `_usage_input_tokens`.
+                    # The per-call record and the run total must agree,
+                    # or `leerie report` disagrees with the run-weight
+                    # line it is meant to break down.
+                    "input_tokens": _usage_input_tokens(_usage),
                     "output_tokens": int(_usage.get("output_tokens") or 0),
                     "latency_ms": _latency_ms,
                     "success": _success,
@@ -16749,6 +16753,28 @@ async def _replay_capture(record: dict, *,
     return (envelope, structured)
 
 
+def _usage_input_tokens(usage: dict) -> int:
+    """Total input tokens for one call, including the cached ones.
+
+    The API reports input in THREE fields — `input_tokens` counts only the
+    uncached remainder, with `cache_creation_input_tokens` and
+    `cache_read_input_tokens` carrying the rest. Reading just the first is what
+    produced run weights like `24,281 in / 194,508 out` for 53 agentic workers:
+    ~460 input tokens per call, which no worker that reads a repository can
+    possibly use. Every leerie worker runs with prompt caching, so for these
+    calls the cached fields are the bulk of the input, not a footnote
+    (docs/POSTMORTEM-2026-08-14.md, F21).
+
+    `cost_usd` was unaffected — it comes from the CLI's own `total_cost_usd` —
+    which is why the discrepancy went unnoticed: the number operators watch was
+    right while the tokens beside it were wrong by orders of magnitude."""
+    if not isinstance(usage, dict):
+        return 0
+    return (int(usage.get("input_tokens") or 0)
+            + int(usage.get("cache_creation_input_tokens") or 0)
+            + int(usage.get("cache_read_input_tokens") or 0))
+
+
 def _accumulate_telemetry(data: dict, envelope: dict) -> None:
     """Accumulate run-weight signals from a worker envelope into `data`.
     Shared between State and _ReplayState."""
@@ -16758,7 +16784,7 @@ def _accumulate_telemetry(data: dict, envelope: dict) -> None:
     t["calls"] += 1
     t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
     usage = envelope.get("usage") or {}
-    t["input_tokens"] += int(usage.get("input_tokens") or 0)
+    t["input_tokens"] += _usage_input_tokens(usage)
     t["output_tokens"] += int(usage.get("output_tokens") or 0)
 
 
