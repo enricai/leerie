@@ -2585,7 +2585,33 @@ SCHEMAS: dict[str, dict] = {
                                           "broken_by_drop",
                                           "orphaned_dependent"]},
                         "sid": {"type": "string"},
-                        "tag_or_dep": {"type": "string"},
+                        # This field is matched by EQUALITY against the
+                        # provides union and the subtask-id set, so anything
+                        # that is not the bare token silently misses every
+                        # predicate keyed on it and the defect reaches the
+                        # die() unexamined. Two shapes do that:
+                        #
+                        #   - the empty string (schema-valid without
+                        #     minLength; every predicate bails on a falsy tag);
+                        #   - prose appended to the token. Run 3bc46e7d's judge
+                        #     emitted "audit-integration-config-diff-wired
+                        #     (mismatched to feat-006's integrations/webhooks/
+                        #     [id] work)". The bare tag WAS provided in-plan, so
+                        #     the provider-exists predicate would have dismissed
+                        #     it — but the parenthetical made the lookup miss
+                        #     and killed the run: $20.32, 71 workers, 38
+                        #     minutes, no branch (POSTMORTEM-2026-08-14, F4).
+                        #
+                        # The pattern forbids parentheses ONLY. It deliberately
+                        # still allows spaces, commas and slashes, because
+                        # `_expand_multi_value_wiring_defects` splits this field
+                        # on "," and " / " to handle a judge naming several
+                        # values at once — a stricter "bare token" pattern would
+                        # reject those valid emissions. Rejecting here re-prompts
+                        # the judge (claude_p re-prompts on a schema miss), which
+                        # is code enforcing what the prompt asks for.
+                        "tag_or_dep": {"type": "string", "minLength": 1,
+                                       "pattern": r"^[^()]+$"},
                         "concrete_reason": {"type": "string"},
                         # live_defect: the plan AS WRITTEN will actually
                         # misbehave (a wave can run out of order, a
@@ -22736,11 +22762,26 @@ def _filter_provably_false_wiring_defects(
     2. any defect whose capability was provided by an `already_satisfied`
        drop: satisfied on the base tree.
 
-    **Predicate 1 is deliberately scoped to `broken_by_*`.** A
-    `missing_requires` naming a still-provided capability is the *canonical
-    true* finding — the provider exists and the consumer failed to declare the
-    edge — and must survive. Applying (1) to it would silently disable the
-    gate's main channel, where findings measure 99% true (69/70)."""
+    **Predicate 1 covers `broken_by_*` and `missing_provides`, and must never
+    cover `missing_requires`.** The distinction is which side of the edge the
+    finding is about. `broken_by_*` asserts a merge/drop severed the capability
+    and `missing_provides` asserts nothing declares it — both are claims about
+    the PRODUCER, so a provider existing in the plan falsifies the premise
+    directly. A `missing_requires` naming a still-provided capability is the
+    opposite: it is the *canonical true* finding — the provider exists and the
+    CONSUMER failed to declare the edge — so applying (1) to it would silently
+    disable the gate's main channel, where findings measure 99% true (69/70).
+
+    `missing_provides` was admitted on 2026-08-14. Before that it matched no
+    predicate here and no repair channel either, so it could only reach the
+    `die()`. That killed run 3bc46e7d — $20.32, 71 workers, 38 minutes, no
+    branch and no plan.json — on a finding whose named capability WAS provided
+    by an in-plan subtask, i.e. exactly the shape this predicate refutes
+    (docs/POSTMORTEM-2026-08-14.md, F4). Note repairing a `missing_provides` by
+    appending the tag to the named subtask's `provides` was considered and
+    rejected: unlike a `requires` edge, which only ORDERS existing work and
+    cannot invent any, a `provides` tag CLAIMS the work exists, so a wrong
+    repair would tell every consumer a capability is present when it is not."""
     by_id: dict[str, dict] = {
         s["id"]: s for plan in plans for s in plan.get("subtasks", []) or []
     }
@@ -22768,7 +22809,8 @@ def _filter_provably_false_wiring_defects(
             kept.append(d)
             continue
 
-        if kind.startswith("broken_by_") and tag in provided:
+        if (kind.startswith("broken_by_") or kind == "missing_provides") \
+                and tag in provided:
             notes.append(
                 f"{kind} {sid} / {tag!r}: capability is still provided by "
                 f"{', '.join(sorted(s for s in by_id if tag in (by_id[s].get('provides') or [])))}"
@@ -23911,18 +23953,20 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "\nAn independent review found the plan's declared dependency "
             "edges do not match the work the subtasks actually need (a subtask "
             "that should require a capability it never declares, or a merge/"
-            "drop that severed a real dependency). The gate already added "
-            "every edge it could resolve unambiguously — on the tag channel, "
-            "the subtask-id channel, and single-sub-file-cluster fan-outs. "
-            "What remains names a value that is NEITHER a surviving subtask "
-            "id NOR a tag any subtask provides (the plan is missing the work, "
-            "not just the edge), or a tag whose SEVERAL providers span "
-            "different sub-file clusters (ambiguous — only you can say "
-            "which), or would close a dependency cycle. This is a "
-            "correctness gate "
+            "drop that severed a real dependency). The gate already dismissed "
+            "every finding the plan provably contradicts and added every edge "
+            "it could resolve unambiguously — on the tag channel, the "
+            "subtask-id channel, and single-sub-file-cluster fan-outs. Each "
+            "line above carries the judge's own concrete_reason for that "
+            "finding; act on those rather than on this paragraph, which cannot "
+            "know which of them applies. "
+            "This is a correctness gate "
             "with no bypass flag: add the missing requires/provides/depends_on "
             "to the plan, or refine the task so the cross-subtask dependencies "
-            "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
+            "are unambiguous, then re-run. The plan this gate rejected is in "
+            "state.json's `plan_snapshot` — a run that dies in planning never "
+            "writes plan.json, so there is no plan file to edit. "
+            "(Note: --skip-overlap-judge does NOT "
             "bypass this gate — it only skips the phase 2¾ overlap judge, which "
             "runs earlier and independently. `resume` does not bypass it "
             "either: the gate re-runs until it passes, since its skip is keyed "
