@@ -25919,6 +25919,24 @@ async def _branch_head_sha(worktree: str) -> str:
     return r.stdout.strip()
 
 
+async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
+    """The merge base of `a` and `b` as a SHA, or empty string on failure.
+
+    Used to resolve a *snapshot* base for a comparison run inside a worktree.
+    A branch NAME cannot serve as that base when the worktree in question has
+    that branch checked out — the name moves the instant the worktree commits,
+    so the base and `HEAD` become the same ref and every comparison collapses
+    (DESIGN §9 *No clobbering the implementer's work*; see
+    docs/POSTMORTEM-2026-08-14.md, F2, where exactly that produced a false
+    clobber report on every run whose final conformer committed anything)."""
+    if not a or not b:
+        return ""
+    r = await run_proc(["git", "merge-base", a, b], cwd=worktree)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
 async def _protected_paths_since(worktree: str,
                                  before_sha: str) -> list[str]:
     """Return the list of protected paths the diff `before_sha..HEAD`
@@ -27699,12 +27717,29 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
 
     # Base ref and pre-pass snapshot for the clobber-survival check
-    # (DESIGN §9 *No clobbering the implementer's work*). Staging is cut
-    # from the run branch (setup-run.sh), so `run_branch..staging_before`
-    # is the union of all integrated implementer work; the run branch is
-    # the base version to compare against.
-    run_branch = _compute_run_branch(st.run_id)
+    # (DESIGN §9 *No clobbering the implementer's work*).
+    #
+    # The base is a SNAPSHOT SHA — the point the run branch forked from
+    # `working_branch` — and must NOT be the run branch itself. Staging is not
+    # merely "cut from" the run branch: `setup-run.sh` does
+    # `git worktree add "${STAGING_WT}" "${BRANCH}"`, so staging has that branch
+    # CHECKED OUT. Naming it as `base_ref` therefore makes
+    # `_blob_sha(base_ref, f)` and `_blob_sha("HEAD", f)` resolve the same ref,
+    # `b_head == b_base` is unconditionally true, and every file the final
+    # conformer edits is reported `(reverted-to-base)`. Measured on three real
+    # runs, the flagged set was exactly the file list of the conformer's own tip
+    # commit and none of those files was reverted; the two runs whose final
+    # conformer committed nothing reported nothing, which is the control. Under
+    # `--strict-conformer` the same false positive drives
+    # `_rollback_conformer_commits`, i.e. it would `git reset --hard` away every
+    # legitimate final-conformer fix (docs/POSTMORTEM-2026-08-14.md, F2).
+    #
+    # `fork_point..staging_before` is what the owned-set docstring actually
+    # means here: the union of all integrated implementer work. `git merge-base`
+    # yields it as a stable SHA even if `working_branch` has since moved.
     staging_before_sha = await _branch_head_sha(str(staging))
+    clobber_base_sha = await _merge_base_sha(
+        str(staging), working_branch, staging_before_sha)
     clobbered_files: list[str] = []
 
     # The final pass always runs the CANONICAL commands, never a delta proxy
@@ -27846,10 +27881,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
         # Clobber-survival check (DESIGN §9 *No clobbering the
         # implementer's work*): same guard as the per-subtask phase,
-        # scoped to the integrated staging tree. base=run_branch,
-        # impl_head=staging HEAD captured before this pass.
+        # scoped to the integrated staging tree. base=the fork-point SHA
+        # (NOT the run branch — staging has it checked out; see the comment
+        # where clobber_base_sha is computed), impl_head=staging HEAD captured
+        # before this pass.
         clobbered = await _clobbered_owned_files(
-            str(staging), run_branch, staging_before_sha)
+            str(staging), clobber_base_sha, staging_before_sha)
         if clobbered:
             clobbered_files = clobbered
             warnings.append(

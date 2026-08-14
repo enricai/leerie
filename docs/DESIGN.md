@@ -6520,8 +6520,18 @@ Two further disciplines apply, and they sit at the §12 axis:
   revert-to-base (the implementer's change was wrong and the conformer
   undid it) is indistinguishable from a clobber by git state alone, and
   the phase is advisory by design. The same guard applies to the
-  final-tree pass, using the run branch as the base and the staging HEAD
-  captured before that pass as the implementer-work snapshot. This is the
+  final-tree pass, using **a snapshot SHA** as the base and the staging HEAD
+  captured before that pass as the implementer-work snapshot. The base must be
+  the point the run branch forked from the working branch, resolved as a SHA —
+  emphatically *not* the run branch itself. The staging worktree has the run
+  branch **checked out**, so naming that branch as the base makes the base and
+  `HEAD` the same ref: the blob comparison then reports every file the final
+  conformer touched as reverted-to-base, and under `--strict-conformer` rolls
+  those legitimate fixes back. That is not a hypothetical — it is what the
+  spec said here until 2026-08-14, and it fired on every run whose final
+  conformer committed anything (docs/POSTMORTEM-2026-08-14.md, F2). Any ref
+  used as a comparison base in a worktree must be a snapshot, because a branch
+  name moves when that worktree commits. This is the
   §12 boundary again: the guarantee that matters (committed implementer
   work survives the conformer) is a code check, not a prompt rule.
 
