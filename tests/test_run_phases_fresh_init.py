@@ -8,10 +8,14 @@ state.json, because `State` creates the file and the seed raised before
 
 Nothing in the suite could see it, for two independent reasons:
 
-1. **No test executed this branch.** Only `test_resume_planning_reentry.py`
-   and `test_resume_planning_regression.py` execute `_run_phases`, and both
-   hardcode `resume=True`; `resume=False` appeared nowhere under `tests/`, and
-   no test executes `_orchestrate` either. Even
+1. **No test executed this branch.** Every path that executed `_run_phases`
+   did so with `resume=True`: `test_resume_planning_reentry.py` and
+   `test_resume_planning_regression.py` contain the call, and
+   `test_checkpoint_aliasing.py` and `test_wiring_gate_resume.py` reached it
+   through the `_drive` they import from the former — four files before this
+   one, and one `resume` value across all of them.
+   `resume=False` appeared nowhere under `tests/`, and no test executes
+   `_orchestrate` either. Even
    `test_wiring_gate_resume.py::test_fresh_run_invokes_the_gate` reuses that
    same `_args()` — "fresh" there means fresh *state*, not a fresh run.
 2. **The guard that existed was a key-presence AST walk.**
@@ -37,15 +41,29 @@ import subprocess
 
 import pytest
 
-# The single owner of the args/caps harness, imported in the same form as
-# tests/test_checkpoint_aliasing.py and tests/test_wiring_gate_resume.py.
-# A local copy would be a third one, which is the duplication class this repo
-# has been bitten by repeatedly (see the launcher-block and state-walk guards).
+# `_args` is imported rather than copied: it is the one definition with
+# importers (tests/test_checkpoint_aliasing.py and
+# tests/test_wiring_gate_resume.py take it too), and a local copy here would
+# have repeated every key in it — the duplication class this repo has been
+# bitten by repeatedly (see the launcher-block and state-walk guards).
+#
+# It is not the *only* `_args` in tests/, and this is not a single-owner rule
+# that a guard could enforce: test_resume_planning_regression.py maintains a
+# parallel harness with its own `_args` and `_drive`, and
+# test_absorb_supplied_answers.py has a purpose-built one with a different
+# signature. `_caps` is taken from the same module only for consistency — it is
+# a common local helper name that many test files define for themselves, not an
+# owned harness.
+#
+# No key counts in either sentence on purpose: those are properties of the
+# current tree and rot silently, unlike a measurement of a past event. The
+# figures live in this change's commit message, where they describe a moment.
+#
 # `resume=False` is passed at each call site rather than defaulted here, so
 # the branch under test is stated where it is exercised. The keys this file's
 # path additionally reads (subtask_tests, skip_coverage_check,
 # skip_completeness_check, skip_integration_check) are all `getattr(...,
-# default)` reads and need no entry in the shared dict.
+# default)` reads and need no entry in the imported dict.
 from tests.test_resume_planning_reentry import _args, _caps
 
 

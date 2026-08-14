@@ -3087,9 +3087,10 @@ nowhere under `tests/`, and no test executes `_orchestrate` either, so the
 branch that every real run takes was never run. Count the callers through the
 shared harness, not by grepping for the call: only
 `test_resume_planning_reentry.py` and `test_resume_planning_regression.py`
-contain one, but `test_checkpoint_aliasing.py` and `test_wiring_gate_resume.py`
-execute it too, via the `_drive` they import from the former — four files, one
-`resume` value. Note
+contained one, but `test_checkpoint_aliasing.py` and
+`test_wiring_gate_resume.py` executed it too, via the `_drive` they import from
+the former — four files before `test_run_phases_fresh_init.py` existed, and one
+`resume` value across all of them. Note
 `test_wiring_gate_resume.py::test_fresh_run_invokes_the_gate` reuses that same
 `_args()`: "fresh" there means fresh *state*, not a fresh run, which is how
 the gap reads as covered. Second, the guard that did exist —
@@ -3756,6 +3757,19 @@ was before this branch" (the feature came from the previous PR), "three
 alternatives are load-bearing" (four). Every one was a figure measured
 against an earlier state and carried forward after the state changed. If a
 message states a count, re-derive it against the diff you are about to push.
+
+**Re-deriving is not enough on its own: the command's scope must match the
+sentence's scope.** #208 — whose subject was *correcting* a claim written into
+CLAUDE.md without being derived — then carried two more underived numbers of a
+different shape. One was never measured at all ("21 of its 24 keys" — the
+function has 21, the copy had 25, and 24 is neither). The other was measured
+correctly and then described wrongly: "the three existing harness consumers
+plus the two new files pass together (61 tests)" — 61 was the output of a
+*six*-file pytest invocation, and the five files the sentence names collect 44.
+A number lifted from a command with a wider scope than the claim reads as
+verified and is not. So: run the command whose scope is exactly the sentence's
+scope, at the moment of writing, and if the sentence names a set of files, name
+that same set on the command line.
 
 ## Task completion checklist
 
