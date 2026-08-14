@@ -33,12 +33,12 @@ def _main_src(leerie) -> str:
 
 class TestRepoChecksPrecedeTheRunDirectory:
     def test_preflight_repo_exists_and_is_separate(self, leerie):
-        assert callable(leerie.preflight_repo)
+        assert callable(leerie._preflight_repo)
 
     def test_it_runs_before_State_is_constructed(self, leerie):
         """Ordering IS the fix — a behavioural test cannot see it."""
         src = _main_src(leerie)
-        pre = src.index("preflight_repo()")
+        pre = src.index("_preflight_repo()")
         state = src.index("st = State(leerie_root, run_id")
         assert pre < state, (
             "repo-state checks must run before State(...) mints the run "
@@ -53,7 +53,7 @@ class TestRepoChecksPrecedeTheRunDirectory:
         late = inspect.getsource(leerie.preflight)
         assert "modified/staged file(s)" not in late
         assert "is not configured" not in late
-        early = inspect.getsource(leerie.preflight_repo)
+        early = inspect.getsource(leerie._preflight_repo)
         assert "modified/staged file(s)" in early
         assert "is not configured" in early
 
@@ -62,12 +62,12 @@ class TestRepoChecksPrecedeTheRunDirectory:
         to protect — and re-checking would refuse a resume over a dirty tree
         the operator may be mid-way through fixing."""
         src = _main_src(leerie)
-        i = src.index("preflight_repo()")
+        i = src.index("_preflight_repo()")
         window = src[max(0, i - 400):i]
         assert "not args.resume" in window, window[-200:]
 
     def test_the_dirty_tree_message_names_the_files(self, leerie):
-        src = inspect.getsource(leerie.preflight_repo)
+        src = inspect.getsource(leerie._preflight_repo)
         assert "_shown" in src and "join(_shown)" in src, (
             "the message must list the offending paths — '2 modified/staged "
             "file(s)' sends the operator to `git status` to find out what "

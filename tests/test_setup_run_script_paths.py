@@ -134,8 +134,8 @@ def test_setup_run_reclaims_orphaned_staging_dir():
     )
     assert 'rm -rf "$STAGING_WT"' in non_comment
     assert '[ -d "$STAGING_WT" ]' in non_comment
-    assert 'git worktree prune' in non_comment, (
-        "setup-run.sh must run `git worktree prune` in an executable line — "
+    assert 'prune_leerie_worktrees' in non_comment, (
+        "setup-run.sh must run the scoped prune (prune_leerie_worktrees) in an executable line — "
         "the comment explaining prune's limits does not satisfy this."
     )
 

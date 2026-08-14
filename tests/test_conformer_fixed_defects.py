@@ -36,13 +36,13 @@ def _defect(**over):
 
 
 def test_a_fixed_defect_is_not_actionable(leerie):
-    res = {"solution_defects": [_defect(status="fixed")]}
+    res = {"solution_defects": [_defect(fixed=True)]}
     assert leerie._actionable_solution_defects(res) == []
 
 
 def test_a_residual_defect_still_gates(leerie):
     """Anti-vacuity: the gating axis must not be disabled wholesale."""
-    res = {"solution_defects": [_defect(status="residual")]}
+    res = {"solution_defects": [_defect(fixed=False)]}
     assert len(leerie._actionable_solution_defects(res)) == 1
 
 
@@ -55,8 +55,8 @@ def test_absent_status_still_gates(leerie):
 def test_the_incident_shape(leerie):
     """Both entries at once: one repaired, one genuinely left."""
     res = {"solution_defects": [
-        _defect(status="fixed"),
-        _defect(status="residual", where="src/lib/other.ts"),
+        _defect(fixed=True),
+        _defect(fixed=False, where="src/lib/other.ts"),
     ]}
     out = leerie._actionable_solution_defects(res)
     assert len(out) == 1 and out[0]["where"] == "src/lib/other.ts"
@@ -64,14 +64,14 @@ def test_the_incident_shape(leerie):
 
 def test_a_fixed_defect_missing_evidence_is_still_dropped(leerie):
     """The anti-gaming guard is unchanged and independent."""
-    res = {"solution_defects": [_defect(status="fixed", concrete_case="")]}
+    res = {"solution_defects": [_defect(fixed=True, concrete_case="")]}
     assert leerie._actionable_solution_defects(res) == []
 
 
-def test_schema_carries_the_status_enum(leerie):
+def test_schema_carries_the_fixed_flag(leerie):
     props = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
              ["items"]["properties"])
-    assert props["status"]["enum"] == ["fixed", "residual"]
+    assert props["fixed"]["type"] == "boolean"
 
 
 def test_status_is_optional(leerie):
@@ -79,16 +79,23 @@ def test_status_is_optional(leerie):
     on wiring_judge (9 of 66 invalid, all on one field)."""
     req = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
            ["items"]["required"])
-    assert "status" not in req
+    assert "fixed" not in req
 
 
-def test_it_mirrors_rule_violations(leerie):
-    """The precedent it follows, in the same schema."""
-    rv = (leerie.SCHEMAS["conformer"]["properties"]["rule_violations"]
-          ["items"]["properties"]["status"]["enum"])
-    sd = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
-          ["items"]["properties"]["status"]["enum"])
-    assert rv == sd
+def test_it_is_a_bool_because_the_schema_has_a_hard_size_bound(leerie):
+    """Deliberately NOT a `status` enum mirroring rule_violations.
+
+    This schema has a 2550-byte dumped bound, because the strict-output grammar
+    compiler has actually rejected it when larger (DESIGN §7, N29). The enum
+    encoding costs 59 bytes and the bool 28; only the bool fits. The
+    consistency with rule_violations is worth less than worker output that
+    validates at all.
+    """
+    import json
+    props = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
+             ["items"]["properties"])
+    assert props["fixed"] == {"type": "boolean"}
+    assert len(json.dumps(leerie.SCHEMAS["conformer"])) < 2550
 
 
 def test_no_path_overlap_inference(leerie):
@@ -110,5 +117,5 @@ def test_the_prompt_asks_for_it(leerie):
     from pathlib import Path
     prompt = (Path(__file__).resolve().parent.parent
               / "prompts" / "conformer.md").read_text()
-    assert "`status`" in prompt and '"fixed"' in prompt, (
+    assert "`fixed`" in prompt, (
         "the conformer must be told the field exists and what it costs to omit")

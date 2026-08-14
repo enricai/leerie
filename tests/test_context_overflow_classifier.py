@@ -168,12 +168,16 @@ class TestWiring:
         assert "capture_repo_deps(" in arm, (
             "the ContextOverflow arm skips the best-effort dep capture its "
             "sibling terminating arms all perform")
-        assert "except (Exception, TerminalAuthFailure, RateLimitedExit," in arm \
-            and "ContextOverflow" in arm.split(
-                "except (Exception, TerminalAuthFailure, RateLimitedExit,", 1)[1] \
-                .split(") as", 1)[0], (
-            "the arm's own capture guard must catch ContextOverflow — "
-            "capture_repo_deps calls claude_p, which can raise it again")
+        # Membership, not literal tuple text: the order of these names is not
+        # the property under test, and pinning the exact prefix made this fail
+        # when KeyboardInterrupt was added to every terminal arm's guard.
+        assert "except (" in arm
+        guard = arm.split("except (", 1)[1].split(") as", 1)[0]
+        for required in ("Exception", "ContextOverflow", "KeyboardInterrupt"):
+            assert required in guard, (
+                f"the arm's own capture guard must catch {required} — "
+                "capture_repo_deps calls claude_p, which can raise it again, "
+                f"and a Ctrl-C during that capture escapes main(). guard: {guard}")
         # The capture must precede the exit_code assignment; an escape past an
         # unguarded call skips it. The ordering *is* the property under test.
         assert arm.index("capture_repo_deps(") < arm.index("exit_code =")
