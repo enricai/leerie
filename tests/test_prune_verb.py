@@ -136,6 +136,69 @@ def test_orphaned_subtask_branches_are_removed(tmp_path):
     assert "my-own-work" in out, "a user branch is never in scope"
 
 
+class TestBranchReapingFailsClosed:
+    """`live` is populated ONLY by the loop over `<root>/runs`. Without that
+    directory it stays empty, every `leerie/subtasks/*` ref reads as orphaned,
+    and `--apply` force-deletes all of them — including branches of runs that
+    are executing right now, with unmerged work.
+
+    Reached by a mistyped or unset `LEERIE_STATE_DIR`, a renamed state root, or
+    a first run on a fresh install. `test_stale_cache_entries_are_reclaimed`
+    already drives this exact path; it passes only because its fixture repo has
+    no leerie branches to lose.
+    """
+
+    def test_no_runs_dir_reaps_no_branches(self, tmp_path):
+        root = tmp_path / "state"
+        (root / "repo-map-cache").mkdir(parents=True)   # root exists, runs/ does not
+        repo = _repo(tmp_path)
+        _git(repo, "branch", "leerie/subtasks/run-a/feat-001")
+        _git(repo, "branch", "leerie/subtasks/run-b/feat-002")
+        r = _prune(root, repo, "--apply")
+        assert r.returncode == 0, r.stderr
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/run-a/feat-001" in out
+        assert "leerie/subtasks/run-b/feat-002" in out
+
+    def test_it_says_why_it_skipped(self, tmp_path):
+        root = tmp_path / "state"
+        (root / "repo-map-cache").mkdir(parents=True)
+        r = _prune(root, _repo(tmp_path), "--apply")
+        assert "skipped branch reaping" in r.stdout
+
+    def test_a_present_runs_dir_still_reaps(self, tmp_path):
+        """Anti-vacuity: failing closed must not disable reaping outright.
+
+        `runs/` exists and lists no live run, so the orphan really is an
+        orphan and must still go.
+        """
+        root = tmp_path / "state"
+        (root / "runs").mkdir(parents=True)
+        repo = _repo(tmp_path)
+        _git(repo, "branch", "leerie/subtasks/dead-run/feat-001")
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/dead-run/feat-001" not in out
+
+
+def test_apply_removes_a_killed_run(tmp_path):
+    """`killed_at` is the second terminal key in the predicate; only
+    `finished_at` was exercised on the deletion path."""
+    root = tmp_path / "state"
+    d = _run_dir(root, "old-killed", old=True, killed_at="t")
+    assert _prune(root, _repo(tmp_path), "--apply").returncode == 0
+    assert not d.exists()
+
+
+def test_older_than_accepts_the_equals_form(tmp_path):
+    """Both spellings are implemented in the arg loop; only the space-separated
+    one was tested."""
+    root = tmp_path / "state"
+    d = _run_dir(root, "old-done", old=True, finished_at="t")
+    assert _prune(root, _repo(tmp_path), "--older-than=90", "--apply").returncode == 0
+    assert d.is_dir(), "60 days old must survive a 90-day cutoff"
+
+
 def test_rejects_a_non_numeric_cutoff(tmp_path):
     r = _prune(tmp_path / "state", _repo(tmp_path), "--older-than", "soon")
     assert r.returncode == 1 and "whole number" in r.stderr

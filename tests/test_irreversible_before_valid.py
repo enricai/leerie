@@ -20,9 +20,31 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
+import tokenize
 from pathlib import Path
 
 import pytest
+
+
+def _strip_comments(src: str) -> str:
+    """Source with `#` comments removed, via `tokenize`.
+
+    Not a `#`-prefix line heuristic: a `#` inside a string literal would
+    corrupt the result. Needed because the comments in the region under test
+    necessarily *name* the calls being counted — scanning raw source finds the
+    prose describing the rule as though it were the rule.
+    """
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    return "".join(out)
 
 _ORCH = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
 
@@ -32,8 +54,15 @@ def _main_src(leerie) -> str:
 
 
 class TestRepoChecksPrecedeTheRunDirectory:
-    def test_preflight_repo_exists_and_is_separate(self, leerie):
-        assert callable(leerie._preflight_repo)
+    def test_preflight_repo_owns_all_three_checks(self, leerie):
+        """Not merely that it exists — existence-only pins guarantee a helper
+        stays present, possibly dead. What matters is that it is the one place
+        the three repo checks live, which is also what makes
+        `test_the_repo_checks_moved_out_of_preflight` meaningful."""
+        src = inspect.getsource(leerie._preflight_repo)
+        assert "user.email" in src and "user.name" in src
+        assert "modified/staged file(s)" in src
+        assert "is not configured" in src
 
     def test_it_runs_before_State_is_constructed(self, leerie):
         """Ordering IS the fix — a behavioural test cannot see it."""
@@ -149,3 +178,34 @@ class TestNeverStartedIsRestartable:
         src = inspect.getsource(leerie._run_phases)
         assert "neither progress nor a" in src, (
             "the one genuinely unusable state must still die")
+
+    def test_the_demotion_runs_the_repo_preflight(self, leerie):
+        """`main()` gates `_preflight_repo()` on `if not args.resume:`, and
+        this demotion happens long after that gate was passed. Without an
+        explicit call here, a demoted resume starts real work as a fresh run
+        having skipped git-identity, dirty-tree and branch-collision — checks
+        that live ONLY in `_preflight_repo()` since the split, so the later
+        `preflight()` does not cover them.
+        """
+        src = inspect.getsource(leerie._run_phases)
+        i = src.index("args.resume = False")
+        window = src[i:i + 900]
+        assert "await _preflight_repo()" in window, (
+            "the demoted resume is a fresh start and must be preflighted "
+            "like one")
+
+    def test_an_ordinary_resume_still_skips_the_repo_preflight(self, leerie):
+        """Anti-vacuity: the call must sit inside the demotion branch, not at
+        the top of `_run_phases` where it would refuse every resume over a
+        dirty tree the operator may be mid-way through fixing."""
+        # Comments stripped first: the ones around the call necessarily name
+        # `_preflight_repo()` while explaining why it is there, so a raw scan
+        # counts the prose describing the rule as instances of the rule.
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
+        assert src.count("_preflight_repo()") == 1, (
+            "exactly one call, and it belongs to the demotion branch")
+        call = src.index("_preflight_repo()")
+        demote = src.index("args.resume = False")
+        assert demote < call, (
+            "preflighting before the demotion decision would catch every "
+            "resume, not just the one that becomes a fresh start")

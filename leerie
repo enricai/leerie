@@ -1417,7 +1417,7 @@ cutoff = time.time() - days * 86400
 freed = 0
 runs_removed = []
 
-def size_of(p):
+def size_of(p: "os.PathLike[str] | str") -> int:
     total = 0
     for dirpath, _dirnames, filenames in os.walk(p):
         for f in filenames:
@@ -1467,14 +1467,28 @@ if cache.is_dir():
 
 # Subtask branches whose run dir is gone. Scoped to leerie/subtasks/<run-id>/*
 # so a user branch is never in scope.
+#
+# FAIL CLOSED when there is no `runs/` at all. `live` is populated only by the
+# loop above, so without that directory it stays empty and EVERY
+# leerie/subtasks/* ref reads as orphaned -- `git branch -D` on all of them,
+# force-deleting unmerged work belonging to runs that may be executing right
+# now. A state root with no runs directory cannot answer "which runs are
+# live?", and the honest answer to a question you cannot answer is to reap
+# nothing. Reached by a mistyped or unset LEERIE_STATE_DIR, a renamed state
+# root, or a first run on a fresh install.
 branches_removed = []
-try:
-    out = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)",
-         "refs/heads/leerie/subtasks"],
-        cwd=str(repo), capture_output=True, text=True, check=False).stdout
-except OSError:
-    out = ""
+out = ""
+if not runs.is_dir():
+    print(f"  skipped branch reaping: no {runs} — cannot tell which runs are "
+          "live, so no branch is safe to delete")
+else:
+    try:
+        out = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:short)",
+             "refs/heads/leerie/subtasks"],
+            cwd=str(repo), capture_output=True, text=True, check=False).stdout
+    except OSError:
+        out = ""
 for ref in out.splitlines():
     parts = ref.split("/")
     if len(parts) < 4:

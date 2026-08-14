@@ -26319,6 +26319,38 @@ async def _branch_head_sha(worktree: str) -> str:
     return r.stdout.strip()
 
 
+async def _create_empty_subtask_branch(repo_root: str, run_id: str,
+                                       sid: str) -> bool:
+    """Point this subtask's branch at the run-branch tip, creating no commits.
+
+    A subtask settled complete WITHOUT running its implementer has no branch:
+    `new-worktree.sh` runs inside `_run_implementer`, so nothing ever created
+    `leerie/subtasks/<run-id>/<sid>`. But `integrate_wave` filters only on
+    `status == "complete"`, so such a subtask still reaches `integrate.sh`,
+    which exits 2 on a missing branch and takes the whole run down with it.
+
+    The post-execution rescue never hit this because its implementer DID run:
+    the branch exists with zero commits, and `git merge --no-ff` of a
+    zero-commit branch is a clean no-op (pinned by
+    `tests/test_mid_run_satisfied_no_commits.py`). So the fix is to give the
+    pre-spawn path the same shape rather than to teach `integrate_wave` a
+    second meaning of "complete" -- which would also mask a branch that is
+    missing for a real reason.
+
+    Returns True when the branch exists afterwards. Idempotent: an existing
+    branch (a resume re-entering `_settle_subtask`) is left exactly where it
+    is, never repointed, since by then it may carry commits."""
+    branch = _compute_subtask_branch(run_id, sid)
+    exists = await run_proc(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_root)
+    if exists.returncode == 0:
+        return True
+    r = await run_proc(["git", "branch", branch, _compute_run_branch(run_id)],
+                       cwd=repo_root)
+    return r.returncode == 0
+
+
 async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
     """The merge base of `a` and `b` as a SHA, or empty string on failure.
 
@@ -28577,11 +28609,24 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # and the audit is worth being able to tell apart — one cost a
                 # probe, the other cost an implementer first.
                 pre_drop["reason"] = "already_satisfied_pre_spawn"
-                log(f"  {sid}: flagged at plan time as provider-subset, and "
-                    "its success criteria are already met on the run branch — "
-                    "settling complete without spawning an implementer. "
-                    f"{pre_drop['evidence'][:160]}")
-                return _settle_already_satisfied(sid, pre_drop, st)
+                # No implementer ran, so no branch exists -- and `integrate_wave`
+                # filters only on `status == "complete"`, so this subtask still
+                # reaches `integrate.sh`, which exits 2 on a missing branch and
+                # die()s the run. Give it the same zero-commit branch the
+                # post-execution rescue's subtask already has. On failure, fall
+                # through to the implementer rather than settling: a settle we
+                # cannot make integrable is strictly worse than the spend.
+                if await _create_empty_subtask_branch(
+                        str(st.repo_root), st.run_id, sid):
+                    log(f"  {sid}: flagged at plan time as provider-subset, and "
+                        "its success criteria are already met on the run "
+                        "branch — settling complete without spawning an "
+                        f"implementer. {pre_drop['evidence'][:160]}")
+                    return _settle_already_satisfied(sid, pre_drop, st)
+                log(f"  {sid}: criteria already met on the run branch, but its "
+                    "subtask branch could not be created — running the "
+                    "implementer rather than settling a subtask integration "
+                    "cannot merge.")
 
     while True:
         try:
@@ -30564,6 +30609,18 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # another ("a task description is required").
             args.task = st.data["task"]
             args.resume = False
+            # `main()` gates `_preflight_repo()` on `if not args.resume:`, and
+            # this demotion happens after that gate has already been passed —
+            # so without this call the run proceeds as a FRESH run having
+            # skipped the git-identity, dirty-tree and branch-collision checks
+            # that every other fresh run gets. They live only in
+            # `_preflight_repo()` since it was split out of `preflight()`
+            # (POSTMORTEM-2026-08-14, F14), so `preflight()` below does not
+            # cover them. The skip-on-resume rationale does not apply here
+            # either: its point is that a resumed run's directory already
+            # exists so there is nothing left to protect, and what this path
+            # is about to do is start the work for the first time.
+            await _preflight_repo()
     if args.resume:
         if not st.load():
             die(f"nothing to resume — no state.json at {_operator_path(st.path)}")

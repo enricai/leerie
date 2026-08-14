@@ -99,6 +99,21 @@ class TestTheProbeRunsBeforeTheSpend:
     def _src(leerie) -> str:
         return inspect.getsource(leerie._settle_subtask)
 
+    @classmethod
+    def _block(cls, leerie) -> str:
+        """The pre-spawn block, sliced BY STRUCTURE — from the flag read to the
+        `while True:` that begins the implementer loop.
+
+        Not a fixed character window: the first version used 1400 chars and
+        truncated mid-block the moment the branch-creation step landed,
+        reporting a call as missing when it was merely past the cutoff. This
+        repo has hit that exact trap twice before.
+        """
+        src = cls._src(leerie)
+        i = src.index('st.data.get("provider_subset_sids")')
+        end = src.index("\n    while True:", i)
+        return src[i:end]
+
     def test_the_flag_is_read_in_settle(self, leerie):
         assert 'st.data.get("provider_subset_sids")' in self._src(leerie)
 
@@ -115,9 +130,7 @@ class TestTheProbeRunsBeforeTheSpend:
         """The subtask's own worktree does not exist yet — `new-worktree.sh`
         runs inside `_run_implementer` — and staging sits at the run-branch
         HEAD, the ref the post-hoc rescue measures against."""
-        src = self._src(leerie)
-        i = src.index('st.data.get("provider_subset_sids")')
-        window = src[i:i + 1400]
+        window = self._block(leerie)
         assert '"worktrees" / "staging"' in window
         assert ".is_dir()" in window, (
             "a missing staging worktree must skip the probe, not crash")
@@ -130,14 +143,10 @@ class TestTheProbeRunsBeforeTheSpend:
         assert 'label="pre"' in self._src(leerie)
 
     def test_the_settle_goes_through_the_shared_helper(self, leerie):
-        src = self._src(leerie)
-        i = src.index('st.data.get("provider_subset_sids")')
-        assert "_settle_already_satisfied(" in src[i:i + 1400]
+        assert "_settle_already_satisfied(" in self._block(leerie)
 
     def test_the_audit_distinguishes_the_two_moments(self, leerie):
-        src = self._src(leerie)
-        i = src.index('st.data.get("provider_subset_sids")')
-        assert '"already_satisfied_pre_spawn"' in src[i:i + 1400], (
+        assert '"already_satisfied_pre_spawn"' in self._block(leerie), (
             "one settlement cost a probe and the other cost a worker first; "
             "the audit should say which")
 
@@ -146,9 +155,7 @@ class TestTheFlagAloneNeverSettles:
     """Anti-vacuity: the advisory must not have become a drop."""
 
     def test_a_declining_probe_leaves_the_subtask_alone(self, leerie):
-        src = inspect.getsource(leerie._settle_subtask)
-        i = src.index('st.data.get("provider_subset_sids")')
-        window = src[i:i + 1400]
+        window = TestTheProbeRunsBeforeTheSpend._block(leerie)
         assert "if pre_drop is not None:" in window, (
             "the settle must be conditional on the probe's verdict, never on "
             "the flag")
