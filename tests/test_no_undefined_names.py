@@ -15,8 +15,10 @@ The rule is the same one ruff's F821 applies — a symbol that is *referenced*,
 resolves to *global* scope, and is bound neither at module level nor in
 `builtins` will raise `NameError` when that line runs.
 
-Measured when this file landed: 1 finding in `orchestrator/leerie.py` (the
-v0.20.0 defect) and 0 across 446 files under `tests/`.
+Measured when this file landed: 1 finding in `orchestrator/leerie.py` — the
+v0.20.0 defect — and 0 everywhere else it looks. Stated without a file count
+on purpose: that number moves with every test added, so a figure written here
+is stale by the next commit and says nothing the scan does not re-derive.
 """
 
 from __future__ import annotations
