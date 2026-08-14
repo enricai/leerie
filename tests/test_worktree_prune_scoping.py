@@ -22,7 +22,10 @@ git's, so a stubbed one would prove nothing.
 from __future__ import annotations
 
 import re
+import ast
+import io
 import subprocess
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -30,6 +33,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
 _SCRIPTS_WITH_PRUNE = ("new-worktree.sh", "setup-run.sh", "cleanup.sh")
+
+# Every file that must not contain a repository-global prune, DERIVED rather
+# than named. The first version was a three-filename tuple covering
+# `scripts/*.sh` only, so four bare `git worktree prune` calls in
+# `orchestrator/leerie.py` — running inside the container against the same
+# shared `.git`, i.e. the identical F19 hazard — were invisible to it, and the
+# commit that claimed to have swept "all four" had counted the shell ones.
+# This is the enumeration-not-derivation class CLAUDE.md records in #180-#183.
+_PRUNE_SURFACE = (
+    sorted((REPO_ROOT / "scripts").glob("*.sh"))
+    + sorted((REPO_ROOT / "orchestrator").glob("*.py"))
+    + [REPO_ROOT / "leerie"]
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -150,6 +166,62 @@ def test_outside_a_git_repo_is_a_silent_no_op(tmp_path):
 
 
 
+
+def _shell_code_only(src: str) -> str:
+    """Shell source with comments removed, including TRAILING ones.
+
+    The `#`-prefix line heuristic this replaces made the guard depend on where
+    a comment sat: `prune_leerie_worktrees "$X"  # never a bare git worktree
+    prune here` failed, while the same words on their own line passed. These
+    three scripts carry ~10 explanatory comment lines each precisely because
+    the construct is forbidden, so that is a guard which fails on correct code.
+
+    Quote-aware rather than a bare `#` split: `${VAR#prefix}` and a `#` inside
+    a string are not comments.
+    """
+    out = []
+    for line in src.splitlines():
+        q = None
+        for i, ch in enumerate(line):
+            if q:
+                if ch == q:
+                    q = None
+                continue
+            if ch in "'\"":
+                q = ch
+                continue
+            if ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                line = line[:i]
+                break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _code_only(src: str) -> str:
+    """Python source with comments and docstrings removed, via `tokenize`."""
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    text = "".join(out)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Module)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                text = text.replace(doc, "", 1)
+    return text
+
+
 def _bare_prune_offenders(code: str) -> list[str]:
     """Lines running a repository-global `git worktree prune`.
 
@@ -160,7 +232,18 @@ def _bare_prune_offenders(code: str) -> list[str]:
     leading options are matched explicitly.
     """
     pat = re.compile(r"\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+worktree\s+prune\b")
-    return [l.strip() for l in code.splitlines() if pat.search(l)]
+    out = []
+    for l in code.splitlines():
+        if not pat.search(l):
+            continue
+        # `-n`/`--dry-run` ASKS git what it would prune and removes nothing —
+        # it is what a scoped implementation is built on, and
+        # `scripts/worktree-lib.sh` runs exactly that. Flagging it forbids the
+        # fix.
+        if re.search(r"\bprune\b[^\n]*(?:\s-n\b|--dry-run\b)", l):
+            continue
+        out.append(l.strip())
+    return out
 
 @pytest.mark.parametrize("script", _SCRIPTS_WITH_PRUNE)
 def test_no_script_runs_a_bare_prune(script):
@@ -170,8 +253,7 @@ def test_no_script_runs_a_bare_prune(script):
     construct they forbid, so a raw scan matches the prose explaining it.
     """
     src = (REPO_ROOT / "scripts" / script).read_text()
-    code = "\n".join(l for l in src.splitlines()
-                     if not l.lstrip().startswith("#"))
+    code = _shell_code_only(src)
     assert not _bare_prune_offenders(code), (
         f"{script} still runs a repository-global prune; use "
         "prune_leerie_worktrees \"$LEERIE_ROOT\": "
@@ -214,3 +296,74 @@ def test_the_scan_leaves_the_replacement_alone(benign):
     code = "\n".join(l for l in benign.splitlines()
                      if not l.lstrip().startswith("#"))
     assert not _bare_prune_offenders(code), benign
+
+
+# --- the derived sweep -------------------------------------------------------
+
+def _python_bare_prune_offenders(code: str) -> list[str]:
+    """Lines running a repository-global prune from Python.
+
+    `["git", "worktree", "prune"]` as an argv list, with nothing scoping it.
+    The `-n`/`-v` dry-run form `_prune_leerie_worktrees` itself uses is what a
+    scoped implementation looks like, so it is not an offender.
+    """
+    out = []
+    for line in code.splitlines():
+        if '"worktree", "prune"' not in line:
+            continue
+        if '"-n"' in line or '"--dry-run"' in line:
+            continue
+        out.append(line.strip())
+    return out
+
+
+@pytest.mark.parametrize("path", _PRUNE_SURFACE, ids=lambda p: p.name)
+def test_no_file_anywhere_runs_a_bare_prune(path):
+    """The whole surface, not a hand-kept list of three shell scripts."""
+    raw = path.read_text()
+    code = _code_only(raw) if path.suffix == ".py" else _shell_code_only(raw)
+    # Per-language, deliberately. The shell regex matches free prose, and a
+    # Python file's docstrings necessarily NAME the construct they forbid — so
+    # running it over `.py` flags the very comments explaining the rule.
+    offenders = (_python_bare_prune_offenders(code) if path.suffix == ".py"
+                 else _bare_prune_offenders(code))
+    assert not offenders, (
+        f"{path.name} runs a repository-global `git worktree prune` against "
+        "the shared, bind-mounted .git — use the scoped helper "
+        "(`prune_leerie_worktrees` in shell, `_prune_leerie_worktrees` in "
+        "Python):\n  " + "\n  ".join(offenders))
+
+
+def test_the_derived_surface_is_not_empty():
+    """Anti-vacuity: a glob that matches nothing passes every case above."""
+    names = {p.name for p in _PRUNE_SURFACE}
+    assert len(_PRUNE_SURFACE) > 10, _PRUNE_SURFACE
+    for required in ("cleanup.sh", "new-worktree.sh", "setup-run.sh",
+                     "leerie.py", "leerie"):
+        assert required in names, f"{required} missing from the derived surface"
+
+
+@pytest.mark.parametrize("evasion", [
+    '    subprocess.run(["git", "worktree", "prune"], check=False)',
+    '    await run_proc(["git", "worktree", "prune"])',
+])
+def test_the_python_scan_fires_on_a_bare_prune(evasion):
+    """The four real call sites, in the shape they actually had."""
+    assert _python_bare_prune_offenders(evasion), evasion
+
+
+def test_the_python_scan_leaves_the_scoped_helper_alone():
+    """The helper itself runs `git worktree prune -n -v` to ASK what git would
+    prune. Flagging that would forbid the fix."""
+    assert not _python_bare_prune_offenders(
+        '    r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],')
+
+
+def test_the_orchestrator_has_a_scoped_helper():
+    """Anti-vacuity for the sweep: passing because the calls were deleted
+    outright would be a different (worse) outcome — the prune is what clears
+    the stale metadata a SIGKILLed run leaves behind."""
+    src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
+    assert "def _prune_leerie_worktrees(" in src
+    assert src.count("_prune_leerie_worktrees(") >= 5, (
+        "the definition plus its four call sites")

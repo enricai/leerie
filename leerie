@@ -1465,30 +1465,38 @@ if cache.is_dir():
         except OSError:
             pass
 
-# Subtask branches whose run dir is gone. Scoped to leerie/subtasks/<run-id>/*
-# so a user branch is never in scope.
+# Subtask branches, scoped to leerie/subtasks/<run-id>/* so a user branch is
+# never in scope.
 #
-# FAIL CLOSED when there is no `runs/` at all. `live` is populated only by the
-# loop above, so without that directory it stays empty and EVERY
-# leerie/subtasks/* ref reads as orphaned -- `git branch -D` on all of them,
-# force-deleting unmerged work belonging to runs that may be executing right
-# now. A state root with no runs directory cannot answer "which runs are
-# live?", and the honest answer to a question you cannot answer is to reap
-# nothing. Reached by a mistyped or unset LEERIE_STATE_DIR, a renamed state
-# root, or a first run on a fresh install.
+# REAPING NEEDS POSITIVE EVIDENCE, and there are only two kinds of it.
+#
+# The tempting rule -- "this run dir is not in <state-root>/runs, so the branch
+# is orphaned" -- is wrong, and destructively so. It infers death from ABSENCE,
+# and a state root is silent about every run it never owned: point `prune` at a
+# different root than the run used (a second shell without LEERIE_STATE_DIR
+# exported is enough, and both roots pass the .owner check when they belong to
+# the same repo) and every branch reads as orphaned. Reproduced: a paused run's
+# `leerie/subtasks/<id>/feat-001`, holding the only copy of its implementer
+# commits, force-deleted and recoverable only from the reflog. Guarding this on
+# `runs.is_dir()` does not help -- the orchestrator creates that directory
+# unconditionally and nothing ever removes it, so on any host that has run
+# leerie once the guard can never fire.
+#
+# So:
+#   * a run dir THIS prune just removed is known terminal and old -> `-D`.
+#   * anything else gets `git branch -d`, which git refuses when the branch is
+#     unmerged. A stale merged branch is still reclaimed; unmerged work cannot
+#     be lost, whatever this root does or does not know.
 branches_removed = []
-out = ""
-if not runs.is_dir():
-    print(f"  skipped branch reaping: no {runs} — cannot tell which runs are "
-          "live, so no branch is safe to delete")
-else:
-    try:
-        out = subprocess.run(
-            ["git", "for-each-ref", "--format=%(refname:short)",
-             "refs/heads/leerie/subtasks"],
-            cwd=str(repo), capture_output=True, text=True, check=False).stdout
-    except OSError:
-        out = ""
+branches_kept = 0
+try:
+    out = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:short)",
+         "refs/heads/leerie/subtasks"],
+        cwd=str(repo), capture_output=True, text=True, check=False).stdout
+except OSError:
+    out = ""
+_reaped = set(runs_removed)
 for ref in out.splitlines():
     parts = ref.split("/")
     if len(parts) < 4:
@@ -1496,16 +1504,30 @@ for ref in out.splitlines():
     run_id = parts[2]
     if run_id in live:
         continue
-    branches_removed.append(ref)
-    if apply:
-        subprocess.run(["git", "branch", "-D", ref], cwd=str(repo),
-                       capture_output=True, check=False)
+    # `-D` only where this prune itself established the run is over.
+    flag = "-D" if run_id in _reaped else "-d"
+    if not apply:
+        branches_removed.append(ref)
+        continue
+    r = subprocess.run(["git", "branch", flag, ref], cwd=str(repo),
+                       capture_output=True, text=True, check=False)
+    if r.returncode == 0:
+        branches_removed.append(ref)
+    else:
+        # `-d` refused: the branch is unmerged, i.e. it holds work. Keeping it
+        # is the whole point.
+        branches_kept += 1
 
 verb = "removed" if apply else "would remove"
 print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
 print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
 print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
 print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
+if branches_kept:
+    # Never silent. A branch that survived did so because it holds unmerged
+    # commits, which is exactly what an operator running `prune` wants told.
+    print(f"  kept {branches_kept} subtask branch(es) with unmerged commits "
+          "(use `scripts/cleanup.sh --subtask-branches` to force)")
 print(f"  {verb} ~{freed / 1048576:.1f} MiB")
 if not apply:
     print("  (dry-run — re-run with --apply to delete)")

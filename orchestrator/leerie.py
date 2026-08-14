@@ -3687,11 +3687,9 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         log(f"  cleanup: {failed_removals} worktree(s) not removed within "
             f"{worktree_remove_timeout}s — run "
             f"`scripts/cleanup.sh --run-id {st.run_id}` to finish manually")
-    try:
-        subprocess.run(["git", "worktree", "prune"],
-                       capture_output=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    # Scoped: a bare prune here is repository-global against the shared,
+    # bind-mounted `.git` and drops the host's own registrations (F19).
+    _prune_leerie_worktrees(st.leerie_root)
     if not full_purge:
         return
     # Full purge: delete branches and the run dir. The run branch lives
@@ -3721,6 +3719,69 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         shutil.rmtree(st.run_dir, ignore_errors=True)
 
 
+def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
+    """Scoped replacement for a bare `git worktree prune`. Python port of
+    `scripts/worktree-lib.sh`'s `prune_leerie_worktrees`, for the orchestrator's
+    own call sites.
+
+    The repo is bind-mounted whole, so `.git` is SHARED with the host and with
+    any other container. A bare prune is repository-global and has no grace
+    period (`gc.worktreePruneExpire` applies to `git gc`, not to an explicit
+    prune), so it drops the registration of every worktree whose path is absent
+    from *this* namespace — including each host-side
+    `/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
+    can see (docs/POSTMORTEM-2026-08-14.md, F19).
+
+    The shell scripts were converted first and these four Python sites were
+    missed, because the sweep and its guard were both scoped to `scripts/*.sh`.
+
+    Asks git what it *would* prune, attributes each entry to a path, and removes
+    only registrations under `leerie_root`. An entry that cannot be attributed
+    is left strictly alone — deleting a registration we cannot identify is the
+    accident this exists to prevent. Best-effort throughout: pruning is
+    housekeeping, and a failure here must never take down the caller."""
+    root = str(Path(leerie_root).resolve())
+    try:
+        gd = subprocess.run(["git", "rev-parse", "--path-format=absolute",
+                             "--git-common-dir"],
+                            capture_output=True, text=True, check=False,
+                            timeout=10)
+        if gd.returncode != 0 or not gd.stdout.strip():
+            return
+        git_dir = Path(gd.stdout.strip())
+        # `2>&1`: `git worktree prune -n -v` reports on STDERR, so reading only
+        # stdout yields an empty list and prunes nothing — a silent no-op
+        # indistinguishable from "nothing was stale".
+        r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],
+                           capture_output=True, text=True, check=False,
+                           timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        line = line.strip()
+        if not line.startswith("Removing worktrees/"):
+            continue
+        name = line[len("Removing worktrees/"):].split(":", 1)[0].strip()
+        if not name:
+            continue
+        entry = git_dir / "worktrees" / name
+        try:
+            wt = (entry / "gitdir").read_text().strip()
+        except OSError:
+            continue
+        if wt.endswith("/.git"):
+            wt = wt[:-len("/.git")]
+        if not wt:
+            continue
+        try:
+            resolved = str(Path(wt).resolve())
+        except OSError:
+            continue
+        if resolved != root and not resolved.startswith(root + os.sep):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -3744,7 +3805,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    await run_proc(["git", "worktree", "prune"])
+    _prune_leerie_worktrees(leerie_dir)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -3766,7 +3827,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    await run_proc(["git", "worktree", "prune"])
+    _prune_leerie_worktrees(leerie_dir)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -29549,7 +29610,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # from the prior invocation persists on the volume. Prune before
     # any wave creates new worktrees so stale entries don't crash
     # `git worktree list --porcelain` in new-worktree.sh.
-    await run_proc(["git", "worktree", "prune"])
+    _prune_leerie_worktrees(leerie_dir)
 
     # Base-tree health baseline (DESIGN §9): staging now exists off the
     # base HEAD and no wave has mutated it yet, so this is the earliest
@@ -32544,7 +32605,30 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # reach the pause branch (DESIGN §6 teardown disposition table).
         if st is not None and st.run_dir is not None:
             try:
-                st.data["finished_at"] = now()
+                # A run that never started is not a run that finished.
+                # `finished_at` is read as a TERMINAL state: it excludes the
+                # run from the never-started demotion in `_run_phases`, makes
+                # `_derive_run_status` report `done` (so bare `resume` will not
+                # auto-pick it), and routes an explicit `resume` into "records
+                # neither progress nor a task" — the message POSTMORTEM F15
+                # records as sending an operator hunting a data-integrity
+                # problem that did not exist. Stamping it on a run that died in
+                # preflight therefore converts a restartable run into a
+                # permanently dead one, and the likeliest trigger is a dirty
+                # working tree, which is the one condition `main()`
+                # deliberately declines to re-check on resume.
+                #
+                # "Never started" is the same predicate the demotion uses: no
+                # waves, no categories, but a recorded task. Such a run has no
+                # branch and no commits, so nothing downstream needs the stamp
+                # — `fetch_branch`'s discovery is looking for completed
+                # unpushed work, of which there is none.
+                _never_started = (
+                    "waves" not in st.data and "categories" not in st.data
+                    and isinstance(st.data.get("task"), str)
+                    and st.data["task"].strip())
+                if not _never_started:
+                    st.data["finished_at"] = now()
                 # Only persist state.json when it carries meaningful
                 # content.  A failed resume leaves st.data as a bare
                 # stub (no "task"); writing that poisons the host-side
@@ -32555,7 +32639,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     # `except Exception` below cannot catch a DiskLowSpace
                     # from inside save(), since that is a BaseException.
                     _save_state_best_effort(st, "SystemExit exit")
-                _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
+                if not _never_started:
+                    _write_run_json(
+                        st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
                 (st.run_dir / "orchestrator.exit_code").write_text(
                     str(_ec) + "\n")

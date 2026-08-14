@@ -136,41 +136,76 @@ def test_orphaned_subtask_branches_are_removed(tmp_path):
     assert "my-own-work" in out, "a user branch is never in scope"
 
 
-class TestBranchReapingFailsClosed:
-    """`live` is populated ONLY by the loop over `<root>/runs`. Without that
-    directory it stays empty, every `leerie/subtasks/*` ref reads as orphaned,
-    and `--apply` force-deletes all of them — including branches of runs that
-    are executing right now, with unmerged work.
+def _unmerged_branch(repo: Path, name: str) -> None:
+    """A subtask branch carrying a commit that exists nowhere else.
 
-    Reached by a mistyped or unset `LEERIE_STATE_DIR`, a renamed state root, or
-    a first run on a fresh install. `test_stale_cache_entries_are_reclaimed`
-    already drives this exact path; it passes only because its fixture repo has
-    no leerie branches to lose.
+    This is the shape that matters. A branch created at the base tip holds no
+    work and is safe to delete; the destructive case is one an implementer has
+    committed to, which is the only copy of that work once
+    `_cleanup_on_abnormal_exit(full_purge=False)` has removed its worktree.
+    """
+    _git(repo, "branch", name)
+    _git(repo, "checkout", "-q", name)
+    (repo / "impl.txt").write_text("implementer work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "implementer commit")
+    _git(repo, "checkout", "-q", "main")
+
+
+class TestBranchReapingNeedsPositiveEvidence:
+    """Absence is not evidence of death.
+
+    The rule this replaces inferred "orphaned" from "no run dir in THIS state
+    root", which is silent about every run the root never owned. Reproduced: a
+    paused run whose state lived under one `--state-dir`, pruned from another
+    (both pass the `.owner` check when they belong to the same repo), lost the
+    only copy of its implementer commits.
+
+    Guarding that on `runs.is_dir()` did not help — the orchestrator creates
+    `runs/` unconditionally and nothing removes it, so on any host that has run
+    leerie once the guard could never fire again.
     """
 
-    def test_no_runs_dir_reaps_no_branches(self, tmp_path):
-        root = tmp_path / "state"
-        (root / "repo-map-cache").mkdir(parents=True)   # root exists, runs/ does not
+    def test_a_run_in_another_state_root_keeps_its_work(self, tmp_path):
+        """The reproduced case, verbatim."""
+        rootA = tmp_path / "rootA"          # pruned from here
+        rootB = tmp_path / "rootB"          # where the live run's state lives
+        _run_dir(rootA, "old-done", old=True, finished_at="t")
+        _run_dir(rootB, "LIVE", old=False, paused_at="t")
         repo = _repo(tmp_path)
-        _git(repo, "branch", "leerie/subtasks/run-a/feat-001")
-        _git(repo, "branch", "leerie/subtasks/run-b/feat-002")
-        r = _prune(root, repo, "--apply")
-        assert r.returncode == 0, r.stderr
+        _unmerged_branch(repo, "leerie/subtasks/LIVE/feat-001")
+
+        assert _prune(rootA, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/LIVE/feat-001" in out, (
+            "a branch holding unmerged implementer commits must survive a "
+            "prune run from a state root that never owned it")
+
+    def test_no_runs_dir_keeps_unmerged_work(self, tmp_path):
+        root = tmp_path / "state"
+        (root / "repo-map-cache").mkdir(parents=True)   # root exists, runs/ absent
+        repo = _repo(tmp_path)
+        _unmerged_branch(repo, "leerie/subtasks/run-a/feat-001")
+        assert _prune(root, repo, "--apply").returncode == 0
         out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
         assert "leerie/subtasks/run-a/feat-001" in out
-        assert "leerie/subtasks/run-b/feat-002" in out
 
-    def test_it_says_why_it_skipped(self, tmp_path):
+    def test_it_reports_what_it_kept(self, tmp_path):
+        """Silence would be worse than the old behaviour: an operator running
+        `prune` to reclaim disk needs to know a branch was spared and why."""
         root = tmp_path / "state"
-        (root / "repo-map-cache").mkdir(parents=True)
-        r = _prune(root, _repo(tmp_path), "--apply")
-        assert "skipped branch reaping" in r.stdout
+        (root / "runs").mkdir(parents=True)
+        repo = _repo(tmp_path)
+        _unmerged_branch(repo, "leerie/subtasks/run-a/feat-001")
+        r = _prune(root, repo, "--apply")
+        assert "kept 1 subtask branch(es) with unmerged commits" in r.stdout
 
-    def test_a_present_runs_dir_still_reaps(self, tmp_path):
-        """Anti-vacuity: failing closed must not disable reaping outright.
+    def test_a_merged_orphan_is_still_reaped(self, tmp_path):
+        """Anti-vacuity: requiring evidence must not disable reaping.
 
-        `runs/` exists and lists no live run, so the orphan really is an
-        orphan and must still go.
+        A branch with nothing on it beyond the base holds no work, `git branch
+        -d` accepts it, and it goes — which is what F22's 64 stale branches
+        were.
         """
         root = tmp_path / "state"
         (root / "runs").mkdir(parents=True)
@@ -179,6 +214,26 @@ class TestBranchReapingFailsClosed:
         assert _prune(root, repo, "--apply").returncode == 0
         out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
         assert "leerie/subtasks/dead-run/feat-001" not in out
+
+    def test_a_run_dir_this_prune_removed_is_force_deleted(self, tmp_path):
+        """The one case where `-D` is right: this prune established the run is
+        terminal and old, so even unmerged commits on its branches are spent."""
+        root = tmp_path / "state"
+        _run_dir(root, "gone", old=True, finished_at="t")
+        repo = _repo(tmp_path)
+        _unmerged_branch(repo, "leerie/subtasks/gone/feat-001")
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/gone/feat-001" not in out
+
+    def test_a_live_runs_branch_is_never_touched(self, tmp_path):
+        root = tmp_path / "state"
+        _run_dir(root, "live-run", old=False)
+        repo = _repo(tmp_path)
+        _unmerged_branch(repo, "leerie/subtasks/live-run/feat-001")
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/live-run/feat-001" in out
 
 
 def test_apply_removes_a_killed_run(tmp_path):

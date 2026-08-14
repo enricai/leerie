@@ -223,3 +223,79 @@ class TestNeverStartedIsRestartable:
         assert demote < call, (
             "preflighting before the demotion decision would catch every "
             "resume, not just the one that becomes a fresh start")
+
+
+class TestAFailedStartLeavesTheRunRestartable:
+    """`die()` before any work must not stamp the run terminal.
+
+    `main()`'s SystemExit handler writes `finished_at`, which is read as a
+    TERMINAL state in three places: the never-started demotion excludes it,
+    `_derive_run_status` reports `done` (so bare `resume` will not auto-pick
+    it), and an explicit `resume` then falls through to "records neither
+    progress nor a task" — the message POSTMORTEM F15 records as sending an
+    operator hunting a data-integrity problem that did not exist.
+
+    So a run that dies in preflight became permanently dead. The likeliest
+    trigger is a dirty working tree, which is precisely the condition `main()`
+    deliberately declines to re-check on an ordinary resume — and the demotion
+    added a new, far more reachable, refusal on that path.
+    """
+
+    @staticmethod
+    def _handler(leerie) -> str:
+        src = inspect.getsource(leerie.main)
+        i = src.index("except SystemExit")
+        return src[i:src.index("\n    except ", i + 10)]
+
+    def test_a_never_started_run_is_not_stamped_finished(self, leerie):
+        h = _strip_comments(self._handler(leerie))
+        assert "_never_started" in h, (
+            "the handler must distinguish a run that never started from one "
+            "that finished")
+        # Structural, not whitespace-exact: the guard must precede the stamp.
+        guard = h.index("if not _never_started:")
+        stamp = h.index('st.data["finished_at"] = now()')
+        assert guard < stamp, (
+            "the stamp must sit inside the not-never-started branch")
+
+    def test_the_predicate_matches_the_demotion(self, leerie):
+        """Both must mean the same thing by 'never started', or a run can be
+        stamped terminal by one and expected restartable by the other."""
+        h = _strip_comments(self._handler(leerie))
+        for token in ('"waves" not in st.data', '"categories" not in st.data',
+                      'st.data.get("task")'):
+            assert token in h, token
+
+    def test_run_json_is_not_stamped_either(self, leerie):
+        """`_derive_run_status` reads run.json, so stamping only state.json
+        would leave the run reporting `done` to `leerie list`."""
+        h = _strip_comments(self._handler(leerie))
+        i = h.index("_write_run_json(")
+        assert "if not _never_started:" in h[max(0, i - 200):i]
+
+    def test_a_run_that_DID_work_is_still_stamped(self, leerie):
+        """Anti-vacuity. `fetch_branch`'s discovery requires `finished_at` on
+        a completed unpushed run; suppressing it unconditionally would make
+        every real post-setup die() undiscoverable — the defect the stamp was
+        added for."""
+        h = _strip_comments(self._handler(leerie))
+        assert 'st.data["finished_at"] = now()' in h, (
+            "the stamp must still happen for a run with progress")
+
+    def test_status_of_a_never_started_run_is_resumable(self, leerie):
+        """End-to-end on the consumer: no finished_at means not `done`, and
+        `resume` can auto-pick it again."""
+        run_json = {"run_id": "r", "started_at": "t"}     # no finished_at
+        state = {"task": "t", "started_at": "t"}           # no waves/categories
+        status = leerie._derive_run_status(run_json, state)
+        assert status != "done"
+        assert status in leerie._AUTO_RESUMABLE_STATUSES, status
+
+    def test_a_stamped_run_really_would_be_done(self, leerie):
+        """Anti-vacuity for the test above: `finished_at` IS what makes it
+        terminal, so the fix is load-bearing rather than incidental."""
+        stamped = leerie._derive_run_status(
+            {"run_id": "r", "started_at": "t", "finished_at": "t"},
+            {"task": "t", "started_at": "t"})
+        assert stamped == "done"
+        assert stamped not in leerie._AUTO_RESUMABLE_STATUSES
