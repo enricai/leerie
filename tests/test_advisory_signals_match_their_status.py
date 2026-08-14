@@ -19,7 +19,9 @@ Three instances, all measured in one corpus (docs/POSTMORTEM-2026-08-14.md, F23)
 """
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 
 import pytest
 
@@ -65,17 +67,40 @@ class TestPlannedFilesIsAdvisory:
 
 
 class TestContinuationCheckpoint:
-    def test_the_instruction_is_conditional(self, leerie):
-        src = inspect.getsource(leerie._run_implementer)
-        assert ".is_file()" in src, (
-            "the checkpoint instruction must be conditional on the file "
-            "existing — most continuations have none")
+    """Pinned via `ast`, not substring presence.
 
-    def test_both_branches_exist(self, leerie):
-        src = inspect.getsource(leerie._run_implementer)
-        assert "There is no checkpoint file" in src, (
-            "a continuation without a checkpoint still needs to be told it is "
-            "a continuation")
+    The first version asserted `".is_file()" in src` — true of any of the
+    eleven other `is_file()` calls in the module — and that the else-branch
+    string appeared *somewhere*. Both survive `if _ckpt.is_file() or
+    continuation:`, which makes the instruction unconditional again and
+    restores the 11 wasted `tool-fail` reads.
+    """
+
+    @staticmethod
+    def _checkpoint_if(leerie) -> ast.If:
+        """The `if` whose body emits the read-the-checkpoint instruction."""
+        fn = ast.parse(textwrap.dedent(
+            inspect.getsource(leerie._run_implementer))).body[0]
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If):
+                continue
+            body = "".join(ast.unparse(s) for s in node.body)
+            if "checkpoint" in body.lower() and "_ckpt" in ast.unparse(node.test):
+                return node
+        raise AssertionError("no checkpoint-conditional found")
+
+    def test_the_test_is_exactly_the_file_existing(self, leerie):
+        node = self._checkpoint_if(leerie)
+        assert ast.unparse(node.test) == "_ckpt.is_file()", (
+            "the instruction must be gated on the checkpoint EXISTING and "
+            f"nothing else; got {ast.unparse(node.test)!r} — an `or` here "
+            "makes it unconditional again")
+
+    def test_the_else_branch_is_a_real_else(self, leerie):
+        node = self._checkpoint_if(leerie)
+        assert node.orelse, "a continuation with no checkpoint still needs telling"
+        assert "There is no checkpoint file" in "".join(
+            ast.unparse(s) for s in node.orelse)
 
 
 class TestLayerGapEnvKeywords:

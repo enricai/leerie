@@ -33,9 +33,17 @@ import pytest
 _ORCH = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
 
 # Every abbreviation CATEGORY_ABBREV can put in front of a subtask id.
+_DOMAINS = ("feat|bugfix|refactor|perf|test|deps|config|infra|docs")
+
+# Every spelling that decides what a subtask IS from the text of its id.
+# `.startswith(` alone was the first version, and `sid[:7] == "bugfix-"`,
+# `sid.split("-")[0] == "bugfix"` and `re.match(r"^bugfix-", sid)` all evade it
+# while doing exactly the thing the rule forbids.
 _PREFIX_RE = re.compile(
-    r'startswith\(\s*\(?\s*["\'](?:feat|bugfix|refactor|perf|test|deps|'
-    r'config|infra|docs)-'
+    r'startswith\(\s*\(?\s*["\'](?:' + _DOMAINS + r')-'
+    r'|\[\s*:\s*\d+\s*\]\s*==\s*["\'](?:' + _DOMAINS + r')-'
+    r'|\.split\(["\']-["\']\)\s*\[\s*0\s*\]\s*==\s*["\'](?:' + _DOMAINS + r')'
+    r'|re\.(?:match|fullmatch|search)\(\s*r?["\']\^?(?:' + _DOMAINS + r')-'
 )
 
 
@@ -84,9 +92,18 @@ def test_the_scan_would_catch_a_prefix_dispatch():
     assert _PREFIX_RE.search('if not sid.startswith("bugfix-"):')
     assert _PREFIX_RE.search('x = [s for s in ids if s.startswith("test-")]')
     assert _PREFIX_RE.search('if sid.startswith(("bugfix-", "feat-")):')
+    # Spellings the `.startswith(`-only version let through. Each does exactly
+    # what the rule forbids, so the control has to probe them or the widening
+    # is unverified.
+    assert _PREFIX_RE.search('if sid[:7] == "bugfix-":')
+    assert _PREFIX_RE.search('if sid.split("-")[0] == "bugfix":')
+    assert _PREFIX_RE.search('if re.match(r"^bugfix-", sid):')
+    assert _PREFIX_RE.search('if re.search(r"bugfix-", sid):')
     # and must not fire on unrelated string work
     assert not _PREFIX_RE.search('if path.startswith("src/"):')
     assert not _PREFIX_RE.search('if line.startswith("#"):')
+    assert not _PREFIX_RE.search('if ref[:4] == "refs":')
+    assert not _PREFIX_RE.search('if re.match(r"^\\d+\\.\\d+", version):')
 
 
 def test_symptom_check_reads_the_declaration(leerie):

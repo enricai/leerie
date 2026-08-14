@@ -22,6 +22,7 @@ subtask before it spends*.
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -136,11 +137,31 @@ class TestTheProbeRunsBeforeTheSpend:
             "a missing staging worktree must skip the probe, not crash")
 
     def test_the_two_probes_do_not_share_a_worker_log(self, leerie):
-        """Both can fire for one subtask in one run; a shared sid would let
-        the second overwrite the first's log."""
+        """Both can fire for one subtask in one run — the pre-spawn probe
+        declines, the implementer commits nothing, the rescue probes again — so
+        a shared sid lets the second overwrite the first's log and the reason
+        for the decline is lost.
+
+        Asserting only that the pre-spawn site passes `label="pre"` is
+        one-directional: setting the RESCUE site to `label="pre"` too restores
+        the collision with that assertion still green. So compare the two
+        labels, which is the property that actually matters.
+        """
         probe_src = inspect.getsource(leerie._probe_criteria_satisfied_on_head)
         assert 'sid=f"satisfied_probe-{label}-{sid}"' in probe_src
-        assert 'label="pre"' in self._src(leerie)
+
+        src = self._src(leerie)
+        labels = re.findall(r'label=("(?:[^"]*)")', src)
+        pre = self._block(leerie)
+        pre_labels = re.findall(r'label=("(?:[^"]*)")', pre)
+        rescue_labels = [l for l in labels if l not in pre_labels] or [
+            # the rescue site relies on the parameter default
+            re.search(r'label: str = ("(?:[^"]*)")', probe_src).group(1)]
+        assert pre_labels == ['"pre"'], pre_labels
+        assert set(pre_labels).isdisjoint(rescue_labels), (
+            f"both probe sites resolve to the same worker-log label "
+            f"({pre_labels} vs {rescue_labels}); the second overwrites the "
+            "first's log")
 
     def test_the_settle_goes_through_the_shared_helper(self, leerie):
         assert "_settle_already_satisfied(" in self._block(leerie)

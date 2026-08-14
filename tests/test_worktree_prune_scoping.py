@@ -149,6 +149,19 @@ def test_outside_a_git_repo_is_a_silent_no_op(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+
+def _bare_prune_offenders(code: str) -> list[str]:
+    """Lines running a repository-global `git worktree prune`.
+
+    Anchored at `git`, not at the start of a line: the first version required
+    `^\\s*git worktree prune`, so `git -C "$USER_REPO" worktree prune`,
+    `cd "$repo" && git worktree prune` and `eval "git worktree prune"` all
+    reopened the failure while the scan stayed silent. `-C <dir>` and other
+    leading options are matched explicitly.
+    """
+    pat = re.compile(r"\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+worktree\s+prune\b")
+    return [l.strip() for l in code.splitlines() if pat.search(l)]
+
 @pytest.mark.parametrize("script", _SCRIPTS_WITH_PRUNE)
 def test_no_script_runs_a_bare_prune(script):
     """The sweep: every call site uses the scoped helper.
@@ -159,9 +172,10 @@ def test_no_script_runs_a_bare_prune(script):
     src = (REPO_ROOT / "scripts" / script).read_text()
     code = "\n".join(l for l in src.splitlines()
                      if not l.lstrip().startswith("#"))
-    assert not re.search(r"^\s*git worktree prune\b", code, re.M), (
+    assert not _bare_prune_offenders(code), (
         f"{script} still runs a repository-global prune; use "
-        "prune_leerie_worktrees \"$LEERIE_ROOT\"")
+        "prune_leerie_worktrees \"$LEERIE_ROOT\": "
+        + "; ".join(_bare_prune_offenders(code)))
     assert "prune_leerie_worktrees" in code, (
         f"{script} must still prune leerie's own stale registrations — "
         "removing the prune entirely reopens the orphaned-directory failure "
@@ -172,3 +186,31 @@ def test_no_script_runs_a_bare_prune(script):
 def test_each_script_sources_the_lib(script):
     src = (REPO_ROOT / "scripts" / script).read_text()
     assert "worktree-lib.sh" in src, script
+
+
+@pytest.mark.parametrize("evasion", [
+    "  git worktree prune",
+    '  git -C "$USER_REPO" worktree prune',
+    '  cd "$repo" && git worktree prune',
+    '  git --git-dir=/x/.git worktree prune -v',
+])
+def test_the_scan_fires_on_every_evasion(evasion):
+    """Anti-vacuity, absent from the original.
+
+    Three of these four evaded the start-of-line anchor while running exactly
+    the repository-global prune that dropped the host's rebase worktrees.
+    """
+    assert _bare_prune_offenders(evasion), evasion
+
+
+@pytest.mark.parametrize("benign", [
+    '  prune_leerie_worktrees "$LEERIE_ROOT"',
+    '  # git worktree prune would drop the host\'s registrations',
+    '  git worktree list',
+])
+def test_the_scan_leaves_the_replacement_alone(benign):
+    """The converse: flagging the scoped helper, or a comment naming the
+    forbidden construct, would make the guard fail on correct code."""
+    code = "\n".join(l for l in benign.splitlines()
+                     if not l.lstrip().startswith("#"))
+    assert not _bare_prune_offenders(code), benign

@@ -23,8 +23,46 @@ See docs/POSTMORTEM-2026-08-14.md, F5 and F6.
 from __future__ import annotations
 
 import inspect
+import tokenize
+import textwrap
+import io
+import ast
 
 import pytest
+
+
+def _code_only(src: str) -> str:
+    """Source with comments AND docstrings removed.
+
+    These scans forbid (or require) a token whose natural home is a comment
+    documenting the rejected alternative — so a raw scan matches the prose
+    describing the rule and fails on correct code, or matches prose instead of
+    code and passes on broken code. CLAUDE.md records this trap repeatedly.
+    `tokenize`, not a `#`-prefix heuristic: a `#` inside a string literal would
+    corrupt the result.
+    """
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    text = "".join(out)
+    try:
+        tree = ast.parse(textwrap.dedent(text))
+    except SyntaxError:
+        return text
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Module)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                text = text.replace(doc, "", 1)
+    return text
+
 
 # The signatures measured in real runs, and what each must classify as.
 # The negative half is as load-bearing as the positive: reading a genuine OOM as
@@ -80,7 +118,7 @@ def test_measure_blt_classifies_on_full_output_not_the_display_summary(leerie):
     the build prints its own epilogue afterwards — so classifying on the
     truncated summary would miss it exactly when the output is long.
     """
-    src = inspect.getsource(leerie._measure_blt)
+    src = _code_only(inspect.getsource(leerie._measure_blt))
     assert "_axis_unmeasurable(full)" in src, (
         "classification must read the full output, not `summary`:\n" + src)
     assert "_axis_unmeasurable(summary)" not in src

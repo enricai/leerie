@@ -109,7 +109,15 @@ class TestRepoChecksPrecedeTheRunDirectory:
 class TestTerminalArmsSurviveTheirOwnInterrupt:
     def _guarded_arms(self, leerie) -> list[str]:
         """Every `except (...)` tuple guarding a best-effort capture in a
-        terminal arm of `main()` or `phase_finalize`."""
+        terminal arm of `main()` or `phase_finalize`.
+
+        Selected by what the guarded `try` DOES — it calls `capture_repo_deps`
+        — not by which exception names the tuple happens to contain. The first
+        version required both `TerminalAuthFailure` and `DiskLowSpace`, so a
+        newly added terminal arm guarded by a different tuple was invisible to
+        the sweep below, which is precisely the arm most likely to have been
+        written without `KeyboardInterrupt`.
+        """
         out = []
         tree = ast.parse(_ORCH.read_text())
         for node in ast.walk(tree):
@@ -117,14 +125,17 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
                 continue
             if node.name not in ("main", "phase_finalize"):
                 continue
-            for h in ast.walk(node):
-                if not isinstance(h, ast.ExceptHandler):
+            for t in ast.walk(node):
+                if not isinstance(t, ast.Try):
                     continue
-                if not isinstance(h.type, ast.Tuple):
+                body = "".join(ast.unparse(s) for s in t.body)
+                if "capture_repo_deps" not in body:
                     continue
-                names = {ast.unparse(e) for e in h.type.elts}
-                if "TerminalAuthFailure" in names and "DiskLowSpace" in names:
-                    out.append(sorted(names))
+                for h in t.handlers:
+                    if isinstance(h.type, ast.Tuple):
+                        out.append(sorted(ast.unparse(e) for e in h.type.elts))
+                    elif h.type is not None:
+                        out.append([ast.unparse(h.type)])
         return out
 
     def test_the_scan_finds_them(self, leerie):
@@ -142,7 +153,10 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
 
 class TestNeverStartedIsRestartable:
     def test_the_corruption_claim_is_gone(self, leerie):
-        src = inspect.getsource(leerie._run_phases)
+        """Comments stripped: a comment recording the retired wording — the
+        natural place to explain why it went — would otherwise fail this on
+        correct code."""
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
         assert "likely corrupt or was hand-edited" not in src, (
             "a run interrupted before phase_classify is not corrupt")
 

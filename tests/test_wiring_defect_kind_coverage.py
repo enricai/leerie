@@ -19,8 +19,46 @@ for a full planning phase.
 from __future__ import annotations
 
 import inspect
+import tokenize
+import textwrap
+import io
+import ast
 
 import pytest
+
+
+def _code_only(src: str) -> str:
+    """Source with comments AND docstrings removed.
+
+    These scans forbid (or require) a token whose natural home is a comment
+    documenting the rejected alternative — so a raw scan matches the prose
+    describing the rule and fails on correct code, or matches prose instead of
+    code and passes on broken code. CLAUDE.md records this trap repeatedly.
+    `tokenize`, not a `#`-prefix heuristic: a `#` inside a string literal would
+    corrupt the result.
+    """
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    text = "".join(out)
+    try:
+        tree = ast.parse(textwrap.dedent(text))
+    except SyntaxError:
+        return text
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Module)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                text = text.replace(doc, "", 1)
+    return text
+
 
 # Every kind, and the predicate/repair surface that must acknowledge it.
 # `orphaned_dependent` deliberately has no dismissal predicate — no set-membership
@@ -51,10 +89,10 @@ def test_schema_still_declares_five_kinds(leerie):
 def test_kind_has_a_dismissal_predicate(leerie, kind):
     """Each kind, bar the documented exception, is named by a filter.
 
-    The parametrization covers the full enum and skips the exception by name, so
-    a sixth kind added to the schema enters this sweep automatically and fails
-    until someone decides what happens to it — rather than silently joining the
-    die()-only class the way `missing_provides` did.
+    The parametrization skips the exception by name. It is a literal list, so a
+    sixth kind does NOT enter here automatically — `test_schema_still_declares_five_kinds`
+    is what catches that, by set equality against the enum in both directions.
+    An earlier version of this docstring claimed otherwise.
     """
     assert kind in _kinds(leerie), (
         f"{kind!r} is parametrized here but no longer in the schema enum")
@@ -63,7 +101,12 @@ def test_kind_has_a_dismissal_predicate(leerie, kind):
     src = inspect.getsource(leerie._filter_provably_false_wiring_defects)
     src += inspect.getsource(leerie._filter_defects_already_ordered)
     src += inspect.getsource(leerie._repair_missing_requires)
-    assert kind in src or kind.startswith("broken_by"), (
+    # No `or kind.startswith("broken_by")` escape hatch. That disjunct was
+    # vacuously true for `broken_by_merge` and `broken_by_drop`, so two of the
+    # five parametrizations asserted nothing at all — deleting every
+    # `broken_by_*` arm from the predicates left them green. Both kinds are in
+    # fact named in the source, so the hatch bought nothing it was supposed to.
+    assert kind in src, (
         f"{kind!r} is admitted by the schema but named by no dismissal "
         "predicate or repair channel, so it can only reach the die()"
     )
@@ -157,7 +200,7 @@ def test_die_message_does_not_claim_causes_it_cannot_know(leerie):
     false, and the message also told the operator to edit a plan.json that a
     planning-phase death never writes.
     """
-    src = inspect.getsource(leerie.phase_wiring_gate)
+    src = _code_only(inspect.getsource(leerie.phase_wiring_gate))
     assert "NEITHER a surviving subtask" not in src, (
         "the die() must not assert a cause it cannot verify")
     assert "plan_snapshot" in src, (

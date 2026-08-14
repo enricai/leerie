@@ -174,8 +174,15 @@ def test_capture_does_not_merge_the_log_stream_into_the_verdict() -> None:
     shell's capture of it — and the capture is where the defect lived.
     """
     src = _code_only(HOST_FINALIZE_SH.read_text())
-    m = re.search(r'python3 "\$_rebaser_py".*?\n(?:.*?\n){0,6}?.*?_rebaser_rc=\$\?',
-                  src, re.S)
+    # Anchored at the START of the invocation's line, not at `python3`. The
+    # first version began the match AT `python3`, so the prefix a regression
+    # adds — `_rebaser_json="$(` — fell outside the extracted block and the
+    # assertions below could not see it. The `( … ) >&2` wrapper fell outside
+    # it too, which is why neither was pinned.
+    m = re.search(
+        r'^[ \t]*[^\n]*python3 "\$_rebaser_py"[^\n]*\n'
+        r'(?:[^\n]*\n){0,6}?[^\n]*_rebaser_rc=\$\?',
+        src, re.M)
     assert m, "could not locate the rebaser seam invocation"
     block = m.group(0)
     assert "2>&1" not in block, (
@@ -186,6 +193,22 @@ def test_capture_does_not_merge_the_log_stream_into_the_verdict() -> None:
     )
     assert '"$_rebaser_out"' in block, (
         "the invocation must pass the verdict-file path to the seam:\n" + block
+    )
+    assert "$(" not in block and "`" not in block, (
+        "the seam's stdout must not be captured at all — capturing is the "
+        "defect, and `2>/dev/null` would evade the `2>&1` check above while "
+        "reinstating it:\n" + block
+    )
+    assert ">&2" in block, (
+        "the seam's stdout carries the worker log and must be redirected to "
+        "stderr, so it reaches the operator without being mistaken for a "
+        "return value:\n" + block
+    )
+    assert block.lstrip().startswith("("), (
+        "the invocation must stay wrapped in a ( … ) subshell: the original "
+        "command substitution provided one, and removing it without replacement "
+        "let a `set -u` abort inside the seam kill host_finalize outright "
+        "(measured: 20 of 32 tests failed):\n" + block
     )
 
 

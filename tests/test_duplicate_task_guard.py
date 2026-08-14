@@ -11,11 +11,15 @@ See docs/POSTMORTEM-2026-08-14.md, F10.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
+
+from tests.test_resume_planning_reentry import _args, _caps
 
 
 def _run_json(root: Path, run_id: str, **fields) -> Path:
@@ -78,6 +82,94 @@ class TestLiveDuplicateDetection:
         """A run with no recorded fingerprint must not match every other one."""
         _run_json(tmp_path, "other", task_sha256="")
         assert leerie._live_duplicate_runs(tmp_path, "mine", "") == []
+
+
+class _ReachedClassify(Exception):
+    """Raised by the stubbed `phase_classify` — the first worker call after the
+    duplicate gate, so reaching it means the gate let the run through."""
+
+
+def _drive_to_the_gate(leerie, monkeypatch, tmp_path, *, task="a task",
+                       siblings=()):
+    """Run the fresh branch of `_run_phases` up to the first worker.
+
+    Returns True when the gate allowed the run through, and raises SystemExit
+    when it refused. Behavioural, because every other test here is a source
+    substring: `if False and _dupes and …` leaves all four of them green with
+    the guard entirely disabled.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "README.md").write_text("hi\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=repo, check=True)
+    leerie_root = repo / ".leerie"
+    run_dir = leerie_root / "runs" / "mine"
+    (run_dir / "subtasks").mkdir(parents=True)
+    for name, fields in siblings:
+        _run_json(leerie_root, name, **fields)
+
+    st = leerie.State(leerie_root, "mine", repo_root=repo)
+    monkeypatch.setattr(
+        leerie, "_enforce_and_record_cgroup_containment", lambda *a, **k: None)
+
+    async def _boom(*_a, **_k):
+        raise _ReachedClassify()
+
+    monkeypatch.setattr(leerie, "phase_classify", _boom)
+
+    try:
+        asyncio.run(leerie._run_phases(
+            _args(resume=False, task=task), _caps(leerie), leerie_root,
+            st, "both", "quiet", {}, {}))
+    except _ReachedClassify:
+        return True
+    return False
+
+
+class TestTheGateActuallyRefuses:
+    """The behavioural half. `TestWiring` below pins the shape of the message
+    and the ordering; neither can see a gate that has been switched off."""
+
+    def test_a_live_duplicate_stops_the_run(self, leerie, monkeypatch, tmp_path):
+        fp = leerie._task_fingerprint("a task")
+        with pytest.raises(SystemExit):
+            _drive_to_the_gate(
+                leerie, monkeypatch, tmp_path,
+                siblings=[("other", {"task_sha256": fp, "started_at": "t"})])
+
+    def test_no_duplicate_proceeds(self, leerie, monkeypatch, tmp_path):
+        """Anti-vacuity: the gate must not stop every run."""
+        assert _drive_to_the_gate(
+            leerie, monkeypatch, tmp_path,
+            siblings=[("other", {"task_sha256": "zzz", "started_at": "t"})])
+
+    def test_a_finished_duplicate_proceeds(self, leerie, monkeypatch, tmp_path):
+        """A completed re-run of the same brief is ordinary."""
+        fp = leerie._task_fingerprint("a task")
+        assert _drive_to_the_gate(
+            leerie, monkeypatch, tmp_path,
+            siblings=[("other", {"task_sha256": fp, "finished_at": "t"})])
+
+    def test_the_escape_hatch_lets_it_through(self, leerie, monkeypatch,
+                                              tmp_path):
+        fp = leerie._task_fingerprint("a task")
+        monkeypatch.setenv("LEERIE_ALLOW_DUPLICATE_TASK", "1")
+        assert _drive_to_the_gate(
+            leerie, monkeypatch, tmp_path,
+            siblings=[("other", {"task_sha256": fp, "started_at": "t"})])
+
+    def test_an_unset_hatch_is_not_a_bypass(self, leerie, monkeypatch,
+                                            tmp_path):
+        """The hatch matches an explicit truthy value; anything else refuses."""
+        fp = leerie._task_fingerprint("a task")
+        monkeypatch.setenv("LEERIE_ALLOW_DUPLICATE_TASK", "0")
+        with pytest.raises(SystemExit):
+            _drive_to_the_gate(
+                leerie, monkeypatch, tmp_path,
+                siblings=[("other", {"task_sha256": fp, "started_at": "t"})])
 
 
 class TestWiring:

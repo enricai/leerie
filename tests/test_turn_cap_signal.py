@@ -18,7 +18,11 @@ See docs/POSTMORTEM-2026-08-14.md, F7.
 from __future__ import annotations
 
 import inspect
+import io
 import re
+import tokenize
+
+import pytest
 
 
 def _claude_p_src(leerie) -> str:
@@ -30,20 +34,40 @@ def _claude_p_src(leerie) -> str:
     zombie-reaper and clobber guards document in CLAUDE.md.
     """
     src = inspect.getsource(leerie.claude_p)
-    return "\n".join(
-        line for line in src.splitlines()
-        if not line.lstrip().startswith("#")
-    )
+    # `tokenize`, not a `#`-prefix line heuristic: a `#` inside a string
+    # literal would corrupt the result, and CLAUDE.md names that exact trap.
+    # It works out the same on today's tree; the point is that it stays right.
+    out, last = [], (1, 0)
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.start[0] > last[0]:
+            out.append("\n" * (tok.start[0] - last[0]))
+            last = (tok.start[0], 0)
+        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
+        last = tok.end
+    return "".join(out)
+
+
+def _ratio_offenders(src: str) -> list[str]:
+    """Lines comparing `num_turns` against `max_turns` in any spelling.
+
+    Deliberately broad. The first version matched two literal shapes, so
+    `0.8 * float(max_turns) <= turns` and `turns / max_turns >= 0.8` — both
+    reinstating the defect exactly — sailed past it.
+    """
+    return [
+        line.strip() for line in src.splitlines()
+        if "max_turns" in line and re.search(
+            r"(0\.\d+\s*\*|/\s*(float\()?max_turns|>=|<=|[^<>=!]>[^=]|"
+            r"[^<>=!]<[^=])", line)
+        and re.search(r"\bturns\b", line.replace("max_turns", ""))
+    ]
 
 
 def test_no_ratio_comparison_between_num_turns_and_max_turns(leerie):
     """The two numbers are not commensurable, so no code may compare them."""
-    src = _claude_p_src(leerie)
-    offenders = [
-        line.strip() for line in src.splitlines()
-        if re.search(r"0\.8\s*\*\s*max_turns", line)
-        or re.search(r"turns\s*>=.*max_turns", line)
-    ]
+    offenders = _ratio_offenders(_claude_p_src(leerie))
     assert not offenders, (
         "num_turns (success path) and --max-turns (bounding the enforcement "
         "path's counter) measure different things; comparing them produced 11 "
@@ -78,3 +102,28 @@ def test_the_comment_records_why_the_proxy_was_deleted(leerie):
     assert "F7" in src or "two DIFFERENT counters" in src, (
         "the deletion must carry its reason inline so a future reader does not "
         "restore the comparison")
+
+
+@pytest.mark.parametrize("canary", [
+    "if turns >= 0.8 * max_turns:",
+    "if 0.8 * float(max_turns) <= turns:",
+    "if turns / max_turns >= 0.8:",
+    "if turns > max_turns - 2:",
+])
+def test_the_scan_fires_on_a_reinstated_comparison(canary):
+    """Anti-vacuity, absent from the original.
+
+    An offender-list scan that can no longer match anything certifies the tree
+    clean forever. Two of these four evaded the first version's two literal
+    regexes while reinstating the defect exactly.
+    """
+    assert _ratio_offenders(canary), f"the scan must flag {canary!r}"
+
+
+def test_the_scan_leaves_legitimate_max_turns_uses_alone():
+    """The converse: `max_turns` is a real parameter, passed and forwarded all
+    over `claude_p`. Flagging its ordinary uses would make the guard unusable.
+    """
+    for benign in ("max_turns=max_turns,", "        max_turns: int,",
+                   'log(f"max_turns={max_turns}")'):
+        assert not _ratio_offenders(benign), benign

@@ -14,6 +14,7 @@ See docs/POSTMORTEM-2026-08-14.md, F17.
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -62,20 +63,83 @@ def test_empty_env_returns_the_input_unchanged(leerie, monkeypatch):
     assert leerie._operator_path("/leerie-state/runs/a") == "/leerie-state/runs/a"
 
 
-def test_operator_messages_use_the_helper(leerie):
-    """The sweep: no operator message may interpolate a raw run-dir path.
+def _raw_state_path_interpolations(src: str) -> list[str]:
+    """Every f-string that interpolates `st.path` / `st.run_dir` un-translated.
 
-    Comments are stripped first — the helper's own docstring necessarily names
-    the container path it translates.
+    An `ast` walk, not a line regex. The regex this replaced was
+    `\\{st\\.(path|run_dir)\\}` — it required `}` immediately after the
+    attribute, so it matched **zero** lines on the fixed tree (verified) and
+    had no anti-vacuity control: it could only ever have caught a
+    byte-identical regression of the shape this branch removed. It was already
+    blind to `{st.run_dir / 'logs'}`, `{str(st.path)}` and `{st.run_dir!s}` —
+    and the first of those was a live offender printing an unopenable
+    container path.
+
+    Occurrences already inside an `_operator_path(...)` call are the point of
+    the helper and are skipped.
     """
+    tree = ast.parse(src)
+    translated: set[int] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_operator_path"):
+            for sub in ast.walk(node):
+                translated.add(id(sub))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        for part in node.values:
+            if not isinstance(part, ast.FormattedValue):
+                continue
+            for sub in ast.walk(part.value):
+                if not (isinstance(sub, ast.Attribute)
+                        and sub.attr in ("path", "run_dir")
+                        and isinstance(sub.value, ast.Name)
+                        and sub.value.id == "st"):
+                    continue
+                if id(sub) in translated:
+                    continue
+                offenders.append(
+                    f"line {node.lineno}: {ast.unparse(node)[:110]}")
+                break
+    return offenders
+
+
+def test_operator_messages_use_the_helper(leerie):
+    """The sweep: no operator message may interpolate a raw run-dir path."""
     src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
-    code = "\n".join(l for l in src.splitlines()
-                     if not l.lstrip().startswith("#"))
-    offenders = [l.strip() for l in code.splitlines()
-                 if re.search(r"\{st\.(path|run_dir)\}", l)]
+    offenders = _raw_state_path_interpolations(src)
     assert not offenders, (
         "these messages print a container path to an operator reading it on "
         "the host; wrap them in _operator_path():\n  " + "\n  ".join(offenders))
+
+
+@pytest.mark.parametrize("canary", [
+    'log(f"see {st.path}")',                    # the shape the old regex caught
+    'log(f"logs: {st.run_dir / \'logs\'}/")',   # the shape it missed, live on the tree
+    'log(f"see {str(st.path)}")',
+    'log(f"see {st.run_dir!s}")',
+])
+def test_the_sweep_fires_on_an_injected_canary(canary):
+    """Anti-vacuity, and the control the original lacked entirely.
+
+    A sweep that asserts an empty offender list certifies 'clean' forever if it
+    can no longer match anything — which is exactly what happened once every
+    instance of the one shape it knew had been rewritten.
+    """
+    src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
+    assert _raw_state_path_interpolations(src + "\n" + canary), (
+        f"the sweep must flag {canary!r}")
+
+
+def test_a_translated_path_is_not_flagged():
+    """The converse: wrapping in the helper is the fix, so it must not read as
+    an offender — otherwise the sweep forbids its own remedy."""
+    assert not _raw_state_path_interpolations(
+        'log(f"see {_operator_path(st.path)}")')
 
 
 def test_the_launcher_forwards_the_display_value(leerie):

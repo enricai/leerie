@@ -30627,7 +30627,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         _validate_resume_state(st.data)
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
-        log(f"per-worker logs: {st.run_dir / 'logs'}/")
+        log(f"per-worker logs: {_operator_path(st.run_dir / 'logs')}/")
         # A successfully finalized run must not re-execute phases 4→5→6.
         # Without this guard, `resume` on a completed run re-runs
         # setup-run.sh + finalize.sh + cleanup.sh, creating a window
