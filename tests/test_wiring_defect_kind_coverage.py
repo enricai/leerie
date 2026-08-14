@@ -7,8 +7,11 @@ predicate was scoped to `broken_by_*` — so `missing_provides` and
 `orphaned_dependent` matched nothing anywhere and could reach only the `die()`.
 
 Measured across the run corpus: **57 defects — 44 `missing_requires`, 6
-`broken_by_drop`, 4 `broken_by_merge`, 3 `missing_provides`** — so 13 (23%) were
-in the die()-only class. One of them killed run 3bc46e7d ($20.32, 71 workers, 38
+`broken_by_drop`, 4 `broken_by_merge`, 3 `missing_provides`** — so **3 (5.3%)**
+were in the die()-only class, the two kinds no predicate could dismiss. (An
+earlier revision of this docstring said "13 (23%)", contradicting its own
+sentence four lines above: 13 counts every kind outside `missing_requires`,
+which is the repair channel's scope, not the dismissal channel's.) One of them killed run 3bc46e7d ($20.32, 71 workers, 38
 minutes, no branch, no plan.json) on a finding whose named capability WAS
 provided by an in-plan subtask. See docs/POSTMORTEM-2026-08-14.md, F4.
 

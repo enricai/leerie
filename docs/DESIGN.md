@@ -1906,7 +1906,9 @@ and, before spawning its first worker, refuses to start when another **live**
 run carries the same one. "Live" means started and not finished, killed or
 paused: a completed run sharing a fingerprint is an ordinary re-run and says
 nothing. The check is deliberately placed at the last cheap moment — after
-state exists, before any spend — and the refusal names the other run and the
+state exists, before this task's first worker. Not literally before
+any spend: `preflight()`'s smoke test and the dep-capture backstop both
+run earlier and both cost — and the refusal names the other run and the
 two commands that resolve it (`leerie attach`, `leerie kill`).
 
 Running the same brief twice on purpose is a real thing to want, so there is an
@@ -5948,6 +5950,25 @@ rescue is unchanged and remains the backstop for every subtask the plan-time
 flag does not cover (the transitive case it deliberately excludes, and any
 sibling overlap the file surfaces never predicted).
 
+**A settle without an implementer still owes the wave a branch.** `integrate_wave`
+filters on one thing — a subtask's `status == "complete"` — and never asks
+whether `leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is
+safe because its implementer ran: `new-worktree.sh` created the branch, it
+carries zero commits, and `git merge --no-ff` of a branch that is already an
+ancestor is a true no-op ("Already up to date", no commit). The pre-spawn probe
+returns *before* `_run_implementer`, so no branch was ever created, and
+`integrate.sh` exits 2 on a missing branch — taking the run down on every probe
+hit.
+
+So the pre-spawn path creates the branch itself, at the run-branch tip, before
+settling. The invariant is the general one and worth stating as such: **any path
+that marks a subtask complete must leave behind the branch integration will look
+for**, and the cheapest way to satisfy that is to produce the same artifact the
+implementer path produces rather than to teach integration a second meaning of
+"complete". If the branch cannot be created the subtask falls through to its
+implementer, because a settle that integration cannot merge is worse than the
+spend it saves.
+
 **The sibling-invalidation case (why a pre-schedule drop must weigh
 survivors).** The two sibling cases above both concern a sibling that
 *satisfies* a subtask. There is a third, opposite hazard the pre-schedule probe
@@ -6521,7 +6542,8 @@ Two further disciplines apply, and they sit at the §12 axis:
   a fix fires; this asks whether the failure it fixes still happens. On run
   `fa979580` a subtask "fixed" a cgroup leak that an earlier PR had already
   fixed **before the run began**, and shipped an event-loop stall doing it.
-  Nothing asked. `bugfix-` subtasks therefore record a `symptom_evidence`
+  Nothing asked. A subtask whose planner entry declares
+  `fixes_reported_symptom: true` therefore records a `symptom_evidence`
   object — did the reported symptom reproduce on the base tree, how, and what
   was observed — and a subtask that could not reproduce it says so.
 

@@ -441,7 +441,10 @@ STATE_FIELDS = (
     # passed. Adjacent to `conformance` because the two are only meaningful
     # together — see DESIGN §9.
     "unreviewed_subtasks",
-    # sid -> check_symptom_evidence findings for `bugfix-` subtasks. Kept
+    # sid -> check_symptom_evidence findings, for subtasks whose planner
+    # entry declares `fixes_reported_symptom: true` (NOT a `bugfix-` id
+    # prefix -- ids are re-homed by merges and synthesised for
+    # verification-only work). Kept
     # beside the row above because both answer "what should the operator
     # know about a subtask that reports itself complete?" — see DESIGN §9
     # *A stale finding is not a bug*.
@@ -1924,8 +1927,10 @@ SCHEMAS: dict[str, dict] = {
             # cheapest: it has the repo mounted and has just written the
             # path. Optional here; check_production_evidence gates.
             "production_evidence": _production_evidence_schema(),
-            # DESIGN §9 *A stale finding is not a bug*. `bugfix-` subtasks
-            # only. Same flat, single-required-bool shape as the field above,
+            # DESIGN §9 *A stale finding is not a bug*. Asked for only when
+            # the subtask declares `fixes_reported_symptom: true`; the id
+            # prefix is not the signal. Same flat, single-required-bool
+            # shape as the field above,
             # for the same decoder-safety reason.
             "symptom_evidence": {
                 "type": "object",
@@ -3689,7 +3694,10 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             f"`scripts/cleanup.sh --run-id {st.run_id}` to finish manually")
     # Scoped: a bare prune here is repository-global against the shared,
     # bind-mounted `.git` and drops the host's own registrations (F19).
-    _prune_leerie_worktrees(st.leerie_root)
+    # Scoped to THIS run's directory, not the whole state root — every
+    # worktree this function removes lives under it, and a concurrent run's
+    # registrations are no more ours to reap than the host's.
+    _prune_leerie_worktrees(st.run_dir)
     if not full_purge:
         return
     # Full purge: delete branches and the run dir. The run branch lives

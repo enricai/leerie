@@ -125,7 +125,9 @@ def test_it_is_a_bool_because_the_schema_has_a_hard_size_bound(leerie):
 
     This schema has a 2550-byte dumped bound, because the strict-output grammar
     compiler has actually rejected it when larger (DESIGN §7, N29). The enum
-    encoding costs 59 bytes and the bool 28; only the bool fits. The
+    encoding costs 59 bytes of field text and the bool 28 — +61 and +30 once
+    `json.dumps`' `", "` separator is counted, which is what the bound actually
+    measures. Only the bool fits. The
     consistency with rule_violations is worth less than worker output that
     validates at all.
     """

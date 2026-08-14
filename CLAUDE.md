@@ -477,7 +477,8 @@ export LEERIE_WORKER_TIMEOUT=9000
 
 # Allow a second run on task text a live run is already working. leerie
 # fingerprints the task (`task_sha256` in run.json) and refuses to start when
-# another started-and-unfinished run carries the same one — measured, one brief
+# another live run carries the same one — live meaning started and not
+# finished, killed or paused — measured, one brief
 # ran twice for $72.21 and produced two incompatible branches with 14 files in
 # collision. A finished run sharing the text is an ordinary re-run and never
 # blocks. With the hatch set the duplicate still gets announced:
@@ -1033,10 +1034,14 @@ fires every run is how a warning stops being read. **(2) "The new tests fail on 
 worthless** — measured on that run all four findings' tests already failed on
 base (9 of 13 for one), because a new test against absent code trivially fails;
 the field therefore asks for a command and an observation, not a bare boolean.
-**(3) Scoped by id prefix**, not by reading the task text (*Language-to-JSON*),
-so it is silent on the feature/test/docs subtasks that have no prior symptom.
-The prefix comes from the ORCHESTRATOR's `sid`, never from the worker's
-echoed `result["subtask_id"]` — nothing in the module cross-checks that
+**(3) Scoped by the planner's `fixes_reported_symptom` declaration**, never by
+the subtask's id — that was the original design and it produced 10 of 10 false
+positives, because `_repair_prescribed_commands` mints ids from the HOST
+subtask's domain and a merge re-homes a `feat-` subtask under a surviving
+`bugfix-` id. *Language-to-JSON* is usually read as being about prose, but an
+identifier is a string too. The `sid` still comes from the ORCHESTRATOR, never
+from the worker's echoed `result["subtask_id"]` — nothing in the module
+cross-checks that
 echo, so a worker reporting `feat-001` while working on `bugfix-005` would
 slip the scope entirely. Taking the sid string rather than the subtask dict
 also removes a `None`-dereference by construction, and neither this check

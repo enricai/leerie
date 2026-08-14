@@ -115,15 +115,30 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     calls: list[list[str]] = []
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
+        # The scoped prune's first step asks git where the common dir is; an
+        # empty answer makes it (correctly) decline to attribute anything, so
+        # the stub has to answer it for the rest of the path to run at all.
+        if list(cmd)[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, str(tmp_path / ".git") + "\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
     leerie._cleanup_on_abnormal_exit(st, full_purge=False)
 
-    # Two worktree-remove calls + one prune.
+    # Two worktree-remove calls + a SCOPED prune.
     remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
     assert len(remove_calls) == 2
-    assert any(c for c in calls if c == ["git", "worktree", "prune"])
+    # `git worktree prune` here is repository-global against a `.git` that is
+    # bind-mounted and shared with the host, so it dropped every host-side
+    # `/tmp/tmp.*/rebase-*` registration (docs/POSTMORTEM-2026-08-14.md, F19).
+    # `_prune_leerie_worktrees` asks git what it WOULD prune (`-n -v`) and
+    # removes only entries under this run's own directory.
+    assert not any(c == ["git", "worktree", "prune"] for c in calls), (
+        "a bare repository-global prune must not be issued from inside the "
+        f"container: {calls}")
+    assert any(c[:5] == ["git", "worktree", "prune", "-n", "-v"]
+               for c in calls), calls
 
 
 def test_cleanup_full_purge_deletes_run_dir(leerie, tmp_path, monkeypatch):

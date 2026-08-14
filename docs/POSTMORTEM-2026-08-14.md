@@ -123,25 +123,39 @@ the contradiction verbatim before being re-driven for it. → **R7**
 
 ### F4 — four of five wiring-defect kinds could only `die()`
 The expand/dismiss/repair handlers each early-out on `kind != "missing_requires"`,
-and `_filter_provably_false_wiring_defects` is scoped to `broken_by_*`. Census
-across all runs: **57 defects — 44 `missing_requires`, 6 `broken_by_drop`, 4
-`broken_by_merge`, 3 `missing_provides`**.
-
-**Corrected 2026-08-14** (this draft first said "13 (23%) were in the die()-only
-class", and the commit that fixed the code repeated it). By this section's own
-definition the die()-only class is the kinds that matched NO predicate anywhere:
-`_filter_provably_false_wiring_defects` was scoped to `broken_by_*`, so the 6
-`broken_by_drop` and 4 `broken_by_merge` were dismissible and only
-`missing_provides` and `orphaned_dependent` were not. That is **3 of 57
-(5.3%)**, not 13. The 13 counts every kind outside `missing_requires`, which is
-the repair channel's scope, not the dismissal channel's. The heading's "four of
-five kinds" refers to the *repair* handlers and is correct as written. This killed `3bc46e7d` — $20.32, 71 workers, 38 minutes, no branch, no
+and `_filter_provably_false_wiring_defects` was, at the time of the incident,
+scoped to `broken_by_*` (it now also covers `missing_provides`). Census across
+all runs: **57 defects — 44 `missing_requires`, 6 `broken_by_drop`, 4
+`broken_by_merge`, 3 `missing_provides`**. This killed `3bc46e7d` — $20.32, 71 workers, 38 minutes, no branch, no
 `plan.json` — over an edge test-009 **had already declared**; the idempotence
 guard sat *after* the kind dispatch and was structurally unreachable. The `die()`
 named three causes, none of which applied, and prescribed editing a `plan.json`
 that a planning-phase death never writes. `tag_or_dep` was a bare
 `{"type": "string"}`, which let the judge put prose in a field Python matches on.
 → **R4**
+
+**Corrected 2026-08-14, twice.** This draft first said "13 (23%) were in the
+die()-only class", and the commit that fixed the code repeated it. Two things
+were wrong with it.
+
+The count: the die()-only class is the kinds no predicate could dismiss, and
+predicate 1 was scoped to `broken_by_*`, so the 6 `broken_by_drop` and 4
+`broken_by_merge` were dismissible. That leaves `missing_provides` and
+`orphaned_dependent` — **3 of 57 (5.3%)**, not 13. The 13 counts every kind
+outside `missing_requires`, which is the *repair* channel's scope, not the
+dismissal channel's.
+
+The heading: the first correction went on to say "four of five kinds" was
+"correct as written". It is not, for the same reason. Four of five is the
+repair handlers' scope; the heading says *could only `die()`*, and that set is
+two of five. The heading is left as the historical title with this note
+attached rather than rewritten.
+
+A precision note on both: predicate 2 (`tag in satisfied_tags`) was always
+kind-agnostic, so "matched NO predicate anywhere" is loose — `missing_provides`
+was within its reach even before the fix. The 3/57 count is unaffected, since
+that predicate only fires for a capability a dropped-satisfied subtask provided.
+
 
 ### F5 — resource exhaustion is adjudicated by worker prose
 **37 worker calls** carry a genuine `OS can't spawn worker thread: Resource
