@@ -8236,11 +8236,28 @@ failure `new-worktree.sh` documents.
 The orchestrator's own four call sites — `_cleanup_on_abnormal_exit`,
 `_reset_subtask_worktree`, `_prune_subtask_worktree` and `phase_execute`'s
 post-`setup-run.sh` prune — go through `_prune_leerie_worktrees`, the Python
-port of the same mechanism at run-dir granularity (see above). They ran a bare prune until 2026-08-14: the first
-sweep converted `scripts/*.sh` only, and its guard hard-coded three
-filenames, so the Python sites were invisible to it. That guard now derives
-its surface from `scripts/*.sh` + `orchestrator/*.py` + the launcher
-(`tests/test_worktree_prune_scoping.py`), so a fifth site anywhere fails.
+port of the same mechanism at run-dir granularity (see above). Two of the four
+(`_reset_subtask_worktree` and `_prune_subtask_worktree`) dispatch it via
+`asyncio.to_thread`, because both are awaited from inside the wave and the
+call shells out to git; `_cleanup_on_abnormal_exit` runs synchronously off
+`st.run_dir` on a path where there is no loop left to block. The probe itself
+runs under `LC_ALL=C LANGUAGE=` — `git worktree prune -n -v` wraps its output
+in `_()`, so parsing English prefixes under another locale matches nothing
+(`tests/test_worktree_prune_scoping.py` pins the property, not the spelling).
+
+They ran a bare prune until 2026-08-14: the first sweep converted `scripts/*.sh` only, and its
+guard hard-coded three filenames, so the Python sites were invisible to it.
+
+That guard (`tests/test_worktree_prune_scoping.py`) now derives its surface
+from `scripts/**/*.sh` + `scripts/**/*.py` + `orchestrator/**/*.py` +
+`chain/**/*.py` + the launcher, including Python embedded in a shell heredoc.
+It does **not** follow that "a fifth site anywhere fails" — that claim was
+made once, retracted in `0332e31`, and is not repeated here. An `ast` walk
+models call names, argument shapes and languages, and each is a list a new
+site can fall off: a local `_run(...)` wrapper, `create_subprocess_exec`, and
+an argv containing a variable each stepped around it in turn. A coarse
+textual floor now runs underneath as an unevadable backstop, and between them
+the coverage is good — but "good" is the claim, not "complete".
 
 #### Prune verb (`leerie prune`)
 
@@ -8263,9 +8280,13 @@ Three categories. Run directories and cache entries are subject to the age cutof
   survives regardless of age.
 - **repo-map cache entries** under `<state-root>/repo-map-cache/` — regenerated
   on demand.
-- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run
-  directory is absent from `<state-root>/runs/`. Scoped to that namespace, so a
-  user branch is never in scope.
+- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run-id is
+  not among the runs this pass left alive (`run_id not in live`), which is a
+  different set from "run directory absent from `<state-root>/runs/`": a run
+  dir removed by this very pass is gone from disk yet still in scope, and a
+  surviving dir keeps its branches whatever their age. `docs/USAGE.md`
+  already states it this way. Scoped to that namespace, so a user branch is
+  never in scope.
 
 **Branch reaping needs positive evidence.** "No run dir in this state root" is
 not evidence a branch is orphaned — a state root is silent about every run it
@@ -8297,14 +8318,42 @@ and saying it did is what kept the next defect invisible.
 `shutil.rmtree` removes `<run>/worktrees/<sid>/` but leaves
 `.git/worktrees/<sid>`, and git then refuses `git branch -D` with "cannot delete
 branch … used by worktree at …" — so every branch of every run prune removed
-survived, and the rc=1 was misreported as unmergedness. Deregistering first is
-scoped by construction: only registrations whose worktree lives under a
-directory being deleted are touched.
+survived, and the rc=1 was misreported as unmergedness.
 
-Dry run classifies the same way `--apply` does. It previously appended every
-candidate without probing mergedness, so the default mode overstated the result
-and never printed the `kept` line — the one thing an operator needs before
-choosing `--apply`.
+Attribution is by **host** path, and the `gitdir` file may hold either
+spelling: a subtask worktree is created *inside* the container, where the
+state root is bind-mounted at `/leerie-state`, so `new-worktree.sh` writes
+`/leerie-state/runs/<id>/…` while prune runs on the host. `_host_spelling`
+translates the container prefix — the same mapping `_operator_path` performs
+for operator-facing text — before any comparison. Without it the whole
+deregistration was a no-op in the only runtime that produces the defect.
+A relative `gitdir` (git ≥ 2.48 with `worktree.useRelativePaths=true`) is
+resolved against the *entry* directory, not the process cwd, and an empty one
+is unattributable rather than resolving to the cwd.
+
+It is scoped by construction to registrations pointing inside the state root,
+so a sibling checkout's or the operator's own worktrees are never touched, and
+git's `locked` marker is honoured. Within that scope it sweeps **every**
+orphaned registration, not only the directories this pass removed: one removed
+by an earlier prune, by `cleanup.sh` or by hand leaves a registration no later
+prune would consult, and its branch is then unreapable forever.
+
+**Reaping requires liveness, not just timestamps.** Nothing clears
+`finished_at`, so a run that die()d once reads as terminal on every later
+prune, leaving `mtime < cutoff` as the only protection — and `--older-than 0`
+is accepted. `_is_live` probes the run-directory flock (`State.__init__` holds
+it for the life of the orchestrator, it is an inode lock, and the container
+bind-mounts that directory, so a host-side probe sees a container-side holder)
+and then `nerdctl inspect`, which covers a crashed orchestrator that released
+the lock while its container is still up. It fails **closed**: any probe that
+cannot complete reads as live.
+
+Dry run classifies branches the same way `--apply` does — it previously
+appended every candidate without probing mergedness, so the default mode
+overstated the result and never printed the `kept` line, the one thing an
+operator needs before choosing `--apply`. The two modes are not identical: a
+dry run performs no deregistration, so it has no `branches_blocked` equivalent
+and cannot report a delete that `--apply` would find blocked.
 
 `prune` is a launcher-only verb and appears in the `REWRITTEN_ARGS` guard arm,
 so a misplaced `leerie <task> prune` errors rather than reaching the
@@ -8950,14 +8999,25 @@ either still exist in the worktree or carry a `[deleted]` annotation,
 catching stale checkpoints whose paths were removed by partial work after
 the snapshot was written.
 
-In the same vein, `claude_p()` logs a context-decay warning when a worker
-returns at ≥80% of its `--max-turns` budget (`num_turns` from the CLI
-envelope). This is a proxy, not a hard guard: the schema only validates
-the *shape* of the worker's final output, not whether the reasoning
-chain that produced it ran against a healthy context. A 9.x confidence
-score from a near-cap worker should be read with appropriate scepticism.
-The warning sits alongside the existing `terminal_reason` warning at the
-`claude_p` return path.
+`claude_p()` carried a "context-decay" warning here — fired when a worker
+returned at ≥80% of its `--max-turns` budget — and it was **deleted** in
+`c967d90`. `claude -p` computes the `num_turns` it reports from two different
+counters: on the cap-enforcement path it reports the `max_turns_reached`
+attachment's count, and on the success path a separately maintained one. Only
+the first is commensurable with the `--max-turns` leerie passes, and the
+warning was the `elif` to the terminal-reason branch, so it fired *only* on
+the success path and compared the wrong number against the flag. Measured
+across a real corpus, 61 fired and **11 were arithmetically impossible**:
+21/20, 26/20, 28/20, 31/30, and 62 through 72 out of 60, across three caps.
+
+The CLI's own `terminal_reason` is the one trustworthy cap signal and is still
+reported, alongside `num_turns` itself — printing the number is fine; only
+comparing it against the cap was meaningless.
+`tests/test_turn_cap_signal.py` enforces that no code re-introduces the
+comparison, keyed on the provenance of both operands rather than on either
+one's name. This paragraph documented a warning the code had not had since
+`c967d90` — an open three-layer gap, which is a spec defect under the
+precedence rule and is corrected here rather than the other way round.
 
 Maps to `DESIGN.md`: §10 (handoff, coordination-artifact location), §9 (criteria
 locking).

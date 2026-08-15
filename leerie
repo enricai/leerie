@@ -1630,7 +1630,7 @@ if cache.is_dir():
 # Subtask branches, scoped to leerie/subtasks/<run-id>/* so a user branch is
 # never in scope.
 #
-# REAPING NEEDS POSITIVE EVIDENCE, and there are only two kinds of it.
+# REAPING NEEDS POSITIVE EVIDENCE, and there are only three kinds of it.
 #
 # The tempting rule -- "this run dir is not in <state-root>/runs, so the branch
 # is orphaned" -- is wrong, and destructively so. It infers death from ABSENCE,
