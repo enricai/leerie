@@ -38,6 +38,11 @@ def _run_dir(root: Path, run_id: str, *, old: bool, **fields) -> Path:
 
 
 def _git(cwd: Path, *args: str):
+    # `check=False` on purpose: several call sites expect a nonzero rc (a
+    # refused `-d`, a missing branch). It means a SETUP failure is silent, so
+    # every fixture below asserts its own postcondition — an
+    # `assert "<branch>" not in out` is satisfied for free by a branch that
+    # was never created.
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, check=False)
 
@@ -45,12 +50,19 @@ def _git(cwd: Path, *args: str):
 def _repo(tmp_path: Path) -> Path:
     d = tmp_path / "repo"
     d.mkdir()
-    _git(d, "init", "-q", "-b", "main")
-    _git(d, "config", "user.email", "t@leerie.local")
-    _git(d, "config", "user.name", "t")
+    assert _git(d, "init", "-q", "-b", "main").returncode == 0
+    # Isolate from the operator's global config. A global `commit.gpgsign` or
+    # a `core.hooksPath` pointing at a repo-local hook makes every commit here
+    # fail, and with `check=False` that is silent — turning this whole file
+    # green for the wrong reason on one developer's machine and red on
+    # another's.
+    for k, v in (("user.email", "t@leerie.local"), ("user.name", "t"),
+                 ("commit.gpgsign", "false"), ("core.hooksPath", "/dev/null")):
+        assert _git(d, "config", k, v).returncode == 0
     (d / "f").write_text("x")
-    _git(d, "add", "-A")
-    _git(d, "commit", "-qm", "base")
+    assert _git(d, "add", "-A").returncode == 0
+    assert _git(d, "commit", "-qm", "base").returncode == 0
+    assert _git(d, "rev-parse", "HEAD").returncode == 0, "fixture has no commit"
     return d
 
 
@@ -321,15 +333,31 @@ class TestStaleRegistrationsDoNotBlockReaping:
             "worktree registration is not a reason to keep it")
 
     def test_a_blocked_delete_is_not_reported_as_unmerged(self, tmp_path):
-        """`-D` never refuses for unmergedness, so that message was a lie."""
+        """`-D` never refuses for unmergedness, so that message was a lie.
+
+        This test CANNOT fail on its own mechanism as written above it: the
+        sibling deregistration makes the `-D` succeed, so the misreporting arm
+        it guards is never reached and the assertion passes because nothing
+        was blocked at all. Drive the arm directly instead — a registration
+        that cannot be deregistered (git's `locked`, which prune honours)
+        leaves a genuinely blocked `-D`, and the rule is that its message is
+        reported as itself rather than laundered into "unmerged commits".
+        """
         root = tmp_path / "state"
         _run_dir(root, "RUN1", old=True, finished_at="t")
         repo = _repo(tmp_path)
-        _git(repo, "worktree", "add", "-q",
-             str(root / "runs" / "RUN1" / "worktrees" / "feat-001"),
-             "-b", "leerie/subtasks/RUN1/feat-001")
+        wt = root / "runs" / "RUN1" / "worktrees" / "feat-001"
+        assert _git(repo, "worktree", "add", "-q", str(wt),
+                    "-b", "leerie/subtasks/RUN1/feat-001").returncode == 0
+        entry = next(p for p in (repo / ".git" / "worktrees").iterdir()
+                     if p.name.startswith("feat-001"))
+        (entry / "locked").write_text("held\n")
         os.utime(root / "runs" / "RUN1", (OLD, OLD))
+
         r = _prune(root, repo, "--apply")
+        assert "could not delete a subtask branch" in r.stdout, (
+            "the fixture must actually BLOCK the delete, or this test passes "
+            f"without reaching the arm it guards:\n{r.stdout}")
         assert "with unmerged commits" not in r.stdout, r.stdout
 
 
