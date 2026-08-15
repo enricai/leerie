@@ -31,11 +31,18 @@ def _fired(out: str) -> bool:
 
 
 def test_fires_on_test_with_no_edges_and_a_producer(leerie, capsys):
-    plans = [{"domain": "d", "status": "ready", "subtasks": [
-        _sub("test-001", files_likely_touched=["src/a.test.ts"]),
-        _sub("feat-001", files_likely_touched=["src/a.ts"],
-             provides=["a-impl"]),
-    ]}]
+    # Real plans are per-domain, and the warn now reads the owning plan's
+    # domain rather than the id prefix (docs/POSTMORTEM-2026-08-14.md, F18),
+    # so the fixture has to be shaped the way a planner actually emits it.
+    plans = [
+        {"domain": "testing", "status": "ready", "subtasks": [
+            _sub("test-001", files_likely_touched=["src/a.test.ts"]),
+        ]},
+        {"domain": "feature-implementation", "status": "ready", "subtasks": [
+            _sub("feat-001", files_likely_touched=["src/a.ts"],
+                 provides=["a-impl"]),
+        ]},
+    ]
     out = _warn_out(leerie, capsys, plans)
     assert _fired(out)
     # names the offending sid
@@ -93,14 +100,19 @@ def test_disjoint_paths_shape_fires(leerie, capsys):
     to the feat subtasks whose files it must register. Disjoint paths — the
     exact case a mechanical file-overlap rule misses but this declaration-
     absence check catches."""
-    plans = [{"domain": "d", "status": "ready", "subtasks": [
-        _sub("test-007", files_likely_touched=["vitest.config.ts",
-             "src/tests/coverage-floors-guard.test.ts"]),
-        _sub("feat-002", files_likely_touched=["src/hooks/use-io.ts"],
-             provides=["io-hook"]),
-        _sub("feat-006", files_likely_touched=["src/components/cc.tsx"],
-             provides=["cc-component"]),
-    ]}]
+    plans = [
+        {"domain": "testing", "status": "ready", "subtasks": [
+            _sub("test-007", files_likely_touched=[
+                "vitest.config.ts",
+                "src/tests/coverage-floors-guard.test.ts"]),
+        ]},
+        {"domain": "feature-implementation", "status": "ready", "subtasks": [
+            _sub("feat-002", files_likely_touched=["src/hooks/use-io.ts"],
+                 provides=["io-hook"]),
+            _sub("feat-006", files_likely_touched=["src/components/cc.tsx"],
+                 provides=["cc-component"]),
+        ]},
+    ]
     out = _warn_out(leerie, capsys, plans)
     assert _fired(out)
     assert "test-007" in out

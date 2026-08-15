@@ -272,6 +272,11 @@ For **each** defect you find, you MUST give:
   found a defect — do not invent one.
 - `where` — the `file:line` or function the diff should have handled it in.
 - `why_ships_a_defect` — one sentence: what goes wrong at runtime.
+- `fixed` — `true` if **you fixed it in this pass**; omit it (or `false`) if
+  you are leaving it for someone else. This matters: a defect reported without
+  `fixed: true` blocks the subtask and re-drives the implementer, so reporting a
+  repair as though it were an outstanding gap blocks the run on work you have
+  already committed. Same distinction `rule_violations.status` draws.
 
 Return `solution_defects: []` when — and only when — you genuinely attacked the
 diff and could construct no concrete unhandled case. An empty array is the

@@ -294,6 +294,22 @@ tests/                      pytest suite
 # after full planning + implementation spend:
 ./leerie accept-integration <run-id> <subtask-id>
 
+# Reclaim disk. Nothing reaps run state automatically, while preflight refuses
+# to start a run on low headroom (measured: 1.5 GB, 71 run dirs, 23,158 cache
+# entries, 64 stale leerie/subtasks/* branches after three weeks on one repo).
+# Dry-run by DEFAULT — this deletes directories that may hold the only record
+# of a paid-for run. Removes terminal run dirs (finished_at/killed_at only —
+# a paused or in-flight run survives regardless of age), repo-map cache
+# entries, and orphaned leerie/subtasks/<run-id>/* branches. Host-only.
+# Branch reaping needs POSITIVE EVIDENCE, never absence: `-D` for a run dir this
+# prune removed or a branch already merged into its own run branch, `git branch
+# -d` otherwise (which git refuses on unmerged work). Kept branches are
+# reported. Worktree registrations are dropped before the run dir goes, or git
+# refuses the delete and the failure reads as "unmerged".
+./leerie prune                        # show what would go
+./leerie prune --apply
+./leerie prune --older-than 30 --apply   # default cutoff is 14 days
+
 # Generate .leerie/config.toml with auto-detected BLT commands (host-only, no container):
 ./leerie config --init
 
@@ -461,6 +477,16 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # Positive integer seconds; same precedence: CLI > env > leerie.toml.
 export LEERIE_WORKER_TIMEOUT=9000
 ./leerie "task" --worker-timeout 9000
+
+# Allow a second run on task text a live run is already working. leerie
+# fingerprints the task (`task_sha256` in run.json) and refuses to start when
+# another live run carries the same one — live meaning started and not
+# finished, killed or paused — measured, one brief
+# ran twice for $72.21 and produced two incompatible branches with 14 files in
+# collision. A finished run sharing the text is an ordinary re-run and never
+# blocks. With the hatch set the duplicate still gets announced:
+export LEERIE_ALLOW_DUPLICATE_TASK=1
+./leerie "task"
 
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
@@ -745,6 +771,33 @@ gathered under concurrent load as unusable, and re-run alone before believing
 it. `-n 4` (xdist) is fine on an otherwise-idle host and matches the serial
 totals exactly; what breaks is *two suites at once*, not parallelism itself.
 
+**A local pass is not evidence until the host lacks `claude`.** The binary is
+on a developer's PATH and **not** on the CI runner's, so any test that reaches
+`preflight()` → `_check_claude_cli_version()` passes here and fails there with
+`FileNotFoundError: 'claude'`. That is not hypothetical: PR #211 reported
+"7114 passed, 0 failed" while CI was red on seven tests of exactly this shape.
+Before claiming a suite green, re-run the affected files with the directory
+holding `claude` removed from PATH:
+
+```bash
+CLAUDE_DIR=$(dirname "$(command -v claude)")
+PATH=$(echo "$PATH" | tr ':' '\n' | grep -vFx "$CLAUDE_DIR" | paste -sd:) \
+  pytest tests/<affected>.py
+```
+
+Prefer removing that one directory over a minimal `env -i PATH=/usr/bin:/bin`:
+several tests legitimately need `git`, `jq` and coreutils, and a too-small PATH
+produces failures that look like regressions and are not. A test whose subject
+is the gate rather than the CLI should **stub** `_check_claude_cli_version`
+rather than skip — skipping on CI removes the coverage instead of the
+dependency (`tests/test_append_system_prompt_file.py` shows the skip form, for
+the case where the CLI genuinely *is* the subject).
+
+`shellcheck` is likewise not installed on every dev host but does run in CI, so
+a `scripts/*.sh` change is unverified until pushed — and it catches things
+`bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix, and the backtick class
+CLAUDE.md records under `tests/test_launcher_integrity.py`).
+
 **Do not edit `orchestrator/leerie.py` (or any file under test) while the
 suite is running.** A great many guards here assert via
 `inspect.getsource` / `ast.parse` on the module read from disk, and Python's
@@ -991,8 +1044,9 @@ Note the two write sites mean different things — the mid-run satisfied-rescue
 sentinel sets `reviewed: False` but is deliberately excluded from
 `unreviewed_subtasks`, since a zero-commit subtask has no diff to review and
 folding it into the operator warning is how a warning becomes noise.
-`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the
-`bugfix-`-only sibling that asks whether the reported symptom still reproduces
+`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the sibling —
+scoped by the planner's `fixes_reported_symptom` declaration, never by an id
+prefix — that asks whether the reported symptom still reproduces
 on the base tree — run fa979580's N18 subtask re-fixed a leak an earlier PR had
 already fixed, shipping an event-loop stall on the way. Three traps. **(1) It is
 advisory and must stay that way**: the output never reaches
@@ -1011,12 +1065,16 @@ fires every run is how a warning stops being read. **(2) "The new tests fail on 
 worthless** — measured on that run all four findings' tests already failed on
 base (9 of 13 for one), because a new test against absent code trivially fails;
 the field therefore asks for a command and an observation, not a bare boolean.
-**(3) Scoped by id prefix**, not by reading the task text (*Language-to-JSON*),
-so it is silent on the feature/test/docs subtasks that have no prior symptom.
-The prefix comes from the ORCHESTRATOR's `sid`, never from the worker's
-echoed `result["subtask_id"]` — nothing in the module cross-checks that
-echo, so a worker reporting `feat-001` while working on `bugfix-005` would
-slip the scope entirely. Taking the sid string rather than the subtask dict
+**(3) Scoped by the planner's `fixes_reported_symptom` declaration**, never by
+the subtask's id — that was the original design and it produced 10 of 10 false
+positives, because `_repair_prescribed_commands` mints ids from the HOST
+subtask's domain and a merge re-homes a `feat-` subtask under a surviving
+`bugfix-` id. *Language-to-JSON* is usually read as being about prose, but an
+identifier is a string too. The `sid` still comes from the ORCHESTRATOR, never
+from the worker's echoed `result["subtask_id"]` — nothing in the module
+cross-checks that
+echo, which is precisely why the id is not the scope signal. Taking the sid
+string rather than the subtask dict
 also removes a `None`-dereference by construction, and neither this check
 nor `check_implementer_output` coerces a bad argument (`sid or ""`,
 `subtask or {}`): both shapes swallow a contract violation and leave the

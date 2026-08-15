@@ -1375,6 +1375,342 @@ PY
         ;;
     esac
     ;;
+  prune)
+    shift
+    # Reclaim state that nothing else reaps. Measured on one repo after three
+    # weeks: 1.5 GB across 71 run dirs and 23,158 repo-map-cache entries, plus
+    # 64 stale leerie/subtasks/* branches left in the user checkout -- while
+    # leerie preflight itself dies on low disk headroom and tells the operator
+    # to prune by hand (docs/POSTMORTEM-2026-08-14.md, F22).
+    #
+    # Dry-run by DEFAULT. This deletes run directories that may hold the only
+    # record of a paid-for run, so the safe mode is the one you get without
+    # asking.
+    _prune_days=14
+    _prune_apply=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --older-than) _prune_days="${2:?--older-than needs a number of days}"; shift 2 ;;
+        --older-than=*) _prune_days="${1#*=}"; shift ;;
+        --apply) _prune_apply=true; shift ;;
+        -h|--help)
+          echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
+          echo "  Removes terminal run dirs and stale repo-map cache entries" >&2
+          echo "  older than DAYS (default 14), and subtask branches whose run" >&2
+          echo "  dir is gone. Dry-run unless --apply is given." >&2
+          exit 0 ;;
+        *) echo "leerie prune: unknown option '$1'" >&2; exit 1 ;;
+      esac
+    done
+    case "$_prune_days" in
+      ''|*[!0-9]*) echo "leerie prune: --older-than needs a whole number of days" >&2; exit 1 ;;
+    esac
+    LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
+      python3 - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
+import fcntl, json, os, pathlib, shutil, subprocess, sys, time
+
+root = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2])
+days = int(os.environ.get("LEERIE_PRUNE_DAYS", "14"))
+apply = os.environ.get("LEERIE_PRUNE_APPLY") == "true"
+cutoff = time.time() - days * 86400
+freed = 0
+runs_removed = []
+reaped_dirs = set()
+
+def size_of(p: "os.PathLike[str] | str") -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(p):
+        for f in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    # LC_ALL=C: `git worktree prune -n -v` and friends emit gettext-translated
+    # messages (builtin/worktree.c wraps them in _()), so parsing English
+    # prefixes under another locale silently matches nothing.
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                          text=True, check=False,
+                          env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
+
+
+CONTAINER_STATE_ROOT = "/leerie-state"
+
+
+def _host_spelling(p: str) -> str:
+    """The host path for a `gitdir` entry a container wrote.
+
+    Subtask worktrees are created INSIDE the container, where the state root
+    is bind-mounted at `/leerie-state` -- so `new-worktree.sh` writes
+    `/leerie-state/runs/<id>/worktrees/<sid>/.git` into
+    `.git/worktrees/<n>/gitdir`, while `prune` runs on the host and knows the
+    directory as `$LEERIE_STATE_HOST_DIR/runs/<id>/...`. Comparing the two
+    spellings without translating never matched, which made the whole
+    deregistration a no-op in the only runtime that produces the defect.
+
+    Same mapping `_operator_path` performs for operator-facing text.
+    """
+    if p == CONTAINER_STATE_ROOT or p.startswith(CONTAINER_STATE_ROOT + "/"):
+        rel = p[len(CONTAINER_STATE_ROOT):].lstrip("/")
+        try:
+            return str(root.resolve() / rel) if rel else str(root.resolve())
+        except OSError:
+            return p
+    return p
+
+
+def _registration_target(entry) -> "str | None":
+    """The worktree directory `.git/worktrees/<name>` points at, host-side.
+
+    `None` when the entry is torn or unattributable -- never a guess. An
+    empty `gitdir` used to fall through to `Path("").resolve()`, which
+    returns the process cwd: a torn file could therefore attribute a
+    registration to whatever directory prune happened to run from.
+    """
+    try:
+        wt = (entry / "gitdir").read_text().strip()
+    except OSError:
+        return None
+    if wt.endswith("/.git"):
+        wt = wt[: -len("/.git")]
+    if not wt:
+        return None
+    q = pathlib.Path(wt)
+    if not q.is_absolute():
+        # git >= 2.48 with `worktree.useRelativePaths=true` stores this
+        # relative to the ENTRY directory. Resolving it against our cwd
+        # instead silently attributes it somewhere else entirely.
+        q = entry / q
+    try:
+        return _host_spelling(str(q.resolve()))
+    except OSError:
+        return None
+
+
+def _is_live(run_dir, run_id: str) -> bool:
+    """Positive evidence that a run is still executing.
+
+    Fails CLOSED: a probe we cannot complete reads as live, because the cost
+    of a wrong "dead" is deleting the only copy of a paid-for run.
+
+    Timestamps cannot carry this. `finished_at` is never cleared -- no site
+    in the launcher or the orchestrator clears it -- so a run that die()d
+    once carries it forever and reads as terminal on every later prune, with
+    only `mtime < cutoff` left in the way, and `--older-than 0` is accepted.
+    Reproduced: a run with a stale `finished_at` and a live worktree holding
+    the only copy of a commit lost both its branch and its run directory,
+    recoverable only from the reflog.
+
+    The flock is authoritative and free: `State.__init__` holds an exclusive
+    flock on the run directory for the life of the orchestrator (DESIGN §6
+    *Single owner per run dir*), the container bind-mounts that same
+    directory, and flock is an inode-level lock -- so a host-side probe sees
+    a container-side holder. `nerdctl inspect` covers the one case the flock
+    cannot: a crashed orchestrator that released the lock while its container
+    is still up.
+    """
+    try:
+        fd = os.open(run_dir, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    try:
+        return subprocess.run(["nerdctl", "inspect", run_id],
+                              capture_output=True, timeout=10).returncode == 0
+    except subprocess.TimeoutExpired:
+        # Fail closed: an unreachable container runtime is "cannot
+        # determine", and prune must never resolve that as "dead".
+        return True
+    except OSError:
+        # nerdctl absent -- a Fly-only host, say. Not evidence that a local
+        # container is up, and the flock has already answered for anything
+        # that runs locally.
+        return False
+
+
+def _deregister_orphaned_worktrees(reaped: set) -> None:
+    """Drop `.git/worktrees/<name>` registrations whose worktree is gone.
+
+    rmtree removes the worktree directory but leaves the registration behind,
+    and git then refuses `git branch -D` with "cannot delete branch ... used
+    by worktree at ..." -- so every branch of every run a prune removed
+    survived, and the rc=1 was misreported below as "unmerged commits", which
+    `-D` never returns.
+
+    Scoped by construction: only registrations pointing inside the state
+    root, so a sibling checkout's or the operator's own worktrees are never
+    touched. Within that scope it attributes over EVERY orphaned
+    registration rather than only the dirs this pass removed -- a directory
+    removed by an earlier prune, by cleanup.sh or by hand leaves a
+    registration no later prune would look at, and its branch is then
+    unreapable forever.
+    """
+    r = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    wdir = pathlib.Path(r.stdout.strip()) / "worktrees"
+    if not wdir.is_dir():
+        return
+    try:
+        sroot = str(root.resolve())
+    except OSError:
+        return
+    for entry in sorted(wdir.iterdir()):
+        if (entry / "locked").exists():
+            # git's own prune honours this; so must we.
+            continue
+        target = _registration_target(entry)
+        if target is None:
+            continue
+        if target != sroot and not target.startswith(sroot + os.sep):
+            continue
+        orphaned = not os.path.exists(target) or any(
+            target == d or target.startswith(d + os.sep) for d in reaped)
+        if orphaned and apply:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+runs = root / "runs"
+live = set()
+if runs.is_dir():
+    for d in sorted(runs.iterdir()):
+        if not d.is_dir():
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            data = {}
+        terminal = bool(data.get("finished_at") or data.get("killed_at"))
+        try:
+            mtime = d.stat().st_mtime
+        except OSError:
+            continue
+        # Only terminal runs, and only old ones. A paused or in-flight run is
+        # resumable and must survive regardless of age.
+        # Terminal AND old AND not live. The first two are timestamps and a
+        # timestamp cannot see a running orchestrator -- see `_is_live`.
+        if terminal and mtime < cutoff and not _is_live(d, d.name):
+            freed += size_of(d)
+            runs_removed.append(d.name)
+            try:
+                reaped_dirs.add(str(d.resolve()))
+            except OSError:
+                pass
+            if apply:
+                shutil.rmtree(d, ignore_errors=True)
+        else:
+            live.add(d.name)
+
+# Deregister BEFORE reaping branches, and after the removal loop so the sweep
+# sees the directories it just deleted as gone.
+_deregister_orphaned_worktrees(reaped_dirs)
+
+cache = root / "repo-map-cache"
+cache_removed = 0
+if cache.is_dir():
+    for f in cache.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                freed += f.stat().st_size
+                cache_removed += 1
+                if apply:
+                    f.unlink()
+        except OSError:
+            pass
+
+# Subtask branches, scoped to leerie/subtasks/<run-id>/* so a user branch is
+# never in scope.
+#
+# REAPING NEEDS POSITIVE EVIDENCE, and there are only three kinds of it.
+#
+# The tempting rule -- "this run dir is not in <state-root>/runs, so the branch
+# is orphaned" -- is wrong, and destructively so. It infers death from ABSENCE,
+# and a state root is silent about every run it never owned: point `prune` at a
+# different root than the run used (a second shell without LEERIE_STATE_DIR
+# exported is enough, and both roots pass the .owner check when they belong to
+# the same repo) and every branch reads as orphaned. Reproduced: a paused run's
+# `leerie/subtasks/<id>/feat-001`, holding the only copy of its implementer
+# commits, force-deleted and recoverable only from the reflog. Guarding this on
+# `runs.is_dir()` does not help -- the orchestrator creates that directory
+# unconditionally and nothing ever removes it, so on any host that has run
+# leerie once the guard can never fire.
+#
+# So, three tiers, in order:
+#   1. a run dir THIS prune just removed is known terminal and old -> `-D`.
+#   2. the branch is an ANCESTOR of its own run branch, i.e. its commits are
+#      already reachable from the integrated history -> `-D`. This tier is what
+#      keeps the feature useful: `git branch -d` checks merged-into-HEAD, and a
+#      subtask branch is merged into `leerie/runs/<id>`, never into `main` --
+#      so without it a fully integrated, long-pushed branch is refused exactly
+#      like one holding unique work, and prune reclaims almost nothing.
+#   3. anything else gets `git branch -d`, which git refuses when the branch is
+#      unmerged. Unmerged work cannot be lost, whatever this root knows.
+branches_removed = []
+branches_kept = 0
+branches_blocked = []
+out = _git("for-each-ref", "--format=%(refname:short)",
+           "refs/heads/leerie/subtasks").stdout
+_reaped = set(runs_removed)
+for ref in out.splitlines():
+    parts = ref.split("/")
+    if len(parts) < 4:
+        continue
+    run_id = parts[2]
+    if run_id in live:
+        continue
+    integrated = _git("merge-base", "--is-ancestor", ref,
+                      "leerie/runs/%s" % run_id).returncode == 0
+    force = run_id in _reaped or integrated
+    if not apply:
+        # Classify in dry run too, so the two modes agree. Reporting every
+        # candidate as removable made the default mode overstate the result and
+        # hid the `kept` line -- the one thing an operator needs before
+        # choosing `--apply`.
+        if force or _git("merge-base", "--is-ancestor", ref,
+                         "HEAD").returncode == 0:
+            branches_removed.append(ref)
+        else:
+            branches_kept += 1
+        continue
+    r = _git("branch", "-D" if force else "-d", ref)
+    if r.returncode == 0:
+        branches_removed.append(ref)
+    elif "not fully merged" in r.stderr:
+        # The branch holds work nothing else has. Keeping it is the point.
+        branches_kept += 1
+    else:
+        # Anything else is NOT unmergedness -- `-D` never returns that -- and
+        # reporting it as such is how the stale-registration defect stayed
+        # invisible. Name it.
+        branches_blocked.append(
+            (r.stderr or "").strip().splitlines()[0] if r.stderr else ref)
+
+verb = "removed" if apply else "would remove"
+print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
+print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
+print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
+print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
+if branches_kept:
+    # Never silent. A branch that survived did so because it holds unmerged
+    # commits, which is exactly what an operator running `prune` wants told.
+    print(f"  kept {branches_kept} subtask branch(es) with unmerged commits")
+for _b in branches_blocked:
+    print(f"  could not delete a subtask branch: {_b}")
+print(f"  {verb} ~{freed / 1048576:.1f} MiB")
+if not apply:
+    print("  (dry-run — re-run with --apply to delete)")
+PY
+    exit 0
+    ;;
   list)
     # `list --runtime fly` is a runtime-aware view: query Fly directly
     # for every machine under FLY_APP, then best-effort cross-reference
@@ -1706,7 +2042,7 @@ PY
     # rely on the process exit code surviving flyctl's rc-flattening) can
     # grep the outcome. Exit code is still set for the local path.
     _ab_mutate='
-import json, os, sys, tempfile
+import datetime, json, os, sys, tempfile
 path, sid = sys.argv[1], sys.argv[2]
 force = len(sys.argv) > 3 and sys.argv[3] == "--force"
 try:
@@ -1749,17 +2085,43 @@ if cur == "complete":
 if not force and not in_registry and cur not in ("blocked", "failed"):
     print(f"ERROR: subtask {sid!r} has status {cur!r} (expected blocked or failed)", file=sys.stderr)
     sys.exit(1)
+# Record the acceptance BEFORE erasing what it accepted. The die() that sends
+# an operator here says "See ... state.json", and this mutation used to set
+# complete, pop the blocked registry and write nothing else -- so afterwards a
+# waived subtask was byte-indistinguishable from one that genuinely succeeded,
+# and the blocker it was waived for had been deleted. Following the advice of
+# the tool destroyed the evidence that advice pointed at
+# (docs/POSTMORTEM-2026-08-14.md, F16).
+_blocker = bl.get(sid) if isinstance(bl, dict) else None
+st.setdefault("accepted_blocked", {})[sid] = {
+    "at": datetime.datetime.now(datetime.timezone.utc)
+          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "previous_status": cur,
+    "blocker": _blocker,
+    "forced": bool(force),
+}
 ss[sid] = "complete"
 if isinstance(bl, dict):
     bl.pop(sid, None)
     if not bl:
         st.pop("blocked", None)
+# Preserve the file mode. NamedTemporaryFile creates 0600 and os.replace keeps
+# the mode of the SOURCE, so writing this way silently tightened state.json
+# from 0644 to 0600 -- a change nobody asked for, and one that differs from how
+# the orchestrator writes the same file.
+try:
+    _mode = os.stat(path).st_mode & 0o777
+except OSError:
+    _mode = None
 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
     json.dump(st, tmp, indent=2)
     tmp.write("\n")
     tmp_path = tmp.name
+if _mode is not None:
+    os.chmod(tmp_path, _mode)
 os.replace(tmp_path, path)
-print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
+print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
+      f"(recorded under accepted_blocked)")
 '
     if [ "$_ab_runtime" = "ec2" ]; then
       # EC2 counterpart of the Fly branch below: wake the instance if it
@@ -2020,7 +2382,7 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
     # NOOP: / ERROR:) so both the local exit code and the Fly/EC2
     # grep-the-output path can tell the outcome apart.
     _ai_mutate='
-import json, os, sys, tempfile
+import datetime, json, os, sys, tempfile
 path, sid = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
@@ -2038,14 +2400,30 @@ if entry.get("accepted"):
     sys.exit(0)
 entry["accepted"] = True
 defects = st.get("integration_defects", {})
+# Keep what was accepted, on the entry itself, before dropping it from the
+# live registry. Same rule as accept-blocked: a waiver that deletes the finding
+# it waived leaves nobody able to say what was waived
+# (docs/POSTMORTEM-2026-08-14.md, F16).
+entry["accepted_at"] = (datetime.datetime.now(datetime.timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"))
+if isinstance(defects, dict) and defects.get(sid) is not None:
+    entry["accepted_defects"] = defects.get(sid)
 if isinstance(defects, dict):
     defects.pop(sid, None)
     if not defects:
         st.pop("integration_defects", None)
+# Preserve the file mode -- NamedTemporaryFile creates 0600 and os.replace
+# keeps the mode of the source, silently tightening state.json.
+try:
+    _mode = os.stat(path).st_mode & 0o777
+except OSError:
+    _mode = None
 with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
     json.dump(st, tmp, indent=2)
     tmp.write("\n")
     tmp_path = tmp.name
+if _mode is not None:
+    os.chmod(tmp_path, _mode)
 os.replace(tmp_path, path)
 print(f"ACCEPTED: {sid!r} integration finding accepted")
 '
@@ -6200,7 +6578,7 @@ for arg in "$@"; do
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|status|version)
+    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|prune|status|version)
       # Launcher-only verbs — normally dispatched at the top-level case
       # (line ~945) when they appear as $1. If one appears here it was
       # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
@@ -8340,6 +8718,18 @@ else
     # launcher-computed, not a user knob, and the forward only carries vars
     # that are exported.
     -e "LEERIE_COMMIT=${LEERIE_COMMIT:-}"
+    # The host path of the state root, for RENDERING OPERATOR TEXT ONLY --
+    # never for filesystem access, which is why it is deliberately NOT
+    # forwarded under its own name. LEERIE_STATE_HOST_DIR is on the deny-list
+    # above precisely because a host path is meaningless as a path inside the
+    # container, and that stays true; the _DISPLAY suffix is the signal that
+    # this value may only ever be printed.
+    #
+    # Without it, a die() naming <state-root>/runs/<id>/state.json prints
+    # /leerie-state/..., and `ls /leerie-state` fails on the operator machine
+    # (docs/POSTMORTEM-2026-08-14.md, F17). The bind-mount below already knows
+    # the answer; nothing carried it across.
+    -e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host

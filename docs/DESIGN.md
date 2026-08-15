@@ -1888,6 +1888,68 @@ deferred — once `orchestrator.pid` is no longer authoritative,
 the launcher's `decide_teardown` arms can no longer be misrouted
 by the stale-pid path.
 
+### Never a repository-global git operation
+
+The user's repo is bind-mounted whole, so `.git` is SHARED — with the host, and
+with every other container. A repository-global operation therefore reaches
+state this run does not own and cannot see.
+
+`git worktree prune` is the case that bit. It has no grace period (the
+three-month `gc.worktreePruneExpire` applies to `git gc`, not to an explicit
+prune), so it drops the registration of every worktree whose path is absent
+from the pruning process's namespace — including each host-side
+`/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
+can see. The result is a rebase worktree that git has forgotten while its
+directory still exists.
+
+So no call site runs one. `prune_leerie_worktrees` (shell) and
+`_prune_leerie_worktrees` (Python) ask git what it *would* prune, attribute
+each entry to a path, and remove only entries under a root the caller names.
+An entry that cannot be attributed is left strictly alone: deleting a
+registration we cannot identify is exactly the accident this exists to prevent.
+Both pin `LC_ALL=C`, because git wraps that output in gettext and a translated
+prefix silently matches nothing — a no-op indistinguishable from "nothing was
+stale", which is worse than the bare prune it replaced.
+
+The rule generalises past pruning: any git verb that acts on the whole
+repository rather than on this run's own refs and worktrees is out of bounds
+from inside a container.
+
+### One task, one run
+
+The flock above makes a *run directory* single-owner. It says nothing about two
+runs working the same **task**, because `run_id` is the container id — two
+launches of byte-identical task text are, to each other, invisible.
+
+Measured: one brief ran twice three minutes apart, for **$72.21** across 173
+worker calls, and produced two architecturally incompatible branches — one
+dynamic test route against two static ones, no persistence against a Prisma
+migration — with 14 files in collision and two PRs whose merge order decides
+which design survives. Neither run was wrong. Nothing told either one that the
+other existed (docs/POSTMORTEM-2026-08-14.md, F10).
+
+So a run records a fingerprint of its task text (`task_sha256` on `run.json`)
+and, before spawning its first worker, refuses to start when another **live**
+run carries the same one. "Live" means started and not finished, killed or
+paused: a completed run sharing a fingerprint is an ordinary re-run and says
+nothing. The check is deliberately placed at the last cheap moment: after state exists,
+before this task's first worker. Not literally before any spend —
+`preflight()`'s smoke test and the dep-capture backstop both run earlier and
+both cost. The refusal names the other run and the two commands that resolve it
+(`leerie attach`, `leerie kill`).
+
+Running the same brief twice on purpose is a real thing to want, so there is an
+escape hatch, `LEERIE_ALLOW_DUPLICATE_TASK`. It is an environment variable
+rather than a CLI flag because it should be *stated* rather than discovered
+mid-argument-list, and with it set the duplicate is still announced — the run
+proceeds, it is not silenced.
+
+Fingerprinting the text rather than the resolved plan is the conservative
+choice in both directions: two different briefs that would produce the same
+plan are not caught (they are also not obviously wrong to run together), and
+two identical briefs are caught before the planner has been paid for.
+
+
 ### Why merge, not cherry-pick
 
 Subtask branches are integrated into the run branch by merging, not by cherry-picking.
@@ -2802,7 +2864,7 @@ rather than folded into the guardrail.
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
 - Worktrees under `<state-root>/runs/<run-id>/worktrees/` are removed and
-  `git worktree prune` clears stale metadata. Worktrees are
+  `_prune_leerie_worktrees` (scoped) clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
   on `resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
@@ -3862,7 +3924,7 @@ container. The `--max-workers` budget persists across the re-exec
 rate-limit still respects the cap and can never run away. Cleanup runs before
 the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
-dirs, then `git worktree prune` — the re-exec'd `resume` finds a clean slate.
+dirs, then `_prune_leerie_worktrees` — the re-exec'd `resume` finds a clean slate.
 That is a convenience, not the guarantee: cleanup cannot run when the process is
 SIGKILLed (Fly `machine stop`), so `setup-run.sh` reclaims a stale staging
 directory itself rather than relying on a predecessor having tidied up.
@@ -5889,6 +5951,51 @@ has no commits to make either way. The mid-run *sibling* case is the one that
 motivated the fix; the base-satisfied case is the same code path with the same
 correct outcome.
 
+**Probing a flagged subtask before it spends.** The rescue above is correct
+but its *ordering* is wasteful. The redundancy it settles is, for a whole class
+of subtasks, predictable one phase earlier: `_warn_provider_subset_subtasks`
+(§5 *Provider-subset subtasks*) already flags, at plan time, every subtask
+whose entire `files_likely_touched` surface belongs to an ordered predecessor.
+That advisory was *right and inert* — measured across the corpus, all three of
+one run's flagged subtasks ran a full implementer and committed nothing, and
+twelve subtasks corpus-wide reached this rescue only after their whole spend.
+
+So the flagged sids are persisted (`provider_subset_sids`) and `_settle_subtask`
+runs the **same** HEAD probe against the staging worktree *before* spawning the
+implementer. Staging sits at the run-branch HEAD, and a provider-subset
+predecessor is by construction in an earlier wave and therefore already merged
+there, so the reference is exactly the one the post-hoc rescue would use. A hit
+settles the subtask on one read-only probe instead of a full implementer — that
+run's three cost ≈18 worker-minutes and ≈$2.6 between them. A miss costs one
+probe and the subtask proceeds untouched.
+
+This deliberately does **not** become a drop. The plan-time signal alone stays
+advisory for the reason it always was — a subtask may make a genuinely distinct
+edit to a shared file — and the decision is still the probe's, judged against a
+real tree. What changes is only *when* the probe is asked. The post-execution
+rescue is unchanged and remains the backstop for every subtask the plan-time
+flag does not cover (the transitive case it deliberately excludes, and any
+sibling overlap the file surfaces never predicted).
+
+**A settle without an implementer still owes the wave a branch.** `integrate_wave`
+filters on one thing — a subtask's `status == "complete"` — and never asks
+whether `leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is
+safe because its implementer ran: `new-worktree.sh` created the branch, it
+carries zero commits, and `git merge --no-ff` of a branch that is already an
+ancestor is a true no-op ("Already up to date", no commit). The pre-spawn probe
+returns *before* `_run_implementer`, so no branch was ever created, and
+`integrate.sh` exits 2 on a missing branch — taking the run down on every probe
+hit.
+
+So the pre-spawn path creates the branch itself, at the run-branch tip, before
+settling. The invariant is the general one and worth stating as such: **any path
+that marks a subtask complete must leave behind the branch integration will look
+for**, and the cheapest way to satisfy that is to produce the same artifact the
+implementer path produces rather than to teach integration a second meaning of
+"complete". If the branch cannot be created the subtask falls through to its
+implementer, because a settle that integration cannot merge is worse than the
+spend it saves.
+
 **The sibling-invalidation case (why a pre-schedule drop must weigh
 survivors).** The two sibling cases above both concern a sibling that
 *satisfies* a subtask. There is a third, opposite hazard the pre-schedule probe
@@ -6462,7 +6569,8 @@ Two further disciplines apply, and they sit at the §12 axis:
   a fix fires; this asks whether the failure it fixes still happens. On run
   `fa979580` a subtask "fixed" a cgroup leak that an earlier PR had already
   fixed **before the run began**, and shipped an event-loop stall doing it.
-  Nothing asked. `bugfix-` subtasks therefore record a `symptom_evidence`
+  Nothing asked. A subtask whose planner entry declares
+  `fixes_reported_symptom: true` therefore records a `symptom_evidence`
   object — did the reported symptom reproduce on the base tree, how, and what
   was observed — and a subtask that could not reproduce it says so.
 
@@ -6520,8 +6628,18 @@ Two further disciplines apply, and they sit at the §12 axis:
   revert-to-base (the implementer's change was wrong and the conformer
   undid it) is indistinguishable from a clobber by git state alone, and
   the phase is advisory by design. The same guard applies to the
-  final-tree pass, using the run branch as the base and the staging HEAD
-  captured before that pass as the implementer-work snapshot. This is the
+  final-tree pass, using **a snapshot SHA** as the base and the staging HEAD
+  captured before that pass as the implementer-work snapshot. The base must be
+  the point the run branch forked from the working branch, resolved as a SHA —
+  emphatically *not* the run branch itself. The staging worktree has the run
+  branch **checked out**, so naming that branch as the base makes the base and
+  `HEAD` the same ref: the blob comparison then reports every file the final
+  conformer touched as reverted-to-base, and under `--strict-conformer` rolls
+  those legitimate fixes back. That is not a hypothetical — it is what the
+  spec said here until 2026-08-14, and it fired on every run whose final
+  conformer committed anything (docs/POSTMORTEM-2026-08-14.md, F2). Any ref
+  used as a comparison base in a worktree must be a snapshot, because a branch
+  name moves when that worktree commits. This is the
   §12 boundary again: the guarantee that matters (committed implementer
   work survives the conformer) is a code check, not a prompt rule.
 
@@ -6625,6 +6743,21 @@ unchanged: a residual about something other than build/lint/test, an unlabelled
 one, a *newly* introduced one, or a failure on an axis that was **green** at
 baseline all continue the loop exactly as before — those are regressions this
 change must stay able to see.
+
+**An axis that could not be measured is a third state, and it is not clean.**
+The baseline already distinguishes it: an axis whose command never produced a
+verdict is recorded `measured: False` and excluded from `red_axes`, because
+"could not measure" is not "RED". But that distinction was defined only for the
+*baseline*, and every later measurement can hit the same condition — a command
+whose runner is missing on this tree, or one the container's resource limits
+killed before it could report. When it does, the loop predicate must treat it as
+unresolved rather than silently clean: no evidence is not evidence of green.
+Reading the axis as clean is how a run shipped a PR whose entire test axis never
+ran, because the axis was also in `red_axes` from the baseline and the
+exclusion swallowed a *second*, different unmeasurability
+(docs/POSTMORTEM-2026-08-14.md, F6). This is rare by construction — measured, 1
+of 46 final axes that ran — so treating it as unresolved costs almost nothing
+and buys the guarantee that a green verdict means something was actually run.
 
 This is the same principle as the baseline itself (*Base-tree health baseline*
 below), applied one layer down. The baseline was already being handed to the
@@ -6808,8 +6941,23 @@ staging worktree — unmodified at this point — is the earliest tree
 where an accurate baseline can be taken. The verdict is **exit-code
 based** (a non-zero exit is RED, zero is GREEN): this is 100% reliable
 and needs no per-framework output parsing, which is deliberate — the
-suite's own summary format varies by tool and cannot be relied on. A
-RED base is surfaced **loudly** (a `log()` warning plus a
+suite's own summary format varies by tool and cannot be relied on.
+
+The one thing an exit code cannot distinguish is *the command never got to
+run*, so that case is classified separately and recorded `measured: False`.
+It has two causes and both must be covered, because leerie owns the
+environment in which the command runs and is therefore the author of both:
+the runner is absent from this tree (the recipe's install failed, so the
+test binary is missing), **or** the container's own limits killed it — a
+build that cannot spawn a worker thread against `pids.max` reports failure
+without having measured anything. Leaving the second uncovered pushed the
+judgment into the workers, which adjudicated it in prose: measured across a
+run corpus, **37 worker calls** reasoned about `OS can't spawn worker
+thread: Resource temporarily unavailable (os error 11)` and decided for
+themselves that it was environmental. §12 says that decision belongs in
+code (docs/POSTMORTEM-2026-08-14.md, F5).
+
+A RED base is surfaced **loudly** (a `log()` warning plus a
 `run.json.health.base_suite` record) rather than silently absorbed,
 because it usually means *leerie could not make this repo green before
 starting* — the operator's signal to suspect provisioning, memory

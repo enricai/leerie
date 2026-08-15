@@ -380,6 +380,10 @@ DEFAULT_CAPS = {
 STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
+    # Written by the LAUNCHER's `accept-blocked` mutator, not by this
+    # module -- declared here because it is a state.json field and
+    # STATE_FIELDS is the file's inventory.
+    "accepted_blocked",
     "plan_snapshot",
     "decompose_snapshot",
     "blocked",
@@ -437,7 +441,10 @@ STATE_FIELDS = (
     # passed. Adjacent to `conformance` because the two are only meaningful
     # together — see DESIGN §9.
     "unreviewed_subtasks",
-    # sid -> check_symptom_evidence findings for `bugfix-` subtasks. Kept
+    # sid -> check_symptom_evidence findings, for subtasks whose planner
+    # entry declares `fixes_reported_symptom: true` (NOT a `bugfix-` id
+    # prefix -- ids are re-homed by merges and synthesised for
+    # verification-only work). Kept
     # beside the row above because both answer "what should the operator
     # know about a subtask that reports itself complete?" — see DESIGN §9
     # *A stale finding is not a bug*.
@@ -460,6 +467,14 @@ STATE_FIELDS = (
     # [str]}. Empty/absent when no drop fired. Audit trail only — the
     # run proceeds with the surviving subtasks.
     "dropped_subtasks",
+    # provider_subset_sids: sids flagged at plan time by
+    # _warn_provider_subset_subtasks — every file the subtask expects to
+    # touch is already owned by an ordered predecessor. Advisory, never a
+    # drop, but read by _settle_subtask to probe the run branch BEFORE
+    # spawning the implementer, since the redundancy usually only becomes
+    # real once the predecessor commits. List of sid; empty when nothing
+    # was flagged.
+    "provider_subset_sids",
     # conditional_drops: planner-emitted consumer subtasks dropped by the
     # reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e.
     # the planner authored the subtask as "no-op if X" and X turned out
@@ -1709,6 +1724,30 @@ SCHEMAS: dict[str, dict] = {
                         # most subtasks run no prescribed command.
                         "runs_commands": {
                             "type": "array", "items": {"type": "string"}},
+                        # Does this subtask fix a symptom the task REPORTED as
+                        # currently broken? `check_symptom_evidence` gates on
+                        # this, and on nothing else.
+                        #
+                        # It used to gate on `sid.startswith("bugfix-")`, which
+                        # is the *Language-to-JSON* rule violated on an id
+                        # rather than on prose: Python inferred the nature of
+                        # the work from an identifier string. Two mechanisms
+                        # mint that prefix onto work that fixes no symptom —
+                        # `_repair_prescribed_commands` synthesises
+                        # `{prefix}{900+n}` from the HOST subtask's domain, and
+                        # a duplicate-provider/overlap merge re-homes a `feat-`
+                        # subtask under a surviving `bugfix-` id. Measured
+                        # across the corpus, **10 of 10** findings were false
+                        # positives (POSTMORTEM-2026-08-14, F18), which is how a
+                        # warning stops being read.
+                        #
+                        # Deliberately OPTIONAL, and absence means "no" — the
+                        # check is advisory, so a silent check is strictly
+                        # better than one at a 100% false-positive rate, and
+                        # requiring the field would risk the validity-rate
+                        # collapse `severity` caused on `wiring_judge` (9 of 66
+                        # invalid, all on one required field).
+                        "fixes_reported_symptom": {"type": "boolean"},
                     },
                 },
             },
@@ -1862,6 +1901,22 @@ SCHEMAS: dict[str, dict] = {
                         "criterion": {"type": "string"},
                         "met": {"type": "boolean"},
                         "evidence": {"type": "string"},
+                        # The third state, and the reason it exists: some
+                        # criteria are not the implementer's to evaluate.
+                        # `prompts/implementer.md` tells the worker that a
+                        # criterion naming the build is a conformance-phase
+                        # signal and to record it `met: false` — and
+                        # `check_implementer_output` then turned any
+                        # `met: false` into UNMET_CRITERION and re-drove the
+                        # worker. With only two states an obedient implementer
+                        # COULD NOT PASS: measured, bugfix-008 took 3 drives
+                        # ($1.96) and feat-003 took 3 ($3.00), one of them
+                        # narrating the contradiction before being re-driven
+                        # for it (docs/POSTMORTEM-2026-08-14.md, F3).
+                        #
+                        # Optional, and absent means "this was mine to
+                        # evaluate", so nothing changes for the ordinary case.
+                        "not_applicable": {"type": "boolean"},
                     },
                 },
             },
@@ -1872,8 +1927,10 @@ SCHEMAS: dict[str, dict] = {
             # cheapest: it has the repo mounted and has just written the
             # path. Optional here; check_production_evidence gates.
             "production_evidence": _production_evidence_schema(),
-            # DESIGN §9 *A stale finding is not a bug*. `bugfix-` subtasks
-            # only. Same flat, single-required-bool shape as the field above,
+            # DESIGN §9 *A stale finding is not a bug*. Asked for only when
+            # the subtask declares `fixes_reported_symptom: true`; the id
+            # prefix is not the signal. Same flat, single-required-bool
+            # shape as the field above,
             # for the same decoder-safety reason.
             "symptom_evidence": {
                 "type": "object",
@@ -2077,6 +2134,11 @@ SCHEMAS: dict[str, dict] = {
                     "required": ["kind", "concrete_case", "where",
                                  "why_ships_a_defect"],
                     "properties": {
+                        # True when the conformer fixed it here; absent
+                        # means residual. Why it exists, and why a bool rather
+                        # than a status enum: POSTMORTEM-2026-08-14 F11 and
+                        # tests/test_conformer_fixed_defects.py.
+                        "fixed": {"type": "boolean"},
                         "kind": {"type": "string",
                                  "enum": ["unhandled_input", "unhandled_path",
                                           "missing_guard",
@@ -2585,7 +2647,33 @@ SCHEMAS: dict[str, dict] = {
                                           "broken_by_drop",
                                           "orphaned_dependent"]},
                         "sid": {"type": "string"},
-                        "tag_or_dep": {"type": "string"},
+                        # This field is matched by EQUALITY against the
+                        # provides union and the subtask-id set, so anything
+                        # that is not the bare token silently misses every
+                        # predicate keyed on it and the defect reaches the
+                        # die() unexamined. Two shapes do that:
+                        #
+                        #   - the empty string (schema-valid without
+                        #     minLength; every predicate bails on a falsy tag);
+                        #   - prose appended to the token. Run 3bc46e7d's judge
+                        #     emitted "audit-integration-config-diff-wired
+                        #     (mismatched to feat-006's integrations/webhooks/
+                        #     [id] work)". The bare tag WAS provided in-plan, so
+                        #     the provider-exists predicate would have dismissed
+                        #     it — but the parenthetical made the lookup miss
+                        #     and killed the run: $20.32, 71 workers, 38
+                        #     minutes, no branch (POSTMORTEM-2026-08-14, F4).
+                        #
+                        # The pattern forbids parentheses ONLY. It deliberately
+                        # still allows spaces, commas and slashes, because
+                        # `_expand_multi_value_wiring_defects` splits this field
+                        # on "," and " / " to handle a judge naming several
+                        # values at once — a stricter "bare token" pattern would
+                        # reject those valid emissions. Rejecting here re-prompts
+                        # the judge (claude_p re-prompts on a schema miss), which
+                        # is code enforcing what the prompt asks for.
+                        "tag_or_dep": {"type": "string", "minLength": 1,
+                                       "pattern": r"^[^()]+$"},
                         "concrete_reason": {"type": "string"},
                         # live_defect: the plan AS WRITTEN will actually
                         # misbehave (a wave can run out of order, a
@@ -2807,6 +2895,28 @@ _CURRENT_RUN_ID: str | None = None
 def _set_current_run_id(run_id: str) -> None:
     global _CURRENT_RUN_ID
     _CURRENT_RUN_ID = run_id
+
+
+def _operator_path(p: "str | Path") -> str:
+    """Render a container path the way the operator will see it on their host.
+
+    The orchestrator runs inside a container where the state root is mounted at
+    `/leerie-state`, so a message naming `<state-root>/runs/<id>/state.json`
+    prints a path that does not exist on the machine reading it: `ls
+    /leerie-state` fails on the host (docs/POSTMORTEM-2026-08-14.md, F17).
+
+    The launcher forwards the host side of that bind-mount as
+    `LEERIE_STATE_HOST_DIR_DISPLAY`. The `_DISPLAY` suffix is deliberate and
+    load-bearing: `LEERIE_STATE_HOST_DIR` is on the launcher's env deny-list
+    because a host path is meaningless AS A PATH inside the container, and this
+    value inherits that restriction — it may be printed and must never be
+    opened. Returns the input unchanged when the variable is absent (any
+    non-container invocation), so this is safe to apply anywhere."""
+    s = str(p)
+    host = os.environ.get("LEERIE_STATE_HOST_DIR_DISPLAY", "").strip()
+    if not host or not s.startswith("/leerie-state"):
+        return s
+    return host.rstrip("/") + s[len("/leerie-state"):]
 
 
 def die(msg: str, code: int = 1):
@@ -3502,7 +3612,8 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     """Clean up after an abnormal exit (signal, exception, WorkerError).
 
     Always: remove every git worktree under `st.run_dir / "worktrees"`,
-    then `git worktree prune` to clear stale metadata. Per-worktree
+    then `_prune_leerie_worktrees` (scoped) to clear stale metadata.
+    Per-worktree
     failures are caught — one bad worktree shouldn't block the others.
 
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
@@ -3582,11 +3693,12 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         log(f"  cleanup: {failed_removals} worktree(s) not removed within "
             f"{worktree_remove_timeout}s — run "
             f"`scripts/cleanup.sh --run-id {st.run_id}` to finish manually")
-    try:
-        subprocess.run(["git", "worktree", "prune"],
-                       capture_output=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    # Scoped: a bare prune here is repository-global against the shared,
+    # bind-mounted `.git` and drops the host's own registrations (F19).
+    # Scoped to THIS run's directory, not the whole state root — every
+    # worktree this function removes lives under it, and a concurrent run's
+    # registrations are no more ours to reap than the host's.
+    _prune_leerie_worktrees(st.run_dir)
     if not full_purge:
         return
     # Full purge: delete branches and the run dir. The run branch lives
@@ -3616,6 +3728,87 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         shutil.rmtree(st.run_dir, ignore_errors=True)
 
 
+def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
+    """Scoped replacement for a bare `git worktree prune`. Python port of
+    `scripts/worktree-lib.sh`'s `prune_leerie_worktrees`, for the orchestrator's
+    own call sites.
+
+    The repo is bind-mounted whole, so `.git` is SHARED with the host and with
+    any other container. A bare prune is repository-global and has no grace
+    period (`gc.worktreePruneExpire` applies to `git gc`, not to an explicit
+    prune), so it drops the registration of every worktree whose path is absent
+    from *this* namespace — including each host-side
+    `/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
+    can see (docs/POSTMORTEM-2026-08-14.md, F19).
+
+    The shell scripts were converted first and these four Python sites were
+    missed, because the sweep and its guard were both scoped to `scripts/*.sh`.
+
+    Asks git what it *would* prune, attributes each entry to a path, and removes
+    only registrations under `leerie_root`. An entry that cannot be attributed
+    is left strictly alone — deleting a registration we cannot identify is the
+    accident this exists to prevent. Best-effort throughout: pruning is
+    housekeeping, and a failure here must never take down the caller."""
+    root = str(Path(leerie_root).resolve())
+    try:
+        # LC_ALL=C / LANGUAGE=: git wraps this output in gettext
+        # (`fprintf_ln(stderr, _("Removing %s/%s: %s"), ...)` in
+        # builtin/worktree.c), and only the FORMAT string is translated -- so
+        # under any non-English locale the `Removing worktrees/` prefix parsed
+        # below never matches and this becomes a total silent no-op, which is
+        # exactly the "looks like nothing was stale" failure the bare prune it
+        # replaced could not have.
+        _env = {**os.environ, "LC_ALL": "C", "LANGUAGE": ""}
+        gd = subprocess.run(["git", "rev-parse", "--path-format=absolute",
+                             "--git-common-dir"],
+                            capture_output=True, text=True, check=False,
+                            timeout=10, env=_env)
+        if gd.returncode != 0 or not gd.stdout.strip():
+            return
+        git_dir = Path(gd.stdout.strip())
+        # `git worktree prune -n -v` reports on STDERR, so both streams are
+        # read below; reading only stdout yields an empty list and prunes
+        # nothing -- a silent no-op indistinguishable from "nothing was
+        # stale". (The shell helper achieves this with `2>&1`; here it is the
+        # concatenation of `r.stdout` and `r.stderr`.)
+        r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],
+                           capture_output=True, text=True, check=False,
+                           timeout=10, env=_env)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        line = line.strip()
+        if not line.startswith("Removing worktrees/"):
+            continue
+        name = line[len("Removing worktrees/"):].split(":", 1)[0].strip()
+        if not name:
+            continue
+        entry = git_dir / "worktrees" / name
+        try:
+            wt = (entry / "gitdir").read_text().strip()
+        except OSError:
+            continue
+        if wt.endswith("/.git"):
+            wt = wt[:-len("/.git")]
+        if not wt:
+            continue
+        p = Path(wt)
+        if not p.is_absolute():
+            # git >= 2.48 with `worktree.useRelativePaths=true` stores this
+            # relative to the ENTRY directory. Resolving it against the
+            # process cwd instead attributes the registration somewhere else
+            # entirely, so the scope check below silently declines and the
+            # stale entry survives.
+            p = entry / p
+        try:
+            resolved = str(p.resolve())
+        except OSError:
+            continue
+        if resolved != root and not resolved.startswith(root + os.sep):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -3639,7 +3832,12 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    await run_proc(["git", "worktree", "prune"])
+    # to_thread: this is reached concurrently for every subtask in a
+    # wave under `gather`, and _prune_leerie_worktrees is synchronous
+    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
+    # negligible -- but each call carries a 10 s timeout, and a git
+    # that blocks would stall the whole loop for it.
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -3661,7 +3859,12 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    await run_proc(["git", "worktree", "prune"])
+    # to_thread: this is reached concurrently for every subtask in a
+    # wave under `gather`, and _prune_leerie_worktrees is synchronous
+    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
+    # negligible -- but each call carries a 10 s timeout, and a git
+    # that blocks would stall the whole loop for it.
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -3685,7 +3888,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
 
     Cleanup runs BEFORE the sleep so the re-exec'd `resume` finds a clean
     slate — `_cleanup_on_abnormal_exit` removes every worktree (git-registered
-    AND orphaned dirs, then `git worktree prune`). That is a convenience, not
+    AND orphaned dirs, then `_prune_leerie_worktrees`). That is a convenience, not
     the guarantee: cleanup cannot run when the process is SIGKILLed, so
     `setup-run.sh` reclaims a stale staging dir itself. A consequence: the
     sleep is measured from AFTER cleanup, so for a parsed reset time the wait
@@ -4070,6 +4273,47 @@ def compose_pr_body(state: dict, run_id: str) -> str:
             else:
                 body += f"- **{tag}**\n"
     return body
+
+
+def _task_fingerprint(task: str) -> str:
+    """Content hash of the resolved task text, for duplicate detection.
+
+    `run_id` is the container id, so two launches of byte-identical task text
+    are invisible to each other. Measured: one task ran twice, three minutes
+    apart, for $72.21 across 173 worker calls, producing two architecturally
+    incompatible branches with 14 files in collision and two PRs whose merge
+    order matters (docs/POSTMORTEM-2026-08-14.md, F10)."""
+    return hashlib.sha256((task or "").encode("utf-8")).hexdigest()
+
+
+def _live_duplicate_runs(leerie_root: Path, run_id: str,
+                         fingerprint: str) -> list[str]:
+    """Run ids, other than `run_id`, that are working on the same task text.
+
+    "Live" means started and not yet finished, killed or paused — a completed
+    run sharing a fingerprint is an ordinary re-run and says nothing. Never
+    raises: an unreadable sidecar is skipped, because a duplicate check must
+    not be able to stop a run by itself."""
+    out: list[str] = []
+    runs = leerie_root / "runs"
+    if not fingerprint or not runs.is_dir():
+        return out
+    for d in sorted(runs.iterdir()):
+        if not d.is_dir() or d.name == run_id:
+            continue
+        try:
+            data = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("task_sha256") != fingerprint:
+            continue
+        if data.get("finished_at") or data.get("killed_at") \
+                or data.get("paused_at"):
+            continue
+        out.append(d.name)
+    return out
 
 
 def _write_run_json(run_dir: Path, **fields) -> None:
@@ -6613,36 +6857,22 @@ def _disk_headroom_message(path: Path, ratio: float) -> str:
             f"{DISK_MIN_FREE_RATIO:.0%} minimum")
 
 
-async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
-                    skip_smoke: bool = False, no_push: bool = False) -> None:
-    """Hard checks before any LLM work. Fails fast rather than wasting workers."""
+async def _preflight_repo() -> None:
+    """Repo-state checks that must run BEFORE any irreversible state exists.
 
-    # 0. subprocess machinery must be able to report exit statuses at all.
-    # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
-    # asyncio result is rc=255/empty — indistinguishable from a genuinely
-    # failed command, which makes every check below report a false negative.
-    # main() resets the disposition; this gate catches one set afterwards.
-    if _sigchld_is_ignored():
-        die("SIGCHLD is set to SIG_IGN, so the kernel auto-reaps this "
-            "process's children and their exit statuses are unreadable. "
-            "Every subprocess would report a bogus failure. This is an "
-            "environment problem, not a leerie configuration problem.")
+    Split out of `preflight()` because of WHEN they run, not what they check.
+    `main()` constructs `State(...)` -- which mints `<state-root>/runs/<run-id>/`,
+    takes its flock and writes `state.json` -- and only then calls `_run_phases`,
+    which calls `preflight()`. So a refusal here used to leave a permanent run
+    directory behind for a run that never started: four of them accumulated on
+    one host from a single afternoon's dirty-tree refusals
+    (docs/POSTMORTEM-2026-08-14.md, F14).
 
-    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
-    # worktrees continuously, and the first failing write under a full disk
-    # was previously an unhandled `OSError: [Errno 28] No space left on
-    # device` from whatever line happened to be writing. Checked on the
-    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
-    # before any worker spawns, so a disk that is already too full to
-    # safely run refuses cleanly instead of dying mid-run.
-    ratio = _disk_free_ratio(leerie_dir)
-    if ratio < DISK_MIN_FREE_RATIO:
-        die(f"insufficient disk space to start a run: "
-            f"{_disk_headroom_message(leerie_dir, ratio)}. "
-            "Free up space (`leerie list` to see past runs, then prune old "
-            "ones under the state root by hand — nothing reaps them "
-            "automatically) and retry.")
-
+    These three need nothing but the checkout, so they run first and the run
+    directory is only created once the repo is fit to run against. Everything
+    else in `preflight()` (subprocess machinery, disk headroom, CLI version,
+    the live smoke test) stays there.
+    """
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
         r = await run_proc(["git", "config", key])
@@ -6672,8 +6902,23 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     r = await run_proc(["git", "status", "--porcelain"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
+        # Name them. "2 modified/staged file(s)" sends the operator to
+        # `git status` to find out what leerie is objecting to, and in the
+        # measured case both files were leerie's OWN tracked config
+        # (`leerie.toml`, `.leerie/config.toml`) — so tuning leerie dirtied the
+        # tree leerie then refused to run in, with nothing in the message
+        # connecting the two (docs/POSTMORTEM-2026-08-14.md, F14).
+        _shown = [l[3:] for l in dirty[:10]]
+        _own = [f for f in _shown
+                if f == "leerie.toml" or f.startswith(".leerie/")]
         die(f"working tree has {len(dirty)} modified/staged file(s). "
-            "Commit or stash before running leerie.")
+            "Commit or stash before running leerie.\n  "
+            + "\n  ".join(_shown)
+            + ("" if len(dirty) <= 10 else
+               f"\n  … and {len(dirty) - 10} more")
+            + ("\n(" + ", ".join(_own) + " belong to leerie itself — editing "
+               "leerie's own config dirties the tree it refuses to run in.)"
+               if _own else ""))
 
     # 3. external 'leerie' branch — a bare branch named 'leerie' occupies
     #    the ref path that leerie's namespaced branches (leerie/runs/*,
@@ -6688,6 +6933,37 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "Rename or delete it:\n"
             "  git branch -m leerie leerie-old    # rename (preserves commits)\n"
             "  git branch -D leerie               # delete (if fully merged)")
+
+
+async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
+                    skip_smoke: bool = False, no_push: bool = False) -> None:
+    """Hard checks before any LLM work. Fails fast rather than wasting workers."""
+
+    # 0. subprocess machinery must be able to report exit statuses at all.
+    # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
+    # asyncio result is rc=255/empty — indistinguishable from a genuinely
+    # failed command, which makes every check below report a false negative.
+    # main() resets the disposition; this gate catches one set afterwards.
+    if _sigchld_is_ignored():
+        die("SIGCHLD is set to SIG_IGN, so the kernel auto-reaps this "
+            "process's children and their exit statuses are unreadable. "
+            "Every subprocess would report a bogus failure. This is an "
+            "environment problem, not a leerie configuration problem.")
+
+    # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
+    # worktrees continuously, and the first failing write under a full disk
+    # was previously an unhandled `OSError: [Errno 28] No space left on
+    # device` from whatever line happened to be writing. Checked on the
+    # state-dir filesystem (leerie_dir is under <state-root>/runs/<id>)
+    # before any worker spawns, so a disk that is already too full to
+    # safely run refuses cleanly instead of dying mid-run.
+    ratio = _disk_free_ratio(leerie_dir)
+    if ratio < DISK_MIN_FREE_RATIO:
+        die(f"insufficient disk space to start a run: "
+            f"{_disk_headroom_message(leerie_dir, ratio)}. "
+            "Free up space (`leerie list` to see past runs, then prune old "
+            "ones under the state root by hand — nothing reaps them "
+            "automatically) and retry.")
 
     # 4. claude CLI version is recent enough for `--json-schema` in -p mode.
     #    Runs even when --skip-smoke is set: --skip-smoke is for skipping the
@@ -8565,6 +8841,19 @@ def check_integrator_output(result: dict) -> list[str]:
     return []
 
 
+# Mechanical-check labels that are reported but must NOT drive a re-drive.
+# Matching leerie's OWN label prefixes is set membership over strings this
+# module authored, not interpretation of a worker response, so it sits outside
+# the *Language-to-JSON* prohibition -- `phase_finalize` already partitions
+# `symptom_findings` the same way.
+_ADVISORY_ISSUES = ("NO_PLANNED_FILES_TOUCHED",)
+
+
+def _gating_issues(issues: list[str]) -> list[str]:
+    """The subset of `check_implementer_output` labels that justify a retry."""
+    return [i for i in issues if not i.startswith(_ADVISORY_ISSUES)]
+
+
 def check_implementer_output(
     result: dict, subtask: dict, actual_files: set[str],
 ) -> list[str]:
@@ -8591,6 +8880,17 @@ def check_implementer_output(
 
     if planned and actual_files:
         if not (actual_files & planned):
+            # ADVISORY, not gating. `files_likely_touched` is a planner GUESS,
+            # and `_clobbered_owned_files` already documents it as "advisory
+            # and NOT used because the implementer may commit outside it" --
+            # which is exactly as true here. Re-driving on it asks a worker to
+            # match a prediction rather than to do the work: measured,
+            # 1b9b52f5/test-007 was re-driven into a pure-rename commit
+            # (+$0.49, 2.3 min) whose only content was moving a test from the
+            # repo convention to the planner path
+            # (docs/POSTMORTEM-2026-08-14.md, F23). The label is still emitted
+            # so the operator sees it; `_ADVISORY_ISSUES` keeps it out of the
+            # retry decision.
             issues.append(
                 f"NO_PLANNED_FILES_TOUCHED: none of the planned "
                 f"files were modified — planned: "
@@ -8598,6 +8898,27 @@ def check_implementer_output(
 
     if result.get("status") == "complete":
         for cr in result.get("criteria_results", []) or []:
+            # A criterion the implementer was never responsible for is not an
+            # unmet one, and the worker declares that in `not_applicable` —
+            # the structured channel the schema previously lacked.
+            #
+            # There was briefly a second channel here: substring-matching the
+            # repo's resolved build/lint/test commands inside the criterion
+            # text, as a backstop for a worker that forgot the flag. It is
+            # gone. `criterion` is planner-authored prose, and the
+            # *Language-to-JSON* rule is that Python never reads meaning out of
+            # prose — its prescribed remedy being exactly "the owning worker
+            # must surface it as a JSON field", which `not_applicable` is. A
+            # spec sentence had been written asserting the match was "against
+            # resolved config values, not worker prose"; the needle was config,
+            # the haystack was prose, and the sentence authorised the code
+            # rather than deriving from it.
+            #
+            # The residual risk is one re-drive when a worker omits the flag —
+            # the behaviour before any of this existed, so not a regression.
+            # `prompts/implementer.md` states the requirement plainly instead.
+            if cr.get("not_applicable") is True:
+                continue
             if cr.get("met") is False:
                 issues.append(
                     f"UNMET_CRITERION: claims complete but "
@@ -8608,8 +8929,9 @@ def check_implementer_output(
     return issues
 
 
-def check_symptom_evidence(result: dict, sid: str) -> list[str]:
-    """DESIGN §9 *A stale finding is not a bug* — advisory, `bugfix-` only.
+def check_symptom_evidence(result: dict, sid: str,
+                           fixes_reported_symptom: bool) -> list[str]:
+    """DESIGN §9 *A stale finding is not a bug* — advisory.
 
     Run `fa979580`'s N18 subtask "fixed" a leak that #190 had already fixed
     before the run began, and shipped an event-loop stall doing it. Nothing
@@ -8623,39 +8945,58 @@ def check_symptom_evidence(result: dict, sid: str) -> list[str]:
     production-evidence gate, which is the cost this repo has already
     measured once (`_confidence_schema`'s docstring).
 
-    Scoped by id prefix rather than by inspecting the task text, per
-    CLAUDE.md's *Language-to-JSON* rule — `_ID_PREFIXES` already makes the
-    prefix a structured fact.
+    **Scoped by the planner's declaration, not by the subtask id.** This used
+    to read `sid.startswith("bugfix-")`, which is *Language-to-JSON* violated
+    on an identifier rather than on prose — Python inferring the nature of the
+    work from a string. Two mechanisms mint that prefix onto work that fixes
+    no reported symptom: `_repair_prescribed_commands` synthesises
+    `{prefix}{900+n:03d}` from the HOST subtask's domain (hence `bugfix-901`,
+    a verification-only subtask), and a duplicate-provider / overlap merge
+    re-homes a `feat-` subtask under a surviving `bugfix-` id. Measured across
+    the run corpus, **10 of 10 findings were false positives** — every one of
+    them a test, coverage or verification subtask that never had a symptom
+    (docs/POSTMORTEM-2026-08-14.md, F18). A warning at that rate is one nobody
+    reads, which costs more than the check is worth.
+
+    `fixes_reported_symptom` is optional on the subtask schema and its absence
+    means "no", so a plan that never fills it makes this check silent. That is
+    the right trade for an ADVISORY check whose measured true-positive count is
+    zero: silence beats noise, and the signal returns as soon as planners fill
+    the field. Requiring it instead would risk the validity-rate collapse a
+    required `severity` caused on `wiring_judge`.
 
     Takes the **orchestrator's** `sid`, not the worker's echoed
     `result["subtask_id"]`, which nothing in this module ever cross-checks
-    against the real id: a worker that echoed `feat-001` while working on
-    `bugfix-005` would otherwise slip past the prefix scope entirely. It
-    also takes the one string it needs rather than the whole subtask dict,
-    which removes a `None`-dereference by construction instead of guarding
-    it — and the guard would have been the wrong fix anyway, since
-    `subtask or {}` yields an empty sid, which fails the prefix test and
-    silently disables this check.
+    against the real id. `sid` is now used only for message text; the scope
+    decision comes from the caller's structured field, which is why that field
+    is a required positional rather than something read off a subtask dict
+    this function would then have to guard against being `None`.
 
     Plain "the tests fail on base" is NOT this and is worthless: measured on
     that run, all four findings' new tests already failed on base (9 of 13
     for one), because a new test against code that does not exist yet
     trivially fails. The claim wanted here is behavioural.
     """
-    # No `sid or ""` coercion, deliberately. `sid` is a required positional
-    # on the only call site, so a non-string is a contract violation — and
-    # swallowing it would return `[]`, silently disabling this check. That is
-    # the same shape as the `subtask or {}` this function's sibling refuses
-    # (see `check_implementer_output`), and it would be inconsistent to
-    # condemn it there and practise it here.
-    if not sid.startswith("bugfix-"):
+    # No coercion on either argument, deliberately. Both are required
+    # positionals on the only call site, so a wrong type is a contract
+    # violation — and swallowing it would return `[]`, silently disabling this
+    # check. That is the same shape as the `subtask or {}` this function's
+    # sibling refuses (see `check_implementer_output`), and it would be
+    # inconsistent to condemn it there and practise it here.
+    if not isinstance(fixes_reported_symptom, bool):
+        raise TypeError(
+            "check_symptom_evidence requires an explicit bool for "
+            f"fixes_reported_symptom, got {type(fixes_reported_symptom).__name__}"
+        )
+    if not fixes_reported_symptom:
         return []
 
     ev = result.get("symptom_evidence")
     if not isinstance(ev, dict):
-        return ["NO_SYMPTOM_EVIDENCE: a bugfix subtask did not record whether "
-                "the reported symptom actually reproduces on the base tree — "
-                "a finding that no longer reproduces may already be fixed"]
+        return ["NO_SYMPTOM_EVIDENCE: a subtask declared as fixing a reported "
+                "symptom did not record whether that symptom actually "
+                "reproduces on the base tree — a finding that no longer "
+                "reproduces may already be fixed"]
 
     reproduced = ev.get("reproduced")
     if reproduced is False:
@@ -9628,7 +9969,7 @@ def _warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
-def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
+def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
     `files_likely_touched` surface is owned by an ordered predecessor it
     depends on (via `depends_on` or a `requires`→`provides` tag match).
@@ -9642,6 +9983,13 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
     rescue (DESIGN §8 *The mid-run sibling case*); this warning surfaces the
     same redundancy one phase earlier so the operator can re-frame the plan
     before workers run.
+
+    Returns the flagged sids so `_settle_subtask` can re-probe those subtasks
+    against the run branch BEFORE spawning their implementer, rather than
+    only after one has run and produced nothing (DESIGN §8 *Probing a
+    flagged subtask before it spends*). The rescue's own ordering is the
+    waste: measured across the corpus, every one of run `1b9b52f5`'s three
+    flagged subtasks ran a full implementer and committed nothing.
 
     Warning only, never a drop — a subtask may make a genuinely distinct edit
     to a shared file, and dropping it would silently delete real work (the
@@ -9663,7 +10011,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
             if sid:
                 subtasks[sid] = s
     if not subtasks:
-        return
+        return []
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 
     flagged: list[tuple[str, list[str], list[str]]] = []
@@ -9682,7 +10030,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
             flagged.append((sid, sorted(pred_ids), sorted(own_files)))
 
     if not flagged:
-        return
+        return []
     log(f"⚠  provider-subset subtask(s): {len(flagged)} subtask(s) whose "
         "entire file surface is already owned by a predecessor they depend "
         "on. If the predecessor commits the shared files, the dependent "
@@ -9693,6 +10041,28 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> None:
         files_str = ", ".join(files)
         log(f"     {sid}: files [{files_str}] ⊆ predecessor(s) "
             f"[{preds_str}]")
+    return sorted(sid for sid, _preds, _files in flagged)
+
+
+def _sid_domain_map(plans: list[dict]) -> dict[str, str]:
+    """Map every subtask id to the domain of the plan that owns it.
+
+    The structured answer to "what kind of work is this subtask", replacing
+    `sid.startswith("<abbrev>-")`. An id prefix is set once, from
+    `CATEGORY_ABBREV`, and then survives operations that change what the
+    subtask IS: a duplicate-provider or overlap merge folds one subtask into
+    another and keeps the *survivor's* id, and `_repair_prescribed_commands`
+    mints its verification subtask's id from the HOST subtask's domain. Reading
+    the owning plan's domain is invariant under both
+    (docs/POSTMORTEM-2026-08-14.md, F18)."""
+    out: dict[str, str] = {}
+    for plan in plans:
+        domain = plan.get("domain") or ""
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if isinstance(sid, str) and sid:
+                out[sid] = domain
+    return out
 
 
 def _warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
@@ -9746,11 +10116,12 @@ def _warn_test_subtask_missing_producer_edge(plans: list[dict]) -> None:
         return bool((s.get("provides") or []) or
                     (s.get("files_likely_touched") or []))
 
+    domains = _sid_domain_map(plans)
     flagged: list[str] = []
     for s in all_subtasks:
         sid = s.get("id", "?")
-        # Testing-domain subtasks carry the `test-` id prefix (CATEGORY_ABBREV).
-        if not sid.startswith("test-"):
+        # The owning plan's domain, not the id prefix — see `_sid_domain_map`.
+        if domains.get(sid) != "testing":
             continue
         has_edge = bool((s.get("requires") or []) or (s.get("depends_on") or []))
         if has_edge:
@@ -9932,7 +10303,14 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     return collisions
 
 
-_TEST_OWNERSHIP_CODE_PREFIXES = ("bugfix-", "feat-", "refactor-")
+# Domains whose subtasks WRITE the code a test subtask would assert against.
+# Compared against each subtask's own plan domain, never against its id: ids are
+# re-homed when a duplicate-provider/overlap merge folds one subtask into
+# another, and `_repair_prescribed_commands` synthesises ids from a *host*
+# subtask's domain — so an id prefix is not evidence of what the work is
+# (docs/POSTMORTEM-2026-08-14.md, F18).
+_TEST_OWNERSHIP_CODE_DOMAINS = frozenset(
+    {"bug-fixing", "feature-implementation", "refactoring"})
 
 
 def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
@@ -9980,10 +10358,13 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
             if isinstance(f, str) and f.strip()
         }
 
-    test_sids = sorted(sid for sid in subtasks if sid.startswith("test-"))
+    # Domain, not id prefix — see `_sid_domain_map`.
+    domains = _sid_domain_map(plans)
+    test_sids = sorted(sid for sid in subtasks
+                       if domains.get(sid) == "testing")
     code_sids = sorted(
         sid for sid in subtasks
-        if sid.startswith(_TEST_OWNERSHIP_CODE_PREFIXES))
+        if domains.get(sid) in _TEST_OWNERSHIP_CODE_DOMAINS)
 
     issues: list[str] = []
     for test_sid in test_sids:
@@ -10007,8 +10388,15 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
     return issues
 
 
-_ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
-                               "credential"})
+# "credential" was removed 2026-08-14. This heuristic is about env-FILE
+# plumbing -- does anything update .env.example when a subtask provides an env
+# contract -- and "credential" matches the domain concept instead, which is a
+# different thing entirely. Measured, both of its firings in one run were false:
+# `credential-field-docurl-support` (adding a docUrl to a form field spec) and
+# `passare-credential-check-helper` (a client-side API ping), neither touching
+# env files or wanting to (docs/POSTMORTEM-2026-08-14.md, F23). The remaining
+# keywords name configuration plumbing rather than a subject area.
+_ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key"})
 
 
 def _warn_layer_gaps(plans: list[dict]) -> None:
@@ -10407,6 +10795,7 @@ async def _filter_satisfied_subtasks(
 async def _probe_criteria_satisfied_on_head(
     subtask: dict, worktree: str, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
+    label: str = "head",
 ) -> dict | None:
     """Post-execution analogue of `_filter_satisfied_subtasks`'s per-subtask
     probe (DESIGN §8 *The mid-run sibling case*). Runs one read-only
@@ -10464,7 +10853,12 @@ async def _probe_criteria_satisfied_on_head(
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
             effort=efforts["satisfied_probe"],
-            sid=f"satisfied_probe-head-{sid}",
+            # `label` distinguishes the two call sites' worker logs. Both can
+            # fire for one subtask in a single run — the pre-spawn probe
+            # declines, the implementer commits nothing, the post-execution
+            # rescue probes again — and a shared name would leave the second
+            # overwriting the first's log, losing the reason for the decline.
+            sid=f"satisfied_probe-{label}-{sid}",
         )
     except (WorkerError, subprocess.TimeoutExpired) as e:
         # A probe crash must NOT rescue the subtask — fail safe toward the
@@ -16238,7 +16632,11 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     "user_content": user_prompt + retry_note,
                     "response_content": str(envelope.get("result") or ""),
                     "parsed_ok": _parsed_ok,
-                    "input_tokens": int(_usage.get("input_tokens") or 0),
+                    # Cached input included — see `_usage_input_tokens`.
+                    # The per-call record and the run total must agree,
+                    # or `leerie report` disagrees with the run-weight
+                    # line it is meant to break down.
+                    "input_tokens": _usage_input_tokens(_usage),
                     "output_tokens": int(_usage.get("output_tokens") or 0),
                     "latency_ms": _latency_ms,
                     "success": _success,
@@ -16247,25 +16645,32 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
                 })
 
-            # surface non-clean exits — a worker that hit --max-turns exits 0 and
-            # can still produce structured_output, but stopped mid-work
+            # surface non-clean exits — a worker that hit its turn cap can still
+            # produce structured_output, but stopped mid-work. This is the ONLY
+            # trustworthy cap signal: the CLI reports it as
+            # terminal_reason/subtype `error_max_turns`, sourced from a
+            # `max_turns_reached` attachment.
             term = envelope.get("terminal_reason", "")
             turns = envelope.get("num_turns", -1)
             if term and term != "completed":
                 log(f"  ⚠  worker exited with terminal_reason='{term}' "
                     f"(num_turns={turns}) — output may be incomplete")
-            # Context-decay proxy: a worker that returned at or above 80% of its
-            # turn budget likely produced its final result against a degraded
-            # context window. The schema only checks structure, not the quality
-            # of reasoning underneath it. Surface the proxy so a 9.x confidence
-            # score from a near-cap worker is read with the right scepticism.
-            # `elif`: this branch only fires when the worker stopped cleanly —
-            # if terminal_reason was set, the warning above already named
-            # num_turns, so we avoid double-warning the same condition.
-            elif turns >= 0 and turns >= int(0.8 * max_turns):
-                log(f"  ⚠  worker returned at {turns}/{max_turns} turns "
-                    f"(≥80% of cap) — output may have been produced against a "
-                    "degraded context window")
+            # There was a second warning here — a "context-decay proxy" firing
+            # when `num_turns >= 0.8 * max_turns` — and it was measuring nothing.
+            # The CLI computes `num_turns` from two DIFFERENT counters: the
+            # cap-enforcement path reports the `max_turns_reached` attachment's
+            # own count, while the success path reports a separately maintained
+            # one. The proxy fired only on the success path (it was the `elif` to
+            # the branch above) and compared that number against the
+            # `--max-turns` bounding the other, so the two were never
+            # commensurable. Measured across a real corpus, 61 of these warnings
+            # fired and 11 were arithmetically impossible — 21/20, 26/20, 28/20,
+            # 31/30, and 62 through 72 out of 60 — across three different caps.
+            # It was deleted rather than re-based because the condition it
+            # claimed to detect is exactly what the branch above already reports,
+            # from the CLI's own terminal signal, and because its premise (that
+            # near-cap output is degraded) was never measured here.
+            # See docs/POSTMORTEM-2026-08-14.md, F7.
 
             return envelope
 
@@ -16549,6 +16954,28 @@ async def _replay_capture(record: dict, *,
     return (envelope, structured)
 
 
+def _usage_input_tokens(usage: dict) -> int:
+    """Total input tokens for one call, including the cached ones.
+
+    The API reports input in THREE fields — `input_tokens` counts only the
+    uncached remainder, with `cache_creation_input_tokens` and
+    `cache_read_input_tokens` carrying the rest. Reading just the first is what
+    produced run weights like `24,281 in / 194,508 out` for 53 agentic workers:
+    ~460 input tokens per call, which no worker that reads a repository can
+    possibly use. Every leerie worker runs with prompt caching, so for these
+    calls the cached fields are the bulk of the input, not a footnote
+    (docs/POSTMORTEM-2026-08-14.md, F21).
+
+    `cost_usd` was unaffected — it comes from the CLI's own `total_cost_usd` —
+    which is why the discrepancy went unnoticed: the number operators watch was
+    right while the tokens beside it were wrong by orders of magnitude."""
+    if not isinstance(usage, dict):
+        return 0
+    return (int(usage.get("input_tokens") or 0)
+            + int(usage.get("cache_creation_input_tokens") or 0)
+            + int(usage.get("cache_read_input_tokens") or 0))
+
+
 def _accumulate_telemetry(data: dict, envelope: dict) -> None:
     """Accumulate run-weight signals from a worker envelope into `data`.
     Shared between State and _ReplayState."""
@@ -16558,7 +16985,7 @@ def _accumulate_telemetry(data: dict, envelope: dict) -> None:
     t["calls"] += 1
     t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
     usage = envelope.get("usage") or {}
-    t["input_tokens"] += int(usage.get("input_tokens") or 0)
+    t["input_tokens"] += _usage_input_tokens(usage)
     t["output_tokens"] += int(usage.get("output_tokens") or 0)
 
 
@@ -22736,11 +23163,26 @@ def _filter_provably_false_wiring_defects(
     2. any defect whose capability was provided by an `already_satisfied`
        drop: satisfied on the base tree.
 
-    **Predicate 1 is deliberately scoped to `broken_by_*`.** A
-    `missing_requires` naming a still-provided capability is the *canonical
-    true* finding — the provider exists and the consumer failed to declare the
-    edge — and must survive. Applying (1) to it would silently disable the
-    gate's main channel, where findings measure 99% true (69/70)."""
+    **Predicate 1 covers `broken_by_*` and `missing_provides`, and must never
+    cover `missing_requires`.** The distinction is which side of the edge the
+    finding is about. `broken_by_*` asserts a merge/drop severed the capability
+    and `missing_provides` asserts nothing declares it — both are claims about
+    the PRODUCER, so a provider existing in the plan falsifies the premise
+    directly. A `missing_requires` naming a still-provided capability is the
+    opposite: it is the *canonical true* finding — the provider exists and the
+    CONSUMER failed to declare the edge — so applying (1) to it would silently
+    disable the gate's main channel, where findings measure 99% true (69/70).
+
+    `missing_provides` was admitted on 2026-08-14. Before that it matched no
+    predicate here and no repair channel either, so it could only reach the
+    `die()`. That killed run 3bc46e7d — $20.32, 71 workers, 38 minutes, no
+    branch and no plan.json — on a finding whose named capability WAS provided
+    by an in-plan subtask, i.e. exactly the shape this predicate refutes
+    (docs/POSTMORTEM-2026-08-14.md, F4). Note repairing a `missing_provides` by
+    appending the tag to the named subtask's `provides` was considered and
+    rejected: unlike a `requires` edge, which only ORDERS existing work and
+    cannot invent any, a `provides` tag CLAIMS the work exists, so a wrong
+    repair would tell every consumer a capability is present when it is not."""
     by_id: dict[str, dict] = {
         s["id"]: s for plan in plans for s in plan.get("subtasks", []) or []
     }
@@ -22768,7 +23210,8 @@ def _filter_provably_false_wiring_defects(
             kept.append(d)
             continue
 
-        if kind.startswith("broken_by_") and tag in provided:
+        if (kind.startswith("broken_by_") or kind == "missing_provides") \
+                and tag in provided:
             notes.append(
                 f"{kind} {sid} / {tag!r}: capability is still provided by "
                 f"{', '.join(sorted(s for s in by_id if tag in (by_id[s].get('provides') or [])))}"
@@ -23911,18 +24354,20 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
             "\nAn independent review found the plan's declared dependency "
             "edges do not match the work the subtasks actually need (a subtask "
             "that should require a capability it never declares, or a merge/"
-            "drop that severed a real dependency). The gate already added "
-            "every edge it could resolve unambiguously — on the tag channel, "
-            "the subtask-id channel, and single-sub-file-cluster fan-outs. "
-            "What remains names a value that is NEITHER a surviving subtask "
-            "id NOR a tag any subtask provides (the plan is missing the work, "
-            "not just the edge), or a tag whose SEVERAL providers span "
-            "different sub-file clusters (ambiguous — only you can say "
-            "which), or would close a dependency cycle. This is a "
-            "correctness gate "
+            "drop that severed a real dependency). The gate already dismissed "
+            "every finding the plan provably contradicts and added every edge "
+            "it could resolve unambiguously — on the tag channel, the "
+            "subtask-id channel, and single-sub-file-cluster fan-outs. Each "
+            "line above carries the judge's own concrete_reason for that "
+            "finding; act on those rather than on this paragraph, which cannot "
+            "know which of them applies. "
+            "This is a correctness gate "
             "with no bypass flag: add the missing requires/provides/depends_on "
             "to the plan, or refine the task so the cross-subtask dependencies "
-            "are unambiguous, then re-run. (Note: --skip-overlap-judge does NOT "
+            "are unambiguous, then re-run. The plan this gate rejected is in "
+            "state.json's `plan_snapshot` — a run that dies in planning never "
+            "writes plan.json, so there is no plan file to edit. "
+            "(Note: --skip-overlap-judge does NOT "
             "bypass this gate — it only skips the phase 2¾ overlap judge, which "
             "runs earlier and independently. `resume` does not bypass it "
             "either: the gate re-runs until it passes, since its skip is keyed "
@@ -24435,7 +24880,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
             f"${tel.get('cost_usd', 0.0):,.2f}, "
             f"{tel.get('input_tokens', 0):,} in / "
             f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {st.path})")
+            f"(see {_operator_path(st.path)})")
 
 
 def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
@@ -24649,6 +25094,14 @@ def _repair_prescribed_commands(plans: list[dict],
         "size": "small",
         "investigation_notes": "",
         "runs_commands": list(cmds),
+        # Explicit, though absence would already mean the same thing. This
+        # subtask is the canonical false positive the field exists to prevent:
+        # its id takes `prefix` from the HOST subtask's domain, so on a
+        # bug-fixing host it is named `bugfix-901` — and the old
+        # prefix-scoped `check_symptom_evidence` then demanded a symptom repro
+        # from a verification-only subtask that never had one. Stating it here
+        # keeps the answer with the code that mints the misleading id.
+        "fixes_reported_symptom": False,
     })
     return sid
 
@@ -25150,9 +25603,22 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     if region_section is not None:
         up.append(region_section)
     if continuation:
-        up.append(f"This is a CONTINUATION. Read the checkpoint at "
-                  f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "
-                  f"actual repo state, then continue.")
+        # Only mention the checkpoint when one exists. It is written solely on
+        # `incomplete-handoff` / `needs-clarification`, so most continuations
+        # have none — and the instruction sent every one of them to read a
+        # missing file: 11 wasted `tool-fail` reads across two runs, on the
+        # highest-stakes prompt in the system, the one that also carries the
+        # completeness gate's mandatory criteria
+        # (docs/POSTMORTEM-2026-08-14.md, F23). Opening a prompt with an
+        # instruction that fails teaches the worker to discount what follows.
+        _ckpt = Path(leerie_dir) / "checkpoints" / f"{sid}.md"
+        if _ckpt.is_file():
+            up.append(f"This is a CONTINUATION. Read the checkpoint at "
+                      f"{_ckpt}, validate it against the actual repo state, "
+                      f"then continue.")
+        else:
+            up.append("This is a CONTINUATION. There is no checkpoint file — "
+                      "read the repo state directly and continue.")
     if note:
         up.append(f"NOTE FROM ORCHESTRATOR: {note}")
 
@@ -25877,12 +26343,22 @@ def _actionable_solution_defects(conf_res: dict | None) -> list[dict]:
     concrete_case AND a where. A defect missing either is dropped as
     non-actionable — the anti-gaming guard that keeps the gate keyed on an
     independently-constructed concrete input, never on vague prose. Returns
-    [] for a None/empty result (fail-open: nothing to attack)."""
+    [] for a None/empty result (fail-open: nothing to attack).
+
+    A defect the conformer FIXED (`fixed: true`) is not actionable either: there is nothing left
+    to drive an implementer at. Reporting a repair and reporting an outstanding
+    gap shared one channel, so the gate read both as outstanding and blocked a
+    run on work its own conformer had already committed — after which that
+    subtask's branch was never integrated and the run shipped a backend with no
+    UI (docs/POSTMORTEM-2026-08-14.md, F11). Absent `fixed` means residual, so
+    a conformer that never sets it behaves exactly as before."""
     if not isinstance(conf_res, dict):
         return []
     out: list[dict] = []
     for d in conf_res.get("solution_defects") or []:
         if not isinstance(d, dict):
+            continue
+        if d.get("fixed") is True:
             continue
         if (d.get("concrete_case") or "").strip() and \
                 (d.get("where") or "").strip():
@@ -25914,6 +26390,62 @@ async def _branch_head_sha(worktree: str) -> str:
     """HEAD sha in the worktree, or empty string on failure. Used as the
     rollback target before the conformer adds commits."""
     r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+async def _create_empty_subtask_branch(repo_root: str, run_id: str,
+                                       sid: str) -> bool:
+    """Point this subtask's branch at the run-branch tip, creating no commits.
+
+    A subtask settled complete WITHOUT running its implementer has no branch:
+    `new-worktree.sh` runs inside `_run_implementer`, so nothing ever created
+    `leerie/subtasks/<run-id>/<sid>`. But `integrate_wave` filters only on
+    `status == "complete"`, so such a subtask still reaches `integrate.sh`,
+    which exits 2 on a missing branch and takes the whole run down with it.
+
+    The post-execution rescue never hit this because its implementer DID run:
+    the branch exists with zero commits, and `git merge --no-ff` of a
+    zero-commit branch is a clean no-op (pinned by
+    `tests/test_mid_run_satisfied_no_commits.py`). So the fix is to give the
+    pre-spawn path the same shape rather than to teach `integrate_wave` a
+    second meaning of "complete" -- which would also mask a branch that is
+    missing for a real reason.
+
+    Returns True when the branch exists afterwards. Idempotent: an existing
+    branch (a resume re-entering `_settle_subtask`) is left exactly where it
+    is, never repointed, since by then it may carry commits."""
+    branch = _compute_subtask_branch(run_id, sid)
+    exists = await run_proc(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_root)
+    if exists.returncode == 0:
+        return True
+    r = await run_proc(["git", "branch", branch, _compute_run_branch(run_id)],
+                       cwd=repo_root)
+    if r.returncode != 0:
+        # Named, not swallowed: the caller falls through to the implementer on
+        # False, and "could not be created" with no reason is a log line that
+        # cannot be acted on.
+        log(f"  {sid}: could not create {branch}: "
+            f"{(r.stderr or r.stdout or '').strip()[:200]}")
+    return r.returncode == 0
+
+
+async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
+    """The merge base of `a` and `b` as a SHA, or empty string on failure.
+
+    Used to resolve a *snapshot* base for a comparison run inside a worktree.
+    A branch NAME cannot serve as that base when the worktree in question has
+    that branch checked out — the name moves the instant the worktree commits,
+    so the base and `HEAD` become the same ref and every comparison collapses
+    (DESIGN §9 *No clobbering the implementer's work*; see
+    docs/POSTMORTEM-2026-08-14.md, F2, where exactly that produced a false
+    clobber report on every run whose final conformer committed anything)."""
+    if not a or not b:
+        return ""
+    r = await run_proc(["git", "merge-base", a, b], cwd=worktree)
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -26612,6 +27144,17 @@ def _conformance_clean(conf_res: dict, baseline: dict | None = None) -> bool:
         return False
     for axis in ("build", "lint", "tests"):
         a = conf_res.get(axis) or {}
+        # An axis that RAN but could not be MEASURED is a third state, and it
+        # is not clean. No evidence is not evidence of green, and the
+        # baseline-red exclusion below must not swallow it: a run shipped a PR
+        # whose entire test axis never executed (its command did not exist on
+        # that tree) because `tests` was independently in `red` from the
+        # baseline, so this predicate returned clean without ever looking at
+        # `measured` (docs/POSTMORTEM-2026-08-14.md, F6). Checked BEFORE the
+        # red-axis exclusion for exactly that reason. Rare by construction —
+        # measured, 1 of 46 final axes that ran — so this blocks almost never.
+        if a.get("ran") and not a.get("measured"):
+            return False
         if a.get("ran") and not a.get("passed") and axis not in red:
             return False
     return True
@@ -27292,16 +27835,23 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
             ["bash", "-c", cmd], cwd=str(tree), timeout=timeout,
             log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
             verbosity=verbosity)
-        summary = (tail or "").strip()[-400:]
-        if rc != 0 and _runner_missing(summary):
-            # The command didn't run — its runner isn't on PATH (e.g.
-            # the recipe's `pip install` failed, so pytest is absent).
-            # This is "could not measure," NOT "RED": recording it as
-            # red-with-`command not found` gives the conformer a
-            # useless delta and provokes it to re-derive the baseline
-            # destructively (git stash / checkout <base> -- .). Mark it
-            # unmeasurable so red-axis logic and the conformer prompt
-            # both skip it.
+        full = (tail or "").strip()
+        summary = full[-400:]
+        # Classification reads the FULL output; only the display summary is
+        # truncated. A resource kill can be reported well before the last 400
+        # characters — a build that dies spawning a thread still prints its
+        # own epilogue afterwards — so classifying on `summary` would miss it
+        # exactly when the output is long.
+        if rc != 0 and _axis_unmeasurable(full):
+            # The command didn't produce a verdict. Two causes, and leerie
+            # authored the environment for both: its runner isn't on PATH
+            # (the recipe's `pip install` failed, so pytest is absent), or
+            # the container's own limits killed it before it could measure
+            # anything. This is "could not measure," NOT "RED": recording it
+            # as red gives the conformer a useless delta and provokes it to
+            # re-derive the baseline destructively (git stash / checkout
+            # <base> -- .). Mark it unmeasurable so red-axis logic and the
+            # conformer prompt both skip it.
             return {"ran": True, "measured": False, "passed": None,
                     "command": cmd, "summary": summary}
         return {
@@ -27434,6 +27984,33 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         st.save()
 
     return results
+
+
+def _axis_unmeasurable(output: str) -> bool:
+    """True when a failed BLT command produced no verdict at all.
+
+    The single predicate for "could not measure", as distinct from "measured
+    and RED". An exit code cannot tell those apart, and both of its causes are
+    authored by leerie's own environment rather than by the diff:
+
+      * the runner is absent from this tree (`_runner_missing`);
+      * the container's limits killed the command (`_is_fork_exhaustion`) — a
+        build that cannot spawn a worker thread against `pids.max` exits
+        non-zero having measured nothing.
+
+    The second was previously left to the workers, which adjudicated it in
+    prose: measured across a run corpus, 37 worker calls reasoned about
+    `OS can't spawn worker thread: Resource temporarily unavailable (os error
+    11)` and each decided for itself that it was environmental. DESIGN §12 puts
+    that decision in code (docs/POSTMORTEM-2026-08-14.md, F5).
+
+    Note what this deliberately does NOT catch. A vitest pool reporting
+    `Worker forks emitted error` / `Worker exited unexpectedly`, or a Next.js
+    build worker exiting on SIGABRT, are downstream symptoms of a genuine
+    out-of-memory in the repo's own code — a real red result that must stay
+    red. The distinction is not cosmetic: reading those as unmeasurable would
+    hide exactly the failures the baseline exists to surface."""
+    return _runner_missing(output) or _is_fork_exhaustion(output)
 
 
 def _runner_missing(summary: str) -> bool:
@@ -27699,12 +28276,29 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     rules_paths_str = _format_rules_paths(rules_files, repo_root)
 
     # Base ref and pre-pass snapshot for the clobber-survival check
-    # (DESIGN §9 *No clobbering the implementer's work*). Staging is cut
-    # from the run branch (setup-run.sh), so `run_branch..staging_before`
-    # is the union of all integrated implementer work; the run branch is
-    # the base version to compare against.
-    run_branch = _compute_run_branch(st.run_id)
+    # (DESIGN §9 *No clobbering the implementer's work*).
+    #
+    # The base is a SNAPSHOT SHA — the point the run branch forked from
+    # `working_branch` — and must NOT be the run branch itself. Staging is not
+    # merely "cut from" the run branch: `setup-run.sh` does
+    # `git worktree add "${STAGING_WT}" "${BRANCH}"`, so staging has that branch
+    # CHECKED OUT. Naming it as `base_ref` therefore makes
+    # `_blob_sha(base_ref, f)` and `_blob_sha("HEAD", f)` resolve the same ref,
+    # `b_head == b_base` is unconditionally true, and every file the final
+    # conformer edits is reported `(reverted-to-base)`. Measured on three real
+    # runs, the flagged set was exactly the file list of the conformer's own tip
+    # commit and none of those files was reverted; the two runs whose final
+    # conformer committed nothing reported nothing, which is the control. Under
+    # `--strict-conformer` the same false positive drives
+    # `_rollback_conformer_commits`, i.e. it would `git reset --hard` away every
+    # legitimate final-conformer fix (docs/POSTMORTEM-2026-08-14.md, F2).
+    #
+    # `fork_point..staging_before` is what the owned-set docstring actually
+    # means here: the union of all integrated implementer work. `git merge-base`
+    # yields it as a stable SHA even if `working_branch` has since moved.
     staging_before_sha = await _branch_head_sha(str(staging))
+    clobber_base_sha = await _merge_base_sha(
+        str(staging), working_branch, staging_before_sha)
     clobbered_files: list[str] = []
 
     # The final pass always runs the CANONICAL commands, never a delta proxy
@@ -27846,10 +28440,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
         # Clobber-survival check (DESIGN §9 *No clobbering the
         # implementer's work*): same guard as the per-subtask phase,
-        # scoped to the integrated staging tree. base=run_branch,
-        # impl_head=staging HEAD captured before this pass.
+        # scoped to the integrated staging tree. base=the fork-point SHA
+        # (NOT the run branch — staging has it checked out; see the comment
+        # where clobber_base_sha is computed), impl_head=staging HEAD captured
+        # before this pass.
         clobbered = await _clobbered_owned_files(
-            str(staging), run_branch, staging_before_sha)
+            str(staging), clobber_base_sha, staging_before_sha)
         if clobbered:
             clobbered_files = clobbered
             warnings.append(
@@ -27954,6 +28550,48 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             "run blocked. Fix and resume.")
 
 
+def _settle_already_satisfied(sid: str, drop: dict, st: State, *,
+                              summary: str | None = None,
+                              criteria_results: list | None = None) -> dict:
+    """Record a subtask whose success criteria a `satisfied_probe` judged
+    already met on the run branch, and return its terminal `complete` result.
+
+    Two callers reach this with the same fact and must record it identically:
+    the pre-spawn probe of a plan-time-flagged provider-subset subtask (DESIGN
+    §8 *Probing a flagged subtask before it spends*) and the post-execution
+    no-commits rescue (§8 *The mid-run sibling case*). The state writes below
+    are load-bearing rather than bookkeeping — a missing conformance sentinel
+    leaves `_get_progress` counting the subtask `in_conformer` forever — so
+    they live in one place rather than being copied to the second site."""
+    st.data.setdefault("dropped_subtasks", {})[sid] = drop
+    st.data.setdefault("subtask_status", {})[sid] = "complete"
+    st.data.get("blocked", {}).pop(sid, None)
+    # Write a conformance sentinel so `_get_progress` counts this subtask as
+    # `done`, not perpetually `in_conformer` (that classifier keys on a
+    # missing `conformance[sid]`). The real conformer is correctly skipped —
+    # a zero-commit subtask has no diff to conform.
+    st.data.setdefault("conformance", {})[sid] = {
+        "result": None,
+        "warnings": ["settled complete via satisfied rescue; "
+                     "no diff to conform"],
+        # Deliberately NOT added to `unreviewed_subtasks`. `reviewed: False`
+        # is literally true — no conformer ran — but this is a review that was
+        # never *needed* (zero commits, no diff to attack), not one that was
+        # attempted and died. Conflating the two would put a
+        # correctly-skipped subtask in the operator-facing warning and train
+        # them to ignore it.
+        "reviewed": False,
+    }
+    st.save()
+    return {"subtask_id": sid, "status": "complete",
+            "summary": (summary
+                        or "success criteria already satisfied on the run "
+                        "branch (deliverable already present — a sibling "
+                        "subtask committed it this run, or it was already on "
+                        "the base tree); no new commits required"),
+            "criteria_results": criteria_results or []}
+
+
 async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict:
@@ -28024,6 +28662,53 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             continuation = False
             note = f"Previous attempt failed: {reason}"
         return None
+
+    # DESIGN §8 *Probing a flagged subtask before it spends*. A subtask the
+    # plan-time provider-subset advisory flagged has no file surface of its
+    # own — every file it expects to touch belongs to an ordered predecessor,
+    # which is by construction in an earlier wave and therefore already merged
+    # into staging. If that predecessor committed the shared deliverable, this
+    # subtask's implementer will produce nothing and be settled by the
+    # post-execution rescue below, having spent a full worker to learn it.
+    # Ask the same probe first. Probed against the STAGING worktree because
+    # this subtask's own worktree does not exist yet — `new-worktree.sh` runs
+    # inside `_run_implementer` — and staging sits at the run-branch HEAD,
+    # which is the ref the rescue would measure against anyway.
+    #
+    # Advisory in, probe decides: the flag alone never settles anything (a
+    # subtask may make a genuinely distinct edit to a shared file), and the
+    # probe fails safe to None, so anything short of a confident `satisfied`
+    # falls through to the implementer untouched.
+    if sid in (st.data.get("provider_subset_sids") or []):
+        staging = leerie_dir / "worktrees" / "staging"
+        if staging.is_dir():
+            pre_drop = await _probe_criteria_satisfied_on_head(
+                subtask, str(staging), st, caps, models, efforts,
+                label="pre")
+            if pre_drop is not None:
+                # Distinct reason from the post-execution rescue's
+                # `already_satisfied_mid_run`: same verdict, different moment,
+                # and the audit is worth being able to tell apart — one cost a
+                # probe, the other cost an implementer first.
+                pre_drop["reason"] = "already_satisfied_pre_spawn"
+                # No implementer ran, so no branch exists -- and `integrate_wave`
+                # filters only on `status == "complete"`, so this subtask still
+                # reaches `integrate.sh`, which exits 2 on a missing branch and
+                # die()s the run. Give it the same zero-commit branch the
+                # post-execution rescue's subtask already has. On failure, fall
+                # through to the implementer rather than settling: a settle we
+                # cannot make integrable is strictly worse than the spend.
+                if await _create_empty_subtask_branch(
+                        str(st.repo_root), st.run_id, sid):
+                    log(f"  {sid}: flagged at plan time as provider-subset, and "
+                        "its success criteria are already met on the run "
+                        "branch — settling complete without spawning an "
+                        f"implementer. {pre_drop['evidence'][:160]}")
+                    return _settle_already_satisfied(sid, pre_drop, st)
+                log(f"  {sid}: criteria already met on the run branch, but its "
+                    "subtask branch could not be created — running the "
+                    "implementer rather than settling a subtask integration "
+                    "cannot merge.")
 
     while True:
         try:
@@ -28159,14 +28844,20 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 cwd=worktree)
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
-            impl_issues = check_implementer_output(res, subtask, actual_files)
-            if impl_issues and confidence_retries < caps.get(
+            impl_issues = check_implementer_output(
+                res, subtask, actual_files)
+            # Advisories are surfaced but never re-drive (see _ADVISORY_ISSUES).
+            _gating = _gating_issues(impl_issues)
+            for _adv in impl_issues:
+                if _adv not in _gating:
+                    log(f"  {sid}: advisory: {_adv}")
+            if _gating and confidence_retries < caps.get(
                     "implementer_confidence_retries", 2):
-                log(f"  {sid}: mechanical check issues: {impl_issues}")
+                log(f"  {sid}: mechanical check issues: {_gating}")
                 confidence_retries += 1
                 continuation = True
                 note = _format_check_feedback(
-                    impl_issues, confidence_retries - 1,
+                    _gating, confidence_retries - 1,
                     caps.get("implementer_confidence_retries", 2))
                 # Record the in-flight attempt before looping. The status
                 # write below is unreachable from here, so a subtask that
@@ -28186,7 +28877,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # gate. Runs only on the success path: a blocked subtask has no claim
         # to substantiate.
         if status == "complete":
-            _sym_findings = check_symptom_evidence(res, sid)
+            _sym_findings = check_symptom_evidence(
+                res, sid, bool(subtask.get("fixes_reported_symptom")))
             for _sym in _sym_findings:
                 log(f"  {sid}: {_sym}")
                 res.setdefault("symptom_warnings", []).append(_sym)
@@ -28246,37 +28938,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                         "present — committed by a sibling subtask this run, "
                         "or already on the base tree) — settling complete "
                         f"instead of failing. {drop['evidence'][:160]}")
-                    st.data.setdefault("dropped_subtasks", {})[sid] = drop
-                    st.data.setdefault("subtask_status", {})[sid] = "complete"
-                    st.data.get("blocked", {}).pop(sid, None)
-                    # Write a conformance sentinel so `_get_progress` counts
-                    # this subtask as `done`, not perpetually `in_conformer`
-                    # (that classifier keys on a missing `conformance[sid]`).
-                    # The real conformer is correctly skipped — a zero-commit
-                    # subtask has no diff to conform.
-                    st.data.setdefault("conformance", {})[sid] = {
-                        "result": None,
-                        "warnings": ["settled complete via mid-run satisfied "
-                                     "rescue; no diff to conform"],
-                        # Deliberately NOT added to `unreviewed_subtasks`.
-                        # `reviewed: False` is literally true — no conformer
-                        # ran — but this is a review that was never *needed*
-                        # (zero commits, no diff to attack), not one that was
-                        # attempted and died. Conflating the two would put a
-                        # correctly-skipped subtask in the operator-facing
-                        # warning and train them to ignore it.
-                        "reviewed": False,
-                    }
-                    st.save()
-                    return {"subtask_id": sid, "status": "complete",
-                            "summary": (res.get("summary")
-                                        or "success criteria already satisfied "
-                                        "on the run branch (deliverable already "
-                                        "present — a sibling subtask committed "
-                                        "it this run, or it was already on the "
-                                        "base tree); no new commits required"),
-                            "criteria_results": res.get("criteria_results")
-                            or []}
+                    return _settle_already_satisfied(
+                        sid, drop, st, summary=res.get("summary"),
+                        criteria_results=res.get("criteria_results"))
                 log(f"  branch check failed for {sid}: {message}")
                 done = await fail(kind, message)
                 if done is not None:
@@ -28989,7 +29653,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # from the prior invocation persists on the volume. Prune before
     # any wave creates new worktrees so stale entries don't crash
     # `git worktree list --porcelain` in new-worktree.sh.
-    await run_proc(["git", "worktree", "prune"])
+    _prune_leerie_worktrees(leerie_dir)
 
     # Base-tree health baseline (DESIGN §9): staging now exists off the
     # base HEAD and no wave has mutated it yet, so this is the earliest
@@ -29142,7 +29806,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                                   or results[s].get("summary") for s in blocked}
             st.save()
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {st.path}; resolve and re-run with resume.")
+                f"See {_operator_path(st.path)}; resolve and re-run with resume.")
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
@@ -29798,8 +30462,8 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # subclasses that a
     # bare `except Exception` would let escape — derailing a clean finalize into
     # a crash. Capture is best-effort; catch them so it never blocks the run.
-    except (Exception, TerminalAuthFailure, RateLimitedExit,
-            ContextOverflow, DiskLowSpace) as _cap_exc:
+    except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
@@ -29853,15 +30517,16 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         sid for sid, findings in (st.data.get("symptom_findings") or {}).items()
         if any(f.startswith("SYMPTOM_DID_NOT_REPRODUCE") for f in findings))
     if _stale:
-        log(f"note — {len(_stale)} bugfix subtask(s) could not reproduce the "
-            f"symptom they were written to fix, so the finding may already "
+        log(f"note — {len(_stale)} subtask(s) declared as fixing a reported "
+            f"symptom could not reproduce it, "
+            f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
             f"${tel.get('cost_usd', 0.0):,.2f}, "
             f"{tel.get('input_tokens', 0):,} in / "
             f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {st.path})")
+            f"(see {_operator_path(st.path)})")
 
 
 # =========================================================================
@@ -29991,13 +30656,80 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # `st` is a parameter, already constructed by `main()`, so `st.run_id`
     # is valid before `st.load()`.
     log(f"run id: {st.run_id}")
+    # A `resume` of a run that never reached phase_classify is a START, not a
+    # resume, and it is demoted HERE — above the dispatch — so the fresh-run
+    # branch below does its normal state seeding. Flipping the flag inside the
+    # resume arm instead looks equivalent and is not: the `else:` has already
+    # been skipped, so `st.data` is never seeded and the run dies later on a
+    # missing `started_at`.
+    #
+    # Reaching this is mundane (Ctrl-C or a preflight refusal before the first
+    # phase) and the recorded `task` is intact, so there is nothing to recover
+    # — the run simply has to begin. It restarts in place rather than asking
+    # for a fresh run because the run directory, its id and its flock already
+    # exist, and minting a second run for the same task is what the
+    # duplicate-task guard exists to prevent (POSTMORTEM-2026-08-14, F15).
+    if args.resume and st.load():
+        # "Never started" must exclude runs that TERMINATED without waves:
+        # a completed run and a no-work run both reach the resume arm's own
+        # early returns below and must keep doing so. Demoting them would
+        # restart finished work — measured against the two guards in
+        # tests/test_resume_planning_regression.py, which is what caught it.
+        # `finished_at` is deliberately NOT a disqualifier here. `main()`'s
+        # SystemExit handler stamps it on every die(), including one that fired
+        # before this run did any work at all -- so excluding it made a run
+        # that died in preflight or phase_classify permanently unrestartable.
+        # Suppressing the stamp instead was tried and reverted: it left the run
+        # with no terminal marker, so `_live_duplicate_runs` read it as LIVE
+        # forever and refused every re-run of the same task, naming a run that
+        # was not running. That is the F15 phantom this whole area exists to
+        # avoid, so the stamp stays and the demotion tolerates it.
+        #
+        # The other two conjuncts already exclude everything that must not
+        # restart: a completed run has `waves`, and `_finish_no_work_run` sets
+        # `waves = []`, so both fail the `"waves" not in st.data` test before
+        # `no_work_required` is even consulted.
+        # `current_phase` is stamped at every phase entry and is documented as
+        # "Empty string before phase 1", so its ABSENCE is the precise
+        # statement of "this run never started" -- and it is what keeps the
+        # completed-run and no-work early returns further down reachable. They
+        # sit AFTER this block, so before `finished_at` was dropped from the
+        # predicate it was silently doing that ordering work; a completed run
+        # whose state carries no `waves` would otherwise be demoted and
+        # restarted here (pinned by
+        # tests/test_resume_planning_regression.py's completed-run guard).
+        if ("waves" not in st.data and "categories" not in st.data
+                and not st.data.get("current_phase")
+                and not st.data.get("no_work_required")
+                and isinstance(st.data.get("task"), str)
+                and st.data["task"].strip()):
+            log("this run never reached phase_classify — starting it from its "
+                "recorded task rather than resuming")
+            # The fresh-run branch reads the task from argv, and a `resume`
+            # invocation carries none — so hand it the one state recorded.
+            # Without this the demotion trades one unhelpful die() for
+            # another ("a task description is required").
+            args.task = st.data["task"]
+            args.resume = False
+            # `main()` gates `_preflight_repo()` on `if not args.resume:`, and
+            # this demotion happens after that gate has already been passed —
+            # so without this call the run proceeds as a FRESH run having
+            # skipped the git-identity, dirty-tree and branch-collision checks
+            # that every other fresh run gets. They live only in
+            # `_preflight_repo()` since it was split out of `preflight()`
+            # (POSTMORTEM-2026-08-14, F14), so `preflight()` below does not
+            # cover them. The skip-on-resume rationale does not apply here
+            # either: its point is that a resumed run's directory already
+            # exists so there is nothing left to protect, and what this path
+            # is about to do is start the work for the first time.
+            await _preflight_repo()
     if args.resume:
         if not st.load():
-            die(f"nothing to resume — no state.json at {st.path}")
+            die(f"nothing to resume — no state.json at {_operator_path(st.path)}")
         _validate_resume_state(st.data)
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
-        log(f"per-worker logs: {st.run_dir / 'logs'}/")
+        log(f"per-worker logs: {_operator_path(st.run_dir / 'logs')}/")
         # A successfully finalized run must not re-execute phases 4→5→6.
         # Without this guard, `resume` on a completed run re-runs
         # setup-run.sh + finalize.sh + cleanup.sh, creating a window
@@ -30036,11 +30768,23 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # never got past its very first st.save(), before phase_classify
         # even started) is the only genuinely-unusable case left to reject.
         if "waves" not in st.data and "categories" not in st.data:
+            # "Never started" is a RESTARTABLE state, not a corrupt one. The
+            # ordinary way to reach it is mundane — Ctrl-C, or a preflight
+            # refusal, before `phase_classify` ran — and the recorded `task` is
+            # intact, so there is nothing to recover and nothing to inspect:
+            # the run simply has to begin. Calling it "likely corrupt or
+            # hand-edited" sent an operator hunting a data-integrity problem
+            # that did not exist (docs/POSTMORTEM-2026-08-14.md, F15).
+            #
+            # Restarting in place is deliberate over die()ing: the run
+            # directory, its id and its flock already exist, and minting a
+            # second run for the same task is what R15's duplicate guard
+            # exists to prevent.
             die(
-                "cannot resume — state.json has no recorded progress at "
-                "all (not even phase_classify started). This state.json "
-                "is likely corrupt or was hand-edited; inspect it under "
-                f"{st.run_dir} or re-run without resume."
+                "cannot resume — state.json records neither progress nor a "
+                "task, so there is nothing to start or continue. This is the "
+                "one genuinely unusable state: the run died before its very "
+                f"first save. Inspect {_operator_path(st.run_dir)}, or start a fresh run."
             )
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
@@ -30254,6 +30998,41 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 pr_base_branch = getattr(args, "pr_base_branch", None) or working_branch
                 st.data["pr_base_branch"] = pr_base_branch
                 st.save()
+                # Refuse to duplicate a task another live run is already
+                # doing. `run_id` is the container id, so byte-identical task
+                # text launched twice is otherwise invisible: measured, one
+                # task ran twice three minutes apart for $72.21, producing two
+                # architecturally incompatible branches with 14 files in
+                # collision (docs/POSTMORTEM-2026-08-14.md, F10).
+                #
+                # Checked here, before the first worker, because this is the
+                # last cheap moment. The escape hatch is an env var rather than
+                # a CLI flag: deliberately running the same brief twice is a
+                # real thing to want, and it should be stated rather than
+                # discovered.
+                _fp = _task_fingerprint(task)
+                _dupes = _live_duplicate_runs(st.leerie_root, st.run_id, _fp)
+                if _dupes and os.environ.get(
+                        "LEERIE_ALLOW_DUPLICATE_TASK", "").strip() not in (
+                        "1", "true", "yes"):
+                    die("this task is already being worked on by "
+                        f"{'run' if len(_dupes) == 1 else 'runs'} "
+                        + ", ".join(_dupes)
+                        + " (identical task text, and that run has not "
+                        "finished, paused or been killed).\n"
+                        "Two runs on one task produce two branches that "
+                        "conflict on the same files and two PRs whose merge "
+                        "order matters.\n"
+                        "  • to watch the existing run:  leerie attach "
+                        f"{_dupes[0]}\n"
+                        "  • to stop it:                 leerie kill "
+                        f"{_dupes[0]}\n"
+                        "  • if you really want both:    "
+                        "LEERIE_ALLOW_DUPLICATE_TASK=1 leerie ...")
+                elif _dupes:
+                    log(f"⚠  duplicate task: {', '.join(_dupes)} "
+                        "already working on identical task text "
+                        "(LEERIE_ALLOW_DUPLICATE_TASK is set)")
                 _write_run_json(
                     st.run_dir,
                     run_id=st.run_id,
@@ -30262,6 +31041,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     pr_base_branch=pr_base_branch,
                     started_at=st.data["started_at"],
                     task=task,
+                    task_sha256=_task_fingerprint(task),
                     **({"group_id": args.group_id} if args.group_id else {}),
                 )
             await phase_classify(task, st, caps, args.clarify, models, efforts)
@@ -30444,8 +31224,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # if the predecessor commits the shared deliverable (DESIGN
             # §5, §8 *The mid-run sibling case*). Warning only; the
             # mid-run satisfied rescue in _settle_subtask is the actual
-            # safety net.
-            _warn_provider_subset_subtasks(plans)
+            # safety net. Persisted (not merely logged) so that rescue can
+            # run its probe BEFORE the implementer spends rather than after
+            # it returns empty-handed.
+            st.data["provider_subset_sids"] = (
+                _warn_provider_subset_subtasks(plans))
+            st.save()
             # Flag a test subtask that declares NO cross-subtask edge at all
             # while the plan has producing subtasks. Advisory, and narrow: the
             # commoner wiring-gate death is a subtask that declares several
@@ -31192,6 +31976,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         run_id = args.run_id
     else:
         die("--run-id is required (the launcher passes the container/machine ID)")
+    # Repo-state checks BEFORE `State(...)`, which is the first irreversible
+    # step: it mints `<state-root>/runs/<run-id>/`, takes its flock and writes
+    # `state.json`. Refusing after that leaves a permanent run directory for a
+    # run that never started — four accumulated on one host from a single
+    # afternoon of dirty-tree refusals, indistinguishable in `leerie list` from
+    # runs that did work (docs/POSTMORTEM-2026-08-14.md, F14). Skipped on
+    # `resume`: a resumed run's directory already exists, so there is nothing
+    # left to protect, and re-checking would refuse a resume for a dirty tree
+    # the operator may be mid-way through fixing.
+    if not args.resume:
+        asyncio.run(_preflight_repo())
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
     except StateLockedError as e:
@@ -31586,8 +32381,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during context-overflow pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -31636,8 +32439,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 repo_root, st,
                 caps=caps, models=models, efforts=efforts,
             ))
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during disk-low pause "
                 f"({_cap_exc})")
         # `exit_code` / `abnormal` are deliberately NOT set here — they are
@@ -31677,8 +32488,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # `except Exception` cannot catch the re-raise: it would escape main()
         # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
         # crash the run with exit 1 — defeating this whole resumable-pause arm.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during auth-locked pause "
                 f"({_cap_exc})")
         exit_code = EXIT_LOCKED
@@ -31732,8 +32551,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             # RateLimitedExit are BaseException subclasses a bare
             # `except Exception` misses, which would skip the `exit_code =
             # EXIT_LOCKED` below and crash the pause with exit 1.
-            except (Exception, TerminalAuthFailure, RateLimitedExit,
-                    ContextOverflow, DiskLowSpace) as _cap_exc:
+            except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                    RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
                 log(f"capture: non-fatal error during out-of-credits pause "
                     f"({_cap_exc})")
             exit_code = EXIT_LOCKED
@@ -31785,8 +32604,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the cancel arm still reaches its `exit_code = 130`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during cancel-arm capture "
                 f"({_cap_exc})")
         exit_code = 130
@@ -31810,8 +32637,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # BaseException subclasses a
         # bare `except Exception` misses; catching them keeps capture non-fatal
         # so the signal arm still reaches its `exit_code = 128 + signum`.
-        except (Exception, TerminalAuthFailure, RateLimitedExit,
-                ContextOverflow, DiskLowSpace) as _cap_exc:
+        # KeyboardInterrupt is IN this tuple, and it is the one that
+        # matters: a terminal arm exists to record a disposition, so a
+        # Ctrl-C during its best-effort capture must not escape main()
+        # and skip the exit_code/cleanup that arm was reached to set.
+        # The comment this replaces enumerated the BaseException
+        # subclasses a bare `except Exception` misses and omitted the
+        # only one guaranteed to be in flight when the arm is a SIGINT
+        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
+        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
             log(f"capture: non-fatal error during signal-arm capture "
                 f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.

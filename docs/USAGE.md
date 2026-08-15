@@ -706,3 +706,46 @@ leerie kill <chain-id>
 
 `kill <chain-id>` iterates the chain's runs and invokes
 `leerie kill <run-id>` per run; already-killed runs are skipped.
+
+## Reclaiming disk: `leerie prune`
+
+Nothing reaps run state automatically. Measured on one repo after three weeks:
+**1.5 GB** across 71 run directories and 23,158 repo-map-cache entries, plus 64
+stale `leerie/subtasks/*` branches left in the checkout — while leerie's own
+preflight refuses to start a run on low disk headroom and tells you to prune by
+hand (`docs/POSTMORTEM-2026-08-14.md`, F22).
+
+```bash
+leerie prune                       # dry-run: shows what it would remove
+leerie prune --apply               # actually remove
+leerie prune --older-than 30 --apply
+```
+
+It removes three things. Run directories and cache entries are subject to
+`--older-than` (default 14 days); **branches are not** — they are scoped by
+whether their run is still live, so a branch whose run directory is gone is in
+scope at any age:
+
+- **terminal run directories** — only runs with `finished_at` or `killed_at`. A
+  paused or in-flight run is resumable and survives regardless of age.
+- **repo-map cache entries** — regenerated on demand.
+- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run is not
+  live. Branches belonging to a live run, and any branch outside that
+  namespace, are never in scope.
+
+  Deleting one needs positive evidence, never absence: a run directory *this
+  prune removed* is known finished, and a branch already merged into its own
+  `leerie/runs/<id>` has its commits in the integrated history. Anything else
+  goes through `git branch -d`, which refuses an unmerged branch — so a branch
+  holding the only copy of some work survives even if this state root has never
+  heard of its run. Those are reported:
+
+  ```
+    kept 2 subtask branch(es) with unmerged commits
+  ```
+
+  To remove them anyway, use `scripts/cleanup.sh --run-id <id> --subtask-branches`.
+
+**Dry-run is the default and that is deliberate**: this deletes directories that
+may hold the only record of a paid-for run, so the safe mode is the one you get
+without asking for it.

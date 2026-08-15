@@ -112,7 +112,7 @@ def test_namespaces_are_explicitly_disjoint(leerie):
 
 
 def test_preflight_checks_external_leerie_branch():
-    """preflight() must check for a pre-existing 'leerie' branch that would
+    """_preflight_repo() must check for a pre-existing 'leerie' branch that would
     collide with the leerie/runs/* and leerie/subtasks/* namespace in git's
     loose ref store. Without this, a user branch named 'leerie' crashes
     setup-run.sh with 'cannot lock ref'."""
@@ -120,13 +120,13 @@ def test_preflight_checks_external_leerie_branch():
     from pathlib import Path
     leerie_py = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
     src = leerie_py.read_text()
-    start = src.index("async def preflight(")
+    start = src.index("async def _preflight_repo(")
     m = re.search(r"\n(?:async )?def ", src[start + 1:])
     end = start + 1 + m.start()
     body = src[start:end]
     assert 'show-ref", "--verify", "--quiet",\n' \
            '                        "refs/heads/leerie"' in body, (
-        "preflight must check for a pre-existing 'leerie' branch — "
+        "_preflight_repo must check for a pre-existing 'leerie' branch — "
         "without it, a user branch named 'leerie' crashes setup-run.sh "
         "with 'cannot lock ref'."
     )

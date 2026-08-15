@@ -175,6 +175,22 @@ class TestSettleWiring:
         src = inspect.getsource(leerie._settle_subtask)
         assert "_probe_criteria_satisfied_on_head(" in src
 
+    @staticmethod
+    def _rescue_probe_idx(src: str) -> int:
+        """Index of the POST-EXECUTION rescue's probe call.
+
+        There are two probe call sites since the pre-spawn probe of a
+        plan-time-flagged provider-subset subtask landed (DESIGN §8 *Probing a
+        flagged subtask before it spends*), and that one is textually first —
+        a bare `find` silently retargets these guards onto it, where the
+        assertions below are all trivially true. Anchor on the `commit_err`
+        branch instead, which is the rescue's defining guard."""
+        commit_branch = src.find("if commit_err")
+        assert commit_branch != -1, "the no-commits branch is missing"
+        idx = src.find("_probe_criteria_satisfied_on_head(", commit_branch)
+        assert idx != -1, "the rescue probe must live on the commit_err branch"
+        return idx
+
     def test_reprobe_precedes_the_fail_call(self, leerie):
         """The HEAD re-probe must run BEFORE the no-commits fail() — fail()
         burns the retry cap and eventually kills the wave, exactly the loop
@@ -182,8 +198,7 @@ class TestSettleWiring:
         probe (the commit-path fail), since an earlier empty_handoff fail()
         also exists above the probe."""
         src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
-        assert probe_idx != -1
+        probe_idx = self._rescue_probe_idx(src)
         fail_after = src.find("done = await fail(kind, message)", probe_idx)
         assert fail_after != -1, "the commit-path fail() must follow the probe"
         assert probe_idx < fail_after
@@ -192,7 +207,7 @@ class TestSettleWiring:
         """The re-probe lives on the check_branch_has_commits (`commit_err`)
         branch, distinct from the empty_handoff rescue above it."""
         src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
+        probe_idx = self._rescue_probe_idx(src)
         # the nearest guard above the probe is the `if commit_err ...` branch
         region = src[:probe_idx]
         last_if = region.rfind("if commit_err")
@@ -200,22 +215,27 @@ class TestSettleWiring:
 
     @staticmethod
     def _rescue_region(leerie):
-        """The source between the HEAD-probe call and its rescued `complete`
-        return — the exact rescue block, sliced by structure (not a fixed
-        char window) so adding comments can't silently break these guards."""
+        """The settle the rescue performs.
+
+        This used to be a slice of `_settle_subtask` between the probe call
+        and the rescued return. The same settle is now reached from a second
+        site — the pre-spawn probe of a plan-time-flagged provider-subset
+        subtask (DESIGN §8 *Probing a flagged subtask before it spends*) — so
+        it lives in `_settle_already_satisfied` and both callers share it.
+        These guards follow the code they guard; what they assert is
+        unchanged."""
+        return inspect.getsource(leerie._settle_already_satisfied)
+
+    def test_rescue_settles_through_the_shared_helper(self, leerie):
+        """The rescue must not re-implement the settle inline: a second copy
+        of these state writes is exactly how one site loses the conformance
+        sentinel the other has."""
         src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = src.find("_probe_criteria_satisfied_on_head(")
-        assert probe_idx != -1, "probe call missing from _settle_subtask"
-        ret_idx = src.find(
-            'return {"subtask_id": sid, "status": "complete"', probe_idx)
-        assert ret_idx != -1, "rescued complete-return missing after the probe"
-        # include the return line itself
-        return src[probe_idx:src.find("\n", ret_idx)]
+        probe_idx = self._rescue_probe_idx(src)
+        assert src.find("_settle_already_satisfied(", probe_idx) != -1, (
+            "the rescued path must return through the shared settle helper")
 
     def test_rescued_result_is_complete_with_drop_record(self, leerie):
-        src = inspect.getsource(leerie._settle_subtask)
-        # settle records the helper's drop and marks the subtask complete
-        assert "dropped_subtasks" in src
         region = self._rescue_region(leerie)
         assert 'st.data.setdefault("dropped_subtasks", {})[sid] = drop' in region
         assert 'return {"subtask_id": sid, "status": "complete"' in region
@@ -225,12 +245,10 @@ class TestSettleWiring:
         must write a `conformance[sid]` sentinel itself — otherwise
         `_get_progress` (which keys `in_conformer` on a missing conformance
         entry for a `complete` subtask) would count the rescued subtask as
-        perpetually in-conformer. Source-coupling guard: the write must appear
-        between the probe call and the rescued return."""
+        perpetually in-conformer."""
         region = self._rescue_region(leerie)
         assert 'setdefault("conformance", {})[sid]' in region, \
             "rescue must write a conformance sentinel before returning"
-        # and it must precede the rescued return in that region
         conf_idx = region.find('setdefault("conformance", {})[sid]')
         ret_idx = region.find('return {"subtask_id": sid, "status": "complete"')
         assert conf_idx != -1 and ret_idx != -1 and conf_idx < ret_idx

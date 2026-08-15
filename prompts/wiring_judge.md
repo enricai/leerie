@@ -116,7 +116,15 @@ on a plan that actually works.
   attack).
 - `wiring_defects`: one entry per missing/broken semantic edge. `kind` is one of
   the enums above; `sid` is the subtask the defect is about; `tag_or_dep` is the
-  capability tag or subtask id the edge concerns (**must be non-empty**);
+  capability tag or subtask id the edge concerns — **the bare token, copied
+  verbatim, and nothing else** (must be non-empty). It is matched by exact
+  equality against the plan's declared tags and subtask ids, so a token with
+  any commentary attached matches nothing and the whole finding is thrown away
+  unexamined. Put the explanation in `concrete_reason`, which is where it
+  belongs. **For `missing_requires` only**, naming several values at once is
+  fine — separate them with `, ` or ` / `, each still a bare token. Every other
+  kind is matched whole: a joined value there resolves to nothing, is dismissed
+  by nothing, and takes the run down. One finding per value for those;
   `concrete_reason` is the **specific** consuming/producing work that proves the
   edge is real — **must be non-empty and concrete**, or the entry is dropped and
   does not gate; `severity` is `live_defect` or `latent_risk` (see above — this

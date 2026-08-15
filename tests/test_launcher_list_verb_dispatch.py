@@ -35,6 +35,10 @@ import os
 import subprocess
 from pathlib import Path
 
+# Single owner of the guard-arm extraction; see `test_block_present_in_launcher`
+# for why this file consumes it rather than pinning the verb list as a literal.
+from tests.test_launcher_verb_filter import _extract_rewritten_args_guard_verbs
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -139,13 +143,18 @@ def test_block_present_in_launcher():
     # the general verb-rejection guard arm matching every OTHER verb, or
     # bare `resume`/`list` at position 1 never gets a chance to pass.
     assert "resume|list)" in src
-    other_verbs_guard = (
-        'finalize|stop|kill|re-seed|accept-blocked|accept-integration|'
-        'attach|chain|group|config|status|version)'
-    )
-    assert other_verbs_guard in src, (
-        "The other-launcher-verbs guard arm is missing or has drifted — "
-        "it must no longer list `resume`/`list` (they get their own arm)."
-    )
-    assert "resume" not in other_verbs_guard.split(")")[0].split("|")
-    assert "list" not in other_verbs_guard.split(")")[0].split("|")
+    # What this actually needs to be true is that the other-verbs arm does not
+    # claim `resume`/`list`. It used to assert that by pinning the arm's whole
+    # membership list as a literal — which failed the moment a legitimate new
+    # verb was added (`prune`), and whose two follow-up assertions split the
+    # literal DEFINED IN THIS FILE rather than the launcher's, so they held no
+    # matter what the launcher said. Derive the arm instead; the extraction has
+    # one owner (tests/test_launcher_verb_filter.py) and two consumers.
+    other_verbs = _extract_rewritten_args_guard_verbs()
+    assert other_verbs, "the other-launcher-verbs guard arm is missing"
+    assert "resume" not in other_verbs, (
+        "`resume` must not be in the reject-everything arm — it has its own "
+        "position-1 pass-through arm")
+    assert "list" not in other_verbs, (
+        "`list` must not be in the reject-everything arm — it has its own "
+        "position-1 pass-through arm")

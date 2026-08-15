@@ -77,14 +77,31 @@ def _make_stub_bin(bin_dir: Path, name: str, body: str) -> None:
 def _make_stub_python3(bin_dir: Path, rebaser_json: str, marker: str = "run_rebaser") -> None:
     """A `python3` stub that recognizes an invocation whose script argument
     contains `marker` (the real seam script always calls `m.run_rebaser(`)
-    and prints `rebaser_json` to stdout; any other invocation execs the
-    real python3 so nothing else in the test harness breaks."""
+    and writes `rebaser_json` to the seam's VERDICT FILE; any other invocation
+    execs the real python3 so nothing else in the test harness breaks.
+
+    The verdict goes to the file, not stdout, because that is the seam's
+    contract: stdout carries the worker's log stream (leerie's `log()` prints
+    there), and the two sharing a channel is what made `jq` fail on 9 of 9 real
+    runs. The stub therefore also emits a log-shaped line on stdout — if
+    host-finalize.sh ever goes back to reading stdout, that noise breaks the
+    parse exactly as it did in production.
+
+    The verdict path is taken as the LAST argument rather than a fixed index:
+    the stub stands in for `python3`, so the seam script itself is `$1` and
+    every seam argument is shifted by one. Hard-coding the wrong index here is
+    not a benign test bug — an earlier revision of a sibling stub wrote to the
+    slot holding "$LEERIE_REPO/orchestrator/leerie.py" and truncated the real
+    orchestrator source to 15 bytes.
+    """
     p = bin_dir / "python3"
     p.write_text(f"""#!/usr/bin/env bash
 echo "$@" >> {bin_dir}/python3.log
 script="$1"
 if [ -f "$script" ] && grep -q '{marker}' "$script"; then
-  cat <<'JSON'
+  for _out; do :; done
+  echo "2026-08-14T04:26:06+00:00 [leerie] [repo]   [rebaser] spawned (pid=1)"
+  cat > "$_out" <<'JSON'
 {rebaser_json}
 JSON
   exit 0

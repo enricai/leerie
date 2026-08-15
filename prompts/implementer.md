@@ -301,8 +301,13 @@ seconds) and is fine to run scoped or full.
 criterion like "`pnpm run build` passes"). That criterion is a
 *conformance-phase* signal — the conformer runs the build and records
 the result. It is **not** an instruction for you to run the build here.
-Record it as `met: false` (or "not run — conformance phase owns this")
-in `criteria_results` and move on; do not re-attempt a full build. A
+Record it as `"met": false, "not_applicable": true` with evidence
+"not run — conformance phase owns this", and move on; do not re-attempt a
+full build. **The `not_applicable` flag is the only thing that stops the
+orchestrator re-driving you for it** — a bare `met: false` reads as work you
+left undone, and nothing infers the exemption from how the criterion is
+worded. If you leave the flag off, you will be re-run for a criterion you
+were told not to evaluate. A
 build that OOMs in this container will burn your entire turn budget and
 get you reaped mid-turn — and if that happens *after* you have committed
 your work, the orchestrator keeps the committed diff, but you will have
@@ -322,7 +327,12 @@ warnings, not as gates here. If your work landed and your confidence
 is anchored, return `complete` even with a few `met: false` items —
 they will surface as warnings on the result.
 
-### 5a. If this is a `bugfix-` subtask, reproduce the symptom first
+### 5a. If your subtask fixes a REPORTED symptom, reproduce it first
+
+This applies when your subtask spec carries `"fixes_reported_symptom": true`
+— not merely when its id happens to begin `bugfix-`. Ids are re-homed by plan
+merges and are synthesised for verification-only work, so the id says nothing
+about whether a symptom exists to reproduce.
 
 Before implementing, reproduce the reported failure **on the base tree**, and
 say in your summary what you observed. If you cannot reproduce it, stop and
