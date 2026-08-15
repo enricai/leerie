@@ -41,9 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _SEAM_MARKER = 'spec_from_file_location("leerie_orch"'
 
 
-def _shell_files() -> list[Path]:
-    files = [REPO_ROOT / "leerie"]
-    files.extend(sorted((REPO_ROOT / "scripts").rglob("*.sh")))
+def _shell_files(root: Path | None = None) -> list[Path]:
+    root = root or REPO_ROOT
+    files = [root / "leerie"]
+    files.extend(sorted((root / "scripts").rglob("*.sh")))
     return [p for p in files if p.is_file()]
 
 
@@ -56,38 +57,93 @@ def _is_comment(line: str) -> bool:
 
 
 
-# A sink consumes stdout without reading a value out of it. Redirecting to
-# stderr is the documented shape — the log stream reaches the operator and
-# nothing parses it.
-_SINKS = ("cat", "tee")
+
+
+def _spans(cmd: str, opener: str, closer: str) -> list[str]:
+    """Every balanced `opener … closer` span, innermost content included."""
+    out, i = [], 0
+    while True:
+        i = cmd.find(opener, i)
+        if i < 0:
+            return out
+        depth, j = 1, i + len(opener)
+        while j < len(cmd) and depth:
+            if cmd.startswith(opener, j):
+                depth += 1; j += len(opener); continue
+            if cmd[j] == closer:
+                depth -= 1
+            j += 1
+        out.append(cmd[i + len(opener):j - 1])
+        i = j
+
+
+def _blank(cmd: str, which: str) -> str:
+    """Blank spans quoted with any char in `which`.
+
+    TWO passes are needed downstream, and that is load-bearing: the quote types
+    suppress different things. Single quotes suppress everything; double quotes
+    still expand `$( )` and backticks. A first draft blanked both before
+    looking for command substitution and therefore could not see
+    `_rebaser_json="$(python3 …)"` — the original F1 defect.
+    """
+    out, i, n = [], 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c in which:
+            q = c
+            i += 1
+            while i < n and cmd[i] != q:
+                if q == '"' and cmd[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(" ")
+                i += 1
+                out.append(" ")
+            i += 1
+            out.append("  ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def _captures_stdout(cmd: str) -> str:
     """Why `cmd` consumes the seam's stdout as a value, or "" if it does not.
 
-    Three mechanisms, all of them F1:
+    An ALLOWLIST, not a blacklist. The permitted contract is narrow and stable:
+    the seam's stdout goes to stderr or the terminal, its exit code may be
+    consumed, and nothing else. Anything outside that fails, so a capture form
+    nobody has thought of yet is a failure rather than a pass.
 
-      * `VAR="$(python3 …)"` — command substitution;
-      * backticks, the same thing in older shell;
-      * `python3 … | jq …` — which is what F1 ACTUALLY did. The first version
-        of this predicate tested only for `$(` before `python3` on one line, so
-        the pipe form, and a `$(` on a preceding continuation line, both walked
-        past. The rule has always been "never captured FOR PARSING"; a pipe
-        into `jq` is that, verbatim.
-
-    Deliberately not a ban on redirection: `>&2` is the shape the fix uses.
+    That inversion is the point. Three successive blacklists enumerated ways to
+    fail and each was still green on F1's own mechanism — verified misses
+    included `| tee /dev/stderr | jq`, `| cat | jq`, `|& jq`, `> file && jq
+    file` and `jq < <(python3 …)`, while a `|` inside a quoted argument
+    produced a false positive on correct code.
     """
-    # Command substitution anywhere in the logical command, including on a
-    # continuation line before the one carrying `python3`.
-    if re.search(r"\$\(\s*(\\\s*\n\s*)?[^)]*python3", cmd, re.S):
-        return "command substitution"
-    if "`" in cmd:
-        return "backtick substitution"
-    # A pipe out of the seam, unless it goes to a pure sink.
-    for seg in re.split(r"\|\|", cmd):          # `||` is control flow, not a pipe
-        m = re.search(r"\|\s*(?:\\\s*\n\s*)?([\w./-]+)", seg)
-        if m and m.group(1) not in _SINKS:
-            return f"piped into `{m.group(1)}`"
+    joined = cmd.replace("\\\n", " ")
+    # Pass 1: only SINGLE quotes suppress substitution. A substitution matters
+    # only if it WRAPS THE SEAM — `LEERIE_NOW="$(date -u +%s)" python3 …`
+    # captures `date`, not the seam, and flagging it fails a correct tree.
+    subst = _blank(joined, "'")
+    for opener, closer, why in (("$(", ")", "command substitution"),
+                                ("<(", ")", "process substitution")):
+        for span in _spans(subst, opener, closer):
+            if _PY3.search(span):
+                return why
+    if "`" in subst:
+        # Backticks do not nest, so the span is between consecutive pairs.
+        parts = subst.split("`")
+        if any(_PY3.search(parts[k]) for k in range(1, len(parts), 2)):
+            return "backtick substitution"
+    # Pass 2: pipes and redirections are inert inside either quote type.
+    bare = _blank(subst, '"')
+    for pat, why in ((r"\|&", "stdout+stderr piped"),
+                     (r"(?<!\|)\|(?!\|)", "piped into another command"),
+                     (r"(?<![0-9&])>(?!&)", "stdout redirected to a file"),
+                     (r"\d>(?!&)", "fd redirected to a file")):
+        if re.search(pat, bare):
+            return why
     return ""
 
 
@@ -100,7 +156,11 @@ def _logical_command(lines: list[str], idx: int) -> str:
     missed a newline-separated `VAR="$(` and a trailing pipe.
     """
     start = idx
-    while start > 0 and lines[start - 1].rstrip().endswith("\\"):
+    # `not _is_comment`: a wrapped comment above the invocation ends in a
+    # backslash too, and swallowing it made a correct tree fail the
+    # matched-an-invocation control.
+    while (start > 0 and lines[start - 1].rstrip().endswith("\\")
+           and not _is_comment(lines[start - 1])):
         start -= 1
     end = idx
     while end < len(lines) - 1 and lines[end].rstrip().endswith("\\"):
@@ -108,7 +168,7 @@ def _logical_command(lines: list[str], idx: int) -> str:
     return "\n".join(lines[start:end + 1])
 
 
-def _seam_invocations() -> list[tuple[Path, int, str]]:
+def _seam_invocations(root: Path | None = None) -> list[tuple[Path, int, str]]:
     """Every shell invocation that RUNS the orchestrator-loading seam.
 
     Returns (path, 1-indexed line number, invocation line).
@@ -131,7 +191,7 @@ def _seam_invocations() -> list[tuple[Path, int, str]]:
     9 of 9 runs their rebase verdict left this file green.
     """
     found: list[tuple[Path, int, str]] = []
-    for path in _shell_files():
+    for path in _shell_files(root):
         lines = path.read_text().splitlines()
         for i, line in enumerate(lines):
             if _SEAM_MARKER not in line:
@@ -209,8 +269,9 @@ def test_the_rebaser_invocation_is_the_one_that_runs_the_script_file() -> None:
              if p.name == "host-finalize.sh"]
     assert len(match) == 1, match
     _lineno, line = match[0]
-    assert "$_rebaser_py" in line, (
-        f"expected the line invoking the seam script, got {line!r}")
+    assert "rebaser" in line, (
+        "expected the line invoking the seam script (matched by basename, so a "
+        f"refactor to a literal path still resolves), got {line!r}")
 
 
 def test_no_seam_captures_the_orchestrator_stdout() -> None:
@@ -235,41 +296,60 @@ def test_no_seam_captures_the_orchestrator_stdout() -> None:
 
 
 def test_the_scan_would_catch_a_capturing_seam(tmp_path: Path) -> None:
-    """Falsification control for the rule above.
+    """Falsification control, driving the REAL helper and the REAL predicate.
 
-    The version this replaces asserted nothing about the real code: it
-    re-implemented the old backwards walk inline and tested that copy, so
-    disabling the actual predicate left every test in the file green. It now
-    drives the REAL `_seam_invocations()` and the REAL `_captures_stdout()`,
-    against a fixture file placed on the scanned surface.
+    Planted under `tmp_path`, never in the repo. The previous version wrote
+    `scripts/zz-capture-canary.sh` into the working tree and removed it in a
+    `finally` — which does not run on SIGKILL, and a survivor was reproduced
+    breaking a sibling file: `_PRUNE_SURFACE` in
+    tests/test_worktree_prune_scoping.py globs `scripts/` at COLLECTION time,
+    this file unlinks the canary first, and that test then dies on
+    FileNotFoundError. Green again next run, because the first run destroyed
+    the evidence — a heisenbug in a suite whose whole thesis is falsifiability.
     """
-    fake = REPO_ROOT / "scripts" / "zz-capture-canary.sh"
-    fake.write_text(
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "canary.sh").write_text(
         '#!/usr/bin/env bash\n'
         'out="$(python3 - "$repo" <<\'PY\'\n'
         f'spec = {_SEAM_MARKER}, orch_path)\n'
         'PY\n'
         ')"\n'
     )
-    try:
-        seams = {p.name: line for p, _, line in _seam_invocations()}
-        assert "zz-capture-canary.sh" in seams, (
-            "the resolver must find a planted seam; if it cannot, the rule "
-            "above is scanning nothing")
-        assert _captures_stdout(seams["zz-capture-canary.sh"]), (
-            "the real predicate must flag a captured seam")
-    finally:
-        fake.unlink()
+    (tmp_path / "leerie").write_text("#!/usr/bin/env bash\n")
+    seams = {p.name: line for p, _, line in _seam_invocations(tmp_path)}
+    assert "canary.sh" in seams, (
+        "the resolver must find a planted seam; if it cannot, the rule above "
+        "is scanning nothing")
+    assert _captures_stdout(seams["canary.sh"]), (
+        "the real predicate must flag a captured seam")
+
+
+def test_the_canary_never_touches_the_repo() -> None:
+    """Guard the guard: the control above must not be able to dirty the tree."""
+    src = Path(__file__).read_text()
+    body = src[src.index("def test_the_scan_would_catch_a_capturing_seam("):]
+    body = body[:body.index("\ndef ")]
+    assert "REPO_ROOT" not in body, (
+        "the canary must be planted under tmp_path — a survivor breaks a "
+        "sibling test file and can reach the Docker build context")
 
 
 @pytest.mark.parametrize("shape,why", [
-    # F1 verbatim: the seam's stdout fed to `jq`. This is the one the previous
-    # predicate could not see at all.
-    ('  python3 "$_rebaser_py" "$X" | jq -r ".status"', "pipe"),
-    # F1's original form, and the same thing split across a continuation —
-    # also invisible before, because only one line was examined.
-    ('  _rebaser_json="$(python3 "$_rebaser_py" "$X")"', "same-line $("),
-    ('  _rebaser_json="$( \\\n    python3 "$_rebaser_py" "$X")"', "continued $("),
+    # Every form verified to slip past the three preceding blacklists. The
+    # first four are F1's own mechanism — "feed the seam's stdout to jq" —
+    # written the ways someone would naturally write it.
+    ('  python3 "$_rebaser_py" "$X" | jq -r ".status"', "naive pipe"),
+    ('  python3 "$_rebaser_py" "$X" | tee /dev/stderr | jq -r ".status"',
+     "the natural rewrite: keep the log AND read the verdict"),
+    ('  python3 "$_rebaser_py" "$X" | cat | jq -r ".status"', "via a sink"),
+    ('  python3 "$_rebaser_py" "$X" |& jq -r ".status"', "|& form"),
+    ('  python3 "$_rebaser_py" "$X" > /tmp/x', "redirect, read later"),
+    ('  jq -r ".status" < <(python3 "$_rebaser_py" "$X")',
+     "process substitution"),
+    ('  mapfile -t v < <(python3 "$_rebaser_py" "$X")', "mapfile"),
+    ('  _rebaser_json="$(python3 "$_rebaser_py" "$X")"', "the original F1"),
+    ('  _rebaser_json="$( \\\n    python3 "$_rebaser_py" "$X")"',
+     "continued command substitution"),
     ('  out=`python3 "$_rebaser_py" "$X"`', "backticks"),
 ])
 def test_the_predicate_sees_every_capture_mechanism(shape, why) -> None:
@@ -277,18 +357,21 @@ def test_the_predicate_sees_every_capture_mechanism(shape, why) -> None:
 
 
 @pytest.mark.parametrize("shape", [
-    # The shipped form. stdout goes to the operator; the verdict travels in a
-    # file. Flagging this would forbid the fix.
+    # The shipped form: stdout to stderr, verdict in a file, exit code read.
     '      ( python3 "$_rebaser_py" "$X" "$_rebaser_out" \\\n        >&2 ) || rc=$?',
-    # An env-var prefix computed by command substitution is not a capture OF
-    # THE SEAM — it captures `date`.
+    # A `|` inside a quoted argument is not a pipe. This one FAILED a correct
+    # tree under the previous predicate.
+    '  python3 - "$repo" --skip-pattern "vendor|node_modules" <<\'PY\'',
+    "  python3 - \"$r\" -E 'foo|bar' <<'PY'",
+    # An env-var prefix computed by command substitution captures `date`, not
+    # the seam — which is why a substitution only counts when it WRAPS it.
     '  LEERIE_NOW="$(date -u +%s)" \\\n    python3 - "$repo" <<\'PY\'',
-    # Consuming only the exit code.
     '  python3 "$_rebaser_py" "$X" || rc=$?',
+    '  ( python3 "$x" 2>&1 >&2 ) || true',
 ])
 def test_the_predicate_leaves_legitimate_shapes_alone(shape) -> None:
-    """The converse. An over-broad rule here fails a correct tree, which is how
-    a guard gets deleted rather than fixed."""
+    """The converse. An over-broad rule fails a correct tree, which is the
+    failure mode that gets a guard deleted rather than fixed."""
     assert not _captures_stdout(shape), _captures_stdout(shape)
 
 

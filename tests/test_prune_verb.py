@@ -228,10 +228,13 @@ class TestBranchReapingNeedsPositiveEvidence:
         assert "leerie/subtasks/gone/feat-001" not in out
 
     def test_a_live_runs_branch_is_never_touched(self, tmp_path):
+        """A MERGED branch, deliberately. With an unmerged one this passes via
+        the `-d` refusal even with the live check neutered, so it would not
+        test its own name."""
         root = tmp_path / "state"
         _run_dir(root, "live-run", old=False)
         repo = _repo(tmp_path)
-        _unmerged_branch(repo, "leerie/subtasks/live-run/feat-001")
+        _git(repo, "branch", "leerie/subtasks/live-run/feat-001")
         assert _prune(root, repo, "--apply").returncode == 0
         out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
         assert "leerie/subtasks/live-run/feat-001" in out

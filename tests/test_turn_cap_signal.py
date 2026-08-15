@@ -17,9 +17,11 @@ See docs/POSTMORTEM-2026-08-14.md, F7.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import io
 import re
+import textwrap
 import tokenize
 
 import pytest
@@ -50,49 +52,58 @@ def _claude_p_src(leerie) -> str:
 
 
 
-def _logical_lines(src: str) -> list[str]:
-    """Physical lines joined while a bracket is open.
 
-    A comparison wrapped across lines is invisible to a per-line scan, and this
-    file's own style wraps at 79 columns — so `if (num_turns\n >= 0.8 *
-    max_turns):` would evade a guard that reads one line at a time.
+def _tainted(fn: ast.AST) -> set[str]:
+    """Locals whose value derives from `envelope.get("num_turns"…)`.
+
+    Transitive, so `a = envelope.get("num_turns", -1); b = a` taints both.
     """
-    out, buf, depth = [], "", 0
-    for line in src.splitlines():
-        buf = line if not buf else buf + " " + line.strip()
-        depth += line.count("(") - line.count(")")
-        if depth <= 0:
-            out.append(buf)
-            buf, depth = "", 0
-    if buf:
-        out.append(buf)
-    return out
+    t: set[str] = set()
+    for _ in range(3):                       # cheap fixpoint
+        before = len(t)
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+                continue
+            tgt = n.targets[0]
+            if not isinstance(tgt, ast.Name):
+                continue
+            names = {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}
+            if '"num_turns"' in ast.unparse(n.value) \
+               or "'num_turns'" in ast.unparse(n.value) or (names & t):
+                t.add(tgt.id)
+        if len(t) == before:
+            break
+    return t
 
 
 def _ratio_offenders(src: str) -> list[str]:
-    """Lines comparing `num_turns` against `max_turns` in any spelling.
+    """Comparisons between the CLI's reported turn count and `--max-turns`.
 
-    Deliberately broad. The first version matched two literal shapes, so
-    `0.8 * float(max_turns) <= turns` and `turns / max_turns >= 0.8` — both
-    reinstating the defect exactly — sailed past it.
+    Keyed on PROVENANCE, not on the local's name. Two regex generations were
+    keyed on the name and both were blind to the thing they were named for:
+    `\bturns\b` cannot match `num_turns` (`_` is a word character), and adding
+    the second literal spelling still let `_used = envelope.get("num_turns",
+    -1)` through — which is the same defect written by anyone who renames a
+    variable.
+
+    `ast` also removes the need to join wrapped lines, and with it the
+    false positive where `[^<>=!]>[^=]` matched the `->` of a return
+    annotation in a joined signature.
     """
+    fn = ast.parse(textwrap.dedent(src))
+    taint = _tainted(fn) | {"num_turns"}
     out = []
-    for line in _logical_lines(src):
-        if "max_turns" not in line:
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Compare):
             continue
-        if not re.search(
-                r"(0\.\d+\s*\*|/\s*(float\()?max_turns|>=|<=|[^<>=!]>[^=]|"
-                r"[^<>=!]<[^=])", line):
+        parts = [n.left, *n.comparators]
+        names = [{x.id for x in ast.walk(p) if isinstance(x, ast.Name)}
+                 for p in parts]
+        if not any("max_turns" in s for s in names):
             continue
-        # The COUNTER, in either spelling. `\bturns\b` alone cannot match
-        # `num_turns` — `_` is a word character, so there is no boundary
-        # between them — which left this scan blind to the very identifier the
-        # finding is about (POSTMORTEM F7 names `num_turns` throughout). It
-        # passed only because the local in `claude_p` happens to be `turns`.
-        if not re.search(r"(?:\bnum_turns\b|\bturns\b)",
-                         line.replace("max_turns", "")):
-            continue
-        out.append(line.strip())
+        if any(s & taint for s in names) or any(
+                '"num_turns"' in ast.unparse(p) for p in parts):
+            out.append(ast.unparse(n))
     return out
 
 
@@ -135,34 +146,52 @@ def test_the_comment_records_why_the_proxy_was_deleted(leerie):
         "restore the comparison")
 
 
+# The assignment `claude_p` really has. A bare `turns` with no provenance is
+# deliberately NOT flagged — it could be any variable, and guessing from the
+# name is the mistake this predicate exists to stop making.
+_T = 'turns = envelope.get("num_turns", -1)\n'
+
+
 @pytest.mark.parametrize("canary", [
-    "if turns >= 0.8 * max_turns:",
-    "if 0.8 * float(max_turns) <= turns:",
-    "if turns / max_turns >= 0.8:",
-    "if turns > max_turns - 2:",
-    # The `num_turns` spelling — what the CLI actually reports, what F7 names,
-    # and what the previous regex could not see.
-    "if num_turns >= 0.8 * max_turns:",
-    'if envelope.get("num_turns", -1) >= 0.8 * max_turns:',
-    "if 0.8 * float(max_turns) <= num_turns:",
-    "ratio = num_turns / max_turns",
-    # Wrapped across lines, which a per-line scan misses.
-    "if (num_turns\n        >= 0.8 * max_turns):",
+    # The historical shapes, written the way `claude_p` actually writes them —
+    # the count comes from the envelope, which is what makes it the CLI's
+    # reported turn count rather than an unrelated local named `turns`.
+    _T + "if turns >= 0.8 * max_turns:\n    pass",
+    _T + "if 0.8 * float(max_turns) <= turns:\n    pass",
+    _T + "if turns / max_turns >= 0.8:\n    pass",
+    _T + "if turns > max_turns - 2:\n    pass",
+    # The `num_turns` spelling — what the CLI reports and what F7 names, and
+    # what `\\bturns\\b` structurally cannot match.
+    "if num_turns >= 0.8 * max_turns:\n    pass",
+    "if 0.8 * float(max_turns) <= num_turns:\n    pass",
+    # A RENAMED local. Both regex generations were keyed on the name and both
+    # let this through — it is the same defect written by anyone who renames a
+    # variable, which is why the check is keyed on provenance instead.
+    'u = envelope.get("num_turns", -1)\nif u >= 0.8 * max_turns:\n    pass',
+    '_used = envelope.get("num_turns", -1)\nif 0.8 * max_turns <= _used:\n    pass',
+    # ...and transitively.
+    'a = envelope.get("num_turns", -1)\nb = a\nif b >= 0.8 * max_turns:\n    pass',
+    # Wrapped across lines: ast needs no line-joining at all.
+    'if (num_turns\n        >= 0.8 * max_turns):\n    pass',
 ])
 def test_the_scan_fires_on_a_reinstated_comparison(canary):
-    """Anti-vacuity, absent from the original.
-
-    An offender-list scan that can no longer match anything certifies the tree
-    clean forever. Two of these four evaded the first version's two literal
-    regexes while reinstating the defect exactly.
-    """
+    """Anti-vacuity. An offender-list scan that can no longer match anything
+    certifies the tree clean forever."""
     assert _ratio_offenders(canary), f"the scan must flag {canary!r}"
 
 
-def test_the_scan_leaves_legitimate_max_turns_uses_alone():
+@pytest.mark.parametrize("benign", [
+    "claude_p(max_turns=max_turns)",
+    "cmd += ['--max-turns', str(max_turns)]",
+    'log(f"max_turns={max_turns}")',
+    # A return annotation is not a comparison. `[^<>=!]>[^=]` matched the `->`
+    # of a joined signature and failed a correct tree for it.
+    "def _watch(turns: int, max_turns: int) -> None:\n    pass",
+    "def _note(num_turns: int, max_turns: int) -> str:\n    return ''",
+    # Reporting both numbers is not comparing them.
+    't = envelope.get("num_turns", -1)\nlog(f"turns={t} cap={max_turns}")',
+])
+def test_the_scan_leaves_legitimate_max_turns_uses_alone(benign):
     """The converse: `max_turns` is a real parameter, passed and forwarded all
-    over `claude_p`. Flagging its ordinary uses would make the guard unusable.
-    """
-    for benign in ("max_turns=max_turns,", "        max_turns: int,",
-                   'log(f"max_turns={max_turns}")'):
-        assert not _ratio_offenders(benign), benign
+    over `claude_p`. Flagging its ordinary uses makes the guard unusable."""
+    assert not _ratio_offenders(benign), benign

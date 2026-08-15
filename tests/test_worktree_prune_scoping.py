@@ -25,6 +25,7 @@ import re
 import ast
 import io
 import subprocess
+import textwrap
 import tokenize
 from pathlib import Path
 
@@ -42,8 +43,13 @@ _SCRIPTS_WITH_PRUNE = ("new-worktree.sh", "setup-run.sh", "cleanup.sh")
 # commit that claimed to have swept "all four" had counted the shell ones.
 # This is the enumeration-not-derivation class CLAUDE.md records in #180-#183.
 _PRUNE_SURFACE = (
-    sorted((REPO_ROOT / "scripts").glob("*.sh"))
+    # rglob, not glob: `scripts/remote/` holds 20 more scripts, four of which
+    # touch worktrees, and the non-recursive form left every one of them
+    # unscanned. The sibling seam guard already used rglob, so the two
+    # disagreed about what "scripts" meant.
+    sorted((REPO_ROOT / "scripts").rglob("*.sh"))
     + sorted((REPO_ROOT / "orchestrator").glob("*.py"))
+    + sorted((REPO_ROOT / "chain").glob("*.py"))
     + [REPO_ROOT / "leerie"]
 )
 
@@ -182,8 +188,18 @@ def _shell_code_only(src: str) -> str:
     out = []
     for line in src.splitlines():
         q = None
+        skip = False
         for i, ch in enumerate(line):
+            if skip:
+                skip = False
+                continue
             if q:
+                # An escaped quote inside a double-quoted span does not close
+                # it; treating it as a close inverted the state and truncated
+                # the line at the next `#`, hiding anything after it.
+                if q == '"' and ch == "\\":
+                    skip = True
+                    continue
                 if ch == q:
                     q = None
                 continue
@@ -300,21 +316,79 @@ def test_the_scan_leaves_the_replacement_alone(benign):
 
 # --- the derived sweep -------------------------------------------------------
 
-def _python_bare_prune_offenders(code: str) -> list[str]:
-    """Lines running a repository-global prune from Python.
+# Only these actually EXECUTE. Scoping to them is what keeps a docstring or a
+# `log(...)` naming the forbidden construct from reading as a violation — the
+# trap this file has hit before.
+_EXEC = {"run", "run_proc", "system", "Popen", "check_output", "check_call",
+         "call", "getoutput", "getstatusoutput"}
 
-    `["git", "worktree", "prune"]` as an argv list, with nothing scoping it.
-    The `-n`/`-v` dry-run form `_prune_leerie_worktrees` itself uses is what a
-    scoped implementation looks like, so it is not an offender.
+
+def _is_bare_prune_argv(elts) -> bool:
+    vals = [e.value for e in elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    if len(vals) != len(elts):
+        return False
+    if not re.search(r"\bgit\b.*\bworktree\b.*\bprune\b", " ".join(vals)):
+        return False
+    return not any(v in ("-n", "--dry-run") for v in vals)
+
+
+def _python_bare_prune_offenders(code: str, *, strict: bool = True) -> list[str]:
+    """Repository-global prunes in Python, via `ast`.
+
+    A substring test for the literal `'"worktree", "prune"'` missed
+    single-quoted argv, `shell=True` string forms, and any wrapped or
+    differently-spaced list — including in `orchestrator/leerie.py`, the file
+    the previous rewrite was for.
     """
+    # NOT wrapped in `except SyntaxError: return []`. A scan that cannot parse
+    # its input must not report "clean" — that is indistinguishable from a
+    # passing tree. Measured: feeding this the comment/docstring-stripped
+    # source produced code that would not parse (removing a docstring that is
+    # a function's entire body leaves an empty block), the exception was
+    # swallowed, and the whole Python prune scan was silently vacuous for
+    # `orchestrator/leerie.py` — the file it exists for. It takes RAW source
+    # now, which needs no stripping: a docstring is never a Call argument.
+    # `strict` is the difference between "this IS Python" and "this might be".
+    # For a real .py file a parse failure must raise: reporting clean on source
+    # we could not read is indistinguishable from a passing tree, and that is
+    # exactly how this scan was silently vacuous for `orchestrator/leerie.py`.
+    # A heredoc body is a guess (the extractor keys on `import `/`print(`), so
+    # a shell body that happens to match may legitimately not parse.
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        if strict:
+            raise
+        return []
     out = []
-    for line in code.splitlines():
-        if '"worktree", "prune"' not in line:
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
             continue
-        if '"-n"' in line or '"--dry-run"' in line:
+        f = n.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+        if name not in _EXEC:
             continue
-        out.append(line.strip())
+        for a in list(n.args) + [k.value for k in n.keywords]:
+            if isinstance(a, (ast.List, ast.Tuple)) and _is_bare_prune_argv(a.elts):
+                out.append(ast.unparse(a))
+            elif isinstance(a, ast.Constant) and isinstance(a.value, str):
+                if re.search(r"\bgit\b[^\n]*?\bworktree\s+prune\b", a.value) \
+                   and not re.search(r"\bprune\b[^\n]*(?:-n\b|--dry-run\b)", a.value):
+                    out.append(repr(a.value))
     return out
+
+
+def _heredoc_pythons(sh: str) -> list[str]:
+    """Python programs embedded in a shell file via `<<'TAG' … TAG`.
+
+    The launcher's own `prune` verb is one of these, and `path.suffix` routed
+    it to the shell scanner — which cannot match an argv list — so the most
+    likely place a fifth site would appear was scanned by neither.
+    """
+    return [body for _tag, body in
+            re.findall(r"<<'?(\w+)'?\s*\n(.*?)\n\1\n", sh, re.S)
+            if "import " in body or "print(" in body]
 
 
 @pytest.mark.parametrize("path", _PRUNE_SURFACE, ids=lambda p: p.name)
@@ -325,8 +399,14 @@ def test_no_file_anywhere_runs_a_bare_prune(path):
     # Per-language, deliberately. The shell regex matches free prose, and a
     # Python file's docstrings necessarily NAME the construct they forbid — so
     # running it over `.py` flags the very comments explaining the rule.
-    offenders = (_python_bare_prune_offenders(code) if path.suffix == ".py"
-                 else _bare_prune_offenders(code))
+    if path.suffix == ".py":
+        # RAW, not `code`: see `_python_bare_prune_offenders`. The ast walk is
+        # already immune to prose, and stripping first broke the parse.
+        offenders = _python_bare_prune_offenders(raw)
+    else:
+        offenders = _bare_prune_offenders(code)
+        for body in _heredoc_pythons(raw):
+            offenders += _python_bare_prune_offenders(body, strict=False)
     assert not offenders, (
         f"{path.name} runs a repository-global `git worktree prune` against "
         "the shared, bind-mounted .git — use the scoped helper "
@@ -344,19 +424,61 @@ def test_the_derived_surface_is_not_empty():
 
 
 @pytest.mark.parametrize("evasion", [
+    # the shape the four real call sites had
     '    subprocess.run(["git", "worktree", "prune"], check=False)',
     '    await run_proc(["git", "worktree", "prune"])',
+    # every spelling the substring version missed
+    "    subprocess.run(['git', 'worktree', 'prune'])",
+    '    subprocess.run("git worktree prune", shell=True)',
+    '    os.system("git -C /x worktree prune")',
+    '    subprocess.run(["git",  "worktree",  "prune"])',
+    '    subprocess.check_output(["git", "worktree", "prune"])',
 ])
 def test_the_python_scan_fires_on_a_bare_prune(evasion):
-    """The four real call sites, in the shape they actually had."""
     assert _python_bare_prune_offenders(evasion), evasion
+
+
+@pytest.mark.parametrize("benign", [
+    # prose in a call that does not execute — the trap that made the first
+    # draft of this scan flag correct code
+    'log("never run git worktree prune here")',
+    'def f():\n    """A scoped replacement for git worktree prune."""',
+    '_prune_leerie_worktrees(leerie_dir)',
+])
+def test_the_python_scan_leaves_non_executing_uses_alone(benign):
+    assert not _python_bare_prune_offenders(benign), benign
+
+
+def test_the_surface_covers_the_holes_it_was_rewritten_for():
+    """Four bare prunes were added to a "derived" surface and it stayed green.
+    Each location is now on it."""
+    names = {str(p.relative_to(REPO_ROOT)) for p in _PRUNE_SURFACE}
+    assert any(n.startswith("scripts/remote/") for n in names), "scripts/remote"
+    assert any(n.startswith("chain/") for n in names), "chain/"
+    assert "orchestrator/leerie.py" in names
+    assert "leerie" in names
+
+
+def test_a_prune_inside_a_shell_heredoc_is_found(tmp_path):
+    """The launcher's own `prune` verb is a Python heredoc, and `path.suffix`
+    routed it to the shell scanner, which cannot match an argv list."""
+    body = _heredoc_pythons(
+        '#!/usr/bin/env bash\npython3 - <<\'PY\'\n'
+        'import subprocess\n'
+        'subprocess.run(["git", "worktree", "prune"])\n'
+        'PY\n')
+    assert body, "the heredoc extractor found nothing"
+    assert _python_bare_prune_offenders(body[0])
 
 
 def test_the_python_scan_leaves_the_scoped_helper_alone():
     """The helper itself runs `git worktree prune -n -v` to ASK what git would
     prune. Flagging that would forbid the fix."""
+    # A COMPLETE statement: the scan now parses its input strictly, so a
+    # truncated fragment is a broken fixture rather than a test of anything.
     assert not _python_bare_prune_offenders(
-        '    r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],')
+        'r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],\n'
+        '                   capture_output=True)')
 
 
 def test_the_orchestrator_has_a_scoped_helper():
