@@ -87,6 +87,6 @@ prune_leerie_worktrees() {
   # FORMAT string is translated -- so under any non-English locale the
   # `Removing worktrees/` case above never matches and this becomes a
   # total silent no-op.
-  done < <(LC_ALL=C LANGUAGE= git worktree prune -n -v 2>&1 || true)
+  done < <(LC_ALL=C LANGUAGE='' git worktree prune -n -v 2>&1 || true)
   return 0
 }
