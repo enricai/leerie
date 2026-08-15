@@ -33,34 +33,10 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from tests.source_strip import code_only as _code_only   # single owner; see that module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
-
-def _code_only(src: str) -> str:
-    """Python source with comments and docstrings removed."""
-    out, last = [], (1, 0)
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type == tokenize.COMMENT:
-            continue
-        if tok.start[0] > last[0]:
-            out.append("\n" * (tok.start[0] - last[0]))
-            last = (tok.start[0], 0)
-        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
-        last = tok.end
-    text = "".join(out)
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return text
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef, ast.Module)):
-            doc = ast.get_docstring(node, clean=False)
-            if doc:
-                text = text.replace(doc, "", 1)
-    return text
 
 
 def _result(**over):

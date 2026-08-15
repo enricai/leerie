@@ -30,6 +30,10 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import HAS_JQ
+# A SHELL script, so the shell stripper. This file used the Python one,
+# whose copy answered the inevitable SyntaxError by returning the input
+# unchanged — so it had never stripped a single comment here.
+from tests.source_strip import shell_code_only as _code_only
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
@@ -47,24 +51,6 @@ _VERDICT = {
     "diagnosis": "",
     "resolution_summary": "Rebased 21 commits onto origin/main with no conflicts.",
 }
-
-
-def _code_only(src: str) -> str:
-    """Drop whole-line `#` comments before scanning for forbidden constructs.
-
-    The region these tests guard is dense with comments that necessarily NAME
-    the constructs they forbid (`2>&1`, `head -c 2000`) in order to explain why
-    they are wrong — so a raw substring scan matches the prose describing the
-    defect and fails on correct code. This is the same trap the zombie-reaper
-    and `unreviewed_subtasks` guards document in CLAUDE.md.
-
-    Whole-line only: a `#` mid-line may sit inside a string literal, and the
-    constructs at issue always appear as their own statements.
-    """
-    return "\n".join(
-        line for line in src.splitlines()
-        if not line.lstrip().startswith("#")
-    )
 
 
 def _extract_rebaser_seam() -> str:

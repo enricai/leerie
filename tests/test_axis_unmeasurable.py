@@ -29,39 +29,7 @@ import io
 import ast
 
 import pytest
-
-
-def _code_only(src: str) -> str:
-    """Source with comments AND docstrings removed.
-
-    These scans forbid (or require) a token whose natural home is a comment
-    documenting the rejected alternative — so a raw scan matches the prose
-    describing the rule and fails on correct code, or matches prose instead of
-    code and passes on broken code. CLAUDE.md records this trap repeatedly.
-    `tokenize`, not a `#`-prefix heuristic: a `#` inside a string literal would
-    corrupt the result.
-    """
-    out, last = [], (1, 0)
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type == tokenize.COMMENT:
-            continue
-        if tok.start[0] > last[0]:
-            out.append("\n" * (tok.start[0] - last[0]))
-            last = (tok.start[0], 0)
-        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
-        last = tok.end
-    text = "".join(out)
-    try:
-        tree = ast.parse(textwrap.dedent(text))
-    except SyntaxError:
-        return text
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef, ast.Module)):
-            doc = ast.get_docstring(node, clean=False)
-            if doc:
-                text = text.replace(doc, "", 1)
-    return text
+from tests.source_strip import code_only as _code_only   # single owner; see that module
 
 
 # The signatures measured in real runs, and what each must classify as.

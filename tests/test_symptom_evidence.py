@@ -31,6 +31,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+from tests.source_strip import code_only as _code_only   # single owner; see that module
 
 
 # ---- scoping --------------------------------------------------------------
@@ -236,33 +237,6 @@ def test_a_clean_later_attempt_clears_a_stale_entry(leerie):
     i = src.index("_sym_findings = check_symptom_evidence(")
     window = src[i:i + 1200]
     assert 'st.data.get("symptom_findings", {}).pop(sid, None)' in window
-
-
-def _code_only(src: str) -> str:
-    """`src` with comments removed.
-
-    Required for the negative assertion below, and for the reason this
-    repo documents repeatedly: the code comment there *names*
-    `NO_SYMPTOM_EVIDENCE` while explaining why it is excluded, so a raw
-    substring scan matches the prose describing the thing it forbids and
-    fails on correct code. `tokenize` rather than a `#` heuristic, so a
-    `#` inside a string literal cannot corrupt the result.
-    """
-    import io
-    import tokenize
-    out, last_line, last_col = [], 1, 0
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.start[0] > last_line:
-            out.append("\n" * (tok.start[0] - last_line))
-            last_col = 0
-        if tok.type == tokenize.COMMENT:
-            last_line, last_col = tok.end
-            continue
-        if tok.start[1] > last_col:
-            out.append(" " * (tok.start[1] - last_col))
-        out.append(tok.string)
-        last_line, last_col = tok.end
-    return "".join(out)
 
 
 def test_summary_surfaces_only_the_actionable_finding(leerie):

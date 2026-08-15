@@ -25,26 +25,8 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from tests.source_strip import strip_comments as _strip_comments   # single owner; see that module
 
-
-def _strip_comments(src: str) -> str:
-    """Source with `#` comments removed, via `tokenize`.
-
-    Not a `#`-prefix line heuristic: a `#` inside a string literal would
-    corrupt the result. Needed because the comments in the region under test
-    necessarily *name* the calls being counted — scanning raw source finds the
-    prose describing the rule as though it were the rule.
-    """
-    out, last = [], (1, 0)
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type == tokenize.COMMENT:
-            continue
-        if tok.start[0] > last[0]:
-            out.append("\n" * (tok.start[0] - last[0]))
-            last = (tok.start[0], 0)
-        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
-        last = tok.end
-    return "".join(out)
 
 _ORCH = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
 

@@ -30,6 +30,8 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from tests.source_strip import (
+    code_only as _code_only, shell_code_only as _shell_code_only)   # single owner; see that module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
@@ -48,8 +50,15 @@ _PRUNE_SURFACE = (
     # unscanned. The sibling seam guard already used rglob, so the two
     # disagreed about what "scripts" meant.
     sorted((REPO_ROOT / "scripts").rglob("*.sh"))
-    + sorted((REPO_ROOT / "orchestrator").glob("*.py"))
-    + sorted((REPO_ROOT / "chain").glob("*.py"))
+    # `scripts/**/*.py` was absent entirely — two real Python files
+    # (`cgroup-broker.py`, `verify-strict-schemas.py`) that the `.sh` glob
+    # cannot see and the `orchestrator`/`chain` globs do not reach. Same
+    # omission class as the non-recursive `scripts` glob above.
+    + sorted((REPO_ROOT / "scripts").rglob("*.py"))
+    # rglob for these two as well: a `glob` stops at the top level, so a
+    # future `orchestrator/foo/bar.py` would be silently unscanned.
+    + sorted((REPO_ROOT / "orchestrator").rglob("*.py"))
+    + sorted((REPO_ROOT / "chain").rglob("*.py"))
     + [REPO_ROOT / "leerie"]
 )
 
@@ -173,71 +182,6 @@ def test_outside_a_git_repo_is_a_silent_no_op(tmp_path):
 
 
 
-def _shell_code_only(src: str) -> str:
-    """Shell source with comments removed, including TRAILING ones.
-
-    The `#`-prefix line heuristic this replaces made the guard depend on where
-    a comment sat: `prune_leerie_worktrees "$X"  # never a bare git worktree
-    prune here` failed, while the same words on their own line passed. These
-    three scripts carry ~10 explanatory comment lines each precisely because
-    the construct is forbidden, so that is a guard which fails on correct code.
-
-    Quote-aware rather than a bare `#` split: `${VAR#prefix}` and a `#` inside
-    a string are not comments.
-    """
-    out = []
-    for line in src.splitlines():
-        q = None
-        skip = False
-        for i, ch in enumerate(line):
-            if skip:
-                skip = False
-                continue
-            if q:
-                # An escaped quote inside a double-quoted span does not close
-                # it; treating it as a close inverted the state and truncated
-                # the line at the next `#`, hiding anything after it.
-                if q == '"' and ch == "\\":
-                    skip = True
-                    continue
-                if ch == q:
-                    q = None
-                continue
-            if ch in "'\"":
-                q = ch
-                continue
-            if ch == "#" and (i == 0 or line[i - 1] in " \t"):
-                line = line[:i]
-                break
-        out.append(line)
-    return "\n".join(out)
-
-
-def _code_only(src: str) -> str:
-    """Python source with comments and docstrings removed, via `tokenize`."""
-    out, last = [], (1, 0)
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type == tokenize.COMMENT:
-            continue
-        if tok.start[0] > last[0]:
-            out.append("\n" * (tok.start[0] - last[0]))
-            last = (tok.start[0], 0)
-        out.append(" " * max(0, tok.start[1] - last[1]) + tok.string)
-        last = tok.end
-    text = "".join(out)
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return text
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef, ast.Module)):
-            doc = ast.get_docstring(node, clean=False)
-            if doc:
-                text = text.replace(doc, "", 1)
-    return text
-
-
 def _bare_prune_offenders(code: str) -> list[str]:
     """Lines running a repository-global `git worktree prune`.
 
@@ -320,14 +264,28 @@ def test_the_scan_leaves_the_replacement_alone(benign):
 # `log(...)` naming the forbidden construct from reading as a violation — the
 # trap this file has hit before.
 _EXEC = {"run", "run_proc", "system", "Popen", "check_output", "check_call",
-         "call", "getoutput", "getstatusoutput"}
+         "call", "getoutput", "getstatusoutput",
+         # `chain/git_ops.py` routes 8 of its 9 git calls through a LOCAL
+         # `_run(...)` wrapper, so the scan was vacuous for a file this
+         # surface certifies as covered.
+         "_run", "_git", "_exec",
+         # 10 sites in `orchestrator/leerie.py` spawn through asyncio, which
+         # none of the names above match.
+         "create_subprocess_exec", "create_subprocess_shell"}
 
 
 def _is_bare_prune_argv(elts) -> bool:
+    """Is this argv a repository-global `git worktree prune`?
+
+    A non-constant element used to abort the whole test (`len(vals) !=
+    len(elts)` returned False), so ANY argv with a variable in it was
+    unreadable — including `["git", "-C", repo, "worktree", "prune"]`, which
+    is the likeliest spelling given F19 is about a shared `.git`. Variables
+    are now skipped rather than disqualifying, so the constant tokens still
+    have to prove innocence.
+    """
     vals = [e.value for e in elts
             if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-    if len(vals) != len(elts):
-        return False
     if not re.search(r"\bgit\b.*\bworktree\b.*\bprune\b", " ".join(vals)):
         return False
     return not any(v in ("-n", "--dry-run") for v in vals)
@@ -386,9 +344,108 @@ def _heredoc_pythons(sh: str) -> list[str]:
     it to the shell scanner — which cannot match an argv list — so the most
     likely place a fifth site would appear was scanned by neither.
     """
+    # `<<-TAG` (tab-stripping) and `<<"TAG"` are the same construct and were
+    # both invisible: the pattern accepted only `<<TAG` and `<<'TAG'`. The
+    # terminator of a `<<-` heredoc may also be indented.
     return [body for _tag, body in
-            re.findall(r"<<'?(\w+)'?\s*\n(.*?)\n\1\n", sh, re.S)
+            re.findall(r"""<<-?\s*['"]?(\w+)['"]?\s*\n(.*?)\n[ \t]*\1\n""",
+                       sh, re.S)
             if "import " in body or "print(" in body]
+
+
+# The ast walk above is precise, and precision is exactly what a scan can be
+# evaded by: it models call names, argument shapes and languages, and every one
+# of those is a list someone can fall off. Three ways it was evaded before this
+# floor existed — a local `_run(...)` wrapper, `create_subprocess_exec`, and an
+# argv with a variable in it — were each fixed by extending a list, which is
+# the enumeration-not-derivation class CLAUDE.md records in #180-#183.
+#
+# So: a coarse textual sweep underneath it, with no model of anything. If the
+# three tokens appear in that order on one line of executable text, and no
+# dry-run flag appears with them, it is reported. It cannot be evaded by a call
+# name, a language, or an argument shape — only by not writing the command.
+#
+# It is deliberately NOT a replacement. It cannot see argv-list spellings
+# (`["git", "worktree", "prune"]` has the tokens in order but as separate
+# strings — matched here only because the quotes and commas fall between them,
+# which is luck rather than design), and it must stay coarse enough not to
+# fail a correct tree. The ast walk stays for precise findings; this is the
+# unevadable floor.
+
+_BARE_PRUNE_TEXT = re.compile(
+    r"\bgit\b[^\n]{0,80}?\bworktree\b[^\n]{0,40}?\bprune\b")
+_DRY_RUN_NEAR = re.compile(r"(?:-n\b|--dry-run\b)")
+
+
+def _textual_prune_offenders(code: str) -> list[str]:
+    """Every executable line naming a repository-global prune.
+
+    Takes ALREADY-STRIPPED code: this one does match prose, so a docstring
+    that names the construct it forbids would flag it — the trap CLAUDE.md
+    documents for the zombie-reaper guard and that this file has hit before.
+    """
+    out = []
+    for line in code.splitlines():
+        if not _BARE_PRUNE_TEXT.search(line) or _DRY_RUN_NEAR.search(line):
+            continue
+        out.append(line.strip()[:100])
+    return out
+
+
+@pytest.mark.parametrize("path", _PRUNE_SURFACE, ids=lambda p: p.name)
+def test_the_textual_floor_finds_no_bare_prune(path):
+    """The floor. No model of call names, argument shapes or languages."""
+    raw = path.read_text()
+    code = _code_only(raw) if path.suffix == ".py" else _shell_code_only(raw)
+    offenders = _textual_prune_offenders(code)
+    assert not offenders, (
+        f"{path.name}: a repository-global `git worktree prune` reaps every "
+        "sibling run's worktrees out of the shared .git (F19). Use "
+        "`prune_leerie_worktrees` / `_prune_leerie_worktrees`:\n  "
+        + "\n  ".join(offenders))
+
+
+@pytest.mark.parametrize("evasion", [
+    # Each of these defeated the ast walk at some point, by falling off one of
+    # its lists. The floor has no lists to fall off.
+    '_run(["git", "worktree", "prune"])',
+    'await asyncio.create_subprocess_exec("git", "worktree", "prune")',
+    'subprocess.run(["git", "-C", repo, "worktree", "prune"])',
+    # Not Python at all, and not a call the walk models.
+    'git worktree prune',
+    'git -C "$repo" worktree prune',
+    # A name nobody has thought of yet — the whole point of a floor.
+    'some_future_spawn_helper("git worktree prune")',
+])
+def test_the_floor_fires_on_every_evasion(evasion):
+    """Anti-vacuity. A floor that matches nothing certifies the tree forever."""
+    assert _textual_prune_offenders(evasion), evasion
+
+
+@pytest.mark.parametrize("benign", [
+    # The dry-run probe the locale pin above is about — reads, never reaps.
+    'LC_ALL=C LANGUAGE= git worktree prune -n -v',
+    'subprocess.run(["git", "worktree", "prune", "--dry-run"])',
+    # The scoped replacement: not a prune command at all.
+    'prune_leerie_worktrees "$leerie_root"',
+    '_prune_leerie_worktrees(leerie_root)',
+    # Two unrelated commands that happen to share a line.
+    'git status && ls prune',
+])
+def test_the_floor_leaves_correct_code_alone(benign):
+    """The converse. An over-broad floor fails a correct tree, and a guard that
+    fails correct code gets deleted rather than fixed."""
+    assert not _textual_prune_offenders(benign), benign
+
+
+def test_the_floor_and_the_ast_walk_are_not_the_same_check():
+    """Guard the guard: if the floor were merely a slower ast walk it would add
+    nothing. It must fire on at least one shape the walk cannot see."""
+    blind_spot = '_run(["git", "worktree", "prune"])'
+    assert not _python_bare_prune_offenders(
+        blind_spot.replace("_run", "totally_unmodelled_spawner")), (
+        "pick a shape the ast walk genuinely misses")
+    assert _textual_prune_offenders(blind_spot)
 
 
 @pytest.mark.parametrize("path", _PRUNE_SURFACE, ids=lambda p: p.name)

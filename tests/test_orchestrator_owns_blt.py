@@ -22,22 +22,7 @@ import pathlib
 import tokenize
 
 import pytest
-
-
-def _strip_comments(src: str) -> str:
-    """Remove comments before scanning.
-
-    The regions below necessarily MENTION `TEST_CMD` and `BLT_RESULTS` while
-    explaining the change, so a raw substring scan matches the prose
-    describing what it forbids — the same trap `tests/test_subreaper.py`
-    documents for its `/proc` guard.
-    """
-    out = []
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type == tokenize.COMMENT:
-            continue
-        out.append(tok)
-    return tokenize.untokenize(out)
+from tests.source_strip import strip_comments as _strip_comments   # single owner; see that module
 
 
 def _prompt(name: str, leerie) -> str:
