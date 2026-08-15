@@ -108,6 +108,9 @@ def test_the_scan_would_catch_a_prefix_dispatch():
     assert _PREFIX_RE.search('if sid.partition("-")[0] == "bugfix":')
     assert _PREFIX_RE.search('if sid.split("-")[0] not in ("bugfix",):')
     assert _PREFIX_RE.search('if "bugfix-" != sid[:7]:')
+    # The fourth alternative 8bd77ef added, which its message did not name and
+    # which had no canary — so it was the one spelling nothing probed.
+    assert _PREFIX_RE.search('if sid[:7] != "bugfix-":')
     # and must not fire on unrelated string work
     assert not _PREFIX_RE.search('if path.startswith("src/"):')
     assert not _PREFIX_RE.search('if line.startswith("#"):')
