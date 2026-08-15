@@ -495,15 +495,21 @@ def test_the_orchestrator_has_a_scoped_helper():
         f"the definition plus its four call sites; found {refs}")
 
 
-@pytest.mark.parametrize("path,needle", [
-    ("orchestrator/leerie.py", '"LC_ALL": "C"'),
-    ("scripts/worktree-lib.sh", "LC_ALL=C LANGUAGE= git worktree prune"),
+@pytest.mark.parametrize("path,pattern", [
+    # The PROPERTY, not one spelling. This pinned the literal
+    # `LC_ALL=C LANGUAGE= git worktree prune`, and broke the moment
+    # `LANGUAGE=` was legitimately quoted to `LANGUAGE=''` for shellcheck
+    # SC1007 — behaviourally identical, and the guard failed a correct tree.
+    # Same lesson as the `$_rebaser_py` name pin.
+    ("orchestrator/leerie.py", r'"LC_ALL":\s*"C"'),
+    ("scripts/worktree-lib.sh",
+     r"LC_ALL=C\s+LANGUAGE=(?:''|\"\")?\s+git\s+worktree\s+prune"),
 ])
-def test_the_prune_probe_pins_the_locale(path, needle):
+def test_the_prune_probe_pins_the_locale(path, pattern):
     """git wraps `Removing %s/%s: %s` in gettext (builtin/worktree.c) and only
     the FORMAT string is translated — so under any non-English locale the
     `Removing worktrees/` prefix both implementations parse never matches, and
     the scoped prune becomes a total silent no-op. That is strictly worse than
     the bare prune it replaced, which had no such dependency.
     """
-    assert needle in (REPO_ROOT / path).read_text(), path
+    assert re.search(pattern, (REPO_ROOT / path).read_text()), path

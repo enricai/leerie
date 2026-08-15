@@ -114,6 +114,13 @@ def _drive_to_the_gate(leerie, monkeypatch, tmp_path, *, task="a task",
     st = leerie.State(leerie_root, "mine", repo_root=repo)
     monkeypatch.setattr(
         leerie, "_enforce_and_record_cgroup_containment", lambda *a, **k: None)
+    # `preflight()` shells out to the real `claude` binary
+    # (`_check_claude_cli_version`). It is on a developer's PATH and NOT on the
+    # CI runner's, so leaving it live made these tests pass locally and fail in
+    # CI with `FileNotFoundError: 'claude'` — the difference between my green
+    # and CI's red. Stubbed rather than skipped: these tests are about the
+    # gate, not about the CLI, so skipping would lose the coverage entirely.
+    monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda *a, **k: None)
 
     async def _boom(*_a, **_k):
         raise _ReachedClassify()

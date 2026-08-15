@@ -137,6 +137,14 @@ def _stub_common(leerie, monkeypatch, calls: dict):
     # tests/test_irreversible_before_valid.py, which owns that contract.
     monkeypatch.setattr(leerie, "_preflight_repo", _preflight)
 
+    # `preflight()` shells out to the real `claude` binary
+    # (`_check_claude_cli_version`). It is on a developer's PATH and NOT on the
+    # CI runner's, so leaving it live made these tests pass locally and fail in
+    # CI with `FileNotFoundError: 'claude'` — the difference between my green
+    # and CI's red. Stubbed rather than skipped: these tests are about the
+    # gate, not about the CLI, so skipping would lose the coverage entirely.
+    monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda *a, **k: None)
+
     async def _backstop(*a, **kw):
         calls["_backstop_capture_prior_runs"] = calls.get(
             "_backstop_capture_prior_runs", 0) + 1
