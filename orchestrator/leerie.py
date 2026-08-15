@@ -3792,8 +3792,16 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
             wt = wt[:-len("/.git")]
         if not wt:
             continue
+        p = Path(wt)
+        if not p.is_absolute():
+            # git >= 2.48 with `worktree.useRelativePaths=true` stores this
+            # relative to the ENTRY directory. Resolving it against the
+            # process cwd instead attributes the registration somewhere else
+            # entirely, so the scope check below silently declines and the
+            # stale entry survives.
+            p = entry / p
         try:
-            resolved = str(Path(wt).resolve())
+            resolved = str(p.resolve())
         except OSError:
             continue
         if resolved != root and not resolved.startswith(root + os.sep):

@@ -1407,7 +1407,7 @@ PY
     esac
     LEERIE_PRUNE_DAYS="$_prune_days" LEERIE_PRUNE_APPLY="$_prune_apply" \
       python3 - "$LEERIE_STATE_HOST_DIR" "$USER_REPO" <<'PY'
-import json, os, pathlib, shutil, subprocess, sys, time
+import fcntl, json, os, pathlib, shutil, subprocess, sys, time
 
 root = pathlib.Path(sys.argv[1])
 repo = pathlib.Path(sys.argv[2])
@@ -1416,6 +1416,7 @@ apply = os.environ.get("LEERIE_PRUNE_APPLY") == "true"
 cutoff = time.time() - days * 86400
 freed = 0
 runs_removed = []
+reaped_dirs = set()
 
 def size_of(p: "os.PathLike[str] | str") -> int:
     total = 0
@@ -1436,12 +1437,122 @@ def _git(*args: str) -> subprocess.CompletedProcess:
                           env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
 
 
-def _deregister_worktrees_under(run_dir) -> None:
-    """Drop `.git/worktrees/<name>` registrations pointing inside `run_dir`.
+CONTAINER_STATE_ROOT = "/leerie-state"
 
-    Scoped by construction: only registrations whose worktree lives under a
-    directory this prune is deleting, so a sibling run's or the host's
-    registrations are never touched.
+
+def _host_spelling(p: str) -> str:
+    """The host path for a `gitdir` entry a container wrote.
+
+    Subtask worktrees are created INSIDE the container, where the state root
+    is bind-mounted at `/leerie-state` -- so `new-worktree.sh` writes
+    `/leerie-state/runs/<id>/worktrees/<sid>/.git` into
+    `.git/worktrees/<n>/gitdir`, while `prune` runs on the host and knows the
+    directory as `$LEERIE_STATE_HOST_DIR/runs/<id>/...`. Comparing the two
+    spellings without translating never matched, which made the whole
+    deregistration a no-op in the only runtime that produces the defect.
+
+    Same mapping `_operator_path` performs for operator-facing text.
+    """
+    if p == CONTAINER_STATE_ROOT or p.startswith(CONTAINER_STATE_ROOT + "/"):
+        rel = p[len(CONTAINER_STATE_ROOT):].lstrip("/")
+        try:
+            return str(root.resolve() / rel) if rel else str(root.resolve())
+        except OSError:
+            return p
+    return p
+
+
+def _registration_target(entry) -> "str | None":
+    """The worktree directory `.git/worktrees/<name>` points at, host-side.
+
+    `None` when the entry is torn or unattributable -- never a guess. An
+    empty `gitdir` used to fall through to `Path("").resolve()`, which
+    returns the process cwd: a torn file could therefore attribute a
+    registration to whatever directory prune happened to run from.
+    """
+    try:
+        wt = (entry / "gitdir").read_text().strip()
+    except OSError:
+        return None
+    if wt.endswith("/.git"):
+        wt = wt[: -len("/.git")]
+    if not wt:
+        return None
+    q = pathlib.Path(wt)
+    if not q.is_absolute():
+        # git >= 2.48 with `worktree.useRelativePaths=true` stores this
+        # relative to the ENTRY directory. Resolving it against our cwd
+        # instead silently attributes it somewhere else entirely.
+        q = entry / q
+    try:
+        return _host_spelling(str(q.resolve()))
+    except OSError:
+        return None
+
+
+def _is_live(run_dir, run_id: str) -> bool:
+    """Positive evidence that a run is still executing.
+
+    Fails CLOSED: a probe we cannot complete reads as live, because the cost
+    of a wrong "dead" is deleting the only copy of a paid-for run.
+
+    Timestamps cannot carry this. `finished_at` is never cleared -- no site
+    in the launcher or the orchestrator clears it -- so a run that die()d
+    once carries it forever and reads as terminal on every later prune, with
+    only `mtime < cutoff` left in the way, and `--older-than 0` is accepted.
+    Reproduced: a run with a stale `finished_at` and a live worktree holding
+    the only copy of a commit lost both its branch and its run directory,
+    recoverable only from the reflog.
+
+    The flock is authoritative and free: `State.__init__` holds an exclusive
+    flock on the run directory for the life of the orchestrator (DESIGN §6
+    *Single owner per run dir*), the container bind-mounts that same
+    directory, and flock is an inode-level lock -- so a host-side probe sees
+    a container-side holder. `nerdctl inspect` covers the one case the flock
+    cannot: a crashed orchestrator that released the lock while its container
+    is still up.
+    """
+    try:
+        fd = os.open(run_dir, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    try:
+        return subprocess.run(["nerdctl", "inspect", run_id],
+                              capture_output=True, timeout=10).returncode == 0
+    except subprocess.TimeoutExpired:
+        # Fail closed: an unreachable container runtime is "cannot
+        # determine", and prune must never resolve that as "dead".
+        return True
+    except OSError:
+        # nerdctl absent -- a Fly-only host, say. Not evidence that a local
+        # container is up, and the flock has already answered for anything
+        # that runs locally.
+        return False
+
+
+def _deregister_orphaned_worktrees(reaped: set) -> None:
+    """Drop `.git/worktrees/<name>` registrations whose worktree is gone.
+
+    rmtree removes the worktree directory but leaves the registration behind,
+    and git then refuses `git branch -D` with "cannot delete branch ... used
+    by worktree at ..." -- so every branch of every run a prune removed
+    survived, and the rc=1 was misreported below as "unmerged commits", which
+    `-D` never returns.
+
+    Scoped by construction: only registrations pointing inside the state
+    root, so a sibling checkout's or the operator's own worktrees are never
+    touched. Within that scope it attributes over EVERY orphaned
+    registration rather than only the dirs this pass removed -- a directory
+    removed by an earlier prune, by cleanup.sh or by hand leaves a
+    registration no later prune would look at, and its branch is then
+    unreapable forever.
     """
     r = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
     if r.returncode != 0 or not r.stdout.strip():
@@ -1450,23 +1561,22 @@ def _deregister_worktrees_under(run_dir) -> None:
     if not wdir.is_dir():
         return
     try:
-        target = str(run_dir.resolve())
+        sroot = str(root.resolve())
     except OSError:
         return
     for entry in sorted(wdir.iterdir()):
-        try:
-            wt = (entry / "gitdir").read_text().strip()
-        except OSError:
+        if (entry / "locked").exists():
+            # git's own prune honours this; so must we.
             continue
-        if wt.endswith("/.git"):
-            wt = wt[: -len("/.git")]
-        try:
-            rp = str(pathlib.Path(wt).resolve())
-        except OSError:
+        target = _registration_target(entry)
+        if target is None:
             continue
-        if rp == target or rp.startswith(target + os.sep):
-            if apply:
-                shutil.rmtree(entry, ignore_errors=True)
+        if target != sroot and not target.startswith(sroot + os.sep):
+            continue
+        orphaned = not os.path.exists(target) or any(
+            target == d or target.startswith(d + os.sep) for d in reaped)
+        if orphaned and apply:
+            shutil.rmtree(entry, ignore_errors=True)
 
 
 runs = root / "runs"
@@ -1486,20 +1596,23 @@ if runs.is_dir():
             continue
         # Only terminal runs, and only old ones. A paused or in-flight run is
         # resumable and must survive regardless of age.
-        if terminal and mtime < cutoff:
+        # Terminal AND old AND not live. The first two are timestamps and a
+        # timestamp cannot see a running orchestrator -- see `_is_live`.
+        if terminal and mtime < cutoff and not _is_live(d, d.name):
             freed += size_of(d)
             runs_removed.append(d.name)
-            # Deregister BEFORE deleting. rmtree removes the worktree
-            # directory but leaves `.git/worktrees/<name>` behind, and git
-            # then refuses `git branch -D` with "cannot delete branch ... used
-            # by worktree at ..." -- so every branch of every run this prune
-            # removed survived, and the rc=1 was misreported below as
-            # "unmerged commits", which `-D` never returns.
-            _deregister_worktrees_under(d)
+            try:
+                reaped_dirs.add(str(d.resolve()))
+            except OSError:
+                pass
             if apply:
                 shutil.rmtree(d, ignore_errors=True)
         else:
             live.add(d.name)
+
+# Deregister BEFORE reaping branches, and after the removal loop so the sweep
+# sees the directories it just deleted as gone.
+_deregister_orphaned_worktrees(reaped_dirs)
 
 cache = root / "repo-map-cache"
 cache_removed = 0
