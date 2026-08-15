@@ -11,7 +11,8 @@ Measured across the run corpus: **57 defects — 44 `missing_requires`, 6
 were in the die()-only class, the two kinds no predicate could dismiss. (An
 earlier revision of this docstring said "13 (23%)", contradicting its own
 sentence four lines above: 13 counts every kind outside `missing_requires`,
-which is the repair channel's scope, not the dismissal channel's.) One of them killed run 3bc46e7d ($20.32, 71 workers, 38
+which is the set the repair handlers DECLINE — they early-out on
+`kind != "missing_requires"` — and not the dismissal channel's scope.) One of them killed run 3bc46e7d ($20.32, 71 workers, 38
 minutes, no branch, no plan.json) on a finding whose named capability WAS
 provided by an in-plan subtask. See docs/POSTMORTEM-2026-08-14.md, F4.
 

@@ -3612,7 +3612,8 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     """Clean up after an abnormal exit (signal, exception, WorkerError).
 
     Always: remove every git worktree under `st.run_dir / "worktrees"`,
-    then `git worktree prune` to clear stale metadata. Per-worktree
+    then `_prune_leerie_worktrees` (scoped) to clear stale metadata.
+    Per-worktree
     failures are caught — one bad worktree shouldn't block the others.
 
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
@@ -3879,7 +3880,7 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | Non
 
     Cleanup runs BEFORE the sleep so the re-exec'd `resume` finds a clean
     slate — `_cleanup_on_abnormal_exit` removes every worktree (git-registered
-    AND orphaned dirs, then `git worktree prune`). That is a convenience, not
+    AND orphaned dirs, then `_prune_leerie_worktrees`). That is a convenience, not
     the guarantee: cleanup cannot run when the process is SIGKILLed, so
     `setup-run.sh` reclaims a stale staging dir itself. A consequence: the
     sleep is measured from AFTER cleanup, so for a parsed reset time the wait

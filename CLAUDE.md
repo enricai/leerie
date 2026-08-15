@@ -301,8 +301,11 @@ tests/                      pytest suite
 # of a paid-for run. Removes terminal run dirs (finished_at/killed_at only —
 # a paused or in-flight run survives regardless of age), repo-map cache
 # entries, and orphaned leerie/subtasks/<run-id>/* branches. Host-only.
-# Branch reaping FAILS CLOSED: a state root with no runs/ cannot say which
-# runs are live, so it reaps no branches at all.
+# Branch reaping needs POSITIVE EVIDENCE, never absence: `-D` for a run dir this
+# prune removed or a branch already merged into its own run branch, `git branch
+# -d` otherwise (which git refuses on unmerged work). Kept branches are
+# reported. Worktree registrations are dropped before the run dir goes, or git
+# refuses the delete and the failure reads as "unmerged".
 ./leerie prune                        # show what would go
 ./leerie prune --apply
 ./leerie prune --older-than 30 --apply   # default cutoff is 14 days
@@ -1014,8 +1017,9 @@ Note the two write sites mean different things — the mid-run satisfied-rescue
 sentinel sets `reviewed: False` but is deliberately excluded from
 `unreviewed_subtasks`, since a zero-commit subtask has no diff to review and
 folding it into the operator warning is how a warning becomes noise.
-`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the
-`bugfix-`-only sibling that asks whether the reported symptom still reproduces
+`tests/test_symptom_evidence.py` covers `check_symptom_evidence`, the sibling —
+scoped by the planner's `fixes_reported_symptom` declaration, never by an id
+prefix — that asks whether the reported symptom still reproduces
 on the base tree — run fa979580's N18 subtask re-fixed a leak an earlier PR had
 already fixed, shipping an event-loop stall on the way. Three traps. **(1) It is
 advisory and must stay that way**: the output never reaches
@@ -1042,8 +1046,8 @@ subtask's domain and a merge re-homes a `feat-` subtask under a surviving
 identifier is a string too. The `sid` still comes from the ORCHESTRATOR, never
 from the worker's echoed `result["subtask_id"]` — nothing in the module
 cross-checks that
-echo, so a worker reporting `feat-001` while working on `bugfix-005` would
-slip the scope entirely. Taking the sid string rather than the subtask dict
+echo, which is precisely why the id is not the scope signal. Taking the sid
+string rather than the subtask dict
 also removes a `None`-dereference by construction, and neither this check
 nor `check_implementer_output` coerces a bad argument (`sid or ""`,
 `subtask or {}`): both shapes swallow a contract violation and leave the

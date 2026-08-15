@@ -1888,6 +1888,33 @@ deferred — once `orchestrator.pid` is no longer authoritative,
 the launcher's `decide_teardown` arms can no longer be misrouted
 by the stale-pid path.
 
+### Never a repository-global git operation
+
+The user's repo is bind-mounted whole, so `.git` is SHARED — with the host, and
+with every other container. A repository-global operation therefore reaches
+state this run does not own and cannot see.
+
+`git worktree prune` is the case that bit. It has no grace period (the
+three-month `gc.worktreePruneExpire` applies to `git gc`, not to an explicit
+prune), so it drops the registration of every worktree whose path is absent
+from the pruning process's namespace — including each host-side
+`/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
+can see. The result is a rebase worktree that git has forgotten while its
+directory still exists.
+
+So no call site runs one. `prune_leerie_worktrees` (shell) and
+`_prune_leerie_worktrees` (Python) ask git what it *would* prune, attribute
+each entry to a path, and remove only entries under a root the caller names.
+An entry that cannot be attributed is left strictly alone: deleting a
+registration we cannot identify is exactly the accident this exists to prevent.
+Both pin `LC_ALL=C`, because git wraps that output in gettext and a translated
+prefix silently matches nothing — a no-op indistinguishable from "nothing was
+stale", which is worse than the bare prune it replaced.
+
+The rule generalises past pruning: any git verb that acts on the whole
+repository rather than on this run's own refs and worktrees is out of bounds
+from inside a container.
+
 ### One task, one run
 
 The flock above makes a *run directory* single-owner. It says nothing about two
@@ -1905,11 +1932,11 @@ So a run records a fingerprint of its task text (`task_sha256` on `run.json`)
 and, before spawning its first worker, refuses to start when another **live**
 run carries the same one. "Live" means started and not finished, killed or
 paused: a completed run sharing a fingerprint is an ordinary re-run and says
-nothing. The check is deliberately placed at the last cheap moment — after
-state exists, before this task's first worker. Not literally before
-any spend: `preflight()`'s smoke test and the dep-capture backstop both
-run earlier and both cost — and the refusal names the other run and the
-two commands that resolve it (`leerie attach`, `leerie kill`).
+nothing. The check is deliberately placed at the last cheap moment: after state exists,
+before this task's first worker. Not literally before any spend —
+`preflight()`'s smoke test and the dep-capture backstop both run earlier and
+both cost. The refusal names the other run and the two commands that resolve it
+(`leerie attach`, `leerie kill`).
 
 Running the same brief twice on purpose is a real thing to want, so there is an
 escape hatch, `LEERIE_ALLOW_DUPLICATE_TASK`. It is an environment variable
@@ -2837,7 +2864,7 @@ rather than folded into the guardrail.
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
 - Worktrees under `<state-root>/runs/<run-id>/worktrees/` are removed and
-  `git worktree prune` clears stale metadata. Worktrees are
+  `_prune_leerie_worktrees` (scoped) clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
   on `resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
@@ -3897,7 +3924,7 @@ container. The `--max-workers` budget persists across the re-exec
 rate-limit still respects the cap and can never run away. Cleanup runs before
 the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
-dirs, then `git worktree prune` — the re-exec'd `resume` finds a clean slate.
+dirs, then `_prune_leerie_worktrees` — the re-exec'd `resume` finds a clean slate.
 That is a convenience, not the guarantee: cleanup cannot run when the process is
 SIGKILLed (Fly `machine stop`), so `setup-run.sh` reclaims a stale staging
 directory itself rather than relying on a predecessor having tidied up.

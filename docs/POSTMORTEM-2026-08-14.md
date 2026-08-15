@@ -142,14 +142,15 @@ The count: the die()-only class is the kinds no predicate could dismiss, and
 predicate 1 was scoped to `broken_by_*`, so the 6 `broken_by_drop` and 4
 `broken_by_merge` were dismissible. That leaves `missing_provides` and
 `orphaned_dependent` — **3 of 57 (5.3%)**, not 13. The 13 counts every kind
-outside `missing_requires`, which is the *repair* channel's scope, not the
-dismissal channel's.
+outside `missing_requires` — the set the repair handlers DECLINE, since they
+early-out on `kind != "missing_requires"`. That is not the dismissal channel's
+scope, and it is not the die()-only set either.
 
 The heading: the first correction went on to say "four of five kinds" was
-"correct as written". It is not, for the same reason. Four of five is the
-repair handlers' scope; the heading says *could only `die()`*, and that set is
-two of five. The heading is left as the historical title with this note
-attached rather than rewritten.
+"correct as written". It is not, for the same reason: four of five is the set
+the repair handlers decline, while the heading says *could only `die()`*, and
+that set is two of five. The heading is left as the historical title with this
+note attached rather than rewritten.
 
 A precision note on both: predicate 2 (`tag in satisfied_tags`) was always
 kind-agnostic, so "matched NO predicate anywhere" is loose — `missing_provides`
