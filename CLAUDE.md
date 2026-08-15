@@ -771,6 +771,33 @@ gathered under concurrent load as unusable, and re-run alone before believing
 it. `-n 4` (xdist) is fine on an otherwise-idle host and matches the serial
 totals exactly; what breaks is *two suites at once*, not parallelism itself.
 
+**A local pass is not evidence until the host lacks `claude`.** The binary is
+on a developer's PATH and **not** on the CI runner's, so any test that reaches
+`preflight()` → `_check_claude_cli_version()` passes here and fails there with
+`FileNotFoundError: 'claude'`. That is not hypothetical: PR #211 reported
+"7114 passed, 0 failed" while CI was red on seven tests of exactly this shape.
+Before claiming a suite green, re-run the affected files with the directory
+holding `claude` removed from PATH:
+
+```bash
+CLAUDE_DIR=$(dirname "$(command -v claude)")
+PATH=$(echo "$PATH" | tr ':' '\n' | grep -vFx "$CLAUDE_DIR" | paste -sd:) \
+  pytest tests/<affected>.py
+```
+
+Prefer removing that one directory over a minimal `env -i PATH=/usr/bin:/bin`:
+several tests legitimately need `git`, `jq` and coreutils, and a too-small PATH
+produces failures that look like regressions and are not. A test whose subject
+is the gate rather than the CLI should **stub** `_check_claude_cli_version`
+rather than skip — skipping on CI removes the coverage instead of the
+dependency (`tests/test_append_system_prompt_file.py` shows the skip form, for
+the case where the CLI genuinely *is* the subject).
+
+`shellcheck` is likewise not installed on every dev host but does run in CI, so
+a `scripts/*.sh` change is unverified until pushed — and it catches things
+`bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix, and the backtick class
+CLAUDE.md records under `tests/test_launcher_integrity.py`).
+
 **Do not edit `orchestrator/leerie.py` (or any file under test) while the
 suite is running.** A great many guards here assert via
 `inspect.getsource` / `ast.parse` on the module read from disk, and Python's
