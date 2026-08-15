@@ -3750,19 +3750,29 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     housekeeping, and a failure here must never take down the caller."""
     root = str(Path(leerie_root).resolve())
     try:
+        # LC_ALL=C / LANGUAGE=: git wraps this output in gettext
+        # (`fprintf_ln(stderr, _("Removing %s/%s: %s"), ...)` in
+        # builtin/worktree.c), and only the FORMAT string is translated -- so
+        # under any non-English locale the `Removing worktrees/` prefix parsed
+        # below never matches and this becomes a total silent no-op, which is
+        # exactly the "looks like nothing was stale" failure the bare prune it
+        # replaced could not have.
+        _env = {**os.environ, "LC_ALL": "C", "LANGUAGE": ""}
         gd = subprocess.run(["git", "rev-parse", "--path-format=absolute",
                              "--git-common-dir"],
                             capture_output=True, text=True, check=False,
-                            timeout=10)
+                            timeout=10, env=_env)
         if gd.returncode != 0 or not gd.stdout.strip():
             return
         git_dir = Path(gd.stdout.strip())
-        # `2>&1`: `git worktree prune -n -v` reports on STDERR, so reading only
-        # stdout yields an empty list and prunes nothing — a silent no-op
-        # indistinguishable from "nothing was stale".
+        # `git worktree prune -n -v` reports on STDERR, so both streams are
+        # read below; reading only stdout yields an empty list and prunes
+        # nothing -- a silent no-op indistinguishable from "nothing was
+        # stale". (The shell helper achieves this with `2>&1`; here it is the
+        # concatenation of `r.stdout` and `r.stderr`.)
         r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],
                            capture_output=True, text=True, check=False,
-                           timeout=10)
+                           timeout=10, env=_env)
     except (OSError, subprocess.TimeoutExpired):
         return
     for line in (r.stdout + "\n" + r.stderr).splitlines():
@@ -3813,7 +3823,12 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    _prune_leerie_worktrees(leerie_dir)
+    # to_thread: this is reached concurrently for every subtask in a
+    # wave under `gather`, and _prune_leerie_worktrees is synchronous
+    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
+    # negligible -- but each call carries a 10 s timeout, and a git
+    # that blocks would stall the whole loop for it.
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -3835,7 +3850,12 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
-    _prune_leerie_worktrees(leerie_dir)
+    # to_thread: this is reached concurrently for every subtask in a
+    # wave under `gather`, and _prune_leerie_worktrees is synchronous
+    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
+    # negligible -- but each call carries a 10 s timeout, and a git
+    # that blocks would stall the whole loop for it.
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -30646,8 +30666,31 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # early returns below and must keep doing so. Demoting them would
         # restart finished work — measured against the two guards in
         # tests/test_resume_planning_regression.py, which is what caught it.
+        # `finished_at` is deliberately NOT a disqualifier here. `main()`'s
+        # SystemExit handler stamps it on every die(), including one that fired
+        # before this run did any work at all -- so excluding it made a run
+        # that died in preflight or phase_classify permanently unrestartable.
+        # Suppressing the stamp instead was tried and reverted: it left the run
+        # with no terminal marker, so `_live_duplicate_runs` read it as LIVE
+        # forever and refused every re-run of the same task, naming a run that
+        # was not running. That is the F15 phantom this whole area exists to
+        # avoid, so the stamp stays and the demotion tolerates it.
+        #
+        # The other two conjuncts already exclude everything that must not
+        # restart: a completed run has `waves`, and `_finish_no_work_run` sets
+        # `waves = []`, so both fail the `"waves" not in st.data` test before
+        # `no_work_required` is even consulted.
+        # `current_phase` is stamped at every phase entry and is documented as
+        # "Empty string before phase 1", so its ABSENCE is the precise
+        # statement of "this run never started" -- and it is what keeps the
+        # completed-run and no-work early returns further down reachable. They
+        # sit AFTER this block, so before `finished_at` was dropped from the
+        # predicate it was silently doing that ordering work; a completed run
+        # whose state carries no `waves` would otherwise be demoted and
+        # restarted here (pinned by
+        # tests/test_resume_planning_regression.py's completed-run guard).
         if ("waves" not in st.data and "categories" not in st.data
-                and not st.data.get("finished_at")
+                and not st.data.get("current_phase")
                 and not st.data.get("no_work_required")
                 and isinstance(st.data.get("task"), str)
                 and st.data["task"].strip()):
@@ -32619,30 +32662,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # reach the pause branch (DESIGN §6 teardown disposition table).
         if st is not None and st.run_dir is not None:
             try:
-                # A run that never started is not a run that finished.
-                # `finished_at` is read as a TERMINAL state: it excludes the
-                # run from the never-started demotion in `_run_phases`, makes
-                # `_derive_run_status` report `done` (so bare `resume` will not
-                # auto-pick it), and routes an explicit `resume` into "records
-                # neither progress nor a task" — the message POSTMORTEM F15
-                # records as sending an operator hunting a data-integrity
-                # problem that did not exist. Stamping it on a run that died in
-                # preflight therefore converts a restartable run into a
-                # permanently dead one, and the likeliest trigger is a dirty
-                # working tree, which is the one condition `main()`
-                # deliberately declines to re-check on resume.
-                #
-                # "Never started" is the same predicate the demotion uses: no
-                # waves, no categories, but a recorded task. Such a run has no
-                # branch and no commits, so nothing downstream needs the stamp
-                # — `fetch_branch`'s discovery is looking for completed
-                # unpushed work, of which there is none.
-                _never_started = (
-                    "waves" not in st.data and "categories" not in st.data
-                    and isinstance(st.data.get("task"), str)
-                    and st.data["task"].strip())
-                if not _never_started:
-                    st.data["finished_at"] = now()
+                st.data["finished_at"] = now()
                 # Only persist state.json when it carries meaningful
                 # content.  A failed resume leaves st.data as a bare
                 # stub (no "task"); writing that poisons the host-side
@@ -32653,9 +32673,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     # `except Exception` below cannot catch a DiskLowSpace
                     # from inside save(), since that is a BaseException.
                     _save_state_best_effort(st, "SystemExit exit")
-                if not _never_started:
-                    _write_run_json(
-                        st.run_dir, finished_at=st.data["finished_at"])
+                _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
                 (st.run_dir / "orchestrator.exit_code").write_text(
                     str(_ec) + "\n")

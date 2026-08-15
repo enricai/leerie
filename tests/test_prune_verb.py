@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -271,3 +272,118 @@ def test_reports_reclaimed_size(tmp_path):
     os.utime(d, (OLD, OLD))
     r = _prune(root, _repo(tmp_path))
     assert "MiB" in r.stdout
+
+
+def _integrated_branch(repo: Path, run_id: str, sid: str) -> None:
+    """A subtask branch whose work is merged into its RUN branch.
+
+    This is the shape `git branch -d` cannot recognise: `-d` checks
+    merged-into-HEAD, and a subtask branch is merged into `leerie/runs/<id>`,
+    never into `main`. So a fully integrated, long-pushed branch is refused
+    exactly like one holding unique work.
+    """
+    br = f"leerie/subtasks/{run_id}/{sid}"
+    _git(repo, "branch", f"leerie/runs/{run_id}")
+    _git(repo, "checkout", "-q", "-b", br, "main")
+    (repo / f"{sid}.txt").write_text("work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", f"{sid} work")
+    _git(repo, "checkout", "-q", f"leerie/runs/{run_id}")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "integrate", br)
+    _git(repo, "checkout", "-q", "main")
+
+
+class TestStaleRegistrationsDoNotBlockReaping:
+    """Removing a run dir orphans its worktree REGISTRATION.
+
+    `shutil.rmtree` deletes `<run>/worktrees/<sid>/` but leaves
+    `.git/worktrees/<sid>` behind, and git then refuses `git branch -D` with
+    "cannot delete branch … used by worktree at …". Every branch of every run
+    prune removed therefore survived — and the rc=1 was reported as "unmerged
+    commits", which `-D` never returns. Reproduced end to end before the fix.
+    """
+
+    def test_a_removed_runs_branch_is_actually_reaped(self, tmp_path):
+        root = tmp_path / "state"
+        _run_dir(root, "RUN1", old=True, finished_at="t")
+        repo = _repo(tmp_path)
+        _git(repo, "worktree", "add", "-q",
+             str(root / "runs" / "RUN1" / "worktrees" / "feat-001"),
+             "-b", "leerie/subtasks/RUN1/feat-001")
+        os.utime(root / "runs" / "RUN1", (OLD, OLD))
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/RUN1/feat-001" not in out, (
+            "the run dir was removed, so its branch must go too — a leftover "
+            "worktree registration is not a reason to keep it")
+
+    def test_a_blocked_delete_is_not_reported_as_unmerged(self, tmp_path):
+        """`-D` never refuses for unmergedness, so that message was a lie."""
+        root = tmp_path / "state"
+        _run_dir(root, "RUN1", old=True, finished_at="t")
+        repo = _repo(tmp_path)
+        _git(repo, "worktree", "add", "-q",
+             str(root / "runs" / "RUN1" / "worktrees" / "feat-001"),
+             "-b", "leerie/subtasks/RUN1/feat-001")
+        os.utime(root / "runs" / "RUN1", (OLD, OLD))
+        r = _prune(root, repo, "--apply")
+        assert "with unmerged commits" not in r.stdout, r.stdout
+
+
+class TestIntegratedBranchesAreReclaimed:
+    """The tier that keeps the feature useful.
+
+    Without it, `-d` refuses every real subtask branch and prune reclaims only
+    zero-commit ones — F22's 64 stale branches would be unreclaimable.
+    """
+
+    def test_an_integrated_branch_of_an_unknown_run_is_reaped(self, tmp_path):
+        root = tmp_path / "state"
+        (root / "runs").mkdir(parents=True)          # this root never knew GHOST
+        repo = _repo(tmp_path)
+        _integrated_branch(repo, "GHOST", "done")
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/GHOST/done" not in out, (
+            "its commits are reachable from leerie/runs/GHOST, so the branch "
+            "is redundant — that is positive evidence, not absence")
+
+    def test_unique_work_beside_it_still_survives(self, tmp_path):
+        """Anti-vacuity: the tier must not reap by run-id alone."""
+        root = tmp_path / "state"
+        (root / "runs").mkdir(parents=True)
+        repo = _repo(tmp_path)
+        _integrated_branch(repo, "GHOST", "done")
+        _unmerged_branch(repo, "leerie/subtasks/GHOST/pending")
+        assert _prune(root, repo, "--apply").returncode == 0
+        out = _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+        assert "leerie/subtasks/GHOST/pending" in out
+        assert "leerie/subtasks/GHOST/done" not in out
+
+
+def test_dry_run_and_apply_agree(tmp_path):
+    """The default mode must predict the outcome it is previewing.
+
+    It appended every candidate without probing mergedness, so it said "would
+    remove 3" where apply removed 1 and kept 2 — and never printed the `kept`
+    line at all, which is the one thing an operator needs before choosing
+    `--apply`.
+    """
+    root = tmp_path / "state"
+    (root / "runs").mkdir(parents=True)
+    repo = _repo(tmp_path)
+    _integrated_branch(repo, "GHOST", "done")
+    _unmerged_branch(repo, "leerie/subtasks/GHOST/pending")
+
+    dry = _prune(root, repo)
+    n_dry = int(re.search(r"would remove (\d+) orphaned", dry.stdout).group(1))
+    kept_dry = re.search(r"kept (\d+) subtask", dry.stdout)
+
+    applied = _prune(root, repo, "--apply")
+    n_app = int(re.search(r"removed (\d+) orphaned", applied.stdout).group(1))
+    kept_app = re.search(r"kept (\d+) subtask", applied.stdout)
+
+    assert n_dry == n_app, f"dry-run said {n_dry}, apply did {n_app}"
+    assert (kept_dry is None) == (kept_app is None)
+    if kept_dry:
+        assert kept_dry.group(1) == kept_app.group(1)

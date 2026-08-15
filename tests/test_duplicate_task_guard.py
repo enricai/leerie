@@ -220,3 +220,68 @@ class TestWiring:
         assert "elif _dupes:" in window, (
             "with the hatch set the run proceeds, but the duplicate must "
             "still be announced")
+
+
+class TestADeadRunIsNotALiveDuplicate:
+    """A run that died before doing any work must not block re-running its task.
+
+    A fix for a different problem — suppressing `finished_at` on a run that
+    never started, so it stayed restartable — left such a run with NO terminal
+    marker, and `_live_duplicate_runs` treats "no finished_at/killed_at/
+    paused_at" as live. Measured: `leerie "add rate limiting"` → classifier
+    crashes → exit 1; the identical task is then refused forever, offering
+    `leerie attach DEAD` (attaches to nothing) and `leerie kill DEAD`, and
+    `leerie list` shows it `in-progress` indefinitely. That is the F15 phantom
+    this area exists to avoid.
+
+    The stamp is therefore unconditional again, and the never-started demotion
+    tolerates it instead.
+    """
+
+    def test_a_run_that_died_is_not_live(self, leerie, tmp_path):
+        _run_json(tmp_path, "DEAD", task_sha256="abc", started_at="t",
+                  finished_at="t")
+        assert leerie._live_duplicate_runs(tmp_path, "mine", "abc") == []
+
+    def test_the_stamp_is_unconditional(self, leerie):
+        """Structural, via `ast`: the assignment must not sit inside ANY `If`
+        in the handler.
+
+        A substring check for a particular guard shape is not enough — the
+        first version of this test looked for `if not ` and sailed straight
+        past `if "waves" in st.data:`, which reinstates the phantom exactly.
+        """
+        import ast as _ast, textwrap as _tw
+        fn = _ast.parse(_tw.dedent(inspect.getsource(leerie.main))).body[0]
+        handler = next(h for h in _ast.walk(fn)
+                       if isinstance(h, _ast.ExceptHandler)
+                       and "SystemExit" in _ast.unparse(h.type or _ast.Name(id="")))
+
+        def _assigns_finished_at(node):
+            return any(
+                isinstance(n, _ast.Assign)
+                and 'finished_at' in _ast.unparse(n.targets[0])
+                and "now()" in _ast.unparse(n.value)
+                for n in _ast.walk(node))
+
+        # The outer `if st is not None and st.run_dir is not None:` is a null
+        # check and is fine. What must never gate the stamp is a condition on
+        # the run's own STATE — that is what "never started" was.
+        guarded = [_ast.unparse(n.test) for n in _ast.walk(handler)
+                   if isinstance(n, _ast.If) and _assigns_finished_at(n)
+                   and "st.data" in _ast.unparse(n.test)]
+        assert not guarded, (
+            "the stamp must not sit behind any condition — a run left without "
+            "a terminal marker reads as LIVE to `_live_duplicate_runs` "
+            f"forever; found it guarded by {guarded}")
+        assert _assigns_finished_at(handler), "the stamp must still happen"
+
+    def test_the_demoted_run_is_still_restartable(self, leerie):
+        """The other half: stamping must not cost restartability, which is why
+        the demotion no longer excludes `finished_at`."""
+        src = inspect.getsource(leerie._run_phases)
+        i = src.index("args.resume = False")
+        window = src[max(0, i - 1200):i]
+        code = "\n".join(l for l in window.splitlines()
+                         if not l.lstrip().startswith("#"))
+        assert "finished_at" not in code

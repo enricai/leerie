@@ -1427,6 +1427,48 @@ def size_of(p: "os.PathLike[str] | str") -> int:
                 pass
     return total
 
+def _git(*args: str) -> subprocess.CompletedProcess:
+    # LC_ALL=C: `git worktree prune -n -v` and friends emit gettext-translated
+    # messages (builtin/worktree.c wraps them in _()), so parsing English
+    # prefixes under another locale silently matches nothing.
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                          text=True, check=False,
+                          env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
+
+
+def _deregister_worktrees_under(run_dir) -> None:
+    """Drop `.git/worktrees/<name>` registrations pointing inside `run_dir`.
+
+    Scoped by construction: only registrations whose worktree lives under a
+    directory this prune is deleting, so a sibling run's or the host's
+    registrations are never touched.
+    """
+    r = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    wdir = pathlib.Path(r.stdout.strip()) / "worktrees"
+    if not wdir.is_dir():
+        return
+    try:
+        target = str(run_dir.resolve())
+    except OSError:
+        return
+    for entry in sorted(wdir.iterdir()):
+        try:
+            wt = (entry / "gitdir").read_text().strip()
+        except OSError:
+            continue
+        if wt.endswith("/.git"):
+            wt = wt[: -len("/.git")]
+        try:
+            rp = str(pathlib.Path(wt).resolve())
+        except OSError:
+            continue
+        if rp == target or rp.startswith(target + os.sep):
+            if apply:
+                shutil.rmtree(entry, ignore_errors=True)
+
+
 runs = root / "runs"
 live = set()
 if runs.is_dir():
@@ -1447,6 +1489,13 @@ if runs.is_dir():
         if terminal and mtime < cutoff:
             freed += size_of(d)
             runs_removed.append(d.name)
+            # Deregister BEFORE deleting. rmtree removes the worktree
+            # directory but leaves `.git/worktrees/<name>` behind, and git
+            # then refuses `git branch -D` with "cannot delete branch ... used
+            # by worktree at ..." -- so every branch of every run this prune
+            # removed survived, and the rc=1 was misreported below as
+            # "unmerged commits", which `-D` never returns.
+            _deregister_worktrees_under(d)
             if apply:
                 shutil.rmtree(d, ignore_errors=True)
         else:
@@ -1482,20 +1531,21 @@ if cache.is_dir():
 # unconditionally and nothing ever removes it, so on any host that has run
 # leerie once the guard can never fire.
 #
-# So:
-#   * a run dir THIS prune just removed is known terminal and old -> `-D`.
-#   * anything else gets `git branch -d`, which git refuses when the branch is
-#     unmerged. A stale merged branch is still reclaimed; unmerged work cannot
-#     be lost, whatever this root does or does not know.
+# So, three tiers, in order:
+#   1. a run dir THIS prune just removed is known terminal and old -> `-D`.
+#   2. the branch is an ANCESTOR of its own run branch, i.e. its commits are
+#      already reachable from the integrated history -> `-D`. This tier is what
+#      keeps the feature useful: `git branch -d` checks merged-into-HEAD, and a
+#      subtask branch is merged into `leerie/runs/<id>`, never into `main` --
+#      so without it a fully integrated, long-pushed branch is refused exactly
+#      like one holding unique work, and prune reclaims almost nothing.
+#   3. anything else gets `git branch -d`, which git refuses when the branch is
+#      unmerged. Unmerged work cannot be lost, whatever this root knows.
 branches_removed = []
 branches_kept = 0
-try:
-    out = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)",
-         "refs/heads/leerie/subtasks"],
-        cwd=str(repo), capture_output=True, text=True, check=False).stdout
-except OSError:
-    out = ""
+branches_blocked = []
+out = _git("for-each-ref", "--format=%(refname:short)",
+           "refs/heads/leerie/subtasks").stdout
 _reaped = set(runs_removed)
 for ref in out.splitlines():
     parts = ref.split("/")
@@ -1504,19 +1554,32 @@ for ref in out.splitlines():
     run_id = parts[2]
     if run_id in live:
         continue
-    # `-D` only where this prune itself established the run is over.
-    flag = "-D" if run_id in _reaped else "-d"
+    integrated = _git("merge-base", "--is-ancestor", ref,
+                      "leerie/runs/%s" % run_id).returncode == 0
+    force = run_id in _reaped or integrated
     if not apply:
-        branches_removed.append(ref)
+        # Classify in dry run too, so the two modes agree. Reporting every
+        # candidate as removable made the default mode overstate the result and
+        # hid the `kept` line -- the one thing an operator needs before
+        # choosing `--apply`.
+        if force or _git("merge-base", "--is-ancestor", ref,
+                         "HEAD").returncode == 0:
+            branches_removed.append(ref)
+        else:
+            branches_kept += 1
         continue
-    r = subprocess.run(["git", "branch", flag, ref], cwd=str(repo),
-                       capture_output=True, text=True, check=False)
+    r = _git("branch", "-D" if force else "-d", ref)
     if r.returncode == 0:
         branches_removed.append(ref)
-    else:
-        # `-d` refused: the branch is unmerged, i.e. it holds work. Keeping it
-        # is the whole point.
+    elif "not fully merged" in r.stderr:
+        # The branch holds work nothing else has. Keeping it is the point.
         branches_kept += 1
+    else:
+        # Anything else is NOT unmergedness -- `-D` never returns that -- and
+        # reporting it as such is how the stale-registration defect stayed
+        # invisible. Name it.
+        branches_blocked.append(
+            (r.stderr or "").strip().splitlines()[0] if r.stderr else ref)
 
 verb = "removed" if apply else "would remove"
 print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
@@ -1526,8 +1589,9 @@ print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
 if branches_kept:
     # Never silent. A branch that survived did so because it holds unmerged
     # commits, which is exactly what an operator running `prune` wants told.
-    print(f"  kept {branches_kept} subtask branch(es) with unmerged commits "
-          "(use `scripts/cleanup.sh --subtask-branches` to force)")
+    print(f"  kept {branches_kept} subtask branch(es) with unmerged commits")
+for _b in branches_blocked:
+    print(f"  could not delete a subtask branch: {_b}")
 print(f"  {verb} ~{freed / 1048576:.1f} MiB")
 if not apply:
     print("  (dry-run — re-run with --apply to delete)")

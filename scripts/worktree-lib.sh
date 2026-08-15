@@ -83,6 +83,10 @@ prune_leerie_worktrees() {
   # so discarding stderr reads an empty list and silently prunes nothing --
   # a no-op that looks exactly like "there was nothing stale". Verified
   # against git 2.53: stdout is empty and stderr carries every line.
-  done < <(git worktree prune -n -v 2>&1 || true)
+  # LC_ALL=C / LANGUAGE=: git wraps this line in gettext, and only the
+  # FORMAT string is translated -- so under any non-English locale the
+  # `Removing worktrees/` case above never matches and this becomes a
+  # total silent no-op.
+  done < <(LC_ALL=C LANGUAGE= git worktree prune -n -v 2>&1 || true)
   return 0
 }

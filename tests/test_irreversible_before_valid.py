@@ -184,15 +184,40 @@ class TestNeverStartedIsRestartable:
         dispatch = src.index("\n    if args.resume:\n", demote)
         assert demote < dispatch
 
-    @pytest.mark.parametrize("terminal_key", ["finished_at", "no_work_required"])
-    def test_terminated_runs_are_not_demoted(self, leerie, terminal_key):
-        """A completed or no-work run also lacks `waves`, and both have their
-        own early returns. Demoting them would restart finished work."""
-        src = inspect.getsource(leerie._run_phases)
+    def test_finished_at_is_deliberately_not_a_disqualifier(self, leerie):
+        """`main()` stamps `finished_at` on EVERY die(), including one that
+        fired before the run did any work — so excluding it made a run that
+        died in preflight permanently unrestartable.
+
+        Suppressing the stamp instead was tried and reverted: it left the run
+        with no terminal marker at all, so `_live_duplicate_runs` read it as
+        LIVE forever and refused every re-run of the same task, naming a run
+        that was not running. The stamp stays; the demotion tolerates it.
+        """
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
         i = src.index("args.resume = False")
-        window = src[max(0, i - 900):i]
-        assert terminal_key in window, (
-            f"the never-started predicate must exclude {terminal_key}")
+        window = src[max(0, i - 1200):i]
+        assert "finished_at" not in window, (
+            "excluding finished_at is what made a failed start unrecoverable")
+
+    def test_a_completed_run_is_still_not_demoted(self, leerie):
+        """The conjunct that actually does the work. A completed run has
+        `waves`, so it fails `"waves" not in st.data` before anything else is
+        consulted — which is why dropping the finished_at test is safe."""
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
+        i = src.index("args.resume = False")
+        window = src[max(0, i - 1200):i]
+        assert '"waves" not in st.data' in window
+        assert '"categories" not in st.data' in window
+
+    def test_a_no_work_run_is_still_not_demoted(self, leerie):
+        """`_finish_no_work_run` sets `waves = []`, so the waves conjunct
+        already excludes it; the explicit test is belt-and-braces."""
+        assert 'st.data["waves"] = []' in inspect.getsource(
+            leerie._finish_no_work_run)
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
+        i = src.index("args.resume = False")
+        assert "no_work_required" in src[max(0, i - 1200):i]
 
     def test_no_task_at_all_still_dies(self, leerie):
         src = inspect.getsource(leerie._run_phases)
@@ -234,77 +259,29 @@ class TestNeverStartedIsRestartable:
             "resume, not just the one that becomes a fresh start")
 
 
-class TestAFailedStartLeavesTheRunRestartable:
-    """`die()` before any work must not stamp the run terminal.
+class TestTheDemotionCannotRestartFinishedWork:
+    """The demotion widened its predicate to tolerate `finished_at`, which
+    `main()` stamps on every die(). That removed the conjunct that was
+    *implicitly* keeping the completed-run and no-work early returns reachable
+    — they sit AFTER this block, so a completed run whose state carries no
+    `waves` was demoted and restarted.
 
-    `main()`'s SystemExit handler writes `finished_at`, which is read as a
-    TERMINAL state in three places: the never-started demotion excludes it,
-    `_derive_run_status` reports `done` (so bare `resume` will not auto-pick
-    it), and an explicit `resume` then falls through to "records neither
-    progress nor a task" — the message POSTMORTEM F15 records as sending an
-    operator hunting a data-integrity problem that did not exist.
-
-    So a run that dies in preflight became permanently dead. The likeliest
-    trigger is a dirty working tree, which is precisely the condition `main()`
-    deliberately declines to re-check on an ordinary resume — and the demotion
-    added a new, far more reachable, refusal on that path.
+    `current_phase` is the precise replacement: stamped at every phase entry
+    and documented as "Empty string before phase 1", so its absence IS "this
+    run never started".
     """
 
-    @staticmethod
-    def _handler(leerie) -> str:
-        src = inspect.getsource(leerie.main)
-        i = src.index("except SystemExit")
-        return src[i:src.index("\n    except ", i + 10)]
+    def test_the_predicate_requires_no_phase_was_entered(self, leerie):
+        src = _strip_comments(inspect.getsource(leerie._run_phases))
+        i = src.index("args.resume = False")
+        window = src[max(0, i - 1400):i]
+        assert 'not st.data.get("current_phase")' in window
 
-    def test_a_never_started_run_is_not_stamped_finished(self, leerie):
-        h = _strip_comments(self._handler(leerie))
-        assert "_never_started" in h, (
-            "the handler must distinguish a run that never started from one "
-            "that finished")
-        # Structural, not whitespace-exact: the guard must precede the stamp.
-        guard = h.index("if not _never_started:")
-        stamp = h.index('st.data["finished_at"] = now()')
-        assert guard < stamp, (
-            "the stamp must sit inside the not-never-started branch")
-
-    def test_the_predicate_matches_the_demotion(self, leerie):
-        """Both must mean the same thing by 'never started', or a run can be
-        stamped terminal by one and expected restartable by the other."""
-        h = _strip_comments(self._handler(leerie))
-        for token in ('"waves" not in st.data', '"categories" not in st.data',
-                      'st.data.get("task")'):
-            assert token in h, token
-
-    def test_run_json_is_not_stamped_either(self, leerie):
-        """`_derive_run_status` reads run.json, so stamping only state.json
-        would leave the run reporting `done` to `leerie list`."""
-        h = _strip_comments(self._handler(leerie))
-        i = h.index("_write_run_json(")
-        assert "if not _never_started:" in h[max(0, i - 200):i]
-
-    def test_a_run_that_DID_work_is_still_stamped(self, leerie):
-        """Anti-vacuity. `fetch_branch`'s discovery requires `finished_at` on
-        a completed unpushed run; suppressing it unconditionally would make
-        every real post-setup die() undiscoverable — the defect the stamp was
-        added for."""
-        h = _strip_comments(self._handler(leerie))
-        assert 'st.data["finished_at"] = now()' in h, (
-            "the stamp must still happen for a run with progress")
-
-    def test_status_of_a_never_started_run_is_resumable(self, leerie):
-        """End-to-end on the consumer: no finished_at means not `done`, and
-        `resume` can auto-pick it again."""
-        run_json = {"run_id": "r", "started_at": "t"}     # no finished_at
-        state = {"task": "t", "started_at": "t"}           # no waves/categories
-        status = leerie._derive_run_status(run_json, state)
-        assert status != "done"
-        assert status in leerie._AUTO_RESUMABLE_STATUSES, status
-
-    def test_a_stamped_run_really_would_be_done(self, leerie):
-        """Anti-vacuity for the test above: `finished_at` IS what makes it
-        terminal, so the fix is load-bearing rather than incidental."""
-        stamped = leerie._derive_run_status(
-            {"run_id": "r", "started_at": "t", "finished_at": "t"},
-            {"task": "t", "started_at": "t"})
-        assert stamped == "done"
-        assert stamped not in leerie._AUTO_RESUMABLE_STATUSES
+    def test_current_phase_is_documented_as_empty_before_phase_one(self, leerie):
+        """The predicate is only correct if the field means what it says."""
+        i = leerie.STATE_FIELDS.index("current_phase")
+        src = inspect.getsource(leerie)
+        j = src.index('"current_phase"')
+        assert "Empty string before phase 1" in src[max(0, j - 400):j], (
+            "the demotion relies on this documented meaning")
+        assert i >= 0

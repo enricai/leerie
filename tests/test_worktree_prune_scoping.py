@@ -365,5 +365,23 @@ def test_the_orchestrator_has_a_scoped_helper():
     the stale metadata a SIGKILLed run leaves behind."""
     src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
     assert "def _prune_leerie_worktrees(" in src
-    assert src.count("_prune_leerie_worktrees(") >= 5, (
-        "the definition plus its four call sites")
+    # Count REFERENCES, not call syntax: two of the four sites go through
+    # `asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)`, which passes
+    # the function by reference and therefore has no `(` after the name.
+    refs = len(re.findall(r"\b_prune_leerie_worktrees\b", _code_only(src)))
+    assert refs >= 5, (
+        f"the definition plus its four call sites; found {refs}")
+
+
+@pytest.mark.parametrize("path,needle", [
+    ("orchestrator/leerie.py", '"LC_ALL": "C"'),
+    ("scripts/worktree-lib.sh", "LC_ALL=C LANGUAGE= git worktree prune"),
+])
+def test_the_prune_probe_pins_the_locale(path, needle):
+    """git wraps `Removing %s/%s: %s` in gettext (builtin/worktree.c) and only
+    the FORMAT string is translated — so under any non-English locale the
+    `Removing worktrees/` prefix both implementations parse never matches, and
+    the scoped prune becomes a total silent no-op. That is strictly worse than
+    the bare prune it replaced, which had no such dependency.
+    """
+    assert needle in (REPO_ROOT / path).read_text(), path
