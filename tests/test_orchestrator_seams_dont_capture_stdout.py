@@ -31,6 +31,7 @@ that shows the rule is about *capturing*, not about printing.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -234,6 +235,252 @@ def _seam_invocations(root: Path | None = None) -> list[tuple[Path, int, str]]:
                 continue
             found.append((path, run + 1, _logical_command(lines, run)))
     return found
+
+
+# ===========================================================================
+# The same rule over BASH'S OWN PARSE
+# ===========================================================================
+#
+# Everything above resolves shell structure out of source TEXT, and four
+# generations of it were each still green on a form that reinstates F1. The
+# verified misses were all resolution failures rather than predicate failures:
+# a multi-line `$(` with no backslash (the joiner follows backslashes only), a
+# pre-opened fd (`>&3`), a capture at the CALL SITE of a wrapper function,
+# `eval` with single quotes, `coproc`, a `|` on the line after a brace group,
+# and a second capturing invocation (the resolver takes the first match only).
+# In the other direction it failed correct code twice: a trailing comment
+# containing `>` or `|`, and `2>logfile` — redirecting the seam's own log is
+# not capturing its stdout.
+#
+# `source <script>; declare -f` re-renders every function from bash's internal
+# parse tree, which removes all of that at once rather than one form at a
+# time: comments are gone, continuations are joined, a multi-line `$( )`
+# collapses onto one line, and `>&2` normalises to `1>&2` so stdout-vs-stderr
+# is explicit instead of guessed.
+#
+# SCOPE, stated honestly: `declare -f` reaches functions. That is where the F1
+# defect lived, and it is `host-finalize.sh`'s whole surface. The launcher's
+# `config --recapture` seam sits in a `case` arm at top level, so bash cannot
+# render it and the textual rule above remains its only check.
+
+_SINKS = frozenset({"cat", "tee"})
+
+
+def _canonical_functions(script: Path) -> dict[str, str]:
+    """{function name: bash's own re-rendering of its body}."""
+    out = subprocess.run(
+        # `cut`, not `awk "{print $3}"`: inside double quotes BASH expands
+        # `$3` (empty) before awk ever sees it, so awk prints the whole
+        # `declare -f <name>` line and word-splitting invents two extra
+        # "functions" called `declare` and `-f`.
+        ["bash", "-c", f'source "{script}" 2>/dev/null; '
+                       'for f in $(declare -F | cut -d" " -f3); do '
+                       'echo "@@FN $f"; declare -f "$f"; done'],
+        capture_output=True, text=True, check=False).stdout
+    fns: dict[str, list[str]] = {}
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("@@FN "):
+            cur = line[5:]
+            fns[cur] = []
+        elif cur is not None:
+            fns[cur].append(line)
+    return {k: "\n".join(v) for k, v in fns.items()}
+
+
+def _canonical_captures(stmt: str, needle: str) -> str:
+    """Why this canonical statement consumes `needle`'s stdout, or "".
+
+    Two passes over the quoting, for the same reason `_captures_stdout` needs
+    two: only SINGLE quotes suppress `$( )`, while a pipe or a redirect is
+    inert inside either kind. Scanning for pipes without blanking quotes first
+    flags `python3 "$seam" --re "a|b"` — a correct tree failing on an argument.
+    """
+    subst = _blank(stmt, "'")
+    for opener, why in (("$(", "command substitution"),
+                        ("<(", "process substitution")):
+        for span in _spans(subst, opener, ")"):
+            if needle in span:
+                return why
+    if "`" in subst:
+        parts = subst.split("`")
+        if any(needle in parts[k] for k in range(1, len(parts), 2)):
+            return "backticks"
+    # `coproc` reads the command's stdout over a pipe pair with no `|` token.
+    if re.search(r"\bcoproc\b", stmt) and needle in stmt:
+        return "coproc"
+    stmt = _blank(subst, '"')
+    # bash writes `>&2` as `1>&2` but leaves a plain `> file` as `>`, so both
+    # spellings of "stdout goes to a descriptor that is not fd 2" must count.
+    if re.search(r"(?:\b1)?>\s*&\s*(?!2\b)\d", stmt):
+        return "stdout to another fd"
+    if re.search(r"(?<![0-9])>\s*(?!&)", stmt) or re.search(r"\b1>\s*(?!&)", stmt):
+        return "stdout to a file"
+    for seg in re.split(r"\|\|", stmt):
+        stages = re.findall(r"\|\s*([\w./-]+)", seg)
+        # EVERY downstream stage must be a sink. Taking only the first let
+        # `| tee /dev/stderr | jq` through — the natural way to keep the log
+        # and read the verdict, i.e. F1 with one extra stage.
+        bad = next((st for st in stages if st not in _SINKS), None)
+        if bad is not None:
+            return f"piped into `{bad}`"
+    return ""
+
+
+def _canonical_offenders(script: Path, needle: str,
+                         expect: tuple[str, ...] = ()) -> list[str]:
+    fns = _canonical_functions(script)
+    # FAIL CLOSED. If the script does not source, `declare -F` is empty and
+    # every check below passes vacuously — the same fail-open defect that made
+    # the prune scan silently useless. Measured: a mutant with a dangling `)`
+    # lost `host_finalize` entirely and the first draft of this audit reported
+    # clean.
+    missing = [f for f in expect if f not in fns]
+    if missing:
+        raise AssertionError(
+            f"{script}: bash did not parse {missing} — the audit cannot run. "
+            "Reporting clean here is indistinguishable from a pass.")
+    bad: list[str] = []
+    for name, body in fns.items():
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            # The needle alone is not enough: `cat > "$_rebaser_py"` WRITES the
+            # seam script and mentions it, but runs nothing. Only a statement
+            # that actually invokes the interpreter can capture its stdout.
+            if needle not in line or not _PY3.search(line):
+                continue
+            why = _canonical_captures(line, needle)
+            if why:
+                bad.append(f"{name}: [{why}] {line.strip()[:70]}")
+                continue
+            # `coproc NAME {` opens a block and the invocation lands inside it,
+            # so the keyword is on an EARLIER line — the mirror of the
+            # group-pipe case below.
+            for k in range(max(0, i - 5), i):
+                if re.search(r"\bcoproc\b", lines[k]):
+                    bad.append(f"{name}: [coproc] {lines[k].strip()[:60]}")
+                    break
+            # A brace/subshell group piped on a LATER line.
+            for k in range(i + 1, min(i + 6, len(lines))):
+                if re.match(r"\s*[})]\s*\|", lines[k]):
+                    bad.append(f"{name}: [group piped] {lines[k].strip()[:60]}")
+                    break
+        # A helper defined INSIDE this function: `declare -f` renders the
+        # nested definition inline, so the definition and the capturing call
+        # site are both in this body.
+        for m in re.finditer(r"^\s*(?:function\s+)?(\w+)\s*\(\)\s*$", body, re.M):
+            inner = m.group(1)
+            # `declare -f` renders the function's OWN header as `name () ` on
+            # the first line; matching it made every mention of the enclosing
+            # function look like a captured helper call.
+            if inner == name:
+                continue
+            tail = body[m.end():]
+            block = tail[:tail.find("\n    }")] if "\n    }" in tail else tail
+            if needle not in block:
+                continue
+            for line in lines:
+                if (re.search(rf"\b{re.escape(inner)}\b", line)
+                        and _canonical_captures(line, inner)):
+                    bad.append(f"{name}: [call-site capture of {inner}()] "
+                               f"{line.strip()[:56]}")
+                    break
+        # The seam lives in this function; the CAPTURE is at its call site.
+        if needle in body:
+            for other, obody in fns.items():
+                if other == name:
+                    continue
+                for line in obody.splitlines():
+                    if (re.search(rf"\b{re.escape(name)}\b", line)
+                            and _canonical_captures(line, name)):
+                        bad.append(f"{other}: [call-site capture of {name}()] "
+                                   f"{line.strip()[:60]}")
+    return bad
+
+
+def test_bash_own_parse_sees_no_capture_in_host_finalize() -> None:
+    """The load-bearing rule again, resolved by bash rather than by regex."""
+    offenders = _canonical_offenders(
+        REPO_ROOT / "scripts" / "host-finalize.sh", "rebaser",
+        expect=("host_finalize",))
+    assert not offenders, (
+        "these statements consume the rebaser seam's stdout (see "
+        "docs/POSTMORTEM-2026-08-14.md, F1):\n  " + "\n  ".join(offenders))
+
+
+def test_the_canonical_audit_fails_closed_on_an_unparseable_script(tmp_path) -> None:
+    """A scanner that reports clean when it could not read the script is worse
+    than no scanner: it is a green tick with no coverage behind it."""
+    bad = tmp_path / "broken.sh"
+    bad.write_text("host_finalize() {\n  python3 x )\n}\n")
+    with pytest.raises(AssertionError, match="did not parse"):
+        _canonical_offenders(bad, "x", expect=("host_finalize",))
+
+
+@pytest.mark.parametrize("body,why", [
+    # Every form verified to slip past the text-scanning generations.
+    ('host_finalize() {\n  v=$(\n    python3 "$_rebaser_py" "$X"\n  )\n}',
+     "multi-line $( ) with NO backslash — the joiner follows backslashes only"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" "$X" >&3\n}',
+     "capture on a pre-opened fd"),
+    ('host_finalize() {\n  _run() {\n    python3 "$_rebaser_py" "$X"\n  }\n'
+     '  out=$(_run)\n}',
+     "capture at the CALL SITE of a nested wrapper"),
+    ('host_finalize() {\n  coproc CO { python3 "$_rebaser_py" "$X"; }\n}',
+     "coproc — a pipe pair with no | token"),
+    ('host_finalize() {\n  {\n    python3 "$_rebaser_py" "$X"\n  } | jq .\n}',
+     "a group piped on the closing-brace line — the invocation and the pipe "
+     "are never on the same line, so a per-line predicate cannot see it"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" a >&2\n'
+     '  out=$(python3 "$_rebaser_py" b)\n}',
+     "a SECOND invocation — the text resolver took the first match only"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" "$X" | tee /dev/stderr | jq .\n}',
+     "keep the log AND read the verdict"),
+])
+def test_the_canonical_audit_sees_what_text_scanning_missed(tmp_path, body, why):
+    f = tmp_path / "c.sh"
+    f.write_text(body + "\n")
+    assert _canonical_offenders(f, "_rebaser_py", expect=("host_finalize",)), why
+
+
+@pytest.mark.parametrize("body,why", [
+    ('host_finalize() {\n  python3 "$_rebaser_py" "$X" "$out" >&2 || rc=$?\n}',
+     "the shipped form: stdout to stderr, verdict in a file, rc consumed"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" "$X" # writes > and | too\n}',
+     "a TRAILING comment — a false positive under the text scan, and bash "
+     "strips it outright"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" "$X" 2>"$log"\n}',
+     "redirecting the seam's own LOG is not capturing its stdout"),
+    ('host_finalize() {\n  cat > "$_rebaser_py" <<\'PY\'\nx = 1\nPY\n}',
+     "writing the seam script mentions it but runs nothing"),
+    ('host_finalize() {\n  python3 "$_rebaser_py" --re "a|b" >&2\n}',
+     "a pipe inside a quoted argument is not a pipe"),
+])
+def test_the_canonical_audit_leaves_legitimate_shapes_alone(tmp_path, body, why):
+    f = tmp_path / "c.sh"
+    f.write_text(body + "\n")
+    got = _canonical_offenders(f, "_rebaser_py", expect=("host_finalize",))
+    assert not got, f"{why}: {got}"
+
+
+def test_eval_with_single_quotes_defeats_both_checks(tmp_path) -> None:
+    """A known gap, pinned so it is a decision rather than a surprise.
+
+    `eval 'out=$(python3 "$seam")'` hides the capture from BOTH mechanisms:
+    the text scan sees a quoted argument, and bash's parse tree records an
+    `eval` with a string operand — the substitution does not exist until the
+    string is evaluated at runtime, so `declare -f` cannot show it.
+
+    Measured A/B on planted seam files, full pipelines: the text scan misses
+    7 of 7 capture forms; the canonical audit misses 1 — this one. It stays
+    documented rather than "handled", because the only way to catch it is to
+    parse the eval operand, i.e. to go back to scanning text.
+    """
+    f = tmp_path / "e.sh"
+    f.write_text('host_finalize() {\n  eval \'out=$(python3 "$s" "$X")\'\n}\n')
+    assert not _canonical_offenders(f, "$s", expect=("host_finalize",)), (
+        "if this now fires, the gap closed — delete this test and add the "
+        "shape to the caught list above")
 
 
 def test_the_scan_finds_the_known_seams() -> None:
