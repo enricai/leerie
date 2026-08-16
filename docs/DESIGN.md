@@ -5547,6 +5547,27 @@ networking, and the container boundary reaps it if the run dies abnormally. The
 port is chosen by binding to `0` and reading back what the OS assigned, so
 concurrent leerie runs on one host never collide and no port scan is needed.
 
+The guarantee is per-*call*, not per-orchestrator-process. Three entrypoints
+invoke workers without ever reaching `_orchestrate()`, so each opens its own
+proxy around its own calls rather than sharing the main run's:
+
+- `run_rebaser` and `run_recapture_deps` — host-seam entrypoints (§6
+  *Finalization*, §6½) that run in their own separate, short-lived `python3`
+  process. They cannot re-derive the flag from CLI args, which never cross
+  that process boundary, so they read the value `_orchestrate()` already
+  resolved and persisted onto the run's own state.
+- `--phase heal` — returns before `_orchestrate()` is reached, so the replays
+  its heal loop drives would otherwise be unconstrained. It runs inside
+  `main()`, where the resolved flag is already in hand.
+
+Before this, all three silently ran unconstrained regardless of the flag: the
+guarantee held for every worker `_orchestrate()` itself drove, and for none
+of the workers reached any other way. Because these three are best-effort
+paths — none may block a push, abort a multi-run loop, or fail a heal — their
+proxies fail *soft* rather than following §7's fail-closed startup rule
+below: a listener that cannot bind costs the guarantee for that call, not the
+call itself.
+
 The proxy rewrites exactly one thing: on a request carrying a single tool named
 `StructuredOutput`, it sets `strict: true` and normalises the schema to the
 subset grammar compilation accepts — `additionalProperties: false` on every

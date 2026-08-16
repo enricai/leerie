@@ -487,6 +487,282 @@ class TestRunRecaptureMultiRun:
                 f"{run_dir.name} not captured; captured={captured}"
             )
 
+    def test_wires_strict_output_proxy_when_flag_is_set_on_run_state(
+            self, leerie, tmp_path, monkeypatch):
+        """Regression test for the host-seam strict-output wiring gap
+        (same class of bug as run_rebaser's): when a run's own state has
+        dangerously_force_strict_output=True, run_recapture_deps must
+        start the proxy around that run's capture_repo_deps() call."""
+        state_dir = tmp_path / "state"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_finished_run(state_dir, "run-001", "2026-01-01T10:00:00",
+                           commands=["pip install flask"])
+
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        calls = {"started": False, "stopped": False}
+
+        class _FakeProxy:
+            def __init__(self, max_parallel, verbosity, timeout_sec):
+                pass
+
+            async def start(self):
+                calls["started"] = True
+                return 12345
+
+            async def stop(self):
+                calls["stopped"] = True
+
+        async def fake_capture(repo_root, st, **kwargs):
+            assert leerie._STRICT_PROXY is not None, (
+                "capture_repo_deps must run while the proxy is active")
+
+        with patch.object(leerie, "capture_repo_deps", new=fake_capture), \
+             patch.object(leerie, "_StrictOutputProxy", _FakeProxy), \
+             patch.object(leerie, "State") as mock_state_cls:
+            def _make_fake_st(leerie_root, run_id, repo_root=None):
+                class _St:
+                    pass
+                s = _St()
+                s.run_dir = leerie_root / "runs" / run_id
+                s.data = {"dangerously_force_strict_output": True}
+                s.bump_workers = lambda c: None
+                s.load = lambda: None
+                return s
+            mock_state_cls.side_effect = _make_fake_st
+
+            leerie.run_recapture_deps(state_dir, repo)
+
+        assert calls["started"] is True
+        assert calls["stopped"] is True
+        assert leerie._STRICT_PROXY is None
+
+    def test_skips_strict_output_proxy_when_flag_is_unset_on_run_state(
+            self, leerie, tmp_path, monkeypatch):
+        """When the flag is false/absent on a run's state, no proxy should
+        be instantiated for its capture_repo_deps() call — guards against
+        an always-on regression of the fix above."""
+        state_dir = tmp_path / "state"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_finished_run(state_dir, "run-001", "2026-01-01T10:00:00",
+                           commands=["pip install flask"])
+
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        instantiated = {"count": 0}
+
+        class _FakeProxy:
+            def __init__(self, *a, **kw):
+                instantiated["count"] += 1
+
+            async def start(self):
+                return 1
+
+            async def stop(self):
+                pass
+
+        async def fake_capture(repo_root, st, **kwargs):
+            pass
+
+        with patch.object(leerie, "capture_repo_deps", new=fake_capture), \
+             patch.object(leerie, "_StrictOutputProxy", _FakeProxy), \
+             patch.object(leerie, "State") as mock_state_cls:
+            def _make_fake_st(leerie_root, run_id, repo_root=None):
+                class _St:
+                    pass
+                s = _St()
+                s.run_dir = leerie_root / "runs" / run_id
+                s.data = {"dangerously_force_strict_output": False}
+                s.bump_workers = lambda c: None
+                s.load = lambda: None
+                return s
+            mock_state_cls.side_effect = _make_fake_st
+
+            leerie.run_recapture_deps(state_dir, repo)
+
+        assert instantiated["count"] == 0
+
+    def test_proxy_global_is_reset_even_when_stop_raises_across_runs(
+            self, leerie, tmp_path, monkeypatch):
+        """run_recapture_deps consolidates across MULTIPLE finished runs,
+        reusing the same module-level _STRICT_PROXY global each iteration
+        (unlike _orchestrate's single-shot use of it). If proxy.stop()
+        itself raised and the reset were skipped, the run AFTER it would
+        silently inherit a stale/closed proxy — even one whose own state
+        has the flag off. Assert the second run's capture never sees a
+        proxy at all, regardless of what happened to the first run's."""
+        state_dir = tmp_path / "state"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_finished_run(state_dir, "run-001", "2026-01-01T10:00:00",
+                           commands=["pip install flask"])
+        _make_finished_run(state_dir, "run-002", "2026-01-02T10:00:00",
+                           commands=["pip install django"])
+
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        seen_proxy_during_run: dict[str, bool] = {}
+
+        class _FakeProxy:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def start(self):
+                return 1
+
+            async def stop(self):
+                raise RuntimeError("simulated teardown failure")
+
+        async def fake_capture(repo_root, st, **kwargs):
+            run_name = Path(getattr(st, "run_dir", "")).name
+            seen_proxy_during_run[run_name] = leerie._STRICT_PROXY is not None
+
+        with patch.object(leerie, "capture_repo_deps", new=fake_capture), \
+             patch.object(leerie, "_StrictOutputProxy", _FakeProxy), \
+             patch.object(leerie, "State") as mock_state_cls:
+            def _make_fake_st(leerie_root, run_id, repo_root=None):
+                class _St:
+                    pass
+                s = _St()
+                s.run_dir = leerie_root / "runs" / run_id
+                # target_dirs is processed newest-first (run-002, then
+                # run-001). Only run-002 has the flag on and a stop() that
+                # raises; run-001 (flag off) is processed second and must
+                # not see a proxy leaked from run-002's failed teardown.
+                s.data = {"dangerously_force_strict_output":
+                          run_id == "run-002"}
+                s.bump_workers = lambda c: None
+                s.load = lambda: None
+                return s
+            mock_state_cls.side_effect = _make_fake_st
+
+            leerie.run_recapture_deps(state_dir, repo)
+
+        assert seen_proxy_during_run.get("run-002") is True
+        assert seen_proxy_during_run.get("run-001") is False
+        assert leerie._STRICT_PROXY is None, (
+            "a raising stop() must not leave a stale proxy on the module "
+            "global after run_recapture_deps returns")
+
+    def test_proxy_setup_failure_does_not_abort_the_whole_consolidation(
+            self, leerie, tmp_path, monkeypatch):
+        """Per-run errors are logged and skipped — that contract covers proxy
+        SETUP too, not just the capture call.
+
+        The proxy is constructed and started outside the guard that wraps
+        `capture_repo_deps` itself, so a constructor failure (or any
+        non-`OSError` out of `start()`) escapes that inner guard. Unguarded,
+        it would propagate out of `asyncio.run` and abort the entire
+        multi-run loop — killing consolidation for every remaining run over
+        one run's setup problem."""
+        state_dir = tmp_path / "state"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_finished_run(state_dir, "run-001", "2026-01-01T10:00:00",
+                           commands=["pip install flask"])
+        _make_finished_run(state_dir, "run-002", "2026-01-02T10:00:00",
+                           commands=["pip install django"])
+
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        captured: list[str] = []
+
+        class _ExplodingProxy:
+            def __init__(self, *a, **kw):
+                # Not an OSError: the start() guard deliberately catches only
+                # OSError, so this models the escape route that guard misses.
+                raise RuntimeError("simulated proxy construction failure")
+
+        async def fake_capture(repo_root, st, **kwargs):
+            captured.append(Path(getattr(st, "run_dir", "")).name)
+
+        with patch.object(leerie, "capture_repo_deps", new=fake_capture), \
+             patch.object(leerie, "_StrictOutputProxy", _ExplodingProxy), \
+             patch.object(leerie, "State") as mock_state_cls:
+            def _make_fake_st(leerie_root, run_id, repo_root=None):
+                class _St:
+                    pass
+                s = _St()
+                s.run_dir = leerie_root / "runs" / run_id
+                # run-002 is processed first (newest-first) and blows up in
+                # proxy setup; run-001 has the flag off and must still run.
+                s.data = {"dangerously_force_strict_output":
+                          run_id == "run-002"}
+                s.bump_workers = lambda c: None
+                s.load = lambda: None
+                return s
+            mock_state_cls.side_effect = _make_fake_st
+
+            # Must not raise.
+            leerie.run_recapture_deps(state_dir, repo)
+
+        assert "run-001" in captured, (
+            "a proxy setup failure on one run aborted the whole "
+            f"consolidation; captured={captured}")
+        assert leerie._STRICT_PROXY is None
+
+    def test_non_oserror_from_start_does_not_leak_a_dead_proxy(
+            self, leerie, tmp_path, monkeypatch):
+        """`start()` failing with anything but `OSError` must not leave the
+        proxy published on the module global.
+
+        The `except OSError` arm is the only one that resets it, and an
+        exception raised before the context manager's `yield` escapes without
+        entering the `finally` that would otherwise clean up. A proxy left
+        behind that way never bound, so `__init__`'s `port = 0` stands — and
+        `_invoke` gates on the global being non-None before reading `.port`,
+        so the NEXT run in this loop would send every worker to
+        `127.0.0.1:0`. That is a hard failure, not the lost guarantee this is
+        meant to degrade to."""
+        state_dir = tmp_path / "state"
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_finished_run(state_dir, "run-001", "2026-01-01T10:00:00",
+                           commands=["pip install flask"])
+        _make_finished_run(state_dir, "run-002", "2026-01-02T10:00:00",
+                           commands=["pip install django"])
+
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        seen_proxy_during_run: dict[str, bool] = {}
+
+        class _FailingStartProxy:
+            def __init__(self, *a, **kw):
+                self.port = 0
+
+            async def start(self):
+                # Deliberately NOT an OSError — that arm is already covered
+                # and is the only one that resets the global.
+                raise RuntimeError("simulated non-OSError start failure")
+
+            async def stop(self):
+                pass
+
+        async def fake_capture(repo_root, st, **kwargs):
+            run_name = Path(getattr(st, "run_dir", "")).name
+            seen_proxy_during_run[run_name] = leerie._STRICT_PROXY is not None
+
+        with patch.object(leerie, "capture_repo_deps", new=fake_capture), \
+             patch.object(leerie, "_StrictOutputProxy", _FailingStartProxy), \
+             patch.object(leerie, "State") as mock_state_cls:
+            def _make_fake_st(leerie_root, run_id, repo_root=None):
+                class _St:
+                    pass
+                s = _St()
+                s.run_dir = leerie_root / "runs" / run_id
+                # run-002 is processed first and fails to start its proxy;
+                # run-001 (flag off) follows and must see no proxy at all.
+                s.data = {"dangerously_force_strict_output":
+                          run_id == "run-002"}
+                s.bump_workers = lambda c: None
+                s.load = lambda: None
+                return s
+            mock_state_cls.side_effect = _make_fake_st
+
+            leerie.run_recapture_deps(state_dir, repo)
+
+        assert seen_proxy_during_run.get("run-001") is False, (
+            "a failed start() leaked a never-bound proxy onto the global; "
+            "the next run's workers would be pointed at 127.0.0.1:0")
+        assert leerie._STRICT_PROXY is None
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: real python3 seam with stubbed claude

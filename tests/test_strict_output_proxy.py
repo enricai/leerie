@@ -1988,3 +1988,105 @@ def test_no_proxied_requests_at_all_is_not_a_rename(leerie):
     """A run where the proxy saw nothing proves nothing about the tool — the
     warning must key on `passed_through`, not fire on an empty run."""
     assert "NOTHING was rewritten" not in _summary_for(leerie)
+
+
+# ---------------------------------------------------------------------------
+# The flag has to REACH the workers, not merely resolve.
+# ---------------------------------------------------------------------------
+
+class TestStrictOutputReachesEveryEntrypoint:
+    """A knob that resolves correctly but never reaches its consumers is
+    documented-but-inert.
+
+    `main()` resolves `caps["force_strict_output"]`, but the proxy that makes
+    it mean anything is started in `_orchestrate()`. Three entrypoints never
+    reach `_orchestrate`, so without their own instance every worker they
+    invoke runs unconstrained no matter the flag:
+
+      - `run_rebaser` and `run_recapture_deps` — each a separate host-seam
+        `python3` process, where the module-level `_STRICT_PROXY` starts
+        fresh at `None` regardless of config.
+      - `main()`'s `--phase heal` branch — returns before `_orchestrate` is
+        called, so its `_replay_capture` replays inherit no proxy.
+
+    This is the same defect class
+    `test_worker_duration_distribution.py::TestOverrideReachesEveryConsumer`
+    pins for the worker-timeout knob — and it caught these very entrypoints
+    missing that one. Shipped consequence here: the rebaser's nullable
+    `diagnosis` field produced unparseable output on every single call,
+    exhausting all structured-output retries and silently skipping the
+    rebase on every finalize.
+    """
+
+    def test_host_seam_entrypoints_wrap_their_worker_call(self, leerie):
+        """The two separate-process seams must open the proxy themselves."""
+        import inspect
+        for fn in (leerie.run_rebaser, leerie.run_recapture_deps):
+            src = inspect.getsource(fn)
+            assert "_strict_output_proxy(" in src, (
+                f"{fn.__name__} never opens a strict-output proxy, so "
+                "--dangerously-force-strict-output is inert for its worker")
+
+    def test_host_seam_entrypoints_read_the_flag_off_run_state(self, leerie):
+        """The CLI flag never reaches these separate processes — only
+        `state.json` crosses the boundary — so re-resolving from argv alone
+        would miss a run launched with the bare CLI flag."""
+        import inspect
+        for fn in (leerie.run_rebaser, leerie.run_recapture_deps):
+            src = inspect.getsource(fn)
+            assert "dangerously_force_strict_output" in src, (
+                f"{fn.__name__} never reads the resolved per-run value, so a "
+                "CLI-flag-only run silently runs unconstrained there")
+
+    def test_heal_branch_wraps_phase_heal(self, leerie):
+        """`--phase heal` returns before `_orchestrate`, so its replays need
+        the proxy opened in the branch itself.
+
+        Structural (not a substring match): the `phase_heal` call must sit
+        lexically inside an `async with _strict_output_proxy(...)` block, so
+        merely mentioning the helper somewhere in `main()` cannot satisfy it.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(leerie.main)))
+
+        def opens_strict_proxy(node: ast.AsyncWith) -> bool:
+            for item in node.items:
+                call = item.context_expr
+                if (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "_strict_output_proxy"):
+                    return True
+            return False
+
+        guarded = any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "phase_heal"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncWith) and opens_strict_proxy(node)
+            for inner in ast.walk(node)
+        )
+        assert guarded, (
+            "main()'s --phase heal branch calls phase_heal outside any "
+            "async with _strict_output_proxy(...) — the heal loop's replays "
+            "run unconstrained even when the flag is set")
+
+    def test_replay_capture_needs_no_proxy_of_its_own(self, leerie):
+        """Pins WHY `_replay_capture` is deliberately untouched: `_invoke`
+        gates on the module-level global alone, never on
+        `caps["force_strict_output"]`. So a caller that opens the proxy is
+        sufficient, and `_replay_capture` rebuilding its own caps from
+        `DEFAULT_CAPS` is harmless. If that gating ever moved to `caps`, this
+        assumption would break silently and `_replay_capture` would need its
+        own wiring — hence the guard."""
+        import inspect
+        invoke_src = inspect.getsource(leerie._invoke)
+        assert "_STRICT_PROXY is not None" in invoke_src, (
+            "_invoke no longer gates on the global; _replay_capture (and any "
+            "other caller relying on an ambient proxy) may now be inert")
+        assert "force_strict_output" not in invoke_src, (
+            "_invoke now reads force_strict_output off caps — _replay_capture "
+            "builds its own caps from DEFAULT_CAPS and would silently lose it")

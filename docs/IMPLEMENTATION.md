@@ -3649,6 +3649,65 @@ reach it via `ANTHROPIC_BASE_URL` injected into `worker_env`. The orchestrator
 is PID 1 in the container and workers are its children, so loopback needs no
 port mapping.
 
+**Three entrypoints get their own instance, not `_orchestrate()`'s.** The
+module-level `_STRICT_PROXY` global is what `_invoke` actually gates on
+(`if _STRICT_PROXY is not None` — never `caps["force_strict_output"]`, which
+only `_orchestrate` and `main`'s collision guards read). Any path that
+invokes a worker without `_orchestrate` having run therefore sees no proxy:
+
+| entrypoint | why it misses `_orchestrate` | where the flag comes from |
+|---|---|---|
+| `run_rebaser` | separate `python3` process (`scripts/host-finalize.sh`'s heredoc, §6) | `st.data["dangerously_force_strict_output"]` |
+| `run_recapture_deps` | separate `python3` process (`./leerie config --recapture`'s seam, §6½) | same, re-read per `target_run_dir` |
+| `main()`'s `--phase heal` branch | `return`s before `_orchestrate()` is called | `caps` — already resolved in `main()` |
+
+All three wrap their worker call in the shared
+`_strict_output_proxy(caps, label)` async context manager (defined beside
+`_StrictOutputProxy`), which constructs, starts, and tears down one
+short-lived instance scoped to that call. The two host-seam entrypoints
+cannot call `resolve_dangerously_force_strict_output` meaningfully — the CLI
+flag never crosses the process boundary, only `state.json` does — so they
+read the value `_orchestrate()` already persisted for that exact run
+(§ *State fields*), falling back to a CLI-blind resolve only for a
+`state.json` predating that field. The heal branch needs no such read: it is
+still inside `main()`, which resolved the flag (and passed `main()`'s
+`ANTHROPIC_BASE_URL`/Bedrock collision guards) before the branch runs.
+`_replay_capture`, which the heal loop drives, deliberately needs **no**
+wiring of its own: it inherits whatever proxy is ambient, which is why
+rebuilding its `caps` from `DEFAULT_CAPS` is harmless here.
+
+The helper fails **soft in both directions**, deliberately departing from
+`_orchestrate`'s fail-closed startup rule (DESIGN §7) because all three
+callers are best-effort paths that must never block a push (`run_rebaser`'s
+own contract), abort multi-run consolidation, or fail a heal: a `start()`
+`OSError` logs and proceeds unconstrained, and a `stop()` failure is caught,
+logged, and swallowed rather than escaping the `finally` — where it would
+neither be caught by the caller's own `try` (a `finally`-raised exception
+bypasses its own handlers) nor leave an already-valid result intact. The
+global is reset unconditionally either way, which `run_recapture_deps`
+depends on per loop iteration: a stale non-`None` value would silently route
+the next target run through the previous run's closed proxy, even a run whose
+own state has the flag off. `run_recapture_deps` additionally keeps a broad
+guard *around* `asyncio.run` as well as inside it, since proxy construction
+sits outside the inner guard and a setup failure must not abort the whole
+consolidation.
+
+Before this wiring, all three built their own `caps` with no
+`force_strict_output` key, so every worker they invoked ran unconstrained no
+matter the flag. In production this surfaced as the rebaser's nullable
+`diagnosis` field (`SCHEMAS["rebaser"]`) reliably producing a bare,
+unparseable token instead of the literal `null` under unconstrained
+`--json-schema`, exhausting all 5 structured-output retries on effectively
+every rebase — non-fatal (finalize falls through to pushing `run_branch`
+un-rebased), but the intended rebase-onto-latest-base step silently never
+ran. `SCHEMAS["rebaser"]["diagnosis"]` was also independently narrowed from
+`["string", "null"]` to plain `"string"` (the prompt's own convention is
+already "empty string" for "nothing to diagnose") — the schema fix and the
+proxy-wiring fix are independent and compose; either alone closes this
+specific failure, together they also protect any other nullable field these
+entrypoints' schemas may gain later. `tests/test_strict_output_proxy.py`'s
+`TestStrictOutputReachesEveryEntrypoint` pins all three, structurally.
+
 **Upstream read timeout.** `_StrictOutputProxy(max_parallel, verbosity,
 upstream_timeout_sec)`, applied to the `urlopen` that forwards each request
 and floored at the module constant `_STRICT_PROXY_TIMEOUT_SEC`.
@@ -8920,7 +8979,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
-| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). Mirrored from `caps["force_strict_output"]`. Recorded because the flag changes worker behaviour invisibly — it owns `ANTHROPIC_BASE_URL`, which makes the CLI treat the session as gateway-routed and apply a conservative client-side context ceiling instead of the model's native window (see `_model_arg`). Without this field a run's failure cannot be attributed to the flag after the fact. |
+| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). Mirrored from `caps["force_strict_output"]`. Recorded because the flag changes worker behaviour invisibly — it owns `ANTHROPIC_BASE_URL`, which makes the CLI treat the session as gateway-routed and apply a conservative client-side context ceiling instead of the model's native window (see `_model_arg`). Originally attribution-only ("without this field a run's failure cannot be attributed to the flag after the fact"); now also load-bearing — `run_rebaser` and `run_recapture_deps` read it back from `st.data` to decide whether to wire their own per-call proxy instance, since they run in a separate process the original CLI flag never reaches (§ *Forced constrained decoding*). |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `skip_coverage_check` | bool | whether the phase 2⅞½ task-coverage gate (a single advisory `task_coverage_judge` invocation since 2026-08-04; the deterministic `check_required_items_coverage` floor it used to compose with was deleted) is suppressed. Resolved from `--skip-coverage-check` / `LEERIE_SKIP_COVERAGE_CHECK` / `skip_coverage_check` in `leerie.toml` / default `False`. When True, the review does not run at all — no gap is surfaced before `phase_execute` spends. Since the gate is advisory, this suppresses the report and its worker call, not a block. Added after run 488c42e5, where the judge counted a task item the task itself deferred as `missing_work` — unsatisfiable by any planner, with no operator override, unlike every sibling gate. Re-resolved fresh on every run, including `resume` |
@@ -9485,7 +9544,7 @@ enforcement functions:
 | `test_dockerfile_bake_from_capture.py` | Bake-from-persisted-installs path (distinct from `test_dockerfile_autogen.py`): launcher emits apt layer from `setup_packages` plus a `COPY`+`RUN` layer per `language_installs` entry with embedded `copy-input-shas` comment; `p.exists()` guard silently drops hallucinated `copy_input` paths from COPY while always emitting the RUN; all copy_inputs absent → RUN emitted, no COPY; multi-manager (pnpm+pip) → two COPY+RUN layers each with their own sha comment; pip install with only `requirements.txt` (no lockfile) → baked via persisted path, not lockfile fallback; identical regen → bit-identical Dockerfile (sha stable, no needless rebuild); changing `copy_input` file content → sha comment changes; committed `.leerie/Dockerfile` left untouched even when `language_installs` present; **node-ancillary augmentation on the persisted path — a pnpm entry whose `copy_inputs` omit `patches/` still emits `COPY patches/ ./patches/` (its own path-preserving line, never flattened into `./`) with the patch sha folded into the rebuild comment; a workspace child `packages/a/package.json` is COPYed to `./packages/a/package.json` (no basename clobber); a non-node (poetry) install ignores a `patches/` dir; the apt layer has no trailing `USER leerie`**; coupling tests that `persisted_installs`, `.exists()`, `copy-input-shas`, and `language_installs` sentinel strings exist in extracted launcher block |
 | `test_base_dockerfile_chromium.py` | Base image `./Dockerfile` (not the per-repo autogen one): asserts `chromium` and `chromium-driver` are installed and the three container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`) are baked into `/etc/chromium.d/leerie-container-flags` after the chromium install (ordering guard) — see *Browser-based testing* above |
 | `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam (`run_recapture_deps`) when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `config.toml`, `Dockerfile`; instructs ending at `USER root` and does NOT instruct a trailing `USER leerie`) and a parallel guard that `docs/USAGE.md`'s hand-authored `.leerie/Dockerfile` example likewise has no trailing `USER leerie`; coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run`. Also covers the Dockerfile language-layer bake-from-persisted-installs logic (extracted Python heredoc invoked directly): persisted `language_installs` → COPY+RUN emitted per manager; hallucinated copy_inputs silently dropped while RUN always emitted; all copy_inputs missing → RUN without COPY; multi-manager → multiple COPY+RUN layers; no persisted installs → lockfile-detection fallback; empty `language_installs` list → lockfile fallback; no lockfile and no persisted installs → empty output; identical inputs → identical output (hash stability). |
-| `test_config_recapture.py` | `leerie config --recapture` LLM-seam dispatch and multi-run consolidation: launcher `--recapture` arm dispatches to the python3 seam; exits 1 with diagnostic when no runs directory or no finished run found; `--force` flag passed to the seam; python3 failure exits 1; no `nerdctl` invoked; `--recapture` arm within extraction boundary; `run_recapture_deps` consolidates across ≥2 finished runs (all captured, not just newest); `--force` drops sentinel on each run (wholesale replace semantics); without `--force` already-captured runs are skipped (never-clobber union); Dockerfile survivor tests (committed and generated) |
+| `test_config_recapture.py` | `leerie config --recapture` LLM-seam dispatch and multi-run consolidation: launcher `--recapture` arm dispatches to the python3 seam; exits 1 with diagnostic when no runs directory or no finished run found; `--force` flag passed to the seam; python3 failure exits 1; no `nerdctl` invoked; `--recapture` arm within extraction boundary; `run_recapture_deps` consolidates across ≥2 finished runs (all captured, not just newest); `--force` drops sentinel on each run (wholesale replace semantics); without `--force` already-captured runs are skipped (never-clobber union); Dockerfile survivor tests (committed and generated); per-run `dangerously_force_strict_output` in `state.json` wires (and, when unset, correctly skips) `run_recapture_deps`'s own `_StrictOutputProxy` instance around that run's `capture_repo_deps()` call; a raising `stop()` still resets the global so the next target run in the loop cannot inherit a closed proxy; a proxy *construction* failure is logged and skipped rather than aborting the whole consolidation |
 | `test_replay_capture.py` | `_replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `_judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `_heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `_heal_apply_patch()` — patched prompts written per sample under iter-1/; `_heal_replay_patched()` — history + best_so_far updated in state.json |
